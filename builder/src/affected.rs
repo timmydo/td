@@ -295,7 +295,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/crc32.rs",
-        "td-builder's xz and gzip decoders, and target-static td-install (through gpt.rs)",
+        "td-builder's xz decoder, the shared gzip decoder, and target-static td-install (through gpt.rs)",
     ),
     (
         "engine/src/gpt.rs",
@@ -682,6 +682,16 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_note(&format!(
             "{p} is the td-builder build engine: the ~2-min check-engine smoke (compile + unit tests) is the fast signal; the from-source build coverage is the full check (DESIGN §7.2)."
         ));
+        return;
+    }
+
+    if p == "engine/src/gzip.rs" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check-engine");
+        sel.add_target("check");
+        sel.add_note(
+            "engine/src/gzip.rs is shared by td-builder source extraction and the bounded OSTree importer: check-engine is the fast signal and the full check exercises the from-source consumer.",
+        );
         return;
     }
 
@@ -1774,6 +1784,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // side) AND recipe-rs + the package build gates (recipe side).
     assert_target!("engine/src/json.rs", "check-engine");
     assert_target!("engine/src/json.rs", "recipe-rs");
+    assert_target!("engine/src/gzip.rs", "check-engine");
+    assert_target!("engine/src/gzip.rs", "check");
+    assert_contains!("engine/src/gzip.rs", "source extraction");
     assert_target!(
         "engine/tests/fixtures/flathub-firefox-154.commit.hex",
         "check-engine"

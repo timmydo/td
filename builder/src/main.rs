@@ -36,7 +36,7 @@ mod gate_bodies;
 mod gate_inputs;
 mod gate_timing;
 mod gates;
-mod gzip;
+use td_engine::gzip;
 mod lock;
 mod mes_boot;
 mod nar;

@@ -1224,25 +1224,40 @@ The importer contract is narrower than Flatpak:
    obtains payload bytes from outside the signed commit-reachable object graph,
    is refused. The inspected application and runtime do not use extra data.
 
-**The bounded metadata decoder has LANDED.** `td_engine::ostree` accepts an
-expected checksum rooted in the reviewed commit pin, authenticates the exact
-commit, dirtree or dirmeta bytes before parsing, and exposes no unauthenticated
-public parse route. This is object integrity, not signature verification; pin
-review still owns the signing-key decision in item 1. The decoder parses only
-the three big-endian GVariant layouts needed to walk a deploy. It bounds
-individual metadata objects, entries per tree and UTF-8 component names;
-rejects noncanonical framing, unsafe or duplicate names, xattrs,
-non-directories and undefined or special permission bits; and exposes typed
-child checksums for the later fetch/materialize increment. Commit metadata is
-a closed, typed subset matching the reviewed app and runtime commits: unknown
-keys, `xa.extra-data-sources`, duplicate keys or mistyped values, and nonempty
+**The bounded metadata and archive decoders have LANDED.**
+`td_engine::ostree` accepts an expected checksum rooted in the reviewed commit
+pin, authenticates the exact commit, dirtree or dirmeta bytes before parsing,
+and exposes no unauthenticated public metadata parse route. This is object
+integrity, not signature verification; pin review still owns the signing-key
+decision in item 1. The metadata decoder parses only the three big-endian
+GVariant layouts needed to walk a deploy. It bounds individual metadata
+objects, entries per tree and UTF-8 component names; rejects noncanonical
+framing, unsafe or duplicate names, xattrs, non-directories and undefined or
+special permission bits; and exposes typed child checksums for the later
+fetch/materialize increment. Commit metadata is a closed, typed subset
+matching the reviewed app and runtime commits: unknown keys,
+`xa.extra-data-sources`, duplicate keys or mistyped values, and nonempty
 related objects are refused. The decoder retains bindings but does not require
 their presence or choose a ref; the acquisition increment must require and
-compare the exact pinned ref before walking its graph. Tests pin the exact
-Firefox and runtime commits plus the Firefox root dirtree and dirmeta bytes as
-independent wire oracles. This is deliberately not a repository client or a
-general GVariant implementation. Network acquisition, archive-file decoding,
-whole-graph bounds and transactional materialization remain part of E1b.
+compare the exact pinned ref before walking its graph.
+
+The archive decoder accepts only OSTree's `(tuuuusa(ayay))` archive-z2
+regular-file and symlink headers. It bounds the transfer, header, decoded file
+and symlink target at 257 MiB, 8 KiB, 256 MiB and 4095 bytes respectively;
+refuses xattrs, devices, special or undefined mode bits, body-bearing symlinks
+and target-bearing regular files; and admits only one exact raw-DEFLATE
+stream with at most 1,048,576 blocks. Archive transport bytes are not the
+content identity. td reconstructs OSTree's canonical uncompressed
+`(uuuusa(ayay))` header, hashes that header plus regular-file contents, and
+compares it with the tree-reachable checksum. The existing gzip inflater is
+now the shared std-only implementation rather than a second decoder. Tests
+pin real Firefox regular-file and symlink `.filez` transfers and their
+semantic identities; the regular fixture is linked to the authenticated root
+dirtree. This is deliberately not a repository client or a general GVariant
+implementation. Network acquisition, exact-ref admission, whole-graph bounds
+and transactional materialization remain part of E1b. Authenticated symlink
+targets remain opaque content here; materialization must create each link
+without following it while resolving the destination path.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
@@ -1504,7 +1519,8 @@ served the repository client:
 | `builder/src/sandbox.rs` | **rewrite** as `td-jail` — the namespace mechanics are the model, but its build-user ids, offline network, `/gnu/store` paths and trust model are all wrong here |
 | `builder/src/store.rs` | **read, do not port** — the store semantics are the control plane's, and with packages in the store there is nothing on the target that creates a store path |
 | `builder/src/elf.rs` | **never** — see §G |
-| `builder/src/gzip.rs`, `xz.rs`, `bzip2.rs`, `erofs.rs`, `tar.rs`, `oci.rs` | do not port — all of them served the repository client or the image writer, and decompression now happens in a recipe on the control plane |
+| `engine/src/gzip.rs` | **reuse only in the control plane** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; nothing on the target decompresses a package |
+| `builder/src/xz.rs`, `bzip2.rs`, `erofs.rs`, `tar.rs`, `oci.rs` | do not port — these serve source extraction or the image writer on the control plane |
 | `builder/src/nar.rs` | **needed, but only in the control plane** — `read_nar` is how host mode materializes a package (§X.1). Nothing on the target extracts an archive. §X.6 records the arbitrary-file-write this design found in it, fixed on main before this landed |
 | `engine` SHA-256 | **not needed** — nothing on the target hashes a package; the deployment's signed manifest is the integrity check |
 
@@ -6849,7 +6865,7 @@ The experiments that settle what is left, none longer than a week:
 | # | experiment | settles |
 |---|---|---|
 | **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split, has no special or setid files, and at 993.7 MB deployed is smaller than the roughly 1.4 GB uncompressed standalone Guix closure. Its separate compressed transfer is 382.7 MB. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
-| **E1b — metadata subset landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | The authenticated commit/dirtree/dirmeta decoder is landed. Network acquisition, archive-file decoding, whole-graph bounds and transactional materialization remain. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
+| **E1b — object decoders landed** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | The authenticated commit/dirtree/dirmeta and archive-z2 regular-file/symlink decoders are landed. Network acquisition, exact-ref admission, whole-graph bounds and transactional materialization remain. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000`, with active membership and exact controller readback gating the QEMU oracle | §P's mechanism works on the target kernel |

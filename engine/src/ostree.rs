@@ -6,7 +6,7 @@
 //! publish.  OSTree metadata values use big-endian byte order, while GVariant
 //! framing offsets are always little-endian.
 
-use crate::sha256;
+use crate::{gzip, sha256};
 use std::collections::BTreeSet;
 
 pub const CHECKSUM_BYTES: usize = 32;
@@ -15,8 +15,14 @@ pub const MAX_TREE_ENTRIES: usize = 262_144;
 pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_COMMIT_METADATA_ENTRIES: usize = 64;
 pub const MAX_COMMIT_ARRAY_ENTRIES: usize = 4_096;
+pub const MAX_ARCHIVE_INPUT_BYTES: usize = 257 * 1024 * 1024;
+pub const MAX_ARCHIVE_FILE_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_ARCHIVE_HEADER_BYTES: usize = 8 * 1024;
+pub const MAX_SYMLINK_TARGET_BYTES: usize = 4 * 1024 - 1;
 
 const DIRECTORY_TYPE: u32 = 0o040000;
+const REGULAR_TYPE: u32 = 0o100000;
+const SYMLINK_TYPE: u32 = 0o120000;
 const FILE_TYPE_MASK: u32 = 0o170000;
 const SPECIAL_PERMISSION_BITS: u32 = 0o7000;
 const PERMISSION_BITS: u32 = 0o7777;
@@ -128,6 +134,29 @@ pub struct Dirmeta {
     pub uid: u32,
     pub gid: u32,
     pub mode: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArchiveFile {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub kind: ArchiveFileKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArchiveFileKind {
+    Regular(Vec<u8>),
+    Symlink(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArchiveHeader {
+    size: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    target: String,
 }
 
 pub fn verify_object(expected: Checksum, bytes: &[u8], what: &str) -> Result<(), String> {
@@ -397,6 +426,177 @@ fn parse_dirmeta(bytes: &[u8]) -> Result<Dirmeta, String> {
     Ok(Dirmeta { uid, gid, mode })
 }
 
+/// Decode and authenticate one archive-z2 `.filez` regular file or symlink.
+///
+/// Archive bytes are transport encoding, so their SHA-256 is not the object
+/// identity. The identity covers OSTree's canonical uncompressed content
+/// header followed by regular-file contents. Symlinks have no content body.
+pub fn decode_archive_file_verified(
+    expected: Checksum,
+    bytes: &[u8],
+) -> Result<ArchiveFile, String> {
+    require_archive_input_size(bytes.len())?;
+    let header_len = usize::try_from(u32_be(bytes, 0, "archive header length")?)
+        .map_err(|_| "archive header length does not fit usize".to_string())?;
+    if header_len == 0 || header_len > MAX_ARCHIVE_HEADER_BYTES {
+        return Err(format!(
+            "archive header size must be in 1..={MAX_ARCHIVE_HEADER_BYTES} bytes"
+        ));
+    }
+    require_zero_padding(bytes, 4, 8, "archive header alignment")?;
+    let header_end = 8usize
+        .checked_add(header_len)
+        .ok_or_else(|| "archive header end overflow".to_string())?;
+    let header = parse_archive_header(slice(bytes, 8, header_end, "archive header")?)?;
+    let body = slice(bytes, header_end, bytes.len(), "archive body")?;
+
+    if header.mode & !ALLOWED_MODE_BITS != 0 {
+        return Err(format!(
+            "archive file mode {:#o} carries undefined bits",
+            header.mode
+        ));
+    }
+    if header.mode & SPECIAL_PERMISSION_BITS != 0 {
+        return Err(format!(
+            "archive file mode {:#o} carries setid or sticky permission bits",
+            header.mode
+        ));
+    }
+
+    let kind = match header.mode & FILE_TYPE_MASK {
+        REGULAR_TYPE => {
+            if !header.target.is_empty() {
+                return Err("regular archive file carries a symlink target".into());
+            }
+            let size = usize::try_from(header.size)
+                .map_err(|_| "archive file size does not fit usize".to_string())?;
+            let contents = gzip::decompress_raw_exact(body, size, MAX_ARCHIVE_FILE_BYTES)
+                .map_err(|error| format!("archive file payload: {error}"))?;
+            verify_archive_content(expected, &header, &contents)?;
+            ArchiveFileKind::Regular(contents)
+        }
+        SYMLINK_TYPE => {
+            if header.size != 0 {
+                return Err("archive symlink declares a nonzero content size".into());
+            }
+            if !body.is_empty() {
+                return Err("archive symlink carries a content body".into());
+            }
+            if header.target.is_empty() || header.target.len() > MAX_SYMLINK_TARGET_BYTES {
+                return Err(format!(
+                    "archive symlink target length must be in 1..={MAX_SYMLINK_TARGET_BYTES} bytes"
+                ));
+            }
+            verify_archive_content(expected, &header, &[])?;
+            ArchiveFileKind::Symlink(header.target.clone())
+        }
+        kind => {
+            return Err(format!(
+                "archive file mode {:#o} has refused file type {kind:#o}",
+                header.mode
+            ));
+        }
+    };
+
+    Ok(ArchiveFile {
+        uid: header.uid,
+        gid: header.gid,
+        mode: header.mode,
+        kind,
+    })
+}
+
+fn require_archive_input_size(size: usize) -> Result<(), String> {
+    if size == 0 || size > MAX_ARCHIVE_INPUT_BYTES {
+        return Err(format!(
+            "archive file size must be in 1..={MAX_ARCHIVE_INPUT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_archive_header(bytes: &[u8]) -> Result<ArchiveHeader, String> {
+    let (ends, data_end) = tuple_variable_ends(bytes, 1, "archive header")?;
+    let target_end = item(&ends, 0, "archive symlink-target offset")?;
+    if target_end < 24 {
+        return Err("archive header overlaps its fixed fields".into());
+    }
+    if target_end != data_end {
+        return Err("archive file carries refused xattrs".into());
+    }
+    let size = u64_be_at(bytes, 0, "archive file size")?;
+    let uid = u32_be(bytes, 8, "archive file uid")?;
+    let gid = u32_be(bytes, 12, "archive file gid")?;
+    let mode = u32_be(bytes, 16, "archive file mode")?;
+    let rdev = u32_be(bytes, 20, "archive file device number")?;
+    if rdev != 0 {
+        return Err("archive file carries a nonzero device number".into());
+    }
+    let target = parse_string(
+        slice(bytes, 24, target_end, "archive symlink target")?,
+        "archive symlink target",
+    )?
+    .to_string();
+    Ok(ArchiveHeader {
+        size,
+        uid,
+        gid,
+        mode,
+        target,
+    })
+}
+
+fn verify_archive_content(
+    expected: Checksum,
+    header: &ArchiveHeader,
+    contents: &[u8],
+) -> Result<(), String> {
+    let canonical_header = canonical_content_header(header)?;
+    let mut hasher = sha256::Sha256::new();
+    hasher.update(&canonical_header);
+    hasher.update(contents);
+    let actual = hasher.finalize();
+    if actual != expected.0 {
+        return Err(format!(
+            "OSTree file checksum mismatch: expected {}, got {}",
+            expected.to_hex(),
+            sha256::to_base16(&actual)
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_content_header(header: &ArchiveHeader) -> Result<Vec<u8>, String> {
+    let target_len = header
+        .target
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| "archive symlink target length overflow".to_string())?;
+    let data_len = 16usize
+        .checked_add(target_len)
+        .ok_or_else(|| "OSTree content header length overflow".to_string())?;
+    let width = minimal_serialized_width(data_len, 1, "OSTree content header")?;
+    let variant_len = data_len
+        .checked_add(width)
+        .ok_or_else(|| "OSTree content header length overflow".to_string())?;
+    let variant_len_u32 = u32::try_from(variant_len)
+        .map_err(|_| "OSTree content header length does not fit u32".to_string())?;
+    let total_len = 8usize
+        .checked_add(variant_len)
+        .ok_or_else(|| "OSTree content header length overflow".to_string())?;
+    let mut bytes = Vec::with_capacity(total_len);
+    bytes.extend_from_slice(&variant_len_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&header.uid.to_be_bytes());
+    bytes.extend_from_slice(&header.gid.to_be_bytes());
+    bytes.extend_from_slice(&header.mode.to_be_bytes());
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(header.target.as_bytes());
+    bytes.push(0);
+    push_offset(&mut bytes, data_len, width, "OSTree content header")?;
+    Ok(bytes)
+}
+
 fn parse_file_entry(bytes: &[u8]) -> Result<FileEntry, String> {
     let (ends, data_end) = tuple_variable_ends(bytes, 1, "dirtree file entry")?;
     let name_end = item(&ends, 0, "dirtree file name offset")?;
@@ -612,6 +812,18 @@ fn require_minimal_framing_width(
     actual: usize,
     what: &str,
 ) -> Result<(), String> {
+    let expected = minimal_serialized_width(data_len, offset_count, what)?;
+    if actual != expected {
+        return Err(format!("{what} uses a non-minimal framing width"));
+    }
+    Ok(())
+}
+
+fn minimal_serialized_width(
+    data_len: usize,
+    offset_count: usize,
+    what: &str,
+) -> Result<usize, String> {
     for width in [1usize, 2, 4] {
         let table_len = offset_count
             .checked_mul(width)
@@ -620,13 +832,30 @@ fn require_minimal_framing_width(
             .checked_add(table_len)
             .ok_or_else(|| format!("{what} framing size overflow"))?;
         if framing_width(total) == width {
-            if actual != width {
-                return Err(format!("{what} uses a non-minimal framing width"));
-            }
-            return Ok(());
+            return Ok(width);
         }
     }
     Err(format!("{what} has no supported framing width"))
+}
+
+fn push_offset(output: &mut Vec<u8>, value: usize, width: usize, what: &str) -> Result<(), String> {
+    match width {
+        1 => {
+            output.push(u8::try_from(value).map_err(|_| format!("{what} offset does not fit u8"))?)
+        }
+        2 => output.extend_from_slice(
+            &u16::try_from(value)
+                .map_err(|_| format!("{what} offset does not fit u16"))?
+                .to_le_bytes(),
+        ),
+        4 => output.extend_from_slice(
+            &u32::try_from(value)
+                .map_err(|_| format!("{what} offset does not fit u32"))?
+                .to_le_bytes(),
+        ),
+        _ => return Err(format!("{what} uses an unsupported framing width")),
+    }
+    Ok(())
 }
 
 fn read_offset(bytes: &[u8], at: usize, width: usize, what: &str) -> Result<usize, String> {
@@ -703,6 +932,17 @@ fn u64_be_exact(bytes: &[u8], what: &str) -> Result<u64, String> {
     Ok(u64::from_be_bytes(raw))
 }
 
+fn u64_be_at(bytes: &[u8], at: usize, what: &str) -> Result<u64, String> {
+    let end = at
+        .checked_add(8)
+        .ok_or_else(|| format!("{what} offset overflow"))?;
+    Ok(u64::from_be_bytes(
+        slice(bytes, at, end, what)?
+            .try_into()
+            .map_err(|_| format!("{what} is truncated"))?,
+    ))
+}
+
 fn item(values: &[usize], index: usize, what: &str) -> Result<usize, String> {
     values
         .get(index)
@@ -744,6 +984,12 @@ mod tests {
                 u8::from_str_radix(pair, 16).unwrap()
             })
             .collect()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = sha256::Sha256::new();
+        hasher.update(bytes);
+        sha256::to_base16(&hasher.finalize())
     }
 
     fn serialized_width(data_len: usize, offsets: usize) -> usize {
@@ -852,6 +1098,47 @@ mod tests {
             &[0, 1, 2, 3, 4, 6, 7],
             &[8, 1, 1, 1, 1, 8, 1, 1],
         )
+    }
+
+    fn archive_file(
+        size: u64,
+        mode: u32,
+        rdev: u32,
+        target: &str,
+        xattrs: Vec<u8>,
+        body: &[u8],
+    ) -> Vec<u8> {
+        archive_file_owned(size, 0, 0, mode, rdev, target, xattrs, body)
+    }
+
+    fn archive_file_owned(
+        size: u64,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        rdev: u32,
+        target: &str,
+        xattrs: Vec<u8>,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let header = tuple(
+            vec![
+                size.to_be_bytes().to_vec(),
+                uid.to_be_bytes().to_vec(),
+                gid.to_be_bytes().to_vec(),
+                mode.to_be_bytes().to_vec(),
+                rdev.to_be_bytes().to_vec(),
+                text(target),
+                xattrs,
+            ],
+            &[5],
+            &[8, 4, 4, 4, 4, 1, 1],
+        );
+        let mut bytes = u32::try_from(header.len()).unwrap().to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(body);
+        bytes
     }
 
     #[test]
@@ -985,6 +1272,11 @@ mod tests {
         assert_eq!(tree.files.len(), 1);
         assert_eq!(tree.files[0].name, "metadata");
         assert_eq!(
+            tree.files[0].checksum,
+            Checksum::from_hex("e2893afcb40e2252a53c4bb1a795d179c7f09dd46d93a165afbfae993dbf0c57")
+                .unwrap()
+        );
+        assert_eq!(
             tree.directories
                 .iter()
                 .map(|entry| entry.name.as_str())
@@ -1001,6 +1293,249 @@ mod tests {
                 .mode,
             0o040755
         );
+    }
+
+    #[test]
+    fn pinned_firefox_regular_filez_authenticates_after_raw_inflate() {
+        let bytes = fixture_hex(include_str!(
+            "../tests/fixtures/flathub-firefox-154-metadata.filez.hex"
+        ));
+        let expected =
+            Checksum::from_hex("e2893afcb40e2252a53c4bb1a795d179c7f09dd46d93a165afbfae993dbf0c57")
+                .unwrap();
+        assert_eq!(
+            sha256_hex(&bytes),
+            "5ded1bbcd3337033da61f7274a422804615039605291063b1118e5a3e149abae"
+        );
+
+        let decoded = decode_archive_file_verified(expected, &bytes).unwrap();
+
+        assert_eq!(decoded.uid, 0);
+        assert_eq!(decoded.gid, 0);
+        assert_eq!(decoded.mode, 0o100644);
+        let ArchiveFileKind::Regular(contents) = decoded.kind else {
+            panic!("Firefox metadata decoded as a symlink");
+        };
+        assert_eq!(contents.len(), 908);
+        let text = std::str::from_utf8(&contents).unwrap();
+        assert!(text.starts_with("[Application]\nname=org.mozilla.firefox\n"));
+        assert!(text.contains("runtime=org.freedesktop.Platform/x86_64/25.08"));
+    }
+
+    #[test]
+    fn pinned_firefox_symlink_filez_authenticates_without_a_body() {
+        let bytes = fixture_hex(include_str!(
+            "../tests/fixtures/flathub-firefox-154-libcanberra-link.filez.hex"
+        ));
+        let expected =
+            Checksum::from_hex("438966c390c22e06217b4ad1919539fe6d2bd2b740416ab19376b34807dfd4eb")
+                .unwrap();
+        assert_eq!(
+            sha256_hex(&bytes),
+            "b9de86ad749eb567387080bc76725ecca24160f7ad9ae1ce6d010c8f1643d98a"
+        );
+
+        let decoded = decode_archive_file_verified(expected, &bytes).unwrap();
+
+        assert_eq!(decoded.mode, 0o120777);
+        assert_eq!(
+            decoded.kind,
+            ArchiveFileKind::Symlink("libcanberra-gtk3.so.0.1.9".to_string())
+        );
+    }
+
+    #[test]
+    fn archive_filez_refuses_transport_and_content_ambiguity() {
+        let fixture = fixture_hex(include_str!(
+            "../tests/fixtures/flathub-firefox-154-metadata.filez.hex"
+        ));
+        let expected =
+            Checksum::from_hex("e2893afcb40e2252a53c4bb1a795d179c7f09dd46d93a165afbfae993dbf0c57")
+                .unwrap();
+
+        let mut trailing = fixture.clone();
+        trailing.push(0);
+        assert!(decode_archive_file_verified(expected, &trailing)
+            .unwrap_err()
+            .contains("consumed"));
+
+        let wrong = Checksum::from_hex(&"00".repeat(CHECKSUM_BYTES)).unwrap();
+        assert!(decode_archive_file_verified(wrong, &fixture)
+            .unwrap_err()
+            .contains("checksum mismatch"));
+
+        let mut bad_padding = fixture.clone();
+        bad_padding[4] = 1;
+        assert!(decode_archive_file_verified(expected, &bad_padding)
+            .unwrap_err()
+            .contains("nonzero alignment padding"));
+
+        let header_len = usize::try_from(u32_be(&fixture, 0, "fixture header").unwrap()).unwrap();
+        let raw = fixture
+            .get(8 + header_len..)
+            .expect("pinned archive fixture contains its compressed body");
+        let over_declared = archive_file(909, 0o100644, 0, "", Vec::new(), raw);
+        assert!(decode_archive_file_verified(expected, &over_declared)
+            .unwrap_err()
+            .contains("output is 908 bytes; expected 909"));
+
+        let under_declared = archive_file(907, 0o100644, 0, "", Vec::new(), raw);
+        assert!(decode_archive_file_verified(expected, &under_declared)
+            .unwrap_err()
+            .contains("exceeds declared 907 bytes"));
+    }
+
+    #[test]
+    fn archive_filez_refuses_xattrs_devices_special_bits_and_oversize() {
+        let any = Checksum([0; CHECKSUM_BYTES]);
+        let empty_raw = [0x03, 0x00];
+
+        let xattrs = archive_file(0, 0o100644, 0, "", vec![1], &empty_raw);
+        assert!(decode_archive_file_verified(any, &xattrs)
+            .unwrap_err()
+            .contains("xattrs"));
+
+        let device = archive_file(0, 0o020644, 1, "", Vec::new(), &[]);
+        assert!(decode_archive_file_verified(any, &device)
+            .unwrap_err()
+            .contains("device number"));
+
+        let fifo = archive_file(0, 0o010644, 0, "", Vec::new(), &[]);
+        assert!(decode_archive_file_verified(any, &fifo)
+            .unwrap_err()
+            .contains("refused file type"));
+
+        let setid = archive_file(0, 0o104644, 0, "", Vec::new(), &empty_raw);
+        assert!(decode_archive_file_verified(any, &setid)
+            .unwrap_err()
+            .contains("setid or sticky"));
+
+        let undefined = archive_file(0, 0x8000_0000 | 0o100644, 0, "", Vec::new(), &empty_raw);
+        assert!(decode_archive_file_verified(any, &undefined)
+            .unwrap_err()
+            .contains("undefined bits"));
+
+        let oversized = archive_file(
+            u64::try_from(MAX_ARCHIVE_FILE_BYTES).unwrap() + 1,
+            0o100644,
+            0,
+            "",
+            Vec::new(),
+            &empty_raw,
+        );
+        assert!(decode_archive_file_verified(any, &oversized)
+            .unwrap_err()
+            .contains("limit is"));
+
+        assert!(require_archive_input_size(0).is_err());
+        assert!(require_archive_input_size(MAX_ARCHIVE_INPUT_BYTES).is_ok());
+        assert!(require_archive_input_size(MAX_ARCHIVE_INPUT_BYTES + 1).is_err());
+
+        let mut oversized_header = vec![0; 8];
+        oversized_header[..4].copy_from_slice(
+            &u32::try_from(MAX_ARCHIVE_HEADER_BYTES + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert!(decode_archive_file_verified(any, &oversized_header)
+            .unwrap_err()
+            .contains("archive header size"));
+    }
+
+    #[test]
+    fn archive_filez_keeps_regular_and_symlink_roles_disjoint() {
+        let any = Checksum([0; CHECKSUM_BYTES]);
+        let empty_raw = [0x03, 0x00];
+
+        let regular_target = archive_file(0, 0o100644, 0, "target", Vec::new(), &empty_raw);
+        assert!(decode_archive_file_verified(any, &regular_target)
+            .unwrap_err()
+            .contains("regular archive file carries a symlink target"));
+
+        let symlink_size = archive_file(1, 0o120777, 0, "target", Vec::new(), &[]);
+        assert!(decode_archive_file_verified(any, &symlink_size)
+            .unwrap_err()
+            .contains("nonzero content size"));
+
+        let symlink_body = archive_file(0, 0o120777, 0, "target", Vec::new(), &[0]);
+        assert!(decode_archive_file_verified(any, &symlink_body)
+            .unwrap_err()
+            .contains("content body"));
+
+        let long_target = "x".repeat(MAX_SYMLINK_TARGET_BYTES + 1);
+        let symlink_target = archive_file(0, 0o120777, 0, &long_target, Vec::new(), &[]);
+        assert!(decode_archive_file_verified(any, &symlink_target)
+            .unwrap_err()
+            .contains("target length"));
+    }
+
+    #[test]
+    fn canonical_content_header_crosses_the_one_byte_framing_boundary() {
+        let one_byte = ArchiveHeader {
+            size: 0,
+            uid: 1,
+            gid: 2,
+            mode: 0o120777,
+            target: "x".repeat(237),
+        };
+        let one = canonical_content_header(&one_byte).unwrap();
+        assert_eq!(u32_be(&one, 0, "test header length").unwrap(), 255);
+        assert_eq!(one.last().copied(), Some(254));
+
+        let two_byte = ArchiveHeader {
+            target: "x".repeat(238),
+            ..one_byte
+        };
+        let two = canonical_content_header(&two_byte).unwrap();
+        assert_eq!(u32_be(&two, 0, "test header length").unwrap(), 257);
+        assert_eq!(two.get(two.len() - 2..), Some([255, 0].as_slice()));
+    }
+
+    #[test]
+    fn canonical_content_header_pins_nonzero_ownership_and_byte_order() {
+        let header = ArchiveHeader {
+            size: 0,
+            uid: 0x0102_0304,
+            gid: 0x1122_3344,
+            mode: 0o120777,
+            target: "x".to_string(),
+        };
+
+        let encoded = canonical_content_header(&header).unwrap();
+        assert_eq!(
+            encoded,
+            fixture_hex("000000130000000001020304112233440000a1ff00000000780012")
+        );
+    }
+
+    #[test]
+    fn archive_decoder_pins_distinct_nonzero_uid_and_gid_offsets() {
+        let header = ArchiveHeader {
+            size: 0,
+            uid: 0x0102_0304,
+            gid: 0x1122_3344,
+            mode: 0o100644,
+            target: String::new(),
+        };
+        let mut hasher = sha256::Sha256::new();
+        hasher.update(&canonical_content_header(&header).unwrap());
+        let expected = Checksum(hasher.finalize());
+        let bytes = archive_file_owned(
+            0,
+            header.uid,
+            header.gid,
+            header.mode,
+            0,
+            "",
+            Vec::new(),
+            &[0x03, 0x00],
+        );
+
+        let decoded = decode_archive_file_verified(expected, &bytes).unwrap();
+
+        assert_eq!(decoded.uid, header.uid);
+        assert_eq!(decoded.gid, header.gid);
+        assert_eq!(decoded.kind, ArchiveFileKind::Regular(Vec::new()));
     }
 
     #[test]
