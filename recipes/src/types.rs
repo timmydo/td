@@ -956,8 +956,10 @@ pub struct Recipe {
     pub phases: Option<Vec<Phase>>,
     pub tests: Option<bool>,
     pub bins: Option<Vec<String>>,
-    /// Relative path from the materialized source root to the Cargo workspace.
-    /// Absent means the source root itself, preserving existing recipes.
+    /// Relative path from the materialized source root to a self-contained Cargo
+    /// workspace. No ancestor below the source root may carry another Cargo.toml,
+    /// because Cargo could select that ancestor's lock. Absent means the source root
+    /// itself, preserving existing recipes.
     pub cargo_subdir: Option<String>,
     /// Cargo package selected from the workspace. Absent builds the workspace's
     /// normal default target set, preserving existing recipes. When set, every
@@ -978,6 +980,12 @@ pub struct Recipe {
     /// committed-checksum ingress that lets a rust node build in the graph without
     /// reopening the #469 crate-provenance gate.
     pub cargo_lock: Option<String>,
+    /// Replace the materialized source workspace's existing regular Cargo.lock with
+    /// the exact committed `cargo_lock` before the frozen build. Absent verifies byte
+    /// equality instead. This is an explicit escape hatch for reviewed normalized
+    /// workspace locks; ordinary recipes must use the upstream source's embedded lock
+    /// verbatim. It does not generate a lock for source that omits one.
+    pub replace_cargo_lock: Option<bool>,
     /// Repo-relative path to an IN-TREE source directory this recipe builds from
     /// (#469 local-source provenance). Set via `local_source`, which also points
     /// `source_input` at this recipe's own `<name>-source` key. The runner
@@ -1042,6 +1050,7 @@ impl Recipe {
             checks: None,
             source_pins: None,
             cargo_lock: None,
+            replace_cargo_lock: None,
             local_source: None,
         }
     }
@@ -1185,6 +1194,12 @@ impl Recipe {
     /// crate closure for the `--auto` committed-checksum vendor gate.
     pub fn cargo_lock(mut self, path: &str) -> Recipe {
         self.cargo_lock = Some(path.into());
+        self
+    }
+    /// Make the exact committed Cargo.lock authoritative for the materialized
+    /// workspace. The default is stricter: require the source's lock to match it.
+    pub fn replace_cargo_lock(mut self) -> Recipe {
+        self.replace_cargo_lock = Some(true);
         self
     }
     /// Build this recipe from an IN-TREE source directory (repo-relative `path`),
@@ -1364,6 +1379,9 @@ impl Recipe {
         if let Some(l) = &self.cargo_lock {
             o.push(("cargoLock".into(), Json::Str(l.clone())));
         }
+        if let Some(replace) = self.replace_cargo_lock {
+            o.push(("replaceCargoLock".into(), Json::Bool(replace)));
+        }
         Json::Obj(o)
     }
 }
@@ -1391,6 +1409,21 @@ mod tests {
         assert_eq!(
             r.to_json().to_canonical(),
             r#"{"bins":["cat"],"buildSystem":"rust","name":"cat","version":"0.9.0"}"#
+        );
+    }
+
+    #[test]
+    fn cargo_lock_replacement_is_explicit_recipe_data() {
+        let plain = Recipe::rust("tool", "1.0")
+            .bins(&["tool"])
+            .cargo_lock("recipes/locks/tool/Cargo.lock");
+        assert_eq!(
+            plain.to_json().to_canonical(),
+            r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","version":"1.0"}"#
+        );
+        assert_eq!(
+            plain.replace_cargo_lock().to_json().to_canonical(),
+            r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","replaceCargoLock":true,"version":"1.0"}"#
         );
     }
 

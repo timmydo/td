@@ -259,6 +259,7 @@ fn prove_td_shell_userland(
     let tmp = product.join("tmp");
     let tmp_s = path_str(&tmp)?;
     let vendor_s = path_str(&vendor_root)?;
+    let repo_s = path_str(&root)?;
     let lock_s = path_str(&native_lock)?;
     let persist_db = product.join("products.db");
     let persist_db_s = path_str(&persist_db)?;
@@ -271,6 +272,7 @@ fn prove_td_shell_userland(
         .env("TD_RECIPE_EVAL", evaluator_s)
         .env("TD_SHELL_CACHE", product.join("packages"))
         .env("TD_SHELL_VENDOR_ROOT", vendor_s)
+        .env("TD_SHELL_REPO_ROOT", repo_s)
         .env("TD_SHELL_NATIVE_STORE", tdstore_s)
         .env("TD_SHELL_NATIVE_EXTRA_DBS", dbs)
         .env("TD_SHELL_NATIVE_INTERP", &interp)

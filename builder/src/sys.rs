@@ -269,7 +269,7 @@ pub fn set_pdeathsig(sig: usize) -> io::Result<()> {
 }
 
 const O_CLOEXEC: usize = 0o2_000_000;
-const O_NONBLOCK: usize = 0o4000;
+pub(crate) const O_NONBLOCK: usize = 0o4000;
 const EINTR: i32 = 4;
 
 /// pipe2(2), O_CLOEXEC|O_NONBLOCK — the sandbox's parent-liveness channel.

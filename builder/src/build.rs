@@ -40,7 +40,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1323,6 +1323,8 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) const STAGED_CARGO_LOCK: &str = ".td-Cargo.lock";
+
 /// Collect the `(crate-file-path, name-version)` pairs to vendor, from TD_VENDOR_CRATES
 /// (':'-joined `.crate` STORE paths — nv via the store-path basename) and/or TD_VENDOR_DIR
 /// (an interned DIRECTORY of `*.crate` files — nv = the crate filename, so NO `/gnu/store`
@@ -1376,6 +1378,96 @@ pub(crate) fn valid_cargo_package_name(package: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CargoLockPolicy {
+    Verify,
+    Replace,
+}
+
+fn parse_cargo_lock_policy(value: &str) -> Result<CargoLockPolicy, String> {
+    match value {
+        "verify" => Ok(CargoLockPolicy::Verify),
+        "replace" => Ok(CargoLockPolicy::Replace),
+        _ => Err(format!(
+            "TD_CARGO_LOCK_POLICY must be `verify' or `replace', not `{value}'"
+        )),
+    }
+}
+
+fn open_regular_file(path: &Path, description: &str, write: bool) -> Result<fs::File, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {description} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{description} is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .custom_flags(crate::nar::O_NOFOLLOW | crate::sys::O_NONBLOCK as i32);
+    let file = options
+        .open(path)
+        .map_err(|error| format!("open {description} {}: {error}", path.display()))?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("inspect open {description} {}: {error}", path.display()))?
+        .is_file()
+    {
+        return Err(format!(
+            "{description} is not a regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+fn read_regular_file(path: &Path, description: &str) -> Result<Vec<u8>, String> {
+    let mut file = open_regular_file(path, description, false)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read {description} {}: {error}", path.display()))?;
+    Ok(bytes)
+}
+
+fn write_regular_file(path: &Path, description: &str, bytes: &[u8]) -> Result<(), String> {
+    let mut file = open_regular_file(path, description, true)?;
+    file.set_len(0)
+        .map_err(|error| format!("truncate {description} {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("write {description} {}: {error}", path.display()))
+}
+
+fn enforce_cargo_lock_policy(
+    cargo_dir: &Path,
+    staged_vendor_dir: &Path,
+    policy: CargoLockPolicy,
+) -> Result<(), String> {
+    let committed_path = staged_vendor_dir.join(STAGED_CARGO_LOCK);
+    let committed = read_regular_file(&committed_path, "staged committed Cargo.lock")?;
+    let source_path = cargo_dir.join("Cargo.lock");
+    let source = read_regular_file(&source_path, "source workspace Cargo.lock")?;
+    match policy {
+        CargoLockPolicy::Verify if source != committed => Err(format!(
+            "source workspace Cargo.lock {} does not byte-match the committed lock; update the reviewed lock from the pinned source, or declare replaceCargoLock for an intentional normalized workspace lock",
+            source_path.display()
+        )),
+        CargoLockPolicy::Verify => Ok(()),
+        CargoLockPolicy::Replace => {
+            if source != committed {
+                write_regular_file(
+                    &source_path,
+                    "source workspace Cargo.lock",
+                    &committed,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// rust-build — td's OWN Rust/cargo build "system" (sibling of `run`, the
 /// autotools runner). The REPLACEMENT for Guix's `cargo-build-system`: here the
 /// build LOGIC is td's Rust; only the rustc/cargo/gcc seed is the external
@@ -1406,6 +1498,10 @@ pub(crate) fn valid_cargo_package_name(package: &str) -> bool {
 ///                the Cargo workspace.
 ///   TD_CARGO_PACKAGE optional package selected from that workspace. Every
 ///                TD_RUST_BINS entry must be a binary target of this package.
+///   TD_CARGO_LOCK_POLICY optional `verify` or `replace`. The exact committed
+///                lock is `TD_VENDOR_DIR/.td-Cargo.lock`; verify requires the
+///                materialized workspace lock to byte-match it, while replace
+///                writes those exact reviewed bytes before cargo `--frozen`.
 ///   TD_VENDOR_CRATES optional ':'-joined `.crate` STORE paths (the dependency closure
 ///                pinned by Cargo.lock; nv from the store-path basename). The guix-realized
 ///                FOD inputs.
@@ -1439,6 +1535,20 @@ pub fn run_rust() -> Result<(), String> {
         Err(env::VarError::NotPresent) => None,
         Err(env::VarError::NotUnicode(_)) => {
             return Err("TD_CARGO_PACKAGE is not valid UTF-8".into())
+        }
+    };
+    let cargo_lock_policy = match env::var("TD_CARGO_LOCK_POLICY") {
+        Ok(value) => Some(parse_cargo_lock_policy(&value)?),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("TD_CARGO_LOCK_POLICY is not valid UTF-8".into())
+        }
+    };
+    let vendor_input_dir = match env::var("TD_VENDOR_DIR") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => String::new(),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("TD_VENDOR_DIR is not valid UTF-8".into())
         }
     };
     let bins: Vec<&str> = bins_spec.split_whitespace().collect();
@@ -1523,6 +1633,13 @@ pub fn run_rust() -> Result<(), String> {
         &build_abs,
         cargo_subdir.as_deref(),
     )?;
+    if let Some(policy) = cargo_lock_policy {
+        if vendor_input_dir.is_empty() {
+            return Err("TD_CARGO_LOCK_POLICY requires TD_VENDOR_DIR".into());
+        }
+        require_selected_cargo_workspace(&cargo, &cargo_dir, &path_env)?;
+        enforce_cargo_lock_policy(&cargo_dir, Path::new(&vendor_input_dir), policy)?;
+    }
     let cargo_dir_str = cargo_dir
         .to_str()
         .ok_or("non-utf8 Cargo workspace path")?
@@ -1619,7 +1736,7 @@ pub fn run_rust() -> Result<(), String> {
     fs::create_dir_all(&cargo_home).map_err(|e| format!("mkdir CARGO_HOME {cargo_home}: {e}"))?;
     let crate_files = collect_vendor_crates(
         &env::var("TD_VENDOR_CRATES").unwrap_or_default(),
-        &env::var("TD_VENDOR_DIR").unwrap_or_default(),
+        &vendor_input_dir,
     )?;
     if !crate_files.is_empty() {
         let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS (vendor)")?;
@@ -1717,6 +1834,38 @@ fn cargo_workspace_dir(source_root: &Path, subdir: Option<&str>) -> Result<PathB
                 ));
             }
         }
+
+        // Cargo walks upward from a selected package manifest to discover its
+        // workspace root.  An outer manifest would therefore make Cargo use an
+        // outer Cargo.lock while the lock policy below verified the selected
+        // directory's lock.  The recipe deliberately selects a self-contained
+        // workspace root, so reject that ambiguous layout before invoking Cargo.
+        let mut ancestor = workspace.parent();
+        while let Some(directory) = ancestor {
+            if !directory.starts_with(source_root) {
+                break;
+            }
+            let outer_manifest = directory.join("Cargo.toml");
+            match fs::symlink_metadata(&outer_manifest) {
+                Ok(_) => {
+                    return Err(format!(
+                        "TD_CARGO_SUBDIR `{subdir}' is below an outer Cargo.toml {}; Cargo could select that outer workspace and a different Cargo.lock",
+                        outer_manifest.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "inspect outer Cargo workspace manifest {}: {error}",
+                        outer_manifest.display()
+                    ));
+                }
+            }
+            if directory == source_root {
+                break;
+            }
+            ancestor = directory.parent();
+        }
     }
     let manifest = workspace.join("Cargo.toml");
     let metadata = fs::symlink_metadata(&manifest)
@@ -1728,6 +1877,69 @@ fn cargo_workspace_dir(source_root: &Path, subdir: Option<&str>) -> Result<PathB
         ));
     }
     Ok(workspace)
+}
+
+fn require_selected_cargo_workspace(
+    cargo: &str,
+    selected: &Path,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    let output = Command::new(cargo)
+        .args(["locate-project", "--workspace", "--message-format", "plain"])
+        .current_dir(selected)
+        .env_clear()
+        .envs(envs.iter().map(|(key, value)| (key, value)))
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("run cargo locate-project in {}: {error}", selected.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo could not resolve the selected workspace {}: {}",
+            selected.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| "cargo locate-project returned a non-UTF-8 workspace path".to_string())?;
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let manifest_text = lines
+        .next()
+        .ok_or("cargo locate-project returned no workspace manifest")?;
+    if lines.next().is_some() {
+        return Err("cargo locate-project returned more than one workspace manifest".into());
+    }
+    let reported_manifest = PathBuf::from(manifest_text.trim());
+    let reported_manifest = if reported_manifest.is_absolute() {
+        reported_manifest
+    } else {
+        selected.join(reported_manifest)
+    };
+    let actual = reported_manifest
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "cargo locate-project returned a manifest with no parent: {}",
+                reported_manifest.display()
+            )
+        })?
+        .canonicalize()
+        .map_err(|error| {
+            format!(
+                "canonicalize Cargo's selected workspace {}: {error}",
+                reported_manifest.display()
+            )
+        })?;
+    let selected = selected
+        .canonicalize()
+        .map_err(|error| format!("canonicalize selected Cargo workspace: {error}"))?;
+    if actual != selected {
+        return Err(format!(
+            "selected Cargo workspace {} resolves through Cargo to {}; refusing to verify a Cargo.lock Cargo will not use",
+            selected.display(),
+            actual.display()
+        ));
+    }
+    Ok(())
 }
 
 const RUST_TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -4152,6 +4364,9 @@ mod tests {
         fs::write(base.join("codex-rs/Cargo.toml"), "[workspace]\n").unwrap();
 
         assert_eq!(cargo_workspace_dir(&base, None).unwrap(), base);
+        let error = cargo_workspace_dir(&base, Some("codex-rs")).unwrap_err();
+        assert!(error.contains("outer Cargo.toml"), "{error}");
+        fs::remove_file(base.join("Cargo.toml")).unwrap();
         assert_eq!(
             cargo_workspace_dir(&base, Some("codex-rs")).unwrap(),
             base.join("codex-rs")
@@ -4177,6 +4392,117 @@ mod tests {
         assert!(cargo_workspace_dir(&base, Some("directory-manifest")).is_err());
         fs::create_dir_all(base.join("missing-manifest")).unwrap();
         assert!(cargo_workspace_dir(&base, Some("missing-manifest")).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cargo_workspace_selection_refuses_explicit_workspace_redirection() {
+        let base = std::env::temp_dir().join(format!(
+            "td-cargo-workspace-redirection-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let source = base.join("source");
+        let selected = source.join("codex-rs");
+        let external = base.join("external-workspace");
+        fs::create_dir_all(selected.join("src")).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(selected.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            selected.join("Cargo.toml"),
+            "[package]\nname = \"redirected\"\nversion = \"0.1.0\"\nedition = \"2021\"\nworkspace = \"../../external-workspace\"\n",
+        )
+        .unwrap();
+        fs::write(
+            external.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"../source/codex-rs\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+
+        let cargo_dir = cargo_workspace_dir(&source, Some("codex-rs")).unwrap();
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let envs = vec![(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        )];
+        let error = require_selected_cargo_workspace(&cargo, &cargo_dir, &envs).unwrap_err();
+        assert!(error.contains("Cargo.lock Cargo will not use"), "{error}");
+
+        fs::write(selected.join("Cargo.toml"), "[workspace]\nresolver = \"2\"\n").unwrap();
+        require_selected_cargo_workspace(&cargo, &cargo_dir, &envs).unwrap();
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn committed_cargo_lock_is_verified_or_explicitly_replaced() {
+        let base = std::env::temp_dir().join(format!(
+            "td-cargo-lock-enforcement-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let cargo_dir = base.join("workspace");
+        let vendor_dir = base.join("vendor");
+        fs::create_dir_all(&cargo_dir).unwrap();
+        fs::create_dir_all(&vendor_dir).unwrap();
+        let source_lock = cargo_dir.join("Cargo.lock");
+        let committed_lock = vendor_dir.join(STAGED_CARGO_LOCK);
+        fs::write(&source_lock, b"version = 4\n# source\n").unwrap();
+        fs::write(&committed_lock, b"version = 4\n# source\n").unwrap();
+
+        enforce_cargo_lock_policy(&cargo_dir, &vendor_dir, CargoLockPolicy::Verify).unwrap();
+        fs::write(&committed_lock, b"version = 4\n# normalized\n").unwrap();
+        let error = enforce_cargo_lock_policy(&cargo_dir, &vendor_dir, CargoLockPolicy::Verify)
+            .unwrap_err();
+        assert!(error.contains("does not byte-match"), "{error}");
+        assert_eq!(
+            fs::read(&source_lock).unwrap(),
+            b"version = 4\n# source\n",
+            "verify mode must not modify a mismatched source lock"
+        );
+        enforce_cargo_lock_policy(&cargo_dir, &vendor_dir, CargoLockPolicy::Replace).unwrap();
+        assert_eq!(
+            fs::read(&source_lock).unwrap(),
+            b"version = 4\n# normalized\n",
+            "replace mode writes the exact staged committed bytes"
+        );
+        assert_eq!(
+            parse_cargo_lock_policy("verify").unwrap(),
+            CargoLockPolicy::Verify
+        );
+        assert_eq!(
+            parse_cargo_lock_policy("replace").unwrap(),
+            CargoLockPolicy::Replace
+        );
+        assert!(parse_cargo_lock_policy("ignore").is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn committed_cargo_lock_refuses_symlinks_and_non_files() {
+        let base = std::env::temp_dir().join(format!(
+            "td-cargo-lock-node-types-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let cargo_dir = base.join("workspace");
+        let vendor_dir = base.join("vendor");
+        fs::create_dir_all(&cargo_dir).unwrap();
+        fs::create_dir_all(&vendor_dir).unwrap();
+        let real_lock = base.join("real.lock");
+        fs::write(&real_lock, b"version = 4\n").unwrap();
+        std::os::unix::fs::symlink(&real_lock, vendor_dir.join(STAGED_CARGO_LOCK)).unwrap();
+        fs::write(cargo_dir.join("Cargo.lock"), b"version = 4\n").unwrap();
+        let error = enforce_cargo_lock_policy(&cargo_dir, &vendor_dir, CargoLockPolicy::Verify)
+            .unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+
+        fs::remove_file(vendor_dir.join(STAGED_CARGO_LOCK)).unwrap();
+        fs::write(vendor_dir.join(STAGED_CARGO_LOCK), b"version = 4\n").unwrap();
+        fs::remove_file(cargo_dir.join("Cargo.lock")).unwrap();
+        fs::create_dir(cargo_dir.join("Cargo.lock")).unwrap();
+        let error = enforce_cargo_lock_policy(&cargo_dir, &vendor_dir, CargoLockPolicy::Replace)
+            .unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
         let _ = fs::remove_dir_all(&base);
     }
 

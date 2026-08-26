@@ -62,7 +62,9 @@ mod xz;
 pub use td_engine::{crc32, json, sha256};
 
 use std::ffi::CString;
+use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -5276,6 +5278,19 @@ fn assemble_recipe_drv(
     // autotools path; "rust" is the cargo path (build::run_rust), used to SELF-HOST
     // td-builder itself off Guile-construction + the daemon.
     let build_system = alist.get("buildSystem").and_then(json::Json::as_str).unwrap_or("gnu");
+    let cargo_lock = match alist.get("cargoLock") {
+        None => None,
+        Some(json::Json::Str(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(json::Json::Str(_)) => {
+            return Err("recipe: `cargoLock' must be a non-empty repo-relative path".into())
+        }
+        Some(_) => return Err("recipe: `cargoLock' must be a string".into()),
+    };
+    let replace_cargo_lock = match alist.get("replaceCargoLock") {
+        None => false,
+        Some(json::Json::Bool(value)) => *value,
+        Some(_) => return Err("recipe: `replaceCargoLock' must be a boolean".into()),
+    };
     let cargo_subdir = match alist.get("cargoSubdir") {
         None => None,
         Some(json::Json::Str(value)) if build::valid_cargo_subdir(value) => Some(value.as_str()),
@@ -5298,10 +5313,24 @@ fn assemble_recipe_drv(
         }
         Some(_) => return Err("recipe: `cargoPackage' must be a string".into()),
     };
-    if build_system != "rust" && (cargo_subdir.is_some() || cargo_package.is_some()) {
+    if build_system != "rust"
+        && (cargo_subdir.is_some()
+            || cargo_package.is_some()
+            || cargo_lock.is_some()
+            || alist.get("replaceCargoLock").is_some())
+    {
         return Err(format!(
-            "recipe: buildSystem \"{build_system}\" cannot declare cargoSubdir/cargoPackage"
+            "recipe: buildSystem \"{build_system}\" cannot declare Cargo build policy"
         ));
+    }
+    if replace_cargo_lock && cargo_lock.is_none() {
+        return Err("recipe: `replaceCargoLock' requires `cargoLock'".into());
+    }
+    if cargo_lock.is_some() && vendor_dir.is_none() {
+        return Err(
+            "recipe: `cargoLock' requires the exact committed lock staged in TD_VENDOR_DIR"
+                .into(),
+        );
     }
     let foreign_source = foreign_source_of(name, &alist)?;
     let phase_runner = match build_system {
@@ -5677,6 +5706,10 @@ fn assemble_recipe_drv(
             if let Some(package) = cargo_package {
                 push_drv_env(&mut spec, "TD_CARGO_PACKAGE", package)?;
             }
+            if cargo_lock.is_some() {
+                let policy = if replace_cargo_lock { "replace" } else { "verify" };
+                push_drv_env(&mut spec, "TD_CARGO_LOCK_POLICY", policy)?;
+            }
             let bins: Vec<&str> = alist
                 .get("bins")
                 .and_then(json::Json::as_arr)
@@ -5799,39 +5832,93 @@ fn persist_store_env() -> Result<Option<(String, String)>, String> {
     }
 }
 
-/// A recipe's committed `cargoLock` path must be repo-relative — no absolute prefix,
-/// no `..` component, and (once joined and canonicalized) landing INSIDE the repo root
-/// so an in-repo symlink cannot redirect it either. The path names a reviewed in-repo
-/// lock; confine it so a recipe cannot aim the gate at an arbitrary host file
-/// (re #469/#547).
-fn confine_repo_relative(root: &Path, rel: &str) -> Result<PathBuf, String> {
+/// Read a recipe's reviewed `cargoLock` without following any declared path
+/// component. The lock must be a regular, repo-relative file so a recipe cannot
+/// redirect the closure gate to mutable in-repo state, a host file, or a blocking
+/// special node (re #469/#547).
+fn read_confined_repo_file(root: &Path, rel: &str) -> Result<(PathBuf, String), String> {
+    // Keep the directory object open while resolving each child through procfs.
+    // A concurrent rename can change a pathname, but it cannot retarget this
+    // descriptor. O_NOFOLLOW then applies to each child as the final component
+    // of its descriptor-relative path, without adding an unsafe openat surface.
+    let flags = crate::nar::O_NOFOLLOW | crate::sys::O_NONBLOCK as i32;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(root)
+        .map_err(|e| format!("open repo root {} without following symlinks: {e}", root.display()))?;
+    if !directory
+        .metadata()
+        .map_err(|e| format!("inspect open repo root {}: {e}", root.display()))?
+        .is_dir()
+    {
+        return Err(format!("repo root is not a directory: {}", root.display()));
+    }
+    read_confined_repo_descriptor(directory, root, rel)
+}
+
+fn read_confined_repo_descriptor(
+    mut directory: std::fs::File,
+    display_root: &Path,
+    rel: &str,
+) -> Result<(PathBuf, String), String> {
     let relp = Path::new(rel);
     if relp.is_absolute() {
         return Err(format!("cargoLock `{rel}' must be repo-relative, not absolute"));
     }
-    if relp
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(format!("cargoLock `{rel}' must not escape the repo with `..'"));
+    let component_count = relp.components().count();
+    if component_count == 0 {
+        return Err("cargoLock path must not be empty".into());
     }
-    let joined = root.join(relp);
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| format!("canonicalize repo root {}: {e}", root.display()))?;
-    let canon = joined
-        .canonicalize()
-        .map_err(|e| format!("canonicalize cargoLock {}: {e}", joined.display()))?;
-    if !canon.starts_with(&canon_root) {
-        return Err(format!(
-            "cargoLock `{rel}' resolves to {} outside the repo root {}",
-            canon.display(),
-            canon_root.display()
-        ));
+
+    let flags = crate::nar::O_NOFOLLOW | crate::sys::O_NONBLOCK as i32;
+    let mut path = display_root.to_path_buf();
+    for (index, component) in relp.components().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!(
+                "cargoLock `{rel}' must contain only plain repo-relative components"
+            ));
+        };
+        path.push(name);
+        let descriptor_path = PathBuf::from("/proc/self/fd")
+            .join(directory.as_raw_fd().to_string())
+            .join(name);
+        let mut node = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(&descriptor_path)
+            .map_err(|e| {
+                format!(
+                    "cargoLock `{rel}' component {} is not an accessible regular file or directory; symlinks are refused: {e}",
+                    path.display()
+                )
+            })?;
+        let metadata = node
+            .metadata()
+            .map_err(|e| format!("inspect open cargoLock component {}: {e}", path.display()))?;
+        let final_component = index + 1 == component_count;
+        if !final_component {
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "cargoLock `{rel}' has a non-directory parent: {}",
+                    path.display()
+                ));
+            }
+            directory = node;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "cargoLock `{rel}' must name a regular file: {}",
+                path.display()
+            ));
+        }
+        let mut text = String::new();
+        node.read_to_string(&mut text)
+            .map_err(|e| format!("read committed lock {}: {e}", path.display()))?;
+        return Ok((path, text));
     }
-    // Return the symlink-resolved path so the caller reads the validated node — not the
-    // pre-canonicalize `joined`, which a swapped symlink could redirect after the check.
-    Ok(canon)
+    Err("cargoLock path must not be empty".into())
 }
 
 /// `remove_dir_all` that tolerates an absent dir but propagates every other error: a
@@ -5845,13 +5932,17 @@ fn clear_dir(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Stage the crates a recipe's COMMITTED Cargo.lock pins into a FRESH private tree,
+/// Stage the crates a recipe's COMMITTED Cargo.lock pins and the exact lock itself
+/// into a FRESH private tree,
 /// verifying as we go: every lock entry must be present in `vendor_dir` as
 /// `<name>-<version>.crate` with a matching sha256, the dir must carry NO extra
 /// `.crate` beyond that pinned set, and only the verified bytes are copied into
 /// `staged_dir`. Interning `staged_dir` (never the shared cache dir) means a stale or
 /// tampered `.td-build-cache` can neither drop, swap, smuggle, NOR win a
 /// verify-to-intern race for a crate the gate did not vouch for (re #469/#547).
+/// The exact committed lock becomes part of the same content-addressed input, so
+/// run_rust can verify or deliberately replace the source workspace's lock without
+/// reading a mutable checkout path inside the sandbox.
 /// Returns the verified crate count.
 fn stage_verified_vendor(
     vendor_dir: &Path,
@@ -5906,6 +5997,9 @@ fn stage_verified_vendor(
     clear_dir(staged_dir)?;
     std::fs::create_dir_all(staged_dir)
         .map_err(|e| format!("create staged vendor dir {}: {e}", staged_dir.display()))?;
+    let staged_lock = staged_dir.join(build::STAGED_CARGO_LOCK);
+    std::fs::write(&staged_lock, lock_text.as_bytes())
+        .map_err(|e| format!("stage committed Cargo.lock {}: {e}", staged_lock.display()))?;
     for (crate_name, ver, sum) in &want {
         let fname = format!("{crate_name}-{ver}.crate");
         let src = vendor_dir.join(&fname);
@@ -6003,15 +6097,11 @@ fn check_pkg_pinned(
 /// `.td-build-cache/crate-vendor/<name>/vendor`; they are staged into a private tree and
 /// verified against the recipe's committed, fully-checksum-pinned `Cargo.lock` here
 /// (set-equality: every pinned crate present with a matching sha256 and no extra), then
-/// that tree is interned. The build itself is anchored to the AUTHENTICATED source: cargo
-/// `--frozen` unpacks the content-addressed sourceInput and enforces its embedded
-/// Cargo.lock against each vendored crate's checksum. The warm vendor set is fetched by
-/// the committed lock's checksums, and cargo `--frozen` then enforces equality with the
-/// source's embedded lock — so the closure is authenticated downstream, without trusting
-/// the mutable warm cache. (Byte-anchoring the committed lock to
-/// the in-sandbox unpacked source lock — staged into the derivation and compared in
-/// run_rust before cargo — is the stronger follow-up form; reading the mutable
-/// `.td-build-cache` src lock here would only give false assurance.) Returns the
+/// that tree is interned. The same tree carries the exact committed lock bytes. run_rust
+/// either requires the materialized source's lock to match them byte-for-byte or, for an
+/// explicit reviewed normalized-lock recipe, replaces it before cargo `--frozen`. Thus
+/// both the lock and every registry archive it authenticates are derivation inputs; the
+/// mutable warm cache carries bytes but no authority. Returns the
 /// `(canonical, store_dir, db)` triple `build_recipe` wants, or `None` for a non-rust
 /// recipe or a rust recipe with no `cargoLock`. A declared `cargoLock` makes the
 /// `TD_AUTO_REPO_ROOT` anchor MANDATORY: a plan that cannot resolve and gate the
@@ -6043,11 +6133,8 @@ fn provision_auto_vendor(
         }
     };
     let root = Path::new(&repo_root);
-    let committed =
-        confine_repo_relative(root, lock_rel).map_err(|e| format!("--auto rust `{name}': {e}"))?;
-    let lock_text = std::fs::read_to_string(&committed).map_err(|e| {
-        format!("--auto rust `{name}': read committed lock {}: {e}", committed.display())
-    })?;
+    let (_committed, lock_text) = read_confined_repo_file(root, lock_rel)
+        .map_err(|e| format!("--auto rust `{name}': {e}"))?;
     // Trust the committed lock as the closure record only if it is fully checksum-pinned —
     // no git/unchecksummed deps that the set-equality gate below would silently skip.
     reject_unpinned_dependencies(&lock_text).map_err(|e| format!("--auto rust `{name}': {e}"))?;
@@ -6943,7 +7030,8 @@ impl NativeToolchain {
 /// Config (env): TD_RECIPE_EVAL (td's Rust recipe-catalog evaluator, to emit the
 /// recipe),
 /// TD_SHELL_NATIVE_* (the pre-provisioned native `/td/store` toolchain for vendored rust builds —
-/// `NativeToolchain::from_env`), TD_SHELL_CACHE (build cache root, default `$HOME/.cache/td-shell`),
+/// `NativeToolchain::from_env`), TD_SHELL_REPO_ROOT (the checkout containing each recipe's
+/// committed `cargoLock`), TD_SHELL_CACHE (build cache root, default `$HOME/.cache/td-shell`),
 /// TD_BUILDER_PATH/STORE/DB (optional stage0 builder override, so the build's builder
 /// is td-placed too).
 ///
@@ -6999,7 +7087,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         // package without warmed inputs cannot use the retired legacy shell path. Keep the chosen
         // native env so the build-recipe subprocess gets TD_RUST_STORE_* (and the
         // recipe-output store/db argv) for the vendored-rust case.
-        let native_env = match provision_rust_inputs(pkg, &sd, &self_exe)? {
+        let native_env = match provision_rust_inputs(pkg, &recipe_json, &sd, &self_exe)? {
             Some((seedlock, source_lock, extra)) => {
                 let Some(nt) = &native else {
                     return Err(format!(
@@ -7299,10 +7387,12 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
 /// Source of the crates: a warmed tree at `$TD_SHELL_VENDOR_ROOT/<pkg>/{work,vendor}`
 /// (host PREP via `td-feed warm crate`). The package source archive is verified again
 /// here against the recipe catalog's committed fixed-output SHA-256 before interning;
-/// dependency archives remain selected and checksum-verified by the pinned Cargo.lock.
+/// dependency archives are staged through the same committed-lock set/checksum gate as
+/// `build-plan --auto` before that private verified tree is interned.
 /// This:
 ///   - verifies and interns the immutable source `.crate` with `store-add-recursive`,
-///   - interns the crate SET the same way (a no-ref content-addressed tree),
+///   - resolves the recipe's `cargoLock` beneath `$TD_SHELL_REPO_ROOT`, stages its exact
+///     bytes plus exactly the checksum-verified crate set, and interns that private tree,
 ///   - writes a lock containing only `<pkg>-source <interned-src>`; Cargo.lock
 ///     inside that source selects and verifies the separately interned crates,
 ///
@@ -7315,6 +7405,7 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn provision_rust_inputs(
     pkg: &str,
+    recipe_json: &str,
     sd: &str,
     self_exe: &str,
 ) -> Result<Option<(String, String, [String; 5])>, String> {
@@ -7328,6 +7419,28 @@ fn provision_rust_inputs(
     if !vendor.is_dir() {
         return Ok(None);
     }
+    let alist = json::parse(recipe_json)
+        .map_err(|e| format!("td shell rust `{pkg}': parse emitted recipe JSON: {e}"))?;
+    let lock_rel = alist
+        .get("cargoLock")
+        .and_then(json::Json::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            format!("td shell rust `{pkg}': warmed crate closure has no committed cargoLock")
+        })?;
+    let repo_root = std::env::var("TD_SHELL_REPO_ROOT")
+        .ok()
+        .filter(|root| !root.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "td shell rust `{pkg}': declares cargoLock `{lock_rel}' but \
+                 TD_SHELL_REPO_ROOT is unset — cannot resolve or gate the committed crate closure"
+            )
+        })?;
+    let (_committed, lock_text) = read_confined_repo_file(Path::new(&repo_root), lock_rel)
+        .map_err(|e| format!("td shell rust `{pkg}': {e}"))?;
+    reject_unpinned_dependencies(&lock_text)
+        .map_err(|e| format!("td shell rust `{pkg}': {e}"))?;
     let pin = shell_recipe_source_pin(pkg)?;
     let source_archive = pkg_root.join("work").join(&pin.file);
     verify_shell_source_archive(&source_archive, &pin)?;
@@ -7357,13 +7470,21 @@ fn provision_rust_inputs(
         &src_db,
     )?;
 
-    // --- intern the crate set ---
+    // --- verify, privately stage, and intern the crate set + exact lock ---
+    let staged_vendor = work.join("vendor-verified");
+    stage_verified_vendor(&vendor, &lock_text, &staged_vendor)
+        .map_err(|e| format!("td shell rust `{pkg}': {e}"))?;
     let vendor_store = work.join("vendorstore");
     let vendor_db = work.join("vendor.db");
     let _ = std::fs::remove_dir_all(&vendor_store);
     let _ = std::fs::remove_file(&vendor_db);
-    let vendor_canonical =
-        run_store_add(self_exe, &format!("{pkg}-vendor"), &vendor, &vendor_store, &vendor_db)?;
+    let vendor_canonical = run_store_add(
+        self_exe,
+        &format!("{pkg}-vendor"),
+        &staged_vendor,
+        &vendor_store,
+        &vendor_db,
+    )?;
 
     // --- source lock: exact interned package source only --------------------
     let sourcekey = pin.key;
@@ -15100,7 +15221,7 @@ daemon build START (2/2 active)
             ),
             (
                 r#"{"name":"x","version":"1","buildSystem":"gnu","cargoPackage":"x"}"#,
-                "cannot declare cargoSubdir/cargoPackage",
+                "cannot declare Cargo build policy",
             ),
         ];
         for (recipe, expected) in cases {
@@ -15113,6 +15234,94 @@ daemon build START (2/2 active)
             .expect_err("malformed Cargo selection must fail during assembly");
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn assemble_recipe_drv_hashes_and_validates_cargo_lock_policy() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-cargo-lock-policy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("tool.lock");
+        std::fs::write(
+            &lock,
+            "tool-source /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tool-source source\n\
+             binutils-x86-64-self /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-binutils-x86-64-self td-recipe-output\n",
+        )
+        .unwrap();
+        let lockp = lock.to_str().unwrap();
+        let vendor = "/td/store/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv-tool-vendor";
+        let verify = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"],"cargoLock":"recipes/locks/tool/Cargo.lock"}"#;
+        let replace = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"],"cargoLock":"recipes/locks/tool/Cargo.lock","replaceCargoLock":true}"#;
+        let env_of = |drv: &drv::Derivation, key: &str| {
+            drv.env
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+
+        let (verify_path, _, verify_drv, _) =
+            assemble_recipe_drv(verify, lockp, &dir, Some(vendor)).unwrap();
+        let (replace_path, _, replace_drv, _) =
+            assemble_recipe_drv(replace, lockp, &dir, Some(vendor)).unwrap();
+        assert_eq!(
+            env_of(&verify_drv, "TD_CARGO_LOCK_POLICY").as_deref(),
+            Some("verify")
+        );
+        assert_eq!(
+            env_of(&replace_drv, "TD_CARGO_LOCK_POLICY").as_deref(),
+            Some("replace")
+        );
+        assert_ne!(verify_path, replace_path, "lock policy must change the derivation");
+
+        let plain = r#"{"name":"tool","version":"1","buildSystem":"rust","sourceInput":"tool-source","bins":["tool"]}"#;
+        let (_, _, plain_drv, _) = assemble_recipe_drv(plain, lockp, &dir, None).unwrap();
+        assert!(env_of(&plain_drv, "TD_CARGO_LOCK_POLICY").is_none());
+
+        for (recipe, staged_vendor, expected) in [
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoLock":""}"#,
+                Some(vendor),
+                "non-empty repo-relative path",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoLock":1}"#,
+                Some(vendor),
+                "must be a string",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","replaceCargoLock":"yes"}"#,
+                Some(vendor),
+                "must be a boolean",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","replaceCargoLock":true}"#,
+                Some(vendor),
+                "requires `cargoLock'",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"gnu","cargoLock":"recipes/locks/x/Cargo.lock"}"#,
+                Some(vendor),
+                "cannot declare Cargo build policy",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoLock":"recipes/locks/x/Cargo.lock"}"#,
+                None,
+                "requires the exact committed lock staged in TD_VENDOR_DIR",
+            ),
+        ] {
+            let error = assemble_recipe_drv(
+                recipe,
+                "/unreadable-lock-is-never-reached",
+                Path::new("/tmp"),
+                staged_vendor,
+            )
+            .expect_err("malformed Cargo lock policy must fail during assembly");
+            assert!(error.contains(expected), "{error}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // build-plan --auto derives TD_RUST_STORE_* from the declared native inputs (the env
@@ -15315,6 +15524,71 @@ daemon build START (2/2 active)
         }
     }
 
+    #[test]
+    fn confined_repo_lock_refuses_symlinks_and_nonregular_nodes() {
+        let root = std::env::temp_dir().join(format!(
+            "td-confined-cargo-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("locks")).unwrap();
+        std::fs::write(root.join("locks/Cargo.lock"), "version = 4\n").unwrap();
+
+        let (path, text) = read_confined_repo_file(&root, "locks/Cargo.lock").unwrap();
+        assert_eq!(path, root.join("locks/Cargo.lock"));
+        assert_eq!(text, "version = 4\n");
+
+        std::os::unix::fs::symlink("locks/Cargo.lock", root.join("linked.lock")).unwrap();
+        let error = read_confined_repo_file(&root, "linked.lock").unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+
+        std::os::unix::fs::symlink("locks", root.join("linked-locks")).unwrap();
+        let error = read_confined_repo_file(&root, "linked-locks/Cargo.lock").unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+
+        std::fs::create_dir(root.join("directory.lock")).unwrap();
+        let error = read_confined_repo_file(&root, "directory.lock").unwrap_err();
+        assert!(error.contains("regular file"), "{error}");
+
+        let socket_path = root.join("socket.lock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let error = read_confined_repo_file(&root, "socket.lock").unwrap_err();
+        assert!(error.contains("regular file"), "{error}");
+
+        assert!(read_confined_repo_file(&root, "../Cargo.lock").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn confined_repo_lock_keeps_parent_directory_identity_across_rename() {
+        let base = std::env::temp_dir().join(format!(
+            "td-confined-cargo-lock-race-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("repo");
+        let moved = base.join("moved-repo");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join("locks")).unwrap();
+        std::fs::create_dir_all(outside.join("locks")).unwrap();
+        std::fs::write(root.join("locks/Cargo.lock"), "original\n").unwrap();
+        std::fs::write(outside.join("locks/Cargo.lock"), "outside\n").unwrap();
+
+        let flags = crate::nar::O_NOFOLLOW | crate::sys::O_NONBLOCK as i32;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(&root)
+            .unwrap();
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        let (_path, text) =
+            read_confined_repo_descriptor(directory, &root, "locks/Cargo.lock").unwrap();
+        assert_eq!(text, "original\n", "a renamed parent redirected the lock read");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // The --auto crate gate: every checksummed committed-lock entry must be present in the
     // warm vendor dir as `<name>-<ver>.crate` with a matching sha256; the root (no checksum)
     // is ignored, a tampered/missing crate fails closed (re #547).
@@ -15360,6 +15634,11 @@ daemon build START (2/2 active)
         assert_eq!(stage_verified_vendor(&dir, &lock, &staged).unwrap(), 2);
         assert!(staged.join("foo-1.2.3.crate").is_file());
         assert!(staged.join("bar-0.1.0.crate").is_file());
+        assert_eq!(
+            std::fs::read(staged.join(build::STAGED_CARGO_LOCK)).unwrap(),
+            lock.as_bytes(),
+            "the exact committed lock bytes join the content-addressed vendor input"
+        );
         // A committed crate absent from the vendor dir fails closed.
         let missing = format!("{lock}\n[[package]]\nname = \"baz\"\nversion = \"2.0.0\"\nchecksum = \"{foo}\"\n");
         assert!(stage_verified_vendor(&dir, &missing, &staged).is_err());

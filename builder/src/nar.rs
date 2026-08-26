@@ -124,7 +124,7 @@ const MAX_NAR_TOKEN: u64 = 1 << 20;
 /// existing symlink — so a wrong value would cost the belt, never the braces. It is
 /// nonetheless pinned behaviorally by a test, since a bit the kernel merely ignored is
 /// indistinguishable from the belt working.
-const O_NOFOLLOW: i32 = 0o400_000;
+pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
 
 /// Cap on directory nesting. Without it the only bound on the reader's recursion is
 /// `PATH_MAX` failing a `create_dir` around 1300 levels down — arithmetic over two
