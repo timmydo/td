@@ -14,6 +14,7 @@ btrfs-progs-x86-64-source vzy2jr0gnwlzczsxpsy80mr0k26v2jjv-btrfs-progs-x86-64-so
 busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
 ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
 cmake-x86-64-source arcs0qgnqjhfljjd69mpgnjnanpcrlid-cmake-x86-64-source
+codex-source 468dyzi341i0b80fp9rl64q634inclbn-codex-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
@@ -36,6 +37,7 @@ gmp kb9mnqdvrr77gcgsc746pa1xmpaiazc0-gmp
 gmp63 a1sfm9d525pjz2if348xssl3wprnr21f-gmp63
 grep-mesboot0-source 664n3hm5dz2hyn5py2frds5cc3r4nid4-grep-mesboot0-source
 hello-source r2gr5vy54san8vw8ry4mmjm93ivybbpv-hello-source
+libcap-x86-64-source 14mkpjichrq0gzqyz5nrg4l0yq9hd3dw-libcap-x86-64-source
 libressl-x86-64-source vmx5274krlcs393la52x3iggv4kparn4-libressl-x86-64-source
 linux-headers hg590f1sggdwv8z3yvs4yz90cr0vnvfd-linux-headers
 linux-headers-x86-64 r4mg86l36d6x7c08wqj8v2fdkx23sxjv-linux-headers-x86-64

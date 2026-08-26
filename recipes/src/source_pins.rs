@@ -89,6 +89,19 @@ const PINS: &[PinDef] = &[
         file: "cmake-3.31.12.tar.gz",
     },
     PinDef {
+        key: "codex-source",
+        aliases: &[],
+        // OpenAI Codex 0.148.0 is the source-built daily-driver coding agent.
+        // The same reviewed archive supplies its vendored Bubblewrap 0.11.2
+        // sources; the helper is compiled separately against td-built libcap.
+        // Upstream publishes binaries but no source release asset for this tag;
+        // GitHub's tag archive is its only upstream-hosted source archive, so
+        // this exact SHA pin deliberately accepts that availability tradeoff.
+        url: "https://github.com/openai/codex/archive/refs/tags/rust-v0.148.0.tar.gz",
+        sha256: "a45e90403eb36b7d6093b167fe1c7dba9b36063bef6d39359eed52c47a21f94a",
+        file: "codex-rust-v0.148.0.tar.gz",
+    },
+    PinDef {
         key: "coreutils-mesboot0-source",
         aliases: &[],
         // GNU coreutils 5.0 — the tcc-era coreutils provider (re #469). The exact
@@ -306,6 +319,16 @@ const PINS: &[PinDef] = &[
         url: "https://ftp.gnu.org/gnu/hello/hello-2.10.tar.gz",
         sha256: "31e066137a962676e89f69d1b65382de95a7ef7d914b8cb956f41ea72e0f516b",
         file: "hello-2.10.tar.gz",
+    },
+    PinDef {
+        key: "libcap-x86-64-source",
+        aliases: &[],
+        // libcap 2.78 is the small static capability-name library required by
+        // Codex's vendored Bubblewrap. Only libcap.a and its public headers
+        // leave the recipe; no administrative tools or shared objects ship.
+        url: "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.78.tar.xz",
+        sha256: "0d621e562fd932ccf67b9660fb018e468a683d7b827541df27813228c996bb11",
+        file: "libcap-2.78.tar.xz",
     },
     PinDef {
         key: "libressl-x86-64-source",
@@ -660,8 +683,9 @@ mod tests {
         // and its minimal libuuid/libblkid build closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
         // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0, and
-        // curl's dated Mozilla CA extract.
-        assert_eq!(all().len(), 61);
+        // curl's dated Mozilla CA extract, OpenAI Codex 0.148.0 (including its
+        // vendored Bubblewrap), and libcap 2.78.
+        assert_eq!(all().len(), 63);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
