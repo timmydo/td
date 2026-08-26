@@ -13,7 +13,7 @@
 //! ceiling is in bytes: a queue is only a queue if somebody else owns the far
 //! end of it.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::lineage::Identity;
+use crate::lineage::{Caller, Identity, Named, Procfs};
 use crate::match_rule::{
     Rule, MAX_RULES_PER_CONNECTION, MAX_RULE_TEXT_PER_CONNECTION,
 };
@@ -768,6 +768,27 @@ pub enum Requested {
     AlreadyOwner,
 }
 
+/// The reserved-namespace check and the ownership change are one directory
+/// operation, so replacing an activation record cannot race a name claim.
+pub enum PortalRequested {
+    /// This exact live process was not activated for this exact name.
+    Unauthorized,
+    /// The directory lock was poisoned while deciding the request.
+    Unavailable,
+    /// The grant matched and `RequestName` was applied normally.
+    Requested(Requested, Option<Handover>),
+}
+
+/// What the second half of supervised portal activation established.
+pub(crate) enum PortalActivation {
+    /// The token, caller, ancestry, or live supervisor did not prove out.
+    Unauthorized,
+    /// The directory lock was poisoned while deciding the activation.
+    Unavailable,
+    /// The grant replaced its predecessor and caused these ownership changes.
+    Activated(Vec<Handover>),
+}
+
 impl Requested {
     pub fn code(&self) -> u32 {
         match self {
@@ -817,6 +838,9 @@ pub struct Handover {
 /// One connection's claim on a well-known name.
 struct Claim {
     unique: String,
+    /// Present only for a reserved portal claim. Promotion is allowed only
+    /// while this exact process is the active grant holder.
+    portal: Option<Caller>,
     /// Whether this holder consents to being replaced by a later caller that
     /// asks with `REPLACE_EXISTING`.
     allow_replacement: bool,
@@ -875,6 +899,26 @@ struct Directory {
     /// whoever was waiting, and stops routing, and a lookup that saw two of
     /// those three would route to a peer that had already gone.
     owned: Vec<Owned>,
+    /// The exact supervised process allowed to claim the listed reserved
+    /// portal services. The reservation itself is compiled in and survives
+    /// this process disappearing; a replacement receives a new root-issued
+    /// activation record rather than racing an ordinary peer for the name.
+    portal: Option<PortalGrant>,
+    /// One root supervisor waiting for its child to prove the other half of
+    /// activation. A single slot bounds both the token and held pidfd.
+    portal_pending: Option<PortalPreparation>,
+}
+
+struct PortalGrant {
+    process: Caller,
+    names: Vec<String>,
+}
+
+struct PortalPreparation {
+    supervisor: Caller,
+    supervisor_pidfd: OwnedFd,
+    names: Vec<String>,
+    token: String,
 }
 
 /// The bus's directory.
@@ -907,6 +951,8 @@ impl Bus {
                 peers: Vec::new(),
                 pending: Vec::new(),
                 owned: Vec::new(),
+                portal: None,
+                portal_pending: None,
             }),
             total_outgoing: Arc::new(AtomicUsize::new(0)),
             ordering: Mutex::new(()),
@@ -922,6 +968,106 @@ impl Bus {
     /// one it is guarding against.
     pub fn ordering(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
         self.ordering.lock().ok()
+    }
+
+    /// First half of portal activation: retain one proved root supervisor,
+    /// its pidfd, and an unguessable token its intended child must return.
+    pub(crate) fn prepare_portal(
+        &self,
+        supervisor: Caller,
+        supervisor_pidfd: OwnedFd,
+        names: Vec<String>,
+        token: String,
+    ) -> Result<(), String> {
+        Self::validate_portal_names(&names)?;
+        if token.len() != crate::auth::GUID_LEN
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("a portal token must be 32 lowercase hex digits".to_string());
+        }
+        let mut directory = self
+            .directory
+            .lock()
+            .map_err(|_| "the bus directory is poisoned".to_string())?;
+        directory.portal_pending = Some(PortalPreparation {
+            supervisor,
+            supervisor_pidfd,
+            names,
+            token,
+        });
+        Ok(())
+    }
+
+    /// Second half: the token-bearing child is proved by its own connection,
+    /// while the retained pidfd proves the preparing supervisor is still the
+    /// same process. Superseded owned and queued claims are revoked under this
+    /// same lock.
+    pub(crate) fn complete_portal(
+        &self,
+        procfs: &dyn Procfs,
+        token: &str,
+        process: Caller,
+        parent: i32,
+    ) -> PortalActivation {
+        let Ok(mut directory) = self.directory.lock() else {
+            return PortalActivation::Unavailable;
+        };
+        let Some(pending) = directory.portal_pending.as_ref() else {
+            return PortalActivation::Unauthorized;
+        };
+        let supervisor_live = procfs.named_by(pending.supervisor_pidfd.as_raw_fd())
+            == Named::Pid(pending.supervisor.pid);
+        let authorized = token == pending.token
+            && supervisor_live
+            && parent == pending.supervisor.pid
+            && process.starttime >= pending.supervisor.starttime;
+        if !authorized {
+            return PortalActivation::Unauthorized;
+        }
+        let grant = PortalGrant {
+            process,
+            names: pending.names.clone(),
+        };
+        directory.portal_pending = None;
+        let handovers = Self::revoke_portal_claims(&mut directory, &grant);
+        directory.portal = Some(grant);
+        PortalActivation::Activated(handovers)
+    }
+
+    fn validate_portal_names(names: &[String]) -> Result<(), String> {
+        let distinct: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        if names.is_empty()
+            || names.len() > MAX_NAMES_PER_CONNECTION
+            || distinct.len() != names.len()
+            || names.iter().any(|name| {
+                !crate::name::valid_well_known_name(name)
+                    || !policy::is_portal_service_name(name)
+            })
+        {
+            return Err(format!(
+                "portal activation requires 1..={MAX_NAMES_PER_CONNECTION} distinct exact portal service names"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_portal_for_test(
+        &self,
+        process: Caller,
+        names: Vec<String>,
+    ) -> Result<Vec<Handover>, String> {
+        Self::validate_portal_names(&names)?;
+        let mut directory = self
+            .directory
+            .lock()
+            .map_err(|_| "the bus directory is poisoned".to_string())?;
+        let grant = PortalGrant { process, names };
+        let handovers = Self::revoke_portal_claims(&mut directory, &grant);
+        directory.portal = Some(grant);
+        Ok(handovers)
     }
 
     /// Make an outbox for a connection, before it has a name. A connection has
@@ -1136,10 +1282,20 @@ impl Bus {
     /// answers carry the same `reply_serial` to a client that cannot tell
     /// them apart, and `forget_reply`, which un-records a call that could not
     /// be sent, could remove the wrong one and leave a live call untracked.
-    pub fn route_expecting(&self, name: &str, caller: &str, serial: u32) -> Routing {
+    pub fn route_expecting(
+        &self,
+        name: &str,
+        caller: &str,
+        serial: u32,
+        identity: &Identity,
+        own: Option<&str>,
+    ) -> Routing {
         let Ok(mut directory) = self.directory.lock() else {
             return Routing::Absent;
         };
+        if !Self::permitted_by(&directory, identity, own, name, policy::may_talk) {
+            return Routing::Absent;
+        }
         let Some(unique) = Self::resolve(&directory, name) else {
             return Routing::Absent;
         };
@@ -1317,6 +1473,42 @@ impl Bus {
         let Ok(mut directory) = self.directory.lock() else {
             return (Requested::Exists, None);
         };
+        Self::request_name_locked(&mut directory, unique, name, flags, None)
+    }
+
+    /// Cross the reserved portal-name boundary and claim the name as one
+    /// atomic directory operation. The transport re-proves `process` from
+    /// the requesting socket, including its start time.
+    pub(crate) fn request_portal_name(
+        &self,
+        process: Caller,
+        unique: &str,
+        name: &str,
+        flags: u32,
+    ) -> PortalRequested {
+        let Ok(mut directory) = self.directory.lock() else {
+            return PortalRequested::Unavailable;
+        };
+        let authorized = crate::name::valid_well_known_name(name)
+            && policy::is_portal_service_name(name)
+            && directory.portal.as_ref().is_some_and(|portal| {
+                portal.process == process && portal.names.iter().any(|held| held == name)
+            });
+        if !authorized {
+            return PortalRequested::Unauthorized;
+        }
+        let (requested, handover) =
+            Self::request_name_locked(&mut directory, unique, name, flags, Some(process));
+        PortalRequested::Requested(requested, handover)
+    }
+
+    fn request_name_locked(
+        directory: &mut Directory,
+        unique: &str,
+        name: &str,
+        flags: u32,
+        portal: Option<Caller>,
+    ) -> (Requested, Option<Handover>) {
         let allow_replacement = flags & NAME_FLAG_ALLOW_REPLACEMENT != 0;
         let replace_existing = flags & NAME_FLAG_REPLACE_EXISTING != 0;
         let do_not_queue = flags & NAME_FLAG_DO_NOT_QUEUE != 0;
@@ -1342,6 +1534,7 @@ impl Bus {
                 name: name.to_string(),
                 queue: vec![Claim {
                     unique: unique.to_string(),
+                    portal,
                     allow_replacement,
                     do_not_queue,
                 }],
@@ -1374,6 +1567,7 @@ impl Bus {
             };
             claim.allow_replacement = allow_replacement;
             claim.do_not_queue = do_not_queue;
+            claim.portal = portal;
             return (Requested::AlreadyOwner, None);
         }
 
@@ -1404,6 +1598,7 @@ impl Bus {
                 0,
                 Claim {
                     unique: unique.to_string(),
+                    portal,
                     allow_replacement,
                     do_not_queue,
                 },
@@ -1447,6 +1642,7 @@ impl Bus {
                 };
                 claim.allow_replacement = allow_replacement;
                 claim.do_not_queue = do_not_queue;
+                claim.portal = portal;
                 (Requested::InQueue, None)
             }
             None => {
@@ -1455,12 +1651,51 @@ impl Bus {
                 }
                 owned.queue.push(Claim {
                     unique: unique.to_string(),
+                    portal,
                     allow_replacement,
                     do_not_queue,
                 });
                 (Requested::InQueue, None)
             }
         }
+    }
+
+    /// Remove every reserved-name claim the replacement activation no longer
+    /// authorizes. This covers both current owners and queued successors, so
+    /// neither can outlive the exact process-and-name capability that created
+    /// it.
+    fn revoke_portal_claims(
+        directory: &mut Directory,
+        grant: &PortalGrant,
+    ) -> Vec<Handover> {
+        let mut handovers = Vec::new();
+        let mut emptied = Vec::new();
+        for (at, owned) in directory.owned.iter_mut().enumerate() {
+            if !policy::is_portal_service_name(&owned.name) {
+                continue;
+            }
+            let before = owned.queue.first().map(|claim| claim.unique.clone());
+            let name_allowed = grant.names.iter().any(|name| name == &owned.name);
+            owned.queue.retain(|claim| {
+                name_allowed && claim.portal == Some(grant.process)
+            });
+            let after = owned.queue.first().map(|claim| claim.unique.clone());
+            if before != after {
+                handovers.push(Handover {
+                    name: owned.name.clone(),
+                    lost: before,
+                    gained: after,
+                });
+            }
+            if owned.queue.is_empty() {
+                emptied.push(at);
+            }
+        }
+        emptied.sort_unstable();
+        for at in emptied.into_iter().rev() {
+            directory.owned.swap_remove(at);
+        }
+        handovers
     }
 
     /// `ReleaseName`, with the handover it caused if the caller was holding
@@ -1576,6 +1811,59 @@ impl Bus {
         Self::holder(directory, name)
     }
 
+    /// Whether a policy admits `target` either directly or as the current
+    /// holder of an admitted well-known name.
+    ///
+    /// The alias lookup shares the directory lock with the state it
+    /// qualifies. Losing the well-known name therefore loses permission to
+    /// address its former holder by unique name before a route can observe
+    /// the new state.
+    fn permitted_by(
+        directory: &Directory,
+        identity: &Identity,
+        own: Option<&str>,
+        target: &str,
+        permits: fn(&Identity, Option<&str>, &str) -> bool,
+    ) -> bool {
+        permits(identity, own, target)
+            || directory.owned.iter().any(|owned| {
+                owned
+                    .queue
+                    .first()
+                    .is_some_and(|claim| claim.unique == target)
+                    && permits(identity, own, &owned.name)
+            })
+    }
+
+    /// Whether this caller may learn that `target` exists, including the
+    /// current unique-name holder of a visible well-known name.
+    pub fn may_see(
+        &self,
+        identity: &Identity,
+        own: Option<&str>,
+        target: &str,
+    ) -> bool {
+        let Ok(directory) = self.directory.lock() else {
+            return false;
+        };
+        Self::permitted_by(&directory, identity, own, target, policy::may_see)
+    }
+
+    /// Whether this caller may address `target`, with the same current-holder
+    /// alias rule as visibility. Routing repeats this decision under the lock
+    /// that resolves the destination.
+    pub fn may_talk(
+        &self,
+        identity: &Identity,
+        own: Option<&str>,
+        target: &str,
+    ) -> bool {
+        let Ok(directory) = self.directory.lock() else {
+            return false;
+        };
+        Self::permitted_by(&directory, identity, own, target, policy::may_talk)
+    }
+
     /// Every name on this bus, unique and well-known, under ONE lock.
     ///
     /// Two acquisitions would let a connection join, leave or hand a name on
@@ -1632,6 +1920,27 @@ impl Bus {
     /// point of holding one.
     pub fn route(&self, name: &str) -> Option<Arc<Outbox>> {
         let directory = self.directory.lock().ok()?;
+        let unique = Self::resolve(&directory, name)?;
+        directory
+            .peers
+            .iter()
+            .find(|peer| peer.unique == unique)
+            .map(|peer| Arc::clone(&peer.outbox))
+    }
+
+    /// Route an ordinary directed message only while the destination is in
+    /// the caller's talk set. A holder's unique name is an alias for a
+    /// permitted well-known name only for as long as it holds that name.
+    pub fn route_authorized(
+        &self,
+        name: &str,
+        identity: &Identity,
+        own: Option<&str>,
+    ) -> Option<Arc<Outbox>> {
+        let directory = self.directory.lock().ok()?;
+        if !Self::permitted_by(&directory, identity, own, name, policy::may_talk) {
+            return None;
+        }
         let unique = Self::resolve(&directory, name)?;
         directory
             .peers
@@ -1799,6 +2108,129 @@ mod tests {
             bus.join(&third, 1000, 4003).expect("join"),
             ":1.3",
             "a unique name was reused"
+        );
+    }
+
+    #[test]
+    fn a_portal_grant_is_exact_and_replacement_revokes_it() {
+        let bus = Bus::new();
+        let portal = Caller {
+            pid: 4001,
+            starttime: 71,
+        };
+        bus.activate_portal_for_test(
+            portal,
+            vec!["org.freedesktop.portal.Desktop".to_string()],
+        )
+        .expect("install a portal grant");
+
+        for (process, name) in [
+            (
+                Caller {
+                    pid: portal.pid,
+                    starttime: portal.starttime.saturating_add(1),
+                },
+                "org.freedesktop.portal.Desktop",
+            ),
+            (portal, "org.freedesktop.impl.portal.FileChooser"),
+        ] {
+            assert!(matches!(
+                bus.request_portal_name(process, ":1.1", name, NAME_FLAG_DO_NOT_QUEUE),
+                PortalRequested::Unauthorized
+            ));
+        }
+
+        assert!(matches!(
+            bus.request_portal_name(
+                portal,
+                ":1.1",
+                "org.freedesktop.portal.Desktop",
+                0
+            ),
+            PortalRequested::Requested(Requested::PrimaryOwner, Some(_))
+        ));
+        assert!(matches!(
+            bus.request_portal_name(
+                portal,
+                ":1.2",
+                "org.freedesktop.portal.Desktop",
+                0
+            ),
+            PortalRequested::Requested(Requested::InQueue, None)
+        ));
+        assert_eq!(bus.wanting("org.freedesktop.portal.Desktop"), 2);
+
+        let replacement = Caller {
+            pid: 4002,
+            starttime: 72,
+        };
+        let handovers = bus
+            .activate_portal_for_test(
+                replacement,
+                vec!["org.freedesktop.portal.Desktop".to_string()],
+            )
+            .expect("replace the portal grant");
+        assert_eq!(handovers.len(), 1);
+        let handover = handovers.first().expect("the revoked owner");
+        assert_eq!(handover.name, "org.freedesktop.portal.Desktop");
+        assert_eq!(handover.lost.as_deref(), Some(":1.1"));
+        assert_eq!(handover.gained, None);
+        assert_eq!(bus.wanting("org.freedesktop.portal.Desktop"), 0);
+        assert!(matches!(
+            bus.request_portal_name(
+                portal,
+                ":1.1",
+                "org.freedesktop.portal.Desktop",
+                NAME_FLAG_DO_NOT_QUEUE
+            ),
+            PortalRequested::Unauthorized
+        ));
+        assert!(matches!(
+            bus.request_portal_name(
+                replacement,
+                ":1.3",
+                "org.freedesktop.portal.Desktop",
+                NAME_FLAG_DO_NOT_QUEUE
+            ),
+            PortalRequested::Requested(Requested::PrimaryOwner, Some(_))
+        ));
+    }
+
+    #[test]
+    fn portal_activation_validates_its_own_boundary() {
+        let bus = Bus::new();
+        let portal = Caller {
+            pid: 4001,
+            starttime: 71,
+        };
+        for names in [
+            Vec::new(),
+            vec!["org.example.NotPortal".to_string()],
+            vec!["org.freedesktop.portal".to_string()],
+            vec![
+                "org.freedesktop.portal.Desktop".to_string(),
+                "org.freedesktop.portal.Desktop".to_string(),
+            ],
+        ] {
+            assert!(
+                bus.activate_portal_for_test(portal, names).is_err(),
+                "the registry accepted an invalid portal capability"
+            );
+        }
+        let too_many = (0..=MAX_NAMES_PER_CONNECTION)
+            .map(|at| format!("org.freedesktop.portal.Service{at}"))
+            .collect();
+        assert!(bus.activate_portal_for_test(portal, too_many).is_err());
+        let file = std::fs::File::open("/dev/null").expect("open a harmless descriptor");
+        let pidfd: OwnedFd = file.into();
+        assert!(
+            bus.prepare_portal(
+                portal,
+                pidfd,
+                vec!["org.freedesktop.portal.Desktop".to_string()],
+                "not-a-token".to_string(),
+            )
+            .is_err()
         );
     }
 

@@ -22,13 +22,13 @@ use std::sync::Arc;
 
 use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
 use crate::lineage::{
-    Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs, Registration,
+    Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs, Registration, Stat,
 };
 use crate::message;
 use crate::policy;
 use crate::registry::{
-    Bus, DescriptorCharge, Descriptors, Outbox, Overflow, QueuedFrame, Rejected, Released,
-    Routing,
+    Bus, DescriptorCharge, Descriptors, Outbox, Overflow, PortalActivation, PortalRequested,
+    QueuedFrame, Rejected, Released, Routing,
 };
 use crate::sys::{self, PeerCredential};
 use crate::wire::{WireError, Writer};
@@ -49,6 +49,10 @@ pub const PEER_INTERFACE: &str = "org.freedesktop.DBus.Peer";
 /// anything that introspects the bus.
 pub const JAIL_INTERFACE: &str = "td.Jail1";
 pub const JAIL_PATH: &str = "/td/Jail1";
+/// Root-supervisor activation of the exact process allowed to own the
+/// reserved portal namespace.
+pub const PORTAL_INTERFACE: &str = "td.Portal1";
+pub const PORTAL_PATH: &str = "/td/Portal1";
 /// The most bytes an instance name may carry.
 ///
 /// It is a registry key and it reaches diagnostics, so it is bounded and
@@ -762,7 +766,7 @@ impl<'a> Connection<'a> {
     /// The descriptor is held across both reads. Dropping it in between would
     /// return its NUMBER to this process's descriptor table, and the second
     /// read could then be of something else entirely.
-    fn caller(&self, procfs: &dyn Procfs) -> Option<Caller> {
+    fn caller_process(&self, procfs: &dyn Procfs) -> Option<(Caller, Stat, OwnedFd)> {
         let pidfd = sys::peer_pidfd(&self.stream).ok()?;
         let Named::Pid(pid) = procfs.named_by(pidfd.as_raw_fd()) else {
             return None;
@@ -771,12 +775,21 @@ impl<'a> Connection<'a> {
             return None;
         };
         match procfs.named_by(pidfd.as_raw_fd()) {
-            Named::Pid(again) if again == pid => Some(Caller {
-                pid,
-                starttime: stat.starttime,
-            }),
+            Named::Pid(again) if again == pid => Some((
+                Caller {
+                    pid,
+                    starttime: stat.starttime,
+                },
+                stat,
+                pidfd,
+            )),
             _ => None,
         }
+    }
+
+    fn caller(&self, procfs: &dyn Procfs) -> Option<Caller> {
+        self.caller_process(procfs)
+            .map(|(caller, _stat, _pidfd)| caller)
     }
 
     /// A peer whose pidfd the kernel would not give.
@@ -1312,6 +1325,17 @@ impl<'a> Connection<'a> {
                 _ => Ok(()),
             };
         }
+        let portal_method = matches!(member, "Prepare" | "Activate")
+            && is_call
+            && on_the_portal_object(message)
+            && on(PORTAL_INTERFACE);
+        if portal_method {
+            return match member {
+                "Prepare" => self.portal_prepare(message, wants_reply),
+                "Activate" => self.portal_activate(message, wants_reply),
+                _ => Ok(()),
+            };
+        }
         // `RequestName` and `ReleaseName` CHANGE something, so they belong up
         // here with the jail methods rather than below the gate: a caller that
         // set `NO_REPLY_EXPECTED` has withdrawn the REPLY, not the work, and a
@@ -1633,12 +1657,12 @@ impl<'a> Connection<'a> {
         // which is what makes an invisible peer indistinguishable from an
         // absent one.
         //
-        // `may_ask_credentials` and NOT `may_see`, and the difference is the
-        // permission file's grant. A granted name resolves to whoever holds
-        // it, so a gate that admitted every visible name would hand one
-        // instance the uid and pid of another the moment two windows of an
-        // application shared a grant — reached through a widening that was
-        // about names rather than about peers. A reviewer found it there.
+        // `may_ask_credentials` and NOT `may_see`: neither portal access nor
+        // a permission file's name grant carries process identity. A granted
+        // name resolves to whoever holds it, so a gate that admitted every
+        // visible name would hand one instance the uid and pid of another the
+        // moment two windows shared a grant — reached through a widening that
+        // was about names rather than about peers.
         let name = &self.askable(name)?;
         if name == BUS_NAME {
             // The bus is this process. Reading `/proc/self` rather than calling
@@ -1690,15 +1714,16 @@ impl<'a> Connection<'a> {
     /// name a caller may not see is absent in the same way whichever way it
     /// asks.
     fn may_see(&self, name: &str) -> bool {
-        policy::may_see(&self.identity, self.unique.as_deref(), name)
+        self.bus
+            .may_see(&self.identity, self.unique.as_deref(), name)
     }
 
     /// The narrower question the two credential answers ask.
     ///
-    /// Separate from `may_see` because a permission file's grant widened that
-    /// one: a granted name may be looked up and addressed, and the uid and
-    /// pid behind it still belong to whoever holds it. See
-    /// `policy::may_ask_credentials`.
+    /// Separate from `may_see` because portal and permission-file grants
+    /// widen that one: a granted name and its current holder may be looked up
+    /// and addressed, while the uid and pid still belong to the peer behind
+    /// them. See `policy::may_ask_credentials`.
     fn may_ask_credentials(&self, name: &str) -> bool {
         policy::may_ask_credentials(&self.identity, self.unique.as_deref(), name)
     }
@@ -1934,7 +1959,15 @@ impl<'a> Connection<'a> {
         let Some((asked, flags)) = self.name_and_flags(message, wants_reply)? else {
             return Ok(());
         };
-        if !policy::may_own(&self.identity, &asked) {
+        let ordinarily_allowed = policy::may_own(&self.identity, &asked);
+        let portal_process = if policy::is_portal_service_name(&asked)
+            && policy::may_hold_portal_service(&self.identity)
+        {
+            self.caller(&RealProcfs)
+        } else {
+            None
+        };
+        if !ordinarily_allowed && portal_process.is_none() {
             return self.refuse_if_wanted(
                 message,
                 "org.freedesktop.DBus.Error.AccessDenied",
@@ -1952,7 +1985,23 @@ impl<'a> Connection<'a> {
         }
         let mine = self.named()?.to_string();
         let ordering = self.bus.ordering();
-        let (outcome, handover) = self.bus.request_name(&mine, &asked, flags);
+        let (outcome, handover) = match portal_process {
+            Some(process) => match self.bus.request_portal_name(process, &mine, &asked, flags) {
+                PortalRequested::Requested(outcome, handover) => (outcome, handover),
+                PortalRequested::Unauthorized => {
+                    return self.refuse_if_wanted(
+                        message,
+                        "org.freedesktop.DBus.Error.AccessDenied",
+                        "this process was not activated to own that portal name",
+                        wants_reply,
+                    );
+                }
+                PortalRequested::Unavailable => {
+                    return Err(Ended::Failed("the bus directory is unavailable".into()));
+                }
+            },
+            None => self.bus.request_name(&mine, &asked, flags),
+        };
         // The news BEFORE the answer, which is the reference daemon's order
         // and not `say_hello`'s. `say_hello` puts its reply first because the
         // peer has no name until it arrives, so anything ahead of it reaches a
@@ -2052,6 +2101,172 @@ impl<'a> Connection<'a> {
                 Ok(None)
             }
         }
+    }
+
+    /// `td.Portal1.Prepare(as names) -> s token`.
+    ///
+    /// The root supervisor proves itself through this socket and leaves its
+    /// pidfd with the registry. The intended direct child receives the random
+    /// token out of band and proves the other half from its own connection;
+    /// no peer-supplied pid is ever trusted as the portal process.
+    fn portal_prepare(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        self.portal_prepare_using(message, wants_reply, &RealProcfs)
+    }
+
+    fn portal_prepare_using(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+        procfs: &dyn Procfs,
+    ) -> Result<(), Ended> {
+        if self.credential.uid != 0 || !policy::may_hold_portal_service(&self.identity) {
+            return self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "td.Portal1.Prepare is for the root service supervisor",
+                wants_reply,
+            );
+        }
+        if !self.takes_if_wanted(message, "as", wants_reply)? {
+            return Ok(());
+        }
+        let Some(seq) = message.args().first().and_then(crate::wire::Value::as_seq) else {
+            return self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "Prepare takes a list of portal names",
+                wants_reply,
+            );
+        };
+        let Some(names) = self.well_known_names(
+            message,
+            &seq,
+            crate::registry::MAX_NAMES_PER_CONNECTION,
+            "that portal name list cannot be read",
+            "an activated portal service must be a well-known bus name",
+            wants_reply,
+        )?
+        else {
+            return Ok(());
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        if names.is_empty()
+            || names
+                .iter()
+                .any(|name| !policy::is_portal_service_name(name) || !seen.insert(name))
+        {
+            return self.refuse_if_wanted(
+                message,
+                "td.Portal1.Error.Refused",
+                "portal activation names must be distinct members of the reserved namespaces",
+                wants_reply,
+            );
+        }
+        let Some((supervisor, _stat, pidfd)) = self.caller_process(procfs) else {
+            return self.refuse_if_wanted(
+                message,
+                "td.Portal1.Error.Refused",
+                "the preparing supervisor could not be identified",
+                wants_reply,
+            );
+        };
+        let token = guid_text()
+            .map_err(|why| Ended::Failed(format!("cannot make a portal token: {why}")))?;
+        self.bus
+            .prepare_portal(supervisor, pidfd, names, token.clone())
+            .map_err(|why| Ended::Failed(format!("cannot prepare the portal: {why}")))?;
+        if wants_reply {
+            self.answer(message, "s", move |writer| writer.string(&token))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `td.Portal1.Activate(s token) -> ()`.
+    ///
+    /// The child is sampled only through its own socket's pidfd, and the
+    /// registry still holds the supervisor's pidfd while it checks direct
+    /// ancestry and replaces the preceding capability and every claim made
+    /// through it.
+    fn portal_activate(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+    ) -> Result<(), Ended> {
+        self.portal_activate_using(message, wants_reply, &RealProcfs)
+    }
+
+    fn portal_activate_using(
+        &mut self,
+        message: &message::Message<'_>,
+        wants_reply: bool,
+        procfs: &dyn Procfs,
+    ) -> Result<(), Ended> {
+        if !policy::may_hold_portal_service(&self.identity) {
+            return self.refuse_if_wanted(
+                message,
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "td.Portal1.Activate is for an unconfined portal process",
+                wants_reply,
+            );
+        }
+        if !self.takes_if_wanted(message, "s", wants_reply)? {
+            return Ok(());
+        }
+        let token = message
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .filter(|token| {
+                token.len() == GUID_LEN
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        let Some(token) = token else {
+            return self.refuse_if_wanted(
+                message,
+                "td.Portal1.Error.Refused",
+                "that is not a portal activation token",
+                wants_reply,
+            );
+        };
+        let Some((process, stat, _pidfd)) = self.caller_process(procfs) else {
+            return self.refuse_if_wanted(
+                message,
+                "td.Portal1.Error.Refused",
+                "the portal process could not be identified",
+                wants_reply,
+            );
+        };
+        let ordering = self.bus.ordering();
+        match self.bus.complete_portal(procfs, token, process, stat.ppid) {
+            PortalActivation::Unauthorized => {
+                return self.refuse_if_wanted(
+                    message,
+                    "td.Portal1.Error.Refused",
+                    "the portal process is not the prepared supervisor's live child",
+                    wants_reply,
+                )
+            }
+            PortalActivation::Unavailable => {
+                return Err(Ended::Failed("cannot activate the portal".to_string()))
+            }
+            PortalActivation::Activated(handovers) => {
+                for handover in &handovers {
+                    self.announce(handover);
+                }
+            }
+        }
+        if wants_reply {
+            self.answer(message, "", |_| Ok(()))?;
+        }
+        drop(ordering);
+        Ok(())
     }
 
     /// `RequestName`'s name and flags, validated, or a refusal already sent.
@@ -2186,9 +2401,10 @@ impl<'a> Connection<'a> {
         //
         // BOTH lists, which a reviewer asked for and which costs one
         // iterator. A predeclared service is a name the instance intends to
-        // answer on, so a reserved one is the same lie in the same file —
-        // inert only because activation has not landed, which is exactly the
-        // condition that makes it easy to forget later.
+        // answer on, so a reserved one is the same lie in the same file.
+        // App-local service activation has not landed, but the supervised
+        // portal path has; relying on today's unused list would turn this
+        // omission into a privilege widening when the first app service does.
         let mut claimed = owned.iter().chain(services.iter());
         if let Some(reserved) = claimed.find(|name| policy::is_reserved_name(name)) {
             self.refuse_if_wanted(
@@ -2540,7 +2756,7 @@ impl<'a> Connection<'a> {
             }
             _ => None,
         };
-        let permitted = match reply {
+        let reply_permitted = match reply {
             // A method return or an error with no `reply_serial` answers
             // nothing, and the codec refuses one on those two types, so this
             // arm is dead. It falls through to the rules below rather than
@@ -2552,10 +2768,18 @@ impl<'a> Connection<'a> {
                 .bus
                 .claim_reply(self.named()?, destination, serial),
             None => {
-                // Who may be addressed, and then what may be sent to them. A
-                // confined peer may CALL the portal; a directed signal at it
-                // is a channel §D does not grant.
-                policy::may_talk(&self.identity, self.unique.as_deref(), destination)
+                let direct = policy::may_talk(
+                    &self.identity,
+                    self.unique.as_deref(),
+                    destination,
+                );
+                let permitted = direct
+                    || self.bus.may_talk(
+                        &self.identity,
+                        self.unique.as_deref(),
+                        destination,
+                    );
+                permitted
                     && (message.kind != message::MessageType::Signal
                         || policy::may_signal(&self.identity))
             }
@@ -2581,12 +2805,20 @@ impl<'a> Connection<'a> {
         // would be a dead branch shaped like a safety check, which this file
         // argues is worse than none because the next reader trusts it.
         let recorded = wants_reply;
-        let found = if !permitted {
+        let found = if !reply_permitted {
             None
+        } else if reply.is_some() {
+            self.bus.route(destination)
         } else if recorded {
             match self
                 .bus
-                .route_expecting(destination, self.named()?, message.serial)
+                .route_expecting(
+                    destination,
+                    self.named()?,
+                    message.serial,
+                    &self.identity,
+                    self.unique.as_deref(),
+                )
             {
                 Routing::Ready(outbox) => Some(outbox),
                 Routing::Absent => None,
@@ -2610,7 +2842,8 @@ impl<'a> Connection<'a> {
                 }
             }
         } else {
-            self.bus.route(destination)
+            self.bus
+                .route_authorized(destination, &self.identity, self.unique.as_deref())
         };
         let Some(outbox) = found else {
             // §D's one consistent story: a name with no owner is absent, and
@@ -2921,6 +3154,10 @@ fn on_the_bus_object(message: &message::Message<'_>) -> bool {
 
 fn on_the_jail_object(message: &message::Message<'_>) -> bool {
     message.fields.path == Some(JAIL_PATH)
+}
+
+fn on_the_portal_object(message: &message::Message<'_>) -> bool {
+    message.fields.path == Some(PORTAL_PATH)
 }
 
 /// The most bytes in a td application identity.
@@ -3358,6 +3595,43 @@ mod tests {
         .expect("encode a jail call")
         .encode()
         .expect("encode a jail call")
+    }
+
+    fn portal_prepare(names: &[&str], serial: u32) -> Vec<u8> {
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            PORTAL_PATH,
+            Some(PORTAL_INTERFACE),
+            "Prepare",
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .body("as", |writer| {
+            writer.array("s", |array| {
+                for name in names {
+                    array.string(name)?;
+                }
+                Ok(())
+            })
+        })
+        .expect("encode a portal activation")
+        .encode()
+        .expect("encode a portal activation")
+    }
+
+    fn portal_activate(token: &str, serial: u32) -> Vec<u8> {
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            PORTAL_PATH,
+            Some(PORTAL_INTERFACE),
+            "Activate",
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .body("s", |writer| writer.string(token))
+        .expect("encode a portal activation")
+        .encode()
+        .expect("encode a portal activation")
     }
 
     fn register_call(instance: &str, app_id: &str, serial: u32) -> Vec<u8> {
@@ -5200,8 +5474,8 @@ mod tests {
     }
 
     /// A message with no DESTINATION splits by type. A signal is a broadcast,
-    /// which needs the match rules that have not landed, and is accepted and
-    /// goes nowhere — it has no reply to be missing. A method CALL is the
+    /// and without a matching subscription it is accepted and goes nowhere —
+    /// it has no reply to be missing. A method CALL is the
     /// opposite: its sender is waiting on a serial no route can currently
     /// answer, so it is told rather than left to time out.
     #[test]
@@ -6022,9 +6296,9 @@ mod tests {
         // would have been told everything. Between them the arm is pinned.
         //
         // The remaining difference between this arm and `Jailed` — the
-        // portal grant — is NOT observable here and is not asserted here:
-        // nothing can own a portal name until td-portal exists, so both arms
-        // answer "no owner". It is pinned in `policy`'s own tests instead.
+        // portal grant — is NOT observable on this isolated bus because this
+        // fixture installed no supervisor activation. It is pinned at the
+        // activation and end-to-end portal tests instead.
         one.send(&name_query("GetConnectionCredentials", &name_one, 5));
         let frame = one.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode credentials");
@@ -7656,6 +7930,243 @@ mod tests {
         }
     }
 
+    /// The reservation has one narrow crossing: a root-issued record naming
+    /// this exact process and service. A confined connection from the same
+    /// process still cannot borrow it, which pins both halves of the gate.
+    #[test]
+    fn only_the_activated_unconfined_process_claims_a_portal_name() {
+        if !pidfd_available() {
+            return;
+        }
+        let (bus, free, jailed) = mixed_bus();
+        let pid = i32::try_from(std::process::id()).expect("a pid fits");
+        let Reading::Of(stat) = RealProcfs.stat(pid) else {
+            panic!("this process has a /proc entry");
+        };
+        bus.activate_portal_for_test(
+            Caller {
+                pid,
+                starttime: stat.starttime,
+            },
+            vec!["org.freedesktop.portal.Desktop".to_string()],
+        )
+        .expect("activate the portal");
+        let (mut portal, portal_unique) = Peer::arrive(free);
+        let (mut app, app_unique) = Peer::arrive(jailed);
+
+        portal.send(&request_name(
+            "org.freedesktop.portal.Desktop",
+            crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            2,
+        ));
+        assert_eq!(name_code(&portal.answer()), (1, Some(2)));
+        let _acquired = portal.frame();
+        assert!(bus.holds(
+            &portal_unique,
+            "org.freedesktop.portal.Desktop"
+        ));
+
+        app.send(&request_name(
+            "org.freedesktop.portal.Desktop",
+            crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            2,
+        ));
+        let frame = app.answer();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode the refusal");
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.AccessDenied")
+        );
+        assert!(!bus.holds(
+            &app_unique,
+            "org.freedesktop.portal.Desktop"
+        ));
+    }
+
+    /// Portal handles are ordinary object paths on one directed conversation:
+    /// the application calls the public service, the portal answers with a
+    /// Request or Session path, and later signals that path back to the same
+    /// application. Drive both forms over the wire so no special-case router
+    /// can claim the service name while dropping the handle traffic.
+    #[test]
+    fn portal_request_and_session_handles_route_end_to_end() {
+        if !pidfd_available() {
+            return;
+        }
+        let (bus, free, jailed) = mixed_bus();
+        let pid = i32::try_from(std::process::id()).expect("a pid fits");
+        let Reading::Of(stat) = RealProcfs.stat(pid) else {
+            panic!("this process has a /proc entry");
+        };
+        bus.activate_portal_for_test(
+            Caller {
+                pid,
+                starttime: stat.starttime,
+            },
+            vec!["org.freedesktop.portal.Desktop".to_string()],
+        )
+        .expect("activate the portal");
+        let (mut portal, portal_unique) = Peer::arrive(free);
+        let (mut app, app_unique) = Peer::arrive(jailed);
+        portal.send(&request_name(
+            "org.freedesktop.portal.Desktop",
+            crate::registry::NAME_FLAG_DO_NOT_QUEUE,
+            2,
+        ));
+        assert_eq!(name_code(&portal.answer()).0, 1);
+        let _acquired = portal.frame();
+
+        app.send(&name_query(
+            "GetNameOwner",
+            "org.freedesktop.portal.Desktop",
+            5,
+        ));
+        let frame = app.answer();
+        let (owner, _) = message::decode(&frame, 0).expect("decode GetNameOwner");
+        assert_eq!(
+            owner.args().first().and_then(crate::wire::Value::as_str),
+            Some(portal_unique.as_str())
+        );
+        for (serial, target) in [
+            (6, "org.freedesktop.portal.Desktop"),
+            (7, portal_unique.as_str()),
+        ] {
+            app.send(&name_query("GetConnectionCredentials", target, serial));
+            let frame = app.answer();
+            let (refusal, _) = message::decode(&frame, 0).expect("decode refusal");
+            assert_eq!(
+                refusal.fields.error_name,
+                Some("org.freedesktop.DBus.Error.NameHasNoOwner"),
+                "portal credentials leaked through {target}"
+            );
+        }
+        let direct = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.FileChooser"),
+            "OpenFile",
+        )
+        .destination(&portal_unique)
+        .serial(8)
+        .flags(message::FLAG_NO_REPLY_EXPECTED)
+        .encode()
+        .expect("encode a call to the portal's unique alias");
+        app.send(&direct);
+        let frame = portal.frame();
+        let (direct, _) = message::decode(&frame, 0).expect("decode the direct call");
+        assert_eq!(direct.fields.destination, Some(portal_unique.as_str()));
+
+        let request_path = "/org/freedesktop/portal/desktop/request/1_2/open";
+        let open = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.FileChooser"),
+            "OpenFile",
+        )
+        .destination("org.freedesktop.portal.Desktop")
+        .serial(10)
+        .encode()
+        .expect("encode a portal call");
+        app.send(&open);
+        let frame = portal.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the portal call");
+        assert_eq!(call.fields.sender, Some(app_unique.as_str()));
+        assert_eq!(
+            call.fields.destination,
+            Some("org.freedesktop.portal.Desktop")
+        );
+        let answer = message::Builder::method_return(crate::wire::Endian::Little, call.serial)
+            .destination(&app_unique)
+            .serial(3)
+            .body("o", |writer| writer.object_path(request_path))
+            .expect("encode a request handle")
+            .encode()
+            .expect("encode a portal answer");
+        portal.send(&answer);
+        let frame = app.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the portal answer");
+        assert_eq!(answer.kind, message::MessageType::MethodReturn);
+        assert_eq!(answer.fields.reply_serial, Some(10));
+        assert_eq!(answer.fields.sender, Some(portal_unique.as_str()));
+        assert_eq!(
+            answer.args().first().and_then(crate::wire::Value::as_str),
+            Some(request_path)
+        );
+
+        let response = message::Builder::signal(
+            crate::wire::Endian::Little,
+            request_path,
+            "org.freedesktop.portal.Request",
+            "Response",
+        )
+        .destination(&app_unique)
+        .serial(4)
+        .body("ua{sv}", |writer| {
+            writer.uint32(0);
+            writer.array("{sv}", |_| Ok(()))
+        })
+        .expect("encode a request response")
+        .encode()
+        .expect("encode a request response");
+        portal.send(&response);
+        let frame = app.frame();
+        let (response, _) = message::decode(&frame, 0).expect("decode the response");
+        assert_eq!(response.kind, message::MessageType::Signal);
+        assert_eq!(response.fields.path, Some(request_path));
+        assert_eq!(response.fields.member, Some("Response"));
+        assert_eq!(response.fields.destination, Some(app_unique.as_str()));
+        assert_eq!(response.fields.sender, Some(portal_unique.as_str()));
+
+        let session_path = "/org/freedesktop/portal/desktop/session/1_2/shortcuts";
+        let create = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.GlobalShortcuts"),
+            "CreateSession",
+        )
+        .destination("org.freedesktop.portal.Desktop")
+        .serial(11)
+        .encode()
+        .expect("encode a session call");
+        app.send(&create);
+        let frame = portal.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode the session call");
+        assert_eq!(call.fields.sender, Some(app_unique.as_str()));
+        let answer = message::Builder::method_return(crate::wire::Endian::Little, call.serial)
+            .destination(&app_unique)
+            .serial(5)
+            .body("o", |writer| writer.object_path(session_path))
+            .expect("encode a session handle")
+            .encode()
+            .expect("encode a session answer");
+        portal.send(&answer);
+        let frame = app.frame();
+        let (answer, _) = message::decode(&frame, 0).expect("decode the session answer");
+        assert_eq!(answer.fields.reply_serial, Some(11));
+        assert_eq!(
+            answer.args().first().and_then(crate::wire::Value::as_str),
+            Some(session_path)
+        );
+
+        let closed = message::Builder::signal(
+            crate::wire::Endian::Little,
+            session_path,
+            "org.freedesktop.portal.Session",
+            "Closed",
+        )
+        .destination(&app_unique)
+        .serial(6)
+        .encode()
+        .expect("encode a session closure");
+        portal.send(&closed);
+        let frame = app.frame();
+        let (closed, _) = message::decode(&frame, 0).expect("decode the session closure");
+        assert_eq!(closed.kind, message::MessageType::Signal);
+        assert_eq!(closed.fields.path, Some(session_path));
+        assert_eq!(closed.fields.member, Some("Closed"));
+        assert_eq!(closed.fields.sender, Some(portal_unique.as_str()));
+    }
+
     /// §D's default sandboxed policy owns no name.
     #[test]
     fn a_confined_peer_may_own_no_name() {
@@ -8067,19 +8578,33 @@ mod tests {
             }
         }
 
-        // The unique name is not addressable either, which is the same rule
-        // one layer over: §D grants the NAME, and the peer behind it is not
-        // a thing the grant mentions. Reported ABSENT rather than denied, for
-        // the reason `dispatch` records where it makes that choice -- a
-        // refusal that said `AccessDenied` would announce the peer it was
-        // refusing to admit exists.
+        // The unique name is addressable while it is the current holder. A
+        // portal client resolves the public service and then directs Request
+        // and Session traffic to the sender it learned, so the alias is part
+        // of routing even though it carries no credential authority.
         caller.send(&peer_call(&unique, serial, "over here"));
-        let frame = caller.answer();
-        let (reply, _) = message::decode(&frame, 0).expect("decode");
+        let frame = holder.frame();
+        let (call, _) = message::decode(&frame, 0).expect("decode");
         assert_eq!(
-            reply.fields.error_name,
+            call.fields.destination,
+            Some(unique.as_str()),
+            "the holder's unique alias did not route"
+        );
+
+        holder.send(&release_name("org.mozilla.firefox", 3));
+        assert_eq!(name_code(&holder.answer()).0, 1);
+        let _lost = holder.frame();
+        caller.send(&peer_call(
+            &unique,
+            serial.saturating_add(1),
+            "too late",
+        ));
+        let frame = caller.answer();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            refusal.fields.error_name,
             Some("org.freedesktop.DBus.Error.NameHasNoOwner"),
-            "a granted caller addressed the holder rather than the name"
+            "the unique alias outlived its well-known name"
         );
     }
 
@@ -9368,6 +9893,288 @@ mod tests {
                 _ => self.first,
             }
         }
+    }
+
+    struct PortalProcfs {
+        supervisor: Caller,
+        child: Caller,
+        child_parent: i32,
+        supervisor_fd: std::cell::Cell<Option<RawFd>>,
+        supervisor_alive: std::cell::Cell<bool>,
+    }
+
+    impl PortalProcfs {
+        fn new(supervisor: Caller, child: Caller, child_parent: i32) -> Self {
+            Self {
+                supervisor,
+                child,
+                child_parent,
+                supervisor_fd: std::cell::Cell::new(None),
+                supervisor_alive: std::cell::Cell::new(true),
+            }
+        }
+    }
+
+    impl Procfs for PortalProcfs {
+        fn stat(&self, pid: i32) -> Reading {
+            if pid == self.supervisor.pid {
+                Reading::Of(crate::lineage::Stat {
+                    ppid: 1,
+                    starttime: self.supervisor.starttime,
+                })
+            } else if pid == self.child.pid {
+                Reading::Of(crate::lineage::Stat {
+                    ppid: self.child_parent,
+                    starttime: self.child.starttime,
+                })
+            } else {
+                Reading::Gone
+            }
+        }
+
+        fn named_by(&self, pidfd: std::os::fd::RawFd) -> Named {
+            let supervisor_fd = match self.supervisor_fd.get() {
+                Some(supervisor_fd) => supervisor_fd,
+                None => {
+                    self.supervisor_fd.set(Some(pidfd));
+                    pidfd
+                }
+            };
+            if pidfd == supervisor_fd {
+                if self.supervisor_alive.get() {
+                    Named::Pid(self.supervisor.pid)
+                } else {
+                    Named::Reaped
+                }
+            } else {
+                Named::Pid(self.child.pid)
+            }
+        }
+    }
+
+    /// Preparation is a root capability and activation belongs only to the
+    /// direct child returning its token from a separately proved socket. The
+    /// injected procfs makes the ancestry and retained-supervisor refusals
+    /// deterministic while both connections still supply real pidfds.
+    #[test]
+    fn portal_activation_requires_root_token_and_a_direct_live_child() {
+        if !pidfd_available() {
+            return;
+        }
+        let (supervisor_client, supervisor_server) = UnixStream::pair().expect("socketpair");
+        let (child_client, child_server) = UnixStream::pair().expect("socketpair");
+        let guid = Guid::new(GUID).expect("guid");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let mut supervisor_connection =
+            Connection::accept(supervisor_server, guid, &quota, &bus, &instances)
+                .expect("accept the supervisor");
+        supervisor_connection.unique = Some(":1.1".to_string());
+        let mut child_connection =
+            Connection::accept(child_server, guid, &quota, &bus, &instances)
+                .expect("accept the child");
+        child_connection.unique = Some(":1.2".to_string());
+        let supervisor = Caller {
+            pid: 4100,
+            starttime: 70,
+        };
+        let child = Caller {
+            pid: 4101,
+            starttime: 71,
+        };
+        let direct = PortalProcfs::new(supervisor, child, supervisor.pid);
+        let call = portal_prepare(&["org.freedesktop.portal.Desktop"], 2);
+        let (message, _) = message::decode(&call, 0).expect("decode Prepare");
+
+        supervisor_connection.credential.uid = 1000;
+        supervisor_connection
+            .bus_method(&message, true)
+            .expect("the non-root refusal was sent through dispatch");
+        let frame = supervisor_connection
+            .outbox
+            .take()
+            .expect("a refusal was queued");
+        assert_eq!(
+            error_of(&frame.bytes).as_deref(),
+            Some("org.freedesktop.DBus.Error.AccessDenied")
+        );
+
+        supervisor_connection.credential.uid = 0;
+        for (serial, names) in [
+            (3, Vec::new()),
+            (4, vec!["org.example.NotPortal"]),
+            (5, vec!["org.freedesktop.portal"]),
+            (
+                6,
+                vec![
+                    "org.freedesktop.portal.Desktop",
+                    "org.freedesktop.portal.Desktop",
+                ],
+            ),
+        ] {
+            let invalid = portal_prepare(&names, serial);
+            let (invalid, _) = message::decode(&invalid, 0).expect("decode Prepare");
+            supervisor_connection
+                .portal_prepare_using(&invalid, true, &direct)
+                .expect("the invalid-name refusal was sent");
+            let frame = supervisor_connection
+                .outbox
+                .take()
+                .expect("a refusal was queued");
+            assert_eq!(
+                error_of(&frame.bytes).as_deref(),
+                Some("td.Portal1.Error.Refused")
+            );
+        }
+
+        supervisor_connection
+            .portal_prepare_using(&message, true, &direct)
+            .expect("the preparation was answered");
+        let frame = supervisor_connection
+            .outbox
+            .take()
+            .expect("an answer was queued");
+        assert_eq!(error_of(&frame.bytes), None);
+        let (answer, _) = message::decode(&frame.bytes, 0).expect("decode Prepare answer");
+        let token = answer
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .expect("a token")
+            .to_string();
+
+        child_connection.credential.uid = 1000;
+        let zeros = "0".repeat(GUID_LEN);
+        let wrong_token = if token == zeros {
+            "1".repeat(GUID_LEN)
+        } else {
+            zeros
+        };
+        let wrong = portal_activate(&wrong_token, 2);
+        let (wrong, _) = message::decode(&wrong, 0).expect("decode Activate");
+        child_connection
+            .portal_activate_using(&wrong, true, &direct)
+            .expect("the wrong-token refusal was sent");
+        let frame = child_connection
+            .outbox
+            .take()
+            .expect("a refusal was queued");
+        assert_eq!(
+            error_of(&frame.bytes).as_deref(),
+            Some("td.Portal1.Error.Refused")
+        );
+        assert!(matches!(
+            bus.request_portal_name(
+                child,
+                ":1.2",
+                "org.freedesktop.portal.Desktop",
+                crate::registry::NAME_FLAG_DO_NOT_QUEUE
+            ),
+            PortalRequested::Unauthorized
+        ));
+
+        let activate = portal_activate(&token, 3);
+        let (activate, _) = message::decode(&activate, 0).expect("decode Activate");
+        child_connection
+            .portal_activate_using(&activate, true, &direct)
+            .expect("the activation was answered");
+        let frame = child_connection
+            .outbox
+            .take()
+            .expect("an answer was queued");
+        assert_eq!(error_of(&frame.bytes), None);
+        assert!(matches!(
+            bus.request_portal_name(
+                child,
+                ":1.2",
+                "org.freedesktop.portal.Desktop",
+                crate::registry::NAME_FLAG_DO_NOT_QUEUE
+            ),
+            PortalRequested::Requested(crate::registry::Requested::PrimaryOwner, Some(_))
+        ));
+
+        let reaped = PortalProcfs::new(supervisor, child, supervisor.pid);
+        let other = portal_prepare(&["org.freedesktop.impl.portal.FileChooser"], 7);
+        let (other, _) = message::decode(&other, 0).expect("decode Prepare");
+        supervisor_connection
+            .portal_prepare_using(&other, true, &reaped)
+            .expect("the replacement preparation was answered");
+        let frame = supervisor_connection
+            .outbox
+            .take()
+            .expect("an answer was queued");
+        let (answer, _) = message::decode(&frame.bytes, 0).expect("decode Prepare answer");
+        let other_token = answer
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .expect("a token")
+            .to_string();
+        reaped.supervisor_alive.set(false);
+        let other = portal_activate(&other_token, 4);
+        let (other, _) = message::decode(&other, 0).expect("decode Activate");
+        child_connection
+            .portal_activate_using(&other, true, &reaped)
+            .expect("the reaped-supervisor refusal was sent");
+        let frame = child_connection
+            .outbox
+            .take()
+            .expect("a refusal was queued");
+        assert_eq!(
+            error_of(&frame.bytes).as_deref(),
+            Some("td.Portal1.Error.Refused")
+        );
+        assert!(matches!(
+            bus.request_portal_name(
+                child,
+                ":1.2",
+                "org.freedesktop.impl.portal.FileChooser",
+                crate::registry::NAME_FLAG_DO_NOT_QUEUE
+            ),
+            PortalRequested::Unauthorized
+        ));
+
+        let indirect = PortalProcfs::new(supervisor, child, 1);
+        let last = portal_prepare(&["org.freedesktop.impl.portal.Secret"], 8);
+        let (last, _) = message::decode(&last, 0).expect("decode Prepare");
+        supervisor_connection
+            .portal_prepare_using(&last, true, &indirect)
+            .expect("the indirect preparation was answered");
+        let frame = supervisor_connection
+            .outbox
+            .take()
+            .expect("an answer was queued");
+        let (answer, _) = message::decode(&frame.bytes, 0).expect("decode Prepare answer");
+        let last_token = answer
+            .args()
+            .first()
+            .and_then(crate::wire::Value::as_str)
+            .expect("a token");
+        let last = portal_activate(last_token, 5);
+        let (last, _) = message::decode(&last, 0).expect("decode Activate");
+        child_connection
+            .portal_activate_using(&last, true, &indirect)
+            .expect("the indirect-child refusal was sent");
+        let frame = child_connection
+            .outbox
+            .take()
+            .expect("a refusal was queued");
+        assert_eq!(
+            error_of(&frame.bytes).as_deref(),
+            Some("td.Portal1.Error.Refused")
+        );
+        assert!(matches!(
+            bus.request_portal_name(
+                child,
+                ":1.2",
+                "org.freedesktop.impl.portal.Secret",
+                crate::registry::NAME_FLAG_DO_NOT_QUEUE
+            ),
+            PortalRequested::Unauthorized
+        ));
+        drop(supervisor_client);
+        drop(child_client);
     }
 
     /// Every state in which this seam must prove nothing, against a real

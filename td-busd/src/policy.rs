@@ -81,10 +81,7 @@ pub fn is_reserved_name(name: &str) -> bool {
     name == BUS_NAME
         || name == PORTAL_ROOT
         || name == IMPL_PORTAL_ROOT
-        || is_portal_name(name)
-        || name
-            .strip_prefix(IMPL_PORTAL_PREFIX)
-            .is_some_and(|rest| !rest.is_empty())
+        || is_portal_service_name(name)
 }
 
 /// Whether `caller` may take `name` as a well-known name.
@@ -114,10 +111,10 @@ pub fn is_reserved_name(name: &str) -> bool {
 /// grant can reach it. That ordering is the load-bearing part now that grants
 /// exist at all: the registration path already refuses to RECORD a reserved
 /// name, and this is the second of two independent refusals, placed where the
-/// name is actually taken. The connection that will hold the portal's names
-/// is the one a supervisor registers as the portal at startup, and that path
-/// does not exist yet, so today the reservation means the names are held by
-/// nobody. A name nobody can take is a name nobody can impersonate.
+/// name is actually taken. The portal is the one narrow exception: the root
+/// supervisor activates an exact live child for an exact set of portal names,
+/// and the directory checks that capability atomically with ownership. The
+/// general policy remains a refusal, so no same-uid peer can race a restart.
 pub fn may_own(caller: &Identity, name: &str) -> bool {
     if is_reserved_name(name) {
         return false;
@@ -145,6 +142,27 @@ pub fn may_own(caller: &Identity, name: &str) -> bool {
 pub fn is_portal_name(name: &str) -> bool {
     name.strip_prefix(PORTAL_PREFIX)
         .is_some_and(|rest| !rest.is_empty())
+}
+
+/// A reserved name a supervised portal process may be activated to own.
+///
+/// This includes the public and implementation namespaces, but not their bare
+/// roots: the roots are reserved only to keep the namespace out of general
+/// circulation and route no portal interface themselves.
+pub fn is_portal_service_name(name: &str) -> bool {
+    is_portal_name(name)
+        || name
+            .strip_prefix(IMPL_PORTAL_PREFIX)
+            .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Whether this identity may exercise a supervised portal capability.
+///
+/// Separate from `may_register`: creating a jail record and claiming a portal
+/// service are independent authorities even though both currently require a
+/// positively proved unconfined peer.
+pub fn may_hold_portal_service(caller: &Identity) -> bool {
+    matches!(caller, Identity::Unconfined)
 }
 
 /// Whether `caller` may learn that `target` exists.
@@ -207,10 +225,11 @@ pub fn may_see(caller: &Identity, own: Option<&str>, target: &str) -> bool {
 
 /// Whether `caller` may ask the broker WHO is behind `target`.
 ///
-/// Narrower than `may_see`, and the gap is exactly the permission file's
-/// grant. `own` implies `talk`, so a granted name is one the caller may look
-/// up and address — but the uid and pid behind it belong to whoever HOLDS it,
-/// which on a bus with two windows of one application is the other window.
+/// Narrower than `may_see`: neither the portal grant nor a permission file's
+/// name grant carries process identity. `own` implies `talk`, so a granted
+/// name is one the caller may look up and address — but the uid and pid behind
+/// it belong to whoever HOLDS it, which on a bus with two windows of one
+/// application is the other window.
 /// §D singles the credential methods out for precisely this: another
 /// instance's host pid is an identifier for `/proc` spelunking outside the
 /// jail and the input to the lineage walk this broker's identity story rests
@@ -218,10 +237,9 @@ pub fn may_see(caller: &Identity, own: Option<&str>, target: &str) -> bool {
 /// current holder lives. Two instances may call each other by name without
 /// either learning the other's pid.
 ///
-/// This is the set `may_see` had before the grant widened it, which is not a
-/// coincidence: the widening was about NAMES, and this function is about
-/// PEERS. Keeping them separate is what stopped the widening from quietly
-/// carrying a disclosure with it — a reviewer found that it had.
+/// Portal and permission-file widening are about NAMES, and this function is
+/// about PEERS. Keeping them separate is what stops either routing grant from
+/// quietly carrying a disclosure with it.
 ///
 /// A caller asking about a well-known name IT holds is refused too, and that
 /// is a narrower route rather than a contradiction: its own credentials are
@@ -232,7 +250,7 @@ pub fn may_ask_credentials(caller: &Identity, own: Option<&str>, target: &str) -
     match caller {
         Identity::Unconfined => true,
         Identity::Unknown(_) => told_already,
-        Identity::Jailed { .. } => told_already || is_portal_name(target),
+        Identity::Jailed { .. } => told_already,
     }
 }
 
@@ -523,8 +541,9 @@ mod tests {
         // learn before is withheld now.
         assert!(may_ask_credentials(&firefox, Some(":1.4"), ":1.4"));
         assert!(may_ask_credentials(&firefox, Some(":1.4"), BUS_NAME));
-        // And the portal, which is what the set was before the grant.
-        assert!(may_ask_credentials(
+        // Portal routing carries no authority to learn the service process's
+        // host identity.
+        assert!(!may_ask_credentials(
             &firefox,
             Some(":1.4"),
             "org.freedesktop.portal.Desktop"
@@ -591,6 +610,20 @@ mod tests {
         assert!(!is_portal_name("org.freedesktop.portal."));
         assert!(!is_portal_name("org.freedesktop.portal"));
         assert!(is_portal_name("org.freedesktop.portal.Desktop"));
+    }
+
+    #[test]
+    fn only_members_of_the_reserved_namespaces_are_portal_services() {
+        assert!(is_portal_service_name("org.freedesktop.portal.Desktop"));
+        assert!(is_portal_service_name(
+            "org.freedesktop.impl.portal.FileChooser"
+        ));
+        for root in [PORTAL_ROOT, IMPL_PORTAL_ROOT, BUS_NAME] {
+            assert!(!is_portal_service_name(root), "{root}");
+        }
+        assert!(may_hold_portal_service(&Identity::Unconfined));
+        assert!(!may_hold_portal_service(&jailed()));
+        assert!(!may_hold_portal_service(&Identity::Unknown("no proof".into())));
     }
 
     /// A peer with no name yet still gets a decision, and it is not "see

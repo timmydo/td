@@ -1280,8 +1280,9 @@ For `td-busd`, full Firefox fidelity needs:
   counts stay tied to their message even when several descriptor-bearing
   messages share one `recvmsg`; portal file results now depend on the portal
   service rather than missing broker forwarding;
-- per-instance portal activation and Request/Session handle routing. The
-  portal namespace remains reserved even while the portal is restarting;
+- per-instance portal activation and Request/Session handle routing are
+  landed. The portal namespace remains reserved even while the portal is
+  restarting; `td-portal` itself is still the service-side prerequisite;
 - a deliberate decision for the imported requests to
   `org.a11y.Bus`, `org.gtk.vfs.*`, `org.freedesktop.FileManager1` and the
   system-bus `org.freedesktop.NetworkManager`. They are not silently granted.
@@ -1294,7 +1295,8 @@ receive-side descriptor adoption, a global connection ceiling with
 per-instance admission shares, and — since the landings
 recorded in §D's "what is landed" — the per-caller filter and the per-jail
 identity it reads, authenticated pending-reply ownership, and well-known
-names with their owner queue. The first bullet above is therefore discharged
+names with their owner queue, bounded match and descriptor forwarding, and
+supervised portal activation. The first bullet above is therefore discharged
 for connection admission and routing: a
 confined connection is resolved to its instance and answered accordingly, so
 all of that instance's processes share one admission key and it cannot see or
@@ -1318,10 +1320,10 @@ enforceable, and message-type policy refuses a confined peer's directed
 signals. `RequestName` is no longer blocked on them.
 
 The image's assertion of exactly one shipped application no longer rests on
-the filter being absent. It now rests on the rest of this list — a second
-application would need names, match rules and portal routing to be useful,
-and none of those is filtered per caller yet because none of them exists. A
-second real application must not weaken that assertion.
+missing broker substrate: the filter, names, match rules and portal routing
+are all per-caller now. A second real application still needs reviewed service
+decisions and exact grants from the remaining bullets; it must not weaken the
+assertion merely because the broker mechanisms exist.
 
 For `td-compositor`, the minimum useful Firefox target is Software WebRender
 over `wl_shm`; dmabuf must remain unadvertised until it works. The platform
@@ -3389,7 +3391,10 @@ connection, and announcing the assigned name like any other name gained),
 `GetNameOwner`, `GetConnectionUnixUser`, `GetConnectionUnixProcessID`,
 `GetConnectionCredentials`, `AddMatch`, `RemoveMatch`, `GetId` and
 `Peer.Ping`, plus `NameAcquired`, `NameLost`, and filtered
-`NameOwnerChanged` signals. A `Hello` that omits
+`NameOwnerChanged` signals. The private two-phase `td.Portal1.Prepare` and
+`td.Portal1.Activate` supervisor capability is landed at `/td/Portal1`; its
+exact process-and-name rules are recorded in the reservation subsection
+below. A `Hello` that omits
 its `DESTINATION` is accepted, because there is nothing else a connection
 with no name could be addressing — the broker is the only peer it can
 reach — and requiring the field made the no-destination case unreachable
@@ -3460,14 +3465,14 @@ it is one more reason the image pins 7.x. Nothing else — §D's default sandbox
 portal and the `org.freedesktop.DBus` subset, and the portal is how a
 sandbox asks for anything outside itself.
 
-Three consequences worth stating rather than discovering. First, until
-`td-portal` exists and can own a portal name, a confined application can
-reach the BROKER and nothing else; the portal side of the policy names a
-namespace nobody can yet own, so it is written and unexercised rather than
-"built". That is the honest state, not a defect, and it is why the portal
-bullets remain in §B.3.2. Second, an instance's connections cannot see EACH
-OTHER: §D's default grants the portal and the broker, and same-instance
-peer-to-peer traffic is not among them. If a real application turns out to
+Three consequences worth stating rather than discovering. First, `td-portal`
+does not exist yet, so a confined application on the shipped image can reach
+the BROKER and no portal service. The activation and routing substrate is
+exercised by wire-level broker tests rather than by a shipped service; this is
+why the service-side portal bullets remain in §B.3.2. Second, an instance's
+connections cannot see EACH OTHER: §D's default grants the portal and the
+broker, and same-instance peer-to-peer traffic is not among them. If a real
+application turns out to
 need it, that is a reviewed widening with its own argument, not something to
 assume. Third, this filter decides WHO may be addressed and not WHAT may
 be sent; message type is a separate rule, and it now exists — a confined
@@ -3477,8 +3482,10 @@ paragraphs later in this section.
 What this filter does NOT make private is everything a peer shares with
 every other peer rather than learns by asking. Unique names are handed out
 from one sequential counter and never reused, so a peer that reconnects can
-count the arrivals it did not see. Admission is capped globally and before
-identity is resolved. The outgoing budget is bus-wide, and §D's remedy for
+count the arrivals it did not see. Admission takes a cheap global and
+provisional per-process reservation before the lineage walk, then atomically
+converts it to the registered instance's bounded share; unprovable peers share
+one fail-closed key. The outgoing budget is bus-wide, and §D's remedy for
 exhausting it disconnects the LARGEST CONSUMER — which is a receiver, so a
 peer permitted to talk to the portal can pressure the portal off the bus by
 talking to it. These are shared-resource observation and denial of service,
@@ -3904,10 +3911,10 @@ secret spent as a name stops being one.
 
 The **service list is empty**, and that is the honest statement rather
 than a placeholder. Predeclared names are for app-local activation, which
-needs `RequestName` and the activation path in §D. `RequestName` now exists;
-activation does not, and an instance still owns none — not for want of the
-method but because §D's default sandboxed policy grants no name and nothing
-yet carries a permission file's `own` entries to the broker.
+remains absent and is separate from both well-known-name ownership and
+supervised portal startup. `RequestName` and the permission file's exact
+`own` entries are landed; the empty service list says only that td-jail
+starts no app-local D-Bus service.
 
 **Both orderings in the list above are pinned by a source-level test**,
 in `td-jail/src/main.rs`'s confinement module, because no type expresses
@@ -4248,46 +4255,32 @@ can reach ANY interface the portal's connection serves, not only the portal
 ones §D enumerates. Three things bound it today. The holder of a portal name
 will be the connection a supervisor registers as the portal, which is a
 td-owned program rather than an arbitrary peer. Nobody can hold a portal
-name at all until that path exists. And the sandbox cannot reach the
-holder's UNIQUE name — `may_talk` refuses it — so the only way in is the
-name it was granted. Narrowing the grant to an interface set is a real
-option and a separate decision: it has to keep `Peer.Ping` and
+name without that capability. And a holder's UNIQUE name is an alias only
+while it holds a well-known name the sandbox may address; losing the name
+atomically loses that alias. Narrowing the grant to an interface set is a
+real option and a separate decision: it has to keep `Peer.Ping` and
 `Introspectable.Introspect` working, which every toolkit calls, so it
 belongs with the portal landing rather than with the machinery that makes
 names holdable.
 
 **Seeing a name includes learning who holds it.** `GetNameOwner` answers
 with the holder's unique name to any caller that may `see` the name asked
-about, without separately asking whether it may see that unique name. That
-is deliberate: it is the question the method exists to answer, and a client
-that cannot resolve a name cannot match the `SENDER` of the replies and
-signals that come back from it, which is how a D-Bus client knows the
-portal's traffic is the portal's. What does NOT follow is reach or
-identity — the caller still may not ADDRESS that unique name, and
-`GetConnectionUnixUser`/`GetConnectionUnixProcessID`/`GetConnectionCredentials`
-still refuse to say anything about it, so the host pid this design's whole
-identity story rests on stays withheld.
+about. The same current-holder alias is visible and addressable when the
+caller may see and talk to at least one well-known name that connection
+currently holds. That is deliberate: a client must resolve a name to match
+the `SENDER` of replies and signals, and portal Request and Session traffic
+may be directed to the unique sender it learned. The authorization, ownership
+check and route share the directory lock, so a connection that loses the
+well-known name loses the alias before another message can route through it.
 
-That combination is not yet coherent, and saying so is better than
-pretending otherwise: a caller ends up holding an answer it can do nothing
-with. It is REACHABLE now. It was not when this paragraph was written — the
-only names a confined caller could see were portal names and nobody could
-hold one — but a permission file's `own` entries are names a confined caller
-both sees and may be told the holder of, so a second window of an application
-can resolve its own well-known name to a `:1.N` it may not then address or
-ask the credentials of. Nothing in §B.3.2's flows needs to: a call goes to
-the NAME and the reply comes back through the pending-reply table, so the
-unique name is a fact with no use rather than a missing capability. The
-portal makes the same shape matter more, since a sandbox resolving
-`org.freedesktop.portal.Desktop` to `:1.N` finds that everything it may do
-with the name it may not do with the answer.
-
-The likely resolution is that a caller which may see a NAME may also see and
-address its HOLDER. That is a policy widening, so it belongs with the portal
-landing where it can be exercised rather than ahead of it — but it is no
-longer a hypothetical, and the first thing that landing must decide is
-whether `GetNameOwner` should have been answering a unique name to a confined
-caller at all.
+**The alias does not carry credentials.**
+`GetConnectionUnixUser`, `GetConnectionUnixProcessID` and
+`GetConnectionCredentials` do not follow a visible well-known name to its
+holder and do not admit the holder's unique alias. A peer may ask about its
+own unique name, and a holder asking about its own well-known name is answered
+about itself; another application or the portal remains absent to those
+queries. The host pid this design's identity story rests on therefore stays
+withheld even though the routing identity is usable.
 
 **A sandboxed application owns the names its permission file grants it, and
 nobody at all may own a reserved one.** §D's default sandboxed policy owns no
@@ -4364,10 +4357,27 @@ precisely the caller the reservation exists to refuse. It is refused twice
 independently: once where a registration would record it, so a file that
 claims it fails at launch rather than at first use, and once where the name
 would be taken, which is the refusal that holds if the first is ever bypassed.
-The connection that will hold those names is the one a supervisor registers as
-the portal at startup, and that path does not exist yet, so today the
-reservation means they are held by nobody. A name nobody can take is a name
-nobody can impersonate.
+The crossing is explicit and narrow. A root, unconfined supervisor calls
+`td.Portal1.Prepare(as names) -> s token` at `/td/Portal1`; the list is
+bounded to the same 32-name ownership ceiling and contains distinct exact
+members of the public or implementation portal namespaces. The broker proves
+the supervisor from its socket and retains that process's pidfd with the
+token. The intended portal child then calls
+`td.Portal1.Activate(s token) -> ()` from its own connection. That connection
+is pidfd-bracketed, and activation succeeds only while the retained
+supervisor is still the same live process and the caller is its direct child.
+No peer-supplied pid selects the portal process.
+
+Successful activation atomically replaces the active process-and-name grant
+and removes every owned or queued reserved-name claim the replacement no
+longer authorizes. A hung predecessor therefore cannot keep the service, and
+a queued predecessor cannot be promoted later. Only an unconfined connection
+proved to be the activated `{pid, starttime}` may claim an exact granted name
+through `RequestName`; that capability check and ownership change are one
+directory operation. Pid reuse and an ordinary same-uid peer inherit neither
+the capability nor a queued claim. The bare namespace roots never cross the
+reservation. `td-svc` does not call these methods yet because `td-portal`
+itself is not landed; the broker substrate no longer blocks that integration.
 
 **A callee that never answers is still not bounded in TIME.** An entry
 leaves the table when the call is answered, when the call could not be
@@ -4676,9 +4686,10 @@ peer's uid and pid out of `GetConnectionCredentials`, and send a directed
 call to any of them, with no call/reply pairing to stop a forged
 `METHOD_RETURN`. Rungs 15a–15c and the match-rule landing closed those
 broker-policy gaps. A confined peer now resolves to a jail identity taken from
-`SO_PEERPIDFD` at accept; it sees, addresses and may be told the
-credentials of only the portal, its own name, and the names its
-permission file grants; well-known names and a bounded owner queue exist;
+`SO_PEERPIDFD` at accept; it sees and addresses the portal, its own name, the
+names its permission file grants, and the current unique-name holders of
+those well-known names. It may be told credentials only for the broker and
+itself; well-known names and a bounded owner queue exist;
 and a reply is delivered only against a call the broker actually routed;
 matched broadcasts are delivered once and filtered by the same visibility
 policy. Admission now resolves that identity before taking a place and keys
@@ -4709,10 +4720,11 @@ to cover more than it does is worse than no gate. It counts
 APPLICATIONS; the exposures are about PEERS.
 
 - **`td-portal` will not trip it.** It is the next thing that will speak
-  D-Bus and it is not a `ShippedApplication`. On the day it lands a
-  jailed application can enumerate its unique name, read its uid and pid,
-  call it directly and aim a forged reply serial at a call it is waiting
-  on — with the count still one and the build still green.
+  D-Bus and it is not a `ShippedApplication`. The broker now reserves and
+  activates its exact names, hides its credentials, authenticates replies,
+  and routes directed handles with the count still one. The service's own
+  methods, handle lifecycle and compositor authority are the new surface the
+  tripwire cannot grade.
 - **One application is already two peers.** Nothing takes a
   single-instance lock, and the image has two launch routes for the
   fixture: the `jail-fixture` unit and the compositor's launcher menu.
@@ -4744,7 +4756,12 @@ exported *before* the method reply, closing the subscription race.
 Sessions use `…/session/1_42/<token>` with `Close`/`Closed`. Responses:
 0 success, 1 cancelled, 2 other. Getting this exactly right unblocks
 every toolkit and getting it subtly wrong fails as timeouts, so its tests
-are wire-level fixtures against the spec.
+are wire-level fixtures against the spec. The broker half is landed and has
+wire-level coverage: a jailed call reaches the activated public portal name,
+the authenticated method reply returns a Request or Session object path, and
+the portal's directed `Response` or `Closed` signal reaches only that caller.
+Export-before-reply and the handle objects themselves remain `td-portal`
+service work.
 
 ### Order
 
