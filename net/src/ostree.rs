@@ -18,17 +18,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use td_engine::ostree::{
-    self, ArchiveFileKind, Checksum, Commit, DirectoryEntry, Dirtree, MAX_ARCHIVE_FILE_BYTES,
-    MAX_ARCHIVE_INPUT_BYTES, MAX_METADATA_BYTES,
+    self, ArchiveFileKind, Checksum, Commit, DirectoryEntry, Dirtree, GraphLimits, ObjectKey,
+    ObjectKind, GRAPH_LIMITS, MAX_ARCHIVE_FILE_BYTES, MAX_GRAPH_DECODED_BYTES, MAX_GRAPH_OBJECTS,
+    MAX_GRAPH_PATHS, MAX_GRAPH_TOTAL_PATH_BYTES, MAX_GRAPH_TRANSFER_BYTES,
 };
 
-pub(crate) const MAX_GRAPH_OBJECTS: usize = 300_000;
-pub(crate) const MAX_GRAPH_PATHS: usize = 262_144;
-pub(crate) const MAX_GRAPH_PATH_BYTES: usize = 4_095;
-pub(crate) const MAX_GRAPH_TOTAL_PATH_BYTES: u64 = 64 * 1024 * 1024;
-pub(crate) const MAX_GRAPH_TRANSFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-pub(crate) const MAX_GRAPH_DECODED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_GRAPH_DEPTH: usize = 256;
 const MAX_FETCH_WORKERS: usize = 16;
 const MAX_FILE_FETCH_WORKERS: usize = 8;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
@@ -38,27 +32,6 @@ const OWNER_STAGING_NAME: &str = "td-ostree-cache.v1.staging";
 const RESERVATION_NAME: &str = "reservation";
 const MAX_OWNER_BYTES: u64 = 4 * 1024;
 const MAX_GRAPH_FETCH_TIME: Duration = Duration::from_secs(12 * 60 * 60);
-
-#[derive(Clone, Copy)]
-struct GraphLimits {
-    objects: usize,
-    paths: usize,
-    path_bytes: usize,
-    total_path_bytes: u64,
-    transfer_bytes: u64,
-    decoded_bytes: u64,
-    depth: usize,
-}
-
-const GRAPH_LIMITS: GraphLimits = GraphLimits {
-    objects: MAX_GRAPH_OBJECTS,
-    paths: MAX_GRAPH_PATHS,
-    path_bytes: MAX_GRAPH_PATH_BYTES,
-    total_path_bytes: MAX_GRAPH_TOTAL_PATH_BYTES,
-    transfer_bytes: MAX_GRAPH_TRANSFER_BYTES,
-    decoded_bytes: MAX_GRAPH_DECODED_BYTES,
-    depth: MAX_GRAPH_DEPTH,
-};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AcquireSpec {
@@ -76,7 +49,7 @@ impl AcquireSpec {
         content: &str,
     ) -> Result<Self, String> {
         let repository = normalize_repository(repository)?;
-        validate_exact_ref(exact_ref)?;
+        ostree::validate_exact_ref(exact_ref)?;
         Ok(Self {
             repository,
             exact_ref: exact_ref.to_string(),
@@ -100,55 +73,6 @@ pub(crate) struct GraphStats {
     pub(crate) path_bytes: u64,
     pub(crate) decoded_bytes: u64,
     pub(crate) transfer_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ObjectKind {
-    Commit,
-    Dirtree,
-    Dirmeta,
-    File,
-}
-
-impl ObjectKind {
-    fn suffix(self) -> &'static str {
-        match self {
-            Self::Commit => "commit",
-            Self::Dirtree => "dirtree",
-            Self::Dirmeta => "dirmeta",
-            Self::File => "filez",
-        }
-    }
-
-    fn max_transfer(self) -> Result<u64, String> {
-        let limit = match self {
-            Self::File => MAX_ARCHIVE_INPUT_BYTES,
-            Self::Commit | Self::Dirtree | Self::Dirmeta => MAX_METADATA_BYTES,
-        };
-        u64::try_from(limit).map_err(|_| "OSTree object limit does not fit u64".to_string())
-    }
-
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "commit" => Ok(Self::Commit),
-            "dirtree" => Ok(Self::Dirtree),
-            "dirmeta" => Ok(Self::Dirmeta),
-            "filez" => Ok(Self::File),
-            _ => Err(format!("unknown OSTree object kind {value:?}")),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ObjectKey {
-    kind: ObjectKind,
-    checksum: Checksum,
-}
-
-impl ObjectKey {
-    fn new(kind: ObjectKind, checksum: Checksum) -> Self {
-        Self { kind, checksum }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,48 +210,12 @@ fn normalize_repository(repository: &str) -> Result<String, String> {
     Ok(normalized.to_string())
 }
 
-fn validate_exact_ref(exact_ref: &str) -> Result<(), String> {
-    if exact_ref.len() > 512 {
-        return Err("OSTree ref exceeds its 512-byte limit".into());
-    }
-    let parts: Vec<&str> = exact_ref.split('/').collect();
-    if parts.len() != 4 || !matches!(parts.first().copied(), Some("app" | "runtime")) {
-        return Err("OSTree ref must be app/NAME/ARCH/BRANCH or runtime/NAME/ARCH/BRANCH".into());
-    }
-    for part in parts.iter().skip(1) {
-        if part.is_empty()
-            || matches!(*part, "." | "..")
-            || !part
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
-            return Err(format!("OSTree ref component {part:?} is unsafe"));
-        }
-    }
-    Ok(())
-}
-
-fn object_relative_path(key: ObjectKey) -> Result<String, String> {
-    let hex = key.checksum.to_hex();
-    let prefix = hex
-        .get(..2)
-        .ok_or_else(|| "OSTree checksum has no two-byte path prefix".to_string())?;
-    let tail = hex
-        .get(2..)
-        .ok_or_else(|| "OSTree checksum has no path tail".to_string())?;
-    Ok(format!("objects/{prefix}/{tail}.{}", key.kind.suffix()))
-}
-
 fn object_path(root: &Path, key: ObjectKey) -> Result<PathBuf, String> {
-    Ok(root.join(object_relative_path(key)?))
+    Ok(root.join(key.relative_path()?))
 }
 
 fn object_url(spec: &AcquireSpec, key: ObjectKey) -> Result<String, String> {
-    Ok(format!(
-        "{}/{}",
-        spec.repository,
-        object_relative_path(key)?
-    ))
+    Ok(format!("{}/{}", spec.repository, key.relative_path()?))
 }
 
 fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
@@ -908,22 +796,6 @@ impl PathBudget {
     }
 }
 
-fn child_path(parent: &str, name: &str, max_bytes: usize) -> Result<String, String> {
-    let needed = parent
-        .len()
-        .checked_add(usize::from(!parent.is_empty()))
-        .and_then(|length| length.checked_add(name.len()))
-        .ok_or_else(|| "OSTree deploy path length overflow".to_string())?;
-    if needed > max_bytes {
-        return Err(format!("OSTree deploy path exceeds {max_bytes} bytes"));
-    }
-    if parent.is_empty() {
-        Ok(name.to_string())
-    } else {
-        Ok(format!("{parent}/{name}"))
-    }
-}
-
 fn expand_directory(
     task: &DirectoryTask,
     tree: &Dirtree,
@@ -932,7 +804,7 @@ fn expand_directory(
     next: &mut Vec<DirectoryTask>,
 ) -> Result<(), String> {
     for file in &tree.files {
-        let path = child_path(&task.path, &file.name, paths.limits.path_bytes)?;
+        let path = ostree::join_deploy_path(&task.path, &file.name, paths.limits.path_bytes)?;
         paths.admit(&path)?;
         let references = files.entry(file.checksum).or_insert(0);
         *references = references
@@ -940,7 +812,7 @@ fn expand_directory(
             .ok_or_else(|| "OSTree file reference count overflow".to_string())?;
     }
     for directory in &tree.directories {
-        let path = child_path(&task.path, &directory.name, paths.limits.path_bytes)?;
+        let path = ostree::join_deploy_path(&task.path, &directory.name, paths.limits.path_bytes)?;
         paths.admit(&path)?;
         paths.directories = paths
             .directories
@@ -2020,7 +1892,7 @@ mod tests {
     }
 
     fn insert_object(objects: &mut BTreeMap<String, Vec<u8>>, key: ObjectKey, bytes: Vec<u8>) {
-        objects.insert(format!("/{}", object_relative_path(key).unwrap()), bytes);
+        objects.insert(format!("/{}", key.relative_path().unwrap()), bytes);
     }
 
     fn synthetic_graph_with_files(
@@ -2177,7 +2049,7 @@ mod tests {
             "app/org.mozilla.firefox/x86_64/..",
             "sdk/org.example/x86_64/stable",
         ] {
-            assert!(validate_exact_ref(bad).is_err(), "{bad}");
+            assert!(ostree::validate_exact_ref(bad).is_err(), "{bad}");
         }
         assert!(normalize_repository("http://example.com/repo").is_err());
         assert!(normalize_repository("http://127.0.0.1:1234/repo").is_ok());
@@ -2193,14 +2065,15 @@ mod tests {
             Checksum::from_hex("86ba63a1c2378a9525b495e1ba2c3ed9dc71ee92f67e45d8016cc4972024b410")
                 .unwrap();
         assert_eq!(
-            object_relative_path(ObjectKey::new(ObjectKind::Commit, checksum)).unwrap(),
+            ObjectKey::new(ObjectKind::Commit, checksum)
+                .relative_path()
+                .unwrap(),
             "objects/86/ba63a1c2378a9525b495e1ba2c3ed9dc71ee92f67e45d8016cc4972024b410.commit"
         );
-        assert!(
-            object_relative_path(ObjectKey::new(ObjectKind::File, checksum))
-                .unwrap()
-                .ends_with(".filez")
-        );
+        assert!(ObjectKey::new(ObjectKind::File, checksum)
+            .relative_path()
+            .unwrap()
+            .ends_with(".filez"));
     }
 
     #[test]

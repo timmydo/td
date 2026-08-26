@@ -1207,18 +1207,31 @@ The importer contract is narrower than Flatpak:
    and every fetched object hash then preserve that decision during builds.
 2. Only the two commit-reachable `files/` trees are materialized. Summary
    browsing, updates, installation state, exports, permissions and activation
-   metadata are not imported. The target has no OSTree or Flatpak code.
+   metadata are not imported. No application runtime, launcher or image service
+   has OSTree or Flatpak code. The target-built control-plane programs retain
+   the same bounded importer so td can reproduce builds on td; the current boot
+   image does not ship those programs.
 3. The object count, aggregate decoded bytes, path count, path length and file
    size are bounded before publication. Hash, type, mode or tree-reference
    mismatches fail closed, and a temporary tree is renamed into place only
    after complete validation.
 4. Device nodes, FIFOs, sockets, setid/sticky bits and file capabilities are
    refused. So are all xattrs and ACLs, rather than copying only the ones the
-   importer understands. Every node is materialized as root-owned, timestamps
-   are normalized to a fixed value, and directory and regular-file modes are
-   canonicalized. Symlinks are retained only when lexical resolution stays in
-   the assembled `/app` or `/usr` trees or names an explicitly synthesized
-   jail path. The current application has 102 absolute locale links under
+   importer understands. Imported uid/gid and timestamps are never authority:
+   the host staging tree discards them, canonical recursive-store interning
+   retains only NAR's structure, content, symlink target and executable bit,
+   and the deterministic image writer emits the deployed nodes as root-owned
+   with epoch timestamps. Directory modes become 0755 and regular-file modes
+   become 0755 or 0644 from the authenticated executable bit before interning.
+   Symlinks are retained only when lexical resolution stays in the assembled
+   `/app` or `/usr` trees or names the closed application namespace roster:
+   td-jail's current roots plus `/bin`, `/lib`, `/lib64` and `/sbin`, which the
+   later jail integration must synthesize as `/usr` aliases before admission.
+   They are not current td-jail roots. A direct or lexically normalized
+   `/run/host` target is refused here. The later assembled-tree validator
+   resolves symlink chains and must refuse every indirect route to `/run/host`
+   before the package is admitted. The current application has 102 absolute
+   locale links under
    `/app`; selecting or omitting the locale extension must be explicit rather
    than leaving an accidental set of dangling links.
 5. td generates the manifest, spec and launcher from reviewed typed data after
@@ -1306,9 +1319,45 @@ Firefox and runtime graph counts above are permanent reviewed pin evidence and
 were reauthenticated offline during this landing, not downloaded test
 fixtures. The `net-test` affected-checks preflight runs the td-net suite for
 net and td-engine changes.
-Transactional payload materialization remains part of E1b.
-Authenticated symlink targets remain opaque content here; materialization must
-create each link without following it while resolving the destination path.
+**The transactional deploy-tree materializer has now LANDED.**
+`td-builder ostree-materialize` takes the cache plus the reviewed exact ref,
+commit and content checksums. It ignores the cache manifest as authority,
+re-authenticates the commit and every reachable metadata/file object, repeats
+the acquisition graph bounds, and walks only `files/`. Unique regular objects
+are decoded once into private staging and hard-linked to authenticated paths
+while the filesystem link-count ceiling permits it. Later references receive
+independent files with the same canonical content, mode and timestamp.
+Symlinks are created only after their path resolves within the closed
+namespace roster above. Target existence is checked only after the selected
+app, runtime and required `/usr` aliases are assembled, since a link may
+intentionally cross those trees; this materializer admits the namespace, not
+an accidental extension set. The `/app` or `/usr` interpretation is derived
+from the authenticated `app/` or `runtime/` ref, never supplied as a second
+role input.
+Acquisition and materialization use the same engine-owned object-kind, suffix,
+fanout-path and deploy-path definitions as well as the same graph bounds.
+
+The destination must be absent. It appears through one
+`renameat2(RENAME_NOREPLACE)` only after the complete tree, files and directory
+metadata have been synchronized, so a concurrent writer or intervening empty
+directory is refused rather than replaced. That rename is the commit point:
+pre-publication failure removes normal-process staging and leaves no
+destination, while a later parent-directory sync or empty-staging cleanup
+failure reports a warning beside the committed complete tree rather than a
+false failure that poisons retries. Staging, destination and cleanup paths are
+addressed below the held destination-parent descriptor through `/proc/self/fd`,
+so a renamed or retargeted caller path cannot split their directory identity.
+Abrupt process death can leave an inert
+private sibling directory; it is never mistaken for a deploy. The next typed
+caller that owns the cache scratch must also own bounded stale-staging cleanup.
+Symlink timestamps are staging-clock values because safe `std` has no
+no-follow timestamp setter; recursive store interning ignores timestamps and
+the deterministic image writer restamps every node, so they are not artifact
+authority. The real Firefox and runtime caches materialize with exactly the
+357/14,346 object, 480/18,196 path and decoded-byte counts recorded above.
+Typed recipe pins, automatic warming and recursive store admission remain the
+next E1b increment; the CLI alone does not make an arbitrary cache a recipe
+input.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
@@ -6917,7 +6966,7 @@ The experiments that settle what is left, none longer than a week:
 | # | experiment | settles |
 |---|---|---|
 | **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split and has no special or setid files. Publisher estimates total 993.7 MB deployed and 382.7 MB downloaded; the bounded importer records exact authenticated graph totals separately. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
-| **E1b — acquisition landed; materialization remains** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication and transactional cache publication are landed and exercised against both pins. Transactional deploy materialization and recipe/store integration remain. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
+| **E1b — acquisition and deploy materialization landed; typed recipe admission remains** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication, transactional cache publication and transactional `files/` reconstruction are landed and exercised against both pins. Typed recipe pins, automatic warming and recursive store admission remain. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000`, with active membership and exact controller readback gating the QEMU oracle | §P's mechanism works on the target kernel |

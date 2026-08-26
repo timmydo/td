@@ -8,9 +8,11 @@ and the code disagree, one of them is a bug.
 
 ## The rule
 
-In the control-plane engine the only `unsafe` is the raw-syscall layer
-(`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`), which carry
-`#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
+In the control-plane engine `unsafe` is confined to the raw-syscall layer
+in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
+`sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
+can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
+no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
 `recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are ELEVEN
 target-side exceptions, each a standalone crate OUTSIDE the
@@ -56,8 +58,24 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
-rule above and is not part of this numbering: it is host-side, and no
-target artifact contains it.
+rule above and is not part of this numbering. This is a program-role boundary,
+not a build-provenance boundary: both the host-seeded builder and the later
+target-built builder contain it. The latter is a distribution artifact used to
+build td on td, but the current boot image does not ship builder and no
+application runtime reaches this surface.
+
+That host-side layer includes `renameat2(2)` with both directory descriptors
+fixed to `AT_FDCWD` and flags fixed to `RENAME_NOREPLACE`. Its only caller is
+the authenticated OSTree deploy materializer. Stable `std::fs::rename`
+replaces an empty destination directory, so checking absence before a large
+deploy is decoded leaves a writer race in which one complete result can
+silently replace another. The raw wrapper makes absence part of the atomic
+publication operation. It accepts two NUL-free paths but no caller-selected
+directory descriptor or flags word. The materializer constructs both paths
+below `/proc/self/fd/N` while it holds `N` as the opened destination parent, so
+staging, publication, cleanup and parent synchronization retain one directory
+identity even if its caller-visible path is retargeted. A second caller,
+another flag, or another `*at` operation is an amendment here.
 
 ## 1. `td-kexec` — the guest kexec helper
 

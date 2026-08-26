@@ -19,6 +19,35 @@ pub const MAX_ARCHIVE_INPUT_BYTES: usize = 257 * 1024 * 1024;
 pub const MAX_ARCHIVE_FILE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_ARCHIVE_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_SYMLINK_TARGET_BYTES: usize = 4 * 1024 - 1;
+pub const MAX_GRAPH_OBJECTS: usize = 300_000;
+pub const MAX_GRAPH_PATHS: usize = 262_144;
+pub const MAX_GRAPH_PATH_BYTES: usize = 4_095;
+pub const MAX_GRAPH_TOTAL_PATH_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_GRAPH_TRANSFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_GRAPH_DECODED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_GRAPH_DEPTH: usize = 256;
+
+/// Resource policy shared by OSTree acquisition and materialization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphLimits {
+    pub objects: usize,
+    pub paths: usize,
+    pub path_bytes: usize,
+    pub total_path_bytes: u64,
+    pub transfer_bytes: u64,
+    pub decoded_bytes: u64,
+    pub depth: usize,
+}
+
+pub const GRAPH_LIMITS: GraphLimits = GraphLimits {
+    objects: MAX_GRAPH_OBJECTS,
+    paths: MAX_GRAPH_PATHS,
+    path_bytes: MAX_GRAPH_PATH_BYTES,
+    total_path_bytes: MAX_GRAPH_TOTAL_PATH_BYTES,
+    transfer_bytes: MAX_GRAPH_TRANSFER_BYTES,
+    decoded_bytes: MAX_GRAPH_DECODED_BYTES,
+    depth: MAX_GRAPH_DEPTH,
+};
 
 const DIRECTORY_TYPE: u32 = 0o040000;
 const REGULAR_TYPE: u32 = 0o100000;
@@ -80,6 +109,109 @@ impl Checksum {
         }
         out
     }
+}
+
+/// One object kind in the closed OSTree cache layout shared by acquisition
+/// and materialization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ObjectKind {
+    Commit,
+    Dirtree,
+    Dirmeta,
+    File,
+}
+
+impl ObjectKind {
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Dirtree => "dirtree",
+            Self::Dirmeta => "dirmeta",
+            Self::File => "filez",
+        }
+    }
+
+    pub fn max_transfer(self) -> Result<u64, String> {
+        let limit = match self {
+            Self::File => MAX_ARCHIVE_INPUT_BYTES,
+            Self::Commit | Self::Dirtree | Self::Dirmeta => MAX_METADATA_BYTES,
+        };
+        u64::try_from(limit).map_err(|_| "OSTree object limit does not fit u64".to_string())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "commit" => Ok(Self::Commit),
+            "dirtree" => Ok(Self::Dirtree),
+            "dirmeta" => Ok(Self::Dirmeta),
+            "filez" => Ok(Self::File),
+            _ => Err(format!("unknown OSTree object kind {value:?}")),
+        }
+    }
+}
+
+/// A checksum-addressed object in the shared OSTree cache layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ObjectKey {
+    pub kind: ObjectKind,
+    pub checksum: Checksum,
+}
+
+impl ObjectKey {
+    pub fn new(kind: ObjectKind, checksum: Checksum) -> Self {
+        Self { kind, checksum }
+    }
+
+    pub fn relative_path(self) -> Result<String, String> {
+        let checksum = self.checksum.to_hex();
+        let prefix = checksum
+            .get(..2)
+            .ok_or_else(|| "OSTree checksum has no fanout prefix".to_string())?;
+        let tail = checksum
+            .get(2..)
+            .ok_or_else(|| "OSTree checksum has no object tail".to_string())?;
+        Ok(format!("objects/{prefix}/{tail}.{}", self.kind.suffix()))
+    }
+}
+
+/// Join one parser-validated OSTree name to a bounded deploy path.
+pub fn join_deploy_path(parent: &str, name: &str, max_bytes: usize) -> Result<String, String> {
+    let length = parent
+        .len()
+        .checked_add(usize::from(!parent.is_empty()))
+        .and_then(|value| value.checked_add(name.len()))
+        .ok_or_else(|| "OSTree deploy path length overflow".to_string())?;
+    if length > max_bytes {
+        return Err(format!("OSTree deploy path exceeds {max_bytes} bytes"));
+    }
+    if parent.is_empty() {
+        Ok(name.to_string())
+    } else {
+        Ok(format!("{parent}/{name}"))
+    }
+}
+
+/// Validate the exact Flatpak ref grammar shared by graph acquisition and
+/// deploy materialization.
+pub fn validate_exact_ref(exact_ref: &str) -> Result<(), String> {
+    if exact_ref.len() > 512 {
+        return Err("OSTree ref exceeds its 512-byte limit".into());
+    }
+    let parts: Vec<&str> = exact_ref.split('/').collect();
+    if parts.len() != 4 || !matches!(parts.first().copied(), Some("app" | "runtime")) {
+        return Err("OSTree ref must be app/NAME/ARCH/BRANCH or runtime/NAME/ARCH/BRANCH".into());
+    }
+    for part in parts.iter().skip(1) {
+        if part.is_empty()
+            || matches!(*part, "." | "..")
+            || !part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(format!("OSTree ref component {part:?} is unsafe"));
+        }
+    }
+    Ok(())
 }
 
 fn hex_digit(nibble: u8) -> char {
@@ -1867,5 +1999,30 @@ mod tests {
         assert!(parse_commit_verified(wrong, &bytes)
             .unwrap_err()
             .contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn shared_cache_layout_and_deploy_path_are_closed() {
+        let checksum = Checksum([0xab; CHECKSUM_BYTES]);
+        assert_eq!(
+            ObjectKey::new(ObjectKind::Commit, checksum)
+                .relative_path()
+                .unwrap(),
+            format!("objects/ab/{}.commit", "ab".repeat(31))
+        );
+        assert_eq!(
+            ObjectKey::new(ObjectKind::File, checksum)
+                .relative_path()
+                .unwrap(),
+            format!("objects/ab/{}.filez", "ab".repeat(31))
+        );
+        assert_eq!(
+            join_deploy_path("share", "icons", 11).unwrap(),
+            "share/icons"
+        );
+        assert!(join_deploy_path("share", "icons", 10).is_err());
+        assert!(ObjectKind::parse("file").is_err());
+        assert!(validate_exact_ref("app/example.App/x86_64/stable").is_ok());
+        assert!(validate_exact_ref("usr/example.App/x86_64/stable").is_err());
     }
 }
