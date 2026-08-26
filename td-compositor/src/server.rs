@@ -327,9 +327,12 @@ enum Object {
         /// would come to name whatever took it next, which is a menu placed
         /// on a window that never opened it.
         parent: Option<u32>,
-        /// Where the rules put it, resolved once at `get_popup` and copied here
-        /// for the reason above.
-        rect: PositionerRect,
+        /// The positioner's copied rules and the first placement derived from
+        /// them. Resolution waits until the popup's initial configure so the
+        /// parent has reached the scene and the usable output is current. The
+        /// answer is then retained because version 1 cannot reposition it.
+        rules: Positioner,
+        rect: Option<PositionerRect>,
         /// Whether this popup OBJECT has been sent its `xdg_popup.configure`.
         /// Per object rather than per mapping, which is the scope the protocol
         /// uses: "for version 2 or older, the configure event for an xdg_popup
@@ -2322,21 +2325,52 @@ impl Client {
                             // send, so the lock is not held across it.
                             self.undismiss_popup(id)?;
                             let Some(Object::XdgPopup {
-                                rect,
+                                parent,
+                                rules,
                                 configure_sent,
                                 ..
-                            }) = self.objects.get_mut(&popup_object)
+                            }) = self.objects.get(&popup_object).cloned()
                             else {
                                 return Err(format!(
                                     "xdg_surface {role} names a missing xdg_popup {popup_object}"
                                 ));
                             };
                             // A RE-MAP gets the xdg_surface half alone; see
-                            // `configure_sent`. Held mutably across the send
-                            // so the flag is set from the same lookup that
-                            // read it — `outbound` is a disjoint field, so the
-                            // borrow costs nothing.
-                            let placement = (!*configure_sent).then_some(*rect);
+                            // `configure_sent`. The FIRST placement is solved
+                            // here rather than at `get_popup`: by now a legal
+                            // parent has reached the scene, and an output or
+                            // tiling change between the requests is included.
+                            let placement = if configure_sent {
+                                None
+                            } else {
+                                let parent = parent.ok_or_else(|| {
+                                    format!("xdg_popup {popup_object} lost its parent")
+                                })?;
+                                let constraint = self
+                                    .runtime
+                                    .lock()
+                                    .map_err(|_| "runtime lock poisoned".to_string())?
+                                    .popup_constraint(SurfaceKey {
+                                        client: self.id,
+                                        object: parent,
+                                    })
+                                    .map(|constraint| PositionerRect {
+                                        x: constraint.x,
+                                        y: constraint.y,
+                                        width: constraint.width,
+                                        height: constraint.height,
+                                    });
+                                Some(
+                                    constraint
+                                        .and_then(|constraint| rules.resolve_within(constraint))
+                                        .or_else(|| rules.resolve())
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "xdg_popup {popup_object} has incomplete copied rules"
+                                            )
+                                        })?,
+                                )
+                            };
                             send_popup_configure(
                                 &self.outbound,
                                 role,
@@ -2344,6 +2378,19 @@ impl Client {
                                 placement,
                                 &configure,
                             )?;
+                            let Some(Object::XdgPopup {
+                                rect,
+                                configure_sent,
+                                ..
+                            }) = self.objects.get_mut(&popup_object)
+                            else {
+                                return Err(format!(
+                                    "xdg_surface {role} lost xdg_popup {popup_object}"
+                                ));
+                            };
+                            if let Some(placement) = placement {
+                                *rect = Some(placement);
+                            }
                             *configure_sent = true;
                         }
                     }
@@ -2376,15 +2423,17 @@ impl Client {
                 // screen, a title band and a drag handle.
                 is_popup = true;
                 popup_object_id = Some(popup_object);
-                popup = parent.map(|parent| PopupPlacement {
-                    parent: SurfaceKey {
-                        client: self.id,
-                        object: parent,
-                    },
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: rect.height,
+                popup = parent.and_then(|parent| {
+                    rect.map(|rect| PopupPlacement {
+                        parent: SurfaceKey {
+                            client: self.id,
+                            object: parent,
+                        },
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    })
                 });
             }
             // Taken after the refusals above and pushed after the pixels below,
@@ -3425,10 +3474,12 @@ impl Client {
                             "xdg_popup {id} names {positioner}, which is no xdg_positioner"
                         ));
                     };
-                    // The rules are COPIED here, as the protocol requires: the
-                    // client may reuse or destroy the positioner immediately,
-                    // and nothing placed by it may move afterwards.
-                    let Some(rect) = rules.resolve() else {
+                    // Validate completeness here, where the protocol assigns
+                    // `invalid_positioner`. The copied rules are resolved at
+                    // initial configure, when the parent's current output
+                    // position is known; the client may still reuse or destroy
+                    // the positioner immediately after this request.
+                    if rules.resolve().is_none() {
                         return self.fail_protocol_on(
                             wm_base,
                             XDG_WM_BASE_ERROR_INVALID_POSITIONER,
@@ -3436,13 +3487,14 @@ impl Client {
                                 "xdg_popup {id} was given an incomplete xdg_positioner {positioner}"
                             ),
                         );
-                    };
+                    }
                     self.insert(
                         id,
                         Object::XdgPopup {
                             xdg_surface: message.object,
                             parent: Some(parent_surface),
-                            rect,
+                            rules,
+                            rect: None,
                             configure_sent: false,
                             grabbed: false,
                             mapped_once: false,
@@ -3568,9 +3620,9 @@ impl Client {
                         .insert(message.object, Object::Positioner(positioner));
                     Ok(())
                 }
-                // set_constraint_adjustment. Recorded and not yet acted on:
-                // every bit is permission for td to move a popup that does not
-                // fit, and td does not move one yet.
+                // set_constraint_adjustment. Unknown bits remain harmless
+                // permissions; the six version-1 bits are applied when the
+                // popup is copied from this positioner.
                 5 => {
                     let adjustment = args.u32()?;
                     args.finish()?;
@@ -9220,8 +9272,128 @@ mod tests {
                 parent: Some(5),
                 ..
             })
-                if *rect == PositionerRect { x: 10, y: 26, width: 40, height: 20 }
+                if *rect == Some(PositionerRect { x: 10, y: 26, width: 40, height: 20 })
         ));
+
+        let _ = fs::remove_file(&framebuffer_path);
+    }
+
+    /// The numeric xdg-shell adjustment bits reach the initial popup
+    /// configure, including the SIZE produced by resize. This crosses the
+    /// object copy, parent-key lookup, scene constraint and wire encoder that
+    /// unit placement tests cannot cover.
+    #[test]
+    fn popup_wire_adjustments_use_the_mapped_parents_current_output() {
+        let (mut client, mut peer, runtime, framebuffer_path) =
+            popup_fixture("popup-constraint-wire");
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                POPUP_PARENT_KEY,
+                Surface {
+                    width: 10,
+                    height: 10,
+                    pixels: vec![0; 400],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let initial_constraint = runtime
+            .lock()
+            .unwrap()
+            .popup_constraint(POPUP_PARENT_KEY)
+            .unwrap();
+
+        let mut size = wire::Builder::new();
+        size.i32(initial_constraint.width.saturating_add(20));
+        size.i32(initial_constraint.height.saturating_add(20));
+        client
+            .dispatch(request(30, 1, size).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut anchor_rect = wire::Builder::new();
+        anchor_rect.i32(
+            initial_constraint
+                .x
+                .saturating_add(initial_constraint.width),
+        );
+        anchor_rect.i32(
+            initial_constraint
+                .y
+                .saturating_add(initial_constraint.height),
+        );
+        anchor_rect.i32(0);
+        anchor_rect.i32(0);
+        client
+            .dispatch(
+                request(30, 2, anchor_rect).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        for (opcode, value) in [(3, 8), (4, 8), (5, 1 | 2 | 16 | 32)] {
+            let mut body = wire::Builder::new();
+            body.u32(value);
+            client
+                .dispatch(request(30, opcode, body).unwrap(), &mut VecDeque::new())
+                .unwrap();
+        }
+        get_popup(&mut client, 14, 9, 30).unwrap();
+
+        // Reflow the parent AFTER the rules have been copied. The second
+        // window opens on the right, then moves left, putting this popup's
+        // parent on the right. A get_popup-time solution would retain the old
+        // origin and fail the configure checks below.
+        let second = SurfaceKey {
+            client: 88,
+            object: 77,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                second,
+                Surface {
+                    width: 10,
+                    height: 10,
+                    pixels: vec![0; 400],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .command(crate::layout::Command::Move(
+                crate::layout::Direction::Left,
+            ))
+            .unwrap();
+        let constraint = runtime
+            .lock()
+            .unwrap()
+            .popup_constraint(POPUP_PARENT_KEY)
+            .unwrap();
+        assert_ne!(constraint.x, initial_constraint.x);
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        let messages = receive_messages(&mut peer, 2);
+        let mut payload = wire::Cursor::new(&messages.first().unwrap().payload);
+        assert_eq!(payload.i32().unwrap(), constraint.x);
+        assert_eq!(payload.i32().unwrap(), constraint.y);
+        assert_eq!(payload.i32().unwrap(), constraint.width);
+        assert_eq!(payload.i32().unwrap(), constraint.height);
+        payload.finish().unwrap();
+        assert_eq!(
+            (
+                messages.get(1).unwrap().object,
+                messages.get(1).unwrap().opcode
+            ),
+            (13, 0)
+        );
 
         let _ = fs::remove_file(&framebuffer_path);
     }
@@ -10598,8 +10770,8 @@ mod tests {
     /// would leave a re-map with nothing to ack and no way back on screen.
     ///
     /// What the client loses is a fresh position, and on version 1 that is not
-    /// td's to give: the placement was resolved at `get_popup` and there is no
-    /// event on this version that may revise it.
+    /// td's to give: the placement was resolved for the initial configure and
+    /// there is no event on this version that may revise it.
     ///
     /// The parent EDGE survives here — only the toplevel role object is
     /// destroyed, and `orphan_popups_of` breaks the edge on `wl_surface`

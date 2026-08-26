@@ -908,8 +908,9 @@ client protocol failure.
 and `get_popup` were hard errors that disconnected the client outright, so an
 application opening its first menu died. They are implemented: a positioner
 records the rules — size, anchor rectangle, anchor, gravity, constraint
-adjustment and offset — and `get_popup` derives a rectangle from them, which is
-what the client is told in `xdg_popup.configure`, before the
+adjustment and offset — and `get_popup` copies them. The popup's initial
+configure derives a rectangle against the parent's current mapped position,
+which is what the client is told in `xdg_popup.configure`, before the
 `xdg_surface.configure` that makes the pair one configuration. A PAIR on the
 popup object's first map only — §3's re-map paragraph is the qualification,
 and on a re-map the xdg_surface event goes alone.
@@ -1108,10 +1109,14 @@ renderer's depth bound stays. Six rules across two modules is exactly the kind
 of conjunction that has now been corrected three times, and what it costs to be
 wrong is a compositor that never paints again.
 
-Two parts are incomplete and two have landed, and each is a landing of its
-own. **Constraint adjustment** is recorded and not acted on: every bit of
-it is permission for td to move a popup that does not fit, so a menu near an
-edge extends past it rather than sliding or flipping. **Grabs** are recorded,
+One part is incomplete and three have landed, and each is a landing of its
+own. **Constraint adjustment** is acted on when the parent is visible and has
+a placeable output: flip, slide and resize are applied in protocol order and
+independently on each axis, against the output below td's bar expressed in the
+parent's coordinates. A flip is retained only when it repairs that axis;
+sliding moves as much of an oversized popup into the work area as possible;
+and resize intersects as the last resort. Unknown bits remain inert
+permissions. **Grabs** are recorded,
 checked, and acted on: the topmost grabbing popup has the KEYBOARD, bounded as
 below, and a press with none of the grabbing menus under it CLOSES them — td
 takes the pixels down and sends `xdg_popup.popup_done`, rather than leaving a
@@ -1469,8 +1474,9 @@ acknowledge before attaching — drop both and a re-map has nothing to ack and
 no way back on screen.
 
 What the client gives up is a fresh POSITION, and on version 1 that is not
-td's to give: the placement was resolved at `get_popup` and this version has
-no event that may revise it. The flag sits on the popup object rather than
+td's to give: the placement was resolved for the initial configure and this
+version has no event that may revise it. The flag sits on the popup object
+rather than
 beside the dismissal deliberately. A client's own null attach unmaps the same
 tracker and has done since before td dismissed anything, so a fix hung off
 dismissal would have left the older route — the one a toolkit reaches without

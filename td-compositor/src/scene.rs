@@ -83,6 +83,18 @@ pub struct PopupPlacement {
     pub height: i32,
 }
 
+/// The output's usable rectangle expressed in a popup parent's
+/// window-geometry coordinates. This is the coordinate space an
+/// `xdg_positioner` uses, so the server can solve edge constraints before it
+/// sends the one configure version-1 popups receive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PopupConstraint {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// A popup and where it sits in the stack. The order is the SCENE's own
 /// counter, not anything the client chose: a submenu has to be drawn over —
 /// and asked before — the menu it hangs off, and object ids cannot say which
@@ -2078,6 +2090,33 @@ impl Scene {
             rect = on;
         }
         Some(rect)
+    }
+
+    /// The usable output in `parent`'s coordinates. A parent may itself be a
+    /// popup, so use the same bounded chain resolution as paint and hit-test;
+    /// an invisible or unplaceable parent has no constraint answer yet.
+    pub fn popup_constraint(
+        &self,
+        parent: SurfaceKey,
+        width: usize,
+        height: usize,
+    ) -> Option<PopupConstraint> {
+        let placements = self.tiled_placements(width, height);
+        let parent = if self.popups.contains_key(&parent) {
+            self.popup_rect(parent, &placements)?
+        } else {
+            placements
+                .iter()
+                .find(|placement| placement.key == parent && placement.visible)
+                .map(|placement| ImageRect::tile(placement.rect))?
+        };
+        let usable_height = height.saturating_sub(BAR_HEIGHT);
+        Some(PopupConstraint {
+            x: i32::try_from(parent.x.saturating_neg()).ok()?,
+            y: i32::try_from(i64::try_from(BAR_HEIGHT).ok()?.saturating_sub(parent.y)).ok()?,
+            width: i32::try_from(width).ok()?,
+            height: i32::try_from(usable_height).ok()?,
+        })
     }
 
     /// The window at the end of a popup's parent chain. Bounded as the walk
@@ -6715,6 +6754,40 @@ mod tests {
                 key: over,
                 x: 1,
                 y: 1
+            })
+        );
+    }
+
+    #[test]
+    fn popup_constraints_are_the_usable_output_in_the_parents_coordinates() {
+        let (mut scene, _frame, width, height, _stride, key, rect) = popup_output();
+        assert_eq!(
+            scene.popup_constraint(key, width, height),
+            Some(PopupConstraint {
+                x: i32::try_from(rect.x).unwrap().saturating_neg(),
+                y: i32::try_from(BAR_HEIGHT)
+                    .unwrap()
+                    .saturating_sub(i32::try_from(rect.y).unwrap()),
+                width: i32::try_from(width).unwrap(),
+                height: i32::try_from(height.saturating_sub(BAR_HEIGHT)).unwrap(),
+            })
+        );
+
+        let menu = popup_key(20);
+        scene
+            .commit_popup(menu, surface(MENU, 10, 10), placed(key, 5, 7, 10))
+            .unwrap();
+        assert_eq!(
+            scene.popup_constraint(menu, width, height),
+            Some(PopupConstraint {
+                x: i32::try_from(rect.x.saturating_add(5))
+                    .unwrap()
+                    .saturating_neg(),
+                y: i32::try_from(BAR_HEIGHT)
+                    .unwrap()
+                    .saturating_sub(i32::try_from(rect.y.saturating_add(7)).unwrap()),
+                width: i32::try_from(width).unwrap(),
+                height: i32::try_from(height.saturating_sub(BAR_HEIGHT)).unwrap(),
             })
         );
     }

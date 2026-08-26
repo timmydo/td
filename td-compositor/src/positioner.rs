@@ -63,6 +63,23 @@ enum Edge {
     High,
 }
 
+impl Edge {
+    fn flipped(self) -> Edge {
+        match self {
+            Edge::Low => Edge::High,
+            Edge::Middle => Edge::Middle,
+            Edge::High => Edge::Low,
+        }
+    }
+}
+
+const SLIDE_X: u32 = 1;
+const SLIDE_Y: u32 = 2;
+const FLIP_X: u32 = 4;
+const FLIP_Y: u32 = 8;
+const RESIZE_X: u32 = 16;
+const RESIZE_Y: u32 = 32;
+
 impl Anchor {
     /// The wire value, refused rather than defaulted: an anchor outside the
     /// enum names no point, and inventing one puts a menu somewhere arbitrary.
@@ -216,6 +233,167 @@ impl Positioner {
             height,
         })
     }
+
+    /// Resolve the rules and apply the adjustment permissions when the
+    /// resulting popup crosses `constraint`.
+    ///
+    /// XDG shell fixes the order: flip, then slide, then resize, independently
+    /// on each axis. A flip is kept only when it completely repairs that axis;
+    /// otherwise the original placement proceeds to the next permitted
+    /// adjustment. Sliding moves the popup as far inside the constraint as its
+    /// size permits. Resizing is the last resort and takes the intersection
+    /// with the constraint, which moves an overhanging near edge and trims an
+    /// overhanging far edge in one bounded operation.
+    pub fn resolve_within(&self, constraint: Rect) -> Option<Rect> {
+        let mut rect = self.resolve()?;
+        let anchor = self.anchor.unwrap_or(Anchor::None);
+        let gravity = self.gravity.unwrap_or(Gravity::None);
+        let anchor_rect = self.anchor_rect?;
+
+        rect.x = adjust_axis(
+            AxisRules {
+                anchor_origin: anchor_rect.x,
+                anchor_span: anchor_rect.width,
+                anchor: anchor.horizontal(),
+                size: rect.width,
+                gravity: gravity.horizontal(),
+                offset: self.offset.0,
+            },
+            AxisConstraint {
+                origin: constraint.x,
+                span: constraint.width,
+            },
+            self.constraint_adjustment & FLIP_X != 0,
+            self.constraint_adjustment & SLIDE_X != 0,
+            self.constraint_adjustment & RESIZE_X != 0,
+            &mut rect.width,
+        );
+        rect.y = adjust_axis(
+            AxisRules {
+                anchor_origin: anchor_rect.y,
+                anchor_span: anchor_rect.height,
+                anchor: anchor.vertical(),
+                size: rect.height,
+                gravity: gravity.vertical(),
+                offset: self.offset.1,
+            },
+            AxisConstraint {
+                origin: constraint.y,
+                span: constraint.height,
+            },
+            self.constraint_adjustment & FLIP_Y != 0,
+            self.constraint_adjustment & SLIDE_Y != 0,
+            self.constraint_adjustment & RESIZE_Y != 0,
+            &mut rect.height,
+        );
+        Some(rect)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AxisRules {
+    anchor_origin: i32,
+    anchor_span: i32,
+    anchor: Edge,
+    size: i32,
+    gravity: Edge,
+    offset: i32,
+}
+
+#[derive(Clone, Copy)]
+struct AxisConstraint {
+    origin: i32,
+    span: i32,
+}
+
+fn axis_end(origin: i32, span: i32) -> i64 {
+    i64::from(origin).saturating_add(i64::from(span))
+}
+
+fn axis_fits(origin: i32, span: i32, constraint: AxisConstraint) -> bool {
+    i64::from(origin) >= i64::from(constraint.origin)
+        && axis_end(origin, span) <= axis_end(constraint.origin, constraint.span)
+}
+
+fn clamp_i64(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
+}
+
+fn adjust_axis(
+    rules: AxisRules,
+    constraint: AxisConstraint,
+    flip: bool,
+    slide: bool,
+    resize: bool,
+    size: &mut i32,
+) -> i32 {
+    let original = place(
+        rules.anchor_origin,
+        rules.anchor_span,
+        rules.anchor,
+        rules.size,
+        rules.gravity,
+    )
+    .saturating_add(rules.offset);
+    if constraint.span <= 0 {
+        return original;
+    }
+    if axis_fits(original, rules.size, constraint) {
+        return original;
+    }
+
+    if flip {
+        let flipped = place(
+            rules.anchor_origin,
+            rules.anchor_span,
+            rules.anchor.flipped(),
+            rules.size,
+            rules.gravity.flipped(),
+        )
+        .saturating_add(rules.offset);
+        if axis_fits(flipped, rules.size, constraint) {
+            return flipped;
+        }
+    }
+
+    let mut adjusted = original;
+    if slide {
+        let latest =
+            axis_end(constraint.origin, constraint.span).saturating_sub(i64::from(rules.size));
+        let (low, high) = if latest < i64::from(constraint.origin) {
+            (latest, i64::from(constraint.origin))
+        } else {
+            (i64::from(constraint.origin), latest)
+        };
+        let original = i64::from(original);
+        let slid = if rules.size > constraint.span && low < original && original < high {
+            // Both edges are constrained. Xdg-shell tries the gravity
+            // direction first, so align the opposite edge; a centred rule has
+            // no direction and takes the nearer repair.
+            match rules.gravity {
+                Edge::Low => low,
+                Edge::High => high,
+                Edge::Middle if original.abs_diff(low) <= original.abs_diff(high) => low,
+                Edge::Middle => high,
+            }
+        } else {
+            original.clamp(low, high)
+        };
+        adjusted = clamp_i64(slid);
+        if axis_fits(adjusted, rules.size, constraint) {
+            return adjusted;
+        }
+    }
+
+    if resize {
+        let low = i64::from(adjusted).max(i64::from(constraint.origin));
+        let high = axis_end(adjusted, rules.size).min(axis_end(constraint.origin, constraint.span));
+        if high > low {
+            *size = clamp_i64(high.saturating_sub(low));
+            return clamp_i64(low);
+        }
+    }
+    adjusted
 }
 
 /// One axis of the placement: the anchor point along it, then the popup hung
@@ -515,6 +693,220 @@ mod tests {
                 y: i32::MIN,
                 width: i32::MAX,
                 height: i32::MAX
+            })
+        );
+    }
+
+    #[test]
+    fn constraint_adjustments_flip_then_slide_then_resize_per_axis() {
+        let constraint = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 80,
+        };
+
+        let mut flipped = Positioner::default();
+        flipped.set_size(30, 20);
+        flipped.set_anchor_rect(Rect {
+            x: 90,
+            y: 70,
+            width: 10,
+            height: 10,
+        });
+        flipped.set_anchor(Anchor::BottomRight);
+        flipped.set_gravity(Gravity::BottomRight);
+        // Literal wire bits keep the test independent of the implementation's
+        // names: xdg-shell assigns flip_x=4 and flip_y=8.
+        flipped.set_constraint_adjustment(4 | 8);
+        assert_eq!(
+            flipped.resolve_within(constraint),
+            Some(Rect {
+                x: 60,
+                y: 50,
+                width: 30,
+                height: 20,
+            })
+        );
+
+        let mut slid = Positioner::default();
+        slid.set_size(30, 20);
+        slid.set_anchor_rect(Rect {
+            x: 95,
+            y: 75,
+            width: 0,
+            height: 0,
+        });
+        slid.set_anchor(Anchor::BottomRight);
+        slid.set_gravity(Gravity::BottomRight);
+        // xdg-shell assigns slide_x=1 and slide_y=2.
+        slid.set_constraint_adjustment(1 | 2);
+        assert_eq!(
+            slid.resolve_within(constraint),
+            Some(Rect {
+                x: 70,
+                y: 60,
+                width: 30,
+                height: 20,
+            })
+        );
+
+        let mut resized = Positioner::default();
+        resized.set_size(130, 100);
+        resized.set_anchor_rect(Rect {
+            x: -10,
+            y: -5,
+            width: 0,
+            height: 0,
+        });
+        resized.set_anchor(Anchor::BottomRight);
+        resized.set_gravity(Gravity::BottomRight);
+        // xdg-shell assigns resize_x=16 and resize_y=32.
+        resized.set_constraint_adjustment(16 | 32);
+        assert_eq!(resized.resolve_within(constraint), Some(constraint));
+    }
+
+    #[test]
+    fn an_oversized_popup_slides_before_resizing_to_the_constraint() {
+        let mut positioner = Positioner::default();
+        positioner.set_size(130, 100);
+        positioner.set_anchor_rect(Rect {
+            x: 90,
+            y: 70,
+            width: 0,
+            height: 0,
+        });
+        positioner.set_anchor(Anchor::BottomRight);
+        positioner.set_gravity(Gravity::BottomRight);
+        positioner.set_constraint_adjustment(1 | 2 | 16 | 32);
+        let constraint = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 80,
+        };
+        assert_eq!(positioner.resolve_within(constraint), Some(constraint));
+    }
+
+    #[test]
+    fn an_oversized_slide_only_popup_follows_its_gravity() {
+        let constraint = Rect {
+            x: 0,
+            y: -100,
+            width: 100,
+            height: 200,
+        };
+        for (gravity, offset, expected_x) in [(Gravity::Left, 65, -30), (Gravity::Right, -65, 0)] {
+            let mut positioner = Positioner::default();
+            positioner.set_size(130, 10);
+            positioner.set_anchor_rect(Rect {
+                x: 50,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+            positioner.set_anchor(Anchor::Right);
+            positioner.set_gravity(gravity);
+            positioner.set_offset((offset, 0));
+            positioner.set_constraint_adjustment(1);
+            assert_eq!(
+                positioner.resolve_within(constraint).map(|rect| rect.x),
+                Some(expected_x),
+                "{gravity:?}"
+            );
+        }
+        for (gravity, offset, expected_x) in [(Gravity::Right, -80, -30), (Gravity::Left, 80, 0)] {
+            let mut positioner = Positioner::default();
+            positioner.set_size(130, 10);
+            positioner.set_anchor_rect(Rect {
+                x: 50,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+            positioner.set_anchor(Anchor::Right);
+            positioner.set_gravity(gravity);
+            positioner.set_offset((offset, 0));
+            positioner.set_constraint_adjustment(1);
+            assert_eq!(
+                positioner.resolve_within(constraint).map(|rect| rect.x),
+                Some(expected_x),
+                "an aligned edge moved for {gravity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_constraint_axis_does_not_disable_the_other_axis() {
+        let mut positioner = Positioner::default();
+        positioner.set_size(30, 20);
+        positioner.set_anchor_rect(Rect {
+            x: 95,
+            y: 75,
+            width: 0,
+            height: 0,
+        });
+        positioner.set_anchor(Anchor::BottomRight);
+        positioner.set_gravity(Gravity::BottomRight);
+        positioner.set_constraint_adjustment(1 | 2);
+        assert_eq!(
+            positioner.resolve_within(Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 80,
+            }),
+            Some(Rect {
+                x: 95,
+                y: 60,
+                width: 30,
+                height: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_constraint_bits_are_inert() {
+        let mut positioner = rules();
+        positioner.set_anchor(Anchor::BottomRight);
+        positioner.set_gravity(Gravity::BottomRight);
+        positioner.set_constraint_adjustment(0xffff_ffc0);
+        assert_eq!(
+            positioner.resolve_within(Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }),
+            positioner.resolve()
+        );
+    }
+
+    #[test]
+    fn a_failed_flip_leaves_the_original_for_the_next_adjustment() {
+        let mut positioner = Positioner::default();
+        positioner.set_size(80, 10);
+        positioner.set_anchor_rect(Rect {
+            x: 45,
+            y: 0,
+            width: 10,
+            height: 0,
+        });
+        positioner.set_anchor(Anchor::Right);
+        positioner.set_gravity(Gravity::Right);
+        positioner.set_constraint_adjustment(4 | 1);
+        assert_eq!(
+            positioner.resolve_within(Rect {
+                x: 0,
+                y: -20,
+                width: 100,
+                height: 40,
+            }),
+            Some(Rect {
+                x: 20,
+                y: -5,
+                width: 80,
+                height: 10,
             })
         );
     }

@@ -11,8 +11,8 @@ use crate::pointer::{
     PointerTarget, RoutedPointerFrame,
 };
 use crate::scene::{
-    BandPress, CursorRequest, Fraction, PopupPlacement, Scene, SharedInputRegion, Surface,
-    SurfaceKey, WindowGeometry,
+    BandPress, CursorRequest, Fraction, PopupConstraint, PopupPlacement, Scene, SharedInputRegion,
+    Surface, SurfaceKey, WindowGeometry,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -506,6 +506,11 @@ impl Runtime {
     #[cfg(test)]
     pub fn popup_placement(&self, key: SurfaceKey) -> Option<PopupPlacement> {
         self.scene.popup_placement(key)
+    }
+
+    pub fn popup_constraint(&self, parent: SurfaceKey) -> Option<PopupConstraint> {
+        self.scene
+            .popup_constraint(parent, self.framebuffer.width, self.framebuffer.height)
     }
 
     #[cfg(test)]

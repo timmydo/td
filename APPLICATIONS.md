@@ -5086,11 +5086,9 @@ Hovering a menu counts as hovering the window that opened it, since
 focus-follows-mouse deactivating that window is how a toolkit is told to close
 the menu.
 
-What is deliberately still absent is the part that makes a menu *behave*:
-constraint adjustment is recorded and not acted on, so a popup near a screen
-edge runs past it instead of sliding or flipping. The grab itself no longer
-belongs on that list: it takes the KEYBOARD, and a press outside the chain now
-closes it. What td DOES
+Constraint adjustment now flips, slides, and resizes a popup in protocol order
+against the visible parent's usable output. The grab takes the KEYBOARD, and a
+press outside the chain now closes it. What td DOES
 signal now is its own dismissal: every popup a take-down cascades over is sent
 `xdg_popup.popup_done`, deepest first, so a menu whose window went is no
 longer open as far as its client knows — and is unmapped at the same time, as
@@ -5157,7 +5155,7 @@ by them, and records why a tile ignores them and what an offset cannot reach.
 | popup protocol conformance (error object, permanent role, `not_the_topmost_popup`, `defunct_surfaces`, `already_constructed`) | **landed** | — | ~350 — spent. `xdg_wm_base`'s errors name the shell object rather than the xdg_surface they arrived at, and it outlives the surfaces it made so that id stays meaningful; a surface's role kind outlives its role object, so a former menu cannot come back as a tiled window; and a menu may not be destroyed before the submenu hanging off it |
 | shell edges across id reuse | **landed** | — | ~600 — spent. Neither shell edge keeps a number the client has back: a popup's parent edge is broken when the surface it names is destroyed, and a wl_surface's role edge is retired when its xdg_surface is. So a reissued id cannot re-parent a menu onto an unrelated window, commit a surface through a stranger's role object, close a popup cycle, or answer a `not_the_topmost_popup` scan for a submenu that does not exist. Per surface rather than a sweep, so one window closing leaves other windows' menus alone. The byte accounting it left open is the row below |
 | popup byte accounting across a cascade | **landed** | — | ~120 — spent. A take-down reports the menus it dropped and the client's ledger gives back exactly those, rather than a second walk of the parent edges — which by then reads the edges that walk removed. An application that opens and closes menus is no longer charged for buffers td discarded, and so no longer approaches its own ceiling for holding nothing. All three refunds are reachable, including the one at `wl_surface.destroy`, which looked dead: `get_popup` refuses a parent with no role object, so no new menu can hang off a window whose toplevel has gone — but an existing one only has to be REPAINTED, since its popup object outlives the toplevel and puts the placement back in the scene. Dismissal now unmaps, so that repaint is a whole mapping again rather than a bare attach; it reaches the same refund by a longer road |
-| popup constraint solving (slide/flip/resize) | absent | **U** | 1,500–2,500 — the adjustment bits are recorded; a menu near an edge runs past it |
+| popup constraint solving (slide/flip/resize) | **landed** | — | ~450 — spent. The six version-1 adjustment bits are applied in protocol order, independently per axis, against the usable output in the mapped parent's coordinates; unknown bits remain inert permissions |
 | client cursor rendering | **done** (`1c4b7f88`) | — | spent |
 | `zxdg_decoration_manager_v1` (answer `server_side`) | **landed** | **U** | ~500 — spent. Suppresses CSD, fits tiling, and removes most of the geometry problem for cooperating apps. One divergence, deliberate: `destroy` asks the compositor to stop decorating, and td keeps drawing the band because it is layout rather than a decoration td can withdraw |
 | `zxdg_exporter_v2`/`importer_v2` | absent | **portal-blocking** | 1,200–2,000 |
@@ -5584,7 +5582,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 16 | `td-portal` personality: Request/Session core, Settings, Account | GTK settings call works |
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **E2's GDK, llvmpipe, and Firefox presentation answers are recorded in §F and `td-compositor/DESIGN.md`** | none |
 | 18 | Wayland B: `wl_subcompositor` | none |
-| 19 | Wayland C: `xdg_positioner`/`xdg_popup` and click-outside dismissal LANDED — constraint solving is what is left of this rung | a menu appears where its client asked, takes the keyboard while it is up, and closes when the operator presses outside it; it does not yet slide clear of a screen edge |
+| 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | clipboard (data-device v3) — client cursors LANDED separately (`1c4b7f88`), so this rung is the clipboard alone | paste, and the I-beam already arrived |
 | 21 | xdg-foreign + private portal socket + dialog placement | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
