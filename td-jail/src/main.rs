@@ -440,6 +440,21 @@ mod confinement {
     }
 
     #[test]
+    fn a_launch_plan_derives_network_isolation_from_the_permission_file() {
+        let resolve = without_line_comments(&without_block_comments(AUTHORITY))
+            .split_once("pub(crate) fn resolve")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn resolve_resource_limits")
+            .unwrap()
+            .0
+            .to_string();
+        assert!(resolve.contains("isolate_network: !spec.permissions.network(),"));
+        assert_eq!(resolve.matches("isolate_network").count(), 1);
+        assert!(resolve.contains("Ok(LaunchPlan {"));
+    }
+
+    #[test]
     fn cleanup_helper_owns_the_abandoned_leaf_protocol() {
         let managed = TRANSITION
             .split_once("impl ManagedCgroup")
@@ -663,7 +678,15 @@ mod confinement {
             1
         );
         assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 2);
-        assert!(TRANSITION.contains("sys::unshare_namespaces(true).map_err(|error|"));
+        assert!(TRANSITION.contains(
+            "sys::unshare_namespaces(application.isolate_network).map_err(|error|"
+        ));
+        assert!(TRANSITION.contains(
+            ".require_application_change(&before, application.isolate_network)?;"
+        ));
+        assert!(TRANSITION.contains(
+            "if application.isolate_network {\n            sys::bring_up_loopback()"
+        ));
         assert!(TRANSITION.contains(
             "let flags = sys::MS_BIND\n        | if grant.source_kind == FilesystemSourceKind::Directory {\n            sys::MS_REC"
         ));

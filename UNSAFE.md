@@ -1047,9 +1047,13 @@ no syscall or operation was added.
 
 Stage 1 is single-threaded when it issues the unshare call, writes `setgroups`
 deny before the identity gid map, reads both maps back, and checks that
-the user, mount and UTS namespaces changed. The isolated probe also
-checks its network namespace. It enumerates `/proc/self/fd` and closes
-every inherited descriptor above 2 before opening the proof pipe. The
+the user, mount and UTS namespaces changed. Application launch derives the
+network choice from the authenticated permission policy: isolation additionally
+requires that the network namespace changed and brings up loopback, while
+`shared=network` requires that the network namespace stayed identical and skips
+the loopback ioctl. The probe always selects and reads back isolation. It
+enumerates `/proc/self/fd` and closes every inherited descriptor above 2 before
+opening the proof pipe. The
 `close(2)` entry is a reviewed amendment: safe `std` cannot take
 ownership of an arbitrary inherited descriptor, while leaving one open
 would preserve an old-root handle across `pivot_root`. An iterator's
@@ -1195,10 +1199,11 @@ Namespace exit removes the probe-only mount.
 The same transition now has one closed application action. A `/bin` symlink
 selects a name by argv[0]; safe Rust reads the immutable image configuration,
 sorted registry and canonical builder-owned spec, then accepts only the
-builder-authenticated spec with the Wayland socket and the closed typed
-filesystem subset. The runtime parser closes the spec grammar and uses the
-shared permission type's exhaustive Wayland-plus-filesystem-and-resources predicate; adding
-another policy field cannot silently widen this rung. The image compiler
+builder-authenticated spec with optional shared network, the Wayland socket and
+the closed typed filesystem subset. The runtime parser closes the spec grammar
+and uses the shared permission type's exhaustive
+network-plus-Wayland-plus-filesystem-and-resources predicate; adding another
+policy field cannot silently widen this rung. The image compiler
 selects the fixture's empty runtime. Stage 1 binds
 authenticated package/runtime trees read-only, the exact compositor socket
 read-only, application-owned persistent state read-write, one application-owned

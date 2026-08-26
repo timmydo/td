@@ -226,6 +226,12 @@ mod tests {
         assert!(transition.contains("sys::set_parent_death_signal()?;"));
         assert!(transition.contains("start_stage1_liveness_watcher()?;"));
         assert_eq!(transition.matches("sys::bring_up_loopback()").count(), 2);
+        assert!(transition.contains(
+            ".require_application_change(&before, application.isolate_network)?;"
+        ));
+        assert!(transition.contains(
+            "if application.isolate_network {\n            sys::bring_up_loopback()"
+        ));
         let sys = source("sys").expect("syscall source");
         for row in [
             "const SYS_IOCTL: usize = 16;",

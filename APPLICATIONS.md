@@ -2081,10 +2081,13 @@ CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS [| CLONE_NEWIPC] [| CL
 All in one call so the pid namespace is owned by the new user namespace —
 the kernel applies `NEWUSER` first, which is what grants the capability
 for the rest. `NEWNET` only when metadata lacks `shared=network` (Firefox
-has it, so Firefox keeps td's stack); loopback in a fresh net namespace
-is **brought up** with a pinned `SIOCGIFFLAGS`/`SIOCSIFFLAGS` pair on the
-name `lo` — leaving it down turns "no internet" into "no sockets" for
-every app with a localhost helper. `NEWIPC` only
+has it, so Firefox keeps td's stack). Stage 1 reads back that an isolated
+network changed or that a declared shared network did not. Only in the
+fresh namespace is loopback **brought up** with a pinned
+`SIOCGIFFLAGS`/`SIOCSIFFLAGS` pair on the name `lo` — leaving it down
+turns "no internet" into "no sockets" for every app with a localhost
+helper, while issuing that ioctl against td's shared stack would mutate
+host policy. `NEWIPC` only
 once `CONFIG_IPC_NS` is on (§0). uid/gid maps are **identity** — `1000
 1000 1` — because an app that sees uid 0 mis-chowns its own files, and
 `setgroups` is denied *before* the gid_map write (CVE-2014-8989); that
@@ -2103,16 +2106,19 @@ root, then drops every remaining capability before policy finalization.
 The landed rung-12 application path is the closed static/empty-runtime
 subset of this target table. It implements `/app`, `/usr`, fresh `/proc`,
 the minimal `/dev`, tmpfs `/run`, the exact Wayland socket, the session
-bus socket of step 12 and the five persistent state directories, and a
-read-back-up loopback interface in the otherwise-empty network namespace.
-It deliberately leaves `/etc`, `/sys`, `/var/lib`, `/var/cache`,
-`.flatpak-info`, extension mounts, network sharing, mutable permission
-overrides absent. It accepts exactly `sockets=wayland`, the closed
-filesystem subset below, resource limits, and `[Session Bus Policy]` `own`
-entries, which it forwards to the broker at registration and does not itself
-act on; any other policy is refused, and the refusal names the request so an
-operator holding a permission file learns which line to change. Later rungs
-fill those named rows without making their absence a degraded launch mode.
+bus socket of step 12 and the five persistent state directories, and either a
+read-back-up loopback interface in an otherwise-empty network namespace or the
+unchanged td network namespace selected by `shared=network`. It deliberately
+leaves `/etc`, `/sys`, `/var/lib`, `/var/cache`, `.flatpak-info`, extension
+mounts, and mutable permission overrides absent. It accepts exactly optional
+`shared=network`, `sockets=wayland`, the closed filesystem subset below,
+resource limits, and `[Session Bus Policy]` `own` entries, which it forwards
+to the broker at registration and does not itself act on; any other policy is
+refused, and the refusal names the request so an operator holding a permission
+file learns which line to change. Sharing is direct access to td's network
+stack, not mediation, and this landing does not populate `/etc/resolv.conf` or
+claim name resolution. Later rungs fill those named rows without making their
+absence a degraded launch mode.
 
 The bus is bound unconditionally and is deliberately not a `sockets=`
 permission, which is what step 12 has said since it was written. It is
@@ -5571,6 +5577,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12c | **typed memory/task policy — LANDED**: cgroup2 is mounted by PID 1; PID 1 and system services remain at the hierarchy root under cgroup v2's root exception while td-svc enables `memory`/`pids` top-down and delegates an empty user subtree; td-jail creates one direct per-instance leaf, writes and exactly reads `memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, moves blocked stage 2 before release, verifies membership, sets and reads equal hard/soft `RLIMIT_DATA`, reports `memory.events`/`memory.peak`, and removes the empty leaf. Omitted policy gets the documented finite baseline; partial or page-rounded policy is refused. The 48 MiB/64 MiB/32-task fixture and active-cgroup probe gate the QEMU marker. `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
 | 12d | **application terminal/session containment — LANDED**: the argv0-selected launcher waits on a later-born stage 1; stage 1 binds its lifetime to that exact parent, then either preserves and reads back an existing no-terminal supervisor group or enters and reads back a new session with no controlling terminal. Only then may it resolve authority, register or create state. Parent death still tears down stage 1, stage 2 and the cgroup leaf. `devices=tty` remains refused until a fresh-terminal policy exists | the jail is not an ambient terminal member, and it does not escape a dedicated service stop scope |
 | 12e | **typed CPU bandwidth policy — LANDED**: permission format 2 adds bounded `cpu-max=QUOTA PERIOD`; format 1 remains accepted and inherits a one-CPU baseline. The kernel pins fair-group scheduling and CFS bandwidth while keeping real-time group scheduling off; td-svc delegates `cpu` top-down; td-jail writes and exactly reads `cpu.max`, reports the bandwidth rows from `cpu.stat`, and the 50%-CPU fixture's active leaf gates the QEMU marker | aggregate CPU time is capped with the memory and task budgets |
+| 12f | **typed shared-network policy — LANDED**: the authenticated `shared=network` permission selects the compiled namespace set without `CLONE_NEWNET`; stage 1 requires the network namespace inode to remain unchanged and skips the isolated-loopback ioctl. Omitted policy retains `CLONE_NEWNET`, exact changed-inode readback and the up-loopback oracle. The host fixture launches both its isolated defaults and a derived shared-network variant; the shipped QEMU fixture remains isolated. `/etc/resolv.conf` and mediated network policy remain later work | a declared application can use td's network stack without weakening the default isolated path |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
@@ -6215,10 +6222,19 @@ through setuid or capabilities (`NO_NEW_PRIVS` plus empty caps, both read
 back); cannot speak to non-portal bus names; and cannot record audio. td
 does **not** claim that same-uid *unjailed* processes are isolated from
 each other; that a kernel bug in the allowed syscall surface cannot void
-the jail — in v1 an escape owns the user account; that network traffic is
-mediated when `shared=network` is granted; that a malicious publisher is
-contained beyond the jail; or anything about side channels, resource
-exhaustion, or the profile-data persistence in §B.
+the jail — in v1 an escape owns the user account; that network traffic or
+network-namespace metadata is mediated when `shared=network` is granted;
+that a malicious publisher is contained beyond the jail; or anything about
+side channels, resource exhaustion, or the profile-data persistence in §B.
+
+That shared namespace includes abstract AF_UNIX names and makes td's
+interfaces, routes, socket rows and other network state visible through the
+jail's fresh `/proc/net`. The td-busd and compositor-private-portal endpoints
+use filesystem socket names, so their unmounted paths remain unreachable.
+Other td services, including IP listeners, may be reachable through the
+shared-network grant and continue to rely on their own authentication. Moving
+session authority to an abstract listener would place it inside this grant and
+must revisit that claim before landing.
 
 **Nor that an app without `shared=network` cannot reach the network.**
 `.OpenURI` starts the browser on an `http`/`https` URL with no dialog
@@ -7288,16 +7304,20 @@ gets all three:
   deliberately after, since a host that worked first would invert the
   two-configuration rule at the only moment it matters.
 - **The landed acceptance test** runs the ordinary rung-12 fixture
-  identity, manifest, spec and binary under `--host` from a materialized
-  host prefix. Its declaration, permissions and launcher come directly from
-  the shipped fixture recipe rather than a copied policy. It uses the real
-  td-busd registration path (not an application-originated bus handshake)
-  and caller-owned session-socket endpoints, and asserts the exact two-line
-  degradation report: aggregate memory/task/CPU caps are unavailable without a
-  delegated cgroup, and direct host Wayland cannot filter globals. User
-  namespaces and the standard seccomp filter remain fatal prerequisites
-  rather than degradation entries. A test that asserted only "it ran" would
-  pass on a host enforcing nothing.
+  identity, manifest and binary under `--host` from a materialized host
+  prefix. Its declaration, permission defaults and launcher come directly
+  from the shipped fixture recipe rather than a copied policy. The host leg
+  first launches those exact isolated defaults, then adds only
+  `shared=network` and launches again to prove that policy preserves the
+  caller's network namespace. The exact shipped spec remains the
+  isolated-network QEMU oracle. It uses the real td-busd registration path
+  (not an application-originated bus handshake) and caller-owned
+  session-socket endpoints, and asserts the exact two-line degradation
+  report: aggregate memory/task/CPU caps are unavailable without a delegated
+  cgroup, and direct host Wayland cannot filter globals. User namespaces and
+  the standard seccomp filter remain fatal prerequisites rather than
+  degradation entries. A test that asserted only "it ran" would pass on a
+  host enforcing nothing.
 
 ### X.6 A prerequisite in the control plane, since fixed
 

@@ -18,6 +18,7 @@ const HOST_DEGRADATION_WAYLAND: &str =
 struct HostFixture {
     manifest: String,
     spec: String,
+    shared_spec: String,
     registry: String,
     launcher: String,
 }
@@ -32,11 +33,17 @@ fn host_fixture() -> Result<HostFixture, String> {
     let permissions = fixture
         .application_permissions
         .ok_or_else(|| "td-jail fixture has no permission policy".to_string())?;
+    let shared_permissions = permissions
+        .clone()
+        .with_network()
+        .map_err(|error| format!("extend td-jail host fixture network policy: {error}"))?;
     let launcher = fixture
         .application_launcher
         .ok_or_else(|| "td-jail fixture has no launcher declaration".to_string())?;
     let manifest = declaration.manifest(&name, &version, ApplicationProvenance::Source)?;
     let spec = ApplicationSpec::compile(&manifest, HOST_RUNTIME, permissions)?.to_keyfile();
+    let shared_spec =
+        ApplicationSpec::compile(&manifest, HOST_RUNTIME, shared_permissions)?.to_keyfile();
     let registry =
         ApplicationRegistry::new(vec![(name.clone(), HOST_PACKAGE.to_string())])?.to_tsv();
     let launcher = launcher.bind(&name)?;
@@ -44,6 +51,7 @@ fn host_fixture() -> Result<HostFixture, String> {
     Ok(HostFixture {
         manifest: manifest.to_keyfile(),
         spec,
+        shared_spec,
         registry,
         launcher,
     })
@@ -107,6 +115,10 @@ pub fn recipe() -> Recipe {
             "/home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/spec",
             host.spec,
         ),
+        (
+            "/home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/shared-spec",
+            host.shared_spec,
+        ),
         ("/home/td-jail-host/etc/td-applications.tsv", host.registry),
         ("/home/td-jail-host/etc/td-launcher.tsv", host.launcher),
     ] {
@@ -136,10 +148,16 @@ pub fn recipe() -> Recipe {
                      n=0; while {{ [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ]; }} && [ \"$n\" -lt 10 ]; do n=$((n+1)); sleep 1; done; \
                      if [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ]; then kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; echo 'td-jail host authorities did not become ready' >&2; exit 1; fi; \
                      o=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest 2>&1); s=$?; \
+                     c=0; cp /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/shared-spec /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/spec || c=$?; \
+                     p=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest 2>&1); t=$?; \
                      kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; \
                      [ \"$s\" -eq 0 ] || {{ echo \"td-jail host fixture failed: $o\" >&2; exit 1; }}; \
+                     [ \"$c\" -eq 0 ] || {{ echo 'td-jail host shared spec could not replace the isolated spec' >&2; exit 1; }}; \
+                     [ \"$t\" -eq 0 ] || {{ echo \"td-jail host shared-network fixture failed: $p\" >&2; exit 1; }}; \
                      e='{}\n{}'; \
-                     [ \"$o\" = \"$e\" ] || {{ echo \"td-jail host degradation report changed: $o\" >&2; exit 1; }}",
+                     [ \"$o\" = \"$e\" ] || {{ echo \"td-jail host isolated degradation report changed: $o\" >&2; exit 1; }}; \
+                     [ \"$p\" = \"$e\" ] || {{ echo \"td-jail host shared-network degradation report changed: $p\" >&2; exit 1; }}",
+                    crate::ladder::TD_JAIL_FIXTURE_NAME,
                     crate::ladder::TD_JAIL_FIXTURE_NAME,
                     HOST_DEGRADATION_CGROUP,
                     HOST_DEGRADATION_WAYLAND,
@@ -188,7 +206,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
         content: format!(
-            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, the application bootstrap executes its parent-death and terminal-containment setup before authority resolution, stage 1 closes inherited descriptors, brings up and reads back isolated loopback, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, naturally reaps filtered descendants as PID 1, and exercises bounded namespace-wide TERM and KILL survivor cleanup; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; explicit host mode launches the ordinary fixture identity and spec from a materialized prefix through the real td-busd registration path, binds caller-owned host session sockets, and emits the exact cgroup and Wayland-filter degradation report; the host smoke leg may skip behavior under an inherited filter, while system-x86-64's QEMU oracle supplies the authoritative target-kernel transition through {TD_JAIL_TRANSITION_MARKER} and the installed-application launch proof, including a bounded loopback datagram plus writable and recursively read-only filesystem-grant oracles, through {TD_JAIL_FIXTURE_BOOT_MARKER}\n"
+            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, the application bootstrap executes its parent-death and terminal-containment setup before authority resolution, stage 1 closes inherited descriptors, preserves a policy-declared shared network or brings up and reads back isolated loopback, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, naturally reaps filtered descendants as PID 1, and exercises bounded namespace-wide TERM and KILL survivor cleanup; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; explicit host mode launches the ordinary fixture identity with both its isolated spec and a fixture-derived shared-network spec from a materialized prefix through the real td-busd registration path, binds caller-owned host session sockets, and emits the exact cgroup and Wayland-filter degradation report for both; the host smoke leg may skip behavior under an inherited filter, while system-x86-64's QEMU oracle supplies the authoritative target-kernel isolated transition through {TD_JAIL_TRANSITION_MARKER} and the installed-application launch proof, including a bounded loopback datagram plus writable and recursively read-only filesystem-grant oracles, through {TD_JAIL_FIXTURE_BOOT_MARKER}\n"
         ),
         exec: false,
     });
@@ -208,7 +226,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, launches the ordinary fixture through the parent-death and terminal-containment bootstrap from a host prefix with exact degradation diagnostics, smoke-tests namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping plus bounded TERM/KILL survivor cleanup, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
+echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, launches the ordinary fixture with isolated and shared network policy through the parent-death and terminal-containment bootstrap from a host prefix with exact degradation diagnostics, smoke-tests namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping plus bounded TERM/KILL survivor cleanup, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 "#,
@@ -218,7 +236,16 @@ exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 
 #[cfg(test)]
 mod tests {
-    use super::{HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND};
+    use super::{host_fixture, HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND};
+
+    #[test]
+    fn host_fixture_exercises_declared_shared_network() {
+        let host = host_fixture().expect("host fixture");
+        assert!(!host.spec.contains("shared=network"));
+        assert!(host
+            .shared_spec
+            .contains("[Context]\nshared=network\nsockets=wayland\n"));
+    }
 
     #[test]
     fn host_degradation_contract_matches_td_jail() {

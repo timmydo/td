@@ -77,6 +77,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) outside_gid: u32,
     pub(crate) inside_uid: u32,
     pub(crate) inside_gid: u32,
+    pub(crate) isolate_network: bool,
     pub(crate) enforce_cgroup: bool,
     pub(crate) host_mode: bool,
 }
@@ -348,6 +349,7 @@ where
         outside_gid: outside_identity.1,
         inside_uid: inside_identity.0,
         inside_gid: inside_identity.1,
+        isolate_network: !spec.permissions.network(),
         enforce_cgroup: config.enforce_cgroup,
         host_mode: config.host_mode,
     })
@@ -2440,6 +2442,13 @@ mod tests {
         assert_eq!(spec.name, "fixture");
         assert_eq!(spec.entry, "/app/bin/fixture");
         assert_eq!(spec.environment.len(), 4);
+
+        let shared_network = text.replace(
+            "sockets=wayland\n",
+            "shared=network\nsockets=wayland\n",
+        );
+        let spec = parse_spec(&shared_network).unwrap();
+        assert!(spec.permissions.network());
 
         let filesystem = text.replace(
             "sockets=wayland\n",

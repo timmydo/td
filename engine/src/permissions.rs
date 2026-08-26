@@ -506,13 +506,14 @@ impl PermissionPolicy {
     /// operator holding a permission file and "policy not implemented" does
     /// not say which line to change.
     ///
-    /// What is honoured is the wayland socket, filesystem entries, resource
-    /// limits, and `[Session Bus Policy]` `own` entries — the last of which
-    /// the broker consults when the application asks for the name. `see` and
-    /// `talk` parse and are refused here: widening what a sandbox may ADDRESS
-    /// is a decision about the imported services §B.3.2 lists, not a
-    /// mechanism this file is waiting on, and admitting the entries before
-    /// that decision would make the file claim a grant nothing applies.
+    /// What is honoured is shared network, the wayland socket, filesystem
+    /// entries, resource limits, and `[Session Bus Policy]` `own` entries —
+    /// the last of which the broker consults when the application asks for
+    /// the name. `see` and `talk` parse and are refused here: widening what a
+    /// sandbox may ADDRESS is a decision about the imported services §B.3.2
+    /// lists, not a mechanism this file is waiting on, and admitting the
+    /// entries before that decision would make the file claim a grant nothing
+    /// applies.
     ///
     /// Wayland is REQUIRED and not merely honoured, which is what the
     /// destructure below is for: every rule here is a statement about a named
@@ -520,16 +521,13 @@ impl PermissionPolicy {
     /// being silently admitted.
     pub fn unhonoured_request(&self) -> Option<String> {
         let PermissionPolicy {
-            network,
+            network: _,
             sockets,
             allow_devel,
             filesystems: _,
             session_bus,
             resources: _,
         } = self;
-        if *network {
-            return Some("shared=network".to_string());
-        }
         if !sockets.contains(&PermissionSocket::Wayland) {
             return Some("a launch with no wayland socket".to_string());
         }
@@ -1271,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn jail_subset_is_wayland_filesystems_resources_and_owned_names() {
+    fn jail_subset_is_wayland_network_filesystems_resources_and_owned_names() {
         let admitted = PermissionPolicy::new()
             .with_socket(PermissionSocket::Wayland)
             .unwrap()
@@ -1296,9 +1294,8 @@ mod tests {
                 .clone()
                 .with_network()
                 .unwrap()
-                .unhonoured_request()
-                .as_deref(),
-            Some("shared=network")
+                .unhonoured_request(),
+            None
         );
         assert_eq!(
             admitted

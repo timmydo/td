@@ -132,12 +132,11 @@ impl NamespaceSnapshot {
         })
     }
 
-    fn require_all_changed(&self, before: &Self) -> io::Result<()> {
+    fn require_application_change(&self, before: &Self, isolate_network: bool) -> io::Result<()> {
         for (name, old, new) in [
             ("user", &before.user, &self.user),
             ("mount", &before.mount, &self.mount),
             ("uts", &before.uts, &self.uts),
-            ("network", &before.network, &self.network),
         ] {
             if old == new {
                 return Err(io::Error::other(format!(
@@ -145,7 +144,15 @@ impl NamespaceSnapshot {
                 )));
             }
         }
-        Ok(())
+        match (isolate_network, self.network == before.network) {
+            (true, true) => Err(io::Error::other(
+                "unshare reported success but the network namespace did not change",
+            )),
+            (false, false) => Err(io::Error::other(
+                "shared network policy unexpectedly changed the network namespace",
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -2446,7 +2453,7 @@ pub fn probe_transition() -> io::Result<()> {
 
     sys::unshare_namespaces(true)?;
     install_identity_maps(identity, identity)?;
-    NamespaceSnapshot::read()?.require_all_changed(&before)?;
+    NamespaceSnapshot::read()?.require_application_change(&before, true)?;
     sys::bring_up_loopback()
         .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
     let test_leak = install_test_leak_if_requested()?;
@@ -3200,7 +3207,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     }
 
     let launch_result = (|| -> io::Result<()> {
-        sys::unshare_namespaces(true).map_err(|error| {
+        sys::unshare_namespaces(application.isolate_network).map_err(|error| {
             if application.host_mode {
                 io::Error::new(
                     error.kind(),
@@ -3215,9 +3222,12 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             outside_identity,
             application.host_mode,
         )?;
-        NamespaceSnapshot::read()?.require_all_changed(&before)?;
-        sys::bring_up_loopback()
-            .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
+        NamespaceSnapshot::read()?
+            .require_application_change(&before, application.isolate_network)?;
+        if application.isolate_network {
+            sys::bring_up_loopback()
+                .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
+        }
         close_inherited_descriptors(cleanup_descriptor)?;
         prepare_mount_plan(inside_identity, &executable, Some(&application))?;
         prepare_capability_bridge()?;
@@ -3440,6 +3450,45 @@ mod tests {
             .map(|value| OsString::from(*value))
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    fn namespace_snapshot(
+        user: &str,
+        mount: &str,
+        uts: &str,
+        network: &str,
+    ) -> NamespaceSnapshot {
+        NamespaceSnapshot {
+            user: PathBuf::from(user),
+            mount: PathBuf::from(mount),
+            uts: PathBuf::from(uts),
+            network: PathBuf::from(network),
+            pid: PathBuf::from("pid:[1]"),
+        }
+    }
+
+    #[test]
+    fn application_namespace_readback_distinguishes_shared_and_isolated_networks() {
+        let before = namespace_snapshot("user:[1]", "mnt:[1]", "uts:[1]", "net:[1]");
+        let isolated = namespace_snapshot("user:[2]", "mnt:[2]", "uts:[2]", "net:[2]");
+        let shared = namespace_snapshot("user:[2]", "mnt:[2]", "uts:[2]", "net:[1]");
+
+        isolated.require_application_change(&before, true).unwrap();
+        shared.require_application_change(&before, false).unwrap();
+        assert!(shared.require_application_change(&before, true).is_err());
+        assert!(isolated
+            .require_application_change(&before, false)
+            .is_err());
+
+        for unchanged in [
+            namespace_snapshot("user:[1]", "mnt:[2]", "uts:[2]", "net:[2]"),
+            namespace_snapshot("user:[2]", "mnt:[1]", "uts:[2]", "net:[2]"),
+            namespace_snapshot("user:[2]", "mnt:[2]", "uts:[1]", "net:[2]"),
+        ] {
+            assert!(unchanged
+                .require_application_change(&before, true)
+                .is_err());
+        }
     }
 
     /// The ceiling `td-busd` declares for one of the two names this module
