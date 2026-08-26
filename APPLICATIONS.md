@@ -2106,20 +2106,22 @@ namespace while the old procfs is still visible, pivots into the prepared
 root, then drops every remaining capability before policy finalization.
 The landed rung-12 application path is the closed static/empty-runtime
 subset of this target table. It implements `/app`, `/usr`, fresh `/proc`,
-the minimal `/dev`, tmpfs `/run`, the exact Wayland socket, the session
-bus socket of step 12 and the five persistent state directories, and either a
-read-back-up loopback interface in an otherwise-empty network namespace or the
-unchanged td network namespace selected by `shared=network`. It deliberately
-leaves `/etc`, `/sys`, `/var/lib`, `/var/cache`, `.flatpak-info`, extension
+the minimal `/dev`, a selective immutable `/etc`, tmpfs `/run`, the exact
+Wayland socket, the session bus socket of step 12 and the five persistent state
+directories, and either a read-back-up loopback interface in an otherwise-empty
+network namespace or the unchanged td network namespace selected by
+`shared=network`. It deliberately
+leaves `/sys`, `/var/lib`, `/var/cache`, `.flatpak-info`, extension
 mounts, and mutable permission overrides absent. It accepts exactly optional
 `shared=network`, `sockets=wayland`, the closed filesystem subset below,
 resource limits, and `[Session Bus Policy]` `own` entries, which it forwards
 to the broker at registration and does not itself act on; any other policy is
 refused, and the refusal names the request so an operator holding a permission
 file learns which line to change. Sharing is direct access to td's network
-stack, not mediation, and this landing does not populate `/etc/resolv.conf` or
-claim name resolution. Later rungs fill those named rows without making their
-absence a degraded launch mode.
+stack, not mediation. A shared-network launch binds td-netd's direct regular
+`/run/resolv.conf` read-only when it exists; an isolated launch never exposes
+it. Later rungs fill the remaining named rows without making their absence a
+degraded launch mode.
 
 The bus is bound unconditionally and is deliberately not a `sockets=`
 permission, which is what step 12 has said since it was written. It is
@@ -2198,9 +2200,18 @@ on a load-bearing bind is fatal, never degraded:
  4  /app   <- app deploy files/                ro, nosuid, nodev
  5  /bin /sbin /lib /lib64 -> symlinks into usr/
  6  /etc   tmpfs, populated selectively from the runtime's usr/etc, then
-        immutable; over-written per instance: passwd, group, hosts,
-        hostname, machine-id, resolv.conf, nsswitch.conf,
-        ssl/certs/ca-certificates.crt
+        immutable. The closed runtime allowlist is dconf, fonts, gtk-3.0,
+        gtk-4.0, ld.so.cache, ld.so.conf, ld.so.conf.d, pango, pulse,
+        vulkan and xdg; a present entry must be one direct regular file or
+        directory, and each bind plus every nested mount is read-only,
+        nosuid, nodev and noexec. Unknown runtime entries remain absent from
+        /etc; the complete immutable runtime remains available below /usr/etc.
+        td owns passwd, group, hosts, hostname, machine-id, resolv.conf,
+        nsswitch.conf and ssl/certs/ca-certificates.crt. Identity and name
+        files are synthesized into the tmpfs; machine-id is the validated
+        per-application value from private state; the CA file is a read-only
+        bind of the image's pinned store artifact; resolv.conf is a read-only
+        bind only for shared network and only when td-netd produced it.
  7  extension mounts at authenticated extension-point directories
  8  /proc  mount point prepared by stage 1; after step 15, stage 2 mounts
         a fresh procfs for the namespace where it is PID 1, before the
@@ -5271,16 +5282,22 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   work, and a draft's flat "the work here is not to create it" read as
   denying that.
   **What each sandbox sees is a per-app minted value** (§O), not the
-  machine's, so the jail mints one and binds it over `/etc/machine-id`
-  during mount setup: the host id is a cross-application linkage identifier, and
+  machine's, so the jail mints one at the application-state root on first
+  launch, validates its ownership, mode and 32-digit lowercase-hex shape on
+  every launch, and copies that value into the instance's immutable
+  `/etc/machine-id`: the host id is a cross-application linkage identifier, and
   the draft's "one id per machine — differing per sandbox breaks nothing
   and helps nothing" was written before that decision and contradicts it.
-  Minting is cheap, td has no legacy to preserve, and `GetMachineId`
-  returns the app's own value so the two cannot disagree.
-- **`/etc/resolv.conf`** — bind of `/run/resolv.conf` (td-netd's
-  product), only with network. Absent with no network is correct: DNS
-  should fail like the network it names. **`/etc/hosts`** carries
-  loopback and the hostname.
+  Initial publication is serialized in the private state directory and staged
+  as a fully synced immutable file, so an interrupted first launch is repaired
+  without accepting arbitrary invalid state. Minting is cheap, and td has no
+  legacy to preserve. The broker currently returns `UnknownMethod` for
+  `Peer.GetMachineId`; §D must make that future reply use this same app value.
+- **`/etc/resolv.conf`** — read-only bind of the direct regular
+  `/run/resolv.conf` (td-netd's product), only with shared network and only
+  after td-netd has produced it. Absent with no network or no lease is correct:
+  DNS should fail like the network it names. **`/etc/hosts`** carries loopback
+  and the inherited UTS hostname; `/etc/hostname` agrees with the same name.
 - **`/etc/localtime`** — td carries no TZif and the bar is proudly UTC.
   Apps show UTC; a user who cares sets `TZ=` and glibc reads the
   *runtime's* zoneinfo. Recorded divergence, zero code.
@@ -5581,6 +5598,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12d | **application terminal/session containment — LANDED**: the argv0-selected launcher waits on a later-born stage 1; stage 1 binds its lifetime to that exact parent, then either preserves and reads back an existing no-terminal supervisor group or enters and reads back a new session with no controlling terminal. Only then may it resolve authority, register or create state. Parent death still tears down stage 1, stage 2 and the cgroup leaf. `devices=tty` remains refused until a fresh-terminal policy exists | the jail is not an ambient terminal member, and it does not escape a dedicated service stop scope |
 | 12e | **typed CPU bandwidth policy — LANDED**: permission format 2 adds bounded `cpu-max=QUOTA PERIOD`; format 1 remains accepted and inherits a one-CPU baseline. The kernel pins fair-group scheduling and CFS bandwidth while keeping real-time group scheduling off; td-svc delegates `cpu` top-down; td-jail writes and exactly reads `cpu.max`, reports the bandwidth rows from `cpu.stat`, and the 50%-CPU fixture's active leaf gates the QEMU marker | aggregate CPU time is capped with the memory and task budgets |
 | 12f | **typed shared-network policy — LANDED**: the authenticated `shared=network` permission selects the compiled namespace set without `CLONE_NEWNET`; stage 1 requires the network namespace inode to remain unchanged and skips the isolated-loopback ioctl. Omitted policy retains `CLONE_NEWNET`, exact changed-inode readback and the up-loopback oracle. The host fixture launches both its isolated defaults and a derived shared-network variant; the shipped QEMU fixture remains isolated. `/etc/resolv.conf` and mediated network policy remain later work | a declared application can use td's network stack without weakening the default isolated path |
+| 12g | **selective immutable `/etc` — IMPLEMENTED; integration pending**: a bounded tmpfs admits only the closed runtime configuration allowlist, synthesized passwd/group/host/NSS identity, one persisted per-application machine id, the pinned curl-rendered Mozilla CA bundle, and a read-only resolver bind only for declared shared networking. Stage 1 source-identity-checks every external file and recursively hardens selected runtime directories; stage 2 derives the exact tree from `/usr/etc`, checks synthesized contents, mount flags, nested mounts, PEM shape and write refusal. Host mode names fixture-owned CA and resolver inputs rather than borrowing ambient `/etc`. The compositor's target fixture must replace its stale `/etc`-absent oracle before this rung is landed | applications get libc/toolkit identity and trust data without seeing the host configuration |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
@@ -7129,11 +7147,13 @@ booted td image even though the same static artifact is exercised by the
 host recipe test. The host configuration is an exact, ordered keyfile:
 
 ```text
-format=1
+format=2
 package-root=/absolute/materialized/packages
 state-root=/absolute/caller/home/.td/app
 registry=/absolute/td-applications.tsv
 launcher-table=/absolute/td-launcher.tsv
+ca-bundle=/absolute/materialized/ca-bundle.crt
+resolv-conf=/absolute/materialized/resolv.conf
 cgroup-root=none
 ```
 
@@ -7146,6 +7166,13 @@ the local td-busd socket at `$XDG_RUNTIME_DIR/bus` must be direct paths
 owned by the invoking uid. Inside the jail that caller is mapped to the
 product identity uid/gid 1000, so `/app`, `/usr`, `/home/td`, and
 `/run/user/1000` do not change between configurations.
+
+The two extra host paths stand in for image-owned availability, not policy.
+The CA bundle is a mandatory direct, bounded regular file and the resolver
+file is an optional direct, bounded regular file used only by a
+`shared=network` launch. The host acceptance recipe points the former at the
+same pinned `ca-certificates` output the image uses and materializes the latter
+as fixture data; td-jail never borrows the host's ambient `/etc`.
 
 ### X.2 What is missing on a host, and what answers it
 

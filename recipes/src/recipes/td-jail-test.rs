@@ -1,14 +1,12 @@
 use crate::ladder::{
-    post_bootstrap_path, POST_BOOTSTRAP_SH, TD_JAIL_FIXTURE_BOOT_MARKER,
-    TD_JAIL_TRANSITION_MARKER,
+    post_bootstrap_path, POST_BOOTSTRAP_SH, TD_JAIL_FIXTURE_BOOT_MARKER, TD_JAIL_TRANSITION_MARKER,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::application::ApplicationProvenance;
 use td_engine::application_spec::ApplicationSpec;
 use td_engine::launcher::{ApplicationRegistry, LauncherTable};
 
-const HOST_PACKAGE: &str =
-    "/td/store/00000000000000000000000000000000-td-jail-fixture-0.1";
+const HOST_PACKAGE: &str = "/td/store/00000000000000000000000000000000-td-jail-fixture-0.1";
 const HOST_RUNTIME: &str = "/td/store/00000000000000000000000000000000-empty-runtime-1";
 const HOST_DEGRADATION_CGROUP: &str =
     "TD-JAIL-HOST-DEGRADATION aggregate-memory-task-and-cpu-caps=unenforced reason=no-delegated-cgroup";
@@ -94,6 +92,8 @@ pub fn recipe() -> Recipe {
     for path in [
         "/home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/files/bin",
         "/home/td-jail-host/packages/00000000000000000000000000000000-empty-runtime-1/files",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-empty-runtime-1/files/etc",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-empty-runtime-1/files/etc/fonts",
         "/home/td-jail-host/etc",
         "/home/td-jail-host",
         "/home/td-jail-host/runtime",
@@ -130,7 +130,17 @@ pub fn recipe() -> Recipe {
     }
     steps.push(Step::WriteFile {
         path: "/home/td-jail-host/etc/td-app-host.conf".into(),
-        content: "format=1\npackage-root=/home/td-jail-host/packages\nstate-root=/home/td-jail-host/.td/app\nregistry=/home/td-jail-host/etc/td-applications.tsv\nlauncher-table=/home/td-jail-host/etc/td-launcher.tsv\ncgroup-root=none\n".into(),
+        content: "format=2\npackage-root=/home/td-jail-host/packages\nstate-root=/home/td-jail-host/.td/app\nregistry=/home/td-jail-host/etc/td-applications.tsv\nlauncher-table=/home/td-jail-host/etc/td-launcher.tsv\nca-bundle={in:ca-certificates}/share/ca-certificates/ca-bundle.crt\nresolv-conf=/home/td-jail-host/etc/resolv.conf\ncgroup-root=none\n".into(),
+        exec: false,
+    });
+    steps.push(Step::WriteFile {
+        path: "/home/td-jail-host/etc/resolv.conf".into(),
+        content: "nameserver 127.0.0.1\n".into(),
+        exec: false,
+    });
+    steps.push(Step::WriteFile {
+        path: "/home/td-jail-host/packages/00000000000000000000000000000000-empty-runtime-1/files/etc/ld.so.conf".into(),
+        content: "include /etc/ld.so.conf.d/*.conf\n".into(),
         exec: false,
     });
     steps.push(
@@ -206,7 +216,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
         content: format!(
-            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, the application bootstrap executes its parent-death and terminal-containment setup before authority resolution, stage 1 closes inherited descriptors, preserves a policy-declared shared network or brings up and reads back isolated loopback, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, naturally reaps filtered descendants as PID 1, and exercises bounded namespace-wide TERM and KILL survivor cleanup; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; explicit host mode launches the ordinary fixture identity with both its isolated spec and a fixture-derived shared-network spec from a materialized prefix through the real td-busd registration path, binds caller-owned host session sockets, and emits the exact cgroup and Wayland-filter degradation report for both; the host smoke leg may skip behavior under an inherited filter, while system-x86-64's QEMU oracle supplies the authoritative target-kernel isolated transition through {TD_JAIL_TRANSITION_MARKER} and the installed-application launch proof, including a bounded loopback datagram plus writable and recursively read-only filesystem-grant oracles, through {TD_JAIL_FIXTURE_BOOT_MARKER}\n"
+            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, the application bootstrap executes its parent-death and terminal-containment setup before authority resolution, stage 1 closes inherited descriptors, preserves a policy-declared shared network or brings up and reads back isolated loopback, builds a selective immutable /etc with per-application identity, pinned CA trust, and nonempty file/directory runtime configuration binds, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, derives the exact /etc roster from /usr/etc, verifies its runtime nested mounts and conditional resolver bind, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, naturally reaps filtered descendants as PID 1, and exercises bounded namespace-wide TERM and KILL survivor cleanup; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; explicit host mode launches the ordinary fixture identity with both its isolated spec and a fixture-derived shared-network spec from a materialized prefix through the real td-busd registration path, binds caller-owned host session sockets, and emits the exact cgroup and Wayland-filter degradation report for both; the host smoke leg may skip behavior under an inherited filter, while system-x86-64's QEMU oracle supplies the authoritative target-kernel isolated transition through {TD_JAIL_TRANSITION_MARKER} and the installed-application launch proof, including a bounded loopback datagram plus writable and recursively read-only filesystem-grant oracles, through {TD_JAIL_FIXTURE_BOOT_MARKER}\n"
         ),
         exec: false,
     });
@@ -220,13 +230,14 @@ pub fn recipe() -> Recipe {
             "td-busd",
             "td-compositor",
             "td-jail-seccomp-probe",
+            "ca-certificates",
             "binutils-x86-64-self",
             "busybox-x86-64",
         ])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, launches the ordinary fixture with isolated and shared network policy through the parent-death and terminal-containment bootstrap from a host prefix with exact degradation diagnostics, smoke-tests namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping plus bounded TERM/KILL survivor cleanup, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
+echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, launches the ordinary fixture with isolated and shared network policy through the parent-death and terminal-containment bootstrap from a host prefix with exact degradation diagnostics and fixture-owned CA/resolver inputs, smoke-tests selective immutable /etc plus namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping plus bounded TERM/KILL survivor cleanup, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 "#,
@@ -253,5 +264,34 @@ mod tests {
         for diagnostic in [HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND] {
             assert!(transition.contains(diagnostic));
         }
+    }
+
+    #[test]
+    fn host_config_names_fixture_owned_etc_inputs() {
+        let recipe = super::recipe();
+        assert!(recipe
+            .native_inputs
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&"ca-certificates".to_string()));
+        assert!(recipe.steps.iter().flatten().any(|step| matches!(
+            step,
+            crate::types::Step::WriteFile { path, content, exec: false }
+                if path == "/home/td-jail-host/etc/td-app-host.conf"
+                    && content.starts_with("format=2\n")
+                    && content.contains("ca-bundle={in:ca-certificates}/share/ca-certificates/ca-bundle.crt\n")
+                    && content.contains("resolv-conf=/home/td-jail-host/etc/resolv.conf\n")
+        )));
+        assert!(recipe.steps.iter().flatten().any(|step| matches!(
+            step,
+            crate::types::Step::MkDir { path }
+                if path.ends_with("empty-runtime-1/files/etc/fonts")
+        )));
+        assert!(recipe.steps.iter().flatten().any(|step| matches!(
+            step,
+            crate::types::Step::WriteFile { path, content, exec: false }
+                if path.ends_with("empty-runtime-1/files/etc/ld.so.conf")
+                    && content == "include /etc/ld.so.conf.d/*.conf\n"
+        )));
     }
 }

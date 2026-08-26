@@ -6,15 +6,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{
+    DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::path::{Path, PathBuf};
 
 const CONFIG_PATH: &str = "/etc/td-app.conf";
 const REGISTRY_PATH: &str = "/etc/td-applications.tsv";
 const PACKAGE_ROOT: &str = "/td/store";
 const STATE_ROOT: &str = ".td/app";
+const CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";
+const RESOLV_CONF_PATH: &str = "/run/resolv.conf";
 const APPLICATION_UID: u32 = 1000;
 const APPLICATION_GID: u32 = 1000;
 pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";
@@ -28,6 +32,8 @@ const STATE_ROOT_PREFIX: &str = "state-root=";
 const REGISTRY_PREFIX: &str = "registry=";
 const LAUNCHER_TABLE_PREFIX: &str = "launcher-table=";
 const CGROUP_ROOT_PREFIX: &str = "cgroup-root=";
+const CA_BUNDLE_PREFIX: &str = "ca-bundle=";
+const RESOLV_CONF_PREFIX: &str = "resolv-conf=";
 const SPEC_FORMAT: &str = "format=1";
 const NAME_PREFIX: &str = "name=";
 const RUNTIME_PREFIX: &str = "runtime=";
@@ -36,6 +42,8 @@ const ENVIRONMENT_SECTION: &str = "[Environment]";
 const MAX_CONFIG_BYTES: usize = 4096;
 const MAX_STATUS_BYTES: usize = 64 * 1024;
 const MAX_PASSWD_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_RESOLV_CONF_BYTES: u64 = 64 * 1024;
 const MAX_APPLICATION_SPEC_BYTES: usize = 48 * 1024;
 const MAX_APPLICATION_TABLE_BYTES: usize = 1024 * 1024;
 const MAX_APPLICATIONS: usize = 256;
@@ -56,6 +64,8 @@ pub(crate) struct LaunchPlan {
     pub(crate) name: String,
     pub(crate) package_files: PathBuf,
     pub(crate) runtime_files: PathBuf,
+    pub(crate) ca_bundle: ResolvedFile,
+    pub(crate) resolv_conf: Option<ResolvedFile>,
     pub(crate) state: StatePlan,
     pub(crate) wayland_socket: PathBuf,
     pub(crate) bus_socket: PathBuf,
@@ -86,6 +96,8 @@ pub(crate) struct LaunchPlan {
 struct ProductConfig {
     package_root: PathBuf,
     registry: PathBuf,
+    ca_bundle: ResolvedFile,
+    resolv_conf: PathBuf,
     real_home: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
     enforce_cgroup: bool,
@@ -150,6 +162,15 @@ pub(crate) struct StatePlan {
     pub(crate) data: PathBuf,
     pub(crate) local_state: PathBuf,
     pub(crate) runtime: PathBuf,
+    pub(crate) machine_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedFile {
+    pub(crate) path: PathBuf,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,11 +347,23 @@ where
         &bus_socket,
     )?;
     let resources = ResolvedResourceLimits::from_policy(spec.permissions.resources())?;
+    let isolate_network = !spec.permissions.network();
+    let resolv_conf = if isolate_network {
+        None
+    } else {
+        resolve_optional_file(
+            &config.resolv_conf,
+            "application resolver configuration",
+            MAX_RESOLV_CONF_BYTES,
+        )?
+    };
 
     Ok(LaunchPlan {
         name: name.to_string(),
         package_files,
         runtime_files,
+        ca_bundle: config.ca_bundle,
+        resolv_conf,
         state,
         wayland_socket,
         bus_socket,
@@ -349,7 +382,7 @@ where
         outside_gid: outside_identity.1,
         inside_uid: inside_identity.0,
         inside_gid: inside_identity.1,
-        isolate_network: !spec.permissions.network(),
+        isolate_network,
         enforce_cgroup: config.enforce_cgroup,
         host_mode: config.host_mode,
     })
@@ -385,9 +418,12 @@ fn target_config() -> io::Result<ProductConfig> {
             "application configuration is not the compiled product configuration",
         ));
     }
+    let ca_bundle = resolve_product_ca_bundle(Path::new(CA_BUNDLE_PATH))?;
     Ok(ProductConfig {
         package_root: PathBuf::from(PACKAGE_ROOT),
         registry: PathBuf::from(REGISTRY_PATH),
+        ca_bundle,
+        resolv_conf: PathBuf::from(RESOLV_CONF_PATH),
         real_home: None,
         runtime_root: None,
         enforce_cgroup: true,
@@ -424,8 +460,8 @@ fn host_config(path: &Path, identity: (u32, u32)) -> io::Result<ProductConfig> {
     validate_text("host configuration", &text, MAX_CONFIG_BYTES)?;
     let mut lines = text.lines();
     let format = prefixed_line(&mut lines, FORMAT_PREFIX, "host configuration format")?;
-    if format != "1" {
-        return Err(invalid("host configuration requires format=1"));
+    if format != "2" {
+        return Err(invalid("host configuration requires format=2"));
     }
     let package_root = PathBuf::from(prefixed_line(
         &mut lines,
@@ -446,6 +482,16 @@ fn host_config(path: &Path, identity: (u32, u32)) -> io::Result<ProductConfig> {
         &mut lines,
         LAUNCHER_TABLE_PREFIX,
         "host launcher table",
+    )?);
+    let ca_bundle = PathBuf::from(prefixed_line(
+        &mut lines,
+        CA_BUNDLE_PREFIX,
+        "host CA bundle",
+    )?);
+    let resolv_conf = PathBuf::from(prefixed_line(
+        &mut lines,
+        RESOLV_CONF_PREFIX,
+        "host resolver configuration",
     )?);
     let cgroup_root = prefixed_line(
         &mut lines,
@@ -476,6 +522,9 @@ fn host_config(path: &Path, identity: (u32, u32)) -> io::Result<ProductConfig> {
             return Err(invalid(format!("{label} is not a direct regular file")));
         }
     }
+    validate_absolute_config_path(&ca_bundle, "host CA bundle")?;
+    let ca_bundle = resolve_direct_file(&ca_bundle, "host CA bundle", MAX_CA_BUNDLE_BYTES)?;
+    validate_absolute_config_path(&resolv_conf, "host resolver configuration")?;
     validate_absolute_config_path(&state_root, "host state root")?;
     let real_home = state_root
         .parent()
@@ -505,6 +554,8 @@ fn host_config(path: &Path, identity: (u32, u32)) -> io::Result<ProductConfig> {
     Ok(ProductConfig {
         package_root,
         registry,
+        ca_bundle,
+        resolv_conf,
         real_home: Some(real_home),
         runtime_root: Some(runtime_root),
         enforce_cgroup: false,
@@ -1825,6 +1876,83 @@ fn require_regular(path: &Path, label: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn resolved_regular(path: PathBuf, label: &str, max_bytes: u64) -> io::Result<ResolvedFile> {
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("inspect {label} {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
+        return Err(invalid(format!(
+            "{label} {} is not a bounded nonempty regular file",
+            path.display()
+        )));
+    }
+    Ok(ResolvedFile {
+        path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+    })
+}
+
+fn resolve_direct_file(path: &Path, label: &str, max_bytes: u64) -> io::Result<ResolvedFile> {
+    require_regular(path, label)?;
+    let canonical = fs::canonicalize(path)?;
+    if canonical != path {
+        return Err(invalid(format!("{label} is not a direct regular file")));
+    }
+    resolved_regular(canonical, label, max_bytes)
+}
+
+fn resolve_optional_file(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+) -> io::Result<Option<ResolvedFile>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("inspect {label} {}: {error}", path.display()),
+        )),
+        Ok(_) => resolve_direct_file(path, label, max_bytes).map(Some),
+    }
+}
+
+fn resolve_product_ca_bundle(path: &Path) -> io::Result<ResolvedFile> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("inspect application CA bundle {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_symlink() {
+        return Err(invalid(
+            "application CA bundle is not the image's immutable store symlink",
+        ));
+    }
+    let canonical = fs::canonicalize(path)?;
+    let relative = canonical.strip_prefix(PACKAGE_ROOT).map_err(|_| {
+        invalid("application CA bundle does not resolve into the product store")
+    })?;
+    let object = relative
+        .components()
+        .next()
+        .ok_or_else(|| invalid("application CA bundle has no store object"))?;
+    require_store_child(
+        &Path::new(PACKAGE_ROOT).join(object.as_os_str()),
+        "application CA bundle store object",
+    )?;
+    if relative.components().nth(1).is_none() {
+        return Err(invalid(
+            "application CA bundle resolves to a store object rather than a file",
+        ));
+    }
+    resolved_regular(canonical, "application CA bundle", MAX_CA_BUNDLE_BYTES)
+}
+
 fn require_directory(path: &Path, label: &str) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         io::Error::new(
@@ -2018,6 +2146,7 @@ fn prepare_state(
     let td = ensure_state_component(&home, state_parent, identity, false)?;
     let applications = ensure_state_component(&td, state_applications, identity, true)?;
     let application = ensure_state_component(&applications, name, identity, true)?;
+    let machine_id = ensure_application_machine_id(&application, identity)?;
     let private_home = ensure_state_component(&application, "home", identity, true)?;
     // These empty children are bind targets; persistent contents live in the
     // sibling config, cache, data, and state trees.
@@ -2043,7 +2172,192 @@ fn prepare_state(
         data,
         local_state,
         runtime,
+        machine_id,
     })
+}
+
+fn ensure_application_machine_id(application: &Path, identity: (u32, u32)) -> io::Result<String> {
+    let directory = File::open(application).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "open application state directory {}: {error}",
+                application.display()
+            ),
+        )
+    })?;
+    File::lock(&directory).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "lock application state directory {}: {error}",
+                application.display()
+            ),
+        )
+    })?;
+
+    let path = application.join("machine-id");
+    let staged = application.join(".machine-id.tmp");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => match read_application_machine_id(&path, identity) {
+            Ok(machine_id) => return Ok(machine_id),
+            Err(error) => {
+                if recover_published_machine_id(&path, &staged, &metadata, identity, &directory)? {
+                    return read_application_machine_id(&path, identity);
+                }
+                return Err(error);
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("inspect application machine id {}: {error}", path.display()),
+            ));
+        }
+    }
+
+    remove_staged_machine_id(&staged, identity, &directory)?;
+    let machine_id = mint_machine_id()?;
+    let initialized = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(&staged)?;
+        file.write_all(machine_id.as_bytes())?;
+        file.sync_all()?;
+        file.set_permissions(fs::Permissions::from_mode(0o444))?;
+        file.sync_all()?;
+        fs::hard_link(&staged, &path)?;
+        fs::remove_file(&staged)?;
+        directory.sync_all()
+    })();
+    if let Err(error) = initialized {
+        let _ = fs::remove_file(&staged);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("initialize application machine id {}: {error}", path.display()),
+        ));
+    }
+    read_application_machine_id(&path, identity)
+}
+
+fn recover_published_machine_id(
+    path: &Path,
+    staged: &Path,
+    metadata: &fs::Metadata,
+    identity: (u32, u32),
+    directory: &File,
+) -> io::Result<bool> {
+    if !interrupted_machine_id(metadata, identity, &[0o444]) || metadata.nlink() != 2 {
+        return Ok(false);
+    }
+    let staged_metadata = match fs::symlink_metadata(staged) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if staged_metadata.dev() != metadata.dev()
+        || staged_metadata.ino() != metadata.ino()
+        || staged_metadata.nlink() != 2
+        || read_application_machine_id_with_links(path, identity, 2).is_err()
+    {
+        return Ok(false);
+    }
+    fs::remove_file(staged)?;
+    directory.sync_all()?;
+    Ok(true)
+}
+
+fn remove_staged_machine_id(
+    staged: &Path,
+    identity: (u32, u32),
+    directory: &File,
+) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(staged) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !interrupted_machine_id(&metadata, identity, &[0o400, 0o444]) {
+        return Err(invalid(format!(
+            "staged application machine id {} is not an initializer-owned file",
+            staged.display()
+        )));
+    }
+    fs::remove_file(staged)?;
+    directory.sync_all()
+}
+
+fn interrupted_machine_id(
+    metadata: &fs::Metadata,
+    identity: (u32, u32),
+    modes: &[u32],
+) -> bool {
+    metadata.file_type().is_file()
+        && metadata.uid() == identity.0
+        && metadata.gid() == identity.1
+        && metadata.nlink() >= 1
+        && metadata.nlink() <= 2
+        && metadata.len() <= 33
+        && modes.contains(&(metadata.mode() & 0o7777))
+}
+
+fn mint_machine_id() -> io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let mut machine_id = String::with_capacity(33);
+    for byte in bytes {
+        machine_id.push(char::from_digit(u32::from(byte >> 4), 16).ok_or_else(|| {
+            io::Error::other("machine-id high nibble is outside hexadecimal")
+        })?);
+        machine_id.push(char::from_digit(u32::from(byte & 0x0f), 16).ok_or_else(|| {
+            io::Error::other("machine-id low nibble is outside hexadecimal")
+        })?);
+    }
+    machine_id.push('\n');
+    Ok(machine_id)
+}
+
+fn read_application_machine_id(path: &Path, identity: (u32, u32)) -> io::Result<String> {
+    read_application_machine_id_with_links(path, identity, 1)
+}
+
+fn read_application_machine_id_with_links(
+    path: &Path,
+    identity: (u32, u32),
+    links: u64,
+) -> io::Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != identity.0
+        || metadata.gid() != identity.1
+        || metadata.nlink() != links
+        || metadata.mode() & 0o7777 != 0o444
+    {
+        return Err(invalid(format!(
+            "application machine id {} is not one immutable identity-owned file",
+            path.display()
+        )));
+    }
+    let text = read_bounded_path(path, 33)?;
+    if !valid_machine_id(&text) {
+        return Err(invalid(format!(
+            "application machine id {} is not 32 lowercase hexadecimal digits",
+            path.display()
+        )));
+    }
+    Ok(text)
+}
+
+pub(crate) fn valid_machine_id(text: &str) -> bool {
+    text.len() == 33
+        && text.as_bytes().get(32) == Some(&b'\n')
+        && text.as_bytes().get(..32).is_some_and(|id| {
+            id.iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
 }
 
 fn passwd_home(application_uid: u32) -> io::Result<PathBuf> {
@@ -2435,6 +2749,77 @@ mod tests {
     }
 
     #[test]
+    fn application_machine_id_is_minted_once_and_revalidated() {
+        let application = TestDirectory::new("machine-id").unwrap();
+        let identity = effective_identity().unwrap();
+        let first = ensure_application_machine_id(&application, identity).unwrap();
+        let second = ensure_application_machine_id(&application, identity).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 33);
+        assert!(first.ends_with('\n'));
+
+        let path = application.join("machine-id");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(ensure_application_machine_id(&application, identity).is_err());
+        fs::write(&path, b"0123456789ABCDEF0123456789ABCDEF\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(ensure_application_machine_id(&application, identity).is_err());
+    }
+
+    #[test]
+    fn application_machine_id_recovers_only_interrupted_initialization() {
+        let application = TestDirectory::new("machine-id-interrupted").unwrap();
+        let identity = effective_identity().unwrap();
+        let path = application.join("machine-id");
+        fs::write(&path, b"partial").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        assert!(ensure_application_machine_id(&application, identity).is_err());
+
+        fs::remove_file(&path).unwrap();
+        let staged = application.join(".machine-id.tmp");
+        fs::write(&staged, b"partial").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o400)).unwrap();
+        let recovered = ensure_application_machine_id(&application, identity).unwrap();
+        assert!(valid_machine_id(&recovered));
+        assert_eq!(fs::symlink_metadata(&path).unwrap().nlink(), 1);
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&staged, b"0123456789abcdef0123456789abcdef\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::hard_link(&staged, &path).unwrap();
+        let recovered = ensure_application_machine_id(&application, identity).unwrap();
+        assert_eq!(recovered, "0123456789abcdef0123456789abcdef\n");
+        assert!(!staged.exists());
+        assert_eq!(fs::symlink_metadata(&path).unwrap().nlink(), 1);
+    }
+
+    #[test]
+    fn concurrent_machine_id_initializers_publish_one_value() {
+        let application = TestDirectory::new("machine-id-concurrent").unwrap();
+        let identity = effective_identity().unwrap();
+        let application_path = std::sync::Arc::new(application.0.clone());
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let application_path = std::sync::Arc::clone(&application_path);
+            workers.push(std::thread::spawn(move || {
+                ensure_application_machine_id(&application_path, identity)
+            }));
+        }
+        let mut values = Vec::new();
+        for worker in workers {
+            values.push(worker.join().unwrap().unwrap());
+        }
+        assert!(values.windows(2).all(|pair| pair.first() == pair.get(1)));
+        assert_eq!(
+            fs::symlink_metadata(application_path.join("machine-id"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+    }
+
+    #[test]
     fn spec_parser_accepts_only_the_closed_canonical_subset() {
         let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1\nentry=/app/bin/fixture\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n";
         assert!(test_parse_spec(text).is_ok());
@@ -2582,6 +2967,7 @@ mod tests {
             data: fs::canonicalize(root.join("data")).unwrap(),
             local_state: fs::canonicalize(root.join("local-state")).unwrap(),
             runtime: fs::canonicalize(root.join("runtime-state")).unwrap(),
+            machine_id: "0123456789abcdef0123456789abcdef\n".to_string(),
         };
         let package = fs::canonicalize(root.join("package")).unwrap();
         let runtime = fs::canonicalize(root.join("runtime")).unwrap();

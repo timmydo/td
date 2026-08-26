@@ -1,13 +1,13 @@
 use crate::{
     authority::{
         self, decode_mountinfo_path, mount_identity_for_path, path_is_same_or_child,
-        paths_overlap,
-        FilesystemGrant, FilesystemSourceKind, LaunchPlan, ResolvedResourceLimits,
+        paths_overlap, FilesystemGrant, FilesystemSourceKind, LaunchPlan, ResolvedFile,
+        ResolvedResourceLimits,
     },
     cgroup, seccomp, sys,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -28,6 +28,8 @@ const CGROUP_CLEANUP_READY: [u8; 1] = [1];
 const STAGE2_ARG: &str = "--internal-stage-2";
 const STAGE2_PROBE_ARG: &str = "--probe";
 const STAGE2_LAUNCH_ARG: &str = "--launch";
+const STAGE2_RESOLV_CONF_ARG: &str = "--resolv-conf";
+const STAGE2_MACHINE_ID_ARG: &str = "--machine-id";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
 const STAGE2_RESOURCES_ARG: &str = "--resources";
@@ -68,6 +70,31 @@ const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const SURVIVOR_PROBE_LIFETIME: Duration = Duration::from_secs(30);
 const STAGE2_OUTPUT_LIMIT: usize = 4096;
 const WRITE_PROBE_PREFIX: &str = ".td-jail-write-probe-";
+const ETC_SIZE_BYTES: usize = 8 * 1024 * 1024;
+const NSSWITCH_CONF: &str = "passwd: files\ngroup: files\nhosts: files dns\n";
+const TD_OWNED_ETC_NAMES: &[&str] = &[
+    "group",
+    "hostname",
+    "hosts",
+    "machine-id",
+    "nsswitch.conf",
+    "passwd",
+    "resolv.conf",
+    "ssl",
+];
+const RUNTIME_ETC_ALLOWLIST: &[&str] = &[
+    "dconf",
+    "fonts",
+    "gtk-3.0",
+    "gtk-4.0",
+    "ld.so.cache",
+    "ld.so.conf",
+    "ld.so.conf.d",
+    "pango",
+    "pulse",
+    "vulkan",
+    "xdg",
+];
 
 const DEVICE_NODES: &[(&str, u64, u64)] = &[
     ("null", 1, 3),
@@ -203,6 +230,8 @@ pub enum Stage2Action {
     Probe,
     Launch {
         entry: String,
+        resolv_conf: bool,
+        machine_id: String,
         environment: Vec<(OsString, OsString)>,
         filesystems: Vec<Stage2Filesystem>,
         resources: ResolvedResourceLimits,
@@ -215,6 +244,22 @@ pub enum Stage2Action {
 struct Stage2ResourceBinding<'a> {
     limits: ResolvedResourceLimits,
     membership: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct Stage2MountBinding<'a> {
+    filesystems: &'a [FilesystemGrant],
+    resolv_conf: bool,
+    machine_id: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeEtcEntry {
+    name: &'static str,
+    source: PathBuf,
+    source_kind: FilesystemSourceKind,
+    source_device: u64,
+    source_inode: u64,
 }
 
 struct CgroupCleanup {
@@ -358,6 +403,25 @@ where
             .into_string()
             .map_err(|_| usage_error())?;
         authority::validate_entry(&entry)?;
+        if args.next().as_deref() != Some(STAGE2_RESOLV_CONF_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let resolv_conf = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("present") => true,
+            Some("absent") => false,
+            _ => return Err(usage_error()),
+        };
+        if args.next().as_deref() != Some(STAGE2_MACHINE_ID_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let machine_id = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        if !authority::valid_machine_id(&machine_id) {
+            return Err(usage_error());
+        }
         if args.next().as_deref() != Some(STAGE2_ENVIRONMENT_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -441,6 +505,8 @@ where
         }
         return Ok(Stage2Action::Launch {
             entry,
+            resolv_conf,
+            machine_id,
             environment,
             filesystems,
             resources,
@@ -502,14 +568,14 @@ fn stage2_launch_arguments(
     identity_map: LaunchIdentityMap,
     entry: &str,
     environment: &[(OsString, OsString)],
-    filesystems: &[FilesystemGrant],
+    mounts: Stage2MountBinding<'_>,
     resources: Stage2ResourceBinding<'_>,
     arguments: &[OsString],
 ) -> Vec<OsString> {
     let mut stage2 = Vec::with_capacity(
-        18usize
+        24usize
             .saturating_add(environment.len().saturating_mul(2))
-            .saturating_add(filesystems.len().saturating_mul(2))
+            .saturating_add(mounts.filesystems.len().saturating_mul(2))
             .saturating_add(arguments.len()),
     );
     stage2.extend([
@@ -521,6 +587,14 @@ fn stage2_launch_arguments(
         OsString::from(identity_map.outside.gid.to_string()),
         OsString::from(STAGE2_LAUNCH_ARG),
         OsString::from(entry),
+        OsString::from(STAGE2_RESOLV_CONF_ARG),
+        OsString::from(if mounts.resolv_conf {
+            "present"
+        } else {
+            "absent"
+        }),
+        OsString::from(STAGE2_MACHINE_ID_ARG),
+        OsString::from(mounts.machine_id),
         OsString::from(STAGE2_ENVIRONMENT_ARG),
         OsString::from(environment.len().to_string()),
     ]);
@@ -530,8 +604,8 @@ fn stage2_launch_arguments(
             .flat_map(|(key, value)| [key.clone(), value.clone()]),
     );
     stage2.push(OsString::from(STAGE2_FILESYSTEMS_ARG));
-    stage2.push(OsString::from(filesystems.len().to_string()));
-    for filesystem in filesystems {
+    stage2.push(OsString::from(mounts.filesystems.len().to_string()));
+    for filesystem in mounts.filesystems {
         stage2.push(filesystem.target.as_os_str().to_os_string());
         let mode = match (filesystem.read_only, filesystem.source_kind) {
             (true, FilesystemSourceKind::Directory) => "ro-dir",
@@ -925,37 +999,50 @@ fn mount_bind(source: &Path, target: &str) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("bind {source} at {target}: {e}")))
 }
 
-fn mount_filesystem_grant(grant: &FilesystemGrant) -> io::Result<()> {
-    authority::validate_filesystem_target(&grant.target)?;
-    require_filesystem_source_identity(grant)?;
-    let target = prepare_filesystem_target(&grant.target, grant.source_kind)?;
-    let source = grant.source.to_str().ok_or_else(|| {
-        io::Error::other(format!(
-            "filesystem grant source is not UTF-8: {}",
-            grant.source.display()
-        ))
+fn mount_bind_kind(
+    source: &Path,
+    target: &Path,
+    source_kind: FilesystemSourceKind,
+    label: &str,
+) -> io::Result<()> {
+    let source_text = source.to_str().ok_or_else(|| {
+        io::Error::other(format!("{label} source is not UTF-8: {}", source.display()))
     })?;
     let target_text = target.to_str().ok_or_else(|| {
-        io::Error::other(format!(
-            "filesystem grant target is not UTF-8: {}",
-            target.display()
-        ))
+        io::Error::other(format!("{label} target is not UTF-8: {}", target.display()))
     })?;
-    let source_c = cstring(source)?;
-    let target_c = cstring(target_text)?;
     let flags = sys::MS_BIND
-        | if grant.source_kind == FilesystemSourceKind::Directory {
+        | if source_kind == FilesystemSourceKind::Directory {
             sys::MS_REC
         } else {
             0
         };
-    sys::mount(Some(&source_c), &target_c, None, flags, None).map_err(|error| {
+    sys::mount(
+        Some(&cstring(source_text)?),
+        &cstring(target_text)?,
+        None,
+        flags,
+        None,
+    )
+    .map_err(|error| {
         io::Error::other(format!(
-            "bind filesystem grant {} at {}: {error}",
-            grant.source.display(),
-            grant.target.display()
+            "bind {label} {} at {}: {error}",
+            source.display(),
+            target.display()
         ))
-    })?;
+    })
+}
+
+fn mount_filesystem_grant(grant: &FilesystemGrant) -> io::Result<()> {
+    authority::validate_filesystem_target(&grant.target)?;
+    require_filesystem_source_identity(grant)?;
+    let target = prepare_filesystem_target(&grant.target, grant.source_kind)?;
+    mount_bind_kind(
+        &grant.source,
+        &target,
+        grant.source_kind,
+        "filesystem grant",
+    )?;
     apply_grant_mount_policy(&target, grant.read_only)?;
     let target_metadata = fs::symlink_metadata(&target)?;
     if target_metadata.dev() != grant.source_device
@@ -1202,6 +1289,300 @@ fn remount_read_only(path: &str, flags: usize) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("remount {path} read-only: {e}")))
 }
 
+fn selected_runtime_etc(runtime_files: &Path) -> io::Result<Vec<RuntimeEtcEntry>> {
+    validate_runtime_etc_allowlist()?;
+    let root = runtime_files.join("etc");
+    match fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::other(format!(
+                "runtime configuration root {} is not a direct directory",
+                root.display()
+            )));
+        }
+    }
+
+    let mut selected = Vec::new();
+    for name in RUNTIME_ETC_ALLOWLIST {
+        let source = root.join(name);
+        let metadata = match fs::symlink_metadata(&source) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            Ok(metadata) => metadata,
+        };
+        let source_kind = if metadata.file_type().is_dir() {
+            FilesystemSourceKind::Directory
+        } else if metadata.file_type().is_file() {
+            FilesystemSourceKind::File
+        } else {
+            return Err(io::Error::other(format!(
+                "runtime configuration {} is not a direct file or directory",
+                source.display()
+            )));
+        };
+        selected.push(RuntimeEtcEntry {
+            name,
+            source,
+            source_kind,
+            source_device: metadata.dev(),
+            source_inode: metadata.ino(),
+        });
+    }
+    Ok(selected)
+}
+
+fn validate_runtime_etc_allowlist() -> io::Result<()> {
+    let mut previous = None;
+    for name in RUNTIME_ETC_ALLOWLIST {
+        if name.is_empty()
+            || name.contains('/')
+            || previous.is_some_and(|prior: &str| prior >= *name)
+            || TD_OWNED_ETC_NAMES.contains(name)
+        {
+            return Err(io::Error::other(
+                "runtime configuration allowlist is not sorted, unique and disjoint",
+            ));
+        }
+        previous = Some(name);
+    }
+    Ok(())
+}
+
+fn require_runtime_etc_source_identity(entry: &RuntimeEtcEntry) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(&entry.source)?;
+    let kind_matches = match entry.source_kind {
+        FilesystemSourceKind::Directory => metadata.file_type().is_dir(),
+        FilesystemSourceKind::File => metadata.file_type().is_file(),
+    };
+    if !kind_matches
+        || metadata.dev() != entry.source_device
+        || metadata.ino() != entry.source_inode
+    {
+        return Err(io::Error::other(format!(
+            "runtime configuration {} changed after selection",
+            entry.source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn create_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("create jail file {}: {error}", path.display()),
+            )
+        })?;
+    file.write_all(contents)?;
+    drop(file);
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+fn read_bounded_text(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let mut text = String::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)?;
+    if u64::try_from(text.len()).map_or(true, |length| length > max_bytes) {
+        return Err(io::Error::other(format!(
+            "text file {} exceeds {max_bytes} bytes",
+            path.display()
+        )));
+    }
+    Ok(text)
+}
+
+fn inherited_hostname() -> io::Result<String> {
+    let text = read_bounded_text(Path::new("/proc/sys/kernel/hostname"), 65)?;
+    let hostname = text.strip_suffix('\n').unwrap_or(&text);
+    if hostname.is_empty()
+        || hostname.len() > 64
+        || !hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err(io::Error::other(
+            "inherited UTS hostname is not a canonical ASCII hostname",
+        ));
+    }
+    Ok(hostname.to_string())
+}
+
+fn passwd(identity: Identity) -> String {
+    format!(
+        "root:x:0:0:root:/root:/usr/bin/false\n\
+td:x:{}:{}:td:/home/td:/usr/bin/false\n\
+nobody:x:65534:65534:nobody:/:/usr/bin/false\n",
+        identity.uid, identity.gid
+    )
+}
+
+fn group(identity: Identity) -> String {
+    format!(
+        "root:x:0:\n\
+td:x:{}:\n\
+nobody:x:65534:\n",
+        identity.gid
+    )
+}
+
+fn hosts(hostname: &str) -> String {
+    format!(
+        "127.0.0.1 localhost {hostname}\n::1 localhost ip6-localhost ip6-loopback {hostname}\n"
+    )
+}
+
+fn require_resolved_file_identity(file: &ResolvedFile, label: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(&file.path)?;
+    if !metadata.file_type().is_file()
+        || metadata.dev() != file.device
+        || metadata.ino() != file.inode
+        || metadata.len() != file.size
+    {
+        return Err(io::Error::other(format!(
+            "{label} {} changed after authority resolution",
+            file.path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn mount_runtime_etc_entry(entry: &RuntimeEtcEntry, etc: &Path) -> io::Result<()> {
+    require_runtime_etc_source_identity(entry)?;
+    let target = etc.join(entry.name);
+    match entry.source_kind {
+        FilesystemSourceKind::Directory => {
+            create_dir(
+                target
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("runtime etc target is not UTF-8"))?,
+                0o555,
+            )?;
+        }
+        FilesystemSourceKind::File => create_file(&target, b"", 0o444)?,
+    }
+    mount_bind_kind(
+        &entry.source,
+        &target,
+        entry.source_kind,
+        "runtime configuration",
+    )?;
+    apply_grant_mount_policy(&target, true)?;
+    let target_metadata = fs::symlink_metadata(&target)?;
+    if entry.source_device != target_metadata.dev()
+        || entry.source_inode != target_metadata.ino()
+        || (target_metadata.file_type().is_dir()
+            != (entry.source_kind == FilesystemSourceKind::Directory))
+        || (target_metadata.file_type().is_file()
+            != (entry.source_kind == FilesystemSourceKind::File))
+    {
+        return Err(io::Error::other(format!(
+            "runtime configuration bind {} changed identity",
+            entry.name
+        )));
+    }
+    require_runtime_etc_source_identity(entry)?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    require_bind_source(&mountinfo, &entry.source, &target)?;
+    require_grant_mount_policy(
+        &mountinfo,
+        &Stage2Filesystem {
+            target,
+            read_only: true,
+            source_kind: entry.source_kind,
+        },
+    )
+}
+
+fn mount_resolved_file(file: &ResolvedFile, target: &Path, label: &str) -> io::Result<()> {
+    require_resolved_file_identity(file, label)?;
+    create_file(target, b"", 0o444)?;
+    mount_private_bind(
+        &file.path,
+        target
+            .to_str()
+            .ok_or_else(|| io::Error::other("resolved file target is not UTF-8"))?,
+        true,
+    )?;
+    let metadata = fs::symlink_metadata(target)?;
+    if !metadata.file_type().is_file()
+        || metadata.dev() != file.device
+        || metadata.ino() != file.inode
+        || metadata.len() != file.size
+    {
+        return Err(io::Error::other(format!(
+            "{label} bind {} changed identity",
+            target.display()
+        )));
+    }
+    require_resolved_file_identity(file, label)?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    require_bind_source(&mountinfo, &file.path, target)?;
+    require_mount(
+        &mountinfo,
+        target
+            .to_str()
+            .ok_or_else(|| io::Error::other("resolved file target is not UTF-8"))?,
+        None,
+        &["ro", "nosuid", "nodev", "noexec"],
+        &["rw"],
+    )
+}
+
+fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
+    let etc = PathBuf::from(format!("{NEW_ROOT}/etc"));
+    let identity = Identity {
+        uid: application.inside_uid,
+        gid: application.inside_gid,
+    };
+    let etc_text = etc
+        .to_str()
+        .ok_or_else(|| io::Error::other("jail etc path is not UTF-8"))?;
+    mount_tmpfs(
+        etc_text,
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        &format!("mode=0755,size={ETC_SIZE_BYTES}"),
+    )?;
+    let hostname = inherited_hostname()?;
+    for (name, contents) in [
+        ("passwd", passwd(identity)),
+        ("group", group(identity)),
+        ("nsswitch.conf", NSSWITCH_CONF.to_string()),
+        ("machine-id", application.state.machine_id.clone()),
+        ("hostname", format!("{hostname}\n")),
+        ("hosts", hosts(&hostname)),
+    ] {
+        create_file(&etc.join(name), contents.as_bytes(), 0o444)?;
+    }
+    create_dir(&format!("{etc_text}/ssl"), 0o555)?;
+    create_dir(&format!("{etc_text}/ssl/certs"), 0o555)?;
+    mount_resolved_file(
+        &application.ca_bundle,
+        &etc.join("ssl/certs/ca-certificates.crt"),
+        "application CA bundle",
+    )?;
+    if let Some(resolver) = &application.resolv_conf {
+        mount_resolved_file(
+            resolver,
+            &etc.join("resolv.conf"),
+            "application resolver configuration",
+        )?;
+    }
+    for entry in selected_runtime_etc(&application.runtime_files)? {
+        mount_runtime_etc_entry(&entry, &etc)?;
+    }
+    remount_read_only(
+        etc_text,
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+    )
+}
+
 fn prepare_mount_plan(
     identity: Identity,
     executable: &Path,
@@ -1233,6 +1614,7 @@ fn prepare_mount_plan(
     if application.is_some() {
         for (path, mode) in [
             (format!("{NEW_ROOT}/app"), 0o555),
+            (format!("{NEW_ROOT}/etc"), 0o755),
             (format!("{NEW_ROOT}/usr"), 0o555),
             (format!("{NEW_ROOT}/run"), 0o755),
             (format!("{NEW_ROOT}/home"), 0o755),
@@ -1322,6 +1704,7 @@ fn prepare_mount_plan(
         create_dir(&format!("{NEW_ROOT}/home/td"), 0o700)?;
         mount_application_tree(&application.package_files, &format!("{NEW_ROOT}/app"))?;
         mount_application_tree(&application.runtime_files, &format!("{NEW_ROOT}/usr"))?;
+        prepare_etc(application)?;
         mount_private_bind(
             &application.state.home,
             &format!("{NEW_ROOT}/home/td"),
@@ -1883,7 +2266,7 @@ fn grant_scaffold_names(
     filesystems: &[Stage2Filesystem],
 ) -> io::Result<BTreeMap<PathBuf, BTreeSet<String>>> {
     let root = if application {
-        ["app", "dev", "home", "proc", "run", "tmp", "usr", "var"].as_slice()
+        ["app", "dev", "etc", "home", "proc", "run", "tmp", "usr", "var"].as_slice()
     } else {
         ["dev", "proc", "tmp", "var"].as_slice()
     };
@@ -1930,13 +2313,163 @@ fn grant_scaffold_names(
     Ok(expected)
 }
 
+fn expected_etc_names(
+    runtime_etc: &[RuntimeEtcEntry],
+    resolv_conf: bool,
+) -> io::Result<BTreeSet<String>> {
+    validate_runtime_etc_allowlist()?;
+    let mut expected = TD_OWNED_ETC_NAMES
+        .iter()
+        .filter(|name| resolv_conf || **name != "resolv.conf")
+        .map(|name| (*name).to_string())
+        .collect::<BTreeSet<_>>();
+    for entry in runtime_etc {
+        if !RUNTIME_ETC_ALLOWLIST.contains(&entry.name) || !expected.insert(entry.name.to_string())
+        {
+            return Err(io::Error::other(
+                "runtime configuration selection is not closed and unique",
+            ));
+        }
+    }
+    Ok(expected)
+}
+
+fn require_etc_plan(
+    mountinfo: &str,
+    token: &[u8; TOKEN_LEN],
+    resolv_conf: bool,
+    expected_machine_id: &str,
+    identity: Identity,
+) -> io::Result<()> {
+    let runtime_etc = selected_runtime_etc(Path::new("/usr"))?;
+    let expected = expected_etc_names(&runtime_etc, resolv_conf)?;
+    let actual = read_dir_names("/etc")?;
+    if actual != expected {
+        return Err(io::Error::other(format!(
+            "selective /etc entries are not exact: {actual:?}"
+        )));
+    }
+    require_names("/etc/ssl", &["certs"])?;
+    require_names("/etc/ssl/certs", &["ca-certificates.crt"])?;
+    require_mode("/etc", 0o755)?;
+    require_mode("/etc/ssl", 0o555)?;
+    require_mode("/etc/ssl/certs", 0o555)?;
+    for path in [
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/nsswitch.conf",
+        "/etc/machine-id",
+        "/etc/hostname",
+        "/etc/hosts",
+    ] {
+        require_mode(path, 0o444)?;
+    }
+    if read_bounded_text(Path::new("/etc/passwd"), 4096)? != passwd(identity)
+        || read_bounded_text(Path::new("/etc/group"), 4096)? != group(identity)
+        || read_bounded_text(Path::new("/etc/nsswitch.conf"), 4096)? != NSSWITCH_CONF
+    {
+        return Err(io::Error::other(
+            "selective /etc identity databases are not canonical",
+        ));
+    }
+    let hostname = inherited_hostname()?;
+    if read_bounded_text(Path::new("/etc/hostname"), 65)? != format!("{hostname}\n")
+        || read_bounded_text(Path::new("/etc/hosts"), 4096)? != hosts(&hostname)
+    {
+        return Err(io::Error::other(
+            "selective /etc hostname files do not match the UTS namespace",
+        ));
+    }
+    let machine_id = read_bounded_text(Path::new("/etc/machine-id"), 33)?;
+    if !authority::valid_machine_id(&machine_id) || machine_id != expected_machine_id {
+        return Err(io::Error::other(
+            "selective /etc machine-id does not match application state",
+        ));
+    }
+    let ca_bundle = read_bounded_text(
+        Path::new("/etc/ssl/certs/ca-certificates.crt"),
+        authority::MAX_CA_BUNDLE_BYTES,
+    )?;
+    if !ca_bundle.contains("-----BEGIN CERTIFICATE-----") {
+        return Err(io::Error::other(
+            "selective /etc CA bundle has no PEM certificate",
+        ));
+    }
+
+    require_mount(
+        mountinfo,
+        "/etc",
+        Some("tmpfs"),
+        &["ro", "nosuid", "nodev", "noexec"],
+        &["rw"],
+    )?;
+    require_mount_super_option(mountinfo, "/etc", "size=8192k")?;
+    require_mount(
+        mountinfo,
+        "/etc/ssl/certs/ca-certificates.crt",
+        None,
+        &["ro", "nosuid", "nodev", "noexec"],
+        &["rw"],
+    )?;
+    if resolv_conf {
+        if read_bounded_text(
+            Path::new("/etc/resolv.conf"),
+            authority::MAX_RESOLV_CONF_BYTES,
+        )?
+        .is_empty()
+        {
+            return Err(io::Error::other(
+                "selective /etc resolver configuration is empty",
+            ));
+        }
+        require_mount(
+            mountinfo,
+            "/etc/resolv.conf",
+            None,
+            &["ro", "nosuid", "nodev", "noexec"],
+            &["rw"],
+        )?;
+    }
+    for entry in runtime_etc {
+        require_runtime_etc_source_identity(&entry)?;
+        let target = PathBuf::from("/etc").join(entry.name);
+        let metadata = fs::symlink_metadata(&target)?;
+        if metadata.dev() != entry.source_device
+            || metadata.ino() != entry.source_inode
+            || (metadata.file_type().is_dir()
+                != (entry.source_kind == FilesystemSourceKind::Directory))
+            || (metadata.file_type().is_file()
+                != (entry.source_kind == FilesystemSourceKind::File))
+        {
+            return Err(io::Error::other(format!(
+                "runtime configuration {} does not retain its source identity",
+                target.display()
+            )));
+        }
+        require_bind_source(mountinfo, &entry.source, &target)?;
+        require_grant_mount_policy(
+            mountinfo,
+            &Stage2Filesystem {
+                target,
+                read_only: true,
+                source_kind: entry.source_kind,
+            },
+        )?;
+    }
+    require_read_only_mount("/etc", token)
+}
+
 fn require_mount_plan(
     filesystems: Option<&[Stage2Filesystem]>,
+    resolv_conf: bool,
+    machine_id: Option<&str>,
     token: &[u8; TOKEN_LEN],
     identity: Identity,
 ) -> io::Result<()> {
     let application = filesystems.is_some();
-    if fs::symlink_metadata(OLD_ROOT).is_ok() || fs::symlink_metadata("/etc").is_ok() {
+    if fs::symlink_metadata(OLD_ROOT).is_ok()
+        || (!application && fs::symlink_metadata("/etc").is_ok())
+    {
         return Err(io::Error::other(
             "detached host root remains reachable in the fresh root",
         ));
@@ -2034,6 +2567,9 @@ fn require_mount_plan(
 
     if application {
         let filesystems = filesystems.unwrap_or_default();
+        let machine_id = machine_id
+            .ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
+        require_etc_plan(&mountinfo, token, resolv_conf, machine_id, identity)?;
         require_names("/run", &["user"])?;
         let runtime = format!("/run/user/{}", identity.uid);
         require_mode(&runtime, 0o700)?;
@@ -2758,11 +3294,26 @@ pub fn run_stage2(
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     let mount_probe_token = random_token()?;
-    let filesystems = match &action {
-        Stage2Action::Probe => None,
-        Stage2Action::Launch { filesystems, .. } => Some(filesystems.as_slice()),
+    let (filesystems, resolv_conf, machine_id) = match &action {
+        Stage2Action::Probe => (None, false, None),
+        Stage2Action::Launch {
+            filesystems,
+            resolv_conf,
+            machine_id,
+            ..
+        } => (
+            Some(filesystems.as_slice()),
+            *resolv_conf,
+            Some(machine_id.as_str()),
+        ),
     };
-    require_mount_plan(filesystems, &mount_probe_token, identity)?;
+    require_mount_plan(
+        filesystems,
+        resolv_conf,
+        machine_id,
+        &mount_probe_token,
+        identity,
+    )?;
     clear_and_require_empty_capabilities()?;
     let host_mode = matches!(
         &action,
@@ -2788,6 +3339,8 @@ pub fn run_stage2(
         }
         Stage2Action::Launch {
             entry,
+            resolv_conf: _,
+            machine_id: _,
             environment,
             filesystems: _,
             resources,
@@ -3242,7 +3795,11 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             },
             &application.entry,
             &application.environment,
-            &application.filesystems,
+            Stage2MountBinding {
+                filesystems: &application.filesystems,
+                resolv_conf: application.resolv_conf.is_some(),
+                machine_id: &application.state.machine_id,
+            },
             Stage2ResourceBinding {
                 limits: application.resources,
                 membership: application_cgroup.membership()?,
@@ -3770,6 +4327,7 @@ mod tests {
             *byte = u8::try_from(index).unwrap();
         }
         let encoded = encode_token(&token);
+        let machine_id = "0123456789abcdef0123456789abcdef\n";
         assert_eq!(decode_token(&OsString::from(&encoded)).unwrap(), token);
         assert!(decode_token(&OsString::from("00")).is_err());
         assert!(decode_token(&OsString::from("G0".repeat(TOKEN_LEN))).is_err());
@@ -3793,6 +4351,10 @@ mod tests {
                 "2345",
                 STAGE2_LAUNCH_ARG,
                 "/app/bin/app",
+                STAGE2_RESOLV_CONF_ARG,
+                "present",
+                STAGE2_MACHINE_ID_ARG,
+                machine_id,
                 STAGE2_ENVIRONMENT_ARG,
                 "6",
                 "DBUS_SESSION_BUS_ADDRESS",
@@ -3825,6 +4387,8 @@ mod tests {
             Mode::Stage2 {
                 action: Stage2Action::Launch {
                     entry,
+                    resolv_conf,
+                    machine_id: parsed_machine_id,
                     environment,
                     filesystems,
                     resources,
@@ -3833,6 +4397,8 @@ mod tests {
                 },
                 ..
             } if entry == "/app/bin/app"
+                && resolv_conf
+                && parsed_machine_id == machine_id
                 && environment.first() == Some(&(
                     OsString::from("DBUS_SESSION_BUS_ADDRESS"),
                     OsString::from("unix:path=/run/user/1000/bus"),
@@ -3863,6 +4429,10 @@ mod tests {
             "1000",
             STAGE2_LAUNCH_ARG,
             "/usr/bin/app",
+            STAGE2_RESOLV_CONF_ARG,
+            "absent",
+            STAGE2_MACHINE_ID_ARG,
+            machine_id,
             STAGE2_ENVIRONMENT_ARG,
             "0",
             STAGE2_FILESYSTEMS_ARG,
@@ -3879,6 +4449,10 @@ mod tests {
             "1000",
             STAGE2_LAUNCH_ARG,
             "/app/bin/app",
+            STAGE2_RESOLV_CONF_ARG,
+            "absent",
+            STAGE2_MACHINE_ID_ARG,
+            machine_id,
             STAGE2_ENVIRONMENT_ARG,
             "4",
             "DBUS_SESSION_BUS_ADDRESS",
@@ -3892,6 +4466,19 @@ mod tests {
             STAGE2_FILESYSTEMS_ARG,
             "0",
             STAGE2_ARGUMENTS_ARG,
+        ]))
+        .is_err());
+        assert!(parse_mode(args(&[
+            STAGE2_ARG,
+            &encoded,
+            "1000",
+            "1000",
+            "1000",
+            "1000",
+            STAGE2_LAUNCH_ARG,
+            "/app/bin/app",
+            STAGE2_RESOLV_CONF_ARG,
+            "conditional",
         ]))
         .is_err());
     }
@@ -3932,6 +4519,7 @@ mod tests {
             cpu_period_usec: 100_000,
         };
         let membership = "/td-user-1000/app-0123456789abcdef";
+        let machine_id = "0123456789abcdef0123456789abcdef\n";
         let filesystems = vec![FilesystemGrant {
             source: PathBuf::from("/host/downloads"),
             target: PathBuf::from("/home/td/Downloads"),
@@ -3948,7 +4536,11 @@ mod tests {
             },
             "/app/bin/app",
             &environment,
-            &filesystems,
+            Stage2MountBinding {
+                filesystems: &filesystems,
+                resolv_conf: false,
+                machine_id,
+            },
             Stage2ResourceBinding {
                 limits: resources,
                 membership,
@@ -3963,6 +4555,8 @@ mod tests {
                 outside_identity,
                 action: Stage2Action::Launch {
                     entry: "/app/bin/app".into(),
+                    resolv_conf: false,
+                    machine_id: machine_id.into(),
                     environment,
                     filesystems: vec![Stage2Filesystem {
                         target: PathBuf::from("/home/td/Downloads"),
@@ -4598,6 +5192,20 @@ mod tests {
     fn grant_scaffolds_are_exhaustive_outside_private_home() {
         let base = grant_scaffold_names(true, &[]).unwrap();
         assert_eq!(
+            base.get(Path::new("/")),
+            Some(&BTreeSet::from([
+                "app".to_string(),
+                "dev".to_string(),
+                "etc".to_string(),
+                "home".to_string(),
+                "proc".to_string(),
+                "run".to_string(),
+                "tmp".to_string(),
+                "usr".to_string(),
+                "var".to_string(),
+            ]))
+        );
+        assert_eq!(
             base.get(Path::new("/home")),
             Some(&BTreeSet::from(["td".to_string()]))
         );
@@ -4648,6 +5256,59 @@ mod tests {
             names.get(Path::new("/home/tester")),
             Some(&BTreeSet::from(["Projects".to_string()]))
         );
+    }
+
+    #[test]
+    fn selective_etc_identity_is_exact_and_runtime_entries_are_closed() {
+        let directory = temporary_directory().unwrap();
+        let runtime = directory.join("runtime");
+        let etc = runtime.join("etc");
+        fs::create_dir_all(etc.join("fonts")).unwrap();
+        fs::write(etc.join("ld.so.conf"), b"include /etc/ld.so.conf.d/*.conf\n").unwrap();
+        fs::write(etc.join("unknown"), b"not selected\n").unwrap();
+        let fonts = fs::symlink_metadata(etc.join("fonts")).unwrap();
+        let ld_so_conf = fs::symlink_metadata(etc.join("ld.so.conf")).unwrap();
+
+        let selected = selected_runtime_etc(&runtime).unwrap();
+        assert_eq!(
+            selected,
+            [
+                RuntimeEtcEntry {
+                    name: "fonts",
+                    source: etc.join("fonts"),
+                    source_kind: FilesystemSourceKind::Directory,
+                    source_device: fonts.dev(),
+                    source_inode: fonts.ino(),
+                },
+                RuntimeEtcEntry {
+                    name: "ld.so.conf",
+                    source: etc.join("ld.so.conf"),
+                    source_kind: FilesystemSourceKind::File,
+                    source_device: ld_so_conf.dev(),
+                    source_inode: ld_so_conf.ino(),
+                },
+            ]
+        );
+        assert_eq!(
+            expected_etc_names(&selected, false).unwrap(),
+            BTreeSet::from([
+                "fonts".to_string(),
+                "group".to_string(),
+                "hostname".to_string(),
+                "hosts".to_string(),
+                "ld.so.conf".to_string(),
+                "machine-id".to_string(),
+                "nsswitch.conf".to_string(),
+                "passwd".to_string(),
+                "ssl".to_string(),
+            ])
+        );
+        fs::remove_file(etc.join("ld.so.conf")).unwrap();
+        fs::write(etc.join("ld.so.conf"), b"changed identity\n").unwrap();
+        assert!(require_runtime_etc_source_identity(selected.get(1).unwrap()).is_err());
+        symlink("fonts", etc.join("xdg")).unwrap();
+        assert!(selected_runtime_etc(&runtime).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

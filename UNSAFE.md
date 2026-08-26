@@ -1078,6 +1078,14 @@ tree private, replaces its scratch `/tmp` with a fresh tmpfs, builds another
 tmpfs as the root, binds only null/zero/full/random/urandom as individually
 read-only mounts into a fresh nosuid/noexec `/dev`, mounts fresh devpts and
 `/dev/shm`, mounts fresh `/tmp` and `/var/tmp`, and remounts `/dev` read-only.
+The application plan also mounts an 8 MiB nosuid/nodev/noexec `/etc` tmpfs.
+It binds only the closed runtime-configuration allowlist and applies the
+filesystem-grant hardening loop recursively to every selected directory row;
+synthesizes the fixed account, group, host, hostname, NSS and validated
+per-application machine-id files; and binds the resolved pinned CA file
+read-only. A direct
+bounded resolver file is bound read-only only when authenticated policy shares
+the network and the file exists. The `/etc` tmpfs is then remounted read-only.
 Probe mode overlays the current executable as one read-only, nosuid, nodev,
 executable file bind inside the otherwise-noexec `/tmp`, and source-identity
 checks that bind before detaching the old root; application mode never creates
@@ -1108,9 +1116,12 @@ home, checks device numbers, modes and every device-bind flag, and proves the
 base root, `/dev`, and device binds are read-only while procfs, devpts,
 bounded `/dev/shm`, `/tmp`, and `/var/tmp` carry their compiled writable,
 no-exec flags and size ceilings. The application action additionally reads
-back its bounded private `/run`. Read-only bind metadata does not prevent the
-compiled character devices from performing their device operations; the probe writes
-to `/dev/null` after the remounts. The mountinfo `ro` row is the evidence that
+back its bounded private `/run` and exact selective `/etc`, including every
+runtime nested mount, synthesized contents, CA PEM shape, conditional resolver
+mount, size ceiling and `EROFS` write refusal. Read-only bind metadata does not
+prevent the compiled character devices from performing their device
+operations; the probe writes to `/dev/null` after the remounts. The mountinfo
+`ro` row is the evidence that
 the bind remount itself succeeded; the `EROFS` write probes separately prove
 there is no writable route at `/app` or `/usr`, even when their source
 superblock is already read-only. Writable probes use an unpredictable

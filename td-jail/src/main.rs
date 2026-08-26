@@ -449,8 +449,9 @@ mod confinement {
             .unwrap()
             .0
             .to_string();
-        assert!(resolve.contains("isolate_network: !spec.permissions.network(),"));
-        assert_eq!(resolve.matches("isolate_network").count(), 1);
+        assert!(resolve.contains("let isolate_network = !spec.permissions.network();"));
+        assert_eq!(resolve.matches("let isolate_network =").count(), 1);
+        assert!(resolve.contains("isolate_network,"));
         assert!(resolve.contains("Ok(LaunchPlan {"));
     }
 
@@ -688,8 +689,9 @@ mod confinement {
             "if application.isolate_network {\n            sys::bring_up_loopback()"
         ));
         assert!(TRANSITION.contains(
-            "let flags = sys::MS_BIND\n        | if grant.source_kind == FilesystemSourceKind::Directory {\n            sys::MS_REC"
+            "let flags = sys::MS_BIND\n        | if source_kind == FilesystemSourceKind::Directory {\n            sys::MS_REC"
         ));
+        assert_eq!(TRANSITION.matches("mount_bind_kind(").count(), 3);
         assert_eq!(
             TRANSITION
                 .matches("let flags = grant_mount_policy_flags(read_only || row.read_only);")
