@@ -418,7 +418,7 @@ mod tests {
             .expect("Wayland, filesystem and resource policy");
         let spec = ApplicationSpec::compile(
             &manifest,
-            "/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1",
+            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1",
             permissions,
         )
         .expect("fixture spec")

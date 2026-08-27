@@ -17,6 +17,7 @@
 //!     `td-builder check` rung.
 
 mod affected;
+mod application;
 mod bootstrap;
 mod build;
 mod build_daemon;
@@ -5024,10 +5025,10 @@ fn sole_object_field(value: &json::Json) -> Option<(&str, &json::Json)> {
     fields.first().map(|(name, value)| (name.as_str(), value))
 }
 
-/// Bind the native static seed check to the manifest and to a quiescent output.
-/// The only steps before it are builder-native and spawn no package process, and
-/// the check is terminal, so nothing can race or mutate the tree after approval.
-fn validate_static_application_step_contract(
+/// Bind one native package validator to the manifest and a quiescent output.
+/// Earlier steps are builder-native and spawn no package process. The marker is
+/// terminal, so package bytes cannot race or mutate the tree after approval.
+fn validate_application_step_contract(
     name: &str,
     alist: &json::Json,
     declaration: Option<&td_engine::application::ApplicationDeclaration>,
@@ -5038,100 +5039,177 @@ fn validate_static_application_step_contract(
         if requires_validator {
             return Err(format!(
                 "recipe `{name}': a foreign-source application requires exactly one \
-                 validateStaticApplication step"
+                 static or dynamic application validator"
             ));
         }
         return Ok(());
     };
-    let mut marker_index = None;
+    let mut marker: Option<(usize, &str)> = None;
     for (index, step) in steps.iter().enumerate() {
-        if step.get("validateStaticApplication").is_none() {
+        let operation = if step.get("validateStaticApplication").is_some() {
+            Some("validateStaticApplication")
+        } else if step.get("validateDynamicApplication").is_some() {
+            Some("validateDynamicApplication")
+        } else {
+            None
+        };
+        let Some(operation) = operation else {
             continue;
-        }
-        if marker_index.is_some() {
+        };
+        if marker.is_some() {
             return Err(format!(
-                "recipe `{name}': validateStaticApplication must occur exactly once"
+                "recipe `{name}': an application validator must occur exactly once"
             ));
         }
-        marker_index = Some(index);
+        marker = Some((index, operation));
     }
-    let Some(marker_index) = marker_index else {
+    let Some((marker_index, marker_operation)) = marker else {
         if requires_validator {
             return Err(format!(
                 "recipe `{name}': a foreign-source application requires exactly one \
-                 validateStaticApplication step"
+                 static or dynamic application validator"
             ));
         }
         return Ok(());
     };
     let declaration = declaration.ok_or_else(|| {
         format!(
-            "recipe `{name}': validateStaticApplication requires an application declaration"
+            "recipe `{name}': {marker_operation} requires an application declaration"
         )
     })?;
     if marker_index.checked_add(1) != Some(steps.len()) {
         return Err(format!(
-            "recipe `{name}': validateStaticApplication must be the terminal step"
+            "recipe `{name}': {marker_operation} must be the terminal step"
         ));
     }
     for step in steps.iter().take(marker_index) {
         let Some((operation, _)) = sole_object_field(step) else {
             return Err(format!(
-                "recipe `{name}': a static application seed step must name one operation"
+                "recipe `{name}': an application package step must name one operation"
             ));
         };
-        if !matches!(operation, "unpack" | "mkDir" | "copyFiles") {
+        let permitted = match marker_operation {
+            "validateStaticApplication" => {
+                matches!(operation, "unpack" | "mkDir" | "copyFiles")
+            }
+            "validateDynamicApplication" => operation == "copyTree",
+            _ => false,
+        };
+        if !permitted {
             return Err(format!(
-                "recipe `{name}': validateStaticApplication may follow only native unpack, \
-                 mkDir and copyFiles steps; `{operation}' could leave package code able to \
+                "recipe `{name}': {marker_operation} may follow only its native \
+                 materialization steps; `{operation}' could leave package code able to \
                  race validation"
             ));
         }
     }
     let Some((operation, value)) = sole_object_field(steps.get(marker_index).ok_or_else(|| {
-        format!("recipe `{name}': static application marker index is missing")
+        format!("recipe `{name}': application validator index is missing")
     })?) else {
         return Err(format!(
-            "recipe `{name}': validateStaticApplication must be the marker step's only operation"
+            "recipe `{name}': {marker_operation} must be the marker step's only operation"
         ));
     };
-    if operation != "validateStaticApplication" {
+    if operation != marker_operation {
         return Err(format!(
-            "recipe `{name}': validateStaticApplication must be the marker step's only operation"
+            "recipe `{name}': {marker_operation} must be the marker step's only operation"
         ));
     }
     let marker_value = value;
     let json::Json::Obj(fields) = marker_value else {
         return Err(format!(
-            "recipe `{name}': validateStaticApplication must be an object"
+            "recipe `{name}': {marker_operation} must be an object"
         ));
     };
-    if fields.len() != 2
-        || fields
-            .iter()
-            .any(|(key, _)| !matches!(key.as_str(), "entry" | "runtime"))
-    {
+    let fields_are_exact = match marker_operation {
+        "validateStaticApplication" => {
+            fields.len() == 2
+                && fields
+                    .iter()
+                    .all(|(key, _)| matches!(key.as_str(), "entry" | "runtime"))
+        }
+        "validateDynamicApplication" => {
+            fields.len() == 5
+                && fields.iter().all(|(key, _)| {
+                    matches!(
+                        key.as_str(),
+                        "entry"
+                            | "runtime"
+                            | "libraryPaths"
+                            | "optionalTargets"
+                            | "optionalLinks"
+                    )
+                })
+                && value
+                    .get("libraryPaths")
+                    .and_then(json::Json::as_arr)
+                    .is_some()
+                && value
+                    .get("optionalTargets")
+                    .and_then(json::Json::as_arr)
+                    .is_some()
+                && matches!(value.get("optionalLinks"), Some(json::Json::Num(_)))
+        }
+        _ => false,
+    };
+    if !fields_are_exact {
         return Err(format!(
-            "recipe `{name}': validateStaticApplication accepts exactly entry and runtime"
+            "recipe `{name}': {marker_operation} has the wrong fields"
         ));
     }
     let entry = marker_value
         .get("entry")
         .and_then(json::Json::as_str)
         .ok_or_else(|| {
-            format!("recipe `{name}': validateStaticApplication entry is not a string")
+            format!("recipe `{name}': {marker_operation} entry is not a string")
         })?;
     let runtime = marker_value
         .get("runtime")
         .and_then(json::Json::as_str)
         .ok_or_else(|| {
-            format!("recipe `{name}': validateStaticApplication runtime is not a string")
+            format!("recipe `{name}': {marker_operation} runtime is not a string")
         })?;
     if entry != declaration.entry() || runtime != declaration.runtime() {
         return Err(format!(
-            "recipe `{name}': validateStaticApplication entry/runtime must exactly match the \
+            "recipe `{name}': {marker_operation} entry/runtime must exactly match the \
              builder-authenticated application declaration"
         ));
+    }
+    if marker_operation == "validateDynamicApplication" {
+        let policy = td_engine::application_spec::dynamic_application_policy(
+            name,
+            declaration.runtime(),
+        )
+        .ok_or_else(|| {
+            format!(
+                "recipe `{name}': dynamic application validator has no reviewed policy"
+            )
+        })?;
+        let exact_strings = |field: &str, expected: &[&str]| {
+            marker_value
+                .get(field)
+                .and_then(json::Json::as_arr)
+                .is_some_and(|values| {
+                    values.len() == expected.len()
+                        && values.iter().zip(expected).all(|(value, expected)| {
+                            value.as_str().is_some_and(|value| value == *expected)
+                        })
+                })
+        };
+        let links_are_exact = matches!(
+            marker_value.get("optionalLinks"),
+            Some(json::Json::Num(value))
+                if value.parse::<usize>().ok() == Some(policy.optional_links())
+        );
+        if !exact_strings("libraryPaths", policy.library_paths())
+            || !exact_strings("optionalTargets", policy.optional_targets())
+            || !links_are_exact
+        {
+            return Err(format!(
+                "recipe `{name}': dynamic application validator must exactly match its \
+                 reviewed loader and omitted-extension policy"
+            ));
+        }
     }
     Ok(())
 }
@@ -5498,7 +5576,7 @@ fn assemble_recipe_drv(
         parse_application_permissions(&alist, application_declaration.is_some())?;
     let application_launcher =
         parse_application_launcher(&alist, application_declaration.is_some())?;
-    validate_static_application_step_contract(
+    validate_application_step_contract(
         name,
         &alist,
         application_declaration.as_ref(),
@@ -14845,6 +14923,57 @@ daemon build START (2/2 active)
             "{error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_application_validation_is_manifest_bound_terminal_and_non_spawning() {
+        let declaration = td_engine::application::ApplicationDeclaration::new(
+            "freedesktop-platform-25-08",
+            "/app/bin/firefox",
+        )
+        .unwrap();
+        let good = json::parse(
+            r#"{"steps":[{"copyTree":{"from":"{payload:firefox-source}","dest":"{out}/files"}},{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":["/app/lib","/app/lib/firefox"],"optionalTargets":["/app/share/runtime/langpack"],"optionalLinks":102}}]}"#,
+        )
+        .unwrap();
+        validate_application_step_contract("firefox", &good, Some(&declaration), true).unwrap();
+
+        for (text, reason) in [
+            (
+                r#"{"steps":[{"copyTree":{"from":"source","dest":"out"}},{"validateDynamicApplication":{"entry":"/app/bin/other","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":102}}]}"#,
+                "exactly match",
+            ),
+            (
+                r#"{"steps":[{"run":{"argv":["/app/bin/firefox"],"env":[],"dir":"/app"}},{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":102}}]}"#,
+                "could leave package code able to race validation",
+            ),
+            (
+                r#"{"steps":[{"mkDir":"out"},{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":102}}]}"#,
+                "could leave package code able to race validation",
+            ),
+            (
+                r#"{"steps":[{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":102}},{"mkDir":"later"}]}"#,
+                "terminal step",
+            ),
+            (
+                r#"{"steps":[{"validateStaticApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08"}},{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":[],"optionalTargets":[],"optionalLinks":102}}]}"#,
+                "exactly once",
+            ),
+            (
+                r#"{"steps":[{"copyTree":{"from":"source","dest":"out"}},{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":["/app/lib/firefox","/app/lib"],"optionalTargets":["/app/share/runtime/langpack"],"optionalLinks":102}}]}"#,
+                "reviewed loader and omitted-extension policy",
+            ),
+            (
+                r#"{"steps":[{"copyTree":{"from":"source","dest":"out"}},{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":["/app/lib","/app/lib/firefox"],"optionalTargets":["/app/share/runtime/langpack"],"optionalLinks":101}}]}"#,
+                "reviewed loader and omitted-extension policy",
+            ),
+        ] {
+            let value = json::parse(text).unwrap();
+            let error =
+                validate_application_step_contract("firefox", &value, Some(&declaration), true)
+                    .unwrap_err();
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
     }
 
     #[test]

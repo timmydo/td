@@ -54,6 +54,10 @@ const DT_NEEDED: u64 = 1; // .dynstr offset of a required shared-object name
 const DT_STRTAB: u64 = 5; // vaddr of the .dynstr string table
 const DT_RPATH: u64 = 15; // legacy run-path (string offset into .dynstr)
 const DT_RUNPATH: u64 = 29; // run-path, takes precedence over DT_RPATH at load time
+const DT_DEPAUDIT: u64 = 0x6fff_fefb;
+const DT_AUDIT: u64 = 0x6fff_fefc;
+const DT_AUXILIARY: u64 = 0x7fff_fffd;
+const DT_FILTER: u64 = 0x7fff_ffff;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
@@ -997,7 +1001,49 @@ struct RpathSlots {
     entries: Vec<(u64, u64)>, // (DT_RPATH|DT_RUNPATH, string offset into .dynstr)
 }
 
+fn terminated_dynamic_entry_count(
+    b: &[u8],
+    elf: &Elf<'_>,
+    offset: usize,
+    size: usize,
+    entry_size: usize,
+    max_dynamic_entries: usize,
+) -> Result<usize, String> {
+    if size % entry_size != 0 {
+        return Err("PT_DYNAMIC size is not aligned to its entry size".into());
+    }
+    let count = size / entry_size;
+    if count > max_dynamic_entries {
+        return Err(format!(
+            "PT_DYNAMIC exceeds {max_dynamic_entries} entries"
+        ));
+    }
+    for index in 0..count {
+        let entry = index
+            .checked_mul(entry_size)
+            .and_then(|value| offset.checked_add(value))
+            .ok_or("PT_DYNAMIC entry offset overflow")?;
+        if elf.word(entry)? == DT_NULL {
+            return Ok(index + 1);
+        }
+    }
+    let end = offset
+        .checked_add(size)
+        .ok_or("PT_DYNAMIC file range overflows")?;
+    if end > b.len() {
+        return Err("PT_DYNAMIC runs past end of file".into());
+    }
+    Err("PT_DYNAMIC has no DT_NULL terminator inside its file range".into())
+}
+
 fn rpath_slots(b: &[u8]) -> Result<Option<RpathSlots>, String> {
+    rpath_slots_with_limit(b, usize::MAX)
+}
+
+fn rpath_slots_with_limit(
+    b: &[u8],
+    max_dynamic_entries: usize,
+) -> Result<Option<RpathSlots>, String> {
     let elf = Elf::parse(b)?;
     let (doff, dsize) = match elf.segment_slot(PT_DYNAMIC, "PT_DYNAMIC")? {
         None => return Ok(None), // static binary — no dynamic section
@@ -1005,9 +1051,17 @@ fn rpath_slots(b: &[u8]) -> Result<Option<RpathSlots>, String> {
     };
     // Elf64_Dyn is 16 bytes (d_tag u64 @0, d_un u64 @8); Elf32_Dyn is 8 (u32 @0, u32 @4).
     let (entsize, d_un) = if elf.is64 { (16, 8) } else { (8, 4) };
+    let entry_count = terminated_dynamic_entry_count(
+        b,
+        &elf,
+        doff,
+        dsize,
+        entsize,
+        max_dynamic_entries,
+    )?;
     let mut strtab_vaddr: Option<u64> = None;
     let mut entries: Vec<(u64, u64)> = Vec::new();
-    for i in 0..(dsize / entsize) {
+    for i in 0..entry_count {
         let e = i
             .checked_mul(entsize)
             .and_then(|offset| doff.checked_add(offset))
@@ -1044,6 +1098,13 @@ struct NeededSlots {
 }
 
 fn needed_slots(b: &[u8]) -> Result<Option<NeededSlots>, String> {
+    needed_slots_with_limit(b, usize::MAX)
+}
+
+fn needed_slots_with_limit(
+    b: &[u8],
+    max_dynamic_entries: usize,
+) -> Result<Option<NeededSlots>, String> {
     let elf = Elf::parse(b)?;
     let (doff, dsize) = match elf.segment_slot(PT_DYNAMIC, "PT_DYNAMIC")? {
         None => return Ok(None), // static binary — no dynamic section
@@ -1051,9 +1112,17 @@ fn needed_slots(b: &[u8]) -> Result<Option<NeededSlots>, String> {
     };
     // Elf64_Dyn is 16 bytes (d_tag u64 @0, d_un u64 @8); Elf32_Dyn is 8 (u32 @0, u32 @4).
     let (entsize, d_un) = if elf.is64 { (16, 8) } else { (8, 4) };
+    let entry_count = terminated_dynamic_entry_count(
+        b,
+        &elf,
+        doff,
+        dsize,
+        entsize,
+        max_dynamic_entries,
+    )?;
     let mut strtab_vaddr: Option<u64> = None;
     let mut offsets: Vec<u64> = Vec::new();
-    for i in 0..(dsize / entsize) {
+    for i in 0..entry_count {
         let e = i
             .checked_mul(entsize)
             .and_then(|offset| doff.checked_add(offset))
@@ -1357,6 +1426,391 @@ pub fn runtime_link_search(
     Ok((interp, dirs, needed_names(&b)?))
 }
 
+/// Admission limits for an ELF supplied by a foreign application package.
+///
+/// The ordinary bootstrap closure reader predates hostile-package admission
+/// and retains its existing API above. Application admission uses this closed
+/// variant so no file, dynamic array, string, or returned reference list can
+/// allocate before a corresponding limit is checked.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuntimeLinkLimits {
+    pub(crate) file_bytes: u64,
+    pub(crate) dynamic_entries: usize,
+    pub(crate) references: usize,
+    pub(crate) string_bytes: usize,
+    pub(crate) aggregate_text_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeLinkSearch {
+    pub(crate) file_bytes: u64,
+    pub(crate) kind: RuntimeElfKind,
+    pub(crate) executable: bool,
+    pub(crate) interpreter: Option<String>,
+    pub(crate) run_paths: Vec<String>,
+    pub(crate) run_path_kind: RuntimeRunPathKind,
+    pub(crate) needed: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeRunPathKind {
+    None,
+    Rpath,
+    Runpath,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeElfKind {
+    NotElf,
+    Executable,
+    SharedObject,
+    Other(u16),
+}
+
+fn validate_runtime_loadable_shape(bytes: &[u8], elf: &Elf<'_>) -> Result<(), String> {
+    if bytes.get(6).copied() != Some(1) || u32le(bytes, 0x14)? != EV_CURRENT {
+        return Err("dynamic application ELF has an unsupported version".into());
+    }
+    if u16le(bytes, 0x34)? != 64 {
+        return Err("dynamic application ELF has an invalid ELF64 header size".into());
+    }
+    let (phoff, phentsize, phnum) = elf.phdr_table()?;
+    if phnum == 0 || phentsize != 56 {
+        return Err(
+            "dynamic application loadable ELF has no canonical program-header table".into(),
+        );
+    }
+    let table_end = phentsize
+        .checked_mul(phnum)
+        .and_then(|size| phoff.checked_add(size))
+        .ok_or("dynamic application ELF program-header table overflows")?;
+    if table_end > bytes.len() {
+        return Err("dynamic application ELF program-header table runs past end of file".into());
+    }
+    let mut loadable = false;
+    for index in 0..phnum {
+        let offset = index
+            .checked_mul(phentsize)
+            .and_then(|value| phoff.checked_add(value))
+            .ok_or("dynamic application ELF program-header offset overflows")?;
+        if u32le(bytes, offset)? != PT_LOAD {
+            continue;
+        }
+        loadable = true;
+        let file_offset = elf.word(Elf::field_offset(offset, 0x08, "PT_LOAD file offset")?)?;
+        let virtual_address = elf.word(Elf::field_offset(
+            offset,
+            0x10,
+            "PT_LOAD virtual address",
+        )?)?;
+        let file_size = elf.word(Elf::field_offset(offset, 0x20, "PT_LOAD file size")?)?;
+        let memory_size = elf.word(Elf::field_offset(offset, 0x28, "PT_LOAD memory size")?)?;
+        if file_size > memory_size {
+            return Err("dynamic application PT_LOAD has p_filesz larger than p_memsz".into());
+        }
+        let file_end = file_offset
+            .checked_add(file_size)
+            .ok_or("dynamic application PT_LOAD file range overflows")?;
+        if file_end > bytes.len() as u64 {
+            return Err("dynamic application PT_LOAD runs past end of file".into());
+        }
+        virtual_address
+            .checked_add(memory_size)
+            .ok_or("dynamic application PT_LOAD memory range overflows")?;
+    }
+    if !loadable {
+        return Err("dynamic application loadable ELF has no PT_LOAD segment".into());
+    }
+    Ok(())
+}
+
+fn bounded_dynamic_string<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    limits: RuntimeLinkLimits,
+    aggregate: &mut usize,
+    label: &str,
+) -> Result<&'a str, String> {
+    let raw = bytes
+        .get(offset..)
+        .ok_or_else(|| format!("{label} string offset is past end of file"))?;
+    let scan_bytes = limits
+        .string_bytes
+        .checked_add(1)
+        .ok_or("dynamic string limit overflows")?;
+    let bounded = raw
+        .get(..raw.len().min(scan_bytes))
+        .ok_or("dynamic string range is invalid")?;
+    let end = bounded.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        format!(
+            "{label} is not NUL-terminated within {} bytes",
+            limits.string_bytes
+        )
+    })?;
+    *aggregate = aggregate
+        .checked_add(end)
+        .ok_or("dynamic string aggregate overflows")?;
+    if *aggregate > limits.aggregate_text_bytes {
+        return Err(format!(
+            "dynamic strings exceed {} aggregate bytes",
+            limits.aggregate_text_bytes
+        ));
+    }
+    std::str::from_utf8(
+        bounded
+            .get(..end)
+            .ok_or("dynamic string range is invalid")?,
+    )
+    .map_err(|_| format!("{label} is not UTF-8"))
+}
+
+fn account_runtime_reference(
+    references: &mut usize,
+    limits: RuntimeLinkLimits,
+) -> Result<(), String> {
+    *references = references
+        .checked_add(1)
+        .ok_or("dynamic reference count overflows")?;
+    if *references > limits.references {
+        return Err(format!(
+            "dynamic linkage exceeds {} references",
+            limits.references
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unmodeled_loader_objects(
+    bytes: &[u8],
+    max_dynamic_entries: usize,
+) -> Result<(), String> {
+    let elf = Elf::parse(bytes)?;
+    let (offset, size) = match elf.segment_slot(PT_DYNAMIC, "PT_DYNAMIC")? {
+        Some(slot) => slot,
+        None => return Ok(()),
+    };
+    let (entry_size, value_offset) = if elf.is64 { (16, 8) } else { (8, 4) };
+    let entry_count = terminated_dynamic_entry_count(
+        bytes,
+        &elf,
+        offset,
+        size,
+        entry_size,
+        max_dynamic_entries,
+    )?;
+    for index in 0..entry_count {
+        let entry = index
+            .checked_mul(entry_size)
+            .and_then(|value| offset.checked_add(value))
+            .ok_or("PT_DYNAMIC entry offset overflow")?;
+        let tag = elf.word(entry)?;
+        if tag == DT_NULL {
+            break;
+        }
+        if matches!(tag, DT_DEPAUDIT | DT_AUDIT | DT_AUXILIARY | DT_FILTER) {
+            let _ = elf.word(
+                entry
+                    .checked_add(value_offset)
+                    .ok_or("PT_DYNAMIC value offset overflow")?,
+            )?;
+            return Err(format!(
+                "dynamic application ELF uses unsupported loader object tag {tag:#x}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn runtime_link_search_bounded(
+    path: &Path,
+    limits: RuntimeLinkLimits,
+) -> Result<RuntimeLinkSearch, String> {
+    if limits.file_bytes < 4
+        || limits.dynamic_entries == 0
+        || limits.references == 0
+        || limits.string_bytes == 0
+        || limits.aggregate_text_bytes == 0
+    {
+        return Err("dynamic linkage limits must all be nonzero".into());
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?;
+    if metadata.len() > limits.file_bytes {
+        return Err(format!(
+            "{} exceeds the {}-byte dynamic ELF limit",
+            path.display(),
+            limits.file_bytes
+        ));
+    }
+    let mut magic = [0u8; 4];
+    match std::io::Read::read_exact(&mut file, &mut magic) {
+        Ok(()) if magic == EI_MAG => {}
+        Ok(()) => {
+            return Ok(RuntimeLinkSearch {
+                file_bytes: metadata.len(),
+                kind: RuntimeElfKind::NotElf,
+                executable: false,
+                interpreter: None,
+                run_paths: Vec::new(),
+                run_path_kind: RuntimeRunPathKind::None,
+                needed: Vec::new(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(RuntimeLinkSearch {
+                file_bytes: metadata.len(),
+                kind: RuntimeElfKind::NotElf,
+                executable: false,
+                interpreter: None,
+                run_paths: Vec::new(),
+                run_path_kind: RuntimeRunPathKind::None,
+                needed: Vec::new(),
+            });
+        }
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    }
+    let mut bytes = magic.to_vec();
+    // Four bytes are already in `magic`; `file_bytes - 3` reads one byte
+    // beyond the admitted size so concurrent growth is detected without an
+    // unbounded read.
+    std::io::Read::read_to_end(
+        &mut file.take(limits.file_bytes.saturating_sub(3)),
+        &mut bytes,
+    )
+    .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let read_bytes = u64::try_from(bytes.len())
+        .map_err(|_| "dynamic application ELF length does not fit u64")?;
+    if read_bytes > limits.file_bytes {
+        return Err(format!(
+            "{} changed while reading and exceeds the {}-byte dynamic ELF limit",
+            path.display(),
+            limits.file_bytes
+        ));
+    }
+    let elf = Elf::parse(&bytes)?;
+    if !elf.is64 {
+        return Err(format!(
+            "{}: dynamic application object is not ELFCLASS64",
+            path.display()
+        ));
+    }
+    if u16le(&bytes, 0x12)? != EM_X86_64 {
+        return Err(format!(
+            "{}: dynamic application object is not EM_X86_64",
+            path.display()
+        ));
+    }
+    let elf_type = u16le(&bytes, 0x10)?;
+    let kind = match elf_type {
+        ET_EXEC => RuntimeElfKind::Executable,
+        ET_DYN => RuntimeElfKind::SharedObject,
+        other => RuntimeElfKind::Other(other),
+    };
+    if matches!(kind, RuntimeElfKind::Executable | RuntimeElfKind::SharedObject) {
+        validate_runtime_loadable_shape(&bytes, &elf)?;
+    }
+
+    let mut aggregate = 0usize;
+    let mut references = 0usize;
+    reject_unmodeled_loader_objects(&bytes, limits.dynamic_entries)?;
+    let interpreter = match interp_slot(&bytes)? {
+        None => None,
+        Some((offset, size)) => {
+            let end = offset
+                .checked_add(size)
+                .ok_or("PT_INTERP string file range overflows")?;
+            if size > limits.string_bytes.saturating_add(1) {
+                return Err(format!(
+                    "PT_INTERP exceeds {} bytes",
+                    limits.string_bytes
+                ));
+            }
+            let raw = bytes
+                .get(offset..end)
+                .ok_or("PT_INTERP string runs past end of file")?;
+            let value = bounded_dynamic_string(raw, 0, limits, &mut aggregate, "PT_INTERP")?;
+            account_runtime_reference(&mut references, limits)?;
+            Some(value.to_string())
+        }
+    };
+
+    let mut run_paths = Vec::new();
+    let mut run_path_kind = RuntimeRunPathKind::None;
+    if let Some(slots) = rpath_slots_with_limit(&bytes, limits.dynamic_entries)? {
+        let has_rpath = slots.entries.iter().any(|(tag, _)| *tag == DT_RPATH);
+        let has_runpath = slots.entries.iter().any(|(tag, _)| *tag == DT_RUNPATH);
+        if has_rpath && has_runpath {
+            return Err(
+                "dynamic application ELF carries both DT_RPATH and DT_RUNPATH".into(),
+            );
+        }
+        if slots.entries.len() > 1 {
+            return Err("dynamic application ELF carries duplicate run-path tags".into());
+        }
+        run_path_kind = if has_rpath {
+            RuntimeRunPathKind::Rpath
+        } else if has_runpath {
+            RuntimeRunPathKind::Runpath
+        } else {
+            RuntimeRunPathKind::None
+        };
+        for (_, string_offset) in slots.entries {
+            let string_offset = usize::try_from(string_offset)
+                .map_err(|_| "DT_RPATH/DT_RUNPATH offset does not fit this architecture")?;
+            let offset = slots
+                .strtab_off
+                .checked_add(string_offset)
+                .ok_or("DT_RPATH/DT_RUNPATH string offset overflow")?;
+            let raw = bounded_dynamic_string(
+                &bytes,
+                offset,
+                limits,
+                &mut aggregate,
+                "DT_RPATH/DT_RUNPATH",
+            )?;
+            for entry in raw.split(':').filter(|entry| !entry.is_empty()) {
+                account_runtime_reference(&mut references, limits)?;
+                run_paths.push(entry.to_string());
+            }
+        }
+    }
+
+    let mut needed = Vec::new();
+    if let Some(slots) = needed_slots_with_limit(&bytes, limits.dynamic_entries)? {
+        for string_offset in slots.offsets {
+            let string_offset = usize::try_from(string_offset)
+                .map_err(|_| "DT_NEEDED offset does not fit this architecture")?;
+            let offset = slots
+                .strtab_off
+                .checked_add(string_offset)
+                .ok_or("DT_NEEDED string offset overflow")?;
+            let value = bounded_dynamic_string(
+                &bytes,
+                offset,
+                limits,
+                &mut aggregate,
+                "DT_NEEDED",
+            )?;
+            account_runtime_reference(&mut references, limits)?;
+            needed.push(value.to_string());
+        }
+    }
+    let executable = matches!(kind, RuntimeElfKind::Executable | RuntimeElfKind::SharedObject)
+        && assert_x86_64_executable_bytes(path, &bytes).is_ok();
+    Ok(RuntimeLinkSearch {
+        file_bytes: metadata.len().max(read_bytes),
+        kind,
+        executable,
+        interpreter,
+        run_paths,
+        run_path_kind,
+        needed,
+    })
+}
+
 fn needed_names(b: &[u8]) -> Result<Vec<String>, String> {
     let slots = match needed_slots(b)? {
         None => return Ok(Vec::new()),
@@ -1389,36 +1843,35 @@ pub fn read_needed(path: &Path) -> Result<Vec<String>, String> {
 
 /// Assert that PATH has the executable structure the x86-64 application launcher
 /// needs. Static PIE is `ET_DYN`; a traditional static binary is `ET_EXEC`.
-pub fn assert_x86_64_executable(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let elf = Elf::parse(&bytes)?;
+fn assert_x86_64_executable_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let elf = Elf::parse(bytes)?;
     if !elf.is64 {
         return Err(format!(
             "{}: application entry is not ELFCLASS64",
             path.display()
         ));
     }
-    let kind = u16le(&bytes, 0x10)?;
+    let kind = u16le(bytes, 0x10)?;
     if !matches!(kind, ET_EXEC | ET_DYN) {
         return Err(format!(
             "{}: application entry has ELF type {kind}, expected ET_EXEC or ET_DYN",
             path.display()
         ));
     }
-    let machine = u16le(&bytes, 0x12)?;
+    let machine = u16le(bytes, 0x12)?;
     if machine != EM_X86_64 {
         return Err(format!(
             "{}: application entry has ELF machine {machine}, expected EM_X86_64",
             path.display()
         ));
     }
-    if bytes.get(6).copied() != Some(1) || u32le(&bytes, 0x14)? != EV_CURRENT {
+    if bytes.get(6).copied() != Some(1) || u32le(bytes, 0x14)? != EV_CURRENT {
         return Err(format!(
             "{}: application entry has an unsupported ELF version",
             path.display()
         ));
     }
-    if u16le(&bytes, 0x34)? != 64 {
+    if u16le(bytes, 0x34)? != 64 {
         return Err(format!(
             "{}: application entry has an invalid ELF64 header size",
             path.display()
@@ -1456,13 +1909,13 @@ pub fn assert_x86_64_executable(path: &Path) -> Result<(), String> {
             .checked_mul(phentsize)
             .and_then(|value| phoff.checked_add(value))
             .ok_or_else(|| format!("{}: ELF program-header offset overflow", path.display()))?;
-        if u32le(&bytes, offset)? != PT_LOAD {
+        if u32le(bytes, offset)? != PT_LOAD {
             continue;
         }
         let flags_offset = offset
             .checked_add(4)
             .ok_or_else(|| format!("{}: PT_LOAD flags offset overflow", path.display()))?;
-        let flags = u32le(&bytes, flags_offset)?;
+        let flags = u32le(bytes, flags_offset)?;
         let file_offset = elf.word(Elf::field_offset(offset, 0x08, "PT_LOAD file offset")?)?;
         let virtual_address = elf.word(Elf::field_offset(
             offset,
@@ -1505,6 +1958,42 @@ pub fn assert_x86_64_executable(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn assert_x86_64_executable(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    assert_x86_64_executable_bytes(path, &bytes)
+}
+
+pub(crate) fn assert_x86_64_executable_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(), String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    if length > max_bytes {
+        return Err(format!(
+            "{} exceeds the {max_bytes}-byte executable ELF limit",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut file.take(max_bytes.saturating_add(1)),
+        &mut bytes,
+    )
+    .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if u64::try_from(bytes.len()).map_or(true, |read| read > max_bytes) {
+        return Err(format!(
+            "{} changed while reading and exceeds the {max_bytes}-byte executable ELF limit",
+            path.display()
+        ));
+    }
+    assert_x86_64_executable_bytes(path, &bytes)
+}
+
 /// Assert an ELF is FULLY STATIC — no program interpreter (`PT_INTERP`), no `DT_NEEDED`
 /// shared libraries, and no `DT_RPATH`/`DT_RUNPATH` run-path. This is a runtime-provenance
 /// contract (re #469): a *dynamically* linked binary drags a host loader + glibc back in at
@@ -1539,7 +2028,7 @@ pub fn assert_static(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // A minimal little-endian ELF buffer with exactly one PT_INTERP program header whose
@@ -1586,8 +2075,14 @@ mod tests {
     }
     // Fill the e_phoff/e_phentsize/e_phnum header fields for the given class.
     fn put_phdr_header(b: &mut [u8], phoff: usize, phentsize: usize, phnum: usize, is64: bool) {
-        let (off, ents, num) = if is64 { (0x20, 0x36, 0x38) } else { (0x1C, 0x2A, 0x2C) };
+        let (off, header_size, ents, num) = if is64 {
+            (0x20, 0x34, 0x36, 0x38)
+        } else {
+            (0x1C, 0x28, 0x2A, 0x2C)
+        };
         put_word(b, off, phoff as u64, is64);
+        let ehsize = if is64 { 64u16 } else { 52u16 };
+        b[header_size..header_size + 2].copy_from_slice(&ehsize.to_le_bytes());
         b[ents..ents + 2].copy_from_slice(&(phentsize as u16).to_le_bytes());
         b[num..num + 2].copy_from_slice(&(phnum as u16).to_le_bytes());
     }
@@ -1604,7 +2099,9 @@ mod tests {
             if is64 { (64usize, 56usize, 16usize, 8usize) } else { (52usize, 32usize, 8usize, 4usize) };
         let phnum = 2usize;
         let dyn_off = ehdr + phnum * phentsize;
-        let dyn_size = 3 * dyn_entsize; // DT_STRTAB, DT_RPATH/RUNPATH, DT_NULL
+        // Keep a spare terminator so tests can insert a second tag while the
+        // synthetic table remains well formed.
+        let dyn_size = 4 * dyn_entsize;
         let strtab_off = dyn_off + dyn_size;
         let rpath_str_off = 1usize; // index 0 is the conventional empty string ("\0")
         let total = strtab_off + 1 + rpath.len() + 1;
@@ -1613,6 +2110,12 @@ mod tests {
         b[0..4].copy_from_slice(EI_MAG);
         b[EI_CLASS] = if is64 { 2 } else { 1 };
         b[EI_DATA] = 1;
+        b[6] = 1;
+        b[0x10..0x12].copy_from_slice(&ET_DYN.to_le_bytes());
+        b[0x12..0x14].copy_from_slice(
+            &(if is64 { EM_X86_64 } else { 3u16 }).to_le_bytes(),
+        );
+        b[0x14..0x18].copy_from_slice(&EV_CURRENT.to_le_bytes());
         put_phdr_header(&mut b, ehdr, phentsize, phnum, is64);
         let (p_off, p_vaddr, p_filesz) = ph_field_offsets(is64);
 
@@ -1622,6 +2125,8 @@ mod tests {
         put_word(&mut b, p0 + p_off, 0, is64);
         put_word(&mut b, p0 + p_vaddr, 0, is64);
         put_word(&mut b, p0 + p_filesz, total as u64, is64);
+        let p_memsz = if is64 { p0 + 0x28 } else { p0 + 0x14 };
+        put_word(&mut b, p_memsz, total as u64, is64);
         // PHDR 1: PT_DYNAMIC pointing at the dynamic array.
         let p1 = ehdr + phentsize;
         b[p1..p1 + 4].copy_from_slice(&PT_DYNAMIC.to_le_bytes());
@@ -1637,6 +2142,7 @@ mod tests {
         put_dyn(&mut b, 0, DT_STRTAB, strtab_off as u64); // identity map ⇒ vaddr == file offset
         put_dyn(&mut b, 1, if runpath { DT_RUNPATH } else { DT_RPATH }, rpath_str_off as u64);
         put_dyn(&mut b, 2, DT_NULL, 0);
+        put_dyn(&mut b, 3, DT_NULL, 0);
 
         b[strtab_off + rpath_str_off..strtab_off + rpath_str_off + rpath.len()]
             .copy_from_slice(rpath.as_bytes());
@@ -1645,9 +2151,10 @@ mod tests {
 
     // A minimal dynamic ELF whose .dynstr holds each `needed` name, with one DT_NEEDED entry
     // per name (plus DT_STRTAB and the DT_NULL terminator). The single PT_LOAD is identity-
-    // mapped, so the DT_STRTAB vaddr equals its file offset. Enough for the DT_NEEDED reader
-    // and the static assertion; not a runnable binary.
-    fn synth_needed_elf(needed: &[&str], is64: bool) -> Vec<u8> {
+    // mapped, so the DT_STRTAB vaddr equals its file offset. The entry points into an
+    // executable PT_LOAD so application-graph tests can also use it as a real executable
+    // role.
+    pub(crate) fn synth_needed_elf(needed: &[&str], is64: bool) -> Vec<u8> {
         let (ehdr, phentsize, dyn_entsize, d_un) =
             if is64 { (64usize, 56usize, 16usize, 8usize) } else { (52usize, 32usize, 8usize, 4usize) };
         let phnum = 2usize;
@@ -1668,15 +2175,26 @@ mod tests {
         b[0..4].copy_from_slice(EI_MAG);
         b[EI_CLASS] = if is64 { 2 } else { 1 };
         b[EI_DATA] = 1;
+        b[6] = 1;
+        b[0x10..0x12].copy_from_slice(&ET_DYN.to_le_bytes());
+        b[0x12..0x14].copy_from_slice(
+            &(if is64 { EM_X86_64 } else { 3u16 }).to_le_bytes(),
+        );
+        b[0x14..0x18].copy_from_slice(&EV_CURRENT.to_le_bytes());
+        put_word(&mut b, 0x18, ehdr as u64, is64);
         put_phdr_header(&mut b, ehdr, phentsize, phnum, is64);
         let (p_off, p_vaddr, p_filesz) = ph_field_offsets(is64);
 
         // PHDR 0: PT_LOAD covering the whole file, identity-mapped.
         let p0 = ehdr;
         b[p0..p0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        let flags = if is64 { p0 + 0x04 } else { p0 + 0x18 };
+        b[flags..flags + 4].copy_from_slice(&PF_X.to_le_bytes());
         put_word(&mut b, p0 + p_off, 0, is64);
         put_word(&mut b, p0 + p_vaddr, 0, is64);
         put_word(&mut b, p0 + p_filesz, total as u64, is64);
+        let p_memsz = if is64 { p0 + 0x28 } else { p0 + 0x14 };
+        put_word(&mut b, p_memsz, total as u64, is64);
         // PHDR 1: PT_DYNAMIC pointing at the dynamic array.
         let p1 = ehdr + phentsize;
         b[p1..p1 + 4].copy_from_slice(&PT_DYNAMIC.to_le_bytes());
@@ -2310,6 +2828,104 @@ mod tests {
     }
 
     #[test]
+    fn bounded_runtime_search_charges_before_each_foreign_allocation() {
+        let dir =
+            std::env::temp_dir().join(format!("elf-test-bounded-rls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a");
+        let bytes = synth_needed_elf(&["libalpha.so", "libbeta.so"], true);
+        std::fs::write(&file, &bytes).unwrap();
+        let limits = RuntimeLinkLimits {
+            file_bytes: 1024 * 1024,
+            dynamic_entries: 16,
+            references: 16,
+            string_bytes: 4096,
+            aggregate_text_bytes: 4096,
+        };
+        assert_eq!(
+            runtime_link_search_bounded(&file, limits).unwrap().needed,
+            ["libalpha.so", "libbeta.so"]
+        );
+        for limited in [
+            RuntimeLinkLimits {
+                file_bytes: u64::try_from(bytes.len()).unwrap() - 1,
+                ..limits
+            },
+            RuntimeLinkLimits {
+                dynamic_entries: 3,
+                ..limits
+            },
+            RuntimeLinkLimits {
+                references: 1,
+                ..limits
+            },
+            RuntimeLinkLimits {
+                string_bytes: 3,
+                ..limits
+            },
+            RuntimeLinkLimits {
+                aggregate_text_bytes: 12,
+                ..limits
+            },
+        ] {
+            assert!(runtime_link_search_bounded(&file, limited).is_err());
+        }
+
+        let mut invalid_version = bytes.clone();
+        invalid_version[6] = 0;
+        std::fs::write(&file, invalid_version).unwrap();
+        let error = runtime_link_search_bounded(&file, limits).unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
+
+        std::fs::write(&file, synth_dyn_elf("/app/lib", false, true)).unwrap();
+        assert_eq!(
+            runtime_link_search_bounded(&file, limits)
+                .unwrap()
+                .run_path_kind,
+            RuntimeRunPathKind::Rpath
+        );
+        std::fs::write(&file, synth_dyn_elf("/app/lib", true, true)).unwrap();
+        assert_eq!(
+            runtime_link_search_bounded(&file, limits)
+                .unwrap()
+                .run_path_kind,
+            RuntimeRunPathKind::Runpath
+        );
+
+        let mut dual = synth_dyn_elf("/app/lib", true, true);
+        let dynamic_offset = 64 + 2 * 56;
+        let third_entry = dynamic_offset + 2 * 16;
+        dual[third_entry..third_entry + 8].copy_from_slice(&DT_RPATH.to_le_bytes());
+        dual[third_entry + 8..third_entry + 16].copy_from_slice(&1u64.to_le_bytes());
+        std::fs::write(&file, dual).unwrap();
+        let error = runtime_link_search_bounded(&file, limits).unwrap_err();
+        assert!(error.contains("both DT_RPATH and DT_RUNPATH"), "{error}");
+
+        let mut duplicate = synth_dyn_elf("/app/lib", true, true);
+        duplicate[third_entry..third_entry + 8].copy_from_slice(&DT_RUNPATH.to_le_bytes());
+        duplicate[third_entry + 8..third_entry + 16].copy_from_slice(&1u64.to_le_bytes());
+        std::fs::write(&file, duplicate).unwrap();
+        let error = runtime_link_search_bounded(&file, limits).unwrap_err();
+        assert!(error.contains("duplicate run-path"), "{error}");
+
+        let mut hidden_audit = synth_dyn_elf("/app/lib", true, true);
+        hidden_audit[third_entry..third_entry + 8].copy_from_slice(&DT_AUDIT.to_le_bytes());
+        let dynamic_ph = 64 + 56;
+        put_word(&mut hidden_audit, dynamic_ph + 0x20, 2 * 16, true);
+        std::fs::write(&file, hidden_audit).unwrap();
+        let error = runtime_link_search_bounded(&file, limits).unwrap_err();
+        assert!(error.contains("no DT_NULL terminator"), "{error}");
+
+        let mut audit = synth_dyn_elf("/app/lib", true, true);
+        let second_entry = dynamic_offset + 16;
+        audit[second_entry..second_entry + 8].copy_from_slice(&DT_AUDIT.to_le_bytes());
+        std::fs::write(&file, audit).unwrap();
+        let error = runtime_link_search_bounded(&file, limits).unwrap_err();
+        assert!(error.contains("unsupported loader object tag"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn static_binary_needs_nothing() {
         let dir = std::env::temp_dir().join(format!("elf-test-need0-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2345,6 +2961,17 @@ mod tests {
         let valid = synth_static_elf(true);
         std::fs::write(&file, &valid).unwrap();
         assert!(assert_x86_64_executable(&file).is_ok());
+        assert!(assert_x86_64_executable_bounded(
+            &file,
+            u64::try_from(valid.len()).unwrap()
+        )
+        .is_ok());
+        let error = assert_x86_64_executable_bounded(
+            &file,
+            u64::try_from(valid.len()).unwrap() - 1,
+        )
+        .unwrap_err();
+        assert!(error.contains("executable ELF limit"), "{error}");
 
         for (bytes, expected) in [
             ({

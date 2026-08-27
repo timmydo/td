@@ -3470,7 +3470,8 @@ fn visit_step_templates(
         }
         // These are validated manifest values, not templates. The builder
         // resolves `runtime` only through TD_PAYLOAD_MAP.
-        Step::ValidateStaticApplication { .. } => {}
+        Step::ValidateStaticApplication { .. }
+        | Step::ValidateDynamicApplication { .. } => {}
     }
     Ok(())
 }
@@ -5124,17 +5125,35 @@ mod tests {
     }
 
     #[test]
-    fn firefox_classifies_as_one_marked_exact_graph_seed() {
+    fn firefox_classifies_with_its_marked_runtime_graph() {
         let graph = recipe_closure(&["firefox"]).unwrap();
         let seeds = classify_graph_inputs(&graph).unwrap();
-        assert!(matches!(
-            seeds.as_slice(),
-            [SeedInput::Ostree { key, pin }]
-                if key == "firefox-154-source" && pin.foreign()
-        ));
+        let ostree = seeds
+            .iter()
+            .filter_map(|seed| match seed {
+                SeedInput::Ostree { key, pin } => Some((key.as_str(), pin.foreign())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ostree,
+            vec![
+                ("freedesktop-platform-25-08-source", true),
+                ("firefox-154-source", true),
+            ]
+        );
         let closure = payload_closure(&["firefox"]).unwrap();
-        assert_eq!(closure.foreign_members, vec!["firefox"]);
-        assert_eq!(closure.pins, vec!["firefox-154-source"]);
+        assert_eq!(
+            closure.foreign_members,
+            vec!["firefox", "freedesktop-platform-25-08"]
+        );
+        assert_eq!(
+            closure.pins,
+            vec![
+                "firefox-154-source",
+                "freedesktop-platform-25-08-source"
+            ]
+        );
     }
 
     fn payload_template_recipe(step: Step) -> Recipe {

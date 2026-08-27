@@ -252,6 +252,16 @@ pub enum Step {
         entry: String,
         runtime: String,
     },
+    /// Validate a foreign dynamic package against one selected runtime without
+    /// executing either payload. `library_paths` are reviewed application
+    /// search roots. `optional_targets` makes omitted extension trees explicit.
+    ValidateDynamicApplication {
+        entry: String,
+        runtime: String,
+        library_paths: Vec<String>,
+        optional_targets: Vec<String>,
+        optional_links: usize,
+    },
 }
 
 /// One literal edit within a [`Step::SubstituteText`]: replace every occurrence
@@ -339,6 +349,20 @@ impl Step {
         Step::ValidateStaticApplication {
             entry: declaration.entry().to_string(),
             runtime: declaration.runtime().to_string(),
+        }
+    }
+    pub fn validate_dynamic_application(
+        declaration: &ApplicationDeclaration,
+        library_paths: &[&str],
+        optional_targets: &[&str],
+        optional_links: usize,
+    ) -> Step {
+        Step::ValidateDynamicApplication {
+            entry: declaration.entry().to_string(),
+            runtime: declaration.runtime().to_string(),
+            library_paths: vs(library_paths),
+            optional_targets: vs(optional_targets),
+            optional_links,
         }
     }
     fn to_json(&self) -> Json {
@@ -523,6 +547,22 @@ impl Step {
                 Json::Obj(vec![
                     ("entry".into(), Json::Str(entry.clone())),
                     ("runtime".into(), Json::Str(runtime.clone())),
+                ]),
+            )]),
+            Step::ValidateDynamicApplication {
+                entry,
+                runtime,
+                library_paths,
+                optional_targets,
+                optional_links,
+            } => Json::Obj(vec![(
+                "validateDynamicApplication".into(),
+                Json::Obj(vec![
+                    ("entry".into(), Json::Str(entry.clone())),
+                    ("runtime".into(), Json::Str(runtime.clone())),
+                    ("libraryPaths".into(), arr(library_paths)),
+                    ("optionalTargets".into(), arr(optional_targets)),
+                    ("optionalLinks".into(), Json::Num(optional_links.to_string())),
                 ]),
             )]),
             Step::SubstituteText { file, edits } => Json::Obj(vec![(

@@ -531,8 +531,12 @@ mod tests {
         let ostree = root.join("ostree");
         let cold = survey(&root, &sources, &ostree, &["firefox"]).unwrap();
         assert!(cold.sources.is_empty());
-        assert_eq!(cold.ostree.len(), 1);
-        let pin = cold.ostree.first().expect("the Firefox pin is cold");
+        assert_eq!(cold.ostree.len(), 2);
+        let pin = cold
+            .ostree
+            .iter()
+            .find(|pin| pin.key == "firefox-154-source")
+            .expect("the Firefox pin is cold");
         assert_eq!(pin.key, "firefox-154-source");
 
         let cache = ostree.join(&pin.cache);
@@ -543,7 +547,7 @@ mod tests {
                 .unwrap()
                 .ostree
                 .len(),
-            1,
+            2,
             "a graph without the exact owner record is an interrupted warm"
         );
         fs::write(cache.join("td-ostree-cache.v1"), b"wrong owner").unwrap();
@@ -552,7 +556,7 @@ mod tests {
                 .unwrap()
                 .ostree
                 .len(),
-            1,
+            2,
             "a marker for another graph must not suppress warming"
         );
         fs::write(
@@ -560,6 +564,22 @@ mod tests {
             format!(
                 "format=1\nrepository={}\nref={}\ncommit={}\ncontent={}\n",
                 pin.repository, pin.exact_ref, pin.commit, pin.content
+            ),
+        )
+        .unwrap();
+        let platform = cold
+            .ostree
+            .iter()
+            .find(|candidate| candidate.key == "freedesktop-platform-25-08-source")
+            .expect("the platform pin is cold");
+        let platform_cache = ostree.join(&platform.cache);
+        fs::create_dir_all(&platform_cache).unwrap();
+        fs::write(platform_cache.join("graph.v1"), b"authenticated graph").unwrap();
+        fs::write(
+            platform_cache.join("td-ostree-cache.v1"),
+            format!(
+                "format=1\nrepository={}\nref={}\ncommit={}\ncontent={}\n",
+                platform.repository, platform.exact_ref, platform.commit, platform.content
             ),
         )
         .unwrap();

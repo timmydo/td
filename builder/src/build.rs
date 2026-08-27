@@ -5308,6 +5308,36 @@ pub fn run_mesboot() -> Result<(), String> {
                 })?;
             validate_static_application(Path::new(&ctx.out), &entry, Path::new(runtime))
                 .map_err(err)?;
+        } else if let Some(o) = step.get("validateDynamicApplication") {
+            let entry = field(o, "entry")?;
+            let runtime_name = field(o, "runtime")?;
+            let library_paths = string_array(o, "libraryPaths").map_err(err)?;
+            let optional_targets = string_array(o, "optionalTargets").map_err(err)?;
+            let optional_links = match o.get("optionalLinks") {
+                Some(Json::Num(number)) => number
+                    .parse::<usize>()
+                    .map_err(|error| err(format!("optionalLinks: {error}")))?,
+                _ => return Err(err("optionalLinks: missing/non-number".into())),
+            };
+            let runtime = ctx
+                .payloads
+                .iter()
+                .find(|(name, _)| name == &runtime_name)
+                .map(|(_, path)| path)
+                .ok_or_else(|| {
+                    err(format!(
+                        "application runtime {runtime_name:?} is not a declared payload"
+                    ))
+                })?;
+            crate::application::validate_dynamic_application(
+                Path::new(&ctx.out),
+                &entry,
+                Path::new(runtime),
+                &library_paths,
+                &optional_targets,
+                optional_links,
+            )
+            .map_err(err)?;
         } else if let Some(o) = step.get("substituteText") {
             // Host-free `patch`/`sed` (re #469): literal, fail-closed text edits
             // in pure Rust. `parse_substitute_edits` expands ONLY `file`; the
@@ -6605,7 +6635,7 @@ mod tests {
         let compact = compact_mesboot_dispatch();
         assert_eq!(
             compact.match_indices("string_array(o,").count(),
-            8,
+            10,
             "every production array call must remain pinned"
         );
         for (field, count) in [
@@ -6615,6 +6645,8 @@ mod tests {
             ("names", 1),
             ("packages", 1),
             ("runtimes", 1),
+            ("libraryPaths", 1),
+            ("optionalTargets", 1),
             ("paths", 2),
         ] {
             let site = format!("string_array(o,\"{field}\").map_err(err)?");

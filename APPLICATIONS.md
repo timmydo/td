@@ -893,10 +893,13 @@ environment names, its values are bounded single-line strings, duplicates
 are refused, and at most 128 entries are admitted. The canonical writer
 sorts them, so recipe construction order cannot change a package hash.
 Those entries are immutable package content, not process environment. The
-landed spec compiler refuses every `LD_*` loader-control name, including
-`LD_PRELOAD`, `LD_AUDIT` and `LD_LIBRARY_PATH`, and constructs the jailed
-environment from its own fixed base before the remaining entries apply. The
-manifest validator already reserves td's own `TD_*` namespace.
+landed spec compiler refuses every package-authored `LD_*` loader-control
+name, including `LD_PRELOAD`, `LD_AUDIT` and `LD_LIBRARY_PATH`, and constructs
+the jailed environment from its own fixed base before the remaining entries
+apply. A reviewed exact application/runtime policy may add one builder-owned
+`LD_LIBRARY_PATH`; the spec parser requires that value exactly and refuses it
+for every unreviewed pair. The manifest validator already reserves td's own
+`TD_*` namespace.
 `td_recipe::application::ApplicationDeclaration` carries only the authored
 runtime, entry, optional alias and environment. `Recipe::application` attaches
 that declaration to the package; it has no fields for identity, version or
@@ -1406,10 +1409,85 @@ The admitted source paths are
 Production `build-run` proofs created the marked package outputs
 `nar1h76vz8frc9krqi66glm45nrk9l5r-firefox-154.0` and
 `38kv5wnj4g55h8hplbf3f0hyrwzmhl2l-freedesktop-platform-25-08-25.08`.
-These are package trees only: Firefox intentionally has no manifest, launcher,
-permission policy or compiled jail spec until the dynamic package validator
-and runtime assembly land together. Therefore this increment cannot make the
-browser launchable by itself.
+Those hashes record the tree-only import proof and are superseded when package
+metadata is added. The admitted package with that metadata and the validator
+below is
+`kgfx5y5d8fzfkn7i26ck1v0bzc6d74bq-firefox-154.0`; a production
+`build-run firefox` built it through the normal two-step platform-to-browser
+plan and published its canonical manifest, spec and launcher.
+
+**Dynamic-package admission has now LANDED.** Firefox's recipe binds the exact
+25.08 platform as a marked payload, generates its manifest and launcher, and
+compiles the first td policy: Wayland, shared network, one writable/create
+Downloads grant and the exact bare `org.mozilla.firefox` bus name. X11,
+blanket devices, development access, audio, printing and smart cards remain
+absent. The runtime-major environment table forces
+`LIBGL_ALWAYS_SOFTWARE=1`; Firefox's own declaration selects Wayland without
+using the obsolete `MOZ_WEBRENDER` switch. Its omitted resource section
+deliberately selects the reviewed 1 GiB high, 1.25 GiB max, 1,024-task and
+one-CPU baseline above for first-window bring-up; later tuning requires
+measured jailed-browser evidence rather than an unreviewed package guess.
+
+The terminal `validateDynamicApplication` step runs only after native
+`CopyTree` and never executes imported code. It accepts the bounded
+`#!/bin/bash` launcher only because `/bin/bash` resolves through the modeled
+`/bin -> /usr/bin` alias in the selected runtime, then closes Bash's own ELF
+graph. Other package scripts are inert data during admission. A direct entry
+must instead be an executable x86-64 ELF. It walks all
+regular files in the authenticated application tree, parses every ELF
+interpreter, `DT_NEEDED` and run path, and recursively admits regular x86-64
+ELF providers only after their resolved paths remain below the reviewed
+`/app/lib`, `/app/lib/firefox` and 25.08 runtime library directories. The
+exact builder-owned `LD_LIBRARY_PATH=/app/lib:/app/lib/firefox` uses the same
+application roots; neither the recipe step nor a package-authored environment
+can widen them. Those application roots must be real directories that resolve
+to themselves, so package symlinks cannot widen one to `/app` or `/usr`.
+
+The namespace resolver follows at most 64 links in kernel component order,
+so a symlink is followed before a later `..` is applied. It models all four
+`/usr` aliases, refuses entry-parent indirection, escapes and direct or
+indirect `/run/host` paths, and bounds the application walk, unique loader
+objects and loader edges at 262,144, 32,768 and 262,144 respectively. Parsed
+objects are cached by resolved path and their declared file sizes share a
+2 GiB aggregate ceiling. Retained loader-state paths and RPATH ancestry share
+a separate 64 MiB aggregate ceiling. Each
+foreign ELF is admitted before allocation at 256 MiB, 262,144 dynamic-table
+entries and references, 64 KiB per dynamic string and 16 MiB of aggregate
+dynamic text. `PT_DYNAMIC` must be aligned and carry its `DT_NULL` terminator
+inside the declared file range. Interpreter paths must be absolute.
+Token-bearing `DT_NEEDED` names and duplicate run-path tags refuse. Required
+providers must have the
+executable entry point or shared-object ELF role, version, header table and
+loadable segments that their edge needs. Every filesystem search candidate,
+not merely every `DT_NEEDED` row, consumes the shared edge budget.
+
+Relative run paths are not trusted as admission providers. This matters for
+the exact package: `libonnxruntime.so` contains the literal relative run path
+`$`. It is application-state-relative inside the jail, but every needed edge
+must independently resolve from an authenticated absolute package or runtime
+directory. Absolute run paths retain their component order through namespace
+resolution. Legacy `DT_RPATH` precedes the reviewed loader environment;
+its at-most-64-directory, 64-KiB ancestry propagates to descendants exactly
+as a glibc dependency-loader chain. An object's `DT_RUNPATH` suppresses that
+inherited RPATH for its direct lookup, follows the environment and does not
+propagate. An object carrying both forms is refused rather than closing an
+ambiguous graph. Loader audit, dependency-audit, filter and auxiliary object
+tags are unsupported and refused. The 102 locale links are the one explicit
+omitted extension: the
+exact count and target prefix are bound to the reviewed Firefox/runtime
+policy. Missing targets are accepted only below
+`/app/share/runtime/langpack`; every other dangling application link is
+refused. An opt-in offline test ran the validator against the complete
+materialized Firefox and platform deploys above and passed. Routine tests
+drive the complete validator with a synthetic Bash ELF graph and pin
+namespace, alias, symlink-before-`..`, entry, architecture, provider-root,
+indirect `/run/host`, optional-prefix and run-path cases, so the ordinary gate
+does not depend on the mutable graph cache.
+
+The resulting package is authenticated and fully described but is not yet
+selected into the image. td-jail must create the four aliases it now models,
+prepare Firefox's launcher state and accept only the compiler-owned loader
+path above before the package has a supported run path.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
@@ -2721,8 +2799,9 @@ GDK_BACKEND=wayland  GTK_A11Y=none
 
 plus the manifest's `[Environment]` group, then a **per-runtime-major**
 software-rendering policy table (§G) rather than one global set, since
-each yearly runtime rebases Mesa and GTK. `LD_LIBRARY_PATH` is absent
-unless authenticated extension metadata requires one.
+each yearly runtime rebases Mesa and GTK. `LD_LIBRARY_PATH` is absent unless
+an exact reviewed application/runtime policy inserts it; Firefox 154.0 on
+Freedesktop 25.08 receives only `/app/lib:/app/lib/firefox`.
 
 ### The seccomp filter
 

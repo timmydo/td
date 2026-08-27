@@ -15,6 +15,44 @@ pub const MAX_APPLICATION_SPEC_BYTES: usize = 48 * 1024;
 const MAX_RUNTIME_PATH_BYTES: usize = 4096;
 pub const MAX_SPEC_ENVIRONMENT_ENTRIES: usize = 256;
 pub const APPLICATION_UID: u32 = 1000;
+const FIREFOX_LIBRARY_PATHS: &[&str] = &["/app/lib", "/app/lib/firefox"];
+const FIREFOX_OPTIONAL_TARGETS: &[&str] = &["/app/share/runtime/langpack"];
+const FIREFOX_OPTIONAL_LINKS: usize = 102;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DynamicApplicationPolicy {
+    library_paths: &'static [&'static str],
+    optional_targets: &'static [&'static str],
+    optional_links: usize,
+}
+
+impl DynamicApplicationPolicy {
+    pub fn library_paths(self) -> &'static [&'static str] {
+        self.library_paths
+    }
+
+    pub fn optional_targets(self) -> &'static [&'static str] {
+        self.optional_targets
+    }
+
+    pub fn optional_links(self) -> usize {
+        self.optional_links
+    }
+}
+
+pub fn dynamic_application_policy(
+    name: &str,
+    runtime: &str,
+) -> Option<DynamicApplicationPolicy> {
+    match (name, runtime) {
+        ("firefox", "freedesktop-platform-25-08") => Some(DynamicApplicationPolicy {
+            library_paths: FIREFOX_LIBRARY_PATHS,
+            optional_targets: FIREFOX_OPTIONAL_TARGETS,
+            optional_links: FIREFOX_OPTIONAL_LINKS,
+        }),
+        _ => None,
+    }
+}
 
 /// Variables `td-jail` holds a spec to EXACTLY, and which a manifest may
 /// therefore not set.
@@ -112,11 +150,27 @@ impl ApplicationSpec {
         match manifest.runtime() {
             // Fully static payload: no runtime-major rendering override exists.
             "empty-runtime" => {}
+            "freedesktop-platform-25-08" => {
+                if manifest
+                    .environment()
+                    .any(|(name, _)| name == "LIBGL_ALWAYS_SOFTWARE")
+                {
+                    return Err(
+                        "application environment \"LIBGL_ALWAYS_SOFTWARE\" is fixed by the \
+                         Freedesktop 25.08 runtime policy"
+                            .into(),
+                    );
+                }
+                environment.insert("LIBGL_ALWAYS_SOFTWARE".into(), "1".into());
+            }
             runtime => {
                 return Err(format!(
                     "application runtime {runtime:?} has no compiled environment policy"
                 ));
             }
+        }
+        if let Some(policy) = dynamic_application_policy(manifest.name(), manifest.runtime()) {
+            environment.insert("LD_LIBRARY_PATH".into(), policy.library_paths().join(":"));
         }
         let spec = ApplicationSpec {
             name: manifest.name().to_string(),
@@ -319,10 +373,29 @@ impl ApplicationSpec {
         for (name, value) in &self.environment {
             validate_environment_name(name)?;
             validate_environment_value(value)?;
-            if name.starts_with("LD_") {
+            if name.starts_with("LD_") && name != "LD_LIBRARY_PATH" {
                 return Err(format!(
                     "application environment {name:?} controls the dynamic loader and is not allowed in a jail spec"
                 ));
+            }
+        }
+        let loader_policy = runtime_recipe_name(&self.runtime)
+            .and_then(|runtime| dynamic_application_policy(&self.name, runtime));
+        match (
+            loader_policy,
+            self.environment.get("LD_LIBRARY_PATH").map(String::as_str),
+        ) {
+            (Some(policy), Some(value)) if value == policy.library_paths().join(":") => {}
+            (Some(_), _) => {
+                return Err(
+                    "application spec does not carry its exact reviewed loader path".into(),
+                );
+            }
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(
+                    "application spec carries an unreviewed LD_LIBRARY_PATH policy".into(),
+                );
             }
         }
         self.permissions.resources().complete_or_default()?;
@@ -334,6 +407,44 @@ impl ApplicationSpec {
         }
         Ok(())
     }
+}
+
+fn runtime_recipe_name(path: &str) -> Option<&str> {
+    let package = runtime_store_name(path).ok()?;
+    ["freedesktop-platform-25-08", "empty-runtime"]
+        .into_iter()
+        .find(|name| {
+            package == *name
+                || package
+                    .strip_prefix(*name)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
+}
+
+fn runtime_store_name(path: &str) -> Result<&str, String> {
+    const STORE_HASH_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+    let basename = path
+        .strip_prefix("/td/store/")
+        .ok_or("application runtime path must be a full `/td/store' path")?;
+    let digest = basename
+        .as_bytes()
+        .get(..32)
+        .ok_or("application runtime path has no 32-character store digest")?;
+    if !digest
+        .iter()
+        .all(|byte| STORE_HASH_ALPHABET.contains(byte))
+        || basename.as_bytes().get(32) != Some(&b'-')
+    {
+        return Err("application runtime path has a malformed store basename".into());
+    }
+    let name = basename
+        .get(33..)
+        .ok_or("application runtime path has a malformed store name")?;
+    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
+        return Err("application runtime path is not one canonical store child".into());
+    }
+    Ok(name)
 }
 
 fn validate_runtime_path(path: &str) -> Result<(), String> {
@@ -349,12 +460,7 @@ fn validate_runtime_path(path: &str) -> Result<(), String> {
     if path.bytes().any(|byte| byte.is_ascii_control()) {
         return Err("application runtime path contains a control byte".into());
     }
-    let Some(basename) = path.strip_prefix("/td/store/") else {
-        return Err("application runtime path must be a full `/td/store' path".into());
-    };
-    if basename.is_empty() || basename.contains('/') || matches!(basename, "." | "..") {
-        return Err("application runtime path is not one canonical store child".into());
-    }
+    runtime_store_name(path)?;
     Ok(())
 }
 
@@ -541,6 +647,50 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("no compiled environment policy"), "{error}");
+    }
+
+    #[test]
+    fn freedesktop_25_08_policy_forces_software_mesa() {
+        let declaration =
+            ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/firefox")
+                .unwrap()
+                .with_environment("MOZ_ENABLE_WAYLAND", "1")
+                .unwrap();
+        let manifest = declaration
+            .manifest("firefox", "154.0", ApplicationProvenance::Foreign)
+            .unwrap();
+        let runtime =
+            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08";
+        let spec =
+            ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
+        let environment = spec.environment().collect::<BTreeMap<_, _>>();
+        assert_eq!(environment.get("LIBGL_ALWAYS_SOFTWARE"), Some(&"1"));
+        assert_eq!(
+            environment.get("LD_LIBRARY_PATH"),
+            Some(&"/app/lib:/app/lib/firefox")
+        );
+        assert_eq!(environment.get("MOZ_ENABLE_WAYLAND"), Some(&"1"));
+        let text = spec.to_keyfile();
+        assert_eq!(ApplicationSpec::parse(&text).unwrap(), spec);
+        assert!(ApplicationSpec::parse(&text.replace(
+            "LD_LIBRARY_PATH=/app/lib:/app/lib/firefox",
+            "LD_LIBRARY_PATH=/app/lib"
+        ))
+        .is_err());
+        let malformed_store = text.replacen("runtime=/td/store/0", "runtime=/td/store/e", 1);
+        let error = ApplicationSpec::parse(&malformed_store).unwrap_err();
+        assert!(error.contains("malformed store basename"), "{error}");
+
+        let overridden =
+            ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/firefox")
+                .unwrap()
+                .with_environment("LIBGL_ALWAYS_SOFTWARE", "0")
+                .unwrap()
+                .manifest("firefox", "154.0", ApplicationProvenance::Foreign)
+                .unwrap();
+        let error =
+            ApplicationSpec::compile(&overridden, runtime, PermissionPolicy::new()).unwrap_err();
+        assert!(error.contains("Freedesktop 25.08 runtime policy"), "{error}");
     }
 
     #[test]
