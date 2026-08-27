@@ -28,6 +28,41 @@ if [ ! -x "$start_root/target/release/td-builder" ]; then
     echo "start: cargo did not produce an executable td-builder runner" >&2
     exit 1
 fi
+
+# Probe the same provisioned compiler td-builder will pin for the host td-net
+# build. AtomicU64::try_update became stable in Rust 1.95, and compiling the
+# capability probe also handles prerelease compilers without guessing by name.
+rust_path=$("$start_root/target/release/td-builder" provision-rust)
+start_rustc=
+saved_ifs=$IFS
+IFS=:
+for rust_dir in $rust_path; do
+    if [ -x "$rust_dir/rustc" ]; then
+        start_rustc=$rust_dir/rustc
+        break
+    fi
+done
+IFS=$saved_ifs
+if [ -z "$start_rustc" ]; then
+    echo "start: provisioned Rust path contains no executable rustc: $rust_path" >&2
+    exit 1
+fi
+if ! rust_version=$("$start_rustc" --version 2>/dev/null); then
+    rust_version=$start_rustc
+fi
+if ! printf '%s\n' \
+    'use std::sync::atomic::{AtomicU64, Ordering};' \
+    'pub fn probe(value: &AtomicU64) {' \
+    '    let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, Some);' \
+    '}' | "$start_rustc" --crate-name td_start_rust_probe --crate-type lib \
+        --emit metadata -o "$bootstrap_cargo_home/td-start-rust-probe.rmeta" \
+        - 2>/dev/null
+then
+    echo "start: Rust 1.95 or newer is required; found $rust_version" >&2
+    echo "start: update the provisioned Rust toolchain and retry ./start" >&2
+    exit 1
+fi
 cleanup_bootstrap_cargo_home
 trap - EXIT HUP INT TERM
+
 exec cargo run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- run system-x86-64

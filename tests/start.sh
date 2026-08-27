@@ -13,9 +13,22 @@ if [[ ${TD_START_TEST_FAKE_TOOLS:-} == 1 ]]; then
                 "$PWD" "$*" >> "$TD_START_TEST_LOG"
             if [[ ${1-} == build && ${TD_START_TEST_MATERIALIZE:-} == 1 ]]; then
                 mkdir -p "$CARGO_TARGET_DIR/release"
-                printf '#!/bin/sh\nexit 0\n' \
+                printf '%s\n' \
+                    '#!/bin/sh' \
+                    'if [ "${1-}" = provision-rust ]; then' \
+                    '    printf "%s\n" "$TD_START_TEST_RUST_PATH"' \
+                    '    exit 0' \
+                    'fi' \
+                    'exit 1' \
                     > "$CARGO_TARGET_DIR/release/td-builder"
                 chmod +x "$CARGO_TARGET_DIR/release/td-builder"
+            fi
+            ;;
+        rustc)
+            if [[ ${1-} == --version ]]; then
+                printf '%s\n' "${TD_START_TEST_RUSTC_VERSION:-rustc 1.99.0}"
+            else
+                exit "${TD_START_TEST_RUST_PROBE_RC:-0}"
             fi
             ;;
         *) exit 1 ;;
@@ -26,13 +39,45 @@ fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/bin" "$work/tmp"
+mkdir -p "$work/bin" "$work/tmp" "$work/rust/bin"
 ln -s "$root/tests/start.sh" "$work/bin/cargo"
+ln -s "$root/tests/start.sh" "$work/rust/bin/rustc"
 
 make_fixture() {
     mkdir -p "$1/.cargo"
     cp "$root/start" "$1/start"
     cp "$root/.cargo/config.toml" "$1/.cargo/config.toml"
+}
+
+# A provisioned compiler without stable try_update must be diagnosed after the
+# runner bootstrap and before Cargo starts building the system.
+old_rust=$work/old-rust
+make_fixture "$old_rust"
+old_rust_log=$work/old-rust.log
+set +e
+PATH=$work/bin:$PATH \
+TMPDIR=$work/tmp \
+TD_START_TEST_FAKE_TOOLS=1 \
+TD_START_TEST_LOG=$old_rust_log \
+TD_START_TEST_MATERIALIZE=1 \
+TD_START_TEST_RUST_PATH=$work/rust/bin \
+TD_START_TEST_RUSTC_VERSION='rustc 1.92.0-nightly (test 2025-10-02)' \
+TD_START_TEST_RUST_PROBE_RC=1 \
+    "$old_rust/start" >/dev/null 2>"$work/old-rust.err"
+old_rust_rc=$?
+set -e
+test "$old_rust_rc" -ne 0 || {
+    echo "FAIL: start accepted Rust older than 1.95" >&2
+    exit 1
+}
+test "$(wc -l < "$old_rust_log")" -eq 1 || {
+    echo "FAIL: start reached the system Cargo run after rejecting old Rust" >&2
+    exit 1
+}
+grep -F "Rust 1.95 or newer is required; found rustc 1.92.0-nightly" \
+    "$work/old-rust.err" >/dev/null || {
+    echo "FAIL: start did not diagnose the old Rust compiler" >&2
+    exit 1
 }
 
 # A successful Cargo exit without the promised artifact must not reach the
@@ -82,6 +127,9 @@ TMPDIR=$ambient_tmp \
 TD_START_TEST_FAKE_TOOLS=1 \
 TD_START_TEST_LOG=$log \
 TD_START_TEST_MATERIALIZE=1 \
+TD_START_TEST_RUST_PATH=$work/rust/bin \
+TD_START_TEST_RUSTC_VERSION='rustc 1.95.0 (test)' \
+TD_START_TEST_RUST_PROBE_RC=0 \
 CARGO_TARGET_DIR=$ambient_target \
 CARGO_BUILD_TARGET=wrong-target \
 CARGO_HOME=$ambient_home \
@@ -135,4 +183,4 @@ test -x "$fixture/$runner_path" || {
     exit 1
 }
 
-echo "PASS: start bootstraps its Cargo runner before building the system"
+echo "PASS: start requires Rust 1.95 and bootstraps its Cargo runner"

@@ -45,7 +45,7 @@ nothing in the root is mutable.
 - A Linux **x86-64** host with unprivileged user namespaces enabled — the
   build sandbox is rootless, so no `sudo` and no host `/td` directory is
   needed (the store is assembled inside the sandbox).
-- A Rust toolchain (`cargo`) to build td's control-plane tools.
+- Rust 1.95 or newer (`cargo` and `rustc`) to build td's control-plane tools.
 - QEMU (`qemu-system-x86_64`) to boot the image.
 
 ## Try it
