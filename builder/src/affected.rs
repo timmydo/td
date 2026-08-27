@@ -765,6 +765,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // preflight and dies in the full check.
     if p == ".cargo/config.toml" {
         sel.add_preflight("cargo-test");
+        sel.add_preflight("start-bootstrap");
         sel.add_target("recipe-rs");
         return;
     }
@@ -990,8 +991,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "start" {
+    if p == "start" || p == "tests/start.sh" {
         sel.add_preflight("shell-syntax");
+        sel.add_preflight("start-bootstrap");
         return;
     }
 
@@ -1383,6 +1385,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 fn preflight_cmd(name: &str, changed: &[String]) -> Option<String> {
     match name {
         "shell-syntax" => Some("  bash -n start tests/*.sh ci/*.sh tools/*.sh".to_string()),
+        "start-bootstrap" => Some("  bash tests/start.sh".to_string()),
         "heal-revert" => Some("  bash tests/heal-revert.sh".to_string()),
         // Rendered from the SAME list that runs, so a scoped run cannot print a
         // command it will not issue — the dry run is what a reader trusts.
@@ -2188,6 +2191,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // binary's memory, so an edit runs the tier whose attestation proves the
     // runner still applies.
     assert_preflight!(".cargo/config.toml", "cargo-test");
+    assert_preflight!(".cargo/config.toml", "start-bootstrap");
     // recipe-rs is the ONLY tier that runs a musl-target cargo test, so it is
     // the only one that would catch a break confined to the musl runner entry.
     assert_target!(".cargo/config.toml", "recipe-rs");
@@ -2236,6 +2240,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-compositor/Cargo.lock", "recipe-checks");
     assert_no_target!("td-compositor/DESIGN.md", "check");
     assert_preflight!("start", "shell-syntax");
+    assert_preflight!("start", "start-bootstrap");
+    assert_preflight!("tests/start.sh", "shell-syntax");
+    assert_preflight!("tests/start.sh", "start-bootstrap");
     // td-netd/src is include_str!'d into the target artifact (its recipe AND packed
     // into system-x86-64), so a helper-source edit rides the host cargo preflight
     // AND is recorded against recipe-checks, which statically links + shape-asserts
@@ -2399,6 +2406,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // test selects it (the dev host has git; the loop sandbox does not).
     assert_contains!("ci/revert-suspect.sh", "bash tests/heal-revert.sh");
     assert_contains!("tests/heal-revert.sh", "bash tests/heal-revert.sh");
+    assert_contains!("start", "bash tests/start.sh");
+    assert_contains!("tests/start.sh", "bash tests/start.sh");
 
     failures
 }
@@ -2681,6 +2690,7 @@ const CARGO_TEST_CMDS: [&str; 36] = [
 fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
     match name {
         "shell-syntax" => run_shell(root, "bash -n start tests/*.sh ci/*.sh tools/*.sh"),
+        "start-bootstrap" => run_shell(root, "bash tests/start.sh"),
         "heal-revert" => run_shell(root, "bash tests/heal-revert.sh"),
         // BOTH engine crates, tests AND clippy: the AGENTS.md deny-lints only
         // fire under the clippy driver, and the in-loop cargo-test gate (325)

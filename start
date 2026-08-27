@@ -6,4 +6,28 @@ case "$0" in
     *) start_dir=. ;;
 esac
 cd "$start_dir"
+
+# Cargo runs td-recipe-eval through this checkout's td-builder. Build the
+# runner from the filesystem root with a temporary Cargo home so ambient
+# build.target settings cannot move it away from the configured path.
+start_root=$(pwd -P)
+bootstrap_cargo_home=$(mktemp -d "${TMPDIR:-/tmp}/td-start-cargo.XXXXXX")
+cleanup_bootstrap_cargo_home() {
+    rm -rf -- "$bootstrap_cargo_home"
+}
+trap cleanup_bootstrap_cargo_home EXIT HUP INT TERM
+(
+    cd /
+    unset CARGO_BUILD_TARGET
+    CARGO_HOME=$bootstrap_cargo_home CARGO_TARGET_DIR=$start_root/target \
+        cargo build --release --locked \
+        --manifest-path "$start_root/builder/Cargo.toml"
+)
+
+if [ ! -x "$start_root/target/release/td-builder" ]; then
+    echo "start: cargo did not produce an executable td-builder runner" >&2
+    exit 1
+fi
+cleanup_bootstrap_cargo_home
+trap - EXIT HUP INT TERM
 exec cargo run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- run system-x86-64
