@@ -1104,10 +1104,14 @@ mod tests {
         ("make-x86-64-self", "make-x86-64"),
     ];
     const RECIPE_SHEBANG_INTERPRETERS: [&str; 2] = [super::SH, super::POST_BOOTSTRAP_SH];
-    const GUEST_LITERAL_SHEBANGS: [(&str, &str); 12] = [
+    const GUEST_LITERAL_SHEBANGS: [(&str, &str); 13] = [
         ("linux-x86-64", "{root}/initramfs/init"),
         ("kexec-spike-x86-64", "{root}/inner-init"),
         ("kexec-spike-x86-64", "{root}/outer-init"),
+        (
+            "td-jail-test",
+            "/home/td-jail-host/packages/00000000000000000000000000000000-firefox-154.0/files/bin/firefox",
+        ),
         ("system-x86-64", "{root}/selector-init"),
         ("system-x86-64", "{root}/deployment-init"),
         ("system-x86-64", "{root}/real-root/etc/autologin"),

@@ -2,6 +2,8 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-jail/src/main.rs");
+#[cfg(test)]
+const BUILDER_APPLICATION_RS: &str = include_str!("../../../builder/src/application.rs");
 const MODULES: &[(&str, &str)] = &[
     (
         "authority",
@@ -317,6 +319,14 @@ mod tests {
     #[test]
     fn jail_grammar_is_bound_to_the_image_and_spec_compilers() {
         let authority = source("authority").expect("authority source");
+        let transition = source("transition").expect("transition source");
+        let alias_rows = "    (\"bin\", \"/usr/bin\"),\n    (\"lib\", \"/usr/lib\"),\n    (\"lib64\", \"/usr/lib64\"),\n    (\"sbin\", \"/usr/sbin\"),\n";
+        assert!(BUILDER_APPLICATION_RS.contains(&format!(
+            "const APPLICATION_ALIASES: &[(&str, &str)] = &[\n{alias_rows}];"
+        )));
+        assert!(transition.contains(&format!(
+            "const RUNTIME_ALIASES: &[(&str, &str)] = &[\n{alias_rows}];"
+        )));
         assert!(authority.contains(&format!(
             "const CONFIG: &str = {:?};",
             crate::ladder::TD_APPLICATION_CONFIG_TEXT
@@ -460,6 +470,50 @@ mod tests {
             .is_err(),
             "td-jail accepted a spec naming a bus it does not bind"
         );
+
+        let firefox = crate::catalog::registry::firefox::recipe();
+        let firefox_name = firefox.name;
+        let firefox_version = firefox.version;
+        let firefox_declaration = firefox.application.expect("Firefox declaration");
+        let firefox_permissions = firefox
+            .application_permissions
+            .expect("Firefox permissions");
+        let firefox_manifest = firefox_declaration
+            .manifest(
+                &firefox_name,
+                &firefox_version,
+                ApplicationProvenance::Foreign,
+            )
+            .expect("Firefox manifest");
+        let firefox_spec = ApplicationSpec::compile(
+            &firefox_manifest,
+            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08",
+            firefox_permissions,
+        )
+        .expect("Firefox spec")
+        .to_keyfile();
+        target_authority::test_validate_spec_environment(
+            &firefox_spec,
+            td_engine::application_spec::APPLICATION_UID,
+        )
+        .expect("td-jail must accept the compiler-owned Firefox loader path");
+        for altered in [
+            firefox_spec.replace("LD_LIBRARY_PATH=/app/lib:/app/lib/firefox\n", ""),
+            firefox_spec.replace(
+                "LD_LIBRARY_PATH=/app/lib:/app/lib/firefox",
+                "LD_LIBRARY_PATH=/app/lib",
+            ),
+            firefox_spec.replace("name=firefox\n", "name=other\n"),
+        ] {
+            assert!(
+                target_authority::test_validate_spec_environment(
+                    &altered,
+                    td_engine::application_spec::APPLICATION_UID,
+                )
+                .is_err(),
+                "td-jail accepted a Firefox loader path outside its exact application/runtime policy"
+            );
+        }
         let package = "/td/store/0123456789abcdefghijklmnopqrstuv-td-jail-fixture-0.1";
         let registry = ApplicationRegistry::new(vec![(
             crate::ladder::TD_JAIL_FIXTURE_NAME.to_string(),

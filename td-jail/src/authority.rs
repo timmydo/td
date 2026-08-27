@@ -54,6 +54,8 @@ const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4096;
 const MAX_ENTRY_BYTES: usize = 4096;
 const MAX_APPLICATION_ARGUMENTS: usize = 256;
 const MAX_APPLICATION_ARGUMENT_BYTES: usize = 64 * 1024;
+const FIREFOX_RUNTIME: &str = "freedesktop-platform-25-08";
+const FIREFOX_LIBRARY_PATH: &str = "/app/lib:/app/lib/firefox";
 
 #[derive(Debug)]
 pub(crate) struct LaunchPlan {
@@ -82,6 +84,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) resources: ResolvedResourceLimits,
     pub(crate) entry: String,
     pub(crate) environment: Vec<(OsString, OsString)>,
+    pub(crate) loader_library_path: Option<String>,
     pub(crate) arguments: Vec<OsString>,
     pub(crate) outside_uid: u32,
     pub(crate) outside_gid: u32,
@@ -308,7 +311,11 @@ where
         .iter()
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect::<Vec<_>>();
-    validate_environment_list(&environment, inside_identity.0)?;
+    validate_environment_list(
+        &environment,
+        inside_identity.0,
+        spec.loader_library_path.as_deref(),
+    )?;
     let (wayland_socket, bus_socket, runtime_root) = if config.host_mode {
         host_session_sockets(outside_identity, config.runtime_root.as_deref())?
     } else {
@@ -377,6 +384,7 @@ where
         resources,
         entry: spec.entry,
         environment,
+        loader_library_path: spec.loader_library_path,
         arguments,
         outside_uid: outside_identity.0,
         outside_gid: outside_identity.1,
@@ -647,7 +655,9 @@ where
 pub(crate) fn validate_environment_list(
     environment: &[(OsString, OsString)],
     uid: u32,
+    loader_library_path: Option<&str>,
 ) -> io::Result<()> {
+    validate_stage2_loader_library_path(loader_library_path)?;
     if environment.len() > MAX_ENVIRONMENT_ENTRIES {
         return Err(invalid(format!(
             "application environment exceeds {MAX_ENVIRONMENT_ENTRIES} entries"
@@ -711,7 +721,24 @@ pub(crate) fn validate_environment_list(
     {
         return Err(invalid("application environment lacks FLATPAK_ID"));
     }
+    let actual_loader_library_path = environment.iter().find_map(|(key, value)| {
+        (key == "LD_LIBRARY_PATH").then(|| value.to_string_lossy().into_owned())
+    });
+    if actual_loader_library_path.as_deref() != loader_library_path {
+        return Err(invalid(format!(
+            "application environment LD_LIBRARY_PATH is {actual_loader_library_path:?}, expected {loader_library_path:?}"
+        )));
+    }
     Ok(())
+}
+
+pub(crate) fn validate_stage2_loader_library_path(value: Option<&str>) -> io::Result<()> {
+    if value.is_none() || value == Some(FIREFOX_LIBRARY_PATH) {
+        return Ok(());
+    }
+    Err(invalid(
+        "stage-2 loader library path is not a reviewed target policy",
+    ))
 }
 
 struct ParsedSpec {
@@ -719,6 +746,7 @@ struct ParsedSpec {
     runtime: String,
     entry: String,
     environment: BTreeMap<String, String>,
+    loader_library_path: Option<String>,
     permissions: PermissionPolicy,
 }
 
@@ -800,12 +828,52 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
         )));
     }
     ResolvedResourceLimits::from_policy(permissions.resources())?;
+    let loader_library_path = reviewed_loader_library_path(&name, &runtime)?.map(str::to_string);
+    if environment.get("LD_LIBRARY_PATH").map(String::as_str)
+        != loader_library_path.as_deref()
+    {
+        return Err(invalid(
+            "application spec does not carry its exact reviewed loader path",
+        ));
+    }
     Ok(ParsedSpec {
         name,
         runtime,
         entry,
         environment,
+        loader_library_path,
         permissions,
+    })
+}
+
+fn reviewed_loader_library_path(name: &str, runtime: &str) -> io::Result<Option<&'static str>> {
+    const STORE_HASH_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+    let basename = runtime
+        .strip_prefix("/td/store/")
+        .ok_or_else(|| invalid("application runtime is not below /td/store"))?;
+    let digest = basename
+        .as_bytes()
+        .get(..32)
+        .ok_or_else(|| invalid("application runtime has no 32-character store digest"))?;
+    if !digest
+        .iter()
+        .all(|byte| STORE_HASH_ALPHABET.contains(byte))
+        || basename.as_bytes().get(32) != Some(&b'-')
+    {
+        return Err(invalid("application runtime has a malformed store basename"));
+    }
+    let output = basename
+        .get(33..)
+        .filter(|name| !name.is_empty() && !name.contains('/') && !matches!(*name, "." | ".."))
+        .ok_or_else(|| invalid("application runtime has no canonical store output name"))?;
+    let firefox_runtime = output == FIREFOX_RUNTIME
+        || output
+            .strip_prefix(FIREFOX_RUNTIME)
+            .is_some_and(|suffix| suffix.starts_with('-'));
+    Ok(match (name, firefox_runtime) {
+        ("firefox", true) => Some(FIREFOX_LIBRARY_PATH),
+        _ => None,
     })
 }
 
@@ -1815,7 +1883,7 @@ fn validate_environment_entry(key: &str, value: &str) -> io::Result<()> {
         || key.len() > MAX_ENVIRONMENT_NAME_BYTES
         || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         || key.starts_with("TD_")
-        || key.starts_with("LD_")
+        || (key.starts_with("LD_") && key != "LD_LIBRARY_PATH")
         || value.len() > MAX_ENVIRONMENT_VALUE_BYTES
         || value.trim() != value
         || value.chars().any(char::is_control)
@@ -2185,6 +2253,7 @@ fn prepare_state(
     ensure_state_component(&local, "state", identity, true)?;
     let config = ensure_state_component(&application, "config", identity, true)?;
     let cache = ensure_state_component(&application, "cache", identity, true)?;
+    ensure_state_component(&cache, "tmp", identity, true)?;
     let data = ensure_state_component(&application, "data", identity, true)?;
     let local_state = ensure_state_component(&application, "state", identity, true)?;
     require_owned_directory(runtime_root, identity, true)?;
@@ -2550,7 +2619,11 @@ pub(crate) fn test_validate_spec_environment(text: &str, uid: u32) -> io::Result
         .iter()
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect::<Vec<_>>();
-    validate_environment_list(&environment, uid)
+    validate_environment_list(
+        &environment,
+        uid,
+        spec.loader_library_path.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -2849,7 +2922,7 @@ mod tests {
 
     #[test]
     fn spec_parser_accepts_only_the_closed_canonical_subset() {
-        let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1\nentry=/app/bin/fixture\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n";
+        let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1\nentry=/app/bin/fixture\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n";
         assert!(test_parse_spec(text).is_ok());
         let spec = parse_spec(text).unwrap();
         assert_eq!(spec.name, "fixture");
@@ -2963,6 +3036,34 @@ mod tests {
         ] {
             assert!(parse_spec(&invalid).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn firefox_loader_path_is_bound_to_the_exact_runtime_pair() {
+        let text = "format=1\nname=firefox\nruntime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08\nentry=/app/bin/firefox\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nFLATPAK_ID=org.mozilla.firefox\nHOME=/home/td\nLD_LIBRARY_PATH=/app/lib:/app/lib/firefox\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n\n[Filesystem]\nxdg-download=rw:create\n\n[Session Bus Policy]\norg.mozilla.firefox=own\n";
+        let spec = parse_spec(text).unwrap();
+        assert_eq!(
+            spec.loader_library_path.as_deref(),
+            Some(FIREFOX_LIBRARY_PATH)
+        );
+        for altered in [
+            text.replace("LD_LIBRARY_PATH=/app/lib:/app/lib/firefox\n", ""),
+            text.replace(FIREFOX_LIBRARY_PATH, "/app/lib"),
+            text.replace("name=firefox\n", "name=other\n"),
+            text.replace(
+                "freedesktop-platform-25-08-25.08",
+                "empty-runtime-1",
+            ),
+            text.replace(
+                "0123456789abcdfghijklmnpqrsvwxyz-",
+                "0123456789abcdfghijklmnpqrsvwxyz_",
+            ),
+            text.replacen("runtime=/td/store/0", "runtime=/td/store/e", 1),
+        ] {
+            assert!(parse_spec(&altered).is_err(), "accepted {altered:?}");
+        }
+        assert!(validate_stage2_loader_library_path(Some(FIREFOX_LIBRARY_PATH)).is_ok());
+        assert!(validate_stage2_loader_library_path(Some("/app/lib")).is_err());
     }
 
     #[test]
@@ -3295,12 +3396,12 @@ mod tests {
                 OsString::from("/run/user/1000"),
             ),
         ];
-        assert!(validate_environment_list(&environment, 1000).is_ok());
+        assert!(validate_environment_list(&environment, 1000, None).is_ok());
         // A DIFFERENT uid fails on every uid-derived value at once, the bus
         // address among them: an app told to reach /run/user/1000/bus while
         // running as 1001 would find a socket it cannot use, or somebody
         // else's.
-        assert!(validate_environment_list(&environment, 1001).is_err());
+        assert!(validate_environment_list(&environment, 1001, None).is_err());
         // Each required name is required ON ITS OWN. A draft sliced the front
         // of the array instead, which drops one name and then two, so the
         // second assertion passed for the first one's reason and no name after
@@ -3319,7 +3420,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(without.len(), environment.len() - 1, "{dropped} was not there");
             assert!(
-                validate_environment_list(&without, 1000).is_err(),
+                validate_environment_list(&without, 1000, None).is_err(),
                 "a spec missing {dropped} was accepted"
             );
         }
@@ -3342,7 +3443,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            validate_environment_list(&elsewhere, 1000).is_err(),
+            validate_environment_list(&elsewhere, 1000, None).is_err(),
             "a spec may not point the app at a bus this jail does not mount"
         );
 
@@ -3353,7 +3454,7 @@ mod tests {
             ),
             (OsString::from("HOME"), OsString::from("/home/td")),
         ];
-        assert!(validate_environment_list(&unsorted, 1000).is_err());
+        assert!(validate_environment_list(&unsorted, 1000, None).is_err());
     }
 
     /// The shim the td-jail recipe check reaches across the crate boundary
@@ -3371,7 +3472,7 @@ mod tests {
     /// `validate_environment_list` — is pinned on the side that owns both.
     #[test]
     fn the_spec_environment_shim_runs_the_contract_it_names() {
-        let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdefghijklmnopqrstuv-empty-runtime-1\nentry=/app/bin/fixture\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nFLATPAK_ID=org.td.Fixture\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n";
+        let text = "format=1\nname=fixture\nruntime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1\nentry=/app/bin/fixture\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nFLATPAK_ID=org.td.Fixture\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n";
         assert!(
             test_validate_spec_environment(text, 1000).is_ok(),
             "a complete spec must be accepted"

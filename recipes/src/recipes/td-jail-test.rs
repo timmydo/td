@@ -8,6 +8,11 @@ use td_engine::launcher::{ApplicationRegistry, LauncherTable};
 
 const HOST_PACKAGE: &str = "/td/store/00000000000000000000000000000000-td-jail-fixture-0.1";
 const HOST_RUNTIME: &str = "/td/store/00000000000000000000000000000000-empty-runtime-1";
+const HOST_FIREFOX_PACKAGE: &str =
+    "/td/store/00000000000000000000000000000000-firefox-154.0";
+const HOST_FIREFOX_RUNTIME: &str =
+    "/td/store/00000000000000000000000000000000-freedesktop-platform-25-08-25.08";
+const HOST_FIREFOX_MARKER: &str = "TD-FIREFOX-JAIL-SMOKE-OK";
 const HOST_DEGRADATION_CGROUP: &str =
     "TD-JAIL-HOST-DEGRADATION aggregate-memory-task-and-cpu-caps=unenforced reason=no-delegated-cgroup";
 const HOST_DEGRADATION_WAYLAND: &str =
@@ -17,6 +22,8 @@ struct HostFixture {
     manifest: String,
     spec: String,
     shared_spec: String,
+    firefox_manifest: String,
+    firefox_spec: String,
     registry: String,
     launcher: String,
 }
@@ -42,14 +49,47 @@ fn host_fixture() -> Result<HostFixture, String> {
     let spec = ApplicationSpec::compile(&manifest, HOST_RUNTIME, permissions)?.to_keyfile();
     let shared_spec =
         ApplicationSpec::compile(&manifest, HOST_RUNTIME, shared_permissions)?.to_keyfile();
-    let registry =
-        ApplicationRegistry::new(vec![(name.clone(), HOST_PACKAGE.to_string())])?.to_tsv();
-    let launcher = launcher.bind(&name)?;
-    let launcher = LauncherTable::new(vec![launcher])?.to_tsv();
+    let fixture_launcher = launcher.bind(&name)?;
+
+    let firefox = super::firefox::recipe();
+    let firefox_name = firefox.name;
+    let firefox_version = firefox.version;
+    let firefox_declaration = firefox
+        .application
+        .ok_or_else(|| "Firefox has no application declaration".to_string())?;
+    let firefox_permissions = firefox
+        .application_permissions
+        .ok_or_else(|| "Firefox has no permission policy".to_string())?;
+    let firefox_launcher = firefox
+        .application_launcher
+        .ok_or_else(|| "Firefox has no launcher declaration".to_string())?;
+    let firefox_manifest = firefox_declaration.manifest(
+        &firefox_name,
+        &firefox_version,
+        ApplicationProvenance::Foreign,
+    )?;
+    let firefox_spec = ApplicationSpec::compile(
+        &firefox_manifest,
+        HOST_FIREFOX_RUNTIME,
+        firefox_permissions,
+    )?
+    .to_keyfile();
+    let registry = ApplicationRegistry::new(vec![
+        (firefox_name.clone(), HOST_FIREFOX_PACKAGE.to_string()),
+        (name.clone(), HOST_PACKAGE.to_string()),
+    ])?
+    .to_tsv();
+    let launcher = LauncherTable::new(vec![
+        firefox_launcher.bind(&firefox_name)?,
+        fixture_launcher,
+    ])?
+    .to_tsv();
     Ok(HostFixture {
         manifest: manifest.to_keyfile(),
         spec,
         shared_spec,
+        firefox_manifest: firefox_manifest.to_keyfile(),
+        firefox_spec,
         registry,
         launcher,
     })
@@ -94,6 +134,14 @@ pub fn recipe() -> Recipe {
         "/home/td-jail-host/packages/00000000000000000000000000000000-empty-runtime-1/files",
         "/home/td-jail-host/packages/00000000000000000000000000000000-empty-runtime-1/files/etc",
         "/home/td-jail-host/packages/00000000000000000000000000000000-empty-runtime-1/files/etc/fonts",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-firefox-154.0/files/bin",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-firefox-154.0/files/lib/firefox",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/bin",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/lib",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/lib64",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/sbin",
+        "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/etc",
+        "/home/td-jail-host/Downloads",
         "/home/td-jail-host/etc",
         "/home/td-jail-host",
         "/home/td-jail-host/runtime",
@@ -105,6 +153,14 @@ pub fn recipe() -> Recipe {
         dest:
             "/home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/files/bin"
                 .into(),
+    });
+    steps.push(Step::CopyFiles {
+        files: vec!["{in:busybox-x86-64}/bin/busybox".into()],
+        dest: "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/bin".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "busybox".into(),
+        link: "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/bin/sh".into(),
     });
     for (path, content) in [
         (
@@ -119,6 +175,14 @@ pub fn recipe() -> Recipe {
             "/home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/shared-spec",
             host.shared_spec,
         ),
+        (
+            "/home/td-jail-host/packages/00000000000000000000000000000000-firefox-154.0/manifest",
+            host.firefox_manifest,
+        ),
+        (
+            "/home/td-jail-host/packages/00000000000000000000000000000000-firefox-154.0/spec",
+            host.firefox_spec,
+        ),
         ("/home/td-jail-host/etc/td-applications.tsv", host.registry),
         ("/home/td-jail-host/etc/td-launcher.tsv", host.launcher),
     ] {
@@ -128,6 +192,13 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
+    steps.push(Step::WriteFile {
+        path: "/home/td-jail-host/packages/00000000000000000000000000000000-firefox-154.0/files/bin/firefox".into(),
+        content: format!(
+            "#!/bin/sh\nset -eu\nTMPDIR=$XDG_CACHE_HOME/tmp\nexport TMPDIR\n[ \"$LD_LIBRARY_PATH\" = /app/lib:/app/lib/firefox ] || exit 81\nfor path in /bin /lib /lib64 /sbin; do [ -L \"$path\" ] || exit 82; done\n[ -x /bin/sh ] || exit 83\n[ -d \"$TMPDIR\" ] || exit 84\n[ -w \"$TMPDIR\" ] || exit 85\nprintf '%s\\n' '{HOST_FIREFOX_MARKER}' >\"$XDG_RUNTIME_DIR/td-app/dynamic-ready\" || exit 86\n"
+        ),
+        exec: true,
+    });
     steps.push(Step::WriteFile {
         path: "/home/td-jail-host/etc/td-app-host.conf".into(),
         content: "format=2\npackage-root=/home/td-jail-host/packages\nstate-root=/home/td-jail-host/.td/app\nregistry=/home/td-jail-host/etc/td-applications.tsv\nlauncher-table=/home/td-jail-host/etc/td-launcher.tsv\nca-bundle={in:ca-certificates}/share/ca-certificates/ca-bundle.crt\nresolv-conf=/home/td-jail-host/etc/resolv.conf\ncgroup-root=none\n".into(),
@@ -160,13 +231,17 @@ pub fn recipe() -> Recipe {
                      o=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest 2>&1); s=$?; \
                      c=0; cp /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/shared-spec /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/spec || c=$?; \
                      p=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest 2>&1); t=$?; \
+                     f=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf firefox 2>&1); u=$?; \
                      kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; \
                      [ \"$s\" -eq 0 ] || {{ echo \"td-jail host fixture failed: $o\" >&2; exit 1; }}; \
                      [ \"$c\" -eq 0 ] || {{ echo 'td-jail host shared spec could not replace the isolated spec' >&2; exit 1; }}; \
                      [ \"$t\" -eq 0 ] || {{ echo \"td-jail host shared-network fixture failed: $p\" >&2; exit 1; }}; \
+                     [ \"$u\" -eq 0 ] || {{ echo \"td-jail host Firefox-spec smoke failed with status $u: $f\" >&2; exit 1; }}; \
                      e='{}\n{}'; \
                      [ \"$o\" = \"$e\" ] || {{ echo \"td-jail host isolated degradation report changed: $o\" >&2; exit 1; }}; \
-                     [ \"$p\" = \"$e\" ] || {{ echo \"td-jail host shared-network degradation report changed: $p\" >&2; exit 1; }}",
+                     [ \"$p\" = \"$e\" ] || {{ echo \"td-jail host shared-network degradation report changed: $p\" >&2; exit 1; }}; \
+                     [ \"$f\" = \"$e\" ] || {{ echo \"td-jail host Firefox-spec degradation report changed: $f\" >&2; exit 1; }}; \
+                     [ \"$(cat /home/td-jail-host/runtime/td-app/firefox/dynamic-ready)\" = '{HOST_FIREFOX_MARKER}' ] || {{ echo 'td-jail host Firefox-spec marker is absent or wrong' >&2; exit 1; }}",
                     crate::ladder::TD_JAIL_FIXTURE_NAME,
                     crate::ladder::TD_JAIL_FIXTURE_NAME,
                     HOST_DEGRADATION_CGROUP,
@@ -216,7 +291,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
         content: format!(
-            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, the application bootstrap executes its parent-death and terminal-containment setup before authority resolution, stage 1 closes inherited descriptors, preserves a policy-declared shared network or brings up and reads back isolated loopback, builds a selective immutable /etc with per-application identity, pinned CA trust, and nonempty file/directory runtime configuration binds, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, derives the exact /etc roster from /usr/etc, verifies its runtime nested mounts and conditional resolver bind, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, naturally reaps filtered descendants as PID 1, and exercises bounded namespace-wide TERM and KILL survivor cleanup; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; explicit host mode launches the ordinary fixture identity with both its isolated spec and a fixture-derived shared-network spec from a materialized prefix through the real td-busd registration path, binds caller-owned host session sockets, and emits the exact cgroup and Wayland-filter degradation report for both; the host smoke leg may skip behavior under an inherited filter, while system-x86-64's QEMU oracle supplies the authoritative target-kernel isolated transition through {TD_JAIL_TRANSITION_MARKER} and the installed-application launch proof, including a bounded loopback datagram plus writable and recursively read-only filesystem-grant oracles, through {TD_JAIL_FIXTURE_BOOT_MARKER}\n"
+            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, the application bootstrap executes its parent-death and terminal-containment setup before authority resolution, stage 1 closes inherited descriptors, preserves a policy-declared shared network or brings up and reads back isolated loopback, builds a selective immutable /etc with per-application identity, pinned CA trust, and nonempty file/directory runtime configuration binds, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, derives the exact /etc roster from /usr/etc, verifies its runtime nested mounts and conditional resolver bind, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, naturally reaps filtered descendants as PID 1, and exercises bounded namespace-wide TERM and KILL survivor cleanup; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; explicit host mode launches the ordinary fixture identity with both its isolated spec and a fixture-derived shared-network spec plus a source-built surrogate under the real Firefox spec from a materialized prefix through the real td-busd registration path, binds caller-owned host session sockets, verifies Firefox's exact loader path, immutable runtime aliases and private cache tmp, and emits the exact cgroup and Wayland-filter degradation report for all three; the host smoke leg may skip behavior under an inherited filter, while system-x86-64's QEMU oracle supplies the authoritative target-kernel isolated transition through {TD_JAIL_TRANSITION_MARKER} and the installed-application launch proof, including a bounded loopback datagram plus writable and recursively read-only filesystem-grant oracles, through {TD_JAIL_FIXTURE_BOOT_MARKER}\n"
         ),
         exec: false,
     });
@@ -237,7 +312,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, launches the ordinary fixture with isolated and shared network policy through the parent-death and terminal-containment bootstrap from a host prefix with exact degradation diagnostics and fixture-owned CA/resolver inputs, smoke-tests selective immutable /etc plus namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping plus bounded TERM/KILL survivor cleanup, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
+echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, launches the ordinary fixture with isolated and shared network policy plus a source-built surrogate under the exact Firefox spec through the parent-death and terminal-containment bootstrap from a host prefix with exact degradation diagnostics and fixture-owned CA/resolver inputs, verifies the Firefox loader path, runtime aliases and cache tmp, smoke-tests selective immutable /etc plus namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping plus bounded TERM/KILL survivor cleanup, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 "#,
@@ -247,7 +322,10 @@ exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 
 #[cfg(test)]
 mod tests {
-    use super::{host_fixture, HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND};
+    use super::{
+        host_fixture, HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND,
+        HOST_FIREFOX_MARKER, HOST_FIREFOX_RUNTIME,
+    };
 
     #[test]
     fn host_fixture_exercises_declared_shared_network() {
@@ -256,6 +334,38 @@ mod tests {
         assert!(host
             .shared_spec
             .contains("[Context]\nshared=network\nsockets=wayland\n"));
+    }
+
+    #[test]
+    fn host_fixture_uses_the_exact_firefox_runtime_contract() {
+        let host = host_fixture().expect("host fixture");
+        assert!(host.firefox_manifest.contains("name=firefox\n"));
+        assert!(host.firefox_manifest.contains("provenance=foreign\n"));
+        assert!(host
+            .firefox_spec
+            .contains(&format!("runtime={HOST_FIREFOX_RUNTIME}\n")));
+        assert!(host
+            .firefox_spec
+            .contains("LD_LIBRARY_PATH=/app/lib:/app/lib/firefox\n"));
+        assert!(host.firefox_spec.contains("shared=network\n"));
+        assert!(host
+            .registry
+            .starts_with("firefox\t/td/store/00000000000000000000000000000000-firefox-154.0\n"));
+
+        let recipe = super::recipe();
+        assert!(recipe.steps.iter().flatten().any(|step| matches!(
+            step,
+            crate::types::Step::WriteFile { path, content, exec: true }
+                if path.ends_with("firefox-154.0/files/bin/firefox")
+                    && content.starts_with("#!/bin/sh\n")
+                    && content.contains("[ \"$LD_LIBRARY_PATH\" = /app/lib:/app/lib/firefox ]")
+                    && content.contains(HOST_FIREFOX_MARKER)
+        )));
+        assert!(recipe.steps.iter().flatten().any(|step| matches!(
+            step,
+            crate::types::Step::Symlink { target, link }
+                if target == "busybox" && link.ends_with("/files/bin/sh")
+        )));
     }
 
     #[test]

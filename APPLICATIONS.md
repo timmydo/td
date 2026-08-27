@@ -1485,20 +1485,45 @@ indirect `/run/host`, optional-prefix and run-path cases, so the ordinary gate
 does not depend on the mutable graph cache.
 
 The resulting package is authenticated and fully described but is not yet
-selected into the image. td-jail must create the four aliases it now models,
-prepare Firefox's launcher state and accept only the compiler-owned loader
-path above before the package has a supported run path.
+selected into the image. **The dynamic jail mount policy has now LANDED.**
+For the exact Firefox/Freedesktop 25.08 pair, td-jail admits only the
+compiler-owned `LD_LIBRARY_PATH` above; every other application/runtime pair
+must omit it and every other `LD_*` variable remains refused. That decision is
+carried through the token-gated stage-2 argv and revalidated there rather than
+becoming ambient launcher state.
+
+The dynamic mount plan creates exact immutable `/bin`, `/lib`, `/lib64` and
+`/sbin` links to the selected runtime's `/usr` directories, verifies their
+type, target and resolution after the pivot, and leaves the static
+`empty-runtime` root without aliases it does not need. Offline admission of
+the authenticated real deploy also requires each target to resolve to a
+directory, so the synthetic smoke cannot manufacture away a pinned-runtime
+layout mismatch. State preparation also creates and stage 2 verifies writable
+mode-0700
+`$XDG_CACHE_HOME/tmp`, which the Firefox wrapper selects as `TMPDIR`.
+
+The permanent non-manual acceptance test compiles Firefox's real declaration,
+permissions and runtime policy, then launches a source-built static BusyBox
+surrogate under that exact spec through the real td-jail namespace, mount,
+broker-registration and seccomp path. The surrogate enters through `/bin/sh`,
+checks the loader environment, all four aliases and cache tmp, and writes a
+marker through the private volatile runtime bind. It does not execute imported
+Firefox bytes as a recipe tool and does not claim that Firefox has presented a
+window. Image selection and the headless first-committed-window QEMU oracle
+remain the next application increment.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
 interpreter is `/lib64/ld-linux-x86-64.so.2`, supplied by the platform under
-`/usr/lib64`. Therefore dynamic Flatpak packages also require a reviewed
+`/usr/lib64`. Therefore dynamic Flatpak packages require a reviewed
 runtime-major environment policy, synthetic `/bin`, `/lib`, `/lib64` and
 `/sbin` aliases into `/usr`, and a bounded `/etc` assembled from td policy plus
-selected runtime data. Runtime links into Flatpak's `/run/host` are never
-allowed to recreate that host view; DNS, certificates, fonts, timezone and
-machine identity receive td-owned paths from §G. Those are jail/runtime tasks,
-not reasons to reshape the imported trees.
+selected runtime data. The exact mount and environment policies are landed;
+executing the imported loader and Firefox remains the system-image increment.
+Runtime links into Flatpak's `/run/host` are never allowed to recreate that
+host view; DNS, certificates, fonts, timezone and machine identity receive
+td-owned paths from §G. Those are jail/runtime tasks, not reasons to reshape
+the imported trees.
 
 #### B.3.2 The Firefox platform stop line
 
@@ -1506,14 +1531,18 @@ The application packaging workstream stops after this proof until the
 following bus and Wayland capabilities land. This is a dependency boundary:
 the bus and compositor workstreams own their implementations, while a later
 application increment re-runs the proof against the then-current exact
-Flathub commits.
+Flathub commits. The first-window substrate called out as landed below is no
+longer a block on beginning image selection; the remaining fidelity and
+service bullets continue to be live requirements for the corresponding
+features.
 
 Those capabilities are necessary, not a claim that Firefox becomes ready when
-they land. The resumed application workstream still owns the bounded importer
-and dynamic validator from §B.3.1, the runtime aliases and synthesized `/etc`,
-the narrowed td permission and resource policy, and image-capacity accounting
-for the 993.7 MB base deploy. E2's toolkit and nested-sandbox experiments are
-now complete; the exact §H Firefox oracle remains. `td-portal` itself is a
+they land. The resumed application workstream owns the bounded importer,
+dynamic validator, runtime aliases, synthesized `/etc`, narrowed td permission
+and resource policy, and image-capacity accounting for the 993.7 MB base
+deploy. Everything in that list through the aliases and `/etc` is now
+complete. E2's toolkit and nested-sandbox experiments are complete; the exact
+§H Firefox oracle remains. `td-portal` itself is a
 separate platform prerequisite. None of those obligations is discharged by
 the bus/compositor list below.
 
@@ -2465,7 +2494,8 @@ on a load-bearing bind is fatal, never degraded:
  2  tmpfs <newroot>, mode 0755, nosuid/nodev where compatible
  3  /usr   <- runtime deploy files/            ro, nosuid, nodev
  4  /app   <- app deploy files/                ro, nosuid, nodev
- 5  /bin /sbin /lib /lib64 -> symlinks into usr/
+ 5  dynamic-policy apps only: /bin /sbin /lib /lib64 -> exact symlinks
+        into usr/. Static empty-runtime apps omit the four aliases.
  6  /etc   tmpfs, populated selectively from the runtime's usr/etc, then
         immutable. The closed runtime allowlist is dconf, fonts, gtk-3.0,
         gtk-4.0, ld.so.cache, ld.so.conf, ld.so.conf.d, pango, pulse,
@@ -5879,6 +5909,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 12e | **typed CPU bandwidth policy — LANDED**: permission format 2 adds bounded `cpu-max=QUOTA PERIOD`; format 1 remains accepted and inherits a one-CPU baseline. The kernel pins fair-group scheduling and CFS bandwidth while keeping real-time group scheduling off; td-svc delegates `cpu` top-down; td-jail writes and exactly reads `cpu.max`, reports the bandwidth rows from `cpu.stat`, and the 50%-CPU fixture's active leaf gates the QEMU marker | aggregate CPU time is capped with the memory and task budgets |
 | 12f | **typed shared-network policy — LANDED**: the authenticated `shared=network` permission selects the compiled namespace set without `CLONE_NEWNET`; stage 1 requires the network namespace inode to remain unchanged and skips the isolated-loopback ioctl. Omitted policy retains `CLONE_NEWNET`, exact changed-inode readback and the up-loopback oracle. The host fixture launches both its isolated defaults and a derived shared-network variant; the shipped QEMU fixture remains isolated. `/etc/resolv.conf` and mediated network policy remain later work | a declared application can use td's network stack without weakening the default isolated path |
 | 12g | **selective immutable `/etc` — LANDED**: a bounded tmpfs admits only the closed runtime configuration allowlist, synthesized passwd/group/host/NSS identity, one persisted per-application machine id, the pinned curl-rendered Mozilla CA bundle, and a read-only resolver bind only for declared shared networking. Stage 1 source-identity-checks every external file and recursively hardens selected runtime directories; stage 2 derives the exact tree from `/usr/etc`, checks synthesized contents, mount flags, nested mounts, PEM shape and write refusal. Host mode names fixture-owned CA and resolver inputs rather than borrowing ambient `/etc` | applications get libc/toolkit identity and trust data without seeing the host configuration |
+| 12h | **dynamic Firefox jail runtime — LANDED**: the exact Firefox/Freedesktop 25.08 pair is the sole target policy allowed to carry `LD_LIBRARY_PATH=/app/lib:/app/lib/firefox`; token-gated stage 2 revalidates the value after privileged stage 1 installs the four immutable `/usr` aliases, then reads those aliases back. Every application receives and stage 2 requires writable mode-0700 `$XDG_CACHE_HOME/tmp`. A source-built surrogate runs under Firefox's real compiled spec through the complete host jail and broker path and publishes an outside-observed marker; imported Firefox bytes remain inert. | the Firefox package has an automated confinement/runtime preflight without a manual desktop session |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |

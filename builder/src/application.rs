@@ -27,6 +27,12 @@ const MAX_DYNAMIC_STRING_BYTES: usize = 64 * 1024;
 const MAX_DYNAMIC_TEXT_BYTES: usize = 16 * 1024 * 1024;
 
 const RUNTIME_LIBRARY_PATHS: &[&str] = &["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib"];
+const APPLICATION_ALIASES: &[(&str, &str)] = &[
+    ("bin", "/usr/bin"),
+    ("lib", "/usr/lib"),
+    ("lib64", "/usr/lib64"),
+    ("sbin", "/usr/sbin"),
+];
 
 #[derive(Debug)]
 struct Namespace<'a> {
@@ -155,13 +161,35 @@ impl Namespace<'_> {
 }
 
 fn application_alias(name: &str) -> Option<&'static str> {
-    match name {
-        "bin" => Some("/usr/bin"),
-        "lib" => Some("/usr/lib"),
-        "lib64" => Some("/usr/lib64"),
-        "sbin" => Some("/usr/sbin"),
-        _ => None,
+    APPLICATION_ALIASES
+        .iter()
+        .find_map(|(alias, target)| (*alias == name).then_some(*target))
+}
+
+fn validate_runtime_alias_targets(namespace: &Namespace<'_>) -> Result<(), String> {
+    for (alias, target) in APPLICATION_ALIASES {
+        let resolved = match namespace.resolve(target)? {
+            ResolveOutcome::Found(resolved) => resolved,
+            ResolveOutcome::Missing(path) => {
+                return Err(format!(
+                    "dynamic application runtime alias /{alias} has no target {path}"
+                ));
+            }
+        };
+        let metadata = fs::metadata(&resolved.physical_path).map_err(|error| {
+            format!(
+                "inspect dynamic application runtime alias /{alias} target {}: {error}",
+                resolved.physical_path.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(format!(
+                "dynamic application runtime alias /{alias} target {} is not a directory",
+                resolved.virtual_path
+            ));
+        }
     }
+    Ok(())
 }
 
 fn account_link_traversal(traversals: &mut usize, requested: &str) -> Result<(), String> {
@@ -299,18 +327,13 @@ fn normalize_virtual(base: &str, target: &str) -> Result<String, String> {
             }
         }
     }
-    if let Some(first) = components.first_mut() {
-        let alias = match first.as_str() {
-            "bin" => Some(("usr", "bin")),
-            "lib" => Some(("usr", "lib")),
-            "lib64" => Some(("usr", "lib64")),
-            "sbin" => Some(("usr", "sbin")),
-            _ => None,
-        };
-        if let Some((root, child)) = alias {
-            *first = root.to_string();
-            components.insert(1, child.to_string());
-        }
+    if let Some(target) = components
+        .first()
+        .and_then(|first| application_alias(first))
+    {
+        let mut rewritten = virtual_components(target)?;
+        rewritten.extend(components.into_iter().skip(1));
+        components = rewritten;
     }
     let normalized = format!("/{}", components.join("/"));
     if normalized.len() > MAX_NAMESPACE_PATH_BYTES {
@@ -1083,6 +1106,7 @@ pub(crate) fn validate_dynamic_application(
         app: &app,
         usr: &usr,
     };
+    validate_runtime_alias_targets(&namespace)?;
     let entry_interpreter = validate_entry(&namespace, entry)?;
     let allowed_roots = prepare_library_roots(&namespace, library_paths)?;
     let (files, optional_links) = collect_application_files(&namespace, optional_targets)?;
@@ -1473,6 +1497,8 @@ mod tests {
         fs::create_dir_all(app.join("lib/firefox")).unwrap();
         fs::create_dir_all(usr.join("bin")).unwrap();
         fs::create_dir_all(usr.join("lib")).unwrap();
+        fs::create_dir_all(usr.join("lib64")).unwrap();
+        fs::create_dir_all(usr.join("sbin")).unwrap();
         let entry = app.join("bin/firefox");
         fs::write(&entry, b"#!/bin/bash\nexit 0\n").unwrap();
         make_executable(&entry);
@@ -1502,6 +1528,11 @@ mod tests {
         .unwrap();
         validate_dynamic_application(&package, "/app/bin/firefox", &runtime, &paths, &[], 0)
             .unwrap();
+        fs::remove_dir(usr.join("sbin")).unwrap();
+        let error =
+            validate_dynamic_application(&package, "/app/bin/firefox", &runtime, &paths, &[], 0)
+                .unwrap_err();
+        assert!(error.contains("alias /sbin"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 

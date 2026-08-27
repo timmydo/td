@@ -30,6 +30,7 @@ const STAGE2_PROBE_ARG: &str = "--probe";
 const STAGE2_LAUNCH_ARG: &str = "--launch";
 const STAGE2_RESOLV_CONF_ARG: &str = "--resolv-conf";
 const STAGE2_MACHINE_ID_ARG: &str = "--machine-id";
+const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
 const STAGE2_RESOURCES_ARG: &str = "--resources";
@@ -94,6 +95,12 @@ const RUNTIME_ETC_ALLOWLIST: &[&str] = &[
     "pulse",
     "vulkan",
     "xdg",
+];
+const RUNTIME_ALIASES: &[(&str, &str)] = &[
+    ("bin", "/usr/bin"),
+    ("lib", "/usr/lib"),
+    ("lib64", "/usr/lib64"),
+    ("sbin", "/usr/sbin"),
 ];
 
 const DEVICE_NODES: &[(&str, u64, u64)] = &[
@@ -232,6 +239,7 @@ pub enum Stage2Action {
         entry: String,
         resolv_conf: bool,
         machine_id: String,
+        runtime_aliases: bool,
         environment: Vec<(OsString, OsString)>,
         filesystems: Vec<Stage2Filesystem>,
         resources: ResolvedResourceLimits,
@@ -251,6 +259,7 @@ struct Stage2MountBinding<'a> {
     filesystems: &'a [FilesystemGrant],
     resolv_conf: bool,
     machine_id: &'a str,
+    loader_library_path: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -422,6 +431,20 @@ where
         if !authority::valid_machine_id(&machine_id) {
             return Err(usage_error());
         }
+        if args.next().as_deref() != Some(STAGE2_LOADER_LIBRARY_PATH_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let loader_library_path = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("absent") => None,
+            Some("present") => Some(
+                args.next()
+                    .ok_or_else(usage_error)?
+                    .into_string()
+                    .map_err(|_| usage_error())?,
+            ),
+            _ => return Err(usage_error()),
+        };
+        authority::validate_stage2_loader_library_path(loader_library_path.as_deref())?;
         if args.next().as_deref() != Some(STAGE2_ENVIRONMENT_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -435,7 +458,11 @@ where
             let value = args.next().ok_or_else(usage_error)?;
             environment.push((key, value));
         }
-        authority::validate_environment_list(&environment, uid)?;
+        authority::validate_environment_list(
+            &environment,
+            uid,
+            loader_library_path.as_deref(),
+        )?;
         if args.next().as_deref() != Some(STAGE2_FILESYSTEMS_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -507,6 +534,7 @@ where
             entry,
             resolv_conf,
             machine_id,
+            runtime_aliases: loader_library_path.is_some(),
             environment,
             filesystems,
             resources,
@@ -595,6 +623,16 @@ fn stage2_launch_arguments(
         }),
         OsString::from(STAGE2_MACHINE_ID_ARG),
         OsString::from(mounts.machine_id),
+    ]);
+    stage2.push(OsString::from(STAGE2_LOADER_LIBRARY_PATH_ARG));
+    match mounts.loader_library_path {
+        Some(value) => {
+            stage2.push(OsString::from("present"));
+            stage2.push(OsString::from(value));
+        }
+        None => stage2.push(OsString::from("absent")),
+    }
+    stage2.extend([
         OsString::from(STAGE2_ENVIRONMENT_ARG),
         OsString::from(environment.len().to_string()),
     ]);
@@ -1704,6 +1742,9 @@ fn prepare_mount_plan(
         create_dir(&format!("{NEW_ROOT}/home/td"), 0o700)?;
         mount_application_tree(&application.package_files, &format!("{NEW_ROOT}/app"))?;
         mount_application_tree(&application.runtime_files, &format!("{NEW_ROOT}/usr"))?;
+        if application.loader_library_path.is_some() {
+            install_runtime_aliases()?;
+        }
         prepare_etc(application)?;
         mount_private_bind(
             &application.state.home,
@@ -1784,6 +1825,13 @@ fn prepare_mount_plan(
         mount_reaper_probe(executable)?;
     }
     remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+fn install_runtime_aliases() -> io::Result<()> {
+    for (name, target) in RUNTIME_ALIASES {
+        symlink(target, format!("{NEW_ROOT}/{name}"))?;
+    }
+    Ok(())
 }
 
 fn mount_reaper_probe(executable: &Path) -> io::Result<()> {
@@ -2263,18 +2311,29 @@ fn require_read_only_mount(path: &str, token: &[u8; TOKEN_LEN]) -> io::Result<()
 
 fn grant_scaffold_names(
     application: bool,
+    runtime_aliases: bool,
     filesystems: &[Stage2Filesystem],
 ) -> io::Result<BTreeMap<PathBuf, BTreeSet<String>>> {
-    let root = if application {
-        ["app", "dev", "etc", "home", "proc", "run", "tmp", "usr", "var"].as_slice()
+    let mut root = if application {
+        ["app", "dev", "etc", "home", "proc", "run", "tmp", "usr", "var"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
     } else {
-        ["dev", "proc", "tmp", "var"].as_slice()
+        ["dev", "proc", "tmp", "var"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
     };
+    if runtime_aliases {
+        root.extend(
+            RUNTIME_ALIASES
+                .iter()
+                .map(|(name, _)| (*name).to_string()),
+        );
+    }
     let mut expected = BTreeMap::from([
-        (
-            PathBuf::from("/"),
-            root.iter().map(|name| (*name).to_string()).collect(),
-        ),
+        (PathBuf::from("/"), root),
         (PathBuf::from("/var"), BTreeSet::from(["tmp".to_string()])),
     ]);
     if application {
@@ -2463,6 +2522,7 @@ fn require_mount_plan(
     filesystems: Option<&[Stage2Filesystem]>,
     resolv_conf: bool,
     machine_id: Option<&str>,
+    runtime_aliases: bool,
     token: &[u8; TOKEN_LEN],
     identity: Identity,
 ) -> io::Result<()> {
@@ -2474,7 +2534,9 @@ fn require_mount_plan(
             "detached host root remains reachable in the fresh root",
         ));
     }
-    for (path, expected) in grant_scaffold_names(application, filesystems.unwrap_or_default())? {
+    for (path, expected) in
+        grant_scaffold_names(application, runtime_aliases, filesystems.unwrap_or_default())?
+    {
         let path_text = path
             .to_str()
             .ok_or_else(|| io::Error::other("filesystem scaffold path is not UTF-8"))?;
@@ -2569,6 +2631,9 @@ fn require_mount_plan(
         let filesystems = filesystems.unwrap_or_default();
         let machine_id = machine_id
             .ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
+        if runtime_aliases {
+            require_runtime_aliases()?;
+        }
         require_etc_plan(&mountinfo, token, resolv_conf, machine_id, identity)?;
         require_names("/run", &["user"])?;
         let runtime = format!("/run/user/{}", identity.uid);
@@ -2616,6 +2681,8 @@ fn require_mount_plan(
             )?;
             require_writable_directory(path, token)?;
         }
+        require_mode("/home/td/.cache/tmp", 0o700)?;
+        require_writable_directory("/home/td/.cache/tmp", token)?;
         require_mount(
             &mountinfo,
             &format!("{runtime}/wayland-0"),
@@ -2701,6 +2768,47 @@ fn require_mount_plan(
         return Err(io::Error::other("fresh /dev remained mutable"));
     }
     require_stage2_capabilities()
+}
+
+fn require_runtime_aliases() -> io::Result<()> {
+    for (name, expected_target) in RUNTIME_ALIASES {
+        let alias = PathBuf::from("/").join(name);
+        let alias_error = |action: &str, error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{action} runtime alias {} to {expected_target}: {error}",
+                    alias.display()
+                ),
+            )
+        };
+        let metadata = fs::symlink_metadata(&alias)
+            .map_err(|error| alias_error("inspect", error))?;
+        if !metadata.file_type().is_symlink() {
+            return Err(io::Error::other(format!(
+                "runtime alias {} is not a symbolic link to {expected_target}",
+                alias.display()
+            )));
+        }
+        let actual_target = fs::read_link(&alias)
+            .map_err(|error| alias_error("read", error))?;
+        if actual_target.as_os_str() != OsStr::new(expected_target) {
+            return Err(io::Error::other(format!(
+                "runtime alias {} points to {}, expected {expected_target}",
+                alias.display(),
+                actual_target.display()
+            )));
+        }
+        let target_metadata = fs::metadata(expected_target)
+            .map_err(|error| alias_error("inspect target for", error))?;
+        if !target_metadata.file_type().is_dir() {
+            return Err(io::Error::other(format!(
+                "runtime alias {} target {expected_target} is not a directory",
+                alias.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn require_empty_child_capabilities() -> io::Result<()> {
@@ -3294,23 +3402,26 @@ pub fn run_stage2(
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     let mount_probe_token = random_token()?;
-    let (filesystems, resolv_conf, machine_id) = match &action {
-        Stage2Action::Probe => (None, false, None),
+    let (filesystems, resolv_conf, machine_id, runtime_aliases) = match &action {
+        Stage2Action::Probe => (None, false, None, false),
         Stage2Action::Launch {
             filesystems,
             resolv_conf,
             machine_id,
+            runtime_aliases,
             ..
         } => (
             Some(filesystems.as_slice()),
             *resolv_conf,
             Some(machine_id.as_str()),
+            *runtime_aliases,
         ),
     };
     require_mount_plan(
         filesystems,
         resolv_conf,
         machine_id,
+        runtime_aliases,
         &mount_probe_token,
         identity,
     )?;
@@ -3341,6 +3452,7 @@ pub fn run_stage2(
             entry,
             resolv_conf: _,
             machine_id: _,
+            runtime_aliases: _,
             environment,
             filesystems: _,
             resources,
@@ -3799,6 +3911,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 filesystems: &application.filesystems,
                 resolv_conf: application.resolv_conf.is_some(),
                 machine_id: &application.state.machine_id,
+                loader_library_path: application.loader_library_path.as_deref(),
             },
             Stage2ResourceBinding {
                 limits: application.resources,
@@ -4355,6 +4468,8 @@ mod tests {
                 "present",
                 STAGE2_MACHINE_ID_ARG,
                 machine_id,
+                STAGE2_LOADER_LIBRARY_PATH_ARG,
+                "absent",
                 STAGE2_ENVIRONMENT_ARG,
                 "6",
                 "DBUS_SESSION_BUS_ADDRESS",
@@ -4389,6 +4504,7 @@ mod tests {
                     entry,
                     resolv_conf,
                     machine_id: parsed_machine_id,
+                    runtime_aliases,
                     environment,
                     filesystems,
                     resources,
@@ -4399,6 +4515,7 @@ mod tests {
             } if entry == "/app/bin/app"
                 && resolv_conf
                 && parsed_machine_id == machine_id
+                && !runtime_aliases
                 && environment.first() == Some(&(
                     OsString::from("DBUS_SESSION_BUS_ADDRESS"),
                     OsString::from("unix:path=/run/user/1000/bus"),
@@ -4433,6 +4550,8 @@ mod tests {
             "absent",
             STAGE2_MACHINE_ID_ARG,
             machine_id,
+            STAGE2_LOADER_LIBRARY_PATH_ARG,
+            "absent",
             STAGE2_ENVIRONMENT_ARG,
             "0",
             STAGE2_FILESYSTEMS_ARG,
@@ -4453,6 +4572,8 @@ mod tests {
             "absent",
             STAGE2_MACHINE_ID_ARG,
             machine_id,
+            STAGE2_LOADER_LIBRARY_PATH_ARG,
+            "absent",
             STAGE2_ENVIRONMENT_ARG,
             "4",
             "DBUS_SESSION_BUS_ADDRESS",
@@ -4502,6 +4623,10 @@ mod tests {
             (OsString::from("FLATPAK_ID"), OsString::from("org.td.App")),
             (OsString::from("HOME"), OsString::from("/home/td")),
             (
+                OsString::from("LD_LIBRARY_PATH"),
+                OsString::from("/app/lib:/app/lib/firefox"),
+            ),
+            (
                 OsString::from("WAYLAND_DISPLAY"),
                 OsString::from("wayland-0"),
             ),
@@ -4540,6 +4665,7 @@ mod tests {
                 filesystems: &filesystems,
                 resolv_conf: false,
                 machine_id,
+                loader_library_path: Some("/app/lib:/app/lib/firefox"),
             },
             Stage2ResourceBinding {
                 limits: resources,
@@ -4547,6 +4673,14 @@ mod tests {
             },
             &arguments,
         );
+        let mut mismatched = emitted.clone();
+        let loader_index = mismatched
+            .iter()
+            .position(|argument| argument == STAGE2_LOADER_LIBRARY_PATH_ARG)
+            .unwrap();
+        mismatched[loader_index + 1] = OsString::from("absent");
+        mismatched.remove(loader_index + 2);
+        assert!(parse_mode(mismatched.into_iter()).is_err());
         assert_eq!(
             parse_mode(emitted.into_iter()).unwrap(),
             Mode::Stage2 {
@@ -4557,6 +4691,7 @@ mod tests {
                     entry: "/app/bin/app".into(),
                     resolv_conf: false,
                     machine_id: machine_id.into(),
+                    runtime_aliases: true,
                     environment,
                     filesystems: vec![Stage2Filesystem {
                         target: PathBuf::from("/home/td/Downloads"),
@@ -5343,7 +5478,16 @@ mod tests {
 
     #[test]
     fn grant_scaffolds_are_exhaustive_outside_private_home() {
-        let base = grant_scaffold_names(true, &[]).unwrap();
+        assert_eq!(
+            RUNTIME_ALIASES,
+            [
+                ("bin", "/usr/bin"),
+                ("lib", "/usr/lib"),
+                ("lib64", "/usr/lib64"),
+                ("sbin", "/usr/sbin"),
+            ]
+        );
+        let base = grant_scaffold_names(true, false, &[]).unwrap();
         assert_eq!(
             base.get(Path::new("/")),
             Some(&BTreeSet::from([
@@ -5384,7 +5528,12 @@ mod tests {
                 source_kind: FilesystemSourceKind::Directory,
             },
         ];
-        let names = grant_scaffold_names(true, &filesystems).unwrap();
+        let dynamic = grant_scaffold_names(true, true, &[]).unwrap();
+        for alias in ["bin", "lib", "lib64", "sbin"] {
+            assert!(dynamic[Path::new("/")].contains(alias));
+            assert!(!base[Path::new("/")].contains(alias));
+        }
+        let names = grant_scaffold_names(true, false, &filesystems).unwrap();
         assert_eq!(
             names.get(Path::new("/mnt")),
             Some(&BTreeSet::from(["media".to_string()]))
