@@ -251,9 +251,10 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "git-x86-64-source",
         aliases: &[],
-        // Git 2.55.0 is the source-built daily-driver client. Its initial td
-        // configuration keeps local repositories and HTTP(S) remotes while
-        // omitting language runtimes, SSH, WebDAV, and direct OpenSSL use.
+        // Git 2.55.0 is the source-built daily-driver client. Its td configuration
+        // keeps local repositories and HTTP(S) remotes and dispatches SSH remotes
+        // through the separate OpenSSH package, while omitting language runtimes,
+        // WebDAV, and direct OpenSSL use.
         url: "https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz",
         sha256: "457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357",
         file: "git-2.55.0.tar.xz",
@@ -477,6 +478,16 @@ const PINS: &[PinDef] = &[
         url: "https://download.savannah.nongnu.org/releases/nyacc/nyacc-1.00.2.tar.gz",
         sha256: "f36e4fb7dd524dc3f4b354d3d5313f69e7ce5a6ae93711e8cf6d51eaa8d2b318",
         file: "nyacc-1.00.2.tar.gz",
+    },
+    PinDef {
+        key: "openssh-x86-64-source",
+        aliases: &[],
+        // OpenSSH Portable 10.5p1 supplies both halves of td's minimal SSH
+        // surface. The recipe builds only ssh, ssh-keygen, sshd and the two
+        // mandatory privilege-separation helpers, without libcrypto or zlib.
+        url: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.5p1.tar.gz",
+        sha256: "d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11",
+        file: "openssh-10.5p1.tar.gz",
     },
     PinDef {
         key: "oyacc-source",
@@ -740,10 +751,11 @@ mod tests {
         // and its minimal libuuid/libblkid build closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
         // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0, and
-        // curl's dated Mozilla CA extract, OpenAI Codex 0.148.0 (including its
+        // curl's dated Mozilla CA extract, OpenSSH Portable 10.5p1, OpenAI Codex
+        // 0.148.0 (including its
         // vendored Bubblewrap and five Cargo Git commit archives), libcap 2.78,
         // and Protobuf 31.1 with its exact Abseil 20250127.0 source dependency.
-        assert_eq!(all().len(), 70);
+        assert_eq!(all().len(), 71);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

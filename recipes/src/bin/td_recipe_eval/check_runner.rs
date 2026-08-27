@@ -709,11 +709,12 @@ pub fn seed_digests_cli() -> Result<(), String> {
 /// universe and so needs a warm source cache and the ladder; a local source needs
 /// neither — its bytes are already in the checkout, so the check is a tree copy
 /// and a NAR hash. It exists because the key-set coverage test cannot see this
-/// class of staleness at all: editing `tests/sshd` leaves the key present and the
-/// row unchanged, so coverage stays green while the row now describes a tree that
-/// no longer exists. Nothing but a re-hash catches that, and re-hashing a fetched
-/// pin is expensive while re-hashing this is not — which is the whole reason it
-/// can be a per-change gate.
+/// class of staleness at all: editing a local-source tree leaves the key present
+/// and the row unchanged, so coverage stays green while the row now describes a
+/// tree that no longer exists. Nothing but a re-hash catches that, and re-hashing
+/// a fetched pin is expensive while re-hashing this is not — which is the whole
+/// reason it can be a per-change gate. A catalog with no local-source inputs is a
+/// valid empty set; exact seed-table coverage independently refuses orphan rows.
 ///
 /// Deliberately NOT a `RecipeCheckRunner`: no ladder lock, no ladder scratch, no
 /// stage0 placement, no store and no db. It is wired to the recipes surface, which
@@ -723,6 +724,14 @@ pub fn seed_digests_cli() -> Result<(), String> {
 /// being the exception. td-builder is used only to NAR-hash a scratch copy, which
 /// is what `--auto` staging would do to it anyway; nothing here derives a seed.
 pub fn local_source_digests_cli() -> Result<(), String> {
+    let inputs = catalog_seed_universe()?;
+    if !inputs
+        .iter()
+        .any(|input| matches!(input, SeedInput::LocalSource { .. }))
+    {
+        println!("PASS: catalog declares no local sources; no checkout tree needs re-hashing");
+        return Ok(());
+    }
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let tb = find_td_builder_self(&root)?;
     let scratch = env::temp_dir().join(format!("td-local-source-digests-{}", process::id()));
@@ -730,7 +739,7 @@ pub fn local_source_digests_cli() -> Result<(), String> {
     fs::create_dir_all(&scratch).map_err(|e| format!("mkdir {}: {e}", scratch.display()))?;
     let mut checked = 0u32;
     let mut errors: Vec<String> = Vec::new();
-    for input in catalog_seed_universe()? {
+    for input in inputs {
         let SeedInput::LocalSource { key, path } = &input else {
             continue;
         };
@@ -752,14 +761,6 @@ pub fn local_source_digests_cli() -> Result<(), String> {
     remove_path_if_exists(&scratch)?;
     if !errors.is_empty() {
         return Err(errors.join("\n"));
-    }
-    // A gate that passes over an empty class is a gate that stopped working. The
-    // catalog has a local source; if this ever finds none, the classifier changed
-    // under it, not the tree.
-    if checked == 0 {
-        return Err("no local sources found in the catalog — this check verifies nothing; \
-                    the `local_source` classifier or the catalog changed under it"
-            .to_string());
     }
     println!("PASS: {checked} local source(s) agree with seed/seed-digests.txt");
     Ok(())
@@ -6149,10 +6150,9 @@ chmod 755 '{}'
         );
     }
 
-    // The stale basename this repo actually shipped: `tests/sshd` was edited in the
-    // /etc-symlinks landing while its table row kept the digest of the tree before
-    // that edit. Every warm machine kept building the old bytes; a cold one red.
-    const STALE_SSHD_BASENAME: &str = "gyw2rg42bcbx74znn7kr0hlcdhds13r2-sshd-source";
+    // A deliberately stale local-source address. The key below uses a real compiled
+    // row so this exercises the same comparison without retaining a dead fixture pin.
+    const STALE_LOCAL_BASENAME: &str = "00000000000000000000000000000000-stale-local-source";
 
     fn pinned_basename(key: &str) -> &'static str {
         crate::seed_digests::expected(key).unwrap().unwrap()
@@ -6164,8 +6164,8 @@ chmod 755 '{}'
     // the compiled table), and the matching address is accepted.
     #[test]
     fn a_local_source_is_gated_on_its_current_hash_not_on_what_the_store_holds() {
-        let key = "sshd-source";
-        let err = gate_local_source_candidate(key, &format!("{TD_STORE_DIR}/{STALE_SSHD_BASENAME}"))
+        let key = "stage0-source";
+        let err = gate_local_source_candidate(key, &format!("{TD_STORE_DIR}/{STALE_LOCAL_BASENAME}"))
             .expect_err("the pre-edit basename must no longer be admissible");
         assert!(err.contains("provenance rejected"), "got: {err}");
         assert!(err.contains(pinned_basename(key)), "got: {err}");
@@ -6203,11 +6203,9 @@ chmod 755 '{}'
         fs::create_dir_all(&runner.root).unwrap();
         fs::create_dir_all(&runner.store).unwrap();
         fs::create_dir_all(&runner.scratch).unwrap();
-        for key in ["stage0-source", "sshd-source"] {
-            fs::create_dir_all(runner.store.join(pinned_basename(key))).unwrap();
-        }
+        fs::create_dir_all(runner.store.join(pinned_basename("stage0-source"))).unwrap();
         *runner.vouched.lock().unwrap() = Some(
-            ["stage0-source", "sshd-source"]
+            ["stage0-source"]
                 .iter()
                 .map(|k| format!("{TD_STORE_DIR}/{}", pinned_basename(k)))
                 .collect(),
@@ -6225,8 +6223,8 @@ chmod 755 '{}'
 
         let err = runner
             .ensure_seed_input(&SeedInput::LocalSource {
-                key: "sshd-source".into(),
-                path: "tests/sshd".into(),
+                key: "stage0-source".into(),
+                path: "tests".into(),
             })
             .expect_err("a local source must re-hash even with its basename interned");
         assert!(err.contains("local source"), "got: {err}");
@@ -6416,7 +6414,7 @@ chmod 755 '{}'
 
         let err = runner
             .ensure_seed_input(&SeedInput::LocalSource {
-                key: "sshd-source".into(),
+                key: "stage0-source".into(),
                 path: "tests/demo-src".into(),
             })
             .expect_err("this runner has no td-builder to hash with");

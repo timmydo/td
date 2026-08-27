@@ -35,7 +35,7 @@ pub fn direct_rustc_args(build_root: &str, source_root: &str) -> [String; 6] {
 /// preserve an x86-64 frame chain. Compiler-generated functions around them
 /// still use the global policy; samples entering one of these ranges are an
 /// explicit coverage boundary rather than silently trusted unwinds.
-pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 7] = [
+pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 6] = [
     (
         "codex",
         "aws-lc-sys 0.39.0, ring 0.17.14, and zstd-sys 2.0.16+zstd.1.5.7 x86_64 assembly",
@@ -54,19 +54,17 @@ pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 7] = [
         "rust-toolchain",
         "upstream LLVM and Rust compiler-runtime assembly",
     ),
-    ("sshd", "aws-lc-sys 0.41.0 x86_64 assembly"),
 ];
 
 /// Recipes whose linked outputs include the Rust runtime boundary. The glibc
 /// and libgcc boundaries apply to every output passed to the target splitter;
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
 /// recipes by the catalog tests.
-pub const RUST_PROFILED_RECIPES: [&str; 22] = [
+pub const RUST_PROFILED_RECIPES: [&str; 21] = [
     "codex",
     "fd",
     "ripgrep",
     "rust-toolchain",
-    "sshd",
     "td-boot",
     "td-busd",
     "td-compositor",
@@ -88,7 +86,7 @@ pub const RUST_PROFILED_RECIPES: [&str; 22] = [
 
 /// Conservative transitive assembly boundaries for a linked output. Every
 /// split target may contain glibc startup code and libgcc; Rust outputs also
-/// contain standard-library/compiler-runtime code, and sshd adds aws-lc.
+/// contain standard-library/compiler-runtime code.
 pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static str)> {
     ASSEMBLY_EXCEPTIONS
         .iter()
@@ -102,7 +100,6 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                     && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self"))
                 || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
                 || (*source == "codex" && recipe == "codex")
-                || (*source == "sshd" && recipe == "sshd")
         })
         .collect()
 }
@@ -247,7 +244,6 @@ mod tests {
                     "rust-toolchain",
                     "upstream LLVM and Rust compiler-runtime assembly"
                 ),
-                ("sshd", "aws-lc-sys 0.41.0 x86_64 assembly"),
             ]
         );
         assert_eq!(TOOLCHAIN_DEBUG_CEILING_BYTES, 4_294_967_296);
@@ -278,7 +274,6 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(output_assembly_exceptions("sshd").len(), 4);
         assert_eq!(
             output_assembly_exceptions("glibc-x86-64"),
             vec![

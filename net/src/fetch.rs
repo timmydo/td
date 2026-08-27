@@ -10,7 +10,7 @@
 //                                       on the host — the offline loop never egresses.
 //
 //   td-fetch selftest FILE SHA256-HEX   Self-contained LOOPBACK round-trip (offline,
-//                                       like the russh gate's loopback SSH): serve
+//                                       like the image's SSH health probe): serve
 //                                       FILE's bytes over HTTP on 127.0.0.1:<ephemeral>
 //                                       from a worker thread, then fetch+verify them
 //                                       back through the SAME client path. Exits 0 iff

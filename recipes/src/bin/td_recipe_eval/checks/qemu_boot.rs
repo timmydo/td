@@ -124,6 +124,18 @@ const TD_PROFILER_ATTRIBUTION_MARKER: &str =
     td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
+const OPENSSH_ADMIN_PRIVATE_KEY_PATH: &str = "@var/lib/td-test/openssh-admin-selftest";
+const OPENSSH_ADMIN_AUTHORIZED_KEYS_PATH: &str = "@var/lib/td/ssh/authorized_keys";
+const OPENSSH_ADMIN_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACDttFO36sAow04EvJONx4QLcsNSvaO4foqkQnmGvQ1XpgAAAKBfGiUOXxol\n\
+DgAAAAtzc2gtZWQyNTUxOQAAACDttFO36sAow04EvJONx4QLcsNSvaO4foqkQnmGvQ1Xpg\n\
+AAAEA6XhI4oqkaNE8b9UunfEu7W6mEcxaOPIEElYPFdCiuku20U7fqwCjDTgS8k43HhAty\n\
+w1K9o7h+iqRCeYa9DVemAAAAFnRkLXFlbXUtYWRtaW4tc2VsZnRlc3QBAgMEBQYH\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+const OPENSSH_ADMIN_AUTHORIZATION: &str = "restrict,from=\"127.0.0.1\" ssh-ed25519 \
+AAAAC3NzaC1lZDI1NTE5AAAAIO20U7fqwCjDTgS8k43HhAtyw1K9o7h+iqRCeYa9DVem \
+td-qemu-admin-selftest\n";
 
 /// Printed after the unprivileged software compositor paints and listens.
 const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::ladder::TD_WAYLAND_RUNTIME_MARKER;
@@ -442,6 +454,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &btrfs,
         &volume,
         VolumeLayout::Transactional,
+        true,
         &trust,
         Some(&seccomp_probe),
     )?;
@@ -635,6 +648,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &btrfs,
         &volume,
         VolumeLayout::Transactional,
+        true,
         &trust,
         Some(&seccomp_probe),
     )?;
@@ -811,6 +825,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &btrfs,
         &volume,
         VolumeLayout::CorruptCurrent,
+        true,
         &trust,
         Some(&seccomp_probe),
     )?;
@@ -867,7 +882,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), Git plus its \
-         installed CA bundle ({GIT_RUNTIME_MARKER}), Codex plus its Bubblewrap helper \
+         installed CA bundle ({GIT_RUNTIME_MARKER}), OpenSSH through both the preseeded default \
+         administrator path and restricted tester path ({SSHD_MARKER}), Codex plus its Bubblewrap helper \
          ({CODEX_RUNTIME_MARKER}), td-util \
          ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
@@ -1131,7 +1147,8 @@ fn validate_system_boot(
             "the {ordinal} boot did not emit {:?} — {why}. Either /bin/td-firstboot did not run \
              at sysinit, or it refused (the console carries its diagnostic: a volatile or \
              read-only state filesystem, a malformed machine-id it will not replace, or a \
-             `/bin/sshd keygen` that failed). Last serial output:\n{}",
+             `/bin/ssh-keygen` generation/fingerprint operation that failed). Last serial \
+             output:\n{}",
             wanted.0,
             tail(&result.console, 80)
         ));
@@ -1220,11 +1237,13 @@ fn validate_system_boot(
     }
     if !result.evidence.sshd {
         return Err(format!(
-            "the greeter was reached and root/userland checks passed, but the sshd runtime marker \
-             ({SSHD_MARKER:?}) was absent — `/bin/sshd selftest` did not complete a loopback SSH \
-             round-trip and exit 0. Either the kernel lacks working TCP/IP loopback (CONFIG_NET/INET \
-             or the `lo` bring-up regressed), or sshd's dynamic runtime closure (loader, glibc, \
-             libgcc_s, aws-lc crypto) does not resolve on the erofs root. Last serial output:\n{}",
+            "the greeter was reached and root/userland checks passed, but the OpenSSH runtime \
+             marker ({SSHD_MARKER:?}) was absent — the installed unprivileged client did not \
+             authenticate to the running daemon on loopback with the ephemeral Ed25519 key and \
+             execute the expected command under the exact modern-only algorithm policy. Either \
+             loopback/listener setup regressed, public-key auth or a split daemon helper failed, \
+             or the libcrypto-free dynamic closure does not resolve on the erofs root. Last \
+             serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -2062,6 +2081,7 @@ fn build_persistent_system(
         &btrfs,
         &volume,
         VolumeLayout::Basic,
+        true,
         &trust,
         Some(&seccomp_probe),
     )?;
@@ -2117,6 +2137,7 @@ pub(crate) fn create_persistent_volume(
         btrfs,
         output,
         VolumeLayout::Basic,
+        false,
         trust,
         None,
     )
@@ -2169,6 +2190,7 @@ fn create_persistent_volume_layout(
     btrfs: &Path,
     output: &Path,
     layout: VolumeLayout,
+    system_runtime_fixtures: bool,
     trust: &RunTrust,
     seccomp_probe: Option<&Path>,
 ) -> Result<VolumeFixture, String> {
@@ -2209,6 +2231,9 @@ fn create_persistent_volume_layout(
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
     populate_persistent_seed(deployment, &seed, &deployment_id, trust)?;
+    if system_runtime_fixtures {
+        stage_openssh_admin_fixture(&seed)?;
+    }
     if let Some(probe) = seccomp_probe {
         stage_td_jail_seccomp_probe(&seed, probe)?;
     }
@@ -2276,6 +2301,56 @@ fn create_persistent_volume_layout(
         initial_id: deployment_id,
         alternate_id,
     })
+}
+
+/// Seed the disposable system-boot volume with a root login that exercises the
+/// daemon's default persistent AuthorizedKeysFile. The private half exists only
+/// in this host-side test fixture; the authorization is loopback-restricted, and
+/// the guest health probe never rewrites either file.
+fn stage_openssh_admin_fixture(seed: &Path) -> Result<(), String> {
+    let private = seed.join(OPENSSH_ADMIN_PRIVATE_KEY_PATH);
+    let authorized = seed.join(OPENSSH_ADMIN_AUTHORIZED_KEYS_PATH);
+    let private_parent = private.parent().ok_or_else(|| {
+        format!(
+            "OpenSSH admin fixture key has no parent: {}",
+            private.display()
+        )
+    })?;
+    let authorized_parent = authorized.parent().ok_or_else(|| {
+        format!(
+            "OpenSSH admin fixture authorization has no parent: {}",
+            authorized.display()
+        )
+    })?;
+    for (directory, mode) in [
+        (seed.join("@var/lib"), 0o755),
+        (private_parent.to_path_buf(), 0o755),
+        (seed.join("@var/lib/td"), 0o755),
+        (authorized_parent.to_path_buf(), 0o700),
+    ] {
+        fs::create_dir_all(&directory).map_err(|e| {
+            format!(
+                "create OpenSSH admin fixture directory {}: {e}",
+                directory.display()
+            )
+        })?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).map_err(|e| {
+            format!(
+                "chmod OpenSSH admin fixture directory {}: {e}",
+                directory.display()
+            )
+        })?;
+    }
+    for (path, contents) in [
+        (&private, OPENSSH_ADMIN_PRIVATE_KEY),
+        (&authorized, OPENSSH_ADMIN_AUTHORIZATION),
+    ] {
+        fs::write(path, contents)
+            .map_err(|e| format!("write OpenSSH admin fixture {}: {e}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod OpenSSH admin fixture {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn stage_td_jail_seccomp_probe(seed: &Path, probe: &Path) -> Result<(), String> {
@@ -4216,6 +4291,40 @@ mod tests {
             );
         }
         assert!(seed.join("@var").is_dir());
+    }
+
+    #[test]
+    fn openssh_admin_login_is_a_root_only_disposable_volume_fixture() {
+        let seq = AtomicU64::new(2250);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let seed = dir.join("seed");
+        fs::create_dir(&seed).unwrap();
+
+        stage_openssh_admin_fixture(&seed).unwrap();
+
+        let private = seed.join(OPENSSH_ADMIN_PRIVATE_KEY_PATH);
+        let authorized = seed.join(OPENSSH_ADMIN_AUTHORIZED_KEYS_PATH);
+        assert_eq!(fs::read_to_string(&private).unwrap(), OPENSSH_ADMIN_PRIVATE_KEY);
+        assert_eq!(
+            fs::read_to_string(&authorized).unwrap(),
+            OPENSSH_ADMIN_AUTHORIZATION
+        );
+        assert!(OPENSSH_ADMIN_AUTHORIZATION.starts_with("restrict,from=\"127.0.0.1\" "));
+        for path in [&private, &authorized] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            fs::metadata(authorized.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     #[test]

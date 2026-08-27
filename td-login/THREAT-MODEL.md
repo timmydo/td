@@ -3,8 +3,8 @@
 td-login is the credential-switching half of td's login chain: the
 `login` and `su` applets, replacing busybox's, plus the `exec-as`
 subcommand that runs a supervised daemon as another user. It is the only
-program on
-a td image whose job is to *change* a process's Unix credentials, so a
+td-owned general-purpose program on a td image whose job is to *change* a
+process's Unix credentials, so a
 bug here is not a malfunction — it is privilege escalation. This
 document states what it defends, what it does not, and which invariant
 each defence rests on. It is normative: the crate's tests assert the
@@ -41,6 +41,23 @@ Adversaries considered:
 
 Explicitly **not** in the model: an attacker who already has uid 0
 (nothing here can constrain them), physical DMA, and the kernel itself.
+
+OpenSSH is a separate, deliberately narrow credential-changing boundary.
+The externally maintained `sshd` starts as root, switches its pre-auth process
+to the locked `sshd` privilege-separation identity, and switches authenticated
+sessions to their target account without going through td-login. Its immutable
+configuration permits only Ed25519 public-key authentication and disables
+password, interactive, host-based, and forwarding paths. This document does
+not extend td-login's syscall or post-condition claims to OpenSSH; the image
+recipe instead pins its source, configuration, locked account, empty volatile
+chroot, split helpers, seccomp sandbox, and a real unprivileged loopback login.
+The boot-health login uses a fresh volatile key for the unprivileged UI account,
+but its root-owned authorization line is constrained by OpenSSH `restrict` and
+`from="127.0.0.1"`; possession of that key cannot create a network-reachable
+login. The persistent administrator path is exercised separately only in the
+disposable QEMU volume: it is preseeded with a loopback-restricted public key
+and a root-only matching private fixture before boot. Boot health reads those
+fixtures but never rewrites live administrator authorization state.
 
 The resource boundary is also an asset. The application identity must enter
 the delegated `td-user-1000/session` cgroup before it loses root, otherwise a
@@ -213,7 +230,8 @@ Consequences worth stating plainly:
   that no session may run as it; the cheap way to honour that is to make
   `/etc/autologin` naming a locked account fail loudly instead of
   quietly working. Nothing on a td image needs the other behaviour.
-- **A SERVICE account cannot be `Locked` either, and that is a live
+- **A service account launched through `exec-as` cannot be `Locked`, and
+  that is a live
   constraint rather than a footnote.** `exec-as` shares this table, so a
   daemon's identity is governed by a policy written for humans logging
   in. `system-x86-64` writes `!` for any user with `passwordless:
@@ -226,12 +244,18 @@ Consequences worth stating plainly:
   account world-loginable, which is the opposite of what AGENTS.md
   principle 7 wants.
 
-  Nothing is wrong on the shipped image, which has no service account.
-  What closes it is a THIRD `Secret` class — locked for login, permitted
-  for `exec-as` — and that is a policy amendment to this section, landing
-  with the account that needs it rather than speculatively before one
-  exists. It is written down here so the first service account is not
-  made world-loginable by accident.
+  The shipped image has one locked service identity: OpenSSH's `sshd`
+  privilege-separation account. It is not a td-svc `exec-as` target; OpenSSH
+  performs its own fixed-purpose drop. The account has a `!` shadow field,
+  `/bin/false` shell, and an empty root-owned `/run/sshd-empty` chroot recreated
+  before the daemon starts, so neither td-login forced modes nor an interactive
+  login can enter it.
+
+  What closes the remaining `exec-as` constraint is a THIRD `Secret` class —
+  locked for login, permitted for `exec-as` — and that is a policy amendment to
+  this section, landing with the first td-svc service account that needs it rather
+  than speculatively before one exists. It is written down here so that account is
+  not made world-loginable by accident.
 - `system-x86-64`'s `system_def_is_self_consistent` test refuses to ship
   a `SYSTEM` definition whose auto-login user is not passwordless, so the
   image cannot be tailored into a machine that will not let anyone in.

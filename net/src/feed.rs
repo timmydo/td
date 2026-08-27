@@ -1799,8 +1799,8 @@ fn is_workspace_header(line: &str) -> bool {
 /// Stop cargo's upward manifest walk at this extracted crate: it lands under the
 /// repo's own `.td-build-cache`, so the walk reaches td's workspace root and cargo
 /// refuses ("current package believes it's in a workspace when it's not"). An empty
-/// `[workspace]` is cargo's own remedy — `tests/sshd/Cargo.toml` already uses it —
-/// and unlike an `exclude` entry it holds wherever the checkout sits.
+/// `[workspace]` is cargo's own remedy, and unlike an `exclude` entry it holds
+/// wherever the checkout sits.
 ///
 /// Only this scratch copy is rewritten; nothing content-addressed reads it.
 fn detach_from_workspace(manifest: &Path) -> Result<(), String> {

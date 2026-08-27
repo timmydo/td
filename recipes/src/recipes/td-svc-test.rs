@@ -77,7 +77,7 @@ pub fn recipe() -> Recipe {
                   [td-firstboot]\ntype=oneshot\nexec=/bin/td-firstboot provision\n\n\
                   [rootcheck]\ntype=oneshot\nexec=/etc/rootcheck\nafter=td-firstboot\n\n\
                   [netup]\ntype=oneshot\nexec=/etc/netup\nafter=rootcheck\n\n\
-                  [sshd]\ntype=daemon\nexec=/bin/sshd serve\nafter=netup,td-firstboot\nrestart=always\nready=/bin/td-netd reach 127.0.0.1 22\n\n\
+                  [sshd]\ntype=daemon\nexec=/bin/sshd -D -e -f /etc/ssh/sshd_config\nafter=netup,td-firstboot\nrestart=always\nready=/bin/td-netd reach 127.0.0.1 22\n\n\
                   [greeter]\ntype=daemon\nexec=/etc/tty-session\nafter=netup\ntty=ttyS0\nrestart=always\n"
             .into(),
         exec: false,
@@ -121,7 +121,7 @@ pub fn recipe() -> Recipe {
     // stanza rather than start the service without it.
     steps.push(Step::WriteFile {
         path: "{root}/malformed-line.conf".into(),
-        content: "[svc]\ntype=daemon\nexec=/bin/sshd serve\nrequires firewall\n".into(),
+        content: "[svc]\ntype=daemon\nexec=/bin/sshd -D\nrequires firewall\n".into(),
         exec: false,
     });
     // A key the supervisor would silently ignore reads in the table as a

@@ -1249,30 +1249,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // tests/sshd: the td-owned SSH daemon SOURCE, built as the `sshd` local-source
-    // recipe and shipped in system-x86-64. Unlike the crates above it does NOT ride
-    // the cargo-test preflight: it is the one target crate with dependencies (the
-    // vendored russh closure, incl. a C crate), so it cannot compile in the
-    // dependency-free offline preflight. Its coverage is recipe-checks — the sshd
-    // recipe builds it, and `qemu-boot-system` runs the daemon on the image (the
-    // selftest marker, and `keygen` minting this machine's host identity for
-    // td-firstboot). The full check still runs for the fast repo-wide guards.
-    //
-    // It DOES ride local-source-digests: these bytes ARE the `sshd-source` seed, so
-    // editing them re-addresses it and seed/seed-digests.txt must be regenerated in
-    // the same landing. Omitting that is not hypothetical — it is how the row went
-    // stale, and nothing here caught it, because the key stayed present and every
-    // warm ladder kept answering from the pre-edit tree.
-    if pattern_matches(
-        "tests/sshd/*|tests/sshd/src/*|tests/sshd/Cargo.toml|tests/sshd/Cargo.lock",
-        p,
-    ) {
-        sel.add_preflight("local-source-digests");
-        sel.add_target("check");
-        sel.add_target("recipe-checks");
-        return;
-    }
-
     // The review-record fixture two crates share: `td-builder ready` gates on it
     // and td-review displays it, from separate implementations that cannot
     // depend on each other. Editing a case must run BOTH suites, which the one
@@ -2141,19 +2117,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-firstboot/Cargo.lock", "check");
     assert_target!("td-firstboot/Cargo.lock", "recipe-checks");
     assert_target!("td-firstboot/clippy.toml", "check");
-    // tests/sshd is the one target crate WITH dependencies, so it rides the
-    // tier rather than the dependency-free cargo-test preflight.
-    assert_target!("tests/sshd/src/main.rs", "check");
-    assert_target!("tests/sshd/src/main.rs", "recipe-checks");
-    assert_target!("tests/sshd/Cargo.lock", "recipe-checks");
-    // Its bytes ARE the `sshd-source` seed, so any edit re-addresses it and the
-    // seed-digest row must be regenerated in the same landing. The row going stale
-    // unnoticed is what this mapping exists to prevent.
-    assert_preflight!("tests/sshd/src/main.rs", "local-source-digests");
-    assert_preflight!("tests/sshd/Cargo.toml", "local-source-digests");
-    assert_preflight!("tests/sshd/Cargo.lock", "local-source-digests");
     assert_preflight!("seed/seed-digests.txt", "local-source-digests");
-    assert_preflight!("recipes/src/recipes/sshd.rs", "local-source-digests");
     // td-init mirrors td-util, including its confined syscall module: every source
     // is include_str!'d into the td-init recipe, so host cargo preflight
     // + the recipe-checks static-link proof.

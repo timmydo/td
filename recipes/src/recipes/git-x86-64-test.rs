@@ -4,9 +4,11 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let git = "{in:git-x86-64}";
     let curl_test = "{in:curl-x86-64-test}";
+    let openssh = "{in:openssh-x86-64}";
+    let openssh_test = "{in:openssh-x86-64-test}";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
     let path = format!(
-        "{git}/bin:{git}/libexec/git-core:{{tools}}:{}",
+        "{git}/bin:{git}/libexec/git-core:{openssh}/bin:{{tools}}:{}",
         post_bootstrap_path()
     );
     let mut steps = vec![
@@ -19,11 +21,15 @@ pub fn recipe() -> Recipe {
                 format!("{git}/libexec/git-core/git-remote-http"),
                 format!("{git}/libexec/git-core/git-remote-https"),
                 format!("{git}/libexec/git-core/git-sh-i18n--envsubst"),
+                format!("{openssh}/bin/ssh"),
             ],
             exec: true,
         },
         Step::Require {
-            paths: vec![format!("{curl_test}/result")],
+            paths: vec![
+                format!("{curl_test}/result"),
+                format!("{openssh_test}/result"),
+            ],
             exec: false,
         },
         Step::Require {
@@ -42,6 +48,8 @@ pub fn recipe() -> Recipe {
                 &format!(
                     "grep -Fq 'PASS: curl 8.21.0 performs verified local-socket HTTPS' '{curl_test}/result' || \
                          {{ echo 'Git transport prerequisite did not pass its verified TLS oracle' >&2; exit 1; }}; \
+                     grep -Fq 'PASS: OpenSSH Portable 10.5p1 provides the bounded ssh/sshd/ssh-keygen profile' '{openssh_test}/result' || \
+                         {{ echo 'Git SSH prerequisite did not pass the OpenSSH package oracle' >&2; exit 1; }}; \
                      for pair in 'git.c|{git}/lib/debug/bin/git.debug' 'remote-curl.c|{git}/lib/debug/libexec/git-core/git-remote-http.debug' 'sh-i18n--envsubst.c|{git}/lib/debug/libexec/git-core/git-sh-i18n--envsubst.debug'; do \
                          source=${{pair%%|*}}; debug=${{pair#*|}}; \
                          grep -a -Fq \"$source\" \"$debug\" || {{ echo \"Git debug companion omits $source\" >&2; exit 1; }}; \
@@ -120,6 +128,8 @@ pub fn recipe() -> Recipe {
                  test -s remote.archive || exit 1; \
                  if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 git ls-remote https://127.0.0.1:9/td-no-service >https-helper.log 2>&1; then exit 1; fi; \
                  grep -Fq 'git-remote-https' https-helper.log || exit 1; \
+                 if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='{in:openssh-x86-64}/bin/ssh -F /dev/null -o BatchMode=yes' git ls-remote ssh://127.0.0.1:9/td-no-service >ssh-helper.log 2>&1; then exit 1; fi; \
+                 grep -Fq '{in:openssh-x86-64}/bin/ssh' ssh-helper.log || exit 1; \
                  cd repo || exit 1; \
                  build=$(git version --build-options) || exit 1; \
                  printf '%s\\n' \"$build\" | grep -Fq 'git version 2.55.0' || exit 1; \
@@ -137,7 +147,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Git 2.55.0 local and service workflows, HTTPS helper dispatch, and verified curl TLS closure\n".into(),
+        content: "PASS: Git 2.55.0 local and service workflows, HTTPS helper dispatch with verified curl TLS, and SSH dispatch through verified OpenSSH; the system boot oracle completes clone/push/reclone over a real loopback sshd\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -149,6 +159,8 @@ pub fn recipe() -> Recipe {
         .native_inputs(&[
             "git-x86-64",
             "curl-x86-64-test",
+            "openssh-x86-64",
+            "openssh-x86-64-test",
             "glibc-x86-64",
             "binutils-x86-64-self",
             "busybox-x86-64",
@@ -156,7 +168,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check git-x86-64-test: build Git, exercise local service workflows and HTTPS dispatch, and require curl's verified TLS oracle"
+echo ">> recipe-check git-x86-64-test: build Git, exercise local service workflows plus HTTPS/OpenSSH dispatch, and require both transport oracles"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run git-x86-64-test 1
 "#,
@@ -169,7 +181,7 @@ mod tests {
     use super::recipe;
 
     #[test]
-    fn validation_composes_git_with_the_verified_curl_transport_oracle() {
+    fn validation_composes_git_with_both_verified_transport_oracles() {
         let recipe = recipe();
         assert_eq!(
             recipe.native_inputs.as_deref(),
@@ -177,6 +189,8 @@ mod tests {
                 [
                     "git-x86-64",
                     "curl-x86-64-test",
+                    "openssh-x86-64",
+                    "openssh-x86-64-test",
                     "glibc-x86-64",
                     "binutils-x86-64-self",
                     "busybox-x86-64",

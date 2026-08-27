@@ -398,14 +398,12 @@ pub const GIT_RUNTIME_MARKER: &str = "TD-GIT-RUN-OK";
 /// fixture write without changing or hiding the fixture.
 pub const CODEX_RUNTIME_MARKER: &str = "TD-CODEX-BWRAP-RUN-OK";
 
-/// Printed by the root-owned health target only after unprivileged `/bin/sshd selftest`
-/// exits 0 — the source-built russh daemon stood up an in-process server on an ephemeral
-/// loopback port and completed a full SSH handshake+auth+channel+exec round-trip against it.
-/// This proves THREE things the static scan can't: the kernel's TCP/IP loopback works
-/// (CONFIG_NET+INET), the russh crypto/protocol stack runs, and sshd's dynamic runtime
-/// closure (ELF interp, glibc, libgcc_s, the aws-lc crypto C lib) resolves on the erofs root.
-/// The marker string is DUPLICATED as `OK_MARKER` in tests/sshd/src/main.rs (a separate
-/// crate the recipe builds); the two must stay identical.
+/// Printed by the root-owned health target only after the unprivileged OpenSSH client
+/// authenticates to the running OpenSSH daemon on loopback with an ephemeral Ed25519 key
+/// and executes a command using the image's exact modern-only algorithm policy. The Git
+/// leg independently clones, pushes, and reclones over that same SSH transport. Together
+/// they prove the kernel loopback path, client/server protocol, split daemon helpers,
+/// public-key authentication, remote exec, and the libcrypto-free runtime closure.
 pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 
 /// Printed by the root-owned health target only after EVERY `/bin` name the static td-util

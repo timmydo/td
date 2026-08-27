@@ -733,10 +733,10 @@ mod tests {
         assert!(error.contains("is not `<name>-wrong-version.crate'"), "{error}");
     }
 
-    // The vendor warms the distro's closure needs, derived from the recipes
-    // rather than a hand-kept list: a crates.io rung and the in-tree one.
+    // The vendor warms the distro's closure needs from recipe metadata rather
+    // than from a hand-kept package list.
     #[test]
-    fn vendor_jobs_cover_both_crate_and_local_source_rungs() {
+    fn vendor_jobs_cover_the_committed_lock_rungs() {
         let root = scratch("vendor-root");
         let graph = recipe_closure(&["system-x86-64"]).unwrap();
         let jobs = cold_vendor_jobs(&root, &graph);
@@ -751,13 +751,6 @@ mod tests {
             uutils.args,
             vec!["warm", "crate", "coreutils", &version, "uutils"]
         );
-        if let Some(sshd) = jobs.iter().find(|j| j.dest == "sshd") {
-            assert_eq!(
-                sshd.args,
-                vec!["warm", "crate-local", "tests/sshd", "sshd"],
-                "an in-tree crate vendors from its directory"
-            );
-        }
         let _ = fs::remove_dir_all(&root);
     }
 

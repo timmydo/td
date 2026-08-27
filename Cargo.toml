@@ -35,8 +35,8 @@
 #                     (machine-id, SSH host key, deny-all authorized_keys under
 #                     /var/lib/td, which the image's read-only /etc reaches
 #                     through one reviewed symlink each). Pure safe std: it
-#                     delegates ed25519 generation to `sshd keygen` and reads
-#                     its entropy from /dev/urandom as an ordinary file.
+#                     delegates Ed25519 generation to OpenSSH `ssh-keygen` and
+#                     reads its entropy from /dev/random as an ordinary file.
 #   td-busd/        — the target-built session D-Bus broker: the wire codec, and
 #                     eventually the socket, auth and per-connection policy that
 #                     APPLICATIONS.md §D specifies. Pure std with no syscall
@@ -55,12 +55,10 @@
 #   td-review/      — a HOST-side integrator utility (branch review + squash
 #                     landing TUI). In neither bootstrap graph: it is not a
 #                     control-plane build program and never enters a closure.
-#   tests/sshd/     — td-owned SSH daemon source, built offline as the `sshd`
-#                     local-source recipe and shipped in system-x86-64.
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-jail", "td-busd", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-profiler", "td-review", "td-svc", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-jail", "td-busd", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-profiler", "td-review", "td-svc"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

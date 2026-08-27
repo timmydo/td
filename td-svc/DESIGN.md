@@ -146,7 +146,7 @@ timeout=60
 
 [sshd]
 type=daemon
-exec=/bin/sshd serve --listen 0.0.0.0:22 --host-key <KEY> --authorized-keys <AUTH>
+exec=/bin/sshd -D -e -f /etc/ssh/sshd_config
 after=netup,td-firstboot
 ready=/bin/td-netd reach 127.0.0.1 22
 ready-timeout=30
@@ -258,7 +258,7 @@ ready. Promoting it on timeout would make `ready=` decorative and a dead
 listener indistinguishable from a healthy one, which is the exact confusion
 the key exists to prevent.
 
-A readiness probe must target the **running instance**. `sshd selftest` is
+A readiness probe must target the **running instance**. A standalone protocol test is
 not valid: it stands up its own in-process server on an ephemeral loopback
 port, so it passes while the real listener is dead.
 

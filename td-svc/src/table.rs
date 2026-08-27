@@ -504,7 +504,7 @@ mod tests {
         let (units, problems) = parse(
             "[sshd]\n\
              type=daemon\n\
-             exec=/bin/sshd serve --listen 0.0.0.0:22\n\
+             exec=/bin/sshd -D -e -f /etc/ssh/sshd_config\n\
              after=netup, td-firstboot\n\
              restart=always\n\
              ready=/bin/td-netd reach 127.0.0.1 22\n\
@@ -514,7 +514,10 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
         let u = &units[0];
         assert_eq!(u.kind, Kind::Daemon);
-        assert_eq!(u.argv.len(), 4);
+        assert_eq!(
+            u.argv,
+            ["/bin/sshd", "-D", "-e", "-f", "/etc/ssh/sshd_config"]
+        );
         assert_eq!(u.after, ["netup", "td-firstboot"]);
         assert_eq!(u.restart, Restart::Always);
         assert_eq!(u.ready, ["/bin/td-netd", "reach", "127.0.0.1", "22"]);

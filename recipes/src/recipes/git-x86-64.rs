@@ -2,9 +2,9 @@ use crate::ladder::{post_bootstrap_path, split_target_debug, unpack_into, POST_B
 use crate::types::{Recipe, Step, TextEdit};
 
 // Source-built Git with local repository support and smart HTTP(S) transport.
-// SSH is intentionally deferred until td has a reviewed client implementation;
-// language runtimes, legacy WebDAV, localization, and direct OpenSSL use are
-// excluded from this first daily-driver closure.
+// Git delegates SSH transport to the separately source-built OpenSSH client;
+// language runtimes, legacy WebDAV, localization, and direct OpenSSL use remain
+// outside this daily-driver closure.
 pub fn recipe() -> Recipe {
     let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
     let sbin = "{in:binutils-x86-64-self}/bin";

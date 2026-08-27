@@ -70,8 +70,8 @@ const OVERRIDE_ENV: &str = "TD_RUN_CAPPED_MIB";
 /// The suffix is a convention cargo follows, not a namespace it reserves: a
 /// target named `tool-0123456789abcdef` would match. No target in the tree
 /// does, and `no_runnable_target_name_looks_like_a_test_artifact` keeps that
-/// true for every crate at the top level (it does not descend to nested
-/// fixture crates such as `tests/sshd`).
+/// true for every crate at the top level (it does not descend into nested
+/// fixture crates).
 pub fn is_test_artifact(path: &str) -> bool {
     let name = Path::new(path)
         .file_name()

@@ -20,11 +20,11 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // fingerprint — the same before/after shape the qemu oracle checks across a reboot,
 // but decided here in seconds and without a VM.
 //
-// `--keygen` is pointed at a STUB rather than the real sshd: sshd is a heavy
-// `--auto` rust recipe, and what needs proving here is td-firstboot's end of the
-// contract (the argv it passes, the reply it parses, the files it then insists on).
-// The real pairing of the two programs is exercised by `qemu-boot-system`, which
-// boots the image where /bin/sshd is the actual daemon. The stub is deliberately
+// `--keygen` is pointed at a STUB rather than the real OpenSSH package: what needs
+// proving here is td-firstboot's end of the standard `ssh-keygen` contract (the
+// generation and fingerprint argv, and the files it then insists on). The real
+// pairing is exercised by `qemu-boot-system`, which boots the image with the actual
+// `/bin/ssh-keygen` and `/bin/sshd`. The stub is deliberately
 // also driven into its failure modes — a keygen that exits non-zero, and one that
 // claims success without writing a key — because those are the paths where a
 // machine ends up believing it has an identity it does not have.
@@ -71,28 +71,44 @@ pub fn recipe() -> Recipe {
         .env("PATH", &post_bootstrap_path()),
     );
 
-    // The keygen stub: sshd's `keygen` contract, in the smallest form that can hold
-    // it. Writes a fixed key pair and reports `created`; on a second call it finds
-    // the private key already there and reports `existing` with the same
-    // fingerprint, exactly as the real daemon does.
+    // The keygen stub: the three standard OpenSSH operations td-firstboot uses, in
+    // the smallest form that can hold them. Generation writes a fixed pair,
+    // derivation parses the private fixture and emits its public half, and
+    // fingerprinting reports a fixed 256-bit Ed25519 SHA-256 line.
     steps.push(Step::WriteFile {
         path: "{root}/keygen-stub".into(),
         content: format!(
             "{post_bootstrap_shebang}\n{}",
-            "# usage: <self> keygen --host-key PATH --public-key PATH\n\
-             priv=; pub=\n\
+            "# generation: -q -t ed25519 -N '' -C COMMENT -f PATH\n\
+             # derivation: -y -P '' -f PATH\n\
+             # fingerprint: -l -E sha256 -f PATH.pub\n\
+             mode=generate; file=\n\
              while [ $# -gt 0 ]; do\n\
                case $1 in\n\
-                 --host-key) priv=$2; shift 2 ;;\n\
-                 --public-key) pub=$2; shift 2 ;;\n\
+                 -l) mode=fingerprint; shift ;;\n\
+                 -y) mode=derive; shift ;;\n\
+                 -f) file=$2; shift 2 ;;\n\
+                 -t|-N|-C|-E|-P) shift 2 ;;\n\
                  *) shift ;;\n\
                esac\n\
              done\n\
-             [ -n \"$priv\" ] && [ -n \"$pub\" ] || { echo 'stub: missing paths' >&2; exit 1; }\n\
-             if [ -f \"$priv\" ]; then echo 'existing SHA256:stubfingerprint'; exit 0; fi\n\
-             printf 'STUB PRIVATE KEY\\n' > \"$priv\"\n\
-             printf 'ssh-ed25519 STUB stub\\n' > \"$pub\"\n\
-             echo 'created SHA256:stubfingerprint'\n"
+             [ -n \"$file\" ] || { echo 'stub: missing -f path' >&2; exit 1; }\n\
+             if [ \"$mode\" = derive ]; then\n\
+               key=$(cat \"$file\") || exit 1\n\
+               case \"$key\" in\n\
+                 'STUB PRIVATE KEY') echo 'ssh-ed25519 STUB td-openssh-host-key' ;;\n\
+                 'STUB RSA PRIVATE KEY') echo 'ssh-rsa RSASTUB wrong-type' ;;\n\
+                 *) echo 'stub: malformed private key' >&2; exit 1 ;;\n\
+               esac\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$mode\" = fingerprint ]; then\n\
+               [ -f \"$file\" ] || exit 1\n\
+               echo '256 SHA256:stubfingerprint td-openssh-host-key (ED25519)'\n\
+               exit 0\n\
+             fi\n\
+             printf 'STUB PRIVATE KEY\\n' > \"$file\"\n\
+             printf 'ssh-ed25519 STUB td-openssh-host-key\\n' > \"$file.pub\"\n"
         ),
         exec: true,
     });
@@ -105,7 +121,30 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{root}/keygen-lies".into(),
-        content: format!("{post_bootstrap_shebang}\necho 'created SHA256:stubfingerprint'\n"),
+        content: format!("{post_bootstrap_shebang}\nexit 0\n"),
+        exec: true,
+    });
+    steps.push(Step::WriteFile {
+        path: "{root}/keygen-bad-fingerprint".into(),
+        content: format!(
+            "{post_bootstrap_shebang}\n{}",
+            "mode=generate; file=\n\
+             while [ $# -gt 0 ]; do\n\
+               case $1 in\n\
+                 -l) mode=fingerprint; shift ;;\n\
+                 -y) mode=derive; shift ;;\n\
+                 -f) file=$2; shift 2 ;;\n\
+                 -t|-N|-C|-E|-P) shift 2 ;;\n\
+                 *) shift ;;\n\
+               esac\n\
+             done\n\
+             case \"$mode\" in\n\
+               derive) echo 'ssh-ed25519 STUB td-openssh-host-key' ;;\n\
+               fingerprint) echo 'not a SHA-256 Ed25519 fingerprint' ;;\n\
+               generate) printf 'STUB PRIVATE KEY\\n' > \"$file\"; \
+                 printf 'ssh-ed25519 STUB td-openssh-host-key\\n' > \"$file.pub\" ;;\n\
+             esac\n"
+        ),
         exec: true,
     });
 
@@ -167,7 +206,7 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "for case in fails lies; do \
+                    "for case in fails lies bad-fingerprint; do \
                        out=$('{bin}' provision --state-dir \"{{root}}/state-$case\" --keygen \"{{root}}/keygen-$case\" 2>/dev/null); \
                        st=$?; \
                        [ \"$st\" -ne 0 ] || {{ echo \"td-firstboot accepted a keygen that $case\" >&2; exit 1; }}; \
@@ -182,7 +221,41 @@ pub fn recipe() -> Recipe {
                      '{bin}' provision --state-dir \"$bad\" --keygen '{{root}}/keygen-stub' >/dev/null 2>&1; \
                      [ $? -ne 0 ] || {{ echo 'td-firstboot replaced a malformed machine-id instead of refusing - a corrupt read must never become a new machine identity' >&2; exit 1; }}; \
                      [ \"$(cat \"$bad/machine-id\")\" = not-a-machine-id ] || \
-                       {{ echo 'td-firstboot overwrote the malformed machine-id it refused' >&2; exit 1; }}"
+                       {{ echo 'td-firstboot overwrote the malformed machine-id it refused' >&2; exit 1; }}; \
+                     for case in malformed wrong-type mismatch; do \
+                       state=\"{{root}}/state-$case-pair\"; mkdir -p \"$state/ssh\" || exit 1; \
+                       private=\"$state/ssh/ssh_host_ed25519_key\"; public=\"$private.pub\"; \
+                       case \"$case\" in \
+                         malformed) printf 'NOT A PRIVATE KEY\\n' > \"$private\"; \
+                           printf 'ssh-ed25519 STUB recorded\\n' > \"$public\" ;; \
+                         wrong-type) printf 'STUB RSA PRIVATE KEY\\n' > \"$private\"; \
+                           printf 'ssh-rsa RSASTUB recorded\\n' > \"$public\" ;; \
+                         mismatch) printf 'STUB PRIVATE KEY\\n' > \"$private\"; \
+                           printf 'ssh-ed25519 OTHER recorded\\n' > \"$public\" ;; \
+                       esac; \
+                       chmod 0600 \"$private\"; chmod 0644 \"$public\"; \
+                       out=$('{bin}' provision --state-dir \"$state\" \
+                         --keygen '{{root}}/keygen-stub' 2>/dev/null); st=$?; \
+                       [ \"$st\" -ne 0 ] || \
+                         {{ echo \"td-firstboot accepted a $case complete host-key pair\" >&2; exit 1; }}; \
+                       printf '%s\\n' \"$out\" | grep -q TD-FIRSTBOOT && \
+                         {{ echo \"td-firstboot emitted a marker for a $case host-key pair: $out\" >&2; exit 1; }}; \
+                     done; \
+                     for missing in private public; do \
+                       state=\"{{root}}/state-missing-$missing\"; mkdir -p \"$state/ssh\" || exit 1; \
+                       private=\"$state/ssh/ssh_host_ed25519_key\"; public=\"$private.pub\"; \
+                       printf 'STUB PRIVATE KEY\\n' > \"$private\"; \
+                       printf 'ssh-ed25519 STUB recorded\\n' > \"$public\"; \
+                       chmod 0600 \"$private\"; chmod 0644 \"$public\"; \
+                       case \"$missing\" in private) rm \"$private\" ;; public) rm \"$public\" ;; esac; \
+                       out=$('{bin}' provision --state-dir \"$state\" \
+                         --keygen '{{root}}/keygen-stub' 2>/dev/null); st=$?; \
+                       [ \"$st\" -ne 0 ] || \
+                         {{ echo \"td-firstboot accepted a host-key pair missing its $missing half\" >&2; exit 1; }}; \
+                       printf '%s\\n' \"$out\" | grep -q TD-FIRSTBOOT && \
+                         {{ echo \"td-firstboot emitted a marker for a pair missing $missing: $out\" >&2; exit 1; }}; \
+                     done; \
+                     :"
                 ),
             ],
         )
@@ -194,7 +267,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-firstboot is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; a first provision mints a 32-hex machine-id, an SSH host key pair, and a deny-all authorized_keys, reporting TD-FIRSTBOOT-NEW-OK; a second provision over the same state reports TD-FIRSTBOOT-STABLE-OK with an unchanged machine-id and host-key fingerprint; and it refuses (non-zero, no marker) a keygen that fails, a keygen that claims success without writing a key, an unknown argument, and a malformed machine-id it will not replace\n".into(),
+        content: "PASS: td-firstboot is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; a first provision mints a 32-hex machine-id, an SSH host key pair, and a deny-all authorized_keys, reporting TD-FIRSTBOOT-NEW-OK; a second provision over the same state reports TD-FIRSTBOOT-STABLE-OK with an unchanged machine-id and host-key fingerprint; and it refuses (non-zero, no marker) a keygen that fails, writes nothing, or reports a malformed fingerprint, an unknown argument, a malformed machine-id, incomplete keypairs, and malformed, wrong-type, or mismatched complete host-key pairs\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

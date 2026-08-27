@@ -11,8 +11,8 @@
 //!
 //! Nothing here ever silently REPLACES an identity: a file that is present but
 //! malformed is a hard error, because minting a new one over a bad read cannot be
-//! noticed from outside. The ed25519 key comes from `sshd keygen`, the one program
-//! in the image that already has an OpenSSH key implementation, so this crate
+//! noticed from outside. The Ed25519 key comes from OpenSSH `ssh-keygen`, the one
+//! program in the image that already has the required key implementation, so this crate
 //! stays dependency-free `std` with no crypto of its own.
 
 mod machineid;
@@ -38,8 +38,8 @@ const HOST_KEY_PREFIX: &str = "TD-FIRSTBOOT-HOSTKEY ";
 /// literal back out of this file to prove the two agree.
 const DEFAULT_STATE_DIR: &str = "/var/lib/td";
 
-/// The program invoked as `<program> keygen --host-key P --public-key Q`.
-const DEFAULT_KEYGEN: &str = "/bin/sshd";
+/// The OpenSSH key utility used for generation and fingerprinting.
+const DEFAULT_KEYGEN: &str = "/bin/ssh-keygen";
 
 /// Paths relative to the state dir. Each is one entry in the recipe's table.
 const MACHINE_ID: &str = "machine-id";
@@ -50,7 +50,7 @@ const AUTHORIZED_KEYS: &str = "ssh/authorized_keys";
 /// Shipped into a fresh `authorized_keys` so the file exists (the daemon reads it
 /// on every connection) while authorizing nobody.
 const AUTHORIZED_KEYS_HEADER: &str = "\
-# td-sshd authorized_keys - one OpenSSH public key per line.\n\
+# td OpenSSH authorized_keys - one public key per line.\n\
 # Empty => deny all. This file is per-machine state under /var, reached through\n\
 # the /etc/ssh/authorized_keys symlink; adding a key here grants ROOT-equivalent\n\
 # admin access to this machine and needs no image rebuild.\n";
@@ -166,7 +166,11 @@ fn run(args: &[String]) -> Result<(), Failure> {
     let first_boot = [machine_id, host_key, authorized].contains(&Outcome::Created);
     emit(&format!(
         "{HOST_KEY_PREFIX}{fingerprint}\n{}\n",
-        if first_boot { NEW_MARKER } else { STABLE_MARKER }
+        if first_boot {
+            NEW_MARKER
+        } else {
+            STABLE_MARKER
+        }
     ))
     .map_err(Failure::Failed)
 }
@@ -339,54 +343,46 @@ fn provision_machine_id(path: &Path) -> Result<Outcome, Failure> {
     }
 }
 
-/// Delegate ed25519 generation to `sshd keygen`, which is idempotent: it creates
-/// the key only if absent, re-derives the public file from the private one, and
-/// prints `created|existing <fingerprint>`. Its first word is this machine's
-/// first-boot answer for the host key, so the two programs agree without either
-/// duplicating the other's check.
+/// Delegate Ed25519 generation and fingerprinting to OpenSSH. A complete existing
+/// pair is preserved; an incomplete pair is a hard error rather than an invitation
+/// to overwrite or silently repair the machine's identity.
 fn provision_host_key(config: &Config, plan: &Plan) -> Result<(Outcome, String), Failure> {
-    let output = std::process::Command::new(&config.keygen)
-        .arg("keygen")
-        .arg("--host-key")
-        .arg(&plan.host_key)
-        .arg("--public-key")
-        .arg(&plan.host_key_pub)
-        .output()
-        .map_err(|e| {
-            Failure::Failed(format!(
-                "run `{} keygen`: {e} - this machine has no SSH host identity, so sshd \
-                 will refuse to serve one",
-                config.keygen
-            ))
-        })?;
-    if !output.status.success() {
-        // The child's own diagnostic is the useful part; pass it through rather
-        // than reporting only an exit status.
-        return Err(Failure::Failed(format!(
-            "`{} keygen` failed ({}): {}",
-            config.keygen,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim_end()
-        )));
-    }
-    let reply = String::from_utf8_lossy(&output.stdout);
-    let mut words = reply.split_whitespace();
-    let (state, fingerprint) = match (words.next(), words.next()) {
-        (Some(state), Some(fingerprint)) => (state, fingerprint),
+    let private_exists = path_exists(&plan.host_key)?;
+    let public_exists = path_exists(&plan.host_key_pub)?;
+    let outcome = match (private_exists, public_exists) {
+        (true, true) => Outcome::Present,
+        (false, false) => {
+            let output = std::process::Command::new(&config.keygen)
+                .arg("-q")
+                .arg("-t")
+                .arg("ed25519")
+                .arg("-N")
+                .arg("")
+                .arg("-C")
+                .arg("td-openssh-host-key")
+                .arg("-f")
+                .arg(&plan.host_key)
+                .output()
+                .map_err(|e| {
+                    Failure::Failed(format!(
+                        "run `{}` to generate {}: {e} - this machine has no SSH host \
+                         identity, so sshd will refuse to start",
+                        config.keygen,
+                        plan.host_key.display()
+                    ))
+                })?;
+            require_keygen_success(config, "generate Ed25519 host key", &output)?;
+            Outcome::Created
+        }
         _ => {
             return Err(Failure::Failed(format!(
-                "`{} keygen` printed {reply:?}, expected `created|existing <fingerprint>`",
-                config.keygen
-            )))
-        }
-    };
-    let outcome = match state {
-        "created" => Outcome::Created,
-        "existing" => Outcome::Present,
-        other => {
-            return Err(Failure::Failed(format!(
-                "`{} keygen` reported state {other:?}, expected `created` or `existing`",
-                config.keygen
+                "incomplete SSH host identity: private key {} is {}, public key {} is {}. \
+                 Refusing to replace or reconstruct either file; restore the pair or move \
+                 both aside deliberately",
+                plan.host_key.display(),
+                if private_exists { "present" } else { "missing" },
+                plan.host_key_pub.display(),
+                if public_exists { "present" } else { "missing" }
             )))
         }
     };
@@ -396,14 +392,154 @@ fn provision_host_key(config: &Config, plan: &Plan) -> Result<(Outcome, String),
     for (path, mode) in [(&plan.host_key, 0o600), (&plan.host_key_pub, 0o644)] {
         let metadata = std::fs::metadata(path).map_err(|e| {
             Failure::Failed(format!(
-                "`{} keygen` reported success but {} is not there: {e}",
+                "`{}` reported success but {} is not there: {e}",
                 config.keygen,
                 path.display()
             ))
         })?;
         enforce_mode(path, &metadata, mode)?;
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| Failure::Failed(format!("fsync {}: {e}", path.display())))?;
     }
+    std::fs::File::open(&plan.key_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| Failure::Failed(format!("fsync {}: {e}", plan.key_dir.display())))?;
+
+    // The public file is only a cache of what the private identity says. Parse the
+    // private key and derive its public half before trusting either one: otherwise a
+    // valid but mismatched .pub file would make us report a fingerprint the daemon
+    // does not present, while a malformed private key would still look "stable".
+    let output = std::process::Command::new(&config.keygen)
+        .arg("-y")
+        .arg("-P")
+        .arg("")
+        .arg("-f")
+        .arg(&plan.host_key)
+        .output()
+        .map_err(|e| {
+            Failure::Failed(format!(
+                "run `{}` to derive the public key from {}: {e}",
+                config.keygen,
+                plan.host_key.display()
+            ))
+        })?;
+    require_keygen_success(config, "derive Ed25519 public host key", &output)?;
+    let derived = String::from_utf8(output.stdout).map_err(|e| {
+        Failure::Failed(format!(
+            "`{} -y` printed a non-UTF-8 public key for {}: {e}",
+            config.keygen,
+            plan.host_key.display()
+        ))
+    })?;
+    let public = std::fs::read_to_string(&plan.host_key_pub)
+        .map_err(|e| Failure::Failed(format!("read {}: {e}", plan.host_key_pub.display())))?;
+    let derived_identity = ed25519_public_identity(
+        &derived,
+        &format!("public key derived from {}", plan.host_key.display()),
+    )?;
+    let recorded_identity = ed25519_public_identity(
+        &public,
+        &format!("recorded public key {}", plan.host_key_pub.display()),
+    )?;
+    if derived_identity != recorded_identity {
+        return Err(Failure::Failed(format!(
+            "SSH host key pair does not match: {} derives a different public key than {}. \
+             Refusing to report or replace either identity",
+            plan.host_key.display(),
+            plan.host_key_pub.display()
+        )));
+    }
+
+    let output = std::process::Command::new(&config.keygen)
+        .arg("-l")
+        .arg("-E")
+        .arg("sha256")
+        .arg("-f")
+        .arg(&plan.host_key_pub)
+        .output()
+        .map_err(|e| {
+            Failure::Failed(format!(
+                "run `{}` to fingerprint {}: {e}",
+                config.keygen,
+                plan.host_key_pub.display()
+            ))
+        })?;
+    require_keygen_success(config, "fingerprint Ed25519 host key", &output)?;
+    let reply = String::from_utf8_lossy(&output.stdout);
+    let mut words = reply.split_whitespace();
+    let bits = words.next();
+    let fingerprint = words.next();
+    let algorithm = words.next_back();
+    let valid = bits == Some("256")
+        && fingerprint.is_some_and(|value| {
+            value
+                .strip_prefix("SHA256:")
+                .is_some_and(|digest| !digest.is_empty())
+        })
+        && algorithm == Some("(ED25519)")
+        && reply.lines().count() == 1;
+    if !valid {
+        return Err(Failure::Failed(format!(
+            "`{} -l -E sha256` printed {reply:?}, expected one 256-bit Ed25519 SHA-256 \
+             fingerprint line",
+            config.keygen
+        )));
+    }
+    let Some(fingerprint) = fingerprint else {
+        return Err(Failure::Failed(format!(
+            "`{} -l -E sha256` omitted the fingerprint",
+            config.keygen
+        )));
+    };
     Ok((outcome, fingerprint.to_string()))
+}
+
+fn ed25519_public_identity(text: &str, source: &str) -> Result<(String, String), Failure> {
+    let mut words = text.split_whitespace();
+    let algorithm = words.next();
+    let encoded = words.next();
+    if algorithm != Some("ssh-ed25519")
+        || encoded.is_none_or(str::is_empty)
+        || text.lines().count() != 1
+    {
+        return Err(Failure::Failed(format!(
+            "{source} is not one Ed25519 public-key line"
+        )));
+    }
+    let Some(encoded) = encoded else {
+        return Err(Failure::Failed(format!(
+            "{source} omits its public-key encoding"
+        )));
+    };
+    Ok(("ssh-ed25519".to_string(), encoded.to_string()))
+}
+
+fn path_exists(path: &Path) -> Result<bool, Failure> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Failure::Failed(format!(
+            "inspect {} before provisioning: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn require_keygen_success(
+    config: &Config,
+    operation: &str,
+    output: &std::process::Output,
+) -> Result<(), Failure> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(Failure::Failed(format!(
+        "`{}` failed to {operation} ({}): {}",
+        config.keygen,
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim_end()
+    )))
 }
 
 /// Create the file the daemon authorizes from, EMPTY. A fresh machine must
@@ -467,7 +603,11 @@ fn read_entropy(bytes: &mut [u8; 16]) -> Result<(), Failure> {
 }
 
 fn make_dir(path: &Path, mode: u32) -> Result<(), Failure> {
-    match std::fs::DirBuilder::new().recursive(true).mode(mode).create(path) {
+    match std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(mode)
+        .create(path)
+    {
         Ok(()) => {}
         Err(e) => {
             return Err(Failure::Failed(format!(
@@ -590,15 +730,12 @@ mod tests {
         for argv in [vec![], vec!["provision"]] {
             let config = config(&argv).unwrap();
             assert_eq!(config.state, PathBuf::from("/var/lib/td"));
-            assert_eq!(config.keygen, "/bin/sshd");
+            assert_eq!(config.keygen, "/bin/ssh-keygen");
             assert!(config.require_persistent);
 
             let plan = Plan::of(&config);
             assert_eq!(plan.key_dir, PathBuf::from("/var/lib/td/ssh"));
-            assert_eq!(
-                plan.machine_id,
-                PathBuf::from("/var/lib/td/machine-id")
-            );
+            assert_eq!(plan.machine_id, PathBuf::from("/var/lib/td/machine-id"));
             assert_eq!(
                 plan.host_key,
                 PathBuf::from("/var/lib/td/ssh/ssh_host_ed25519_key")
@@ -618,9 +755,9 @@ mod tests {
     /// does not apply to it — and that relaxation must not leak into the default.
     #[test]
     fn an_explicit_state_dir_relocates_everything_and_drops_the_mount_check() {
-        let config = config(&["--state-dir", "/srv/state", "--keygen", "/opt/sshd"]).unwrap();
+        let config = config(&["--state-dir", "/srv/state", "--keygen", "/opt/ssh-keygen"]).unwrap();
         assert!(!config.require_persistent);
-        assert_eq!(config.keygen, "/opt/sshd");
+        assert_eq!(config.keygen, "/opt/ssh-keygen");
         let plan = Plan::of(&config);
         assert_eq!(plan.key_dir, PathBuf::from("/srv/state/ssh"));
         assert_eq!(plan.machine_id, PathBuf::from("/srv/state/machine-id"));
@@ -656,6 +793,25 @@ mod tests {
             assert!(
                 line.starts_with('#'),
                 "a shipped authorized_keys line that is not a comment would grant access: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_identity_is_one_ed25519_line_with_an_encoded_key() {
+        assert_eq!(
+            ed25519_public_identity("ssh-ed25519 AAAA comment with spaces\n", "fixture").unwrap(),
+            ("ssh-ed25519".to_string(), "AAAA".to_string())
+        );
+        for invalid in [
+            "",
+            "ssh-ed25519",
+            "ssh-rsa AAAA",
+            "ssh-ed25519 AAAA\nssh-ed25519 BBBB\n",
+        ] {
+            assert!(
+                ed25519_public_identity(invalid, "fixture").is_err(),
+                "accepted {invalid:?}"
             );
         }
     }
