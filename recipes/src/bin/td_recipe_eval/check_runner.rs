@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 
 use td_recipe::{
-    catalog, source_pins,
-    types::{CheckRunner, Recipe, SourcePin, Step},
+    catalog, ostree_pins, source_pins,
+    types::{CheckRunner, OstreeGraphStats, OstreePin, Recipe, SourcePin, Step},
 };
 
 pub(crate) const TD_STORE_DIR: &str = "/td/store";
 const JOB_BUDGET_ENV: &str = "TD_CHECK_JOB_BUDGET_BYTES";
+const MAX_OSTREE_OWNER_BYTES: u64 = 4 * 1024;
+const MAX_OSTREE_ADMISSION_BYTES: u64 = 4 * 1024;
 
 fn forward_inherited_check_policy(command: &mut Command) {
     if let Some(value) = env::var_os(JOB_BUDGET_ENV) {
@@ -510,12 +512,13 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     crate::checks::run::run(&runner, lock)
 }
 
-/// `td-recipe-eval warm [TARGET]` — fetch every declared input TARGET's closure
-/// needs and the caches lack, and build nothing. The same prep the operator
-/// commands now do for themselves, as a standalone step: for preparing a tree
-/// ahead of a build, or from a script, where the absent terminal holds the
-/// automatic prep back. Asking for it IS the consent it needs, so this is the
-/// one entry point that does not condition on a terminal.
+/// `td-recipe-eval warm [TARGET]` — fetch missing declared inputs, then
+/// reauthenticate every selected exact OSTree graph, and build nothing. The
+/// same prep the operator commands now do for themselves, as a standalone step:
+/// for preparing a tree ahead of a build, repairing a complete-looking graph,
+/// or running from a script where the absent terminal holds automatic prep
+/// back. Asking for it IS the consent it needs, so this entry point uses the
+/// explicit verification mode rather than conditioning on a terminal.
 pub fn warm_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     // Arity before the stem lookup: `warm a b` is a usage error, not a report
@@ -538,7 +541,7 @@ pub fn warm_cli(args: &[String]) -> Result<(), String> {
     // Unlike the piggy-backed callers, a residual cold input IS this command's
     // failure — warming is the whole job, and a script gating an offline build
     // on it needs the exit code to say so.
-    crate::warm::preflight(&runner, &targets)
+    crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Explicit)
 }
 
 pub fn build_cli(args: &[String]) -> Result<(), String> {
@@ -942,6 +945,76 @@ fn ladder_work_dir(root: &Path, home: Option<&Path>) -> PathBuf {
 fn shared_sources_dir(home: Option<&Path>) -> PathBuf {
     home.map(|h| h.join(".td/sources"))
         .unwrap_or_else(|| PathBuf::from(".td/sources"))
+}
+
+/// The machine-shared exact OSTree object cache. Each child is permanently
+/// bound to one pin by td-net's ownership record, so worktrees reuse verified
+/// transfer objects without sharing recipe authority or mutable refs.
+fn shared_ostree_dir(home: Option<&Path>) -> PathBuf {
+    home.map(|h| h.join(".td/ostree"))
+        .unwrap_or_else(|| PathBuf::from(".td/ostree"))
+}
+
+fn render_ostree_owner(pin: &OstreePin) -> String {
+    format!(
+        "format=1\nrepository={}\nref={}\ncommit={}\ncontent={}\n",
+        pin.repository, pin.exact_ref, pin.commit, pin.content
+    )
+}
+
+fn exact_regular_file_equals(path: &Path, expected: &[u8], max_bytes: u64) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return false;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file.take(max_bytes + 1).read_to_end(&mut bytes).is_err()
+        || bytes.len() as u64 > max_bytes
+    {
+        return false;
+    }
+    bytes == expected
+}
+
+pub(crate) fn ostree_cache_is_warm(cache: &Path, pin: &OstreePin) -> bool {
+    if !cache.join("graph.v1").is_file() {
+        return false;
+    }
+    let owner = cache.join("td-ostree-cache.v1");
+    exact_regular_file_equals(
+        &owner,
+        render_ostree_owner(pin).as_bytes(),
+        MAX_OSTREE_OWNER_BYTES,
+    )
+}
+
+fn ostree_admission_record(pin: &OstreePin, store_basename: &str) -> String {
+    format!(
+        "format=1\nkey={}\nrepository={}\nref={}\ncommit={}\ncontent={}\n\
+         signing-key={}\ncache={}\nforeign={}\nobjects={}\npaths={}\ndirectories={}\nregular={}\n\
+         symlinks={}\ndecoded-bytes={}\nobserved-transfer-bytes={}\nstore-basename={}\n",
+        pin.key,
+        pin.repository,
+        pin.exact_ref,
+        pin.commit,
+        pin.content,
+        pin.signing_key_fingerprint,
+        pin.cache,
+        pin.foreign(),
+        pin.expected.objects,
+        pin.expected.paths,
+        pin.expected.directories,
+        pin.expected.regular_files,
+        pin.expected.symlinks,
+        pin.expected.decoded_bytes,
+        pin.expected.transfer_bytes,
+        store_basename
+    )
 }
 
 /// The seed db for THIS worktree's compiled pin table, `<lw>/seed-db/<digest>.db`.
@@ -1371,6 +1444,8 @@ pub(crate) struct RecipeCheckRunner {
     /// The single shared sources cache (`$HOME/.td/sources`) holding the warmed pinned
     /// tarballs + generated kernel-headers, shared across worktrees (see `shared_sources_dir`).
     sources_dir: PathBuf,
+    /// Exact deploy-object caches populated by host-side `td-feed warm ostree`.
+    ostree_dir: PathBuf,
     store: PathBuf,
     db: PathBuf,
     recipes: PathBuf,
@@ -1525,6 +1600,7 @@ fn gate_local_source_candidate(key: &str, candidate_path: &str) -> Result<(), St
 pub(crate) enum SeedInput {
     Stage0 { key: String },
     Source { key: String, pin: SourcePin },
+    Ostree { key: String, pin: OstreePin },
     LinuxHeaders { key: String, arch: &'static str },
     Patch { key: String, patch: String },
     /// An IN-TREE source directory (#469 local-source provenance): `path` is the
@@ -1539,6 +1615,7 @@ impl SeedInput {
         match self {
             SeedInput::Stage0 { key }
             | SeedInput::Source { key, .. }
+            | SeedInput::Ostree { key, .. }
             | SeedInput::LinuxHeaders { key, .. }
             | SeedInput::Patch { key, .. }
             | SeedInput::LocalSource { key, .. } => key,
@@ -1575,6 +1652,7 @@ impl RecipeCheckRunner {
         };
         let lw = ladder_work_dir(&root, home.as_deref());
         let sources_dir = shared_sources_dir(home.as_deref());
+        let ostree_dir = shared_ostree_dir(home.as_deref());
         let store = seed_store_dir(&lw);
         let db = seed_db_path(&lw)?;
         // Claimed here rather than in setup(): the claim is what makes this name OURS,
@@ -1591,6 +1669,7 @@ impl RecipeCheckRunner {
             builder_db: stage0_base.join("builder.db"),
             lw,
             sources_dir,
+            ostree_dir,
             store,
             db,
             recipes,
@@ -1907,6 +1986,106 @@ impl RecipeCheckRunner {
         self.store_add_recursive_into(intern_name, &file, db)
     }
 
+    fn intern_ostree(
+        &self,
+        intern_name: &str,
+        pin: &OstreePin,
+        db: &Path,
+    ) -> Result<String, String> {
+        validate_ostree_pin(pin)?;
+        let cache = self.ostree_dir.join(&pin.cache);
+        if !ostree_cache_is_warm(&cache, pin) {
+            return Err(format!(
+                "ladder: exact OSTree graph not warm ({}) - run `td-recipe-eval warm \
+                 <recipe-target>` or the reviewed `td-feed warm ostree` command",
+                cache.display()
+            ));
+        }
+        let deploy = self.scratch.join(format!("ostree-deploy-{}", pin.key));
+        remove_materialized_deploy_if_exists(&deploy)?;
+        let mut command = self.builder_command();
+        for argument in ostree_materialize_args(pin, &cache, &deploy)? {
+            command.arg(argument);
+        }
+        let output = command_output_reporting_stderr(
+            &mut command,
+            &format!("ostree-materialize {}", pin.key),
+        )?;
+        let actual = parse_ostree_materialize_stats(&output)?;
+        if !ostree_authenticated_stats_match(actual, pin.expected) {
+            return Err(format!(
+                "OSTree graph `{}` materialized with authenticated counts {actual:?}, but the reviewed pin records {:?}",
+                pin.key, pin.expected
+            ));
+        }
+        let interned = self.store_add_recursive_into(intern_name, &deploy, db)?;
+        remove_materialized_deploy(&deploy)?;
+        Ok(interned)
+    }
+
+    fn ostree_admission_path(&self, pin: &OstreePin, store_basename: &str) -> PathBuf {
+        let record = ostree_admission_record(pin, store_basename);
+        self.lw
+            .join("ostree-admissions")
+            .join(format!("{}.v1", sha256sum(record.as_bytes())))
+    }
+
+    fn ostree_admission_is_current(&self, pin: &OstreePin, store_basename: &str) -> bool {
+        let record = ostree_admission_record(pin, store_basename);
+        exact_regular_file_equals(
+            &self.ostree_admission_path(pin, store_basename),
+            record.as_bytes(),
+            MAX_OSTREE_ADMISSION_BYTES,
+        )
+    }
+
+    pub(crate) fn ostree_pin_is_admitted(&self, pin: &OstreePin) -> Result<bool, String> {
+        validate_ostree_pin(pin)?;
+        Ok(crate::seed_digests::expected(&pin.key)?
+            .is_some_and(|base| self.ostree_admission_is_current(pin, base)))
+    }
+
+    fn retained_seed_tree(&self, input: &SeedInput, base: &str) -> Option<PathBuf> {
+        let tree = self.store.join(base);
+        let authority_is_current = match input {
+            SeedInput::Ostree { pin, .. } => self.ostree_admission_is_current(pin, base),
+            _ => true,
+        };
+        (tree.exists() && authority_is_current).then_some(tree)
+    }
+
+    fn record_ostree_admission(&self, pin: &OstreePin, store_basename: &str) -> Result<(), String> {
+        let record = ostree_admission_record(pin, store_basename);
+        let directory = self.lw.join("ostree-admissions");
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("mkdir {}: {error}", directory.display()))?;
+        let path = self.ostree_admission_path(pin, store_basename);
+        if exact_regular_file_equals(&path, record.as_bytes(), MAX_OSTREE_ADMISSION_BYTES) {
+            return Ok(());
+        }
+        let temp = directory.join(format!(
+            ".{}.{}.tmp",
+            sha256sum(record.as_bytes()),
+            sanitize_scratch_component(&self.scratch_id())
+        ));
+        remove_path_if_exists(&temp)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|error| format!("create {}: {error}", temp.display()))?;
+        if let Err(error) = file
+            .write_all(record.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("write {}: {error}", temp.display()));
+        }
+        drop(file);
+        fs::rename(&temp, &path)
+            .map_err(|error| format!("rename {} -> {}: {error}", temp.display(), path.display()))
+    }
+
     fn intern_linux_headers(
         &self,
         intern_name: &str,
@@ -2221,7 +2400,11 @@ impl RecipeCheckRunner {
     /// old bytes. The intended workflow bumps the pin AND regenerates the table in one commit —
     /// then the new basename is not yet interned and this falls through to the cold path (which
     /// re-derives from the pin and gates the fresh basename via `require`); `clear-store` also
-    /// forces cold.
+    /// forces cold. OSTree pins are stricter because authenticated commit metadata can change
+    /// while the canonical `files/` tree does not: their warm path additionally requires an
+    /// atomic admission receipt over every pin field and the store basename. A missing or
+    /// different receipt reauthenticates the graph once and publishes a new receipt only after
+    /// the compiled basename gate and db promotion pass.
     ///
     /// A LOCAL source is exempt from the warm path entirely (the early return at the top of
     /// this function, before the table is consulted at all), because
@@ -2239,9 +2422,11 @@ impl RecipeCheckRunner {
         if let SeedInput::LocalSource { key, path } = input {
             return self.ensure_local_source(key, path);
         }
+        if let SeedInput::Ostree { pin, .. } = input {
+            validate_ostree_pin(pin)?;
+        }
         if let Some(base) = crate::seed_digests::expected(input.key())? {
-            let tree = self.store.join(base);
-            if tree.exists() {
+            if let Some(tree) = self.retained_seed_tree(input, base) {
                 let derived = format!("{TD_STORE_DIR}/{base}");
                 // A warm STORE is no longer evidence that this table's db has the row:
                 // the store is shared across pin tables and the db is not, so on a
@@ -2326,6 +2511,9 @@ impl RecipeCheckRunner {
             ));
         }
         self.record_vouched(&derived);
+        if let SeedInput::Ostree { pin, .. } = input {
+            self.record_ostree_admission(pin, path_basename_str(&derived)?)?;
+        }
         self.stage_store_path(&derived)?;
         Ok(derived)
     }
@@ -2348,6 +2536,7 @@ impl RecipeCheckRunner {
         match input {
             SeedInput::Stage0 { key } => self.intern_stage0_source(key, db),
             SeedInput::Source { key, pin } => self.intern_source(key, pin, db),
+            SeedInput::Ostree { key, pin } => self.intern_ostree(key, pin, db),
             SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch, db),
             SeedInput::Patch { key, patch } => self.intern_patch(key, patch, db),
             SeedInput::LocalSource { key, path } => self.intern_local_source(key, path, db),
@@ -2630,6 +2819,10 @@ impl RecipeCheckRunner {
     /// kernel-header seeds are interned from.
     pub(crate) fn sources_dir(&self) -> &Path {
         &self.sources_dir
+    }
+
+    pub(crate) fn ostree_dir(&self) -> &Path {
+        &self.ostree_dir
     }
 
     fn build_recipe_target(&self, target: &str, outputs: &[&str]) -> Result<(), String> {
@@ -3331,6 +3524,7 @@ fn marked_names() -> HashSet<String> {
         .filter(|(_, recipe)| recipe.is_foreign())
         .map(|(stem, _)| stem.to_string())
         .chain(source_pins::foreign_names())
+        .chain(ostree_pins::foreign_names())
         .collect()
 }
 
@@ -3745,6 +3939,17 @@ fn seed_input_for_recipe_source(key: &str, recipe: &Recipe) -> Result<SeedInput,
             path: path.clone(),
         });
     }
+    if let Some(pin) = recipe
+        .ostree_pins
+        .as_ref()
+        .and_then(|pins| pins.iter().find(|pin| pin.key == key))
+        .cloned()
+    {
+        return Ok(SeedInput::Ostree {
+            key: key.to_string(),
+            pin,
+        });
+    }
     match special_seed_input(key)? {
         Some(input) => Ok(input),
         None => {
@@ -3764,6 +3969,12 @@ fn seed_input_for_recipe_source(key: &str, recipe: &Recipe) -> Result<SeedInput,
 }
 
 fn seed_input_for_recipe_input(key: &str) -> Result<Option<SeedInput>, String> {
+    if let Some(pin) = ostree_pins::by_key(key) {
+        return Ok(Some(SeedInput::Ostree {
+            key: key.to_string(),
+            pin,
+        }));
+    }
     if let Some(input) = special_seed_input(key)? {
         return Ok(Some(input));
     }
@@ -3783,8 +3994,9 @@ fn ensure_targets_provenance(targets: &[&str]) -> Result<(), String> {
     classify_graph_inputs(&graph).map(|_| ())
 }
 
-/// Fetch what TARGETS' closures declare and no cache holds, before the ladder
-/// lock — the prep an operator would otherwise be told to run by hand.
+/// Fetch missing declared inputs before the ladder lock, and reauthenticate a
+/// complete-looking exact OSTree graph until recipe admission records it — the
+/// prep an operator would otherwise be told to run by hand.
 ///
 /// What keeps this off every gate is that no gate invokes `run`/`qemu-boot*` at
 /// all: they need a host qemu and a terminal the sandbox does not have, which is
@@ -3798,7 +4010,9 @@ fn ensure_targets_provenance(targets: &[&str]) -> Result<(), String> {
 /// no inputs at all.
 fn warm_operator_inputs(runner: &RecipeCheckRunner, targets: &[&str]) {
     if io::stdin().is_terminal() {
-        if let Err(e) = crate::warm::preflight(runner, targets) {
+        if let Err(e) =
+            crate::warm::preflight(runner, targets, crate::warm::WarmMode::Automatic)
+        {
             eprintln!("   [warm] {e} — continuing; the build reports what it cannot resolve");
         }
     }
@@ -3854,6 +4068,158 @@ fn validate_source_file_basename(pin: &SourcePin) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn validate_ostree_pin(pin: &OstreePin) -> Result<(), String> {
+    if pin.key.is_empty()
+        || !pin
+            .key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(format!(
+            "OSTree pin key {:?} must be nonempty [a-z0-9-]+",
+            pin.key
+        ));
+    }
+    let mut cache_components = Path::new(&pin.cache).components();
+    if !matches!(cache_components.next(), Some(std::path::Component::Normal(_)))
+        || cache_components.next().is_some()
+    {
+        return Err(format!(
+            "OSTree pin `{}` has non-basename cache {:?}",
+            pin.key, pin.cache
+        ));
+    }
+    if !pin.repository.starts_with("https://")
+        || pin.repository.trim() != pin.repository
+        || pin.repository.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(format!(
+            "OSTree pin `{}` repository must be one exact HTTPS URL",
+            pin.key
+        ));
+    }
+    td_engine::ostree::validate_exact_ref(&pin.exact_ref)
+        .map_err(|error| format!("OSTree pin `{}` ref: {error}", pin.key))?;
+    td_engine::ostree::Checksum::from_hex(&pin.commit)
+        .map_err(|error| format!("OSTree pin `{}` commit: {error}", pin.key))?;
+    td_engine::ostree::Checksum::from_hex(&pin.content)
+        .map_err(|error| format!("OSTree pin `{}` content: {error}", pin.key))?;
+    if pin.signing_key_fingerprint.len() != 40
+        || !pin
+            .signing_key_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase())
+    {
+        return Err(format!(
+            "OSTree pin `{}` signing-key fingerprint must be 40 uppercase hex digits",
+            pin.key
+        ));
+    }
+    let kinds = pin
+        .expected
+        .directories
+        .checked_add(pin.expected.regular_files)
+        .and_then(|count| count.checked_add(pin.expected.symlinks))
+        .ok_or_else(|| format!("OSTree pin `{}` path counts overflow", pin.key))?;
+    let limits = td_engine::ostree::GRAPH_LIMITS;
+    if pin.expected.objects == 0
+        || pin.expected.paths == 0
+        || pin.expected.objects > limits.objects
+        || pin.expected.paths > limits.paths
+        || kinds != pin.expected.paths
+        || pin.expected.decoded_bytes == 0
+        || pin.expected.decoded_bytes > limits.decoded_bytes
+        || pin.expected.transfer_bytes == 0
+        || pin.expected.transfer_bytes > limits.transfer_bytes
+    {
+        return Err(format!(
+            "OSTree pin `{}` has inconsistent or empty reviewed graph accounting",
+            pin.key
+        ));
+    }
+    Ok(())
+}
+
+fn parse_ostree_materialize_stats(output: &str) -> Result<OstreeGraphStats, String> {
+    let line = output
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("objects="))
+        .ok_or_else(|| "ostree-materialize produced no accounting row".to_string())?;
+    let mut fields = BTreeMap::new();
+    for field in line.split_whitespace() {
+        let (name, value) = field
+            .split_once('=')
+            .ok_or_else(|| format!("malformed ostree-materialize field {field:?}"))?;
+        if !matches!(
+            name,
+            "objects"
+                | "paths"
+                | "directories"
+                | "regular"
+                | "symlinks"
+                | "decoded-bytes"
+                | "transfer-bytes"
+        ) {
+            return Err(format!(
+                "unknown ostree-materialize accounting field {name:?}"
+            ));
+        }
+        if fields.insert(name, value).is_some() {
+            return Err(format!(
+                "duplicate ostree-materialize accounting field {name:?}"
+            ));
+        }
+    }
+    let parse_usize = |name: &str| -> Result<usize, String> {
+        fields
+            .get(name)
+            .ok_or_else(|| format!("ostree-materialize accounting omits {name}"))?
+            .parse::<usize>()
+            .map_err(|error| format!("ostree-materialize {name}: {error}"))
+    };
+    let parse_u64 = |name: &str| -> Result<u64, String> {
+        fields
+            .get(name)
+            .ok_or_else(|| format!("ostree-materialize accounting omits {name}"))?
+            .parse::<u64>()
+            .map_err(|error| format!("ostree-materialize {name}: {error}"))
+    };
+    Ok(OstreeGraphStats {
+        objects: parse_usize("objects")?,
+        paths: parse_usize("paths")?,
+        directories: parse_usize("directories")?,
+        regular_files: parse_usize("regular")?,
+        symlinks: parse_usize("symlinks")?,
+        decoded_bytes: parse_u64("decoded-bytes")?,
+        transfer_bytes: parse_u64("transfer-bytes")?,
+    })
+}
+
+fn ostree_authenticated_stats_match(actual: OstreeGraphStats, reviewed: OstreeGraphStats) -> bool {
+    actual.objects == reviewed.objects
+        && actual.paths == reviewed.paths
+        && actual.directories == reviewed.directories
+        && actual.regular_files == reviewed.regular_files
+        && actual.symlinks == reviewed.symlinks
+        && actual.decoded_bytes == reviewed.decoded_bytes
+}
+
+fn ostree_materialize_args(
+    pin: &OstreePin,
+    cache: &Path,
+    deploy: &Path,
+) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "ostree-materialize".into(),
+        path_str(cache)?.into(),
+        pin.exact_ref.clone(),
+        pin.commit.clone(),
+        pin.content.clone(),
+        path_str(deploy)?.into(),
+    ])
 }
 
 fn verify_source_pin(path: &Path, pin: &SourcePin) -> Result<(), String> {
@@ -4325,6 +4691,17 @@ fn command_output(cmd: &mut Command, label: &str) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|e| format!("{label} output not UTF-8: {e}"))
 }
 
+fn command_output_reporting_stderr(cmd: &mut Command, label: &str) -> Result<String, String> {
+    let out = cmd.output().map_err(|e| format!("spawn {label}: {e}"))?;
+    if !out.status.success() {
+        return Err(child_failure(label, &out));
+    }
+    if !out.stderr.is_empty() {
+        let _ = io::stderr().write_all(&out.stderr);
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("{label} output not UTF-8: {e}"))
+}
+
 fn command_output_with_stdin(
     cmd: &mut Command,
     label: &str,
@@ -4449,6 +4826,46 @@ pub(crate) fn remove_path_if_exists(path: &Path) -> Result<(), String> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("stat {}: {e}", path.display())),
     }
+}
+
+fn remove_materialized_deploy(path: &Path) -> Result<(), String> {
+    make_directories_user_writable(path)?;
+    fs::remove_dir_all(path).map_err(|error| format!("remove {}: {error}", path.display()))
+}
+
+fn remove_materialized_deploy_if_exists(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => remove_materialized_deploy(path),
+        Ok(_) => Err(format!(
+            "materialized deploy {} is not a directory",
+            path.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("stat {}: {error}", path.display())),
+    }
+}
+
+fn make_directories_user_writable(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("stat {}: {error}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "materialized deploy {} is not a directory",
+            path.display()
+        ));
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() | 0o700);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("chmod u+rwx {}: {error}", path.display()))?;
+    for child in read_dir_sorted(path)? {
+        let child_metadata = fs::symlink_metadata(&child)
+            .map_err(|error| format!("stat {}: {error}", child.display()))?;
+        if child_metadata.file_type().is_dir() {
+            make_directories_user_writable(&child)?;
+        }
+    }
+    Ok(())
 }
 
 fn make_user_writable(path: &Path) -> Result<(), String> {
@@ -4605,6 +5022,119 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materializer_accounting_is_exact_typed_and_duplicate_free() {
+        let line = "objects=357 paths=480 directories=184 regular=151 symlinks=145 decoded-bytes=333694837 transfer-bytes=125579637\n";
+        let parsed = parse_ostree_materialize_stats(line).unwrap();
+        assert_eq!(
+            parsed,
+            ostree_pins::by_key("firefox-154-source")
+                .expect("reviewed Firefox pin")
+                .expected
+        );
+        let mut recompressed = parsed;
+        recompressed.transfer_bytes += 1;
+        assert!(ostree_authenticated_stats_match(recompressed, parsed));
+        recompressed.decoded_bytes += 1;
+        assert!(!ostree_authenticated_stats_match(recompressed, parsed));
+        for malformed in [
+            "objects=1 objects=1 paths=1 directories=1 regular=0 symlinks=0 decoded-bytes=1 transfer-bytes=1",
+            "objects=1 paths=1 directories=1 regular=0 symlinks=0 decoded-bytes=1 surprise=1 transfer-bytes=1",
+            "objects=1 paths=1 directories=1 regular=0 symlinks=0 decoded-bytes=no transfer-bytes=1",
+        ] {
+            assert!(parse_ostree_materialize_stats(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn reviewed_ostree_pins_validate_and_malformed_authority_refuses() {
+        let pin = ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
+        for reviewed in ostree_pins::all() {
+            validate_ostree_pin(&reviewed).unwrap();
+        }
+        for damage in [
+            "cache",
+            "ref",
+            "commit",
+            "fingerprint",
+            "counts",
+            "object-limit",
+            "decoded-limit",
+        ] {
+            let mut bad = pin.clone();
+            match damage {
+                "cache" => bad.cache = "../escape".into(),
+                "ref" => bad.exact_ref = "stable".into(),
+                "commit" => bad.commit = "00".into(),
+                "fingerprint" => bad.signing_key_fingerprint = "a".repeat(40),
+                "counts" => bad.expected.paths += 1,
+                "object-limit" => {
+                    bad.expected.objects = td_engine::ostree::GRAPH_LIMITS.objects + 1
+                }
+                _ => {
+                    bad.expected.decoded_bytes = td_engine::ostree::GRAPH_LIMITS.decoded_bytes + 1
+                }
+            }
+            assert!(validate_ostree_pin(&bad).is_err(), "{damage}");
+        }
+    }
+
+    #[test]
+    fn materializer_argv_is_exact_and_non_utf8_paths_refuse() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let pin = ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
+        let args = ostree_materialize_args(&pin, Path::new("/cache"), Path::new("/deploy"))
+            .expect("plain paths");
+        assert_eq!(
+            args,
+            vec![
+                "ostree-materialize",
+                "/cache",
+                "app/org.mozilla.firefox/x86_64/stable",
+                pin.commit.as_str(),
+                pin.content.as_str(),
+                "/deploy",
+            ]
+        );
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
+        assert!(ostree_materialize_args(&pin, &invalid, Path::new("/deploy")).is_err());
+    }
+
+    #[test]
+    fn cache_owner_wire_stays_bound_to_td_net() {
+        let net = include_str!("../../../../net/src/ostree.rs");
+        for declaration in [
+            "const MANIFEST_NAME: &str = \"graph.v1\";",
+            "const OWNER_NAME: &str = \"td-ostree-cache.v1\";",
+            "const MAX_OWNER_BYTES: u64 = 4 * 1024;",
+        ] {
+            assert_eq!(net.matches(declaration).count(), 1, "{declaration}");
+        }
+        assert!(net.contains(
+            "\"format=1\\nrepository={}\\nref={}\\ncommit={}\\ncontent={}\\n\""
+        ));
+        let pin = ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
+        assert_eq!(
+            render_ostree_owner(&pin),
+            "format=1\nrepository=https://dl.flathub.org/repo\nref=app/org.mozilla.firefox/x86_64/stable\ncommit=86ba63a1c2378a9525b495e1ba2c3ed9dc71ee92f67e45d8016cc4972024b410\ncontent=e511b540f42135f8703d6ea0f65abe3b798f93d4ab73ad27bf272d372a72fac3\n"
+        );
+    }
+
+    #[test]
+    fn firefox_classifies_as_one_marked_exact_graph_seed() {
+        let graph = recipe_closure(&["firefox"]).unwrap();
+        let seeds = classify_graph_inputs(&graph).unwrap();
+        assert!(matches!(
+            seeds.as_slice(),
+            [SeedInput::Ostree { key, pin }]
+                if key == "firefox-154-source" && pin.foreign()
+        ));
+        let closure = payload_closure(&["firefox"]).unwrap();
+        assert_eq!(closure.foreign_members, vec!["firefox"]);
+        assert_eq!(closure.pins, vec!["firefox-154-source"]);
+    }
 
     fn payload_template_recipe(step: Step) -> Recipe {
         Recipe::mesboot("image", "1")
@@ -4927,8 +5457,12 @@ mod tests {
         assert_eq!(
             asks,
             vec![
+                // The exact admission receipt binds the policy mark beside the
+                // graph identity fields, so a mark change cannot reuse it.
+                "pin.foreign(),",
                 ".filter(|(_, recipe)| recipe.is_foreign())",
                 ".chain(source_pins::foreign_names())",
+                ".chain(ostree_pins::foreign_names())",
                 // The closure query's member rule. Listed rather than exempted:
                 // it asks the NODE it was handed, so a fixture can observe it,
                 // but an exact list is what stops a fourth read being added
@@ -5131,19 +5665,44 @@ mod tests {
 
     /// The union `marked_names` builds is only sound while the two namespaces
     /// are disjoint: a pin name that was also a recipe stem would refuse every
-    /// legal use of that recipe once the pin were marked. Not vacuous — 98
-    /// stems against 57 pin names, both non-empty today.
+    /// legal use of that recipe once the pin were marked. Not vacuous: both
+    /// the recipe and fixed-output pin sets are large and non-empty today.
     #[test]
     fn no_pin_name_is_a_recipe_stem() {
         let stems: HashSet<&str> = catalog::all().into_iter().map(|(stem, _)| stem).collect();
         assert!(stems.len() > 50 && !stems.is_empty());
         let mut names = 0;
+        let mut ostree_caches = HashSet::new();
         for pin in source_pins::all() {
             names += 1;
             assert!(
                 !stems.contains(pin.key.as_str()),
                 "pin `{}' is also a recipe stem",
                 pin.key
+            );
+        }
+        for pin in ostree_pins::all() {
+            names += 1;
+            assert!(
+                !stems.contains(pin.key.as_str()),
+                "OSTree pin `{}' is also a recipe stem",
+                pin.key
+            );
+            assert!(
+                source_pins::by_key(&pin.key).is_none(),
+                "OSTree pin `{}` collides with a fixed-output source pin",
+                pin.key
+            );
+            assert!(
+                special_seed_input(&pin.key).unwrap().is_none(),
+                "OSTree pin `{}` collides with a special seed",
+                pin.key
+            );
+            assert!(
+                ostree_caches.insert(pin.cache.clone()),
+                "OSTree pin `{}` reuses cache identity `{}`",
+                pin.key,
+                pin.cache
             );
         }
         assert!(names > 40, "{names} pins — the sweep must have something to do");
@@ -6118,6 +6677,7 @@ chmod 755 '{}'
             builder_db: PathBuf::new(),
             lw: lw.to_path_buf(),
             sources_dir: lw.join("sources"),
+            ostree_dir: lw.join("ostree"),
             // The real derivations, not `lw/store` and `lw/db`: these tests assert what
             // setup() and clear-store do to the seed store and db, and a helper that
             // invented its own paths would assert it about files production never writes.
@@ -6173,6 +6733,71 @@ chmod 755 '{}'
         // The per-invocation scratch is freshly created.
         assert!(runner.scratch.is_dir());
         let _ = fs::remove_dir_all(&lw);
+    }
+
+    #[test]
+    fn ostree_admission_receipt_binds_authority_beyond_the_store_basename() {
+        let lw = env::temp_dir().join(format!("td-ostree-admission-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        fs::create_dir_all(&lw).unwrap();
+        let runner = shared_test_runner(&lw);
+        let pin = ostree_pins::by_key("firefox-154-source").expect("reviewed Firefox pin");
+        let base = crate::seed_digests::expected(&pin.key)
+            .unwrap()
+            .expect("Firefox seed digest");
+        fs::create_dir_all(runner.store.join(base)).unwrap();
+
+        let input = SeedInput::Ostree {
+            key: pin.key.clone(),
+            pin: pin.clone(),
+        };
+        assert!(runner.retained_seed_tree(&input, base).is_none());
+        runner.record_ostree_admission(&pin, base).unwrap();
+        assert!(runner.ostree_admission_is_current(&pin, base));
+        assert!(runner.retained_seed_tree(&input, base).is_some());
+        assert!(ostree_admission_record(&pin, base).contains("\nforeign=true\n"));
+
+        let mut changed_ref = pin.clone();
+        changed_ref.exact_ref = "app/org.mozilla.firefox/x86_64/beta".into();
+        assert!(!runner.ostree_admission_is_current(&changed_ref, base));
+        let changed_ref_input = SeedInput::Ostree {
+            key: changed_ref.key.clone(),
+            pin: changed_ref,
+        };
+        assert!(runner
+            .retained_seed_tree(&changed_ref_input, base)
+            .is_none());
+        let mut changed_count = pin.clone();
+        changed_count.expected.paths += 1;
+        assert!(!runner.ostree_admission_is_current(&changed_count, base));
+        let changed_count_input = SeedInput::Ostree {
+            key: changed_count.key.clone(),
+            pin: changed_count,
+        };
+        assert!(runner
+            .retained_seed_tree(&changed_count_input, base)
+            .is_none());
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    #[test]
+    fn deploy_cleanup_does_not_chmod_a_hardlinked_store_file() {
+        let root = env::temp_dir().join(format!("td-ostree-cleanup-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let deploy = root.join("deploy");
+        let store = root.join("store-file");
+        fs::create_dir_all(deploy.join("nested")).unwrap();
+        fs::write(deploy.join("nested/file"), b"payload").unwrap();
+        fs::set_permissions(deploy.join("nested/file"), fs::Permissions::from_mode(0o444))
+            .unwrap();
+        fs::hard_link(deploy.join("nested/file"), &store).unwrap();
+        fs::set_permissions(deploy.join("nested"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&deploy, fs::Permissions::from_mode(0o555)).unwrap();
+
+        remove_materialized_deploy_if_exists(&deploy).unwrap();
+        assert!(!deploy.exists());
+        assert_eq!(fs::metadata(&store).unwrap().permissions().mode() & 0o777, 0o444);
+        let _ = fs::remove_dir_all(&root);
     }
 
     // `clear-store` is the ONLY path that resets persisted ladder state: it removes the whole
@@ -6830,6 +7455,7 @@ chmod 755 '{}'
             builder_db: PathBuf::new(),
             lw: tmp.clone(),
             sources_dir: PathBuf::new(),
+            ostree_dir: PathBuf::new(),
             store: PathBuf::new(),
             db: PathBuf::new(),
             recipes: PathBuf::new(),

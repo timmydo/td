@@ -26,7 +26,9 @@ curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
 elfutils-x86-64-source n4g2hjlg72jm5wn0lx9fxplvh2y82d0b-elfutils-x86-64-source
 fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source
+firefox-154-source 40asdrhyln3x194j276abhb2j2i7a04z-firefox-154-source
 flex-x86-64-source v1hf8a11jna03slg5iqr5zj5kfxshvwz-flex-x86-64-source
+freedesktop-platform-25-08-source cgynxza1vd3h30gd4hjl7vp82hdqlyj3-freedesktop-platform-25-08-source
 gawk-mesboot-source 128bh62a669ds6v5q6v2sih5a1qk51wj-gawk-mesboot-source
 gawk-mesboot0-source zdx7nfqxa7pddqpip7bpa13d79d5p7q2-gawk-mesboot0-source
 gcc-10-bridge-source zy6cavi7zz0ay4z9x3r8128vrld0pvnb-gcc-10-bridge-source

@@ -18,10 +18,11 @@
 //!   clear-store           reset the ladder work dir (seed store/db + shared
 //!                         build-cache); the next build re-derives seeds and
 //!                         cold-climbs. The only path that clears persisted state
-//!   warm [TARGET]         fetch every declared input TARGET's closure needs and
-//!                         the caches lack (default system-x86-64), building
-//!                         nothing. The host-side operator commands (`run`,
-//!                         `qemu-boot*`) do this for themselves from a terminal
+//!   warm [TARGET]         fetch missing declared inputs and reauthenticate every
+//!                         selected exact OSTree graph (default system-x86-64),
+//!                         building nothing. The host-side operator commands
+//!                         (`run`, `qemu-boot*`) prepare unadmitted graphs from
+//!                         a terminal
 //!   payload-closure [TARGET...]
 //!                         print APPLICATIONS.md §B.8's closure answer for
 //!                         TARGET (default system-x86-64): how many recipes
@@ -35,6 +36,11 @@
 //!                         <key>\t<url>\t<sha256>\t<file>
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
 //!                         in the same tab-separated form
+//!   ostree-pins           print exact foreign deploy pins as:
+//!                         <key>\t<repository>\t<ref>\t<commit>\t<content>
+//!                         \t<key fingerprint>\t<cache> followed by the
+//!                         reviewed graph counts as name=value fields
+//!   ostree-pin STEM       print the exact deploy pin(s) owned by STEM
 //! This is the loop tool the `recipe-rs` gate drives AND the corpus consumer
 //! entry (replacing `ts-emit` on the boa path). (The system-spec subcommands —
 //! list-specs/emit-spec/verify-spec — were retired with the guix-system museum
@@ -140,6 +146,50 @@ fn print_recipe_source_pins(stem: &str) {
     }
     for pin in pins {
         println!("{}\t{}\t{}\t{}", pin.key, pin.url, pin.sha256, pin.file);
+    }
+}
+
+fn format_ostree_pin(pin: &td_recipe::types::OstreePin) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\tobjects={}\tpaths={}\tdirectories={}\t\
+         regular={}\tsymlinks={}\tdecoded-bytes={}\tobserved-transfer-bytes={}",
+        pin.key,
+        pin.repository,
+        pin.exact_ref,
+        pin.commit,
+        pin.content,
+        pin.signing_key_fingerprint,
+        pin.cache,
+        pin.expected.objects,
+        pin.expected.paths,
+        pin.expected.directories,
+        pin.expected.regular_files,
+        pin.expected.symlinks,
+        pin.expected.decoded_bytes,
+        pin.expected.transfer_bytes
+    )
+}
+
+fn print_ostree_pin(pin: &td_recipe::types::OstreePin) {
+    println!("{}", format_ostree_pin(pin));
+}
+
+fn print_ostree_pins() {
+    for pin in td_recipe::ostree_pins::all() {
+        print_ostree_pin(&pin);
+    }
+}
+
+fn print_recipe_ostree_pins(stem: &str) {
+    let recipe = lookup_or_die(stem);
+    let Some(pins) = recipe.ostree_pins else {
+        die(&format!("recipe `{stem}' declares no exact OSTree pin"));
+    };
+    if pins.is_empty() {
+        die(&format!("recipe `{stem}' declares no exact OSTree pin"));
+    }
+    for pin in pins {
+        print_ostree_pin(&pin);
     }
 }
 
@@ -302,6 +352,21 @@ fn main() {
             }
             print_recipe_source_pins(stem);
         }
+        Some("ostree-pins") => {
+            if args.get(2).is_some() {
+                die("usage: ostree-pins");
+            }
+            print_ostree_pins();
+        }
+        Some("ostree-pin") => {
+            let stem = args
+                .get(2)
+                .unwrap_or_else(|| die("usage: ostree-pin STEM"));
+            if args.get(3).is_some() {
+                die("usage: ostree-pin STEM");
+            }
+            print_recipe_ostree_pins(stem);
+        }
         Some("seed-digests") => {
             if args.get(2).is_some() {
                 die("usage: seed-digests");
@@ -322,7 +387,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|warm|verify-store|payload-closure|application-closure|source-pins|source-pin|seed-digests|local-source-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|warm|verify-store|payload-closure|application-closure|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
     }
 }
 
@@ -463,6 +528,23 @@ mod tests {
         assert!(pins
             .iter()
             .any(|pin| pin.key == "util-linux-libs-x86-64-source"));
+    }
+
+    #[test]
+    fn ostree_pins_cli_surface_is_exact_and_tab_separated() {
+        let pins = td_recipe::ostree_pins::all();
+        assert_eq!(pins.len(), 2);
+        for pin in pins {
+            let line = format_ostree_pin(&pin);
+            let fields: Vec<&str> = line.split('\t').collect();
+            assert_eq!(fields.len(), 14, "{line}");
+            assert_eq!(fields.first(), Some(&pin.key.as_str()));
+            assert_eq!(fields.get(3), Some(&pin.commit.as_str()));
+            assert_eq!(fields.get(4), Some(&pin.content.as_str()));
+            assert_eq!(fields.get(6), Some(&pin.cache.as_str()));
+            let transfer = format!("observed-transfer-bytes={}", pin.expected.transfer_bytes);
+            assert_eq!(fields.last().copied(), Some(transfer.as_str()));
+        }
     }
 
     #[test]

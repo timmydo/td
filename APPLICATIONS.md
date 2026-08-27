@@ -1172,10 +1172,12 @@ the hierarchy td mounts at `/app`; the platform deploy's `files/` tree is the
 hierarchy td mounts at `/usr`. The bounded importer independently walked the
 same immutable objects. The application graph has 357 unique objects and 480
 paths: 184 directories, 151 regular files and 145 symlinks. Its logical file
-payload is 333,694,837 bytes and its unique object transfer is 125,579,637
+payload is 333,694,837 bytes; its observed unique object transfer was 125,579,637
 bytes. The runtime graph has 14,346 unique objects and 18,196 paths: 1,947
 directories, 13,740 regular files and 2,509 symlinks. Its logical file payload
-is 656,400,310 bytes and its unique object transfer is 241,573,468 bytes. The
+is 656,400,310 bytes; its observed unique object transfer was 241,573,468 bytes.
+Transfer size is capacity evidence, not authority: an upstream archive object
+may be recompressed without changing its authenticated decoded identity. The
 earlier host Flatpak checkout reported five additional nodes (four regular
 files and one symlink), but that scratch checkout was removed before their
 paths were recorded. The cause was not captured; the authenticated object
@@ -1191,13 +1193,13 @@ compared with that uncompressed closure. Both sets of figures exclude every
 related extension. The runtime is shared by every application on the same
 runtime major.
 
-The authenticated object-cache landing is deliberately not called a td package
-landing. Flathub publishes an OSTree repository rather than a stable deploy
-tarball, and invoking the caller's `flatpak` from a recipe would make the
-derivation depend on ambient programs, remote configuration and a mutable ref.
-A locally exported tarball would instead make td its distributor. Neither is
-admissible. The remaining materializer must convert the authenticated cache
-into a marked foreign recipe input before these bytes enter the store.
+The authenticated object cache and plain-tree materializer are deliberately
+not called a td package on their own. Flathub publishes an OSTree repository
+rather than a stable deploy tarball, and invoking the caller's `flatpak` from a
+recipe would make the derivation depend on ambient programs, remote
+configuration and a mutable ref. A locally exported tarball would instead make
+td its distributor. Neither is admissible. The typed recipe pin and marked
+recursive-store admission below are what turn the exact graph into a td input.
 
 The importer contract is narrower than Flatpak:
 
@@ -1355,9 +1357,59 @@ no-follow timestamp setter; recursive store interning ignores timestamps and
 the deterministic image writer restamps every node, so they are not artifact
 authority. The real Firefox and runtime caches materialize with exactly the
 357/14,346 object, 480/18,196 path and decoded-byte counts recorded above.
-Typed recipe pins, automatic warming and recursive store admission remain the
-next E1b increment; the CLI alone does not make an arbitrary cache a recipe
-input.
+
+**Typed recipe pins, automatic warming and marked store admission have
+LANDED.** `OstreePin` is a separate recipe type rather than a multi-object
+deploy disguised as a tarball `SourcePin`. Each pin records the upstream HTTPS
+repository, exact ref, commit and content checksums, reviewed Flathub signing
+fingerprint, cache identity, the permanent structural and decoded graph counts,
+and the observed transfer counts above. The
+fingerprint records the pin-review decision; build-time authority starts at the
+reviewed checksums and does not claim to repeat OpenPGP verification. Both the
+Firefox and Freedesktop source pins carry the foreign mark, and the mark
+propagates separately to their recipe outputs.
+
+`td-recipe-eval warm TARGET` now surveys exact graph caches alongside ordinary
+fixed-output sources and crate closures. A cold graph invokes the existing
+`td-feed warm ostree` command with only the compiled pin fields and a
+pin-specific destination under `$HOME/.td/ostree`. Explicit warm reauthenticates
+every selected exact graph offline and lets `td-feed` repair a missing or corrupt
+object. Automatic operator warming does the same for a marker-complete cache
+until that pin has been admitted. Thus a matching owner record and graph
+manifest suppress network work, but are not accepted as proof that the object
+bytes remain intact.
+
+Recipe preparation invokes the control-plane materializer, reauthenticates the
+complete object graph, compares its structural and decoded accounting with the
+pin, and recursively interns the resulting plain tree under the compiled
+seed-digest table before any recipe step runs. Observed transfer bytes are
+reported but deliberately not compared. After the compiled store basename gate
+passes, an atomic admission receipt binds every pin field and that basename. A
+retained store tree skips repeat materialization only while that exact receipt
+exists; changing the ref, commit, content, fingerprint, cache identity or
+accounting forces reauthentication even when the canonical `files/` tree and
+store basename are unchanged. The temporary materialized deploy is removed
+after store admission. The source inputs are absent from command-visible maps
+and mounted as no-exec data. Their two mesboot recipes contain only native
+`CopyTree` steps, so no imported executable runs during admission or package
+assembly.
+
+These roughly 1 GB external graphs do not register routine `RecipeCheck`
+bodies: the ordinary offline gate must not depend on an operator's mutable
+Flathub cache. Permanent tests cover typed pin propagation, authority receipts,
+warm repair selection, importer bounds and materializer behavior; the complete
+real-graph admissions and package builds are recorded landing evidence.
+
+The admitted source paths are
+`40asdrhyln3x194j276abhb2j2i7a04z-firefox-154-source` and
+`cgynxza1vd3h30gd4hjl7vp82hdqlyj3-freedesktop-platform-25-08-source`.
+Production `build-run` proofs created the marked package outputs
+`nar1h76vz8frc9krqi66glm45nrk9l5r-firefox-154.0` and
+`38kv5wnj4g55h8hplbf3f0hyrwzmhl2l-freedesktop-platform-25-08-25.08`.
+These are package trees only: Firefox intentionally has no manifest, launcher,
+permission policy or compiled jail spec until the dynamic package validator
+and runtime assembly land together. Therefore this increment cannot make the
+browser launchable by itself.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
@@ -6966,7 +7018,7 @@ The experiments that settle what is left, none longer than a week:
 | # | experiment | settles |
 |---|---|---|
 | **E1 — package half answered (§B.3.1)** | inspect the signed Firefox 154.0 and Freedesktop 25.08 deploy commits without executing the app; map their exact `files/` trees to `/app` and `/usr` | the deploy hierarchy is the right package/runtime split and has no special or setid files. Publisher estimates total 993.7 MB deployed and 382.7 MB downloaded; the bounded importer records exact authenticated graph totals separately. Execution waits on the dynamic-runtime/jail, bus and Wayland stop line rather than using host `bwrap` as a substitute for td-jail |
-| **E1b — acquisition and deploy materialization landed; typed recipe admission remains** | fetch and materialize the same exact signed Flathub commits through a bounded control-plane importer | Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication, transactional cache publication and transactional `files/` reconstruction are landed and exercised against both pins. Typed recipe pins, automatic warming and recursive store admission remain. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract |
+| **E1b — COMPLETE** | fetch, materialize and admit the same exact signed Flathub commits through a bounded control-plane importer | Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication and repair, transactional cache publication, transactional `files/` reconstruction, typed recipe pins, automatic warming and marked recursive store admission are landed and exercised against both pins. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract; dynamic runtime validation and jail integration are the next application increments |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
 | **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000`, with active membership and exact controller readback gating the QEMU oracle | §P's mechanism works on the target kernel |

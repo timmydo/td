@@ -14,6 +14,7 @@ pub mod catalog;
 // `td_recipe::json::` paths are unchanged.
 pub use td_engine::json;
 pub mod ladder;
+pub mod ostree_pins;
 #[cfg(test)]
 pub mod permissions {
     pub use td_engine::permissions::*;

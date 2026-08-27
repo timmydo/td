@@ -608,6 +608,44 @@ pub struct SourcePin {
     foreign: bool,
 }
 
+/// One exact OSTree deploy graph reviewed as a foreign prebuilt payload.
+///
+/// Unlike `SourcePin`, this is not one URL whose response is the payload. The
+/// commit and content checksums authenticate a bounded graph below `repository`,
+/// while `exact_ref` binds the graph's signed metadata to its reviewed role.
+/// `cache` is only a host cache identity; it is permanently bound to the other
+/// fields by td-net's ownership record and carries no artifact authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OstreePin {
+    pub key: String,
+    pub repository: String,
+    pub exact_ref: String,
+    pub commit: String,
+    pub content: String,
+    pub signing_key_fingerprint: String,
+    pub cache: String,
+    pub expected: OstreeGraphStats,
+    pub(crate) foreign: bool,
+}
+
+/// Reviewed accounting for one exact OSTree `files/` graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OstreeGraphStats {
+    pub objects: usize,
+    pub paths: usize,
+    pub directories: usize,
+    pub regular_files: usize,
+    pub symlinks: usize,
+    pub decoded_bytes: u64,
+    pub transfer_bytes: u64,
+}
+
+impl OstreePin {
+    pub fn foreign(&self) -> bool {
+        self.foreign
+    }
+}
+
 impl SourcePin {
     pub fn new(key: &str, url: &str, sha256: &str, file: &str) -> SourcePin {
         SourcePin {
@@ -1063,6 +1101,10 @@ pub struct Recipe {
     /// consume these; the build JSON deliberately omits them because `sourceInput`
     /// is the staged input key the builder already understands.
     pub source_pins: Option<Vec<SourcePin>>,
+    /// Exact multi-object OSTree deploy pins. Like `source_pins`, these are
+    /// recipe-evaluator metadata and are omitted from build JSON; only the
+    /// aggregate/source-specific foreign marks cross that boundary.
+    pub ostree_pins: Option<Vec<OstreePin>>,
     /// Repo-relative path to the committed Cargo.lock that pins this rust recipe's
     /// crate closure. Under `build-plan --auto` the builder verifies every vendored
     /// `.crate` against this lock's checksums before admitting the closure — the
@@ -1148,6 +1190,7 @@ impl Recipe {
             features: None,
             checks: None,
             source_pins: None,
+            ostree_pins: None,
             cargo_lock: None,
             replace_cargo_lock: None,
             cargo_git_sources: None,
@@ -1192,6 +1235,7 @@ impl Recipe {
     pub fn native_inputs(mut self, xs: &[&str]) -> Recipe {
         self.native_inputs = Some(vs(xs));
         self.add_source_pins_for_keys(xs.iter().copied());
+        self.add_ostree_pins_for_keys(xs.iter().copied());
         self
     }
     /// Declare DATA inputs — see `Recipe::payload_inputs`. A path named here is
@@ -1229,6 +1273,7 @@ impl Recipe {
     pub fn source_input(mut self, key: &str) -> Recipe {
         self.source_input = Some(key.into());
         self.add_source_pin_for_key(key);
+        self.add_ostree_pin_for_key(key);
         self
     }
     pub fn inputs(mut self, xs: &[&str]) -> Recipe {
@@ -1242,12 +1287,14 @@ impl Recipe {
         }
         self.inputs = Some(inputs);
         self.add_source_pins_for_keys(xs.iter().copied());
+        self.add_ostree_pins_for_keys(xs.iter().copied());
         self
     }
     /// Owned-string variant of `inputs`, for `ladder::mesboot0_inputs(...)` which
     /// assembles the extras + MESBOOT0_TOOLS list at runtime.
     pub fn inputs_owned(mut self, xs: Vec<String>) -> Recipe {
         self.add_source_pins_for_keys(xs.iter().map(String::as_str));
+        self.add_ostree_pins_for_keys(xs.iter().map(String::as_str));
         let mut inputs = xs;
         if let Some(sources) = &self.cargo_git_sources {
             for source in sources {
@@ -1371,6 +1418,21 @@ impl Recipe {
         }
     }
 
+    fn add_ostree_pin_for_key(&mut self, key: &str) {
+        if let Some(pin) = crate::ostree_pins::by_key(key) {
+            self.push_ostree_pin(pin);
+        }
+    }
+
+    fn add_ostree_pins_for_keys<'a, I>(&mut self, keys: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        for key in keys {
+            self.add_ostree_pin_for_key(key);
+        }
+    }
+
     fn push_source_pin(&mut self, pin: SourcePin) {
         let pins = self.source_pins.get_or_insert_with(Vec::new);
         if let Some(existing) = pins.iter_mut().find(|existing| existing.key == pin.key) {
@@ -1378,6 +1440,15 @@ impl Recipe {
             // would not be. Two pins under one key disagreeing about §B.8's
             // answer is a conflict either order could hide, so the taint sticks
             // to the pin that is kept.
+            existing.foreign |= pin.foreign();
+            return;
+        }
+        pins.push(pin);
+    }
+
+    fn push_ostree_pin(&mut self, pin: OstreePin) {
+        let pins = self.ostree_pins.get_or_insert_with(Vec::new);
+        if let Some(existing) = pins.iter_mut().find(|existing| existing.key == pin.key) {
             existing.foreign |= pin.foreign();
             return;
         }
@@ -1400,6 +1471,10 @@ impl Recipe {
         self.source_pins
             .as_ref()
             .is_some_and(|pins| pins.iter().any(|pin| pin.foreign()))
+            || self
+                .ostree_pins
+                .as_ref()
+                .is_some_and(|pins| pins.iter().any(|pin| pin.foreign()))
     }
 
     /// Whether `source_input` itself resolves to a foreign pin. A recipe may be
@@ -1415,6 +1490,10 @@ impl Recipe {
         self.source_pins
             .as_ref()
             .is_some_and(|pins| pins.iter().any(|pin| pin.key == canonical && pin.foreign()))
+            || self
+                .ostree_pins
+                .as_ref()
+                .is_some_and(|pins| pins.iter().any(|pin| pin.key == *source && pin.foreign()))
     }
 
     /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake"/"stage0").
@@ -1808,7 +1887,10 @@ mod tests {
         // the KEY rather than matched as text: a check-script body containing the
         // word would otherwise false-red it.
         for (stem, recipe) in crate::catalog::all() {
-            if stem == "ripgrep-seed" {
+            if matches!(
+                stem,
+                "ripgrep-seed" | "firefox" | "freedesktop-platform-25-08"
+            ) {
                 assert!(recipe.to_json().get("foreign").is_some());
                 assert!(recipe.to_json().get("foreignSource").is_some());
                 continue;
@@ -1846,6 +1928,26 @@ mod tests {
         // other recipes' outputs.
         assert!(Recipe::gnu("x", "1").native_inputs(&["gcc"]).source_pins.is_none());
         assert!(Recipe::gnu("x", "1").inputs(&["gcc"]).source_pins.is_none());
+    }
+
+    #[test]
+    fn both_tool_channels_attach_the_ostree_pin_they_will_refuse() {
+        for recipe in [
+            Recipe::gnu("x", "1").inputs(&["firefox-154-source"]),
+            Recipe::gnu("x", "1").native_inputs(&["firefox-154-source"]),
+            Recipe::gnu("x", "1").inputs_owned(vec!["firefox-154-source".into()]),
+        ] {
+            let pins = recipe
+                .ostree_pins
+                .as_ref()
+                .expect("the classified OSTree pin is attached");
+            assert_eq!(pins.len(), 1);
+            assert_eq!(
+                pins.first().map(|pin| pin.key.as_str()),
+                Some("firefox-154-source")
+            );
+            assert!(recipe.is_foreign());
+        }
     }
 
     // The wire contract builder::build::run_mesboot dispatches on ("mesBoot"
