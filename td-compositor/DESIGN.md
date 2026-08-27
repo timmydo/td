@@ -1894,6 +1894,19 @@ compositor exits while a launched child is still live, its readiness socket
 may remain until logout clears the runtime-directory tmpfs. Names carry the
 compositor pid, so that residual path cannot block a later compositor.
 
+The application-window observer is optional and configured only by the paired
+`--application-ready-socket` and `--application-app-id` arguments. It is
+refused without the paired launcher application, and its socket path must be
+an absolute path whose resolved parent and final name differ from the Wayland
+socket, so the ordinary compositor listener cannot answer its probe before a
+window exists. Both resolved endpoints are retained after validation rather
+than following a mutable parent symlink again. The expected id is at most 128
+ASCII letters, digits, dots, underscores, or hyphens, keeping the diagnostic
+one unambiguous field. `probe-application` connects to that distinct socket.
+A publisher failure exits the compositor for its existing `restart=always`
+supervisor to reconstruct the one-shot observer; losing stdout after the
+socket is live reports an error but does not retract readiness.
+
 The one supported output owns workspaces 1 through 9. Each workspace owns an
 n-ary split tree whose leaves are mapped XDG toplevels. A new toplevel is
 inserted after the focused leaf, in the container that DIRECTLY holds it,
@@ -1954,9 +1967,19 @@ ask, so one that drops a title may never see another. It is bounded at 256
 CHARACTERS — a client's string in a map that outlives the request, and counted
 in characters rather than bytes so truncation cannot split a UTF-8 sequence.
 An empty title is stored as NO title, so what draws one has a single absent
-case rather than two that look identical on screen. `set_app_id` is still read
-for wire validity and dropped; it is not what names a window, and storing both
-would make them indistinguishable downstream. Setting a title does not repaint
+case rather than two that look identical on screen. `set_app_id` does not name
+or decorate a window. When the compositor is given one expected application
+id and a readiness-socket path, the request is compared at the wire boundary
+without retaining client text. A matching surface key is held only until the
+configured application's first successfully painted mapped toplevel wakes a
+capacity-one channel. A dedicated thread then publishes the mode-0600 socket;
+before that commit the path does not exist. The match must precede the commit;
+a later app id cannot bless a mapped scene whose framebuffer paint may have
+failed. Replacing an id before mapping clears the candidate. The socket is
+boot evidence, not application identity: app ids are client assertions, and
+the image's authenticated launch and sole selected application provide the
+attribution around this behavioral observation. Setting a title does not
+repaint
 by itself — a client that puts its progress or its filename in its title would
 otherwise repaint the whole screen per keystroke — so a renamed window shows
 its new name at the next repaint anything else asks for.

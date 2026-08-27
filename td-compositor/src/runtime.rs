@@ -353,6 +353,10 @@ pub struct Runtime {
     /// here instead of exposing a parent frame before its synchronized
     /// children.
     compound_settle: Option<CompoundSettle>,
+    /// One configured application-window oracle. App ids are compared at the
+    /// request boundary and only matching surface keys are retained; a client
+    /// string never becomes compositor state.
+    application_ready: Option<ApplicationReady>,
     /// The window a press picked up, held until the button is released.
     /// Nothing in the pointer model carries it: neither press a drag begins
     /// with is delivered, so no client is told any of this.
@@ -364,6 +368,14 @@ struct CompoundSettle {
     paint: bool,
     focus: bool,
     layout_changed: bool,
+    application_ready: bool,
+}
+
+struct ApplicationReady {
+    expected_app_id: String,
+    candidates: BTreeSet<SurfaceKey>,
+    wake: SyncSender<()>,
+    published: bool,
 }
 
 /// How far the pointer must leave the press point, on either axis, before a
@@ -421,8 +433,26 @@ impl Runtime {
             toplevel_parents: BTreeMap::new(),
             pending_paint: false,
             compound_settle: None,
+            application_ready: None,
             dragging: None,
         }
+    }
+
+    pub(crate) fn watch_application(
+        &mut self,
+        expected_app_id: String,
+        wake: SyncSender<()>,
+    ) -> Result<(), String> {
+        if self.application_ready.is_some() {
+            return Err("application-window observer is already configured".to_string());
+        }
+        self.application_ready = Some(ApplicationReady {
+            expected_app_id,
+            candidates: BTreeSet::new(),
+            wake,
+            published: false,
+        });
+        Ok(())
     }
 
     pub(crate) fn set_launcher_application(&mut self, application: bool) {
@@ -521,6 +551,7 @@ impl Runtime {
         let mut layout_changed = false;
         let mut painted = false;
         let mut aimed = false;
+        let attached = surface.is_some();
         if let Some(surface) = surface {
             let parent = self.toplevel_parent(key);
             layout_changed = self.scene.commit_parented(key, surface, parent)?;
@@ -533,7 +564,11 @@ impl Runtime {
             painted |= self.crop_shows(key, geometry);
         }
         if painted {
-            return self.settle(layout_changed);
+            self.settle(layout_changed)?;
+            if attached {
+                self.application_window_mapped(key)?;
+            }
+            return Ok(());
         }
         if aimed {
             return self.refresh_focus();
@@ -863,6 +898,11 @@ impl Runtime {
         if layout_changed && self.refresh_layout() {
             self.publish_layout();
         }
+        if failures.is_empty() && compound.application_ready {
+            if let Err(error) = self.publish_application_ready() {
+                failures.push(error);
+            }
+        }
         if failures.is_empty() {
             Ok(())
         } else {
@@ -921,6 +961,59 @@ impl Runtime {
         Ok(())
     }
 
+    /// Compare an xdg_toplevel app id with the configured boot oracle without
+    /// retaining client text. The match must precede the observed commit, so a
+    /// failed paint cannot later be mistaken for a presented window merely
+    /// because the surface remains mapped in the scene model.
+    pub fn set_application_id(&mut self, key: SurfaceKey, app_id: &str) -> Result<(), String> {
+        let Some(ready) = self.application_ready.as_mut() else {
+            return Ok(());
+        };
+        if ready.published {
+            return Ok(());
+        }
+        if ready.expected_app_id == app_id {
+            ready.candidates.insert(key);
+        } else {
+            ready.candidates.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn application_window_mapped(&mut self, key: SurfaceKey) -> Result<(), String> {
+        let matching = self
+            .application_ready
+            .as_ref()
+            .is_some_and(|ready| !ready.published && ready.candidates.contains(&key));
+        if !matching {
+            return Ok(());
+        }
+        if let Some(compound) = self.compound_settle.as_mut() {
+            compound.application_ready = true;
+            return Ok(());
+        }
+        self.publish_application_ready()
+    }
+
+    fn publish_application_ready(&mut self) -> Result<(), String> {
+        let Some(ready) = self.application_ready.as_mut() else {
+            return Ok(());
+        };
+        if ready.published {
+            return Ok(());
+        }
+        match ready.wake.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {
+                ready.published = true;
+                ready.candidates.clear();
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(())) => {
+                Err("application-window observer stopped before publication".to_string())
+            }
+        }
+    }
+
     /// Whether the surface has committed pixels. Asked by the decoration
     /// manager, which owes `unconfigured_buffer` to a client that maps a window
     /// and then asks for decorations: the attached-but-uncommitted half of that
@@ -934,9 +1027,13 @@ impl Runtime {
         self.scene.focused()
     }
 
-    /// The xdg_toplevel went. Its wl_surface may not have.
-    pub fn forget_title(&mut self, key: SurfaceKey) -> Result<(), String> {
+    /// The xdg_toplevel went. Its wl_surface may not have; neither the title
+    /// nor an observed app-id candidate belongs to a future role object.
+    pub fn forget_toplevel_state(&mut self, key: SurfaceKey) -> Result<(), String> {
         self.scene.forget_title(key);
+        if let Some(ready) = self.application_ready.as_mut() {
+            ready.candidates.remove(&key);
+        }
         Ok(())
     }
 
@@ -959,6 +1056,9 @@ impl Runtime {
     // `unmap_popup`'s reason above.
     pub fn remove(&mut self, key: SurfaceKey) -> Result<Vec<SurfaceKey>, String> {
         self.forget_drag(|dragged| dragged == key);
+        if let Some(ready) = self.application_ready.as_mut() {
+            ready.candidates.remove(&key);
+        }
         let reparented = self.reparent_around_unmap(key);
         self.forget_foreign_surface(key);
         let (mut layout_changed, dropped) = self.scene.remove(key);
@@ -982,6 +1082,9 @@ impl Runtime {
 
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
         self.forget_drag(|dragged| dragged.client == client);
+        if let Some(ready) = self.application_ready.as_mut() {
+            ready.candidates.retain(|key| key.client != client);
+        }
         let reparented = self.reparent_around_client(client);
         self.forget_foreign_client(client);
         let mut layout_changed = self.scene.remove_client(client);
@@ -3088,6 +3191,7 @@ mod tests {
                 paint: false,
                 focus: false,
                 layout_changed: false,
+                application_ready: false,
             })
         ));
         runtime.finish_compound_commit().unwrap();
@@ -8092,6 +8196,173 @@ mod tests {
         runtime.fail_next_repaint();
         assert!(runtime.help(HelpAction::Close).is_err());
         assert!(runtime.help_visible());
+    }
+
+    #[test]
+    fn application_window_wakes_only_after_a_matching_successful_map() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-ready-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application("org.mozilla.firefox".to_string(), wake)
+            .unwrap();
+        let key = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+
+        // Replacing the matching id before pixels arrive removes the
+        // candidate. Neither the in-progress compound commit nor its settle
+        // may wake the observer.
+        runtime
+            .set_application_id(key, "org.mozilla.firefox")
+            .unwrap();
+        runtime.set_application_id(key, "something.else").unwrap();
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .apply_commit(key, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        // A later exact id does not retroactively bless the prior commit.
+        runtime
+            .set_application_id(key, "org.mozilla.firefox")
+            .unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .apply_commit(key, Some(surface([4, 5, 6, 0])), None, None)
+            .unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Ok(()));
+        assert!(runtime
+            .application_ready
+            .as_ref()
+            .unwrap()
+            .candidates
+            .is_empty());
+        runtime
+            .set_application_id(
+                SurfaceKey {
+                    client: 10,
+                    object: 14,
+                },
+                "org.mozilla.firefox",
+            )
+            .unwrap();
+        assert!(runtime
+            .application_ready
+            .as_ref()
+            .unwrap()
+            .candidates
+            .is_empty());
+    }
+
+    #[test]
+    fn every_toplevel_teardown_path_clears_application_candidates() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-teardown-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application("org.mozilla.firefox".to_string(), wake)
+            .unwrap();
+        let role = SurfaceKey {
+            client: 1,
+            object: 11,
+        };
+        let removed_surface = SurfaceKey {
+            client: 2,
+            object: 12,
+        };
+        let client = SurfaceKey {
+            client: 3,
+            object: 13,
+        };
+        for key in [role, removed_surface, client] {
+            runtime
+                .set_application_id(key, "org.mozilla.firefox")
+                .unwrap();
+        }
+
+        runtime.forget_toplevel_state(role).unwrap();
+        runtime.remove(removed_surface).unwrap();
+        runtime.remove_client(client.client).unwrap();
+        for key in [role, removed_surface, client] {
+            runtime.begin_compound_commit().unwrap();
+            runtime
+                .apply_commit(key, Some(surface([1, 2, 3, 0])), None, None)
+                .unwrap();
+            runtime.finish_compound_commit().unwrap();
+        }
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        let live = SurfaceKey {
+            client: 4,
+            object: 14,
+        };
+        runtime
+            .set_application_id(live, "org.mozilla.firefox")
+            .unwrap();
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .apply_commit(live, Some(surface([4, 5, 6, 0])), None, None)
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn failed_compound_paint_does_not_publish_an_application_window() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-failed-paint-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application("org.mozilla.firefox".to_string(), wake)
+            .unwrap();
+        let key = SurfaceKey {
+            client: 9,
+            object: 13,
+        };
+        runtime
+            .set_application_id(key, "org.mozilla.firefox")
+            .unwrap();
+
+        runtime.fail_next_repaint();
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .apply_commit(key, Some(surface([4, 5, 6, 0])), None, None)
+            .unwrap();
+        assert!(runtime.finish_compound_commit().is_err());
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        // A later successful frame retries the still-live observation.
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .apply_commit(key, Some(surface([7, 8, 9, 0])), None, None)
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Ok(()));
     }
 
     #[test]

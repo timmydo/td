@@ -49,7 +49,9 @@ const MAX_HELD_KEYS: usize = 256;
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
      --launcher-client PATH [--launcher-application NAME --launcher-runtime PATH] \
-     --terminal-client PATH | td-compositor probe SOCKET | td-compositor terminfo PATH | \
+     --terminal-client PATH [--application-ready-socket PATH --application-app-id ID] | \
+     td-compositor probe SOCKET | td-compositor probe-application SOCKET | \
+     td-compositor terminfo PATH | \
      td-compositor selftest"
         .into()
 }
@@ -150,6 +152,8 @@ struct RunOptions {
     launcher_application: Option<String>,
     launcher_runtime: Option<PathBuf>,
     terminal_client: PathBuf,
+    application_ready_socket: Option<PathBuf>,
+    application_app_id: Option<String>,
 }
 
 fn parse_run(args: &[String]) -> Result<RunOptions, String> {
@@ -160,6 +164,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut launcher_application = None;
     let mut launcher_runtime = None;
     let mut terminal_client = None;
+    let mut application_ready_socket = None;
+    let mut application_app_id = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args
@@ -184,8 +190,15 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--terminal-client" if terminal_client.is_none() => {
                 terminal_client = Some(PathBuf::from(value))
             }
+            "--application-ready-socket" if application_ready_socket.is_none() => {
+                application_ready_socket = Some(PathBuf::from(value))
+            }
+            "--application-app-id" if application_app_id.is_none() => {
+                application_app_id = Some(value.clone())
+            }
             "--framebuffer" | "--input" | "--socket" | "--launcher-client"
-            | "--launcher-application" | "--launcher-runtime" | "--terminal-client" => {
+            | "--launcher-application" | "--launcher-runtime" | "--terminal-client"
+            | "--application-ready-socket" | "--application-app-id" => {
                 return Err(format!("duplicate flag '{flag}'"));
             }
             _ => return Err(format!("unrecognised argument '{flag}'")),
@@ -197,10 +210,31 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--launcher-application and --launcher-runtime must be supplied together".into(),
         );
     }
+    if application_ready_socket.is_some() != application_app_id.is_some() {
+        return Err(
+            "--application-ready-socket and --application-app-id must be supplied together"
+                .into(),
+        );
+    }
+    if application_ready_socket.is_some() && launcher_application.is_none() {
+        return Err("application-window readiness requires a launcher application".into());
+    }
+    let mut socket = socket.ok_or_else(|| "--socket is required".to_string())?;
+    if let Some(ready) = application_ready_socket.as_mut() {
+        let resolved_wayland = resolve_socket_endpoint(&socket, "Wayland")?;
+        let resolved_ready = resolve_socket_endpoint(ready, "application-window readiness")?;
+        if resolved_ready == resolved_wayland {
+            return Err("application-window readiness must not alias the Wayland socket".into());
+        }
+        // Retain the resolved endpoints, not a mutable symlink spelling that
+        // could name a different parent between this check and either bind.
+        socket = resolved_wayland;
+        *ready = resolved_ready;
+    }
     Ok(RunOptions {
         framebuffer: framebuffer.ok_or_else(|| "--framebuffer is required".to_string())?,
         input: input.ok_or_else(|| "--input is required".to_string())?,
-        socket: socket.ok_or_else(|| "--socket is required".to_string())?,
+        socket,
         launcher_client: launcher_client
             .ok_or_else(|| "--launcher-client is required".to_string())?,
         launcher_application,
@@ -210,7 +244,24 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         // is worse than one that never appeared.
         terminal_client: terminal_client
             .ok_or_else(|| "--terminal-client is required".to_string())?,
+        application_ready_socket,
+        application_app_id,
     })
+}
+
+fn resolve_socket_endpoint(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} socket path must be absolute"));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{label} socket path has no final name"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} socket path has no parent directory"))?;
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("resolve {label} socket parent {}: {error}", parent.display()))?;
+    Ok(parent.join(name))
 }
 
 fn run_compositor(options: RunOptions) -> Result<(), String> {
@@ -218,6 +269,14 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     let geometry = (framebuffer.width, framebuffer.height, framebuffer.stride);
     let mut runtime = Runtime::new(framebuffer);
     runtime.set_launcher_application(options.launcher_application.is_some());
+    if let Some((path, app_id)) = options
+        .application_ready_socket
+        .as_deref()
+        .zip(options.application_app_id.as_deref())
+    {
+        let wake = server::watch_application(path, app_id)?;
+        runtime.watch_application(app_id.to_string(), wake)?;
+    }
     let runtime = Arc::new(Mutex::new(runtime));
     runtime
         .lock()
@@ -306,6 +365,13 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err(usage());
             }
             server::probe(Path::new(socket))
+        }
+        "probe-application" => {
+            let socket = args.get(1).ok_or_else(usage)?;
+            if args.get(2).is_some() {
+                return Err(usage());
+            }
+            server::probe_application(Path::new(socket))
         }
         // The build step that installs the entry; the shipped binary is the
         // only encoder, so nothing can compile a second, divergent copy.
@@ -1035,23 +1101,48 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
 
     #[test]
     fn run_parser_requires_every_device_boundary() {
-        let options = super::parse_run(&[
-            "--framebuffer".into(),
-            "/dev/fb0".into(),
-            "--input".into(),
-            "/dev/input".into(),
-            "--socket".into(),
-            "/run/user/1000/wayland-0".into(),
-            "--launcher-client".into(),
-            "/bin/td-jail-fixture".into(),
-            "--launcher-application".into(),
-            "td-jail-fixture".into(),
-            "--launcher-runtime".into(),
-            "/run/user/1000/td-app".into(),
-            "--terminal-client".into(),
-            "/bin/td-term".into(),
-        ])
-        .unwrap();
+        use std::os::unix::fs::symlink;
+        use std::path::Path;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "td-compositor-parser-{}-{nonce}",
+            std::process::id()
+        ));
+        let actual = root.join("actual");
+        let alias = root.join("alias");
+        std::fs::create_dir_all(&actual).unwrap();
+        symlink(&actual, &alias).unwrap();
+        let wayland = actual.join("wayland-0");
+        let ready = actual.join("firefox-window-ready");
+        let valid = |socket: &Path, ready: &Path| {
+            vec![
+                "--framebuffer".into(),
+                "/dev/fb0".into(),
+                "--input".into(),
+                "/dev/input".into(),
+                "--socket".into(),
+                socket.to_string_lossy().into_owned(),
+                "--launcher-client".into(),
+                "/bin/td-jail-fixture".into(),
+                "--launcher-application".into(),
+                "td-jail-fixture".into(),
+                "--launcher-runtime".into(),
+                "/run/user/1000/td-app".into(),
+                "--terminal-client".into(),
+                "/bin/td-term".into(),
+                "--application-ready-socket".into(),
+                ready.to_string_lossy().into_owned(),
+                "--application-app-id".into(),
+                "org.mozilla.firefox".into(),
+            ]
+        };
+        let options = super::parse_run(&valid(&wayland, &ready)).unwrap();
+        let resolved_parent = std::fs::canonicalize(&actual).unwrap();
         assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
         assert_eq!(
             options.launcher_client,
@@ -1066,6 +1157,15 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             options.terminal_client,
             std::path::PathBuf::from("/bin/td-term")
         );
+        assert_eq!(options.socket, resolved_parent.join("wayland-0"));
+        assert_eq!(
+            options.application_ready_socket,
+            Some(resolved_parent.join("firefox-window-ready"))
+        );
+        assert_eq!(
+            options.application_app_id.as_deref(),
+            Some("org.mozilla.firefox")
+        );
         // Each boundary is required on its own, so dropping any ONE is refused
         // rather than defaulted — a launcher entry that spawns nothing is
         // worse than one that never appeared.
@@ -1078,6 +1178,50 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "/run/user/1000/wayland-0".into(),
             "--launcher-client".into(),
             "/bin/td-ui-demo".into(),
+        ])
+        .is_err());
+        assert!(super::parse_run(&valid(
+            &wayland,
+            &actual.join(".").join("wayland-0")
+        ))
+        .is_err());
+        assert!(super::parse_run(&valid(&wayland, &alias.join("wayland-0"))).is_err());
+        // The observer is meaningful only as one exact pair around a
+        // configured application launch.
+        assert!(super::parse_run(&[
+            "--framebuffer".into(),
+            "/dev/fb0".into(),
+            "--input".into(),
+            "/dev/input".into(),
+            "--socket".into(),
+            "/run/user/1000/wayland-0".into(),
+            "--launcher-client".into(),
+            "/bin/td-jail-fixture".into(),
+            "--launcher-application".into(),
+            "td-jail-fixture".into(),
+            "--launcher-runtime".into(),
+            "/run/user/1000/td-app".into(),
+            "--terminal-client".into(),
+            "/bin/td-term".into(),
+            "--application-ready-socket".into(),
+            "/run/user/1000/application-ready".into(),
+        ])
+        .is_err());
+        assert!(super::parse_run(&[
+            "--framebuffer".into(),
+            "/dev/fb0".into(),
+            "--input".into(),
+            "/dev/input".into(),
+            "--socket".into(),
+            "/run/user/1000/wayland-0".into(),
+            "--launcher-client".into(),
+            "/bin/td-ui-demo".into(),
+            "--terminal-client".into(),
+            "/bin/td-term".into(),
+            "--application-ready-socket".into(),
+            "/run/user/1000/application-ready".into(),
+            "--application-app-id".into(),
+            "org.td.demo".into(),
         ])
         .is_err());
         assert!(super::parse_run(&[
@@ -1138,5 +1282,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "/run/user/1000/wayland-0".into(),
         ])
         .is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

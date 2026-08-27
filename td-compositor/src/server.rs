@@ -29,7 +29,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -5861,7 +5861,7 @@ impl Client {
                     self.runtime
                         .lock()
                         .map_err(|_| "runtime lock poisoned".to_string())?
-                        .forget_title(SurfaceKey {
+                        .forget_toplevel_state(SurfaceKey {
                             client: self.id,
                             object: surface,
                         })?;
@@ -5890,9 +5890,8 @@ impl Client {
                     args.finish()?;
                     self.set_local_parent(message.object, xdg_surface, parent)
                 }
-                // set_title. Kept, where set_app_id below is still read for
-                // wire validity and dropped: the title is what a title bar
-                // shows, and an app id is not.
+                // set_title. The title is retained for decoration; app_id
+                // below is compared only with the configured readiness oracle.
                 2 => {
                     let title = args.string()?;
                     args.finish()?;
@@ -5916,8 +5915,26 @@ impl Client {
                         )
                 }
                 3 => {
-                    args.string()?;
-                    args.finish()
+                    let app_id = args.string()?;
+                    args.finish()?;
+                    let Some(Object::XdgSurface { surface, .. }) =
+                        self.objects.get(&xdg_surface).cloned()
+                    else {
+                        return Err(format!(
+                            "xdg_toplevel {} lost xdg_surface {xdg_surface}",
+                            message.object
+                        ));
+                    };
+                    self.runtime
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .set_application_id(
+                            SurfaceKey {
+                                client: self.id,
+                                object: surface,
+                            },
+                            &app_id,
+                        )
                 }
                 7 | 8 => {
                     args.i32()?;
@@ -6237,6 +6254,78 @@ fn announce(out: &mut impl Write, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("flush Wayland ready marker: {e}"))
 }
 
+fn valid_expected_app_id(app_id: &str) -> bool {
+    !app_id.is_empty()
+        && app_id.len() <= 128
+        && app_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn announce_application_ready(
+    out: &mut impl Write,
+    app_id: &str,
+    path: &Path,
+) -> Result<(), String> {
+    writeln!(
+        out,
+        "TD-APPLICATION-WINDOW-READY app-id={app_id} socket={}",
+        path.display()
+    )
+    .map_err(|error| format!("write application-window ready marker: {error}"))?;
+    out.flush()
+        .map_err(|error| format!("flush application-window ready marker: {error}"))
+}
+
+/// Start the one-shot publisher before clients can connect. Its socket is
+/// deliberately absent until Runtime reports a matching mapped toplevel.
+pub fn watch_application(path: &Path, app_id: &str) -> Result<SyncSender<()>, String> {
+    if !valid_expected_app_id(app_id) {
+        return Err(
+            "expected application app id must be 1..=128 ASCII letters, digits, dots, underscores, or hyphens"
+                .into(),
+        );
+    }
+    socket::remove_stale(path, "application-window readiness")?;
+    let path = path.to_path_buf();
+    let app_id = app_id.to_string();
+    let (wake, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("application-window-ready".into())
+        .spawn(move || {
+            if receiver.recv().is_err() {
+                return;
+            }
+            match socket::publish(&path, "application-ready", Vec::new()) {
+                Ok(published) => {
+                    if let Err(error) = announce_application_ready(
+                        &mut std::io::stdout().lock(),
+                        &app_id,
+                        &path,
+                    ) {
+                        eprintln!("td-compositor: {error}");
+                    }
+                    // The accept-loop thread owns the listener but not this
+                    // unlink guard. Keep it for the compositor's lifetime even
+                    // when stdout disappeared after the socket became live.
+                    let _published = published;
+                    loop {
+                        thread::park();
+                    }
+                }
+                Err(error) => {
+                    eprintln!("td-compositor: application readiness: {error}");
+                    // Runtime has spent its one wake. Restarting the compositor
+                    // is the only way to reconstruct that one-shot state, and
+                    // td-svc already supervises it with restart=always.
+                    std::process::exit(1);
+                }
+            }
+        })
+        .map_err(|error| format!("spawn application-window observer: {error}"))?;
+    Ok(wake)
+}
+
 pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
     let keymap_dir = keymap_directory(path)?.to_path_buf();
     let keymap = keymap_file(&keymap_dir)?;
@@ -6281,6 +6370,17 @@ pub fn probe(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("connect Wayland socket {}: {e}", path.display()))
 }
 
+pub fn probe_application(path: &Path) -> Result<(), String> {
+    UnixStream::connect(path)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "connect application-window readiness socket {}: {error}",
+                path.display()
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     /// The bytes the boot oracle greps, taken from the EMIT rather than from
@@ -6313,6 +6413,53 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn application_socket_is_absent_until_the_one_shot_wakes() {
+        let directory = test_directory("application-window-ready");
+        let path = directory.join("ready");
+        let wake = watch_application(&path, "org.mozilla.firefox").unwrap();
+        assert!(!path.exists());
+        assert!(probe_application(&path).is_err());
+
+        wake.try_send(()).unwrap();
+        let mut connected = false;
+        for _ in 0..200 {
+            if probe_application(&path).is_ok() {
+                connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(connected, "the observer never published its socket");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn application_observer_rejects_marker_injection_and_pins_its_line() {
+        let directory = test_directory("application-window-id");
+        let path = directory.join("ready");
+        for app_id in ["", "bad\nid", "bad value", "bad=value", &"x".repeat(129)] {
+            assert!(watch_application(&path, app_id).is_err());
+        }
+        let mut out = Vec::new();
+        announce_application_ready(&mut out, "org.mozilla.firefox", &path).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "TD-APPLICATION-WINDOW-READY app-id=org.mozilla.firefox socket={}\n",
+                path.display()
+            )
+            .into_bytes()
+        );
+        fs::remove_dir(directory).unwrap();
     }
 
     fn test_keymap() -> KeymapFile {
@@ -8814,7 +8961,7 @@ mod tests {
     /// through `dispatch` rather than calling `Scene::set_title`, because what
     /// broke before was the ARM and not the storage.
     #[test]
-    fn set_title_reaches_the_scene_and_set_app_id_still_does_not() {
+    fn set_title_and_observed_app_id_reach_separate_runtime_state() {
         let stem = format!(
             "td-wayland-set-title-{}-{}",
             std::process::id(),
@@ -8823,7 +8970,12 @@ mod tests {
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
         let framebuffer =
             Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
-        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let mut observed_runtime = Runtime::new(framebuffer);
+        let (wake, ready) = std::sync::mpsc::sync_channel(1);
+        observed_runtime
+            .watch_application("org.td.terminal".to_string(), wake)
+            .unwrap();
+        let runtime = Arc::new(Mutex::new(observed_runtime));
         let key = SurfaceKey {
             client: 88,
             object: 5,
@@ -8871,8 +9023,8 @@ mod tests {
             Some("TD-TERM - BUILD".to_string())
         );
 
-        // set_app_id is still read and dropped: it is not what a title bar
-        // shows, and accepting it here would make the two indistinguishable.
+        // set_app_id remains separate from the title. Its exact match only
+        // makes this surface a candidate for the boot observer.
         let mut app_id = wire::Builder::new();
         app_id.string("org.td.terminal").unwrap();
         client
@@ -8882,6 +9034,25 @@ mod tests {
             runtime.lock().unwrap().title(key),
             Some("TD-TERM - BUILD".to_string())
         );
+        let mut locked = runtime.lock().unwrap();
+        locked.begin_compound_commit().unwrap();
+        locked
+            .apply_commit(
+                key,
+                Some(Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(ready.try_recv().is_err());
+        locked.finish_compound_commit().unwrap();
+        drop(locked);
+        assert_eq!(ready.try_recv(), Ok(()));
 
         // Destroying the TOPLEVEL takes the name, where unmapping its surface
         // does not. The wl_surface outlives the role object, so a toplevel
