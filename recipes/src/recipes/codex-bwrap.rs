@@ -1,4 +1,7 @@
-use crate::ladder::{post_bootstrap_path, split_target_debug, unpack_into, POST_BOOTSTRAP_SH};
+use crate::ladder::{
+    post_bootstrap_path, split_target_debug, unpack_into, CODEX_BWRAP_RECIPE_VERSION,
+    CODEX_BWRAP_VERSION_OUTPUT, POST_BOOTSTRAP_SH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Codex's default Linux sandbox is Bubblewrap, not its deprecated Landlock
@@ -18,7 +21,9 @@ pub fn recipe() -> Recipe {
 
     steps.push(Step::WriteFile {
         path: format!("{source}/config.h"),
-        content: "#pragma once\n#define PACKAGE_STRING \"bubblewrap 0.11.2\"\n".into(),
+        content: format!(
+            "#pragma once\n#define PACKAGE_STRING \"{CODEX_BWRAP_VERSION_OUTPUT}\"\n"
+        ),
         exec: false,
     });
     steps.push(Step::WriteFile {
@@ -121,7 +126,7 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 "version=$('{out}/bin/bwrap' --version 2>&1) || exit 1; \
-                 test \"$version\" = 'bubblewrap 0.11.2' || { echo \"unexpected bwrap version: $version\" >&2; exit 1; }; \
+                 test \"$version\" = \"$TD_EXPECTED_BWRAP_VERSION\" || { echo \"unexpected bwrap version: $version\" >&2; exit 1; }; \
                  help=$('{out}/bin/bwrap' --help 2>&1) || exit 1; \
                  for token in '--as-pid-1' '--argv0' '--perms'; do \
                      printf '%s\\n' \"$help\" | grep -Fq -- \"$token\" || { echo \"bwrap help omits Codex-required $token\" >&2; exit 1; }; \
@@ -142,10 +147,11 @@ pub fn recipe() -> Recipe {
                  done",
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", &post_bootstrap_path())
+        .env("TD_EXPECTED_BWRAP_VERSION", CODEX_BWRAP_VERSION_OUTPUT),
     );
 
-    Recipe::mesboot("codex-bwrap", "0.11.2-codex-0.148.0")
+    Recipe::mesboot("codex-bwrap", CODEX_BWRAP_RECIPE_VERSION)
         .source_input("codex-source")
         .native_inputs(&[
             "libcap-x86-64",
@@ -168,6 +174,7 @@ exec "$TD_RECIPE_EVAL" check-run codex-bwrap 1
 #[cfg(test)]
 mod tests {
     use super::recipe;
+    use crate::ladder::CODEX_BWRAP_VERSION_OUTPUT;
     use crate::types::Step;
 
     #[test]
@@ -260,17 +267,19 @@ mod tests {
             })
             .expect("capability header contract");
         assert!(contract.contains("CAP_LAST_CAP == CAP_CHECKPOINT_RESTORE"));
-        let validation = steps
+        let (validation, validation_env) = steps
             .iter()
             .find_map(|step| match step {
-                Step::Run { argv, .. } if argv.iter().any(|arg| arg.contains("runtime_id=")) => {
-                    argv.get(2)
+                Step::Run { argv, env, .. }
+                    if argv.iter().any(|arg| arg.contains("runtime_id=")) =>
+                {
+                    argv.get(2).map(|validation| (validation, env))
                 }
                 _ => None,
             })
             .expect("realized bwrap validation");
         for required in [
-            "bubblewrap 0.11.2",
+            "TD_EXPECTED_BWRAP_VERSION",
             "--as-pid-1",
             "--argv0",
             "--perms",
@@ -279,6 +288,9 @@ mod tests {
         ] {
             assert!(validation.contains(required), "validation omits {required}");
         }
+        assert!(validation_env.iter().any(|(name, value)| {
+            name == "TD_EXPECTED_BWRAP_VERSION" && value == CODEX_BWRAP_VERSION_OUTPUT
+        }));
         assert_eq!(recipe().checks.as_deref().unwrap_or_default().len(), 1);
     }
 }

@@ -77,6 +77,24 @@ exception rather than retain full variable, type, range, and string payload.
 `.debug_line_str` remains. This policy does not claim that an external reader
 can resolve every retained line row: the producer check does not inspect each
 line-table string form. The resulting companion has a 256-MiB file ceiling.
+The marker is exactly these seven LF-terminated rows, in this order, with no
+trailing section or content:
+
+```text
+format=1
+output=<recipe output name>
+runtime=<canonical relative runtime path>
+reader_ceiling_bytes=<td-profiler line-section ceiling>
+admitted_ceiling_bytes=<exception line-section ceiling>
+companion_ceiling_bytes=<exception companion ceiling>
+reason=<nonempty reviewed reason>
+```
+
+The index binds `output` to the runtime store item's output name, binds
+`runtime` to only that path within the item, requires the reader ceiling to
+equal its compiled limit, and requires
+`0 < reader < admitted <= companion`. A sibling ELF does not inherit the
+boundary.
 td-profiler deliberately refuses that oversized line program, preserves
 function attribution, and emits its existing explicit line-resolution
 diagnostic. A Codex update must remeasure the row and section sizes and
@@ -338,10 +356,13 @@ file and line come from the remapped line table when supported. The report
 retains the runtime store path, object-relative address, device/inode identity,
 and build ID even when a friendly name was found, so resolution can be audited
 and improved without collecting the workload again. The provenance token
-`assembly-boundary=1` carries the split output's conservative exception marker.
-A mapped callchain is reported complete only when every frame resolves and no
-resolved object carries that token; missing symbol coverage is unresolved and
-the token makes the stack explicitly truncated.
+`assembly-boundary=1` carries the split output's conservative exception marker;
+`line-attribution-boundary=1` identifies the exact runtime named by a canonical
+line-attribution exception marker. A mapped callchain is reported complete only
+when every frame resolves and no resolved object carries the assembly token;
+missing symbol coverage is unresolved and that token makes the stack explicitly
+truncated. The line token reports an attribution limit without discarding a
+function-resolved frame.
 An address in a symbol-table hole remains unresolved rather than receiving a
 hexadecimal pseudo-function. A zero-sized symbol covers its exact address only.
 Hotspots aggregate resolved instructions by process image, object, and

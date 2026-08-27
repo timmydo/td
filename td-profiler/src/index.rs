@@ -16,6 +16,7 @@ const APPLICATION_ROOTS_HEADER: &str = "td-profiler-application-roots-v1";
 const MAX_APPLICATION_MANIFEST_BYTES: u64 = 16 * 1024;
 const MAX_APPLICATION_SPEC_BYTES: u64 = 48 * 1024;
 const MAX_ASSEMBLY_MARKER_BYTES: u64 = 64 * 1024;
+const MAX_LINE_ATTRIBUTION_MARKER_BYTES: u64 = 64 * 1024;
 
 pub fn registry_exclusions(
     root: &Path,
@@ -249,9 +250,10 @@ pub fn build(root: &Path, output: &Path, exclusions: &[PathBuf]) -> Result<(), S
     let mut rows = Vec::with_capacity(runtimes.len());
     let mut row_bytes = HEADER.len().saturating_add(2);
     let mut assembly = BTreeMap::new();
+    let mut line_attribution = BTreeMap::new();
     for (runtime_fs, runtime) in runtimes {
         let runtime_id = symbol::load_build_id(&runtime_fs)?;
-        let (expected_debug, runtime_item) = debug_path(&runtime)?;
+        let (expected_debug, runtime_item, runtime_within) = debug_path(&runtime)?;
         let debug = if debug_by_path.contains_key(&expected_debug) {
             expected_debug
         } else {
@@ -276,6 +278,8 @@ pub fn build(root: &Path, output: &Path, exclusions: &[PathBuf]) -> Result<(), S
                 debug.display()
             ));
         }
+        let line_boundary =
+            line_attribution_boundary(root, &runtime_item, &runtime_within, &mut line_attribution)?;
         let runtime = field(&runtime)?;
         let debug = field(&debug)?;
         let mut provenance = format!("store-item={runtime_item}");
@@ -284,6 +288,9 @@ pub fn build(root: &Path, output: &Path, exclusions: &[PathBuf]) -> Result<(), S
         }
         if assembly_boundary(root, debug_item, &mut assembly)? {
             provenance.push_str(";assembly-boundary=1");
+        }
+        if line_boundary {
+            provenance.push_str(";line-attribution-boundary=1");
         }
         let provenance = text_field(&provenance)?;
         let row = format!(
@@ -430,7 +437,7 @@ fn inside_debug_tree(path: &Path) -> bool {
     })
 }
 
-fn debug_path(runtime: &Path) -> Result<(PathBuf, String), String> {
+fn debug_path(runtime: &Path) -> Result<(PathBuf, String, PathBuf), String> {
     if !store_path(runtime) {
         return Err(format!(
             "profiled runtime is not one canonical /td/store child: {}",
@@ -460,7 +467,7 @@ fn debug_path(runtime: &Path) -> Result<(PathBuf, String), String> {
         .join("lib/debug")
         .join(debug_within);
     let item = item.to_str().ok_or("store item is not UTF-8")?;
-    Ok((debug, item.to_string()))
+    Ok((debug, item.to_string(), within))
 }
 
 fn store_item(path: &Path) -> Result<String, String> {
@@ -556,6 +563,150 @@ fn validate_assembly_marker(text: &str) -> Result<(), String> {
         text_field(reason)?;
     }
     Ok(())
+}
+
+fn line_attribution_boundary(
+    root: &Path,
+    item: &str,
+    runtime_within: &Path,
+    cache: &mut BTreeMap<String, Option<PathBuf>>,
+) -> Result<bool, String> {
+    let marked_runtime = if let Some(runtime) = cache.get(item) {
+        runtime.clone()
+    } else {
+        let marker = root
+            .join("td/store")
+            .join(item)
+            .join("lib/debug/.td-line-attribution-exception");
+        let metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                cache.insert(item.to_string(), None);
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "stat line-attribution marker {}: {error}",
+                    marker.display()
+                ));
+            }
+        };
+        if !metadata.is_file()
+            || metadata.len() > MAX_LINE_ATTRIBUTION_MARKER_BYTES
+            || metadata.mode() & 0o777 != 0o644
+        {
+            return Err(format!(
+                "line-attribution marker must be a bounded mode-0644 regular file: {}",
+                marker.display()
+            ));
+        }
+        let text = read_bounded_text(
+            &marker,
+            MAX_LINE_ATTRIBUTION_MARKER_BYTES,
+            "line-attribution marker",
+        )?;
+        let marked_runtime = validate_line_attribution_marker(&text, item)?;
+        cache.insert(item.to_string(), Some(marked_runtime.clone()));
+        Some(marked_runtime)
+    };
+    Ok(marked_runtime
+        .as_ref()
+        .is_some_and(|marked| marked == runtime_within))
+}
+
+fn validate_line_attribution_marker(text: &str, item: &str) -> Result<PathBuf, String> {
+    const SHAPE: [&str; 7] = [
+        "format",
+        "output",
+        "runtime",
+        "reader_ceiling_bytes",
+        "admitted_ceiling_bytes",
+        "companion_ceiling_bytes",
+        "reason",
+    ];
+    if text.is_empty() || !text.ends_with('\n') || text.contains('\r') || text.contains('\0') {
+        return Err("line-attribution marker is not canonical text".into());
+    }
+    if text.lines().count() != SHAPE.len() {
+        return Err("line-attribution marker is not exactly its canonical header".into());
+    }
+    let mut fields = BTreeMap::new();
+    for (line, key) in text.lines().zip(SHAPE) {
+        let prefix = format!("{key}=");
+        let value = line
+            .strip_prefix(&prefix)
+            .ok_or("line-attribution marker header is not canonical")?;
+        text_field(value)?;
+        fields.insert(key, value);
+    }
+    if fields.get("format").copied() != Some("1") {
+        return Err("line-attribution marker lacks format=1".into());
+    }
+    let output = fields
+        .get("output")
+        .copied()
+        .ok_or("line-attribution marker lacks its output")?;
+    let output_suffix = item
+        .split_once('-')
+        .and_then(|(_, name)| name.strip_prefix(output))
+        .and_then(|suffix| suffix.strip_prefix('-'));
+    if !output
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || output.starts_with('-')
+        || output.ends_with('-')
+        || output_suffix
+            .and_then(|suffix| suffix.as_bytes().first())
+            .is_none_or(|byte| !byte.is_ascii_digit())
+    {
+        return Err("line-attribution marker output does not name its runtime store item".into());
+    }
+    let runtime = fields
+        .get("runtime")
+        .copied()
+        .ok_or("line-attribution marker lacks its runtime")?;
+    let components: Result<Vec<_>, _> = Path::new(runtime)
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value
+                .to_str()
+                .ok_or("line-attribution marker runtime is not UTF-8"),
+            _ => Err("line-attribution marker runtime is not canonical relative path"),
+        })
+        .collect();
+    let components = components?;
+    if components.is_empty() || components.join("/") != runtime {
+        return Err("line-attribution marker runtime is not canonical relative path".into());
+    }
+    let ceiling = |key: &str| -> Result<u64, String> {
+        let value = fields
+            .get(key)
+            .copied()
+            .ok_or_else(|| format!("line-attribution marker lacks {key}"))?
+            .parse::<u64>()
+            .map_err(|_| format!("line-attribution marker {key} is not an integer"))?;
+        if value == 0 {
+            return Err(format!("line-attribution marker {key} is zero"));
+        }
+        Ok(value)
+    };
+    let reader = ceiling("reader_ceiling_bytes")?;
+    let admitted = ceiling("admitted_ceiling_bytes")?;
+    let companion = ceiling("companion_ceiling_bytes")?;
+    if reader != crate::dwarf::MAX_LINE_SECTION_BYTES {
+        return Err("line-attribution marker reader ceiling differs from td-profiler".into());
+    }
+    if reader >= admitted || admitted > companion {
+        return Err("line-attribution marker ceilings are not ordered".into());
+    }
+    let reason = fields
+        .get("reason")
+        .copied()
+        .ok_or("line-attribution marker lacks its reason")?;
+    if reason.is_empty() {
+        return Err("line-attribution marker has an empty reason".into());
+    }
+    Ok(PathBuf::from(runtime))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -745,7 +896,7 @@ fn text_field(value: &str) -> Result<&str, String> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{build, debug_path, registry_exclusions};
+    use super::{build, debug_path, registry_exclusions, validate_line_attribution_marker};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -798,7 +949,8 @@ mod tests {
             debug_path(Path::new("/td/store/hash-name/bin/program")).unwrap(),
             (
                 PathBuf::from("/td/store/hash-name/lib/debug/bin/program.debug"),
-                "hash-name".into()
+                "hash-name".into(),
+                PathBuf::from("bin/program")
             )
         );
     }
@@ -810,12 +962,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let runtime = root.join("td/store/hash-native-1/bin/profiler");
         let debug = root.join("td/store/hash-native-1/lib/debug/bin/profiler.debug");
+        let other = root.join("td/store/hash-native-1/bin/other");
+        let other_debug = root.join("td/store/hash-native-1/lib/debug/bin/other.debug");
         let source = root.join("td/store/hash-source-1/bin/source");
         let foreign = root.join("td/store/hash-foreign-1/bin/payload");
         let foreign_runtime = root.join("td/store/hash-foreign-runtime-1/lib/runtime.so");
         for path in [&runtime, &debug, &source, &foreign, &foreign_runtime] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, elf_with_build_id()).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut other_elf = elf_with_build_id();
+        *other_elf.get_mut(227).unwrap() = 0x5b;
+        for path in [&other, &other_debug] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &other_elf).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let assembly = root.join("td/store/hash-native-1/lib/debug/.td-assembly-exception");
@@ -825,6 +986,13 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&assembly, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let line = root.join("td/store/hash-native-1/lib/debug/.td-line-attribution-exception");
+        std::fs::write(
+            &line,
+            b"format=1\noutput=native\nruntime=bin/profiler\nreader_ceiling_bytes=33554432\nadmitted_ceiling_bytes=67108864\ncompanion_ceiling_bytes=134217728\nreason=bounded test fixture\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&line, std::fs::Permissions::from_mode(0o644)).unwrap();
         for (package, manifest, spec) in [
             (
                 "hash-foreign-1",
@@ -875,8 +1043,40 @@ mod tests {
             "/td/store/hash-source-1/bin/source\t/td/store/hash-native-1/lib/debug/bin/profiler.debug"
         ));
         assert!(contents.contains("debug-store-item=hash-native-1"));
-        assert!(contents.contains("store-item=hash-native-1;assembly-boundary=1"));
+        assert!(contents
+            .contains("store-item=hash-native-1;assembly-boundary=1;line-attribution-boundary=1"));
+        let other_row = contents
+            .lines()
+            .find(|line| line.starts_with("/td/store/hash-native-1/bin/other\t"))
+            .unwrap();
+        assert!(other_row.ends_with(";assembly-boundary=1"));
+        assert!(!other_row.contains("line-attribution-boundary=1"));
         assert!(!contents.contains("hash-foreign-1"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn line_attribution_marker_is_canonical_and_runtime_bound() {
+        let marker = "format=1\noutput=codex\nruntime=bin/codex\nreader_ceiling_bytes=33554432\nadmitted_ceiling_bytes=167772160\ncompanion_ceiling_bytes=268435456\nreason=bounded reader exception\n";
+        assert_eq!(
+            validate_line_attribution_marker(marker, "hash-codex-0.148.0").unwrap(),
+            PathBuf::from("bin/codex")
+        );
+        for invalid in [
+            marker.replace("runtime=bin/codex", "runtime=../bin/codex"),
+            marker.replace(
+                "admitted_ceiling_bytes=167772160",
+                "admitted_ceiling_bytes=16",
+            ),
+            marker.replace("reader_ceiling_bytes=33554432", "reader_ceiling_bytes=1"),
+            marker.replace("output=codex", "output=other"),
+            format!("{marker}trailing=value\n"),
+            format!("{marker}\n[trailing]\nvalue=1\n"),
+        ] {
+            assert!(
+                validate_line_attribution_marker(&invalid, "hash-codex-0.148.0").is_err(),
+                "accepted non-canonical marker: {invalid:?}"
+            );
+        }
     }
 }

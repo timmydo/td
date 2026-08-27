@@ -1,3 +1,4 @@
+use crate::ladder::CODEX_RECIPE_VERSION;
 use crate::types::{
     CargoGitPackage, CargoGitSource, CargoSourcePatch, CheckRunner, Recipe, RecipeCheck, TextEdit,
 };
@@ -16,7 +17,7 @@ use crate::types::{
 // HTTP/2, charset, cookie, system-proxy, crash context, or release-health
 // features, and keeps target prebuilts out of the build graph.
 pub fn recipe() -> Recipe {
-    Recipe::rust("codex", "0.148.0")
+    Recipe::rust("codex", CODEX_RECIPE_VERSION)
         .source_input("codex-source")
         .native_inputs(&[
             "rust-toolchain",

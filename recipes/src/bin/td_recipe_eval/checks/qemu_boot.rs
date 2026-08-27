@@ -84,6 +84,9 @@ const RIPGREP_FD_RUNTIME_MARKER: &str = td_recipe::ladder::RIPGREP_FD_RUNTIME_MA
 /// clone/commit/push/reclone workflow and reads its pinned CA bundle.
 const GIT_RUNTIME_MARKER: &str = td_recipe::ladder::GIT_RUNTIME_MARKER;
 
+/// Printed after the installed Codex CLI and Bubblewrap helper report their exact versions.
+const CODEX_RUNTIME_MARKER: &str = td_recipe::ladder::CODEX_RUNTIME_MARKER;
+
 /// Printed by the root-owned health target after an unprivileged SSH loopback self-test.
 const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
 
@@ -197,6 +200,10 @@ const KEXEC_STAGE2_MARKER: &str = td_recipe::ladder::KEXEC_STAGE2_MARKER;
 /// side can assert it outlasts the loop it is waiting for; see there.
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = td_recipe::ladder::DEFAULT_BOOT_TIMEOUT_SECS;
 const GUEST_WAIT_MARGIN_SECS: u64 = td_recipe::ladder::QEMU_GUEST_WAIT_MARGIN_SECS;
+// The daily-driver image leaves too little kexec headroom at 512 MiB after its
+// EROFS pages have populated the guest cache. Keep selector boots large enough
+// to allocate the next kernel's swap buffer during repeated rollback attempts.
+const SYSTEM_GUEST_MEMORY_MIB: &str = "1024";
 const POLL: Duration = Duration::from_millis(200);
 
 /// Cap on retained console/diagnostic bytes. The console is scanned incrementally
@@ -264,6 +271,7 @@ struct ConsoleEvidence {
     uutils_runtime: bool,
     ripgrep_fd_runtime: bool,
     git_runtime: bool,
+    codex_runtime: bool,
     sshd: bool,
     td_util_runtime: bool,
     td_txt_runtime: bool,
@@ -511,7 +519,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                 path: &volume,
                 read_only: true,
             }),
-            mem: "512",
+            mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: td_boot_protocol::SELECTED_PREVIOUS_MARKER,
             kill_on_marker: true,
             extra_append: "",
@@ -859,7 +867,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), Git plus its \
-         installed CA bundle ({GIT_RUNTIME_MARKER}), td-util \
+         installed CA bundle ({GIT_RUNTIME_MARKER}), Codex plus its Bubblewrap helper \
+         ({CODEX_RUNTIME_MARKER}), td-util \
          ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
          td-login credential switch the switched process read back and confirmed \
@@ -910,7 +919,7 @@ fn boot_system_once(
                 path: volume,
                 read_only: false,
             }),
-            mem: "512",
+            mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
             extra_append: tokens,
@@ -943,7 +952,7 @@ fn boot_failed_target_once(
                 path: volume,
                 read_only: false,
             }),
-            mem: "512",
+            mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: SYSTEM_SHUTDOWN_MARKER,
             kill_on_marker: false,
             extra_append: tokens,
@@ -1195,6 +1204,17 @@ fn validate_system_boot(
              path, or read a PEM boundary from the installed CA bundle. Verified HTTPS use \
              of that bundle is covered separately by the operator network oracle. Last serial \
              output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.codex_runtime {
+        return Err(format!(
+            "the greeter was reached and Git ran, but the Codex/Bubblewrap runtime marker \
+             ({CODEX_RUNTIME_MARKER:?}) was absent — the unprivileged health leg could not \
+             execute the exact pinned `/bin/codex` and `/bin/bwrap`, enter a distinct \
+             Bubblewrap network namespace, deny a write through Codex's read-only policy, \
+             or read the unchanged fixture afterward. A /bin symlink or dynamic closure may \
+             also be broken. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -1666,7 +1686,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
                 path: &disk,
                 read_only: false,
             }),
-            mem: "512",
+            mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
             extra_append: &tokens,
@@ -2791,8 +2811,9 @@ struct BootPlan<'a> {
     /// A raw image to attach over virtio-blk (/dev/vda), or none for diskless.
     /// Probe EROFS images are read-only; system volumes allow @var writes.
     disk: Option<BootDisk<'a>>,
-    /// Guest RAM in MiB (qemu `-m`). Diskless/probe boots use "256"; selector and
-    /// kexec boots use "512" so both kernels and initramfses fit at the handoff.
+    /// Guest RAM in MiB (qemu `-m`). Diskless/probe and standalone kexec boots use
+    /// smaller fixed plans; system boots use `SYSTEM_GUEST_MEMORY_MIB` so repeated
+    /// selector handoffs retain room after the deployment populates the page cache.
     mem: &'a str,
     /// The ttyS0 line whose appearance means the boot reached its target state; lets the
     /// boot modes key on different lines (userland vs. read-only-erofs vs. greeter).
@@ -3194,6 +3215,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         UUTILS_RUNTIME_MARKER.len(),
         RIPGREP_FD_RUNTIME_MARKER.len(),
         GIT_RUNTIME_MARKER.len(),
+        CODEX_RUNTIME_MARKER.len(),
         SSHD_MARKER.len(),
         TD_UTIL_RUNTIME_MARKER.len(),
         TD_TXT_RUNTIME_MARKER.len(),
@@ -3328,6 +3350,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.git_runtime,
         buf,
         GIT_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.codex_runtime,
+        buf,
+        CODEX_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(&mut evidence.sshd, buf, SSHD_MARKER.as_bytes());
     latch_marker(
@@ -4296,7 +4323,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 43] {
+    fn all_console_markers() -> [&'static str; 44] {
         [
             MARKER,
             EROFS_MARKER,
@@ -4323,6 +4350,7 @@ mod tests {
             UUTILS_RUNTIME_MARKER,
             RIPGREP_FD_RUNTIME_MARKER,
             GIT_RUNTIME_MARKER,
+            CODEX_RUNTIME_MARKER,
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
@@ -4638,6 +4666,7 @@ mod tests {
             UUTILS_RUNTIME_MARKER,
             RIPGREP_FD_RUNTIME_MARKER,
             GIT_RUNTIME_MARKER,
+            CODEX_RUNTIME_MARKER,
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
@@ -4696,6 +4725,7 @@ mod tests {
         assert!(evidence.uutils_runtime);
         assert!(evidence.ripgrep_fd_runtime);
         assert!(evidence.git_runtime);
+        assert!(evidence.codex_runtime);
         assert!(evidence.sshd);
         assert!(evidence.td_util_runtime);
         assert!(evidence.td_txt_runtime);

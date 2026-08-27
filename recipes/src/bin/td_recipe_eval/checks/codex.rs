@@ -1,5 +1,6 @@
 use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
 use super::rust_toolchain::{path_basename, GLIBC_STAGE};
+use td_recipe::ladder::CODEX_VERSION_OUTPUT;
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     runner.prepare_recipe_target("codex")?;
@@ -36,7 +37,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let interpreter = format!("{TD_STORE_DIR}/{glibc_base}/{GLIBC_STAGE}/lib/ld-linux-x86-64.so.2");
 
     let version = runner.store_ns_output(&[&codex, "--version"], None)?;
-    if version.trim() != "codex-cli 0.148.0" {
+    if version.trim() != CODEX_VERSION_OUTPUT {
         return Err(format!("unexpected Codex version: {}", version.trim()));
     }
     let help = runner.store_ns_output(&[&codex, "--help"], None)?;
