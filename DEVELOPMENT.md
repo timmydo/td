@@ -142,25 +142,32 @@ Build the release binary in whichever checkout supplies the config.
 Every increment is read by three independent reviewers before it lands. They
 review one exact revision of it, which is not always the revision that lands:
 
-1. a code-review subagent using the acting agent's latest strong model;
+1. a code-review subagent using the model required by the roster below;
 2. the other model family's CLI at strong model and high reasoning effort;
 3. Antigravity at its top Pro tier.
 
 The roster depends on the acting agent:
 
 - Claude acting: latest Opus subagent, Codex CLI, Agy CLI.
-- Codex acting: latest Codex subagent, Claude CLI, Agy CLI.
+- Codex acting: `gpt-5.6-sol` subagent, Claude CLI, Agy CLI.
+
+When Codex is acting, explicitly select `gpt-5.6-sol` in the subagent spawn.
+Do not rely on the acting agent's inherited or configured default. A model
+override requires a no-history or bounded-history fork, so set `fork_turns`
+to `none` or a positive turn count and put the exact commit plus all context
+needed for an independent review in the task. A full-history fork is invalid
+for this slot because it cannot carry the required model override.
 
 Inside Claude Code, `/code-review` requires explicit user authorization. If it
 was not authorized, launch an independent read-only reviewer directly with the
 Agent tool and have it review the exact `git show HEAD`. This is the subagent
 slot; never use the `claude` CLI for it. That CLI is Codex's cross-model slot.
 
-These name tiers rather than versions. Resolve the current identity when the
-review runs: `claude --model opus` selects the newest Opus; `codex exec`
-without `--model` uses and prints the configured model; `agy models` lists the
-accepted Antigravity display names. Record the actual version that reviewed,
-not `latest` or a bare family.
+The other roster entries name tiers rather than versions. Resolve their
+current identity when the review runs: `claude --model opus` selects the
+newest Opus; `codex exec` without `--model` uses and prints the configured
+model; `agy models` lists the accepted Antigravity display names. Record the
+actual version that reviewed, not `latest` or a bare family.
 
 Commit the increment first, then give every reviewer the same `git show HEAD`,
 including the commit message and whole diff. Reviewers do not edit the tree or
@@ -288,7 +295,9 @@ Checks: affected-checks --committed-only (green)
 Use the identities that actually reviewed. `td-builder ready` requires a
 `subagent/<model>`, Agy, the non-acting model-family CLI, and non-empty
 `Checks:`. It compares model families so the acting model cannot review itself
-through a second frontend.
+through a second frontend. For a Codex-acting review, the subagent trailer is
+`Reviewed-by: subagent/gpt-5.6-sol`; a generic or inherited model identity does
+not satisfy the roster.
 
 The trailer block must close the message, with no text below it and no wrapped
 trailers.
