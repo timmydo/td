@@ -636,9 +636,21 @@ struct LiveInputTarget {
 }
 
 impl LiveInputTarget {
-    /// A launch failure is REPORTED, never fatal: the evdev reader must keep
-    /// serving so the operator can close the overlay or try again.
-    fn spawn(&mut self, request: LaunchRequest) {
+    /// A native process-launch failure is reported without retiring evdev.
+    /// Application activation mutates the scene, so its paint/focus failures
+    /// follow every other scene mutation and propagate to the input reader.
+    fn spawn(&mut self, request: LaunchRequest) -> Result<(), String> {
+        if request == LaunchRequest::UiDemo && self.launches.activates_application() {
+            let activated = self
+                .runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .activate_application()?;
+            if !activated {
+                eprintln!("td-compositor: configured application has no mapped window");
+            }
+            return Ok(());
+        }
         match self.launches.launch(request) {
             Ok(failures) => {
                 for failure in failures {
@@ -647,6 +659,7 @@ impl LiveInputTarget {
             }
             Err(error) => eprintln!("td-compositor: {error}"),
         }
+        Ok(())
     }
 }
 
@@ -659,8 +672,7 @@ impl InputTarget for LiveInputTarget {
     }
 
     fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
-        self.spawn(request);
-        Ok(())
+        self.spawn(request)
     }
 
     fn help(&mut self, action: HelpAction) -> Result<bool, String> {
@@ -680,7 +692,7 @@ impl InputTarget for LiveInputTarget {
             (request, runtime.launcher_visible())
         };
         if let Some(request) = request {
-            self.spawn(request);
+            self.spawn(request)?;
         }
         Ok(visible)
     }
@@ -3984,7 +3996,7 @@ mod tests {
         runtime.lock().unwrap().repaint().unwrap();
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: PathBuf::from("/bin/td-term"),
             application: None,
         })
@@ -4032,7 +4044,7 @@ mod tests {
         runtime.lock().unwrap().repaint().unwrap();
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: PathBuf::from("/bin/td-term"),
             application: None,
         })

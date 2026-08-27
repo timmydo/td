@@ -580,9 +580,9 @@ pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 /// td-jail's exported filter and observes the compiled errno and kill actions.
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 
-/// Emitted by the trusted fixture-evidence unit only after its unprivileged
-/// probe accepts the fixture's post-frame readiness socket.
-pub const TD_JAIL_FIXTURE_BOOT_MARKER: &str = "TD-JAIL-FIXTURE-BOOT-READY";
+/// Emitted by the trusted Firefox-evidence unit only after the compositor has
+/// painted Firefox's first mapped frame and td-jail's live caps remain bounded.
+pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";
 
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`

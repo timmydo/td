@@ -339,14 +339,10 @@ mod tests {
             "const RESERVED_APPLICATION_NAMES: &[&str] = &{:?};",
             td_engine::application::RESERVED_APPLICATION_NAMES
         )));
-        assert!(launcher.contains(&format!(
-            "const APPLICATION_RUNTIME_ROOT_NAME: &str = {:?};",
-            crate::ladder::TD_APPLICATION_RUNTIME_ROOT
-        )));
-        assert!(launcher.contains(&format!(
-            "const JAIL_FIXTURE_APPLICATION_NAME: &str = {:?};",
-            crate::ladder::TD_JAIL_FIXTURE_NAME
-        )));
+        assert!(launcher.contains("pub client: Option<PathBuf>"));
+        assert!(launcher.contains(
+            "exactly one launcher client or launcher application is required"
+        ));
         for fragment in [
             "application.name.starts_with('-')",
             "application.name == \".\"",
@@ -355,15 +351,18 @@ mod tests {
         ] {
             assert!(launcher.contains(fragment));
         }
-        assert!(launcher.contains(&format!(
-            "label: {:?}",
-            crate::ladder::TD_JAIL_FIXTURE_DISPLAY_NAME.to_ascii_uppercase()
-        )));
-        assert!(launcher.contains(&format!(
-            "search: {:?}",
-            crate::ladder::TD_JAIL_FIXTURE_SEARCH_TERMS.join(" ")
-        )));
-        assert!(launcher.contains("(LaunchRequest::UiDemo, Some(application))"));
+        assert!(launcher.contains("label: name.to_ascii_uppercase()"));
+        assert!(launcher.contains("search: name.to_ascii_lowercase()"));
+        assert!(launcher.contains("(LaunchRequest::UiDemo, Some(_))"));
+        assert!(launcher.contains("configured launcher application is activation-only"));
+        let input = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "input").then_some(*source))
+            .expect("input source");
+        assert!(input.contains(
+            "request == LaunchRequest::UiDemo && self.launches.activates_application()"
+        ));
+        assert!(input.contains(".activate_application()?"));
         let server = MODULES
             .iter()
             .find_map(|(name, source)| (*name == "server").then_some(*source))
@@ -377,6 +376,9 @@ mod tests {
             .iter()
             .find_map(|(name, source)| (*name == "client").then_some(*source))
             .expect("client source");
+        assert!(client.contains("if is_jail_fixture()"));
+        assert!(client.contains("verify_jail_fixture(true, true)?"));
+        assert!(client.contains("verify_jail_fixture(!shared_network, false)?"));
         assert!(client.contains(&format!(
             "writeln!(out, \"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\", width, height)"
         )));

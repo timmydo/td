@@ -10,10 +10,10 @@ use crate::ladder::{
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_BUSD_RUNTIME_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_FIXTURE_BOOT_MARKER,
-    TD_JAIL_FIXTURE_GRANT_FILE, TD_JAIL_FIXTURE_GRANT_ROOT, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
-    TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_INIT_RUNTIME_MARKER,
+    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
+    UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -42,7 +42,7 @@ const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
 /// What ONE iteration of the boot-success loop may cost on a slow TCG guest: ten
 /// `su` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
 /// those copies an image; what the rest add is deployment-sized READS, and the
-/// distinction is worth the words because the fixture's own size budget turns on it
+/// distinction is worth the words because the QEMU volume budget turns on it
 /// — see BOOTSUCCESS below. Named rather than spelled twice because the td-svc
 /// backstop and the host's own ceiling are both derived from it, and a figure that
 /// drifted between them would leave one of the two killing a healthy boot.
@@ -172,7 +172,6 @@ const APPLICATION_REGISTRY: &str = crate::ladder::TD_APPLICATION_REGISTRY;
 const APPLICATION_LAUNCHER_TABLE: &str =
     crate::ladder::TD_APPLICATION_LAUNCHER_TABLE;
 const APPLICATION_CONFIG: &str = crate::ladder::TD_APPLICATION_CONFIG_PATH;
-const APPLICATION_RUNTIME_ROOT: &str = crate::ladder::TD_APPLICATION_RUNTIME_ROOT;
 const PROFILER_OBJECT_INDEX: &str = "/etc/td-profiler-objects.tsv";
 const PROFILER_APPLICATION_ROOTS: &str = "/etc/td-profiler-application-roots.tsv";
 const PROFILER_CAPTURE_ROOT: &str = "/var/lib/td-profiler/captures";
@@ -187,41 +186,37 @@ const SSHD_PRIVSEP_PATH: &str = "/run/sshd-empty";
 const PROFILER_CAPTURE_SECS: u16 = 60;
 const PROFILER_EVIDENCE_TIMEOUT_SECS: u16 = 180;
 const PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS: u16 = 195;
-const APPLICATION_FIXTURE_NAME: &str = crate::ladder::TD_JAIL_FIXTURE_NAME;
-const APPLICATION_FIXTURE_DOWNLOAD_SOURCE: &str = "/var/home/tester/Downloads";
-const APPLICATION_FIXTURE_PICTURES_SOURCE: &str = "/var/home/tester/Pictures";
-const APPLICATION_FIXTURE_XDG_MOUNTS_MARKER: &str =
-    "/run/td-jail-fixture-xdg-mounted";
-const APPLICATION_FIXTURE_GRANT_FILE_ROOT: &str = "/mnt/td-jail-fixture-file";
-const APPLICATION_FIXTURE_GRANT_FILE_SOURCE: &str = "/mnt/td-jail-fixture-file/grant";
-const APPLICATION_FIXTURE_EVIDENCE_PATH: &str = "/run/td-jail-fixture-evidence-ok";
-const APPLICATION_FIXTURE_EVIDENCE_TMP_PATH: &str =
-    "/run/.td-jail-fixture-evidence.tmp";
-const APPLICATION_FIXTURE_EVIDENCE: &str = "td-jail-fixture-evidence-v1";
-const APPLICATION_FIXTURE_COMPLETION_PATH: &str =
-    "/run/td-jail-fixture-evidence-complete";
-const APPLICATION_FIXTURE_COMPLETION_TMP_PATH: &str =
-    "/run/.td-jail-fixture-evidence-complete.tmp";
-const APPLICATION_FIXTURE_COMPLETION: &str = "td-jail-fixture-evidence-complete-v1";
-const APPLICATION_FIXTURE_READY_TIMEOUT_SECS: u16 = 90;
-const APPLICATION_FIXTURE_READY_ATTEMPTS: u16 = 2;
-const APPLICATION_FIXTURE_RETRY_MARGIN_SECS: u16 = 60;
+const FIREFOX_NAME: &str = "firefox";
+const FIREFOX_APP_ID: &str = "org.mozilla.firefox";
+const FIREFOX_WINDOW_READY_SOCKET: &str = "/run/user/1000/td-firefox-window-ready";
+const FIREFOX_DOWNLOAD_SOURCE: &str = "/var/home/tester/Downloads";
+const FIREFOX_XDG_MOUNT_MARKER: &str = "/run/td-firefox-downloads-mounted";
+const FIREFOX_EVIDENCE_PATH: &str = "/run/td-firefox-evidence-ok";
+const FIREFOX_EVIDENCE_TMP_PATH: &str = "/run/.td-firefox-evidence.tmp";
+const FIREFOX_EVIDENCE: &str = "td-firefox-evidence-v1";
+const FIREFOX_COMPLETION_PATH: &str = "/run/td-firefox-evidence-complete";
+const FIREFOX_COMPLETION_TMP_PATH: &str =
+    "/run/.td-firefox-evidence-complete.tmp";
+const FIREFOX_COMPLETION: &str = "td-firefox-evidence-complete-v1";
+const FIREFOX_READY_TIMEOUT_SECS: u16 = 180;
+const FIREFOX_READY_ATTEMPTS: u16 = 2;
+const FIREFOX_RETRY_MARGIN_SECS: u16 = 60;
 // The evidence unit polls itself so its deadline is not widened by td-svc's
 // exponential restart backoff. Autotest allows two cold starts plus margin.
-const APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS: u16 =
-    APPLICATION_FIXTURE_READY_TIMEOUT_SECS * APPLICATION_FIXTURE_READY_ATTEMPTS
-        + APPLICATION_FIXTURE_RETRY_MARGIN_SECS;
-// The greeter may observe deployment health before the fixture's first ready
+const FIREFOX_EVIDENCE_WAIT_ITERATIONS: u16 =
+    FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS
+        + FIREFOX_RETRY_MARGIN_SECS;
+// The greeter may observe deployment health before Firefox's first ready
 // timeout starts the evidence unit, so its own allowance includes that offset.
-const APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS: u16 =
-    APPLICATION_FIXTURE_READY_TIMEOUT_SECS + APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS;
+const FIREFOX_GREETER_WAIT_ITERATIONS: u16 =
+    FIREFOX_READY_TIMEOUT_SECS + FIREFOX_EVIDENCE_WAIT_ITERATIONS;
 
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
-    name: APPLICATION_FIXTURE_NAME,
-    package: APPLICATION_FIXTURE_NAME,
-    package_recipe: super::td_jail_fixture::recipe,
-    runtime: "empty-runtime",
-    runtime_recipe: super::empty_runtime::recipe,
+    name: FIREFOX_NAME,
+    package: FIREFOX_NAME,
+    package_recipe: super::firefox::recipe,
+    runtime: "freedesktop-platform-25-08",
+    runtime_recipe: super::freedesktop_platform_25_08::recipe,
 }];
 
 /// Account names are embedded UNQUOTED in generated root shell — `/bin/su -s /bin/sh
@@ -936,8 +931,8 @@ const TD_SVC_UNITS: [&str; 16] = [
     "busd",
     "wayland",
     "terminal",
-    "jail-fixture",
-    "jail-fixture-evidence",
+    "firefox",
+    "firefox-evidence",
     "bootsuccess",
     "bootfail",
     "sshd",
@@ -1112,9 +1107,9 @@ fn build_td_svc_conf() -> String {
          # ran first, which is a different machine from the one this table\n\
          # describes. td-jail is the first consumer: it registers each launch\n\
          # with this broker and refuses to release the application if that\n\
-         # fails, so the fixture below now depends on this unit answering and\n\
+         # fails, so Firefox below now depends on this unit answering and\n\
          # not merely on its socket existing. `after` and not `requires`, for\n\
-         # the reason recorded at the fixture.\n\
+         # the reason recorded at Firefox.\n\
          # `exec-as` rather than `su -c`, so the argv is literal and the\n\
          # environment is the unit's rather than the boot path's.\n\
          [busd]\n\
@@ -1130,7 +1125,7 @@ fn build_td_svc_conf() -> String {
          # credentials, and the compositor opens only those fixed paths.\n\
          [wayland]\n\
          type=daemon\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --launcher-client /bin/{fixture_name} --launcher-application {fixture_name} --launcher-runtime /run/user/{ui_uid}/{application_runtime_root} --terminal-client /bin/td-term'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --launcher-application {firefox_name} --terminal-client /bin/td-term --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id}'\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor probe /run/user/{ui_uid}/wayland-0'\n\
@@ -1152,29 +1147,30 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
-         # The first packaged application is also QEMU boot evidence. td-login passes\n\
-         # a literal argv, td-jail resolves argv[0] through the immutable image\n\
-         # registry, and the client publishes readiness only after jailed pixels land.\n\
-         # The trusted evidence unit below accepts that readiness before it emits.\n\
-         [jail-fixture]\n\
+         # Firefox is also QEMU boot evidence. td-login passes a literal argv and\n\
+         # td-jail resolves argv[0] through the immutable image registry. The\n\
+         # compositor exposes readiness only after a surface claiming Firefox's\n\
+         # exact XDG app id commits a buffer that the framebuffer accepted.\n\
+         [firefox]\n\
          type=daemon\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/{fixture_name} run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/{application_runtime_root}/ready\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/{firefox_name}\n\
          after=busd,wayland\n\
          requires=wayland\n\
-         ready=/bin/td-login exec-as {ui_user} -- /bin/td-ui-demo probe /run/user/{ui_uid}/{application_runtime_root}/{fixture_name}/ready\n\
-         ready-timeout={fixture_ready_timeout}\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket}\n\
+         ready-timeout={firefox_ready_timeout}\n\
          restart=always\n\
          \n\
-         # This fixture is test evidence, not deployment health. The exact\n\
-         # host-side probe must succeed before trusted unit code prints the\n\
-         # marker QEMU requires, but mutable user state cannot block bootsuccess.\n\
+         # This application is test evidence, not deployment health. The exact\n\
+         # compositor probe and live td-jail cap probe must both succeed before\n\
+         # trusted unit code prints the marker, but mutable user state cannot\n\
+         # block bootsuccess.\n\
          # A failed cold start is covered by this unit's bounded one-second probe\n\
          # loop, not td-svc's exponential restart backoff. No unit consumes its\n\
          # spawn-ready state; the marker after atomic publication is the authority.\n\
-         [jail-fixture-evidence]\n\
+         [firefox-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'n=0; while [ \"$n\" -lt {fixture_evidence_wait} ]; do if /bin/td-login exec-as {ui_user} -- /bin/td-ui-demo probe /run/user/{ui_uid}/{application_runtime_root}/{fixture_name}/ready >/dev/null 2>&1 && /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-resource-caps {fixture_name}; then /bin/rm -f {fixture_evidence_tmp_path} {fixture_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {fixture_evidence} > {fixture_evidence_tmp_path} && /bin/td-util chmod 0644 {fixture_evidence_tmp_path} && /bin/mv {fixture_evidence_tmp_path} {fixture_evidence_path} && /bin/echo {fixture_marker} && /bin/td-util printf \"%s\\n\" {fixture_completion} > {fixture_completion_tmp_path} && /bin/td-util chmod 0644 {fixture_completion_tmp_path} && /bin/mv {fixture_completion_tmp_path} {fixture_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
-         after=jail-fixture\n\
+         exec=/bin/sh -c 'n=0; while [ \"$n\" -lt {firefox_evidence_wait} ]; do if /bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} >/dev/null 2>&1 && /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-resource-caps {firefox_name}; then /bin/rm -f {firefox_evidence_tmp_path} {firefox_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_evidence} > {firefox_evidence_tmp_path} && /bin/td-util chmod 0644 {firefox_evidence_tmp_path} && /bin/mv {firefox_evidence_tmp_path} {firefox_evidence_path} && /bin/echo {firefox_marker} && /bin/td-util printf \"%s\\n\" {firefox_completion} > {firefox_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_completion_tmp_path} && /bin/mv {firefox_completion_tmp_path} {firefox_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         after=firefox\n\
          restart=never\n\
          \n\
          [bootsuccess]\n\
@@ -1240,17 +1236,18 @@ fn build_td_svc_conf() -> String {
         profiler_evidence_timeout_secs = PROFILER_EVIDENCE_TIMEOUT_SECS,
         profiler_evidence_service_timeout_secs = PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
         profiler_attribution_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
-        fixture_name = APPLICATION_FIXTURE_NAME,
-        fixture_marker = TD_JAIL_FIXTURE_BOOT_MARKER,
-        fixture_evidence = APPLICATION_FIXTURE_EVIDENCE,
-        fixture_evidence_path = APPLICATION_FIXTURE_EVIDENCE_PATH,
-        fixture_evidence_tmp_path = APPLICATION_FIXTURE_EVIDENCE_TMP_PATH,
-        fixture_completion = APPLICATION_FIXTURE_COMPLETION,
-        fixture_completion_path = APPLICATION_FIXTURE_COMPLETION_PATH,
-        fixture_completion_tmp_path = APPLICATION_FIXTURE_COMPLETION_TMP_PATH,
-        fixture_ready_timeout = APPLICATION_FIXTURE_READY_TIMEOUT_SECS,
-        fixture_evidence_wait = APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS,
-        application_runtime_root = APPLICATION_RUNTIME_ROOT,
+        firefox_name = FIREFOX_NAME,
+        firefox_app_id = FIREFOX_APP_ID,
+        firefox_window_ready_socket = FIREFOX_WINDOW_READY_SOCKET,
+        firefox_marker = TD_FIREFOX_BOOT_MARKER,
+        firefox_evidence = FIREFOX_EVIDENCE,
+        firefox_evidence_path = FIREFOX_EVIDENCE_PATH,
+        firefox_evidence_tmp_path = FIREFOX_EVIDENCE_TMP_PATH,
+        firefox_completion = FIREFOX_COMPLETION,
+        firefox_completion_path = FIREFOX_COMPLETION_PATH,
+        firefox_completion_tmp_path = FIREFOX_COMPLETION_TMP_PATH,
+        firefox_ready_timeout = FIREFOX_READY_TIMEOUT_SECS,
+        firefox_evidence_wait = FIREFOX_EVIDENCE_WAIT_ITERATIONS,
     )
 }
 
@@ -1325,30 +1322,18 @@ fn build_deployment_init(sys: &SystemDef) -> String {
         }
     }
     init.push_str(&format!(
-        "\nif /bin/td-util readlink /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} >/dev/null 2>&1; then\n\
-           echo 'td-init: fixture Downloads source is a symlink; XDG grants disabled' >&2\n\
-         elif /bin/td-util readlink /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} >/dev/null 2>&1; then\n\
-           echo 'td-init: fixture Pictures source is a symlink; XDG grants disabled' >&2\n\
-         elif /bin/td-util test -e /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} && ! /bin/td-util test -d /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE}; then\n\
-           echo 'td-init: fixture Downloads source is not a directory; XDG grants disabled' >&2\n\
-         elif /bin/td-util test -e /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} && ! /bin/td-util test -d /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}; then\n\
-           echo 'td-init: fixture Pictures source is not a directory; XDG grants disabled' >&2\n\
-         elif /bin/td-util mkdir -p /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}; then\n\
-           /bin/td-util chown {UI_UID}:{UI_GID} /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}\n\
-           /bin/td-util chmod 0700 /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}\n\
-           /bin/mount -o bind /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE}\n\
-           /bin/mount -o bind /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}\n\
-           /bin/td-util printf '' > /sysroot{APPLICATION_FIXTURE_XDG_MOUNTS_MARKER}\n\
+        "\nif /bin/td-util readlink /sysroot{FIREFOX_DOWNLOAD_SOURCE} >/dev/null 2>&1; then\n\
+           echo 'td-init: Firefox Downloads source is a symlink; grant disabled' >&2\n\
+         elif /bin/td-util test -e /sysroot{FIREFOX_DOWNLOAD_SOURCE} && ! /bin/td-util test -d /sysroot{FIREFOX_DOWNLOAD_SOURCE}; then\n\
+           echo 'td-init: Firefox Downloads source is not a directory; grant disabled' >&2\n\
+         elif /bin/td-util mkdir -p /sysroot{FIREFOX_DOWNLOAD_SOURCE}; then\n\
+           /bin/td-util chown {UI_UID}:{UI_GID} /sysroot{FIREFOX_DOWNLOAD_SOURCE}\n\
+           /bin/td-util chmod 0700 /sysroot{FIREFOX_DOWNLOAD_SOURCE}\n\
+           /bin/mount -o bind /sysroot{FIREFOX_DOWNLOAD_SOURCE} /sysroot{FIREFOX_DOWNLOAD_SOURCE}\n\
+           /bin/td-util printf '' > /sysroot{FIREFOX_XDG_MOUNT_MARKER}\n\
          else\n\
-           echo 'td-init: cannot prepare fixture XDG sources; XDG grants disabled' >&2\n\
+           echo 'td-init: cannot prepare Firefox Downloads source; grant disabled' >&2\n\
          fi\n\
-         /bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested\n\
-         /bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{APPLICATION_FIXTURE_GRANT_FILE_ROOT}\n\
-         /bin/td-util printf '%s\\n' td-jail-file-grant-v1 > /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}\n\
-         /bin/td-util chown {UI_UID}:{UI_GID} /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}\n\
-         /bin/td-util chmod 0600 /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}\n\
-         /bin/td-util printf '' > /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
-         /bin/mount -o bind /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE} /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}\n\
          /bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
          /bin/td-util rm -rf /sysroot/var/run\n\
          /bin/td-util ln -s /run /sysroot/var/run\n\
@@ -1449,12 +1434,8 @@ fn build_shutdown() -> String {
         "#!/bin/sh\n\
          ok=1\n\
          /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
-         /bin/umount {TD_JAIL_FIXTURE_GRANT_FILE} || {{ echo 'td-shutdown: umount fixture file failed' >&2; ok=0; }}\n\
-         /bin/umount {APPLICATION_FIXTURE_GRANT_FILE_ROOT} || {{ echo 'td-shutdown: umount fixture file source failed' >&2; ok=0; }}\n\
-         /bin/umount {TD_JAIL_FIXTURE_GRANT_ROOT}/nested || {{ echo 'td-shutdown: umount nested fixture Pictures failed' >&2; ok=0; }}\n\
-         if /bin/td-util test -e {APPLICATION_FIXTURE_XDG_MOUNTS_MARKER}; then\n\
-           /bin/umount {APPLICATION_FIXTURE_DOWNLOAD_SOURCE} || {{ echo 'td-shutdown: umount fixture Downloads failed' >&2; ok=0; }}\n\
-           /bin/umount {APPLICATION_FIXTURE_PICTURES_SOURCE} || {{ echo 'td-shutdown: umount fixture Pictures failed' >&2; ok=0; }}\n\
+         if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then\n\
+           /bin/umount {FIREFOX_DOWNLOAD_SOURCE} || {{ echo 'td-shutdown: umount Firefox Downloads failed' >&2; ok=0; }}\n\
          fi\n\
          /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
          /bin/umount -a -r --exclude /run || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
@@ -2533,23 +2514,23 @@ fn build_profile(sys: &SystemDef) -> String {
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done; \
          case \"$wait\" in ''|*[!0-9]*|0) wait=1;; esac; \
-         n=0; fixture_wait=0; while [ \"$n\" -lt \"$wait\" ]; do \
+         n=0; firefox_wait=0; while [ \"$n\" -lt \"$wait\" ]; do \
          status=$(/bin/td-util cat /run/td-boot-success-ok 2>/dev/null); \
-         fixture=$(/bin/td-util cat {fixture_evidence_path} 2>/dev/null); \
-         fixture_complete=$(/bin/td-util cat {fixture_completion_path} 2>/dev/null); \
-         [ \"$status\" = td-boot-success-v1 ] && [ \"$fixture\" = {fixture_evidence} ] && \
-         [ \"$fixture_complete\" = {fixture_completion} ] && break; \
+         firefox=$(/bin/td-util cat {firefox_evidence_path} 2>/dev/null); \
+         firefox_complete=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); \
+         [ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {firefox_evidence} ] && \
+         [ \"$firefox_complete\" = {firefox_completion} ] && break; \
          if [ \"$status\" = td-boot-success-v1 ]; then \
-         fixture_wait=$((fixture_wait+1)); \
-         [ \"$fixture_wait\" -ge {fixture_greeter_wait} ] && break; fi; \
+         firefox_wait=$((firefox_wait+1)); \
+         [ \"$firefox_wait\" -ge {firefox_greeter_wait} ] && break; fi; \
          [ \"$status\" = td-boot-failure-v1 ] && break; \
          n=$((n+1)); /bin/td-util sleep 1; done; \
          exit 0; fi\n",
-        fixture_evidence = APPLICATION_FIXTURE_EVIDENCE,
-        fixture_evidence_path = APPLICATION_FIXTURE_EVIDENCE_PATH,
-        fixture_completion = APPLICATION_FIXTURE_COMPLETION,
-        fixture_completion_path = APPLICATION_FIXTURE_COMPLETION_PATH,
-        fixture_greeter_wait = APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS,
+        firefox_evidence = FIREFOX_EVIDENCE,
+        firefox_evidence_path = FIREFOX_EVIDENCE_PATH,
+        firefox_completion = FIREFOX_COMPLETION,
+        firefox_completion_path = FIREFOX_COMPLETION_PATH,
+        firefox_greeter_wait = FIREFOX_GREETER_WAIT_ITERATIONS,
     ));
     s
 }
@@ -3051,9 +3032,6 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         "/etc",
         "/bin",
         "/mnt",
-        "/mnt/td-jail-fixture-file",
-        "/mnt/td-jail-fixture-pictures",
-        "/mnt/td-jail-fixture-pictures/nested",
         "/var",
         "/td",
         "/td/store",
@@ -3300,12 +3278,6 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-compositor}/bin/td-compositor".into(),
         link: "{root}/real-root/bin/td-compositor".into(),
     });
-    steps.push(Step::Symlink {
-        target: "{in:td-compositor}/bin/td-ui-demo".into(),
-        link: "{root}/real-root/bin/td-ui-demo".into(),
-    });
-    // The demo name remains for the unprivileged readiness probes above. The
-    // terminal is what the boot starts and what the launcher opens.
     steps.push(Step::Symlink {
         target: "{in:td-compositor}/bin/td-term".into(),
         link: "{root}/real-root/bin/td-term".into(),
@@ -3606,8 +3578,6 @@ fn shape_check() -> String {
      seat=\"{root}/real-root{in:td-seatd}/bin/td-seatd\"; { [ -f \"$seat\" ] && [ -x \"$seat\" ]; } || { echo 'root tree: td-seatd is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-compositor\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-compositor\" ] || { echo 'root tree: /bin/td-compositor is not a symlink to the staged software Wayland compositor' >&2; exit 1; }; \
      compositor=\"{root}/real-root{in:td-compositor}/bin/td-compositor\"; { [ -f \"$compositor\" ] && [ -x \"$compositor\" ]; } || { echo 'root tree: td-compositor is not packed and executable' >&2; exit 1; }; \
-     [ \"$(readlink \"$root/bin/td-ui-demo\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-ui-demo\" ] || { echo 'root tree: /bin/td-ui-demo is not a symlink to the staged td-native Wayland client' >&2; exit 1; }; \
-     uidemo=\"{root}/real-root{in:td-compositor}/bin/td-ui-demo\"; { [ -f \"$uidemo\" ] && [ -x \"$uidemo\" ]; } || { echo 'root tree: td-ui-demo is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-term\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-term\" ] || { echo 'root tree: /bin/td-term is not a symlink to the staged terminal' >&2; exit 1; }; \
      tdterm=\"{root}/real-root{in:td-compositor}/bin/td-term\"; { [ -f \"$tdterm\" ] && [ -x \"$tdterm\" ]; } || { echo 'root tree: td-term is not packed/executable at real-root{in:td-compositor}/bin/td-term - the /bin/td-term symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-busd\" 2>/dev/null)\" = \"{in:td-busd}/bin/td-busd\" ] || { echo 'root tree: /bin/td-busd is not a symlink to the staged session bus broker - the busd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
@@ -3625,7 +3595,7 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); jf=$(svcpos jail-fixture); je=$(svcpos jail-fixture-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$pf\" ] && [ \"$pf\" -lt \"$pe\" ] || { echo 'td-svc would not serialize rootcheck -> profiler -> profiler evidence' >&2; exit 1; }; \
@@ -3633,7 +3603,7 @@ fn shape_check() -> String {
      [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
-     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$jf\" ] && [ \"$jf\" -lt \"$je\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal+jailed fixture evidence and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
+     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$ff\" ] && [ \"$ff\" -lt \"$fe\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal+Firefox evidence and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
      [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds inside the runtime directory td-seatd makes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
@@ -3809,9 +3779,8 @@ pub fn recipe() -> Recipe {
         path: "{out}".into(),
     });
 
-    // 1) Stage the real-root tree in build scratch. WriteFile/MkDir expose only
-    //    their fixed modes. Keep the immutable fixture root permissive so its
-    //    target write refusal cannot come from directory mode.
+    // 1) Stage the real-root tree in build scratch. WriteFile exposes a fixed
+    //    mode, so set the shadow-file mode explicitly before packing.
     steps.extend(real_root_steps(&SYSTEM));
     steps.push(
         Step::run(
@@ -3819,7 +3788,7 @@ pub fn recipe() -> Recipe {
             &[
                 POST_BOOTSTRAP_SH,
                 "-c",
-                "chmod 0600 '{root}/real-root/etc/shadow' && chmod 1777 '{root}/real-root/mnt/td-jail-fixture-pictures'",
+                "chmod 0600 '{root}/real-root/etc/shadow'",
             ],
         )
         .env("PATH", &post_bootstrap_path()),
@@ -3964,12 +3933,9 @@ pub fn recipe() -> Recipe {
         //   how every unprivileged health leg runs. See td-login/THREAT-MODEL.md.
         // td-svc: the static service supervisor that starts every real-root job.
         // td-jail: the static application boundary; its target-kernel transition probe
-        //   and the selected fixture launch both run on every boot.
-        // td-seatd/td-compositor: the static single-user UI substrate and demo client,
-        // copied directly.
-        // td-busd: the static session D-Bus broker. No consumer on this image yet;
-        //   it is here so the unit, its uid and its socket path are exercised by a
-        //   real boot before the portal and the applications depend on them.
+        //   and the Firefox launch both run on every boot.
+        // td-seatd/td-compositor: the static single-user UI substrate and terminal.
+        // td-busd: the static session D-Bus broker used by every Firefox launch.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -4209,7 +4175,7 @@ mod tests {
             Step::WriteFile { path, content, exec: false }
                 if path == "{root}/real-root/etc/td-profiler-application-roots.tsv"
                     && content == "td-profiler-application-roots-v1\n\
-td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
+firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         )));
         assert!(steps.iter().any(|step| matches!(
             step,
@@ -4371,104 +4337,93 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             Some("terminal")
         );
         assert!(unit_after("bootsuccess").contains(&"terminal".to_string()));
-        assert!(!unit_after("bootsuccess").contains(&"jail-fixture".to_string()));
+        assert!(!unit_after("bootsuccess").contains(&"firefox".to_string()));
         // Which marker the ORACLE selects cannot be seen from this crate's
         // lib — it is a `const` in the `td-recipe-eval` bin — so the pin for
         // that lives beside it, in `qemu_boot.rs`'s own tests.
-        let fixture = unit_key("jail-fixture", "exec").unwrap_or_default();
-        assert!(fixture.contains(&format!(
-            "/bin/td-login exec-as tester -- /bin/{APPLICATION_FIXTURE_NAME} run "
-        )));
+        let firefox = unit_key("firefox", "exec").unwrap_or_default();
         assert_eq!(
-            unit_key("jail-fixture", "requires").as_deref(),
+            firefox,
+            format!("/bin/td-login exec-as tester -- /bin/{FIREFOX_NAME}")
+        );
+        assert_eq!(
+            unit_key("firefox", "requires").as_deref(),
             Some("wayland")
         );
-        let fixture_ready = unit_key("jail-fixture", "ready").unwrap_or_default();
-        let published = fixture
-            .split("--ready-socket ")
-            .nth(1)
-            .unwrap_or_default()
-            .split(['\'', ' '])
-            .next()
-            .unwrap_or_default();
-        let dialled = fixture_ready
-            .split("probe ")
-            .nth(1)
-            .unwrap_or_default()
-            .split(['\'', ' '])
-            .next()
-            .unwrap_or_default();
+        let firefox_ready = unit_key("firefox", "ready").unwrap_or_default();
         assert_eq!(
-            published,
-            format!("/run/user/1000/{APPLICATION_RUNTIME_ROOT}/ready")
-        );
-        assert_eq!(
-            dialled,
+            firefox_ready,
             format!(
-                "/run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready"
+                "/bin/td-login exec-as tester -- /bin/td-compositor \
+                 probe-application {FIREFOX_WINDOW_READY_SOCKET}"
             )
         );
+        let wayland = unit_key("wayland", "exec").unwrap_or_default();
+        assert!(wayland.contains(&format!(
+            "--application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
+             --application-app-id {FIREFOX_APP_ID}"
+        )));
         assert_eq!(
-            unit_key("jail-fixture", "ready-timeout"),
-            Some(APPLICATION_FIXTURE_READY_TIMEOUT_SECS.to_string())
+            unit_key("firefox", "ready-timeout"),
+            Some(FIREFOX_READY_TIMEOUT_SECS.to_string())
         );
         assert_eq!(
-            APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS,
-            APPLICATION_FIXTURE_READY_TIMEOUT_SECS * APPLICATION_FIXTURE_READY_ATTEMPTS
-                + APPLICATION_FIXTURE_RETRY_MARGIN_SECS
+            FIREFOX_EVIDENCE_WAIT_ITERATIONS,
+            FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS
+                + FIREFOX_RETRY_MARGIN_SECS
         );
         assert_eq!(
-            APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS,
-            APPLICATION_FIXTURE_READY_TIMEOUT_SECS
-                + APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS
+            FIREFOX_GREETER_WAIT_ITERATIONS,
+            FIREFOX_READY_TIMEOUT_SECS
+                + FIREFOX_EVIDENCE_WAIT_ITERATIONS
         );
         assert!(
-            u64::from(APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS)
+            u64::from(FIREFOX_GREETER_WAIT_ITERATIONS)
                 <= crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS
                     .saturating_sub(crate::ladder::QEMU_GUEST_WAIT_MARGIN_SECS)
                     .saturating_sub(u64::from(BOOT_SUCCESS_ITERATION_BUDGET_SECS)),
-            "the default guest wait must preserve the complete fixture evidence window"
+            "the default guest wait must preserve the complete Firefox evidence window"
         );
-        let evidence = unit_key("jail-fixture-evidence", "exec").unwrap_or_default();
+        let evidence = unit_key("firefox-evidence", "exec").unwrap_or_default();
         assert!(evidence.starts_with(&format!(
-            "/bin/sh -c 'n=0; while [ \"$n\" -lt {APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS} ]; do if /bin/td-login exec-as tester -- /bin/td-ui-demo probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1 && /bin/td-login exec-as tester -- /bin/td-jail --probe-resource-caps {APPLICATION_FIXTURE_NAME}; then "
+            "/bin/sh -c 'n=0; while [ \"$n\" -lt {FIREFOX_EVIDENCE_WAIT_ITERATIONS} ]; do if /bin/td-login exec-as tester -- /bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} >/dev/null 2>&1 && /bin/td-login exec-as tester -- /bin/td-jail --probe-resource-caps {FIREFOX_NAME}; then "
         )));
         assert!(evidence.contains(&format!(
-            "/bin/rm -f {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
+            "/bin/rm -f {FIREFOX_EVIDENCE_TMP_PATH} {FIREFOX_COMPLETION_TMP_PATH}"
         )));
         let evidence_write = evidence
             .find(&format!(
-                "{APPLICATION_FIXTURE_EVIDENCE} > {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH}"
+                "{FIREFOX_EVIDENCE} > {FIREFOX_EVIDENCE_TMP_PATH}"
             ))
-            .expect("fixture evidence temporary write missing");
+            .expect("Firefox evidence temporary write missing");
         let evidence_chmod = evidence
             .find(&format!(
-                "/bin/td-util chmod 0644 {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH}"
+                "/bin/td-util chmod 0644 {FIREFOX_EVIDENCE_TMP_PATH}"
             ))
-            .expect("fixture evidence chmod missing");
+            .expect("Firefox evidence chmod missing");
         let evidence_marker = evidence
-            .find(&format!("/bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER}"))
-            .expect("fixture evidence marker missing");
+            .find(&format!("/bin/echo {TD_FIREFOX_BOOT_MARKER}"))
+            .expect("Firefox evidence marker missing");
         let evidence_publish = evidence
             .find(&format!(
-                "/bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH}"
+                "/bin/mv {FIREFOX_EVIDENCE_TMP_PATH} {FIREFOX_EVIDENCE_PATH}"
             ))
-            .expect("fixture evidence publication missing");
+            .expect("Firefox evidence publication missing");
         let completion_write = evidence
             .find(&format!(
-                "{APPLICATION_FIXTURE_COMPLETION} > {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
+                "{FIREFOX_COMPLETION} > {FIREFOX_COMPLETION_TMP_PATH}"
             ))
-            .expect("fixture completion temporary write missing");
+            .expect("Firefox completion temporary write missing");
         let completion_chmod = evidence
             .find(&format!(
-                "/bin/td-util chmod 0644 {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
+                "/bin/td-util chmod 0644 {FIREFOX_COMPLETION_TMP_PATH}"
             ))
-            .expect("fixture completion chmod missing");
+            .expect("Firefox completion chmod missing");
         let completion_publish = evidence
             .find(&format!(
-                "/bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH}"
+                "/bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH}"
             ))
-            .expect("fixture completion publication missing");
+            .expect("Firefox completion publication missing");
         assert!(
             evidence_write < evidence_chmod
                 && evidence_chmod < evidence_publish
@@ -4479,74 +4434,45 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             "evidence, marker and completion must have one exact order"
         );
         assert!(evidence.ends_with(&format!(
-            "&& /bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
+            "&& /bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
         )));
         assert_eq!(
-            unit_key("jail-fixture-evidence", "type").as_deref(),
+            unit_key("firefox-evidence", "type").as_deref(),
             Some("daemon")
         );
         assert_eq!(
-            unit_key("jail-fixture-evidence", "restart").as_deref(),
+            unit_key("firefox-evidence", "restart").as_deref(),
             Some("never")
         );
         assert!(
-            unit_after("jail-fixture-evidence").contains(&"jail-fixture".to_string())
+            unit_after("firefox-evidence").contains(&"firefox".to_string())
         );
-        assert!(unit_key("jail-fixture-evidence", "requires").is_none());
+        assert!(unit_key("firefox-evidence", "requires").is_none());
 
-        // td-ui-demo appears in service definitions only as the exact host-side
-        // readiness probe for the jailed fixture.
-        for (unit, keys) in parse_td_svc_conf() {
-            for (key, value) in keys {
-                for (at, _) in value.match_indices("/bin/td-ui-demo") {
-                    let after = value
-                        .get(at + "/bin/td-ui-demo".len()..)
-                        .unwrap_or_default();
-                    let expected_ready = format!(
-                        " probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready"
-                    );
-                    let readiness =
-                        unit == "jail-fixture" && key == "ready" && after == expected_ready;
-                    let expected_evidence = format!(
-                        " probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1 && /bin/td-login exec-as tester -- /bin/td-jail --probe-resource-caps {APPLICATION_FIXTURE_NAME}; then /bin/rm -f {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/td-util printf \"%s\\n\" {APPLICATION_FIXTURE_EVIDENCE} > {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} && /bin/td-util chmod 0644 {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} && /bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH} && /bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER} && /bin/td-util printf \"%s\\n\" {APPLICATION_FIXTURE_COMPLETION} > {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/td-util chmod 0644 {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} && /bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
-                    );
-                    let evidence = unit == "jail-fixture-evidence"
-                        && key == "exec"
-                        && value.starts_with(&format!(
-                            "/bin/sh -c 'n=0; while [ \"$n\" -lt {APPLICATION_FIXTURE_EVIDENCE_WAIT_ITERATIONS} ]; do if /bin/td-login exec-as tester -- /bin/td-ui-demo"
-                        ))
-                        && after == expected_evidence;
-                    assert!(
-                        readiness || evidence,
-                        "unit [{unit}] {key}= gives td-ui-demo an unreviewed role: {value}"
-                    );
-                }
-            }
-        }
+        assert!(
+            !build_td_svc_conf().contains("/bin/td-ui-demo"),
+            "the synthetic client must not remain on the system boot path"
+        );
     }
 
-    /// Every client path the compositor is handed is a name the image STAGES.
+    /// Every native client path the compositor is handed is a name the image STAGES.
     ///
     /// The compositor cannot resolve any of them: each is an absolute `/bin`
     /// name, and the launcher refuses a relative program rather than
     /// searching. A flag naming a binary this recipe does not symlink is a
-    /// launcher entry that spawns nothing — and nothing on the boot path would
-    /// say so, because the failure is a `Command::new` inside a running
-    /// compositor, reported through the launcher's own failure path.
+    /// native launcher entry that spawns nothing. Firefox is activation-only
+    /// and therefore has no client-path flag.
     ///
-    /// What this test uniquely holds is the MAPPING. That each path is staged
+    /// What this test uniquely holds is the MAPPING. That the path is staged
     /// is already covered by `direct_bin_calls_resolve_to_a_packed_name`,
     /// which sweeps every `/bin/NAME` in the table; what nothing else sees is
-    /// WHICH flag carries WHICH program. Swap the two and the image is a
-    /// machine whose NEW TERMINAL entry opens the input monitor and whose NEW
-    /// INPUT MONITOR opens a terminal — both binaries staged, every other
-    /// test green, and nothing short of looking at the screen to say so.
+    /// WHICH flag carries the terminal program.
     ///
-    /// The flags are enumerated out of the unit rather than only listed, so a
-    /// renamed or vanished flag reds the count instead of quietly leaving the
-    /// mapping unchecked.
+    /// The client flags are enumerated out of the unit rather than only listed,
+    /// so a renamed or vanished flag reds the count instead of quietly leaving
+    /// the mapping unchecked.
     #[test]
-    fn the_launcher_client_flags_name_binaries_the_image_stages() {
+    fn native_launcher_client_flags_name_binaries_the_image_stages() {
         let exec = unit_key("wayland", "exec").unwrap_or_default();
         let steps = real_root_steps(&SYSTEM);
         let words: Vec<&str> = exec.split_ascii_whitespace().collect();
@@ -4567,11 +4493,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             .collect();
         // The enumeration is only a proof if it FOUND them, and the count is
         // what says so: a renamed flag would silently yield a shorter list.
-        assert_eq!(
-            flags.len(),
-            2,
-            "expected two --*-client flags in the wayland unit, found {flags:?}"
-        );
+        assert_eq!(flags.len(), 1, "expected one native --*-client flag");
         for (flag, path) in &flags {
             let program = path.strip_prefix("/bin/").unwrap_or_default();
             assert!(
@@ -4580,7 +4502,6 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             );
             let link = format!("{{root}}/real-root{path}");
             let expected_target = match *flag {
-                "--launcher-client" => "/bin/td-jail",
                 "--terminal-client" => "{in:td-compositor}/bin/td-term",
                 _ => "",
             };
@@ -4590,32 +4511,19 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                     if at == &link && target == expected_target
             )), "{flag} passes {path}, but nothing stages it through {expected_target}");
         }
-        // Order-independent, because two flags on one command line have none:
-        // what is pinned is which program each NAMES.
-        let launcher_path = format!("/bin/{APPLICATION_FIXTURE_NAME}");
-        for expected in [
-            ("--launcher-client", launcher_path.as_str()),
-            ("--terminal-client", "/bin/td-term"),
-        ] {
-            assert!(
-                flags.contains(&expected),
-                "the wayland unit does not pass {} {} — found {flags:?}",
-                expected.0,
-                expected.1
-            );
-        }
+        assert_eq!(flags, vec![("--terminal-client", "/bin/td-term")]);
     }
 
     #[test]
-    fn wayland_service_supplies_both_explicit_client_paths() {
+    fn wayland_service_uses_activation_only_firefox_and_a_native_terminal() {
         let expected = format!(
             "/bin/su -s /bin/sh tester -c '/bin/td-compositor run \
              --framebuffer /dev/fb0 --input /dev/input \
              --socket /run/user/1000/wayland-0 \
-             --launcher-client /bin/{APPLICATION_FIXTURE_NAME} \
-             --launcher-application {APPLICATION_FIXTURE_NAME} \
-             --launcher-runtime /run/user/1000/{APPLICATION_RUNTIME_ROOT} \
-             --terminal-client /bin/td-term'"
+             --launcher-application {FIREFOX_NAME} \
+             --terminal-client /bin/td-term \
+             --application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
+             --application-app-id {FIREFOX_APP_ID}'"
         );
         assert_eq!(
             unit_key("wayland", "exec").as_deref(),
@@ -4821,8 +4729,8 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             ("busd", vec!["seat"]),
             ("wayland", vec!["seat"]),
             ("terminal", vec!["wayland"]),
-            ("jail-fixture", vec!["busd", "wayland"]),
-            ("jail-fixture-evidence", vec!["jail-fixture"]),
+            ("firefox", vec!["busd", "wayland"]),
+            ("firefox-evidence", vec!["firefox"]),
             (
                 "bootsuccess",
                 sysinit
@@ -4850,39 +4758,35 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         }
     }
 
-    /// The image ships exactly ONE application, and that is a precondition of
-    /// the bus mount rather than a fact about the roadmap.
+    /// The image ships exactly ONE application. This is a review tripwire on a
+    /// second packaged policy surface, not a proof that the bus has one peer.
     ///
-    /// td-jail binds `/run/user/1000/bus` into every jail unconditionally,
-    /// because APPLICATIONS.md §C's mount plan, step 12, says the broker is the
-    /// policy. The broker is not that yet: no well-known names, no match rules,
-    /// no per-caller filter, and an admission quota keyed on `SO_PEERCRED.pid`
-    /// that a PID namespace with no pids cap lets one application fork past.
-    /// Every consequence of that is a problem between PEERS.
+    /// td-jail binds `/run/user/1000/bus` into every jail because the broker is
+    /// the policy boundary. Well-known names, match rules, per-caller filtering
+    /// and per-instance admission have landed. Two shared surfaces remain: the
+    /// global descriptor budget is not charged per instance, and
+    /// `GetConnectionCredentials` reports init-namespace pids.
     ///
     /// Which is NOT what this counts, and the gap is stated here rather than
     /// left for a reader to assume away. A package count does not bound peers:
-    /// `td-portal` will speak D-Bus and is not a `ShippedApplication`, and this
-    /// one package already has two launch routes — its unit and the
-    /// compositor's launcher menu — with no single-instance lock between them.
-    /// What actually makes the exposures unreachable today is that nothing
-    /// inside a jail opens the bus at all, and that is not assertable here.
+    /// `td-portal` will speak D-Bus and is not a `ShippedApplication`, and a
+    /// direct `/bin/firefox` request can add another peer without changing the
+    /// package count. The compositor card itself is activation-only.
     ///
     /// So this is a tripwire on the likeliest next step, put where adding the
     /// entry breaks the build rather than promised in prose a future change
     /// would not have to read. APPLICATIONS.md §D carries the rest of the
     /// sentence, including what the tripwire does not cover.
     #[test]
-    fn the_image_ships_one_application_until_the_broker_is_a_boundary() {
+    fn the_image_stays_single_application_until_remaining_bus_sharing_gaps_land() {
         assert_eq!(
             SHIPPED_APPLICATIONS.len(),
             1,
-            "a second application would share a session bus that cannot yet \
-             tell its callers apart: td-jail binds the bus into every jail \
-             unconditionally on the grounds that the broker is the policy, and \
-             td-busd has no per-caller filter and no per-instance admission \
-             key. See APPLICATIONS.md §D, 'the broker is not that component \
-             yet', for what must land with the second entry"
+            "a second application would share td-busd's global descriptor \
+             budget and could observe init-namespace pids through \
+             GetConnectionCredentials. See APPLICATIONS.md §D for these \
+             remaining peer-attribution gaps and the limits of this package \
+             count tripwire"
         );
     }
 
@@ -4987,7 +4891,7 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             unit_key("bootsuccess", "requires").as_deref(),
             Some("terminal"),
             "deployment health must be skipped when the terminal failed, while the \
-             mutable-state fixture remains independent QEMU evidence"
+             mutable Firefox launch remains independent QEMU evidence"
         );
     }
 
@@ -5039,12 +4943,12 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         // ORDERED after the bus, and STRICT only on the compositor, and the
         // asymmetry is the point. td-jail RESOLVES /run/user/1000/bus before
         // it unshares and fails the launch if it is not a socket owned by the
-        // login user, so the fixture needs that socket to EXIST — `busd` and
+        // login user, so Firefox needs that socket to EXIST — `busd` and
         // `wayland` are siblings, each requiring only `seat`, so without an
-        // ordering edge td-svc may release the fixture the moment the
+        // ordering edge td-svc may release Firefox the moment the
         // compositor is ready, onto a bus that has not bound.
         //
-        // The fixture now DOES need a working broker: since §D's registration
+        // Firefox DOES need a working broker: since §D's registration
         // landed in td-jail, stage 0 opens a connection and refuses the launch
         // if `Register` or `Complete` fails, because an application the broker
         // has no record of resolves `Unconfined`. The edge is still ORDERING
@@ -5059,27 +4963,27 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         // the boot window would permanently kill the application tier of a
         // machine whose broker recovers a second later.
         //
-        // Ordering alone recovers instead. The fixture's own `restart=always`
+        // Ordering alone recovers instead. Firefox's own `restart=always`
         // retries the launch until the broker is answering, which is
         // self-healing where the strict edge was terminal — and it covers the
         // broker that is up but not yet serving as well as the one that never
         // bound, since a registration that fails is a failed launch and a
         // failed launch is a restart. The diagnostic that made the strict edge
         // tempting is no longer the argument for it either: `session_socket`
-        // labels its errors, so a fixture dying on an absent bus says "session
+        // labels its errors, so Firefox dying on an absent bus says "session
         // bus /run/user/1000/bus" rather than a bare ENOENT, and one dying on
         // a wedged broker names the instance it could not register.
         assert_eq!(
-            unit_key("jail-fixture", "requires").as_deref(),
+            unit_key("firefox", "requires").as_deref(),
             Some("wayland"),
-            "the packaged fixture must not start without its compositor — and \
+            "Firefox must not start without its compositor — and \
              must not be made strictly dependent on a broker whose restart \
              backoff td-svc cannot tell from a permanent failure"
         );
         assert_eq!(
-            unit_key("jail-fixture", "restart").as_deref(),
+            unit_key("firefox", "restart").as_deref(),
             Some("always"),
-            "the packaged fixture is supervised and restartable"
+            "Firefox is supervised and restartable"
         );
     }
 
@@ -5106,8 +5010,8 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
             "{in:codex}".to_string(),
-            "{payload:empty-runtime}".to_string(),
-            format!("{{payload:{APPLICATION_FIXTURE_NAME}}}"),
+            format!("{{payload:{FIREFOX_NAME}}}"),
+            "{payload:freedesktop-platform-25-08}".to_string(),
         ];
         assert_eq!(
             roots.as_slice(),
@@ -5289,15 +5193,9 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
              make those generated before changing the graphical account"
         );
         assert_eq!(
-            [
-                APPLICATION_FIXTURE_DOWNLOAD_SOURCE,
-                APPLICATION_FIXTURE_PICTURES_SOURCE,
-            ],
-            [
-                format!("/var{UI_HOME}/Downloads"),
-                format!("/var{UI_HOME}/Pictures"),
-            ],
-            "the fixture XDG bind mounts must follow the fixed UI profile's real home"
+            FIREFOX_DOWNLOAD_SOURCE,
+            format!("/var{UI_HOME}/Downloads"),
+            "Firefox's Downloads bind must follow the fixed UI profile's real home"
         );
         assert_eq!(
             unit_key("seat", "exec"),
@@ -5427,6 +5325,16 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
                 package.name, application.package,
                 "shipped application package provenance must come from its catalog recipe"
             );
+            if application.name == FIREFOX_NAME {
+                assert_eq!(
+                    package
+                        .application
+                        .as_ref()
+                        .and_then(|declaration| declaration.alias()),
+                    Some(FIREFOX_APP_ID),
+                    "the compositor observer must match Firefox's authenticated alias"
+                );
+            }
             let runtime = (application.runtime_recipe)();
             assert_eq!(
                 runtime.name, application.runtime,
@@ -5685,16 +5593,21 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         )));
 
         assert_eq!(SYSTEM.applications.len(), 1);
+        let shipped = SYSTEM
+            .applications
+            .first()
+            .expect("one shipped application");
         assert_eq!(
-            SYSTEM.applications.first().map(|app| app.name),
-            Some(APPLICATION_FIXTURE_NAME)
+            (shipped.name, shipped.package, shipped.runtime),
+            (FIREFOX_NAME, FIREFOX_NAME, "freedesktop-platform-25-08"),
+            "the system image must pair the reviewed Firefox package and runtime"
         );
         let system_recipe = recipe();
         assert_eq!(
             system_recipe.payload_inputs,
             Some(vec![
-                "empty-runtime".into(),
-                APPLICATION_FIXTURE_NAME.into()
+                FIREFOX_NAME.into(),
+                "freedesktop-platform-25-08".into()
             ])
         );
     }
@@ -7165,28 +7078,12 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
              EIO and a greeter that cannot reach td-svc looks like a hang with no explanation"
         );
         let shutdown = build_shutdown();
-        let xdg_guard = format!(
-            "if /bin/td-util test -e {APPLICATION_FIXTURE_XDG_MOUNTS_MARKER}; then"
-        );
-        let download_unmount = format!(
-            "/bin/umount {APPLICATION_FIXTURE_DOWNLOAD_SOURCE} || {{"
-        );
-        let pictures_unmount = format!(
-            "/bin/umount {APPLICATION_FIXTURE_PICTURES_SOURCE} || {{"
-        );
+        let xdg_guard =
+            format!("if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then");
+        let download_unmount = format!("/bin/umount {FIREFOX_DOWNLOAD_SOURCE} || {{");
         assert!(
             shutdown.contains("/bin/td-init sync || {")
                 && shutdown.contains(&download_unmount)
-                && shutdown.contains(&pictures_unmount)
-                && shutdown.contains(&format!(
-                    "/bin/umount {TD_JAIL_FIXTURE_GRANT_FILE} || {{"
-                ))
-                && shutdown.contains(&format!(
-                    "/bin/umount {APPLICATION_FIXTURE_GRANT_FILE_ROOT} || {{"
-                ))
-                && shutdown.contains(&format!(
-                    "/bin/umount {TD_JAIL_FIXTURE_GRANT_ROOT}/nested || {{"
-                ))
                 && shutdown.contains("/bin/umount /var || {")
                 && shutdown.contains("/bin/umount -a -r --exclude /run || {")
                 && shutdown.contains("/bin/td-util test \"$ok\" = 1")
@@ -7196,9 +7093,8 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         assert_eq!(shutdown.matches(&xdg_guard).count(), 1);
         assert!(
             shutdown.find(&xdg_guard) < shutdown.find(&download_unmount)
-                && shutdown.find(&download_unmount) < shutdown.find(&pictures_unmount)
-                && shutdown.find(&pictures_unmount) < shutdown.find("/bin/umount /var || {"),
-            "fixture XDG self-binds must be released only when init installed them"
+                && shutdown.find(&download_unmount) < shutdown.find("/bin/umount /var || {"),
+            "Firefox's Downloads self-bind must be released only when init installed it"
         );
     }
 
@@ -7329,130 +7225,59 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
     }
 
     #[test]
-    fn fixture_grant_oracles_are_prepared_once_before_switch_root() {
-        let steps = real_root_steps(&SYSTEM);
-        for path in [
-            format!("{{root}}/real-root{APPLICATION_FIXTURE_GRANT_FILE_ROOT}"),
-            format!("{{root}}/real-root{TD_JAIL_FIXTURE_GRANT_ROOT}"),
-            format!("{{root}}/real-root{TD_JAIL_FIXTURE_GRANT_ROOT}/nested"),
-        ] {
-            assert!(steps.iter().any(
-                |step| matches!(step, Step::MkDir { path: actual } if actual == &path)
-            ));
-        }
+    fn firefox_downloads_is_prepared_once_before_switch_root() {
         let init = build_deployment_init(&SYSTEM);
         let source_mkdir = format!(
-            "elif /bin/td-util mkdir -p /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}; then"
+            "elif /bin/td-util mkdir -p /sysroot{FIREFOX_DOWNLOAD_SOURCE}; then"
         );
         let download_mount = format!(
-            "/bin/mount -o bind /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE}"
-        );
-        let pictures_mount = format!(
-            "/bin/mount -o bind /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}"
+            "/bin/mount -o bind /sysroot{FIREFOX_DOWNLOAD_SOURCE} /sysroot{FIREFOX_DOWNLOAD_SOURCE}"
         );
         let download_link_guard = format!(
-            "if /bin/td-util readlink /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} >/dev/null 2>&1; then"
-        );
-        let pictures_link_guard = format!(
-            "elif /bin/td-util readlink /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} >/dev/null 2>&1; then"
+            "if /bin/td-util readlink /sysroot{FIREFOX_DOWNLOAD_SOURCE} >/dev/null 2>&1; then"
         );
         let download_directory_guard = format!(
-            "elif /bin/td-util test -e /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} && ! /bin/td-util test -d /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE}; then"
-        );
-        let pictures_directory_guard = format!(
-            "elif /bin/td-util test -e /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE} && ! /bin/td-util test -d /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}; then"
+            "elif /bin/td-util test -e /sysroot{FIREFOX_DOWNLOAD_SOURCE} && ! /bin/td-util test -d /sysroot{FIREFOX_DOWNLOAD_SOURCE}; then"
         );
         let source_chown = format!(
-            "/bin/td-util chown {UI_UID}:{UI_GID} /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}"
+            "/bin/td-util chown {UI_UID}:{UI_GID} /sysroot{FIREFOX_DOWNLOAD_SOURCE}"
         );
         let source_chmod = format!(
-            "/bin/td-util chmod 0700 /sysroot{APPLICATION_FIXTURE_DOWNLOAD_SOURCE} /sysroot{APPLICATION_FIXTURE_PICTURES_SOURCE}"
+            "/bin/td-util chmod 0700 /sysroot{FIREFOX_DOWNLOAD_SOURCE}"
         );
-        let mount_marker = format!(
-            "/bin/td-util printf '' > /sysroot{APPLICATION_FIXTURE_XDG_MOUNTS_MARKER}"
-        );
-        let nested_mount = format!(
-            "/bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{TD_JAIL_FIXTURE_GRANT_ROOT}/nested"
-        );
-        let file_mount = format!(
-            "/bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0700,uid={UI_UID},gid={UI_GID},size=1048576 tmpfs /sysroot{APPLICATION_FIXTURE_GRANT_FILE_ROOT}"
-        );
-        let file_write = format!(
-            "/bin/td-util printf '%s\\n' td-jail-file-grant-v1 > /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}"
-        );
-        let file_target = format!(
-            "/bin/td-util printf '' > /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}"
-        );
-        let file_bind = format!(
-            "/bin/mount -o bind /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE} /sysroot{TD_JAIL_FIXTURE_GRANT_FILE}"
-        );
+        let mount_marker =
+            format!("/bin/td-util printf '' > /sysroot{FIREFOX_XDG_MOUNT_MARKER}");
+        let downloads_end =
+            "/bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'";
         assert_eq!(init.matches(&source_mkdir).count(), 1);
         assert_eq!(init.matches(&download_link_guard).count(), 1);
-        assert_eq!(init.matches(&pictures_link_guard).count(), 1);
         assert_eq!(init.matches(&download_directory_guard).count(), 1);
-        assert_eq!(init.matches(&pictures_directory_guard).count(), 1);
         assert_eq!(init.matches(&source_chown).count(), 1);
         assert_eq!(init.matches(&source_chmod).count(), 1);
         assert_eq!(init.matches(&download_mount).count(), 1);
-        assert_eq!(init.matches(&pictures_mount).count(), 1);
         assert_eq!(init.matches(&mount_marker).count(), 1);
-        assert_eq!(init.matches(&nested_mount).count(), 1);
-        assert_eq!(init.matches(&file_mount).count(), 1);
-        assert!(!init.contains("if /bin/td-util test -d /sysroot/mnt/td-jail-fixture"));
-        assert_eq!(init.matches(&file_write).count(), 1);
-        assert_eq!(init.matches(&file_target).count(), 1);
-        assert_eq!(init.matches(&file_bind).count(), 1);
-        assert!(init.contains(&format!(
-            "/bin/td-util chown {UI_UID}:{UI_GID} /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}\n/bin/td-util chmod 0600 /sysroot{APPLICATION_FIXTURE_GRANT_FILE_SOURCE}"
-        )));
-        let xdg_setup = init
-            .split_once(&download_link_guard)
-            .expect("fixture XDG setup start")
-            .1
-            .split_once(&nested_mount)
-            .expect("fixture XDG setup end")
-            .0;
-        assert_eq!(xdg_setup.matches("XDG grants disabled").count(), 5);
+        assert_eq!(init.matches("grant disabled").count(), 3);
         assert!(
-            !xdg_setup.contains("exit 1"),
-            "untrusted persistent XDG entries must disable fixture grants, not abort init"
+            !init
+                .split_once(&download_link_guard)
+                .expect("Firefox Downloads setup start")
+                .1
+                .split_once(downloads_end)
+                .expect("Firefox Downloads setup end")
+                .0
+                .contains("exit 1"),
+            "untrusted persistent Downloads entries must disable the grant, not abort init"
         );
         assert!(
-            init.find(&download_link_guard) < init.find(&pictures_link_guard)
-                && init.find(&pictures_link_guard) < init.find(&download_directory_guard)
-                && init.find(&download_directory_guard) < init.find(&pictures_directory_guard)
-                && init.find(&pictures_directory_guard) < init.find(&source_mkdir)
+            init.find(&download_link_guard) < init.find(&download_directory_guard)
+                && init.find(&download_directory_guard) < init.find(&source_mkdir)
                 && init.find(&source_mkdir) < init.find(&source_chown)
                 && init.find(&source_chown) < init.find(&source_chmod)
                 && init.find(&source_chmod) < init.find(&download_mount)
-                && init.find(&download_mount) < init.find(&pictures_mount)
-                && init.find(&pictures_mount) < init.find(&mount_marker)
-                && init.find(&mount_marker) < init.find(&nested_mount)
-                && init.find(&nested_mount) < init.find(&file_mount)
-                && init.find(&file_mount) < init.find(&file_write)
-                && init.find(&file_write) < init.find(&file_target)
-                && init.find(&file_target) < init.find(&file_bind)
-                && init.find(&file_bind) < init.find("exec /bin/switch_root /sysroot /init"),
-            "the mount and writable file oracle must precede switch_root"
+                && init.find(&download_mount) < init.find(&mount_marker)
+                && init.find(&mount_marker) < init.find("exec /bin/switch_root /sysroot /init"),
+            "the Downloads self-bind must precede switch_root"
         );
-        let image_recipe = recipe();
-        let mode_command = image_recipe
-            .steps
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find_map(|step| match step {
-                Step::Run { argv, .. } => argv
-                    .iter()
-                    .find(|argument| argument.contains("chmod 1777")),
-                _ => None,
-            })
-            .map(String::as_str)
-            .unwrap_or_default();
-        assert!(mode_command.contains(&format!(
-            "chmod 1777 '{{root}}/real-root{TD_JAIL_FIXTURE_GRANT_ROOT}'"
-        )));
-        assert!(!mode_command.contains("chmod 0777"));
     }
 
     #[test]
@@ -7691,25 +7516,25 @@ td-jail-fixture\ttd-jail-fixture-0.1\tsource\tempty-runtime-1\tsource\n"
         );
         assert!(
             services.contains(&format!(
-                "/bin/td-ui-demo probe /run/user/{UI_UID}/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1"
+                "/bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} >/dev/null 2>&1"
             )) && services.contains(&format!(
-                "{APPLICATION_FIXTURE_EVIDENCE} > {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH}"
+                "{FIREFOX_EVIDENCE} > {FIREFOX_EVIDENCE_TMP_PATH}"
             )) && services.contains(&format!(
-                "/bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER}"
+                "/bin/echo {TD_FIREFOX_BOOT_MARKER}"
             )) && services.contains(&format!(
-                "/bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH}"
+                "/bin/mv {FIREFOX_EVIDENCE_TMP_PATH} {FIREFOX_EVIDENCE_PATH}"
             )) && services.contains(&format!(
-                "{APPLICATION_FIXTURE_COMPLETION} > {APPLICATION_FIXTURE_COMPLETION_TMP_PATH}"
+                "{FIREFOX_COMPLETION} > {FIREFOX_COMPLETION_TMP_PATH}"
             )) && services.contains(&format!(
-                "/bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH}"
-            )) && !bootsuccess.contains(TD_JAIL_FIXTURE_BOOT_MARKER)
+                "/bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH}"
+            )) && !bootsuccess.contains(TD_FIREFOX_BOOT_MARKER)
                 && profile.contains(&format!(
-                    "fixture_complete=$(/bin/td-util cat {APPLICATION_FIXTURE_COMPLETION_PATH} 2>/dev/null)"
+                    "firefox_complete=$(/bin/td-util cat {FIREFOX_COMPLETION_PATH} 2>/dev/null)"
                 ))
                 && profile.contains(&format!(
-                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$fixture\" = {APPLICATION_FIXTURE_EVIDENCE} ] && [ \"$fixture_complete\" = {APPLICATION_FIXTURE_COMPLETION} ] && break"
+                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {FIREFOX_EVIDENCE} ] && [ \"$firefox_complete\" = {FIREFOX_COMPLETION} ] && break"
                 )),
-            "fixture evidence must be exact without controlling deployment health"
+            "Firefox evidence must be exact without controlling deployment health"
         );
         assert!(
             bootsuccess.find("/bin/cat /etc/os-release").unwrap()
@@ -8039,9 +7864,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             profile.contains(AUTOTEST_CMDLINE_TOKEN)
                 && profile.contains("set -f; wait=0")
-                && profile.contains("fixture_wait=0")
+                && profile.contains("firefox_wait=0")
                 && profile.contains(&format!(
-                    "[ \"$fixture_wait\" -ge {APPLICATION_FIXTURE_GREETER_WAIT_ITERATIONS} ] && break"
+                    "[ \"$firefox_wait\" -ge {FIREFOX_GREETER_WAIT_ITERATIONS} ] && break"
                 ))
                 && profile.contains("exit"),
             "profile must exit on the autotest cmdline token so the headless boot powers off"
@@ -8974,28 +8799,28 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             "a failing target probe must not reflect a success marker into console evidence"
         );
         assert!(
-            !bootsuccess.contains(TD_JAIL_FIXTURE_BOOT_MARKER),
+            !bootsuccess.contains(TD_FIREFOX_BOOT_MARKER),
             "mutable application state must not control deployment boot success"
         );
         let services = build_td_svc_conf();
         let evidence_probe = services
             .find(&format!(
-                "/bin/td-ui-demo probe /run/user/1000/{APPLICATION_RUNTIME_ROOT}/{APPLICATION_FIXTURE_NAME}/ready >/dev/null 2>&1"
+                "/bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} >/dev/null 2>&1"
             ))
-            .expect("jailed fixture evidence probe missing");
-        let fixture = services
-            .find(&format!("/bin/echo {TD_JAIL_FIXTURE_BOOT_MARKER}"))
-            .expect("jailed fixture evidence marker missing");
+            .expect("Firefox first-window evidence probe missing");
+        let firefox_marker = services
+            .find(&format!("/bin/echo {TD_FIREFOX_BOOT_MARKER}"))
+            .expect("Firefox evidence marker missing");
         let evidence_publish = services
             .find(&format!(
-                "/bin/mv {APPLICATION_FIXTURE_EVIDENCE_TMP_PATH} {APPLICATION_FIXTURE_EVIDENCE_PATH}"
+                "/bin/mv {FIREFOX_EVIDENCE_TMP_PATH} {FIREFOX_EVIDENCE_PATH}"
             ))
-            .expect("jailed fixture evidence publication missing");
+            .expect("Firefox evidence publication missing");
         let completion_publish = services
             .find(&format!(
-                "/bin/mv {APPLICATION_FIXTURE_COMPLETION_TMP_PATH} {APPLICATION_FIXTURE_COMPLETION_PATH}"
+                "/bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH}"
             ))
-            .expect("jailed fixture completion publication missing");
+            .expect("Firefox evidence completion publication missing");
         let success = bootsuccess
             .find(&format!("echo {SYSTEM_BOOT_SUCCESS_MARKER}"))
             .expect("boot success marker missing");
@@ -9006,10 +8831,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 && gate < seccomp_gate
                 && seccomp_gate < success
                 && evidence_probe < evidence_publish
-                && evidence_publish < fixture
-                && fixture < completion_publish,
+                && evidence_publish < firefox_marker
+                && firefox_marker < completion_publish,
             "target transition must close a leaked descriptor, run the optional target filter \
-             oracle, gate boot success, and keep fixture evidence independent"
+             oracle, gate boot success, and keep Firefox evidence independent"
         );
     }
 

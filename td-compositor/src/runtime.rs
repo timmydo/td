@@ -355,7 +355,9 @@ pub struct Runtime {
     compound_settle: Option<CompoundSettle>,
     /// One configured application-window oracle. App ids are compared at the
     /// request boundary and only matching surface keys are retained; a client
-    /// string never becomes compositor state.
+    /// string never becomes compositor state. Keys remain after publication so
+    /// the launcher can activate the service-owned application without spawning
+    /// a second process over its state.
     application_ready: Option<ApplicationReady>,
     /// The window a press picked up, held until the button is released.
     /// Nothing in the pointer model carries it: neither press a drag begins
@@ -455,7 +457,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn set_launcher_application(&mut self, application: bool) {
+    pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
         self.scene.set_launcher_application(application);
     }
 
@@ -969,9 +971,6 @@ impl Runtime {
         let Some(ready) = self.application_ready.as_mut() else {
             return Ok(());
         };
-        if ready.published {
-            return Ok(());
-        }
         if ready.expected_app_id == app_id {
             ready.candidates.insert(key);
         } else {
@@ -1005,7 +1004,6 @@ impl Runtime {
         match ready.wake.try_send(()) {
             Ok(()) | Err(TrySendError::Full(())) => {
                 ready.published = true;
-                ready.candidates.clear();
                 Ok(())
             }
             Err(TrySendError::Disconnected(())) => {
@@ -1125,6 +1123,30 @@ impl Runtime {
             return Err(error);
         }
         Ok(request)
+    }
+
+    /// Activate the mapped toplevel observed for the configured application.
+    /// The compositor never owns the application process; a missing surface is
+    /// therefore reported to the caller rather than replaced by another launch.
+    pub fn activate_application(&mut self) -> Result<bool, String> {
+        let key = self.application_ready.as_ref().and_then(|ready| {
+            ready
+                .candidates
+                .iter()
+                .copied()
+                .find(|candidate| self.scene.is_mapped(*candidate))
+        });
+        let Some(key) = key else {
+            return Ok(false);
+        };
+        let key = self.topmost_parented(key);
+        let Some(changed) = self.scene.activate_key(key) else {
+            return Ok(false);
+        };
+        if changed {
+            self.settle(true)?;
+        }
+        Ok(true)
     }
 
     /// An overlay going up drops whatever a title band was holding. Cleared
@@ -8249,22 +8271,66 @@ mod tests {
             .as_ref()
             .unwrap()
             .candidates
-            .is_empty());
+            .contains(&key));
+        let later = SurfaceKey {
+            client: 10,
+            object: 14,
+        };
         runtime
-            .set_application_id(
-                SurfaceKey {
-                    client: 10,
-                    object: 14,
-                },
-                "org.mozilla.firefox",
-            )
+            .set_application_id(later, "org.mozilla.firefox")
             .unwrap();
+        runtime
+            .apply_commit(later, Some(surface([7, 8, 9, 0])), None, None)
+            .unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
         assert!(runtime
             .application_ready
             .as_ref()
             .unwrap()
             .candidates
-            .is_empty());
+            .contains(&later));
+    }
+
+    #[test]
+    fn launcher_activation_reuses_the_observed_service_window() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-activate-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application("org.mozilla.firefox".to_string(), wake)
+            .unwrap();
+        let application = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        runtime
+            .set_application_id(application, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(application, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        assert_eq!(ready.try_recv(), Ok(()));
+        runtime.command(Command::MoveToWorkspace(2)).unwrap();
+
+        let other = SurfaceKey {
+            client: 8,
+            object: 12,
+        };
+        runtime
+            .apply_commit(other, Some(surface([4, 5, 6, 0])), None, None)
+            .unwrap();
+        assert_eq!(runtime.focused_toplevel(), Some(other));
+
+        assert!(runtime.activate_application().unwrap());
+        assert_eq!(runtime.focused_toplevel(), Some(application));
+        assert_eq!(runtime.scene.layout().workspace_of(application), Some(2));
+        assert!(runtime.scene.layout().check_invariants().is_ok());
     }
 
     #[test]

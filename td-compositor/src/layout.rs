@@ -1028,6 +1028,32 @@ impl Layout {
         true
     }
 
+    /// Bring a mapped leaf's workspace into view and focus that exact leaf.
+    /// A launcher activation is an explicit request to reveal the application,
+    /// so it also leaves an unrelated fullscreen leaf that would hide it.
+    pub fn activate_key(&mut self, key: SurfaceKey) -> Option<bool> {
+        let number = self.homes.get(&key).copied()?;
+        if !self
+            .workspaces
+            .get(&number)
+            .and_then(|workspace| workspace.root.as_ref())
+            .is_some_and(|root| root.contains(key))
+        {
+            return None;
+        }
+        let old_active = self.active;
+        self.active = number;
+        let workspace = self.workspace_mut(number);
+        let changed = old_active != number
+            || workspace.focused != Some(key)
+            || workspace.fullscreen.is_some_and(|full| full != key);
+        if workspace.fullscreen.is_some_and(|full| full != key) {
+            workspace.fullscreen = None;
+        }
+        workspace.focus(key);
+        Some(changed)
+    }
+
     pub fn contains(&self, key: SurfaceKey) -> bool {
         self.workspaces.values().any(|workspace| {
             workspace
@@ -2944,6 +2970,28 @@ mod tests {
         layout.apply(Command::ToggleFullscreen);
         assert!(layout.focus_key(key(2)));
         assert_eq!(layout.focused(), Some(key(2)));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn application_activation_reveals_its_workspace_and_leaves_other_fullscreen() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        map_below(&mut layout, 2);
+        layout.apply(Command::ToggleFullscreen);
+        assert_eq!(layout.focused(), Some(key(2)));
+        layout.apply(Command::SwitchWorkspace(2));
+        layout.map(key(3));
+
+        assert_eq!(layout.activate_key(key(1)), Some(true));
+        assert_eq!(layout.focused(), Some(key(1)));
+        let views = layout.views(100, 100, 0, 0);
+        assert!(views
+            .iter()
+            .any(|view| view.key == key(1) && view.visible && view.activated));
+        assert!(views.iter().all(|view| !view.fullscreen));
+        assert_eq!(layout.activate_key(key(1)), Some(false));
+        assert_eq!(layout.activate_key(key(99)), None);
         layout.check_invariants().unwrap();
     }
 

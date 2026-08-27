@@ -888,7 +888,24 @@ fn verify_jail_loopback() -> Result<(), String> {
     Ok(())
 }
 
-fn verify_jail_filesystems() -> Result<(), String> {
+fn verify_read_only_directory(directory: &str, probe_tag: u64) -> Result<(), String> {
+    let probe = format!("{directory}/.td-jail-ro-{probe_tag:016x}");
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Err(error) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => Ok(()),
+        Err(error) => Err(format!(
+            "read-only filesystem grant refused {probe} for {error}, not read-only-filesystem"
+        )),
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            Err(format!(
+                "read-only filesystem grant accepted a write at {probe}"
+            ))
+        }
+    }
+}
+
+fn verify_jail_filesystems(require_nested_mount: bool) -> Result<(), String> {
     let mut probe_bytes = [0_u8; 8];
     fs::File::open("/dev/urandom")
         .and_then(|mut random| random.read_exact(&mut probe_bytes))
@@ -915,15 +932,18 @@ fn verify_jail_filesystems() -> Result<(), String> {
         return Err("read-write filesystem grant changed the probe payload".into());
     }
 
-    let nested = format!("{JAIL_FIXTURE_GRANT_ROOT}/nested");
-    let root_device = fs::metadata(JAIL_FIXTURE_GRANT_ROOT)
-        .map_err(|e| format!("stat filesystem-grant root: {e}"))?
-        .dev();
-    let nested_device = fs::metadata(&nested)
-        .map_err(|e| format!("stat nested filesystem-grant mount: {e}"))?
-        .dev();
-    if root_device == nested_device {
-        return Err("recursive filesystem grant did not carry its nested mount".into());
+    if require_nested_mount {
+        let nested = format!("{JAIL_FIXTURE_GRANT_ROOT}/nested");
+        let root_device = fs::metadata(JAIL_FIXTURE_GRANT_ROOT)
+            .map_err(|e| format!("stat filesystem-grant root: {e}"))?
+            .dev();
+        let nested_device = fs::metadata(&nested)
+            .map_err(|e| format!("stat nested filesystem-grant mount: {e}"))?
+            .dev();
+        if root_device == nested_device {
+            return Err("recursive filesystem grant did not carry its nested mount".into());
+        }
+        verify_read_only_directory(&nested, probe_tag)?;
     }
     let file_content = fs::read(JAIL_FIXTURE_GRANT_FILE)
         .map_err(|e| format!("read regular-file filesystem grant: {e}"))?;
@@ -942,32 +962,16 @@ fn verify_jail_filesystems() -> Result<(), String> {
             return Err("read-only regular-file grant accepted a writer".into());
         }
     }
-    for directory in [
-        JAIL_FIXTURE_PICTURES_TARGET,
-        JAIL_FIXTURE_GRANT_ROOT,
-        nested.as_str(),
-    ] {
-        let probe = format!("{directory}/.td-jail-ro-{probe_tag:016x}");
-        match OpenOptions::new().write(true).create_new(true).open(&probe) {
-            Err(error) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {}
-            Err(error) => {
-                return Err(format!(
-                    "read-only filesystem grant refused {probe} for {error}, not read-only-filesystem"
-                ));
-            }
-            Ok(file) => {
-                drop(file);
-                let _ = fs::remove_file(&probe);
-                return Err(format!(
-                    "read-only filesystem grant accepted a write at {probe}"
-                ));
-            }
-        }
+    for directory in [JAIL_FIXTURE_PICTURES_TARGET, JAIL_FIXTURE_GRANT_ROOT] {
+        verify_read_only_directory(directory, probe_tag)?;
     }
     Ok(())
 }
 
-fn verify_jail_fixture() -> Result<(), ClientRunFailure> {
+fn verify_jail_fixture(
+    require_isolated_loopback: bool,
+    require_nested_mount: bool,
+) -> Result<(), ClientRunFailure> {
     verify_jail_status().map_err(|message| ClientRunFailure {
         message,
         exit_code: JAIL_FIXTURE_STATUS_EXIT_CODE,
@@ -980,11 +984,13 @@ fn verify_jail_fixture() -> Result<(), ClientRunFailure> {
         message,
         exit_code: JAIL_FIXTURE_MOUNTS_EXIT_CODE,
     })?;
-    verify_jail_loopback().map_err(|message| ClientRunFailure {
-        message,
-        exit_code: JAIL_FIXTURE_LOOPBACK_EXIT_CODE,
-    })?;
-    verify_jail_filesystems().map_err(|message| ClientRunFailure {
+    if require_isolated_loopback {
+        verify_jail_loopback().map_err(|message| ClientRunFailure {
+            message,
+            exit_code: JAIL_FIXTURE_LOOPBACK_EXIT_CODE,
+        })?;
+    }
+    verify_jail_filesystems(require_nested_mount).map_err(|message| ClientRunFailure {
         message,
         exit_code: JAIL_FIXTURE_FILESYSTEM_EXIT_CODE,
     })?;
@@ -992,9 +998,9 @@ fn verify_jail_fixture() -> Result<(), ClientRunFailure> {
 }
 
 pub fn run(options: &Options) -> Result<(), ClientRunFailure> {
-    let jail_fixture = std::env::var_os("FLATPAK_ID").as_deref() == Some(JAIL_FIXTURE_ID.as_ref());
+    let jail_fixture = is_jail_fixture();
     if jail_fixture {
-        verify_jail_fixture()?;
+        verify_jail_fixture(true, true)?;
     }
     let runtime_directory = options
         .socket
@@ -1140,7 +1146,21 @@ pub fn probe(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("connect UI readiness socket {}: {e}", path.display()))
 }
 
-pub fn selftest() -> Result<(), String> {
+fn is_jail_fixture() -> bool {
+    std::env::var_os("FLATPAK_ID").as_deref() == Some(JAIL_FIXTURE_ID.as_ref())
+}
+
+pub fn selftest(shared_network: bool) -> Result<(), ClientRunFailure> {
+    // The host recipe cannot present a window without a real framebuffer, but
+    // it executes the applicable confinement oracles before this pixel check.
+    // The authenticated application identity is the gate, so direct td-ui-demo
+    // selftests retain only the dependency-free behavior below.
+    if is_jail_fixture() {
+        // A recipe sandbox has no authority to construct a nested source
+        // mount. The mapped client path keeps that additional requirement;
+        // host selftest still exercises every other jail oracle.
+        verify_jail_fixture(!shared_network, false)?;
+    }
     let pixels = build_pixels(DEFAULT_WIDTH, DEFAULT_HEIGHT, &UiModel::default())?;
     let first = pixels
         .get(..4)
@@ -1149,7 +1169,7 @@ pub fn selftest() -> Result<(), String> {
         .get(pixels.len().saturating_sub(4)..)
         .ok_or_else(|| "demo pattern has no last pixel".to_string())?;
     if first == last {
-        return Err("demo pattern did not vary across the surface".into());
+        return Err("demo pattern did not vary across the surface".to_string().into());
     }
 
     let (sender, receiver) =
@@ -1161,7 +1181,11 @@ pub fn selftest() -> Result<(), String> {
     let received = sys::recv_with_fds(&receiver, &mut bytes).map_err(|error| error.to_string())?;
     if received.count != 4 || bytes.get(..4) != Some(b"demo") || received.fds.len() != 1 {
         sys::discard_received(&received.fds);
-        return Err("demo descriptor transport did not preserve its message".into());
+        return Err(
+            "demo descriptor transport did not preserve its message"
+                .to_string()
+                .into(),
+        );
     }
     let fd = received
         .fds
@@ -1174,7 +1198,11 @@ pub fn selftest() -> Result<(), String> {
         .read_to_end(&mut content)
         .map_err(|e| format!("read duplicated demo descriptor: {e}"))?;
     if content != first {
-        return Err("demo descriptor transport did not preserve pixels".into());
+        return Err(
+            "demo descriptor transport did not preserve pixels"
+                .to_string()
+                .into(),
+        );
     }
     let mut out = std::io::stdout().lock();
     writeln!(out, "TD-UI-DEMO-SELFTEST-OK").map_err(|e| format!("write demo selftest marker: {e}"))?;

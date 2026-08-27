@@ -11,8 +11,8 @@ The one compatibility claim, deliberately narrow, which no commit message
 may widen by accident:
 
 > The curated Firefox package and its declared runtime ship in the image,
-> launch without host `/usr` or host libraries, and display an
-> interactive Wayland window in `td-compositor`.
+> launch without host `/usr` or host libraries, and commit a Wayland frame
+> that `td-compositor` paints to the framebuffer.
 
 That implies nothing about audio, printing, cameras, screencast, X11,
 arbitrary document access, GPU acceleration, or any application beyond
@@ -760,8 +760,13 @@ immutable files:
 Each table admits at most 256 applications and 1 MiB. Keeping the path out of
 the presentation table gives each reader only its own input and closes the
 previous design gap where a three-column row gave `td-jail` no way to locate a
-content-addressed package. The image now selects the first jailed fixture into
-both tables. Activation is always the literal argv `/bin/<name>`.
+content-addressed package. The image now selects Firefox into both tables. A
+direct user request remains the literal `/bin/<name>` td-jail route. The
+current compositor receives the selected Firefox name as an explicit image
+argument and uses the launcher row only as builder-authenticated metadata; its
+application card activates an already mapped observed surface and does not
+execute `/bin/<name>`. Fully table-driven compositor discovery remains later
+work.
 
 An image selection names the authenticated application identity plus its
 package catalog key and runtime catalog key. The latter two are data inputs.
@@ -808,7 +813,7 @@ have to serve. The deployment bundle is the only delivery td has
 - rolling an application back rolls the system back with it, which can
   undo an unrelated security fix;
 - the boot-attempt counter does **not** cover application execution: the
-  confined fixture is independent QEMU evidence, so broken application code
+  confined Firefox launch is independent QEMU evidence, so broken application code
   or mutable application state cannot roll back the whole deployment;
 - every account on the machine gets the same set of applications, and
   two accounts can no longer disagree about a browser version;
@@ -820,7 +825,7 @@ reviewed capacity landing**:
 | constant | today | capacity consequence |
 |---|---|---|
 | `td-boot/src/protocol.rs`'s `MIN_VOLUME_BYTES` | 5 GiB | three deployment-sized copies are transiently live during publish. The profiling policy budgets one GiB of debug companions in each copy, one GiB for all three copies' non-debug payloads, and one GiB for Btrfs metadata plus `@var`. `td-install` enforces this as an admission floor, not a promise that every deployment fits; a larger update can still fail with `ENOSPC` while staging, before selectors change |
-| the QEMU oracle's `PERSISTENT_VOLUME_BYTES` / headroom | 5 GiB / 1 GiB, `copies = 3` | permits four GiB of aggregate fixture payload across the three transactional copies. Three ceiling-sized debug trees consume three GiB of that, leaving one GiB total for their boot payloads (roughly 341 MiB per deployment). §H's small fixture fits, but a large browser can still exceed the oracle and therefore still needs an explicit capacity landing |
+| the QEMU oracle's `PERSISTENT_VOLUME_BYTES` / headroom | 7 GiB / 1 GiB, `copies = 3` | reserves three GiB for ceiling-sized debug trees, three GiB for the three non-debug deployment copies that now include Firefox and its runtime, and one GiB of Btrfs/headroom. The oracle separately asserts that this remains at or above target admission's 5 GiB floor |
 | `ESP_BYTES` | 512 MiB | **not** a problem — the ESP carries kernel and initramfs only. Named here because a reader would otherwise assume it is the partition that grows |
 
 The disk cost is therefore **2× the browser permanently and 3× across an
@@ -940,9 +945,10 @@ defaults; an application without that policy, or a policy without an
 application, is refused. Runtime resolution requires one matching
 `payload_inputs` entry, one typed `td-recipe-output` lock row, and one direct
 canonical child of the active `/td/store`. The compiler currently has exactly
-one reviewed runtime-major environment policy, `empty-runtime`; another runtime
-is refused until its policy is added deliberately. The parser accepts only the
-compiler's canonical bytes, including the full `/td/store` runtime path.
+two reviewed runtime-major environment policies, `empty-runtime` and
+`freedesktop-platform-25-08`; another runtime is refused until its policy is
+added deliberately. The parser accepts only the compiler's canonical bytes,
+including the full `/td/store` runtime path.
 
 After PID-namespace teardown prevents any package descendant from running
 further code, the outer sandbox parent recognizes the four application-capable
@@ -1412,9 +1418,9 @@ Production `build-run` proofs created the marked package outputs
 Those hashes record the tree-only import proof and are superseded when package
 metadata is added. The admitted package with that metadata and the validator
 below is
-`kgfx5y5d8fzfkn7i26ck1v0bzc6d74bq-firefox-154.0`; a production
-`build-run firefox` built it through the normal two-step platform-to-browser
-plan and published its canonical manifest, spec and launcher.
+`cibdmpgbj2wjy6fzavqxydjnzyv9mxq4-firefox-154.0`; a production graph build
+built it through the normal two-step platform-to-browser plan and published
+its canonical manifest, spec and launcher.
 
 **Dynamic-package admission has now LANDED.** Firefox's recipe binds the exact
 25.08 platform as a marked payload, generates its manifest and launcher, and
@@ -1423,10 +1429,18 @@ Downloads grant and the exact bare `org.mozilla.firefox` bus name. X11,
 blanket devices, development access, audio, printing and smart cards remain
 absent. The runtime-major environment table forces
 `LIBGL_ALWAYS_SOFTWARE=1`; Firefox's own declaration selects Wayland without
-using the obsolete `MOZ_WEBRENDER` switch. Its omitted resource section
-deliberately selects the reviewed 1 GiB high, 1.25 GiB max, 1,024-task and
-one-CPU baseline above for first-window bring-up; later tuning requires
-measured jailed-browser evidence rather than an unreviewed package guess.
+using the obsolete `MOZ_WEBRENDER` switch. It also sets the upstream
+`MOZ_DISABLE_AUTO_SAFE_MODE=1` switch. Repeated automated boots found that an
+incomplete prior startup can make Firefox exit successfully in order to spawn
+an automatic safe-mode replacement; td-jail correctly treats the direct
+process exit as the end of the instance and reaps that survivor, so the
+replacement cannot become the supervised application. Disabling only that
+automatic restart keeps the direct process as lifecycle authority; an explicit
+safe-mode launch remains available. The repeated-volume QEMU sequence below is
+the regression. Firefox's omitted resource section deliberately selects the
+reviewed 1 GiB high, 1.25 GiB max, 1,024-task and one-CPU baseline above for
+first-window bring-up; later tuning requires measured jailed-browser evidence
+rather than an unreviewed package guess.
 
 The terminal `validateDynamicApplication` step runs only after native
 `CopyTree` and never executes imported code. It accepts the bounded
@@ -1484,8 +1498,8 @@ namespace, alias, symlink-before-`..`, entry, architecture, provider-root,
 indirect `/run/host`, optional-prefix and run-path cases, so the ordinary gate
 does not depend on the mutable graph cache.
 
-The resulting package is authenticated and fully described but is not yet
-selected into the image. **The dynamic jail mount policy has now LANDED.**
+The resulting package is authenticated, fully described and selected into the
+image. **The dynamic jail mount policy has now LANDED.**
 For the exact Firefox/Freedesktop 25.08 pair, td-jail admits only the
 compiler-owned `LD_LIBRARY_PATH` above; every other application/runtime pair
 must omit it and every other `LD_*` variable remains refused. That decision is
@@ -1502,15 +1516,29 @@ layout mismatch. State preparation also creates and stage 2 verifies writable
 mode-0700
 `$XDG_CACHE_HOME/tmp`, which the Firefox wrapper selects as `TMPDIR`.
 
-The permanent non-manual acceptance test compiles Firefox's real declaration,
+The permanent host acceptance test compiles Firefox's real declaration,
 permissions and runtime policy, then launches a source-built static BusyBox
 surrogate under that exact spec through the real td-jail namespace, mount,
 broker-registration and seccomp path. The surrogate enters through `/bin/sh`,
 checks the loader environment, all four aliases and cache tmp, and writes a
 marker through the private volatile runtime bind. It does not execute imported
-Firefox bytes as a recipe tool and does not claim that Firefox has presented a
-window. Image selection and the headless first-committed-window QEMU oracle
-remain the next application increment.
+Firefox bytes as a recipe tool.
+
+The independent target acceptance test is a headless QEMU boot of the built
+system image. The image selects the exact Firefox and Freedesktop 25.08 marked
+payloads, launches `/bin/firefox` through the immutable application registry,
+and asks `td-compositor` to observe the client-asserted exact
+`org.mozilla.firefox` XDG app id. The compositor publishes a mode-0600
+readiness socket only after a matching surface has committed a buffer and the
+framebuffer paint has succeeded. A root-owned evidence unit independently
+requires that latched compositor probe and a currently live Firefox jail with
+the exact cgroup caps before it atomically publishes evidence and emits
+`TD-FIREFOX-FIRST-WINDOW-READY`. The closed image has no other programmed
+producer for that app id, but the two probes are not a cryptographic
+same-process binding. The host oracle accepts only the exact console line.
+This makes first-window bring-up non-manual; it does not prove input,
+navigation, HTTPS, content processes, portals, networking, audio or a
+particular visible pixel value.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
@@ -1518,8 +1546,8 @@ interpreter is `/lib64/ld-linux-x86-64.so.2`, supplied by the platform under
 `/usr/lib64`. Therefore dynamic Flatpak packages require a reviewed
 runtime-major environment policy, synthetic `/bin`, `/lib`, `/lib64` and
 `/sbin` aliases into `/usr`, and a bounded `/etc` assembled from td policy plus
-selected runtime data. The exact mount and environment policies are landed;
-executing the imported loader and Firefox remains the system-image increment.
+selected runtime data. The exact mount and environment policies and the first
+system-image execution are landed.
 Runtime links into Flatpak's `/run/host` are never allowed to recreate that
 host view; DNS, certificates, fonts, timezone and machine identity receive
 td-owned paths from §G. Those are jail/runtime tasks, not reasons to reshape
@@ -1527,14 +1555,11 @@ the imported trees.
 
 #### B.3.2 The Firefox platform stop line
 
-The application packaging workstream stops after this proof until the
-following bus and Wayland capabilities land. This is a dependency boundary:
-the bus and compositor workstreams own their implementations, while a later
-application increment re-runs the proof against the then-current exact
-Flathub commits. The first-window substrate called out as landed below is no
-longer a block on beginning image selection; the remaining fidelity and
-service bullets continue to be live requirements for the corresponding
-features.
+This section was the packaging stop line while the bus and compositor
+workstreams owned the dependencies below. The first-window subset is now
+discharged and the exact pinned Firefox graph has been selected into the
+image. The remaining fidelity and service bullets continue to be live
+requirements for the corresponding features and for §H's complete proof.
 
 Those capabilities are necessary, not a claim that Firefox becomes ready when
 they land. The resumed application workstream owns the bounded importer,
@@ -2400,8 +2425,9 @@ ambient, then drops and reads back the complete bounding set while
 state and empty bounding set, mounts the fresh procfs for its own PID
 namespace while the old procfs is still visible, pivots into the prepared
 root, then drops every remaining capability before policy finalization.
-The landed rung-12 application path is the closed static/empty-runtime
-subset of this target table. It implements `/app`, `/usr`, fresh `/proc`,
+The landed application path implements both the closed static/empty-runtime
+subset and the reviewed Firefox/Freedesktop 25.08 dynamic pair. It provides
+`/app`, `/usr`, fresh `/proc`,
 the minimal `/dev`, a selective immutable `/etc`, tmpfs `/run`, the exact
 Wayland socket, the session bus socket of step 12 and the five persistent state
 directories, and either a read-back-up loopback interface in an otherwise-empty
@@ -2451,27 +2477,31 @@ reader and bounded diagnostic writer: a filtered watcher treats proof EOF as
 stage-1 death and terminates the namespace, while the diagnostic remains live
 through the application's final status. PID 1 is non-dumpable before the child
 exists, so the same-UID application cannot reopen either descriptor through
-procfs. A separate trusted evidence unit probes post-frame readiness,
+procfs. A separate trusted Firefox evidence unit probes post-frame readiness,
 atomically publishes the root-owned evidence file, emits
-`TD-JAIL-FIXTURE-BOOT-READY`, then atomically publishes a distinct completion
-record that releases the autotest greeter. Its own bounded one-second probe
-loop covers the second fixture cold-start attempt without inheriting td-svc's
-exponential restart backoff. The greeter's separate allowance also includes
-the first fixture ready timeout that can elapse before the evidence unit starts.
-Deployment success does not depend on the fixture or its mutable state. Once
-deployment health has finished, missing evidence or completion releases the
-greeter when that complete bounded allowance expires, so
-QEMU reports the missing marker instead of waiting for the full boot ceiling.
-The fixture keeps its stdout and stderr on `/dev/null`, so it cannot forge the
-console marker. Confinement failures instead use phase-specific exits 70--74
+`TD-FIREFOX-FIRST-WINDOW-READY`, then atomically publishes a distinct
+completion record that releases the autotest greeter. Its own bounded
+one-second probe loop covers a second Firefox cold-start attempt without
+inheriting td-svc's exponential restart backoff. The greeter's separate
+allowance also includes the first Firefox ready timeout that can elapse before
+the evidence unit starts. Deployment success does not depend on Firefox or its
+mutable state. Once deployment health has finished, missing evidence or
+completion releases the greeter when that complete bounded allowance expires,
+so QEMU reports the missing marker instead of waiting for the full boot
+ceiling. Firefox receives null stdout and stderr from td-jail, so it cannot
+forge the console marker. Confinement failures instead use phase-specific
+exits 70--74
 for status/capability, procfs/host-boundary, mount, loopback, and filesystem
 grant verification;
 PID 1 reports the raw application status through td-jail's bounded diagnostic.
-The fixture is deliberately both autostarted and present in the launcher, so a
-button press may create a second instance over the same state roots. This rung's
-client leaves no persistent state on normal completion; a stateful application
-must declare and
-enforce its single-instance or multi-profile policy before using both paths.
+The old fixture was deliberately both autostarted and present in the launcher,
+so a button press could create a second instance over the same state roots.
+Firefox is stateful and does not inherit that policy. Its supervised service
+owns the boot-started instance; the compositor retains only matching mapped
+surface keys after readiness, and activating the Firefox card switches to and
+focuses one of those surfaces. If none is mapped, the card reports that fact
+and never starts another jail. A direct `/bin/firefox` request can still start
+another instance, and no single-instance admission lock has landed.
 
 Probe mode alone overlays one read-only executable bind at
 `/tmp/td-jail-reaper-probe` after mounting `/tmp` noexec. It is the current
@@ -2787,25 +2817,18 @@ remounted `nosuid,nodev,noexec`; a read-only grant additionally makes every
 nested mount read-only, deepest first. Stage 1 and stage 2 independently
 read those rows back. Stage 2 exactly enumerates every fresh scaffold
 outside the dynamic private home, stopping at each declared grant root. The
-shipped fixture proves
-read-write Downloads, read-only Pictures, and a read-only regular-file grant.
-The two XDG sources are made distinct self-bind mounts before `switch_root`:
-they retain the graphical user's persistent storage and normal capacity while
-their mount roots no longer alias the reserved state subtree on the same Btrfs
-volume. The regular-file source lives on a separate dedicated tmpfs and is
-bind-mounted at the fixture's existing `/var/td-jail-fixture-file` path. The
-fixture also recursively binds
-a read-only
-`/mnt/td-jail-fixture-pictures` source containing a separately writable nested
-tmpfs. The client requires the root and nested directory to have different
-devices before testing both as read-only, so omitting `MS_REC` cannot satisfy
-the oracle. The fixture root is `1777` on immutable EROFS so its write refusal
-cannot be attributed to directory permissions. Deployment initialization
-mounts the two self-binds and two fixture tmpfs instances once before
-`switch_root`; it is not a restartable root service following mutable user
-state. A process killed in the create/unlink window of stage 2's writable
+lower-level synthetic jail tests prove read-write Downloads, read-only
+Pictures, and a read-only regular-file grant, including recursive hardening of
+a separately writable nested mount. Those are confinement regressions rather
+than the system image's application selection. The current Firefox image
+prepares only its declared read-write Downloads source as a distinct self-bind
+before `switch_root`; it retains the graphical user's persistent storage and
+normal capacity while its mount root no longer aliases the reserved state
+subtree on the same Btrfs volume. Initialization performs that self-bind once
+before `switch_root`; it is not a restartable root service following mutable
+user state. A process killed in the create/unlink window of stage 2's writable
 grant probe can leave one randomly named `.td-jail-write-probe-*` file in that
-host directory. The fixture client has the same window for one
+host directory. The synthetic client has the same window for one
 `.td-jail-rw-*` file in Downloads. The application user can remove either;
 normal error paths unlink them.
 
@@ -4316,7 +4339,8 @@ the launcher or now runs inline. Closing it needs `socket(2)` and
 connection opened before the unshare and held across the spawn, which §H
 forbids for the reason §H gives: the channel that completes
 registrations must be absent before stage 2 exists, not merely
-close-on-exec. A liveness residual does not buy a weakening of that.Phase two after the proof write is the one that is genuinely a race, and
+close-on-exec. A liveness residual does not buy a weakening of that.
+Phase two after the proof write is the one that is genuinely a race, and
 one that passes every test on an unloaded machine. The test asserts the
 positions of `bus::register`, `sys::unshare_namespaces`,
 `close_inherited_descriptors`, `command.spawn` and
@@ -4324,14 +4348,14 @@ positions of `bus::register`, `sys::unshare_namespaces`,
 comments stripped, and that the refused-completion branch kills, reaps
 and returns.
 
-**The fixture's supervision edge does not change, and its reason does.**
-`[jail-fixture]` is `after=busd` and `requires=wayland`; it is now a unit
+**The application's supervision edge does not change, and its reason does.**
+`[firefox]` is `after=busd,wayland` and `requires=wayland`; it is a unit
 that genuinely needs a WORKING broker rather than merely a bound socket,
 and `requires=busd` is still wrong for the reason recorded in the recipe:
 td-svc cannot distinguish a `restart=always` daemon inside its backoff
 from a permanently failed one, so one busd crash in the boot window would
 permanently kill the application tier of a machine whose broker recovers
-a second later. The fixture's own `restart=always` is what recovers, and
+a second later. Firefox's own `restart=always` is what recovers, and
 it now covers the larger failure it always nominally covered. The gain is
 that the boot gate became an end-to-end test of this protocol: the image's
 one application cannot reach the screen without having registered.
@@ -4924,10 +4948,11 @@ launch says `Hello` twice, owns two unique names in turn, and has the
 broker's replies routed to it. What that exercises is the handshake,
 `Hello`, and the two `td.Jail1` calls. It does NOT exercise a message
 routed between two peers, a signal, a match rule, a well-known name, or a
-descriptor — and the fixture opens no connection from INSIDE the jail, so
-lineage resolution and `td.AppId` are still not exercised by a boot.
-Those remain held up host-side and against sd-bus, libdbus and GDBus,
-and the portal is what will hold them up here.
+descriptor. Firefox receives the bus address and permission to own its name,
+but the first-window oracle does not require it to open a bus connection.
+Therefore a boot still does not prove lineage association, `td.AppId`, or
+browser message routing. Those remain held up host-side and against sd-bus,
+libdbus and GDBus, and the portal is what will hold them up here.
 
 It also checks a PATH and not a pid. The probe has no association with
 the unit's process or generation, so what it establishes is that
@@ -5035,11 +5060,11 @@ which is a pid in the INIT namespace, so a jailed caller reads host
 pids — its own included — through a channel its PID namespace otherwise
 closes.
 
-Every one of those is a problem between PEERS. What makes them
-unreachable today is that nothing inside a jail opens the bus: the
-fixture does not, and there is no second application. Half of that can be
-machine-checked and is — the system recipe asserts
-`SHIPPED_APPLICATIONS.len() == 1`, and a second entry breaks the build
+Every one of those is a problem between PEERS. Firefox is now the one selected
+application and may open the bus; the first-window oracle does not drive the
+traffic needed to close these remaining availability and pid-disclosure
+questions. What can be machine-checked today is narrower: the system recipe
+asserts `SHIPPED_APPLICATIONS.len() == 1`, and a second entry breaks the build
 with a diagnostic naming what has to land with it.
 
 Be exact about what that tripwire does NOT cover, because a gate believed
@@ -5052,9 +5077,10 @@ APPLICATIONS; the exposures are about PEERS.
   and routes directed handles with the count still one. The service's own
   methods, handle lifecycle and compositor authority are the new surface the
   tripwire cannot grade.
-- **One application is already two peers.** Nothing takes a
-  single-instance lock, and the image has two launch routes for the
-  fixture: the `jail-fixture` unit and the compositor's launcher menu.
+- **One application can already be several peers.** Nothing takes a
+  single-instance lock. The compositor entry now activates the supervised
+  instance instead of launching, but a direct `/bin/firefox` request can start
+  another jail with the same policy and persistent profile.
 
 The per-caller filter and per-instance admission key are now landed, so the
 connection-table condition this paragraph used to defer is discharged. The
@@ -5702,7 +5728,9 @@ packaged selftest, boot oracle — with **network never in the gate**.
    `/dev/fb0` and `/dev/input` absent, a large `/dev/shm` mapping works,
    `memfd_create` works, both sockets work.
    The transition-only probes deliberately begin after the application
-   bootstrap; the installed QEMU fixture is what traverses both layers.
+   bootstrap. The lower-level synthetic fixture traverses both layers in
+   dedicated jail tests; the system-image oracle now traverses them with
+   Firefox.
 4. **Broker conformance**: committed byte streams with expected decode
    and routing; policy tests driving a fake sandboxed peer through an
    injected identity resolver (a trait, precisely so the test stays
@@ -5715,34 +5743,32 @@ packaged selftest, boot oracle — with **network never in the gate**.
    nested-mount-namespace attribution, FileChooser flows through the pure
    dialog model, refusal of a file outside grants, screenshot pixel and
    PNG hashes, inhibitor acquire/readback/release/crash-cleanup.
-6. **The offline QEMU oracle — the centrepiece.** Its first slice has
-   **LANDED**. The image builds a **fixture package by recipe** from the
-   static `td-compositor` artifact's small fixture personality
-   with a generated manifest and an empty runtime — the cheapest proof at the
-   recipe/runtime-dependency level that the jail needs nothing td-owned from a
-   runtime. The fixture package deliberately carries a second copy of the
-   compositor artifact, so this is not an image-size optimization.
-   Because the package is a recipe output like any other, this needs no
-   fixture repository and no install-time network — and since §B.1 the
-   fixture is *in the image the test boots*, so the boot runs
-   `/bin/<fixture>` directly with no install step at all. The guest
-   currently asserts its `/proc` says `NoNewPrivs`/`Seccomp` and all five
-   capability sets are zero, that `/app`, `/usr`, and selective `/etc` reject
-   writes, and that the host store, target-root `/etc` sentinels,
-   framebuffer and input nodes are absent; it completes a bounded datagram
-   round-trip over the isolated loopback, connects the one granted
-   `wayland-0`, maps a toplevel, commits a frame, then publishes readiness in
-   its private volatile runtime bind. `td-svc` probes the host-side
-   per-application end of that bind for the fixture service; an independent
-   trusted evidence unit repeats the probe in its own bounded one-second loop,
-   publishes the evidence file, emits `TD-JAIL-FIXTURE-BOOT-READY`, then
-   publishes a completion record that lets the autotest greeter exit. QEMU
-   requires that marker on every system boot.
-   That unit is not a dependency of `bootsuccess`, so user-owned state cannot
-   decrement the deployment attempt counter. The application has no terminal
-   or console descriptor
-   with which to forge that evidence or alter terminal state. The earlier
-   plan's direct in-guest
+6. **The offline QEMU oracle — the centrepiece.** Its synthetic first slice
+   established the complete static/empty-runtime jail and first-pixel path;
+   that fixture remains lower-level host regression coverage but has no
+   `/bin` name, service, application-registry row or launcher role in the
+   system image. Its executable personality remains inside the copied
+   `td-compositor` store output. The image now selects the exact marked Firefox
+   154.0 and Freedesktop 25.08 package outputs, exposes `/bin/firefox` through
+   td-jail, and starts it under supervision. `td-compositor` publishes its
+   private observation endpoint only after a surface asserting the exact
+   `org.mozilla.firefox` XDG app id commits a buffer that the framebuffer paint
+   accepts. An independent trusted evidence unit requires that latched probe
+   and a currently live Firefox jail's cgroup-cap readback, publishes the
+   evidence file, emits
+   `TD-FIREFOX-FIRST-WINDOW-READY`, then publishes a completion record that
+   lets the autotest greeter exit. QEMU requires that exact marker on every
+   system boot.
+   The evidence unit is not a dependency of `bootsuccess`, so user-owned state
+   cannot decrement the deployment attempt counter. The application has no
+   terminal or console descriptor with which to forge that evidence or alter
+   terminal state. In the closed boot topology those independent facts are
+   evidence that the imported loader and Firefox reached a painted first frame
+   through the production package, runtime, broker, jail and compositor path.
+   The probes do not bind the Wayland peer to the cgroup instance, and the app
+   id is client-asserted. The marker also does not prove a particular nonblank
+   pixel, input, a content process, navigation, HTTPS, portals or audio. The
+   earlier plan's direct in-guest
    `mount(2) == EPERM` subprobe remains deferred: this slice directly reads
    back all five empty capability sets and the standard-filter interpreter
    pins `EPERM` for the complete mount syscall roster, but a target-side
@@ -5756,17 +5782,14 @@ packaged selftest, boot oracle — with **network never in the gate**.
    working perfectly; an earlier draft said exactly that, and it is the
    kind of error that presents as "the portal is broken" —
    and extends the end-to-end proof after `TD-BUSD-READY` and
-   `TD-PORTAL-READY`. Today the exact fixture marker is jail + seccomp +
-   immutable package/runtime + state + socket grant + compositor,
-   offline, on the shipped kernel. The first *foreign*-toolkit oracle uses a
-   pinned small GTK application — not Firefox.
+   `TD-PORTAL-READY`.
 7. **Recipe tests**: every new crate — `td-jail`, `td-busd`, `td-audio` —
    stays a one-package dependency-free crate and joins BOTH
    `DEPENDENCY_FREE_LOCKS` and `CARGO_TEST_CMDS` in
    `builder/src/affected.rs`, or its lints and tests never run; the
-   kernel config contains every required option; the fixture launches
-   offline; packages are read-only in the jail; host sentinel paths are
-   absent; and no test-only probe enters the closure.
+   kernel config contains every required option; the real system-image launch
+   needs no installation or package fetch; packages are read-only in the jail;
+   host sentinel paths are absent; and no test-only probe enters the closure.
 8. **The §B.8 marker's own tests, which are the ones this design most
    depends on** and which nothing else in this list covers:
    - a recipe naming a marked path in `inputs`/`native_inputs` rather
@@ -5796,6 +5819,11 @@ packaged selftest, boot oracle — with **network never in the gate**.
    - a package's launcher name collides with no applet farm.
 
 ### Before anyone writes "Firefox runs"
+
+The automated first-frame marker above deliberately does not cross this line.
+It proves package selection, jail execution, XDG identity, buffer commit,
+framebuffer paint and live resource caps; the complete browser claim still
+requires every item below.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -5901,15 +5929,16 @@ Each row is one landing or a small family, leaving the tree green.
 | 9 | **mount transition — LANDED**: inherited-FD closure, a private compiled tmpfs root with individually read-only allowlisted device binds and immutable metadata, fresh devpts/shm/tmp/var-tmp, capability-v3 set/get readbacks, an exact ambient/inheritable `CAP_SYS_ADMIN` exec bridge, an empty/read-back bounding set, stage-2 procfs for its own PID namespace, pivot + old-root detach, mountinfo/device/mode/writability readbacks, and host plus target-kernel probes; application launch still refuses | none |
 | 10 | **capability drop/readback + PID-1 reaper — LANDED**: ambient is explicitly cleared before effective/permitted/inheritable become empty, all five sets are read back zero, and a copied static internal helper leaves a zero-capability grandchild for PID 1's bounded `wait4(-1)` oracle; ordinary application launch still refuses | none |
 | 11 | **const BPF assembler, standard filter, interpreter tests, build-host and target probes — LANDED**: stage 2 sets and reads back no-new-privileges, validates and installs the constant policy, requires `Seccomp: 2`, and its filtered PID-1 descendants inherit the same restriction; the non-shipped td-GCC probe is injected only into the disposable QEMU volume | none |
-| 12 | **fixture package shipped in the image and launched by `/bin/<fixture>` — LANDED**: the static `td-compositor` artifact's fixture personality is copied through an ordinary declared input into a generated application package with an empty payload-only runtime and a canonical application spec; the image selects it into the immutable registry and `/bin` farm, its supervised boot unit and the compositor launcher both enter through `/bin/td-jail-fixture`, and td-jail accepts only the canonical index/spec subset implemented by the landed rungs. Stage 1 canonicalizes, mounts and source-identity-checks immutable `/app` and `/usr`, the exact compositor socket, bounded private tmpfs trees, the five persistent state directories, and one private volatile runtime directory; stage 2 verifies the mount plan, clears capabilities, installs seccomp, holds a parent-death pipe, replaces application stdio with null descriptors, preserves the direct application's status, and gives survivors bounded TERM/KILL reap phases. The client publishes readiness through that volatile bind only after confinement readback and a presented frame; a separate readiness-gated evidence unit emits the exact QEMU marker without making mutable application state deployment-success authority | **first jailed pixels on the QEMU screen** |
+| 12 | **synthetic fixture application path — LANDED, then retired from the image interface**: the static `td-compositor` fixture personality, generated application package, empty runtime and host/QEMU regressions established the immutable registry, `/bin/td-jail-fixture` launch, namespace/mount/capability/seccomp/reaper path and first jailed pixels. Its executable remains in the compositor store output, and host confinement tests retain the application path, isolated loopback, writable grant, read-only roots and regular-file grant. The image has no fixture `/bin` name, registry row, service or launcher role. The running-kernel generic transition and seccomp probes remain; recursive read-only grant handling is now structural lower-level coverage because the build sandbox cannot construct a nested source mount. The image registry, supervised boot unit, compositor launcher and QEMU application evidence select Firefox instead | the first jailed-pixel scaffold remains lower-level coverage rather than the shipped application |
 | 12a | **explicit development-host launch — LANDED**: `td-jail --host CONFIG APPLICATION [ARG...]` resolves the ordinary authenticated manifest/spec through a separately materialized physical package root, maps the caller to the fixed uid/gid 1000 jail identity, binds caller-owned Wayland and local td-busd sockets, preserves the target `/app` and `/usr` layout and the full namespace/mount/capability/seccomp transition, and refuses missing user-namespace or seccomp support. The ordinary rung-12 fixture is the recipe acceptance test; it asserts exactly one named diagnostic each for the unavailable aggregate cgroup caps and direct host-Wayland global filtering. Mapped downstream bus authentication and host forwarding remain §D work | host mode works, and says exactly what it could not enforce |
 | 12b | **immutable typed filesystem grants — LANDED**: canonical source resolution and identity pinning, reserved alias refusal, deny-wins/overlap merging, separate recursive bind targets, nested-mount hardening and stage-1/stage-2 readback. Mutable per-user overrides remain a later lifecycle landing | a jailed app can open only a builder-authenticated explicitly granted host path |
-| 12c | **typed memory/task policy — LANDED**: cgroup2 is mounted by PID 1; PID 1 and system services remain at the hierarchy root under cgroup v2's root exception while td-svc enables `memory`/`pids` top-down and delegates an empty user subtree; td-jail creates one direct per-instance leaf, writes and exactly reads `memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, moves blocked stage 2 before release, verifies membership, sets and reads equal hard/soft `RLIMIT_DATA`, reports `memory.events`/`memory.peak`, and removes the empty leaf. Omitted policy gets the documented finite baseline; partial or page-rounded policy is refused. The 48 MiB/64 MiB/32-task fixture and active-cgroup probe gate the QEMU marker. `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
+| 12c | **typed memory/task policy — LANDED**: cgroup2 is mounted by PID 1; PID 1 and system services remain at the hierarchy root under cgroup v2's root exception while td-svc enables `memory`/`pids` top-down and delegates an empty user subtree; td-jail creates one direct per-instance leaf, writes and exactly reads `memory.high`, `memory.max`, `memory.oom.group=1`, and `pids.max`, moves blocked stage 2 before release, verifies membership, sets and reads equal hard/soft `RLIMIT_DATA`, reports `memory.events`/`memory.peak`, and removes the empty leaf. Omitted policy gets the documented finite baseline; partial or page-rounded policy is refused. Lower-level regressions pin the 48 MiB/64 MiB/32-task case; the live Firefox cgroup readback gates its QEMU evidence. `cpu-max` remains refused until the kernel bandwidth controller lands | application resource limits are effective rather than metadata |
 | 12d | **application terminal/session containment — LANDED**: the argv0-selected launcher waits on a later-born stage 1; stage 1 binds its lifetime to that exact parent, then either preserves and reads back an existing no-terminal supervisor group or enters and reads back a new session with no controlling terminal. Only then may it resolve authority, register or create state. Parent death still tears down stage 1, stage 2 and the cgroup leaf. `devices=tty` remains refused until a fresh-terminal policy exists | the jail is not an ambient terminal member, and it does not escape a dedicated service stop scope |
-| 12e | **typed CPU bandwidth policy — LANDED**: permission format 2 adds bounded `cpu-max=QUOTA PERIOD`; format 1 remains accepted and inherits a one-CPU baseline. The kernel pins fair-group scheduling and CFS bandwidth while keeping real-time group scheduling off; td-svc delegates `cpu` top-down; td-jail writes and exactly reads `cpu.max`, reports the bandwidth rows from `cpu.stat`, and the 50%-CPU fixture's active leaf gates the QEMU marker | aggregate CPU time is capped with the memory and task budgets |
-| 12f | **typed shared-network policy — LANDED**: the authenticated `shared=network` permission selects the compiled namespace set without `CLONE_NEWNET`; stage 1 requires the network namespace inode to remain unchanged and skips the isolated-loopback ioctl. Omitted policy retains `CLONE_NEWNET`, exact changed-inode readback and the up-loopback oracle. The host fixture launches both its isolated defaults and a derived shared-network variant; the shipped QEMU fixture remains isolated. `/etc/resolv.conf` and mediated network policy remain later work | a declared application can use td's network stack without weakening the default isolated path |
+| 12e | **typed CPU bandwidth policy — LANDED**: permission format 2 adds bounded `cpu-max=QUOTA PERIOD`; format 1 remains accepted and inherits a one-CPU baseline. The kernel pins fair-group scheduling and CFS bandwidth while keeping real-time group scheduling off; td-svc delegates `cpu` top-down; td-jail writes and exactly reads `cpu.max` and reports the bandwidth rows from `cpu.stat`. A lower-level fixture pins the 50% case; the live Firefox cap readback gates its QEMU evidence | aggregate CPU time is capped with the memory and task budgets |
+| 12f | **typed shared-network policy — LANDED**: the authenticated `shared=network` permission selects the compiled namespace set without `CLONE_NEWNET`; stage 1 requires the network namespace inode to remain unchanged and skips the isolated-loopback ioctl. Omitted policy retains `CLONE_NEWNET`, exact changed-inode readback and the up-loopback oracle. The host fixture launches both its isolated defaults and a derived shared-network variant; the shipped Firefox policy selects shared networking. `/etc/resolv.conf` is supplied by selective immutable `/etc`; mediated network policy remains later work | a declared application can use td's network stack without weakening the default isolated path |
 | 12g | **selective immutable `/etc` — LANDED**: a bounded tmpfs admits only the closed runtime configuration allowlist, synthesized passwd/group/host/NSS identity, one persisted per-application machine id, the pinned curl-rendered Mozilla CA bundle, and a read-only resolver bind only for declared shared networking. Stage 1 source-identity-checks every external file and recursively hardens selected runtime directories; stage 2 derives the exact tree from `/usr/etc`, checks synthesized contents, mount flags, nested mounts, PEM shape and write refusal. Host mode names fixture-owned CA and resolver inputs rather than borrowing ambient `/etc` | applications get libc/toolkit identity and trust data without seeing the host configuration |
-| 12h | **dynamic Firefox jail runtime — LANDED**: the exact Firefox/Freedesktop 25.08 pair is the sole target policy allowed to carry `LD_LIBRARY_PATH=/app/lib:/app/lib/firefox`; token-gated stage 2 revalidates the value after privileged stage 1 installs the four immutable `/usr` aliases, then reads those aliases back. Every application receives and stage 2 requires writable mode-0700 `$XDG_CACHE_HOME/tmp`. A source-built surrogate runs under Firefox's real compiled spec through the complete host jail and broker path and publishes an outside-observed marker; imported Firefox bytes remain inert. | the Firefox package has an automated confinement/runtime preflight without a manual desktop session |
+| 12h | **dynamic Firefox jail runtime — LANDED**: the exact Firefox/Freedesktop 25.08 pair is the sole target policy allowed to carry `LD_LIBRARY_PATH=/app/lib:/app/lib/firefox`; token-gated stage 2 revalidates the value after privileged stage 1 installs the four immutable `/usr` aliases, then reads those aliases back. Every application receives and stage 2 requires writable mode-0700 `$XDG_CACHE_HOME/tmp`. In this pre-image increment, a source-built surrogate ran under Firefox's real compiled spec through the complete host jail and broker path while imported Firefox bytes remained inert | the Firefox package has an automated confinement/runtime preflight without a manual desktop session |
+| 12i | **Firefox selected into the system image — LANDED**: the immutable application registry and `/bin/firefox` pair the exact Firefox 154.0 package with Freedesktop 25.08. The supervised service owns the boot-started instance; the compositor menu activates its observed mapped surface and never starts another jail. Direct `/bin/firefox` remains supported and no global single-instance lock has landed. Headless QEMU accepts an exact marker only after a surface asserting `org.mozilla.firefox` commits a buffer successfully painted to the framebuffer and an independent probe sees a live Firefox jail with its cgroup limits. Mutable Firefox state remains independent of deployment-health authority | **first real Firefox frame without manual testing** |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
@@ -5924,7 +5953,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 25 | **`td-audio` crate + surface #11**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients | **sound from the machine** |
 | 26 | `td-audio`'s PulseAudio protocol: frames, tagstruct codec, `AUTH`/`SET_CLIENT_NAME`/sink info, one playback stream; `sockets=pulseaudio` binds the socket into a jail | a jailed fixture app plays audio |
-| 27 | Firefox policy, shm budget tuning, trace fixes | Firefox attempts startup |
+| 27 | **Firefox policy and first-window image proof — LANDED**; later evidence must tune shm and traces from browsing/content workloads rather than only startup | Firefox starts and paints its first frame |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox window, an HTTPS page, and sound** |
 
 **Two other reversals are still absent from this ladder, and that is a
@@ -7131,7 +7160,7 @@ The experiments that settle what is left, none longer than a week:
 | **E1b — COMPLETE** | fetch, materialize and admit the same exact signed Flathub commits through a bounded control-plane importer | Exact-ref admission, commit/root/file authentication, bounded graph acquisition, offline cache re-authentication and repair, transactional cache publication, transactional `files/` reconstruction, typed recipe pins, automatic warming and marked recursive store admission are landed and exercised against both pins. Flathub publishes no stable deploy tarball, so an ambient `flatpak` recipe and a locally hosted export are both refused. §B.3.1 is the importer contract; dynamic runtime validation and jail integration are the next application increments |
 | **E2 — COMPLETE** | filter globals from GTK 4.22.1; exercise forced Cairo; compile in exact Freedesktop SDK 25.08 and run against the exact pinned Platform; run pinned Firefox 154.0 on no-dmabuf Weston and test its nested user namespace and `about:support` sandbox report | data-device is the GTK first-window blocker while subcompositor is class U; forced Cairo, pinned llvmpipe, and pinned Firefox all attach shm without dmabuf; stock Firefox denies nested user namespaces yet retains effective content sandbox level 6, selecting one standard td filter. The pinned Freedesktop runtime contains GTK 3 rather than GTK 4, so a future GTK 4 runtime selection repeats that identified part of the matrix |
 | **E3** | a Meson-world pilot — recipes for `pkgconf`, Ninja, Meson, a native CPython, then GLib and a Wayland-only `gtk3-demo` | td's *actual* per-package source cost, the number with the widest error bars. Near `cmake-x86-64`'s cost and the source track is real; a multi-week fight per package and the hybrid is permanent posture |
-| **E4 — COMPLETE** | the §0 cgroup pins plus a fixture under `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000`, with active membership and exact controller readback gating the QEMU oracle | §P's mechanism works on the target kernel |
+| **E4 — COMPLETE** | the §0 cgroup pins plus live active membership and exact controller readback for Firefox gating the QEMU oracle; lower-level regressions retain the fixture's `memory.high=48M`, `memory.max=64M`, `pids.max=32`, and `cpu.max=50000 100000` case | §P's mechanism works on the target kernel, while the smaller exact fixture policy remains pinned below it |
 | **E5** | `glxinfo` inside a jail on virtio-gpu QEMU with the runtime's GL extension mounted | §M's first step |
 | **E6** | `RLIMIT_AS=2G` on Firefox; record the crash | closes the rlimits-versus-cgroups argument with data |
 
@@ -7353,7 +7382,7 @@ the work that is deferred:**
 | applied by | `td-boot publish` + reboot | `td-boot publish` + **reboot** | a pointer flip, no reboot |
 | verified by | signed manifest, ed25519 | the same signed manifest | a content hash against the recipe graph |
 | rollback | `previous` selector, attempt counter | `previous` — so an application rollback is a **system** rollback, and can undo an unrelated security fix | repoint; state in `$HOME` untouched |
-| covered by the attempt counter | yes | **not application execution** — `bootsuccess` requires the terminal but not the confined fixture. The fixture has a separate readiness-gated evidence unit for QEMU, so broken application code or mutable per-app state cannot drive the counter down. §A's immutable launcher table is emitted but not yet consumed; the current fixture card is compiled into the compositor | n/a |
+| covered by the attempt counter | yes | **not application execution** — `bootsuccess` requires the terminal but not Firefox. Firefox has a separate readiness-gated evidence unit for QEMU, so broken application code or mutable per-app state cannot drive the counter down. `/bin/firefox` resolves through the immutable application registry; the compositor receives the exact selected name as a service argument. The builder-authenticated launcher table is emitted but remains future table-driven discovery work | n/a |
 | frequency | td's cadence | td's cadence | upstream's, which for a browser is far higher |
 
 A browser is the fastest-moving thing on the machine and it now moves at
@@ -7641,17 +7670,17 @@ gets all three:
 - **`--host`, explicit and never inferred.** Not auto-detection, which is
   precisely how a fixture becomes a supported configuration. Absent the
   flag, `td-jail` targets td and fails on a host with a named diagnostic.
-- **Rung 12a**, immediately after the in-image fixture launch —
+- **Rung 12a**, immediately after the original in-image fixture launch —
   deliberately after, since a host that worked first would invert the
   two-configuration rule at the only moment it matters.
 - **The landed acceptance test** runs the ordinary rung-12 fixture
   identity, manifest and binary under `--host` from a materialized host
   prefix. Its declaration, permission defaults and launcher come directly
-  from the shipped fixture recipe rather than a copied policy. The host leg
+  from the rung-12 fixture recipe rather than a copied policy. The host leg
   first launches those exact isolated defaults, then adds only
   `shared=network` and launches again to prove that policy preserves the
-  caller's network namespace. The exact shipped spec remains the
-  isolated-network QEMU oracle. It uses the real td-busd registration path
+  caller's network namespace. That exact fixture spec remains a lower-level
+  isolated-network oracle. It uses the real td-busd registration path
   (not an application-originated bus handshake) and caller-owned
   session-socket endpoints, and asserts the exact two-line degradation
   report: aggregate memory/task/CPU caps are unavailable without a delegated

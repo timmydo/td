@@ -5981,12 +5981,11 @@ mod tests {
         assert_eq!(payload_closure_of(&good, |_| false).unwrap().members, 1);
     }
 
-    /// The shipped deployment's answer. Vacuous in its LIST today — nothing is
-    /// marked — but not in its counts: a query that walked nothing would report
-    /// "0 of 0", so this is what stops the empty roster and a broken walk
-    /// looking alike. It is also the regression gate for the first application.
+    /// The shipped deployment's exact containment answer. The imported package
+    /// and runtime must be listed as foreign recipes and source pins while the
+    /// image that stages them remains unmarked.
     #[test]
-    fn the_shipped_deployment_holds_no_marked_payload() {
+    fn the_shipped_deployment_reports_only_its_two_foreign_payloads() {
         let answer = payload_closure(&[PAYLOAD_CLOSURE_DEFAULT]).unwrap();
         // Both counts tied to the WALK rather than to a floor: `> 50` is
         // satisfied by the whole catalog as easily as by the deployment's
@@ -5996,8 +5995,21 @@ mod tests {
         assert_eq!(answer.members, nodes.len());
         assert_eq!(answer.seeds, classify_graph_inputs(&nodes).unwrap().len());
         assert!(answer.seeds > 20, "{} seeds", answer.seeds);
-        assert_eq!(answer.unmarked(), answer.members);
-        assert!(answer.foreign_members.is_empty() && answer.pins.is_empty());
+        assert_eq!(answer.unmarked(), answer.members - 2);
+        assert_eq!(
+            answer.foreign_members,
+            [
+                "firefox".to_string(),
+                "freedesktop-platform-25-08".to_string(),
+            ]
+        );
+        assert_eq!(
+            answer.pins,
+            [
+                "firefox-154-source".to_string(),
+                "freedesktop-platform-25-08-source".to_string(),
+            ]
+        );
     }
 
     /// A fake `cargo` at `path`: `body` runs with the real cargo's argv, so a test

@@ -119,7 +119,7 @@ const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
 const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
-const TD_JAIL_FIXTURE_BOOT_MARKER: &str = td_recipe::ladder::TD_JAIL_FIXTURE_BOOT_MARKER;
+const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_BOOT_MARKER;
 const TD_PROFILER_ATTRIBUTION_MARKER: &str =
     td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
@@ -212,10 +212,10 @@ const KEXEC_STAGE2_MARKER: &str = td_recipe::ladder::KEXEC_STAGE2_MARKER;
 /// side can assert it outlasts the loop it is waiting for; see there.
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = td_recipe::ladder::DEFAULT_BOOT_TIMEOUT_SECS;
 const GUEST_WAIT_MARGIN_SECS: u64 = td_recipe::ladder::QEMU_GUEST_WAIT_MARGIN_SECS;
-// The daily-driver image leaves too little kexec headroom at 512 MiB after its
-// EROFS pages have populated the guest cache. Keep selector boots large enough
-// to allocate the next kernel's swap buffer during repeated rollback attempts.
-const SYSTEM_GUEST_MEMORY_MIB: &str = "1024";
+// The dynamic Firefox jail may use 1.25 GiB while the compositor, terminal and
+// next kexec kernel remain live. Keep the guest above that enforced application
+// ceiling rather than making host memory pressure look like a browser failure.
+const SYSTEM_GUEST_MEMORY_MIB: &str = "2048";
 const POLL: Duration = Duration::from_millis(200);
 
 /// Cap on retained console/diagnostic bytes. The console is scanned incrementally
@@ -236,13 +236,16 @@ const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 /// flooded — generous enough that a normal boot's few KiB of printk never trips it.
 const MAX_CONSOLE_BYTES: u64 = 64 * 1024 * 1024;
 const PERSISTENT_DEPLOYMENT_COPIES: u64 = 3;
-// Reserve one GiB for the non-debug payloads across every retained deployment,
-// then another for Btrfs metadata and the writable @var subvolume. The image is
-// sparse, so this bounds the logical fixture without allocating five GiB on the
-// host for an ordinary small deployment.
-const PERSISTENT_NON_DEBUG_BYTES: u64 = 1024 * 1024 * 1024;
+// Firefox and its runtime make each non-debug root materially larger than the
+// native-only image. Reserve three GiB across the three transactional copies,
+// then another for Btrfs metadata and the writable @var subvolume. The sparse
+// image does not allocate that whole logical ceiling on the host.
+const PERSISTENT_NON_DEBUG_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const PERSISTENT_VOLUME_HEADROOM: u64 = 1024 * 1024 * 1024;
-const PERSISTENT_VOLUME_BYTES: u64 = td_boot_protocol::MIN_VOLUME_BYTES;
+const PERSISTENT_VOLUME_BYTES: u64 = td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES
+    * PERSISTENT_DEPLOYMENT_COPIES
+    + PERSISTENT_NON_DEBUG_BYTES
+    + PERSISTENT_VOLUME_HEADROOM;
 // A 64 MiB console needs 17 passes including EOF; allow seven EINTR retries.
 const FINAL_DRAIN_PASSES: usize = 24;
 
@@ -293,7 +296,7 @@ struct ConsoleEvidence {
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
     td_jail_seccomp: bool,
-    td_jail_fixture: bool,
+    td_firefox: bool,
     td_profiler_attribution: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
@@ -904,8 +907,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_POINTER_ABSOLUTE_MARKER}), \
          presented the td-native wl_shm TERMINAL and received its first frame callback \
          ({TD_TERM_RUNTIME_MARKER}), \
-         launched the installed fixture through td-jail and presented its confined frame \
-         ({TD_JAIL_FIXTURE_BOOT_MARKER}), \
+         launched Firefox through td-jail and painted its first matching XDG frame \
+         ({TD_FIREFOX_BOOT_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1446,13 +1449,13 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
-    if !result.evidence.td_jail_fixture {
+    if !result.evidence.td_firefox {
         return Err(format!(
-            "the compositor and terminal became ready, but the packaged jail fixture marker \
-             ({TD_JAIL_FIXTURE_BOOT_MARKER:?}) was absent — argv[0] registry resolution, \
-             canonical spec parsing, the immutable /app and /usr binds, persistent state, the \
-             private runtime directory, the exact Wayland socket grant, zero capabilities, \
-             no-new-privileges/seccomp readback, or the jailed frame presentation failed. \
+            "the compositor and terminal became ready, but the Firefox first-window marker \
+             ({TD_FIREFOX_BOOT_MARKER:?}) was absent — package/runtime composition, argv[0] \
+             registry resolution, canonical spec parsing, the immutable /app and /usr binds, \
+             the private runtime and Downloads grant, bus registration, the exact Wayland \
+             socket, bounded live cgroup state, or matching XDG frame painting failed. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -3300,7 +3303,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_SANDBOX_KERNEL_MARKER.len(),
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
-        exact_line_window(TD_JAIL_FIXTURE_BOOT_MARKER),
+        exact_line_window(TD_FIREFOX_BOOT_MARKER),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
             .saturating_add(exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER)),
@@ -3473,9 +3476,9 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         TD_JAIL_SECCOMP_PROBE_MARKER.as_bytes(),
     );
     latch_line_marker(
-        &mut evidence.td_jail_fixture,
+        &mut evidence.td_firefox,
         buf,
-        TD_JAIL_FIXTURE_BOOT_MARKER.as_bytes(),
+        TD_FIREFOX_BOOT_MARKER.as_bytes(),
     );
     latch_prefixed_line_marker(
         &mut evidence.td_profiler_attribution,
@@ -4357,6 +4360,10 @@ mod tests {
 
     #[test]
     fn persistent_fixture_capacity_accounts_for_the_injected_probe() {
+        assert!(
+            PERSISTENT_VOLUME_BYTES >= td_boot_protocol::MIN_VOLUME_BYTES,
+            "the QEMU volume must still satisfy target-side admission"
+        );
         assert_eq!(
             PERSISTENT_VOLUME_BYTES,
             td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES
@@ -4473,7 +4480,7 @@ mod tests {
             TD_SANDBOX_KERNEL_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
-            TD_JAIL_FIXTURE_BOOT_MARKER,
+            TD_FIREFOX_BOOT_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
@@ -4561,20 +4568,20 @@ mod tests {
     }
 
     #[test]
-    fn jail_fixture_evidence_requires_an_exact_console_line() {
+    fn firefox_evidence_requires_an_exact_console_line() {
         let mut evidence = ConsoleEvidence::default();
         latch_console_evidence(
             &mut evidence,
-            format!("\ntd-ui: {TD_JAIL_FIXTURE_BOOT_MARKER} failed\n").as_bytes(),
+            format!("\ntd-ui: {TD_FIREFOX_BOOT_MARKER} failed\n").as_bytes(),
             b"target",
         );
-        assert!(!evidence.td_jail_fixture);
+        assert!(!evidence.td_firefox);
         latch_console_evidence(
             &mut evidence,
-            format!("\n{TD_JAIL_FIXTURE_BOOT_MARKER}\r\n").as_bytes(),
+            format!("\n{TD_FIREFOX_BOOT_MARKER}\r\n").as_bytes(),
             b"target",
         );
-        assert!(evidence.td_jail_fixture);
+        assert!(evidence.td_firefox);
     }
 
     #[test]
@@ -4668,16 +4675,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_jail_fixture_boot_marker_line_survives_a_read_boundary() {
+    fn exact_firefox_boot_marker_line_survives_a_read_boundary() {
         const CHUNK: usize = 8192;
         let seq = AtomicU64::new(2600);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
         let path = dir.join("console.log");
-        let start = CHUNK - (TD_JAIL_FIXTURE_BOOT_MARKER.len() - 1);
+        let start = CHUNK - (TD_FIREFOX_BOOT_MARKER.len() - 1);
         let mut bytes = vec![b'x'; start];
         *bytes.last_mut().unwrap() = b'\n';
-        bytes.extend_from_slice(TD_JAIL_FIXTURE_BOOT_MARKER.as_bytes());
+        bytes.extend_from_slice(TD_FIREFOX_BOOT_MARKER.as_bytes());
         bytes.push(b'\n');
         fs::write(&path, bytes).unwrap();
 
@@ -4692,15 +4699,15 @@ mod tests {
             &mut evidence,
         )
         .unwrap();
-        assert!(evidence.td_jail_fixture);
+        assert!(evidence.td_firefox);
     }
 
     #[test]
     fn exact_line_overlap_includes_prefix_and_crlf() {
         assert_eq!(exact_line_window("marker"), "\nmarker\r\n".len());
         assert_eq!(
-            exact_line_window(TD_JAIL_FIXTURE_BOOT_MARKER),
-            TD_JAIL_FIXTURE_BOOT_MARKER.len() + 3
+            exact_line_window(TD_FIREFOX_BOOT_MARKER),
+            TD_FIREFOX_BOOT_MARKER.len() + 3
         );
     }
 
@@ -4782,7 +4789,7 @@ mod tests {
             TD_BUSD_RUNTIME_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
-            TD_JAIL_FIXTURE_BOOT_MARKER,
+            TD_FIREFOX_BOOT_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_BOOT_SUCCESS_MARKER,
@@ -4841,7 +4848,7 @@ mod tests {
         assert!(evidence.td_busd_runtime);
         assert!(evidence.td_jail_transition);
         assert!(evidence.td_jail_seccomp);
-        assert!(evidence.td_jail_fixture);
+        assert!(evidence.td_firefox);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
         assert!(evidence.boot_success);

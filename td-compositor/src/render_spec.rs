@@ -1142,4 +1142,3 @@ fn the_diff_marks_a_truncated_frame_rather_than_reading_past_it() {
 fn selftest_renders_the_pinned_face_and_round_trips_through_p6() {
     super::selftest().unwrap();
 }
-

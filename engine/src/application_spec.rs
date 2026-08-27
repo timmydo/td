@@ -654,6 +654,8 @@ mod tests {
         let declaration =
             ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/firefox")
                 .unwrap()
+                .with_environment("MOZ_DISABLE_AUTO_SAFE_MODE", "1")
+                .unwrap()
                 .with_environment("MOZ_ENABLE_WAYLAND", "1")
                 .unwrap();
         let manifest = declaration
@@ -669,6 +671,7 @@ mod tests {
             environment.get("LD_LIBRARY_PATH"),
             Some(&"/app/lib:/app/lib/firefox")
         );
+        assert_eq!(environment.get("MOZ_DISABLE_AUTO_SAFE_MODE"), Some(&"1"));
         assert_eq!(environment.get("MOZ_ENABLE_WAYLAND"), Some(&"1"));
         let text = spec.to_keyfile();
         assert_eq!(ApplicationSpec::parse(&text).unwrap(), spec);

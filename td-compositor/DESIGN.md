@@ -1807,8 +1807,9 @@ xdg_surface, where 3 and 5 are `unconfigured_buffer` and `invalid_size`, and
 `invalid_grab`. Each xdg_surface therefore carries the shell object it was made
 by, and `defunct_surfaces` needs no override at all.
 
-The boot profile starts one `td-term` toplevel; a `td-ui-demo` toplevel is
-reached from the launcher instead, and the conformance below is its. It
+The original boot profile started one `td-term` toplevel and reached a
+`td-ui-demo` toplevel from the launcher; the current Firefox profile retains
+the conformance below only as lower-level protocol coverage. The demo
 discovers and binds
 globals rather than depending on registry names, binds the version-5-or-newer
 seat, and completes the initial XDG configure/ack handshake. It accepts only a
@@ -1852,10 +1853,12 @@ compositor makes the client exit and permits `restart=always` to retry.
 
 The launcher is a compositor-owned overlay, so opening it never depends on an
 already-running client. Its registry has a terminal entry that starts a
-`td-term`, an input-monitor entry that starts another `td-ui-demo`, and an
-explicit close entry. The terminal is FIRST, so it is what an unfiltered
-Enter opens: it is the entry a person came for, where the monitor is a
-diagnostic that happened to be the only client there was. Three entries is
+`td-term`, one application entry when the image supplies an admitted
+application (otherwise an input-monitor entry that starts `td-ui-demo`), and
+an explicit close entry. The application entry's uppercase label and
+lowercase search term are derived from the exact bounded application name;
+the compositor does not carry a fixture- or Firefox-specific card. The
+terminal is FIRST, so it is what an unfiltered Enter opens. Three entries is
 what the card currently holds: a fourth overflows `CARD_HEIGHT`, which
 `registry_entries_are_searchable_and_fit_the_card` reds rather than clipping
 silently, so adding one means growing the card in the same landing. Each entry
@@ -1866,25 +1869,32 @@ first match after an edit. An empty result is explicit and Enter leaves it
 open; Backspace can recover it. Opening clears the previous filter. While the
 overlay is open, all non-modifier keys are consumed by the compositor, and
 modified keys that are not launcher commands do not become text. Activation
-with a match closes the overlay before process creation; activation with no
-matches keeps both the overlay and input capture active. The input adapter
+with a match closes the overlay before native process creation or application
+surface activation; activation with no matches keeps both the overlay and
+input capture active. The input adapter
 updates its capture state from the model's post-action visibility instead of
 guessing which action opened or closed it. It never enables capture before a
 successful open. An overlay action is transactional with its framebuffer
 paint: a failed paint restores the complete prior launcher model, so another
 input device cannot observe model state with stale capture.
-The compositor receives each client executable as an explicit argument —
-`--launcher-client` and `--terminal-client` — and requires both, along with
-the Wayland socket, to be absolute. Neither is defaulted: the store path a
-package lands at is content addressed, so the compositor cannot derive one,
-and a registry entry that spawns nothing is worse than one that never
-appeared. The launch request selects the PROGRAM and nothing else, both
-personalities of the multicall taking the same two run flags. The compositor
-derives a unique readiness-socket name beside the socket and passes both
-paths as literal argv values without a shell. It reaps exited children
-before each launch and retains at most 16 live launched clients. A launch or
-reap failure is reported without terminating the evdev reader, so the user
-can close or retry the launcher. Reaping also removes a dead child's private
+The compositor requires an explicit absolute `--terminal-client` and exactly
+one UI mode. A standalone compositor supplies an absolute `--launcher-client`
+for direct `td-ui-demo`; the image instead supplies a
+`--launcher-application` with its paired app-id observer and no launcher
+client or application-runtime path. An application name must use the image
+grammar. The supervised service owns the boot-started application instance:
+the application card activates a retained matching mapped surface, switching
+workspaces and leaving an unrelated fullscreen view if necessary. It reports
+a missing mapped surface and never starts another process. A direct
+`/bin/<application>` request remains a separate supported route and no
+single-instance lock has landed. Direct `td-ui-demo` and `td-term` requests
+select their program and take the same two run flags. The compositor
+derives a unique readiness-socket name beside the socket and passes both paths
+as literal argv values without a shell. It reaps exited native children before
+each launch and retains at most 16 live launched clients. A native launch or
+reap failure is reported without terminating the evdev reader. Application
+activation is a scene mutation, so its paint or focus failure propagates like
+any other input-driven scene failure. Reaping also removes a dead child's private
 readiness socket and reports any path that cannot be safely removed. Opening
 the modal overlay immediately withdraws ungrabbed pointer focus; closing it
 immediately restores focus under the stationary cursor. An existing implicit
@@ -1894,15 +1904,19 @@ compositor exits while a launched child is still live, its readiness socket
 may remain until logout clears the runtime-directory tmpfs. Names carry the
 compositor pid, so that residual path cannot block a later compositor.
 
-The application-window observer is optional and configured only by the paired
-`--application-ready-socket` and `--application-app-id` arguments. It is
-refused without the paired launcher application, and its socket path must be
+The application-window observer and configured launcher application require
+each other. The observer is configured by the paired
+`--application-ready-socket` and `--application-app-id` arguments. Its socket
+path must be
 an absolute path whose resolved parent and final name differ from the Wayland
 socket, so the ordinary compositor listener cannot answer its probe before a
 window exists. Both resolved endpoints are retained after validation rather
 than following a mutable parent symlink again. The expected id is at most 128
 ASCII letters, digits, dots, underscores, or hyphens, keeping the diagnostic
-one unambiguous field. `probe-application` connects to that distinct socket.
+one unambiguous field. Matching surface keys remain after the one-shot
+readiness publication so launcher activation can reuse the service-owned
+window; role, surface and client teardown remove them. `probe-application`
+connects to that distinct socket.
 A publisher failure exits the compositor for its existing `restart=always`
 supervisor to reconstruct the one-shot observer; losing stdout after the
 socket is live reports an error but does not retract readiness.
@@ -3090,11 +3104,11 @@ out-of-bounds write.
 
 This section records the boot profile. The td-term cutover of sections 12 and
 14 has landed: it replaced the demo SERVICE and the oracle's marker, and the
-devpts setup is in the early mount sequence. It did NOT remove the demo's
-final-image symlink, as this section used to say it would — the launcher
-spawns the demo by absolute path, so the name outlived the service. The
-compositor ordering, readiness, restart, and serial-recovery guarantees remain
-in force.
+devpts setup is in the early mount sequence. The Firefox image cutover then
+removed the demo's final-image `/bin` symlink and assigned the application
+launcher entry to Firefox; `td-ui-demo` remains a protocol fixture inside the
+copied compositor store output and its own recipe. The compositor ordering,
+readiness, restart, and serial-recovery guarantees remain in force.
 
 PID 1 still mounts devtmpfs, procfs, sysfs, tmpfs, and the immutable root.
 `td-svc` starts `td-seatd` after root checking, then starts
@@ -3117,15 +3131,13 @@ requires that marker and the first client's later `TD-TERM-READY` marker.
 
 These are the compositor and client proofs. The td-term proof of section 14
 has landed and superseded the demo-specific `TD-UI-CLIENT-READY` requirement;
-the entry-point and image-roster requirements stand, the demo being a launcher
-entry still. Where a bullet below says "the boot client" it now means td-term,
-except the pointer clause. The terminal takes a pointer now, for its wheel,
-and consumes every framed event on it — but that is proved by HOST tests over
-`Surface::dispatch`, not by the boot oracle, which delivers the boot client no
-pointer input. So the clause stays the demo's and stays proved from the
-launcher; moving it would mean claiming a boot proof that does not run.
-Nothing about the terminal REQUIRES the capability either: it binds a pointer
-only where a seat offers one.
+the demo's protocol coverage remains host-side rather than an image-launcher
+claim. Where a bullet below says "the boot client" it now means td-term. The
+terminal takes a pointer for its wheel and consumes every framed event on it,
+but that is proved by host tests over `Surface::dispatch`, not by the boot
+oracle, which delivers the boot client no pointer input. Nothing about the
+terminal requires the capability either: it binds a pointer only where a seat
+offers one.
 
 The landing must prove:
 
@@ -3480,8 +3492,10 @@ the policy layer, which is what runs where devpts is not mounted. The terminfo
 entry and the `/bin/td-term` symlink are landed, the launcher can open a
 terminal, and the boot cutover is landed: the `[terminal]` unit replaced
 `[ui-demo]`, so the machine comes up on a shell prompt and the boot oracle's
-first-client marker is the terminal's. The demo stays packaged as a launcher
-entry rather than as a service.
+first-client marker is the terminal's. The selected Firefox application now
+occupies the launcher application entry; the demo has no `/bin` name, service
+or launcher role in the image, although its personality remains reachable in
+the copied compositor store output for lower-level protocol tests.
 General Wayland toolkit compatibility is not claimed until the missing core
 protocols have explicit tests. Hardware acceleration, niri, portals, PipeWire,
 Xwayland, and a C desktop stack remain optional consumers rather than
@@ -3501,11 +3515,10 @@ relative `td-term -> td-compositor` symlink. This reuses the one Wayland wire
 implementation and the existing confined SCM_RIGHTS transport instead of
 creating a second target-side unsafe surface. The client and server run as the
 same graphical user, and the shared artifact is not a privilege boundary.
-`td-ui-demo` remains a source and target-recipe protocol fixture. The boot
-cutover KEPT its final-image symlink, superseding the earlier plan to remove
-it: the launcher registry spawns the demo by absolute path, so the name is
-reachable from the screen rather than only from a recipe. What the cutover
-removed is its SERVICE — nothing starts it at boot.
+`td-ui-demo` remains a source and target-recipe protocol fixture. The Firefox
+image cutover removes its final-image `/bin` symlink and service; the copied
+compositor store output, protocol tests and standalone compositor recipe, not
+the deployed launcher, retain the synthetic client.
 
 All terminal code is dependency-free Rust built by td's source-built stage2
 toolchain. It has no toolkit, GPU API, dynamic font system, terminal daemon,
@@ -4198,9 +4211,10 @@ probe /run/user/1000/td-term-ready` as the graphical user. The probe
 requires a ready state and nonzero internally consistent rows and columns;
 its output and the matching `TD-TERM-READY` QEMU diagnostic are compared in
 integration tests. The boot profile has atomically replaced the visible
-`td-ui-demo` service with a `[terminal]` one; the demo's final-image symlink
-stays, because the launcher spawns it. The compositor and serial recovery
-greeter remain independently restartable.
+`td-ui-demo` service with a `[terminal]` one. The later Firefox cutover removed
+the demo's final-image `/bin` symlink; the launcher now activates the mapped
+service-owned Firefox surface rather than spawning either client. The
+compositor and serial recovery greeter remain independently restartable.
 
 ## 13. Native terminal corpus
 

@@ -863,7 +863,7 @@ impl Scene {
         }
     }
 
-    pub(crate) fn set_launcher_application(&mut self, application: bool) {
+    pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
         self.launcher.set_application(application);
     }
 
@@ -1832,6 +1832,10 @@ impl Scene {
 
     pub fn focus_key(&mut self, key: SurfaceKey) -> bool {
         self.layout.focus_key(key)
+    }
+
+    pub fn activate_key(&mut self, key: SurfaceKey) -> Option<bool> {
+        self.layout.activate_key(key)
     }
 
     pub fn launcher(&mut self, action: LauncherAction) -> Option<LaunchRequest> {

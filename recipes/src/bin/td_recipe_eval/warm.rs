@@ -664,6 +664,19 @@ mod tests {
             )
             .unwrap();
         }
+        for pin in &cold.ostree {
+            let cache = root.join("ostree").join(&pin.cache);
+            fs::create_dir_all(&cache).unwrap();
+            fs::write(cache.join("graph.v1"), b"authenticated graph").unwrap();
+            fs::write(
+                cache.join("td-ostree-cache.v1"),
+                format!(
+                    "format=1\nrepository={}\nref={}\ncommit={}\ncontent={}\n",
+                    pin.repository, pin.exact_ref, pin.commit, pin.content
+                ),
+            )
+            .unwrap();
+        }
         for job in &cold.vendors {
             let vendor = root
                 .join(".td-build-cache/crate-vendor")

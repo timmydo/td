@@ -11,9 +11,8 @@ const MAX_QUERY_BYTES: usize = 64;
 const MAX_LAUNCHED_CLIENTS: usize = 16;
 const MAX_APPLICATION_NAME_BYTES: usize = 32;
 const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
-const APPLICATION_RUNTIME_ROOT_NAME: &str = "td-app";
-const JAIL_FIXTURE_APPLICATION_NAME: &str = "td-jail-fixture";
 const UI_ENTRY_INDEX: usize = 1;
+const ENTRY_COUNT: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LauncherAction {
@@ -33,31 +32,25 @@ pub enum LaunchRequest {
 }
 
 #[derive(Clone, Copy)]
-struct Entry {
-    label: &'static str,
-    search: &'static str,
+struct Entry<'a> {
+    label: &'a str,
+    search: &'a str,
     request: Option<LaunchRequest>,
 }
 
-const ENTRIES: &[Entry] = &[
-    // First because it is the one a person came here for; the monitor below it
-    // is a diagnostic that happened to be the only client there was.
-    Entry {
-        label: "NEW TERMINAL",
-        search: "new terminal shell console prompt",
-        request: Some(LaunchRequest::Terminal),
-    },
-    Entry {
-        label: "JAIL FIXTURE",
-        search: "jail fixture sandbox wayland",
-        request: Some(LaunchRequest::UiDemo),
-    },
-    Entry {
-        label: "CLOSE LAUNCHER",
-        search: "close launcher",
-        request: None,
-    },
-];
+// First because it is the one a person came here for; the monitor below it
+// is a diagnostic that happened to be the only client there was.
+const TERMINAL_ENTRY: Entry = Entry {
+    label: "NEW TERMINAL",
+    search: "new terminal shell console prompt",
+    request: Some(LaunchRequest::Terminal),
+};
+
+const CLOSE_ENTRY: Entry = Entry {
+    label: "CLOSE LAUNCHER",
+    search: "close launcher",
+    request: None,
+};
 
 const DIRECT_UI_ENTRY: Entry = Entry {
     label: "NEW INPUT MONITOR",
@@ -65,11 +58,25 @@ const DIRECT_UI_ENTRY: Entry = Entry {
     request: Some(LaunchRequest::UiDemo),
 };
 
-fn entry_at(application: bool, index: usize) -> Option<Entry> {
-    if index == UI_ENTRY_INDEX && !application {
-        Some(DIRECT_UI_ENTRY)
-    } else {
-        ENTRIES.get(index).copied()
+#[derive(Clone)]
+struct ApplicationEntry {
+    label: String,
+    search: String,
+}
+
+fn entry_at(application: Option<&ApplicationEntry>, index: usize) -> Option<Entry<'_>> {
+    match index {
+        0 => Some(TERMINAL_ENTRY),
+        UI_ENTRY_INDEX => match application {
+            Some(application) => Some(Entry {
+                label: &application.label,
+                search: &application.search,
+                request: Some(LaunchRequest::UiDemo),
+            }),
+            None => Some(DIRECT_UI_ENTRY),
+        },
+        2 => Some(CLOSE_ENTRY),
+        _ => None,
     }
 }
 
@@ -79,12 +86,12 @@ pub struct Launcher {
     selected: usize,
     query: String,
     matches: Vec<usize>,
-    application: bool,
+    application: Option<ApplicationEntry>,
 }
 
 pub struct LaunchOptions {
     pub socket: PathBuf,
-    pub client: PathBuf,
+    pub client: Option<PathBuf>,
     pub terminal: PathBuf,
     pub application: Option<ApplicationLaunch>,
 }
@@ -92,7 +99,6 @@ pub struct LaunchOptions {
 #[derive(Clone)]
 pub struct ApplicationLaunch {
     pub name: String,
-    pub runtime: PathBuf,
 }
 
 pub(crate) trait ChildProcess {
@@ -137,17 +143,25 @@ impl LaunchOptions {
                 self.socket.display()
             ));
         }
-        if !self.client.is_absolute() {
-            return Err(format!(
-                "launcher client {} is not absolute",
-                self.client.display()
-            ));
-        }
         if !self.terminal.is_absolute() {
             return Err(format!(
                 "launcher terminal {} is not absolute",
                 self.terminal.display()
             ));
+        }
+        match (&self.client, &self.application) {
+            (Some(client), None) if !client.is_absolute() => {
+                return Err(format!(
+                    "launcher client {} is not absolute",
+                    client.display()
+                ));
+            }
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(
+                    "exactly one launcher client or launcher application is required".into(),
+                );
+            }
+            _ => {}
         }
         if let Some(application) = &self.application {
             if application.name.is_empty()
@@ -162,25 +176,6 @@ impl LaunchOptions {
             {
                 return Err("launcher application name is outside the image grammar".into());
             }
-            if !application.runtime.is_absolute()
-                || application.runtime.parent() != self.socket.parent()
-                || application.runtime.file_name().and_then(|name| name.to_str())
-                    != Some(APPLICATION_RUNTIME_ROOT_NAME)
-            {
-                return Err(format!(
-                    "launcher application runtime {} is not the image runtime beside the \
-                     Wayland socket",
-                    application.runtime.display()
-                ));
-            }
-            if self.client.file_name().and_then(|name| name.to_str())
-                != Some(application.name.as_str())
-            {
-                return Err("launcher application name does not match its /bin client".into());
-            }
-            if application.name != JAIL_FIXTURE_APPLICATION_NAME {
-                return Err("launcher application does not match the fixture card".into());
-            }
         }
         Ok(())
     }
@@ -192,13 +187,16 @@ impl Launcher {
             visible: false,
             selected: 0,
             query: String::with_capacity(MAX_QUERY_BYTES),
-            matches: (0..ENTRIES.len()).collect(),
-            application: false,
+            matches: (0..ENTRY_COUNT).collect(),
+            application: None,
         }
     }
 
-    pub(crate) fn set_application(&mut self, application: bool) {
-        self.application = application;
+    pub(crate) fn set_application(&mut self, application: Option<&str>) {
+        self.application = application.map(|name| ApplicationEntry {
+            label: name.to_ascii_uppercase(),
+            search: name.to_ascii_lowercase(),
+        });
         self.refresh_matches();
     }
 
@@ -225,7 +223,7 @@ impl Launcher {
                 let request = self
                     .matches
                     .get(self.selected)
-                    .and_then(|index| entry_at(self.application, *index))
+                    .and_then(|index| entry_at(self.application.as_ref(), *index))
                     .map(|entry| entry.request);
                 let request = request?;
                 self.visible = false;
@@ -256,8 +254,8 @@ impl Launcher {
     fn refresh_matches(&mut self) {
         self.matches.clear();
         let terms = self.query.split_ascii_whitespace();
-        for index in 0..ENTRIES.len() {
-            let Some(entry) = entry_at(self.application, index) else {
+        for index in 0..ENTRY_COUNT {
+            let Some(entry) = entry_at(self.application.as_ref(), index) else {
                 continue;
             };
             if terms.clone().all(|term| entry.search.contains(term)) {
@@ -336,7 +334,7 @@ impl Launcher {
             );
         }
         for (match_index, entry_index) in self.matches.iter().enumerate() {
-            let Some(entry) = entry_at(self.application, *entry_index) else {
+            let Some(entry) = entry_at(self.application.as_ref(), *entry_index) else {
                 continue;
             };
             let row_top = top
@@ -395,10 +393,12 @@ impl Launcher {
     }
 
     #[cfg(test)]
-    fn matched_labels(&self) -> Vec<&'static str> {
+    fn matched_labels(&self) -> Vec<&str> {
         self.matches
             .iter()
-            .filter_map(|index| entry_at(self.application, *index).map(|entry| entry.label))
+            .filter_map(|index| {
+                entry_at(self.application.as_ref(), *index).map(|entry| entry.label)
+            })
             .collect()
     }
 }
@@ -440,6 +440,10 @@ impl<S> LaunchProcesses<S>
 where
     S: ProcessSpawner,
 {
+    pub fn activates_application(&self) -> bool {
+        self.options.application.is_some()
+    }
+
     #[cfg(test)]
     fn with_spawner(options: LaunchOptions, spawner: S) -> Self {
         Self {
@@ -547,22 +551,21 @@ pub(crate) fn launch_command(
         "td-launcher-{}-{sequence}.ready",
         std::process::id()
     ));
-    let ready_name = ready
-        .file_name()
-        .ok_or_else(|| "launcher readiness path has no file name".to_string())?;
-    // Both personalities take the same two run flags. The installed fixture's
-    // readiness crosses its private runtime bind; an ordinary direct client
-    // and the terminal publish beside the Wayland socket.
+    // A configured application is owned by its supervised service. The card
+    // activates the observed surface through Runtime and must never create a
+    // second process over the same persistent profile.
     let (program, published_ready, tracked_ready) = match (request, &options.application) {
-        (LaunchRequest::UiDemo, Some(application)) => (
-            options.client.clone(),
-            application.runtime.join(ready_name),
-            application
-                .runtime
-                .join(&application.name)
-                .join(ready_name),
+        (LaunchRequest::UiDemo, Some(_)) => {
+            return Err("configured launcher application is activation-only".to_string());
+        }
+        (LaunchRequest::UiDemo, None) => (
+            options
+                .client
+                .clone()
+                .ok_or_else(|| "launcher client is not configured".to_string())?,
+            ready.clone(),
+            ready,
         ),
-        (LaunchRequest::UiDemo, None) => (options.client.clone(), ready.clone(), ready),
         (LaunchRequest::Terminal, _) => (options.terminal.clone(), ready.clone(), ready),
     };
     let arguments = vec![
@@ -621,7 +624,7 @@ mod tests {
             socket: std::env::temp_dir()
                 .join(format!("td-launcher-fake-{}-missing", std::process::id()))
                 .join("wayland-0"),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: PathBuf::from("/bin/td-term"),
             application: None,
         }
@@ -668,15 +671,10 @@ mod tests {
     }
 
     #[test]
-    fn application_configuration_changes_only_the_ui_entry() {
+    fn application_configuration_names_only_the_ui_entry() {
         assert_eq!(
-            ENTRIES.get(UI_ENTRY_INDEX).map(|entry| entry.label),
-            Some("JAIL FIXTURE")
-        );
-        assert_eq!(DIRECT_UI_ENTRY.label, "NEW INPUT MONITOR");
-        assert_eq!(
-            ENTRIES.get(UI_ENTRY_INDEX).and_then(|entry| entry.request),
-            DIRECT_UI_ENTRY.request
+            entry_at(None, UI_ENTRY_INDEX).map(|entry| entry.label),
+            Some("NEW INPUT MONITOR")
         );
         let mut launcher = Launcher::new();
         launcher.apply(LauncherAction::Open);
@@ -684,23 +682,23 @@ mod tests {
             launcher.matched_labels(),
             ["NEW TERMINAL", "NEW INPUT MONITOR", "CLOSE LAUNCHER"]
         );
-        launcher.set_application(true);
+        launcher.set_application(Some("firefox"));
         assert_eq!(
             launcher.matched_labels(),
-            ["NEW TERMINAL", "JAIL FIXTURE", "CLOSE LAUNCHER"]
+            ["NEW TERMINAL", "FIREFOX", "CLOSE LAUNCHER"]
         );
     }
 
     #[test]
     fn filtering_is_ascii_bounded_and_matches_all_terms() {
         let mut launcher = Launcher::new();
-        launcher.set_application(true);
+        launcher.set_application(Some("firefox"));
         launcher.apply(LauncherAction::Open);
-        for character in "SaNdBoX jail".chars() {
+        for character in "FiReFoX".chars() {
             launcher.apply(LauncherAction::Insert(character));
         }
-        assert_eq!(launcher.query(), "sandbox jail");
-        assert_eq!(launcher.matched_labels(), ["JAIL FIXTURE"]);
+        assert_eq!(launcher.query(), "firefox");
+        assert_eq!(launcher.matched_labels(), ["FIREFOX"]);
         assert_eq!(
             launcher.apply(LauncherAction::Activate),
             Some(LaunchRequest::UiDemo)
@@ -800,10 +798,10 @@ mod tests {
     fn registry_entries_are_searchable_and_fit_the_card() {
         let glyph_height = ui::GLYPH_HEIGHT.saturating_mul(2);
         let final_row = 92usize
-            .saturating_add(ENTRIES.len().saturating_sub(1).saturating_mul(42))
+            .saturating_add(ENTRY_COUNT.saturating_sub(1).saturating_mul(42))
             .saturating_add(glyph_height);
         assert!(final_row <= CARD_HEIGHT);
-        for entry in ENTRIES.iter().chain([&DIRECT_UI_ENTRY]) {
+        for entry in [TERMINAL_ENTRY, CLOSE_ENTRY, DIRECT_UI_ENTRY] {
             assert!(entry.search.is_ascii());
             assert_eq!(entry.search, entry.search.to_ascii_lowercase());
             for word in entry.label.split_ascii_whitespace() {
@@ -813,60 +811,24 @@ mod tests {
     }
 
     #[test]
-    fn launch_commands_are_explicit_unique_and_socket_local() {
+    fn native_launch_commands_are_explicit_unique_and_socket_local() {
         let options = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("/bin/td-jail-fixture"),
+            client: None,
             terminal: PathBuf::from("/bin/td-term"),
             application: Some(ApplicationLaunch {
                 name: "td-jail-fixture".into(),
-                runtime: PathBuf::from("/run/user/1000/td-app"),
             }),
         };
-        let (program, first, first_ready) =
-            launch_command(&options, LaunchRequest::UiDemo, 7).unwrap();
-        let (_, second, second_ready) = launch_command(&options, LaunchRequest::UiDemo, 8).unwrap();
-        assert_eq!(program, PathBuf::from("/bin/td-jail-fixture"));
+        assert!(launch_command(&options, LaunchRequest::UiDemo, 7).is_err());
         let (terminal, terminal_arguments, _) =
             launch_command(&options, LaunchRequest::Terminal, 9).unwrap();
         assert_eq!(terminal, PathBuf::from("/bin/td-term"));
-        // Same flag grammar, but the jailed client publishes through its
-        // private runtime bind while the terminal publishes on the host.
-        assert_eq!(terminal_arguments.get(..4), first.get(..4));
-        assert_eq!(
-            first,
-            [
-                OsString::from("run"),
-                OsString::from("--socket"),
-                OsString::from("/run/user/1000/wayland-0"),
-                OsString::from("--ready-socket"),
-                OsString::from(format!(
-                    "/run/user/1000/td-app/td-launcher-{}-7.ready",
-                    std::process::id()
-                )),
-            ]
-        );
-        assert_ne!(first, second);
-        let first_published = Path::new("/run/user/1000/td-app")
-            .join(first_ready.file_name().unwrap());
-        assert_eq!(
-            first.last().map(OsString::as_os_str),
-            Some(first_published.as_os_str())
-        );
-        assert_eq!(
-            first_ready.parent(),
-            Some(Path::new("/run/user/1000/td-app/td-jail-fixture"))
-        );
-        let second_published = Path::new("/run/user/1000/td-app")
-            .join(second_ready.file_name().unwrap());
-        assert_eq!(
-            second.last().map(OsString::as_os_str),
-            Some(second_published.as_os_str())
-        );
+        assert_eq!(terminal_arguments.first(), Some(&OsString::from("run")));
 
         let direct = LaunchOptions {
             socket: options.socket.clone(),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: options.terminal.clone(),
             application: None,
         };
@@ -880,38 +842,36 @@ mod tests {
 
         let relative = LaunchOptions {
             socket: PathBuf::from("wayland-0"),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: PathBuf::from("/bin/td-term"),
             application: None,
         };
         assert!(launch_command(&relative, LaunchRequest::UiDemo, 0).is_err());
         let relative = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("td-ui-demo"),
+            client: Some(PathBuf::from("td-ui-demo")),
             terminal: PathBuf::from("/bin/td-term"),
             application: None,
         };
         assert!(launch_command(&relative, LaunchRequest::UiDemo, 0).is_err());
         assert!(LaunchProcesses::new(relative).is_err());
-        let wrong_runtime = LaunchOptions {
+        let ambiguous = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("/bin/td-jail-fixture"),
+            client: Some(PathBuf::from("/bin/td-jail-fixture")),
             terminal: PathBuf::from("/bin/td-term"),
             application: Some(ApplicationLaunch {
                 name: "td-jail-fixture".into(),
-                runtime: PathBuf::from("/run/user/1000/not-td-app"),
             }),
         };
-        assert!(launch_command(&wrong_runtime, LaunchRequest::UiDemo, 0).is_err());
-        assert!(LaunchProcesses::new(wrong_runtime).is_err());
+        assert!(launch_command(&ambiguous, LaunchRequest::UiDemo, 0).is_err());
+        assert!(LaunchProcesses::new(ambiguous).is_err());
         for name in RESERVED_APPLICATION_NAMES {
             let reserved = LaunchOptions {
                 socket: PathBuf::from("/run/user/1000/wayland-0"),
-                client: PathBuf::from(format!("/bin/{name}")),
+                client: None,
                 terminal: PathBuf::from("/bin/td-term"),
                 application: Some(ApplicationLaunch {
                     name: (*name).into(),
-                    runtime: PathBuf::from("/run/user/1000/td-app"),
                 }),
             };
             assert!(launch_command(&reserved, LaunchRequest::UiDemo, 0).is_err());
@@ -919,20 +879,19 @@ mod tests {
         }
         let other_application = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("/bin/other-application"),
+            client: None,
             terminal: PathBuf::from("/bin/td-term"),
             application: Some(ApplicationLaunch {
                 name: "other-application".into(),
-                runtime: PathBuf::from("/run/user/1000/td-app"),
             }),
         };
         assert!(launch_command(&other_application, LaunchRequest::UiDemo, 0).is_err());
-        assert!(LaunchProcesses::new(other_application).is_err());
+        assert!(LaunchProcesses::new(other_application).is_ok());
         // Both paths are refused, whichever request asks: the terminal is
         // spawned by the same `Command::new` the demo is.
         let relative = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: PathBuf::from("td-term"),
             application: None,
         };
@@ -1040,7 +999,7 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let options = LaunchOptions {
             socket: directory.join("wayland-0"),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: PathBuf::from("/bin/td-term"),
             application: None,
         };
@@ -1071,7 +1030,7 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let options = LaunchOptions {
             socket: directory.join("wayland-0"),
-            client: PathBuf::from("/bin/td-ui-demo"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: PathBuf::from("/bin/td-term"),
             application: None,
         };

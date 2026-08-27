@@ -16,6 +16,7 @@ pub fn recipe() -> Recipe {
     };
     let Ok(declaration) = ApplicationDeclaration::new(RUNTIME, ENTRY)
         .and_then(|value| value.with_alias("org.mozilla.firefox"))
+        .and_then(|value| value.with_environment("MOZ_DISABLE_AUTO_SAFE_MODE", "1"))
         .and_then(|value| value.with_environment("MOZ_ENABLE_WAYLAND", "1"))
     else {
         return invalid_recipe("declaration");
@@ -80,7 +81,10 @@ mod tests {
         assert_eq!(declaration.alias(), Some("org.mozilla.firefox"));
         assert_eq!(
             declaration.environment().collect::<Vec<_>>(),
-            vec![("MOZ_ENABLE_WAYLAND", "1")]
+            vec![
+                ("MOZ_DISABLE_AUTO_SAFE_MODE", "1"),
+                ("MOZ_ENABLE_WAYLAND", "1"),
+            ]
         );
         assert!(matches!(
             recipe.steps.as_deref(),

@@ -48,8 +48,9 @@ const MAX_HELD_KEYS: usize = 256;
 
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
-     --launcher-client PATH [--launcher-application NAME --launcher-runtime PATH] \
-     --terminal-client PATH [--application-ready-socket PATH --application-app-id ID] | \
+     (--launcher-client PATH | --launcher-application NAME \
+     --application-ready-socket PATH --application-app-id ID) \
+     --terminal-client PATH | \
      td-compositor probe SOCKET | td-compositor probe-application SOCKET | \
      td-compositor terminfo PATH | \
      td-compositor selftest"
@@ -58,7 +59,7 @@ fn usage() -> String {
 
 fn client_usage() -> String {
     "usage: td-ui-demo run --socket PATH --ready-socket PATH | \
-     td-ui-demo probe READY_SOCKET | td-ui-demo selftest"
+     td-ui-demo probe READY_SOCKET | td-ui-demo selftest [--shared-network]"
         .into()
 }
 
@@ -148,9 +149,8 @@ struct RunOptions {
     framebuffer: PathBuf,
     input: PathBuf,
     socket: PathBuf,
-    launcher_client: PathBuf,
+    launcher_client: Option<PathBuf>,
     launcher_application: Option<String>,
-    launcher_runtime: Option<PathBuf>,
     terminal_client: PathBuf,
     application_ready_socket: Option<PathBuf>,
     application_app_id: Option<String>,
@@ -162,7 +162,6 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut socket = None;
     let mut launcher_client = None;
     let mut launcher_application = None;
-    let mut launcher_runtime = None;
     let mut terminal_client = None;
     let mut application_ready_socket = None;
     let mut application_app_id = None;
@@ -184,9 +183,6 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--launcher-application" if launcher_application.is_none() => {
                 launcher_application = Some(value.clone())
             }
-            "--launcher-runtime" if launcher_runtime.is_none() => {
-                launcher_runtime = Some(PathBuf::from(value))
-            }
             "--terminal-client" if terminal_client.is_none() => {
                 terminal_client = Some(PathBuf::from(value))
             }
@@ -197,7 +193,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
                 application_app_id = Some(value.clone())
             }
             "--framebuffer" | "--input" | "--socket" | "--launcher-client"
-            | "--launcher-application" | "--launcher-runtime" | "--terminal-client"
+            | "--launcher-application" | "--terminal-client"
             | "--application-ready-socket" | "--application-app-id" => {
                 return Err(format!("duplicate flag '{flag}'"));
             }
@@ -205,10 +201,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         }
         index += 2;
     }
-    if launcher_application.is_some() != launcher_runtime.is_some() {
-        return Err(
-            "--launcher-application and --launcher-runtime must be supplied together".into(),
-        );
+    if launcher_client.is_some() == launcher_application.is_some() {
+        return Err("exactly one --launcher-client or --launcher-application is required".into());
     }
     if application_ready_socket.is_some() != application_app_id.is_some() {
         return Err(
@@ -216,8 +210,10 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
                 .into(),
         );
     }
-    if application_ready_socket.is_some() && launcher_application.is_none() {
-        return Err("application-window readiness requires a launcher application".into());
+    if application_ready_socket.is_some() != launcher_application.is_some() {
+        return Err(
+            "launcher applications require application-window readiness and vice versa".into(),
+        );
     }
     let mut socket = socket.ok_or_else(|| "--socket is required".to_string())?;
     if let Some(ready) = application_ready_socket.as_mut() {
@@ -235,10 +231,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         framebuffer: framebuffer.ok_or_else(|| "--framebuffer is required".to_string())?,
         input: input.ok_or_else(|| "--input is required".to_string())?,
         socket,
-        launcher_client: launcher_client
-            .ok_or_else(|| "--launcher-client is required".to_string())?,
+        launcher_client,
         launcher_application,
-        launcher_runtime,
         // Required rather than defaulted: the compositor cannot know the store
         // path the terminal landed at, and a launcher entry that spawns nothing
         // is worse than one that never appeared.
@@ -268,7 +262,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     let framebuffer = Framebuffer::open(&options.framebuffer)?;
     let geometry = (framebuffer.width, framebuffer.height, framebuffer.stride);
     let mut runtime = Runtime::new(framebuffer);
-    runtime.set_launcher_application(options.launcher_application.is_some());
+    runtime.set_launcher_application(options.launcher_application.as_deref());
     if let Some((path, app_id)) = options
         .application_ready_socket
         .as_deref()
@@ -289,9 +283,9 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
             socket: options.socket.clone(),
             client: options.launcher_client,
             terminal: options.terminal_client,
-            application: options.launcher_application.zip(options.launcher_runtime).map(
-                |(name, runtime)| launcher::ApplicationLaunch { name, runtime },
-            ),
+            application: options
+                .launcher_application
+                .map(|name| launcher::ApplicationLaunch { name }),
         },
     )?;
     // Reported, never fatal: a compositor without a clock is worth more
@@ -450,10 +444,12 @@ fn run_client(args: &[String]) -> Result<(), client::ClientRunFailure> {
             client::probe(Path::new(socket)).map_err(Into::into)
         }
         "selftest" => {
-            if args.get(1).is_some() {
-                return Err(client_usage().into());
-            }
-            client::selftest().map_err(Into::into)
+            let shared_network = match (args.get(1).map(String::as_str), args.get(2)) {
+                (None, None) => false,
+                (Some("--shared-network"), None) => true,
+                _ => return Err(client_usage().into()),
+            };
+            client::selftest(shared_network)
         }
         _ => Err(client_usage().into()),
     }
@@ -533,15 +529,12 @@ mod tests {
     }
 
     #[test]
-    fn launcher_command_round_trips_through_the_client_parser() {
+    fn native_launcher_commands_round_trip_through_the_client_parser() {
         let launch = launcher::LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
-            client: PathBuf::from("/bin/td-jail-fixture"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
             terminal: PathBuf::from("/bin/td-term"),
-            application: Some(launcher::ApplicationLaunch {
-                name: "td-jail-fixture".into(),
-                runtime: PathBuf::from("/run/user/1000/td-app"),
-            }),
+            application: None,
         };
         let (program, arguments, ready_socket) =
             launcher::launch_command(&launch, launcher::LaunchRequest::UiDemo, 7).unwrap();
@@ -549,17 +542,17 @@ mod tests {
             .into_iter()
             .map(|argument| argument.into_string().unwrap())
             .collect();
-        assert_eq!(program, launch.client);
+        assert_eq!(Some(program), launch.client);
         assert_eq!(arguments.first().map(String::as_str), Some("run"));
         let parsed = parse_client_run(arguments.get(1..).unwrap()).unwrap();
         assert_eq!(parsed.socket, launch.socket);
         assert_eq!(
             parsed.ready_socket.parent(),
-            Some(Path::new("/run/user/1000/td-app"))
+            Some(Path::new("/run/user/1000"))
         );
         assert_eq!(
             ready_socket.parent(),
-            Some(Path::new("/run/user/1000/td-app/td-jail-fixture"))
+            Some(Path::new("/run/user/1000"))
         );
         let ready_name = parsed.ready_socket.file_name().unwrap().to_string_lossy();
         assert!(ready_name.starts_with("td-launcher-"));
@@ -1127,12 +1120,8 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 "/dev/input".into(),
                 "--socket".into(),
                 socket.to_string_lossy().into_owned(),
-                "--launcher-client".into(),
-                "/bin/td-jail-fixture".into(),
                 "--launcher-application".into(),
                 "td-jail-fixture".into(),
-                "--launcher-runtime".into(),
-                "/run/user/1000/td-app".into(),
                 "--terminal-client".into(),
                 "/bin/td-term".into(),
                 "--application-ready-socket".into(),
@@ -1144,15 +1133,8 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         let options = super::parse_run(&valid(&wayland, &ready)).unwrap();
         let resolved_parent = std::fs::canonicalize(&actual).unwrap();
         assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
-        assert_eq!(
-            options.launcher_client,
-            std::path::PathBuf::from("/bin/td-jail-fixture")
-        );
+        assert_eq!(options.launcher_client, None);
         assert_eq!(options.launcher_application.as_deref(), Some("td-jail-fixture"));
-        assert_eq!(
-            options.launcher_runtime,
-            Some(std::path::PathBuf::from("/run/user/1000/td-app"))
-        );
         assert_eq!(
             options.terminal_client,
             std::path::PathBuf::from("/bin/td-term")
@@ -1162,13 +1144,15 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             options.application_ready_socket,
             Some(resolved_parent.join("firefox-window-ready"))
         );
+        let mut activation_without_observer = valid(&wayland, &ready);
+        activation_without_observer.truncate(activation_without_observer.len() - 4);
+        assert!(super::parse_run(&activation_without_observer).is_err());
         assert_eq!(
             options.application_app_id.as_deref(),
             Some("org.mozilla.firefox")
         );
-        // Each boundary is required on its own, so dropping any ONE is refused
-        // rather than defaulted — a launcher entry that spawns nothing is
-        // worse than one that never appeared.
+        // Each device boundary and exactly one launcher mode are required, so
+        // dropping one is refused rather than defaulted.
         assert!(super::parse_run(&[
             "--framebuffer".into(),
             "/dev/fb0".into(),
@@ -1195,12 +1179,8 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "/dev/input".into(),
             "--socket".into(),
             "/run/user/1000/wayland-0".into(),
-            "--launcher-client".into(),
-            "/bin/td-jail-fixture".into(),
             "--launcher-application".into(),
             "td-jail-fixture".into(),
-            "--launcher-runtime".into(),
-            "/run/user/1000/td-app".into(),
             "--terminal-client".into(),
             "/bin/td-term".into(),
             "--application-ready-socket".into(),
@@ -1231,14 +1211,20 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "/dev/input".into(),
             "--socket".into(),
             "/run/user/1000/wayland-0".into(),
-            "--launcher-client".into(),
-            "/bin/td-jail-fixture".into(),
             "--launcher-application".into(),
             "td-jail-fixture".into(),
             "--terminal-client".into(),
             "/bin/td-term".into(),
         ])
         .is_err());
+        // The activation-only application mode cannot also retain a dead
+        // direct launcher client.
+        let mut both_modes = valid(&wayland, &ready);
+        both_modes.extend([
+            "--launcher-client".into(),
+            "/bin/td-ui-demo".into(),
+        ]);
+        assert!(super::parse_run(&both_modes).is_err());
         assert!(super::parse_run(&[
             "--framebuffer".into(),
             "/dev/fb0".into(),
