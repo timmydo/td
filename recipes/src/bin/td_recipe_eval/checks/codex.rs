@@ -66,7 +66,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          if \"{readelf}\" -S '{codex}' | \"{busybox}\" grep -F '.symtab' >/dev/null; then exit 81; fi\n\
          \"{readelf}\" -S '{debug}' | \"{busybox}\" grep -F '.symtab' >/dev/null\n\
          \"{readelf}\" -S '{debug}' | \"{busybox}\" grep -F '.debug_line' >/dev/null\n\
-         test \"$(\"{readelf}\" -SW '{debug}' | \"{busybox}\" awk '{{ for (i = 1; i <= NF; i++) if ($i == \".debug_line\") {{ print $(i + 4); exit }} }}')\" = 80bdc24\n\
+         test \"$(\"{readelf}\" -SW '{debug}' | \"{busybox}\" awk '{{ for (i = 1; i <= NF; i++) if ($i == \".debug_line\") {{ print $(i + 4); exit }} }}')\" = 80bdc26\n\
          test \"$(\"{readelf}\" --debug-dump=decodedline '{debug}' 2>/dev/null | \"{busybox}\" awk '$2 ~ /^[0-9]+$/ && $3 ~ /^0x/ {{ count++ }} END {{ print count + 0 }}')\" = 18612350\n\
          if \"{readelf}\" -S '{debug}' | \"{busybox}\" grep -E '\\.debug_(info|abbrev|aranges|ranges|rnglists|frame|loc|loclists|str)([[:space:]]|$)' >/dev/null; then exit 83; fi\n\
          test \"$(\"{busybox}\" wc -c < '{debug}')\" -le 268435456\n\

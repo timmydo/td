@@ -5862,6 +5862,17 @@ fn assemble_recipe_drv(
                 );
             }
             push_drv_env(&mut spec, "TD_RECIPE_NAME", name)?;
+            if steps.as_arr().is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| step.get("splitDebugTree").is_some())
+            }) {
+                push_drv_env(
+                    &mut spec,
+                    "TD_DEBUG_COMPANION_POLICY",
+                    &td_engine::target_profile::debug_companion_policy(name),
+                )?;
+            }
             push_drv_env(&mut spec, "TD_STEPS", &steps.to_json_string())?;
             let map = input_map_json(&entries, &payloads)?;
             // The refusals in `payload_names` partition NAMES; the sandbox keys its
@@ -5903,6 +5914,11 @@ fn assemble_recipe_drv(
         // if any vendored deps were locked, resolves them offline (TD_VENDOR_CRATES).
         "rust" => {
             push_drv_env(&mut spec, "TD_RECIPE_NAME", name)?;
+            push_drv_env(
+                &mut spec,
+                "TD_DEBUG_COMPANION_POLICY",
+                &td_engine::target_profile::debug_companion_policy(name),
+            )?;
             if let Some(subdir) = cargo_subdir {
                 push_drv_env(&mut spec, "TD_CARGO_SUBDIR", subdir)?;
             }
@@ -15252,6 +15268,41 @@ daemon build START (2/2 active)
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn assemble_recipe_drv_hashes_typed_split_debug_policy() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-split-debug-policy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("fixture.lock");
+        std::fs::write(&lock, "").unwrap();
+        let recipe = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","steps":[{"splitDebugTree":{"root":"{out}","objcopy":"{in:binutils}/bin/objcopy"}}]}"#;
+        let (_path, _file, drv, _source) =
+            assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap();
+        let expected_policy = td_engine::target_profile::debug_companion_policy("fixture");
+        assert_eq!(
+            drv.env
+                .iter()
+                .find(|(key, _)| key == "TD_DEBUG_COMPANION_POLICY")
+                .map(|(_, value)| value.as_str()),
+            Some(expected_policy.as_str()),
+            "the typed splitter policy must re-key its derivation"
+        );
+
+        let unsplit = r#"{"name":"fixture","version":"1","buildSystem":"mesboot","steps":[{"makeDir":{"path":"{out}/bin"}}]}"#;
+        let (_path, _file, drv, _source) =
+            assemble_recipe_drv(unsplit, lock.to_str().unwrap(), &dir, None).unwrap();
+        assert!(
+            drv.env
+                .iter()
+                .all(|(key, _)| key != "TD_DEBUG_COMPANION_POLICY"),
+            "an unrelated mesboot recipe must retain its prior derivation identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ABI-token-in-drv: a recipe's drv is keyed on the STABLE builder-identity path
     // (store::builder_identity_path), NOT the builder binary. So the `builder` line and
     // the builder input-src are that path, no real builder Cb appears anywhere in the drv,
@@ -15620,6 +15671,12 @@ daemon build START (2/2 active)
             "debug splitting binds the exact named tool input"
         );
         assert_eq!(env_of(&drv, "TD_RECIPE_NAME").as_deref(), Some("ripgrep"));
+        let expected_policy = td_engine::target_profile::debug_companion_policy("ripgrep");
+        assert_eq!(
+            env_of(&drv, "TD_DEBUG_COMPANION_POLICY").as_deref(),
+            Some(expected_policy.as_str()),
+            "the splitter policy is a derivation-hashed input"
+        );
         assert_eq!(env_of(&drv, "TD_CARGO_SUBDIR").as_deref(), Some("workspace"));
         assert_eq!(env_of(&drv, "TD_CARGO_PACKAGE").as_deref(), Some("ripgrep"));
 

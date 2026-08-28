@@ -2061,6 +2061,7 @@ pub fn run_rust() -> Result<(), String> {
     let bins_spec = env::var("TD_RUST_BINS").map_err(|_| "TD_RUST_BINS not set".to_string())?;
     let recipe_name =
         env::var("TD_RECIPE_NAME").map_err(|_| "TD_RECIPE_NAME not set".to_string())?;
+    require_debug_companion_policy(&recipe_name)?;
     let cargo_subdir = match env::var("TD_CARGO_SUBDIR") {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
@@ -4743,6 +4744,18 @@ fn validate_line_exception_runtime(
     Ok(())
 }
 
+fn require_debug_companion_policy(recipe_name: &str) -> Result<(), String> {
+    let actual = env::var("TD_DEBUG_COMPANION_POLICY")
+        .map_err(|_| "TD_DEBUG_COMPANION_POLICY is not set for debug splitting".to_string())?;
+    let expected = td_engine::target_profile::debug_companion_policy(recipe_name);
+    if actual != expected {
+        return Err(format!(
+            "debug companion policy {actual:?} does not match builder policy {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Split every installed executable/shared object below `root`, then verify
 /// the runtime and companion as one build-ID-addressed pair. The walker and
 /// validation are engine-native; only the declared target `objcopy` executes.
@@ -4961,7 +4974,7 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
                 runtime,
                 debug,
                 exception.max_line_section_bytes,
-                false,
+                exception.require_complete_line_strings,
             )?;
         } else {
             crate::elf::assert_debug_pair(runtime, debug)?;
@@ -5179,6 +5192,7 @@ pub fn run_mesboot() -> Result<(), String> {
         } else if let Some(o) = step.get("splitDebugTree") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
             let objcopy = ctx.expand(&field(o, "objcopy")?).map_err(err)?;
+            require_debug_companion_policy(&recipe_name).map_err(err)?;
             split_debug_tree(Path::new(&root), Path::new(&objcopy), &recipe_name).map_err(err)?;
         } else if let Some(o) = step.get("assertDebugSize") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;

@@ -78,6 +78,28 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          marker='{rust_path}/lib/debug/.td-assembly-exception'\n\
          test -f \"$marker\"\n\
          \"$bb\" grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
+         line_marker='{rust_path}/lib/debug/.td-line-attribution-exception'\n\
+         driver_runtime='{rust_path}/lib/librustc_driver-277b25caa34f5853.so'\n\
+         driver_debug='{rust_path}/lib/debug/lib/librustc_driver-277b25caa34f5853.so.debug'\n\
+         test -f \"$line_marker\"\n\
+         test -f \"$driver_runtime\"\n\
+         test -f \"$driver_debug\"\n\
+         driver_runtime_id=\"$(\"$readelf\" -n \"$driver_runtime\" | \"$bb\" grep 'Build ID:')\"\n\
+         driver_debug_id=\"$(\"$readelf\" -n \"$driver_debug\" | \"$bb\" grep 'Build ID:')\"\n\
+         test -n \"$driver_runtime_id\" || exit 83\n\
+         test \"$driver_runtime_id\" = \"$driver_debug_id\" || exit 84\n\
+         if \"$readelf\" -S \"$driver_runtime\" | \"$bb\" grep -F '.symtab' >/dev/null; then exit 87; fi\n\
+         \"$readelf\" -S \"$driver_debug\" | \"$bb\" grep -F '.symtab' >/dev/null\n\
+         line_size=\"$(\"$readelf\" -SW \"$driver_debug\" | \"$bb\" awk '{{ for (i = 1; i <= NF; i++) if ($i == \".debug_line\") {{ print $(i + 4); exit }} }}')\"\n\
+         printf '%s\\n' \"$line_size\" | \"$bb\" grep -E '^0*6179aa9$' >/dev/null || exit 85\n\
+         if \"$readelf\" -SW \"$driver_debug\" | \"$bb\" grep -E '[[:space:]](\\.debug_(info|abbrev|aranges|types|ranges|rnglists|frame|loc|loclists|str|str_offsets|addr|macro|macinfo|pubnames|pubtypes|gnu_pubnames|gnu_pubtypes|names|sup|cu_index|tu_index)|\\.gdb_index)([[:space:]]|$)' >/dev/null; then exit 88; fi\n\
+         test \"$(\"$bb\" wc -c < \"$driver_debug\")\" = 165003688 || exit 86\n\
+         \"$bb\" grep -F -x 'output=rust-toolchain' \"$line_marker\" >/dev/null\n\
+         \"$bb\" grep -F -x 'runtime=lib/librustc_driver-277b25caa34f5853.so' \"$line_marker\" >/dev/null\n\
+         \"$bb\" grep -F -x 'reader_ceiling_bytes=33554432' \"$line_marker\" >/dev/null\n\
+         \"$bb\" grep -F -x 'admitted_ceiling_bytes=134217728' \"$line_marker\" >/dev/null\n\
+         \"$bb\" grep -F -x 'companion_ceiling_bytes=201326592' \"$line_marker\" >/dev/null\n\
+         \"$bb\" grep -F \"Rust 1.96.0 librustc_driver's line program\" \"$line_marker\" >/dev/null\n\
          for name in rustc rustdoc cargo; do\n\
            runtime='{rust_path}/bin/'\"$name\"\n\
            debug='{rust_path}/lib/debug/bin/'\"$name\"'.debug'\n\

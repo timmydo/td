@@ -53,10 +53,16 @@ pub fn recipe() -> Recipe {
                      for pair in 'git.c|{git}/lib/debug/bin/git.debug' 'remote-curl.c|{git}/lib/debug/libexec/git-core/git-remote-http.debug' 'sh-i18n--envsubst.c|{git}/lib/debug/libexec/git-core/git-sh-i18n--envsubst.debug'; do \
                          source=${{pair%%|*}}; debug=${{pair#*|}}; \
                          grep -a -Fq \"$source\" \"$debug\" || {{ echo \"Git debug companion omits $source\" >&2; exit 1; }}; \
-                         '{readelf}' --debug-dump=info \"$debug\" 2>/dev/null | \
-                             awk '/DW_AT_comp_dir/ {{ seen=1; if ($0 !~ /: \\/td-build(\\/[^[:space:]]+)?$/) {{ print \"noncanonical Git closure comp_dir: \" $0 > \"/dev/stderr\"; bad=1 }} }} END {{ if (!seen || bad) exit 1 }}' || exit 1; \
+                         lines=$('{readelf}' --debug-dump=rawline \"$debug\" 2>/dev/null) || {{ echo \"cannot read Git $source line tables\" >&2; exit 1; }}; \
+                         printf '%s\\n' \"$lines\" | awk -v wanted=\"$source\" ' \
+                             /The Directory Table/ {{ unit++; in_dirs=1; in_files=0; next }} \
+                             in_dirs && /^[[:space:]]*[0-9]+[[:space:]]/ {{ value=$0; sub(/^.*: /, \"\", value); dirs[unit,$1]=value }} \
+                             /The File Name Table/ {{ in_dirs=0; in_files=1; next }} \
+                             in_files {{ name=$0; sub(/^.*: /, \"\", name); if (name == wanted && dirs[unit,$2] ~ /^\\/td-build(\\/.*)?$/) found=1 }} \
+                             /Line Number Statements:/ {{ in_files=0 }} \
+                             END {{ if (!found) exit 1 }}' || {{ echo \"Git $source does not use the canonical source root\" >&2; exit 1; }}; \
                          for forbidden in '/gnu/store' '/home/' '/tmp/' '/.td/' 'guix-build' '/td-input/'; do \
-                             if '{readelf}' --debug-dump=info,rawline \"$debug\" 2>/dev/null | grep -Fq \"$forbidden\"; then echo \"Git $source exposes forbidden debug path $forbidden\" >&2; exit 1; fi; \
+                             if printf '%s\\n' \"$lines\" | grep -Fq \"$forbidden\"; then echo \"Git $source exposes forbidden debug path $forbidden\" >&2; exit 1; fi; \
                          done; \
                      done; \
                      for binary in '{git}/bin/git' '{git}/libexec/git-core/git-remote-http' '{git}/libexec/git-core/git-sh-i18n--envsubst'; do \

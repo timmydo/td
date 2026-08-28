@@ -110,29 +110,66 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
 /// source-line attribution unavailable and keeps function symbols.
 pub const DEFAULT_PROFILE_LINE_SECTION_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Hash-visible producer policy for every recipe which creates debug
+/// companions. The control-plane builder has a stable ABI identity, so a
+/// semantic splitter change must move this token to re-key realized outputs.
+pub const DEBUG_COMPANION_POLICY: &str = "line-tables-v2";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineAttributionException {
     pub runtime_relative_path: &'static str,
     pub max_line_section_bytes: u64,
     pub max_companion_bytes: u64,
+    pub require_complete_line_strings: bool,
     pub reason: &'static str,
 }
 
-pub const LINE_ATTRIBUTION_EXCEPTIONS: [(&str, LineAttributionException); 1] = [(
-    "codex",
-    LineAttributionException {
-        runtime_relative_path: "bin/codex",
-        max_line_section_bytes: 160 * 1024 * 1024,
-        max_companion_bytes: 256 * 1024 * 1024,
-        reason:
-            "Codex 0.148.0's ThinLTO line program is beyond td-profiler's bounded per-object reader",
-    },
-)];
+pub const LINE_ATTRIBUTION_EXCEPTIONS: [(&str, LineAttributionException); 2] = [
+    (
+        "codex",
+        LineAttributionException {
+            runtime_relative_path: "bin/codex",
+            max_line_section_bytes: 160 * 1024 * 1024,
+            max_companion_bytes: 256 * 1024 * 1024,
+            require_complete_line_strings: false,
+            reason:
+                "Codex 0.148.0's ThinLTO line program is beyond td-profiler's bounded per-object reader",
+        },
+    ),
+    (
+        "rust-toolchain",
+        LineAttributionException {
+            runtime_relative_path: "lib/librustc_driver-277b25caa34f5853.so",
+            max_line_section_bytes: 128 * 1024 * 1024,
+            max_companion_bytes: 192 * 1024 * 1024,
+            require_complete_line_strings: true,
+            reason:
+                "Rust 1.96.0 librustc_driver's line program is beyond td-profiler's bounded per-object reader",
+        },
+    ),
+];
 
 pub fn line_attribution_exception(recipe: &str) -> Option<LineAttributionException> {
     LINE_ATTRIBUTION_EXCEPTIONS
         .iter()
         .find_map(|(output, exception)| (*output == recipe).then_some(*exception))
+}
+
+/// Complete derivation-hashed splitter policy for one recipe. The version
+/// moves for global transform changes; every exception field is included so a
+/// local admission change cannot reuse an output produced under older bounds.
+pub fn debug_companion_policy(recipe: &str) -> String {
+    match line_attribution_exception(recipe) {
+        Some(exception) => format!(
+            "{DEBUG_COMPANION_POLICY};runtime={};line={};companion={};complete-line-strings={};reason={}",
+            exception.runtime_relative_path,
+            exception.max_line_section_bytes,
+            exception.max_companion_bytes,
+            exception.require_complete_line_strings,
+            exception.reason,
+        ),
+        None => DEBUG_COMPANION_POLICY.to_string(),
+    }
 }
 
 /// Maximum debug-companion bytes admitted by the source-built Rust toolchain
@@ -308,17 +345,46 @@ mod tests {
     }
 
     #[test]
-    fn oversized_line_attribution_is_a_single_named_boundary() {
+    fn oversized_line_attribution_boundaries_are_exactly_named() {
         assert_eq!(DEFAULT_PROFILE_LINE_SECTION_BYTES, 32 * 1024 * 1024);
-        assert_eq!(LINE_ATTRIBUTION_EXCEPTIONS.len(), 1);
+        assert_eq!(DEBUG_COMPANION_POLICY, "line-tables-v2");
+        assert_eq!(LINE_ATTRIBUTION_EXCEPTIONS.len(), 2);
         let codex = line_attribution_exception("codex").unwrap();
         assert_eq!(codex.runtime_relative_path, "bin/codex");
         assert_eq!(codex.max_line_section_bytes, 160 * 1024 * 1024);
         assert_eq!(codex.max_companion_bytes, 256 * 1024 * 1024);
+        assert!(!codex.require_complete_line_strings);
         assert_eq!(
             codex.reason,
             "Codex 0.148.0's ThinLTO line program is beyond td-profiler's bounded per-object reader"
         );
+        let rust = line_attribution_exception("rust-toolchain").unwrap();
+        assert_eq!(
+            rust.runtime_relative_path,
+            "lib/librustc_driver-277b25caa34f5853.so"
+        );
+        assert_eq!(rust.max_line_section_bytes, 128 * 1024 * 1024);
+        assert_eq!(rust.max_companion_bytes, 192 * 1024 * 1024);
+        assert!(rust.require_complete_line_strings);
+        assert_eq!(
+            rust.reason,
+            "Rust 1.96.0 librustc_driver's line program is beyond td-profiler's bounded per-object reader"
+        );
         assert_eq!(line_attribution_exception("td-profiler"), None);
+        assert_eq!(
+            debug_companion_policy("td-profiler"),
+            "line-tables-v2"
+        );
+        let mut recipes = std::collections::BTreeSet::new();
+        for (recipe, exception) in LINE_ATTRIBUTION_EXCEPTIONS {
+            assert!(recipes.insert(recipe), "duplicate exception for {recipe}");
+            assert!(DEFAULT_PROFILE_LINE_SECTION_BYTES < exception.max_line_section_bytes);
+            assert!(exception.max_line_section_bytes <= exception.max_companion_bytes);
+            let policy = debug_companion_policy(recipe);
+            assert!(policy.contains(exception.runtime_relative_path));
+            assert!(policy.contains(&exception.max_line_section_bytes.to_string()));
+            assert!(policy.contains(&exception.max_companion_bytes.to_string()));
+            assert!(policy.contains(exception.reason));
+        }
     }
 }

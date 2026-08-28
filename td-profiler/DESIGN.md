@@ -62,11 +62,12 @@ build scratch, and `/td-cargo` for Cargo's working state; vendor source is
 mapped below `/td-cargo/vendor`. Timestamps, archive ordering, and other build
 identity inputs remain pinned by the normal recipe reproducibility contract.
 
-Codex 0.148.0 is the one named source-line attribution exception. Its shipped
-ThinLTO CLI contains 18,612,350 numeric line rows and a 134,994,980-byte
-`.debug_line`; expanding that program would exceed the dependency-free reader's
-one-million-row and 128-MiB object ceilings. The exception is bound to
-`bin/codex`; any other ELF in that recipe remains under the ordinary policy.
+Codex 0.148.0 is one of two named source-line attribution exceptions. Its
+shipped ThinLTO CLI contains 18,612,350 numeric line rows and a
+134,994,982-byte `.debug_line`; expanding that program would exceed the
+dependency-free reader's one-million-row and 128-MiB object ceilings. The
+exception is bound to `bin/codex`; any other ELF in that recipe remains under
+the ordinary policy.
 The producer still structurally validates and retains the uncompressed line
 program under a literal 160-MiB section ceiling, retains ordinary function
 symbols, and records
@@ -97,8 +98,20 @@ equal its compiled limit, and requires
 boundary.
 td-profiler deliberately refuses that oversized line program, preserves
 function attribution, and emits its existing explicit line-resolution
-diagnostic. A Codex update must remeasure the row and section sizes and
-re-review or remove this exception.
+diagnostic.
+
+Rust 1.96.0's `lib/librustc_driver-277b25caa34f5853.so` is the second named
+exception. Its 102,210,217-byte `.debug_line` exceeds the ordinary reader
+ceiling; after the same non-line DWARF pruning, its companion is 165,003,688
+bytes. The producer admits only that exact runtime under a 128-MiB line-section
+ceiling and a 192-MiB companion ceiling. This producer ceiling happens to
+equal the reader's separate 128-MiB whole-object budget; it does not relax or
+derive from that budget. Every other Rust-toolchain ELF remains ordinary. The
+driver's retained line program is structurally checked to require no pruned
+`.debug_str`; Codex makes no such string-dependency claim. Neither exception
+claims that the runtime reader accepts its oversized line program. An update
+to either pinned producer must remeasure the section and companion, then
+re-review or remove its exception.
 
 A recipe links each user-mode ELF with a deterministic GNU build ID, using the
 linker's SHA-1 build-id form. This is a pair check over linked bytes, not object
@@ -137,13 +150,15 @@ debugging information. The producer removes `.debug_info`, `.debug_abbrev`,
 `.gdb_index` from every companion. It also removes `.debug_str` when every
 line-table unit is DWARF 2 through 4, whose path tables are inline, or when a
 structural scan of every DWARF-5 directory and file format finds no
-`DW_FORM_strp`. A declared `DW_FORM_strp` keeps `.debug_str` and subjects it
-to the ordinary reader ceiling. The named Codex exception makes no line-reader
-claim and removes `.debug_str` without this scan. The image recipe records the
-companions' total bytes and enforces a literal compiled ceiling kept outside
-the measuring code. The source-built toolchain and shipped deployment have
-independent ceilings: four GiB for the LLVM/rustc-dominated toolchain and one
-GiB for the image, which deliberately excludes that build-only toolchain.
+`DW_FORM_strp`. A declared `DW_FORM_strp` keeps `.debug_str` and subjects it to
+the ordinary reader ceiling. The Codex oversized-line exception removes
+`.debug_str` without making a string-dependency claim. The Rust-driver
+exception removes it and then structurally rejects a retained line program
+which declares `DW_FORM_strp`. The image recipe records the companions' total
+bytes and enforces a literal compiled ceiling kept outside the measuring code.
+The source-built toolchain and shipped deployment have independent ceilings:
+four GiB for the LLVM/rustc-dominated toolchain and one GiB for the image,
+which deliberately excludes that build-only toolchain.
 Changing either is reviewed with the corresponding size report. This keeps
 the always-available data useful for function and source-line attribution
 without turning every deployment into a full debugger SDK.
@@ -154,10 +169,10 @@ legacy `.zdebug_*` forms for those sections, so the dependency-free runtime
 reader is the checked consumer of every ordinary accepted companion rather
 than silently relying on a decompressor that is absent from the image. It also
 rejects duplicate named line/string sections and sections above the runtime's
-32-MiB input ceiling. The named Codex boundary above raises only the producer's
-structural `.debug_line` ceiling; it does not relax the runtime reader. The
-runtime reads `.debug_str` only when a line-table `DW_FORM_strp` actually
-refers to it.
+32-MiB input ceiling. The named boundaries above raise only the corresponding
+producer's structural `.debug_line` ceiling; they do not relax the runtime
+reader. The runtime reads `.debug_str` only when a line-table `DW_FORM_strp`
+actually refers to it.
 
 The deployment bundle records `deployment/debug-size` beside `root.erofs`.
 It remains a derived build report rather than a boot payload: the exact
@@ -171,7 +186,16 @@ scope's compiled ceiling before their containing outputs can be committed.
 Debug information is expected to change output hashes. Reproducibility means
 that the same declared inputs produce the same runtime and debug bytes; it
 does not mean that enabling observability preserves an older store path. The
-double-build check remains the oracle. Increment 1 copies the same `td-boot`
+stable control-plane builder identity therefore does not stand in for producer
+semantics: every debug-splitting derivation carries the compiled
+`line-tables-v2` policy token. Its derivation value also includes every field
+of a named recipe's effective source-line exception, so changing a path,
+ceiling, dependency requirement, or reason automatically moves that output.
+Ordinary recipes carry the version alone. A global splitter transform requires
+changing that version token. This increment moves it because the preceding
+non-line DWARF pruning applied to every companion without changing the stable
+builder identity. The double-build check remains the oracle. Increment 1 copies
+the same `td-boot`
 source below two different source and build roots, canonicalizes each with the
 shared direct-rustc policy, and performs two independent links and companion
 transforms. It compares both the installed runtime and companion byte for byte;
@@ -402,11 +426,12 @@ callchain.
 
 One ordinary object accepts at most 32 MiB of `.debug_line`, 32 MiB for either
 external line-string section, one million retained line ranges, and 4,096 bytes
-in one reported source path. The named Codex producer exception is not accepted
-by this reader: function symbols remain available and source-line attribution
-fails explicitly at the 32-MiB check. One unit may declare at most 200,000
-combined transient file/directory entries. The producer's pre-prune dependency
-scan applies that same per-unit ceiling and admits at most 6,400,000
+in one reported source path. The named Codex and Rust-driver producer
+exceptions are not accepted by this reader: function symbols remain available
+and source-line attribution fails explicitly at the 32-MiB check. One unit may
+declare at most 200,000 combined transient file/directory entries. The
+producer's pre-prune dependency scan applies that same per-unit ceiling and
+admits at most 6,400,000
 directory/file form values across one object, so zero-width forms cannot
 amplify its work beyond a fixed bound. The section byte ceiling bounds the
 runtime reader's aggregate work across units. The section-name roster, symbol

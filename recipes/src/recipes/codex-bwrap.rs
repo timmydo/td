@@ -139,10 +139,10 @@ pub fn recipe() -> Recipe {
                  if '{in:binutils-x86-64-self}/bin/readelf' -S \"$runtime\" | grep -Fq '.symtab'; then echo 'bwrap runtime was not stripped' >&2; exit 1; fi; \
                  '{in:binutils-x86-64-self}/bin/readelf' -S \"$debug\" | grep -Fq '.symtab' || { echo 'bwrap debug companion lacks symbols' >&2; exit 1; }; \
                  '{in:binutils-x86-64-self}/bin/readelf' -S \"$debug\" | grep -Fq '.debug_line' || { echo 'bwrap debug companion lacks line tables' >&2; exit 1; }; \
-                 info=$('{in:binutils-x86-64-self}/bin/readelf' --debug-dump=info,rawline \"$debug\") || exit 1; \
-                 printf '%s\\n' \"$info\" | grep -Eq 'DW_AT_comp_dir.*: /td-build/codex-rs/vendor/bubblewrap$' || { echo 'bwrap debug companion lacks its canonical source root' >&2; exit 1; }; \
+                 lines=$('{in:binutils-x86-64-self}/bin/readelf' --debug-dump=rawline \"$debug\") || exit 1; \
+                 printf '%s\\n' \"$lines\" | grep -Eq ': /td-build/codex-rs/vendor/bubblewrap$' || { echo 'bwrap debug companion lacks its canonical source root' >&2; exit 1; }; \
                  for forbidden in '/gnu/store' '/td-input' '/home/' '/tmp/' '/.td/' 'guix-build'; do \
-                     match=$(printf '%s\\n' \"$info\" | grep -F -m 1 \"$forbidden\") || true; \
+                     match=$(printf '%s\\n' \"$lines\" | grep -F -m 1 \"$forbidden\") || true; \
                      if test -n \"$match\"; then echo \"bwrap debug companion retains forbidden path $forbidden: $match\" >&2; exit 1; fi; \
                  done",
             ],

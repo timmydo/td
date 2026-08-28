@@ -31,9 +31,14 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "d=$('{readelf}' --debug-dump=info '{debug}' 2>/dev/null) || {{ echo 'cannot read make debug companion' >&2; exit 1; }}; \
-                     main_comp_dir=$(printf '%s\\n' \"$d\" | awk '/DW_AT_name/ && index($0, \"src/main.c\") {{ want=1; next }} want && /DW_AT_comp_dir/ {{ print; exit }}') || exit 1; \
-                     case \"$main_comp_dir\" in *': /td-build') ;; *) echo 'make main.c does not use the canonical source root' >&2; exit 1;; esac; \
+                    "lines=$('{readelf}' --debug-dump=rawline '{debug}' 2>/dev/null) || {{ echo 'cannot read make debug companion' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$lines\" | awk ' \
+                         /The Directory Table/ {{ unit++; in_dirs=1; in_files=0; next }} \
+                         in_dirs && /^[[:space:]]*[0-9]+[[:space:]]/ {{ value=$0; sub(/^.*: /, \"\", value); dirs[unit,$1]=value }} \
+                         /The File Name Table/ {{ in_dirs=0; in_files=1; next }} \
+                         in_files && $2 == 1 && $0 ~ /: main[.]c$/ && dirs[unit,$2] == \"src\" && dirs[unit,0] == \"/td-build\" {{ found=1 }} \
+                         /Line Number Statements:/ {{ in_files=0 }} \
+                         END {{ if (!found) exit 1 }}' || {{ echo 'make main.c does not use the canonical source root' >&2; exit 1; }}; \
                      if grep -q -a -F 'guix-build' '{debug}'; then echo 'make debug companion exposes a build scratch path' >&2; exit 1; fi"
                 ),
             ],
