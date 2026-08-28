@@ -154,10 +154,19 @@ const DECORATION_ERROR_ORPHANED: u32 = 2;
 /// `configure`, the interface's only event.
 const DECORATION_CONFIGURE: u16 = 0;
 const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CLIENT_SHM_POOLS: usize = 8;
+const MAX_CLIENT_SHM_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CLIENT_BUFFER: usize = 256 * 1024;
 const MAX_PENDING_FDS: usize = 64;
 const MAX_OBJECTS: usize = 512;
 const MAX_CLIENTS: usize = 32;
+const MAX_CACHED_SUBSURFACE_COMMITS: usize = 128;
+const MAX_PENDING_FRAME_CALLBACKS: usize = 256;
+const MAX_SURFACE_OUTPUT_MULTIPLIER: usize = 2;
+const MAX_DEFERRED_BUFFER_RELEASES: usize = 512;
+const MAX_DEFERRED_FRAME_CALLBACKS: usize = MAX_PENDING_FRAME_CALLBACKS;
+const MAX_DEFERRED_EVENTS: usize = 2_048;
+const MAX_DEFERRED_EVENT_BYTES: usize = 256 * 1024;
 const MAX_CLIENT_INPUT_REGION_OPERATIONS: usize = 4_096;
 /// Server-created data offers use the range the Wayland core reserves for
 /// them. Client-created ids are refused from this boundary upwards, so the two
@@ -183,6 +192,10 @@ static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone)]
 struct Pool {
     file: Arc<File>,
+    /// Monotonic declared high-water shared with every buffer from this pool.
+    /// Destroying the pool object must not refund a later resize while any
+    /// older buffer still retains the same resource.
+    charge: Arc<AtomicUsize>,
     size: usize,
 }
 
@@ -190,6 +203,7 @@ struct Pool {
 struct Buffer {
     serial: u64,
     file: Arc<File>,
+    pool_charge: Arc<AtomicUsize>,
     offset: usize,
     width: usize,
     height: usize,
@@ -578,6 +592,14 @@ struct Outbound {
     disconnected: bool,
 }
 
+#[derive(Default)]
+struct DeferredOutbound {
+    messages: Vec<Vec<u8>>,
+    bytes: usize,
+    buffer_releases: usize,
+    frame_callbacks: usize,
+}
+
 impl Outbound {
     fn send(&mut self, message: &[u8]) -> Result<(), String> {
         if self.disconnected {
@@ -632,7 +654,7 @@ struct Client {
     /// Events produced while the runtime lock is held for one compound commit.
     /// They leave only after the scene has settled, so a stalled client cannot
     /// hold the global runtime lock in a blocking socket write.
-    deferred_outbound: Option<Vec<Vec<u8>>>,
+    deferred_outbound: Option<DeferredOutbound>,
     /// Pending stack per parent surface, bottom to top. `None` is the parent
     /// itself; child entries name wl_surface objects rather than protocol ids.
     subsurface_stacks: BTreeMap<u32, Vec<Option<u32>>>,
@@ -1686,6 +1708,124 @@ fn client_surface_total(current: usize, prior: usize, proposed: usize) -> Result
     Ok(next)
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ShmUsage {
+    pools: usize,
+    bytes: usize,
+}
+
+fn retain_shm_reference(
+    pools: &mut BTreeMap<usize, usize>,
+    file: &Arc<File>,
+    size: usize,
+) {
+    let identity = Arc::as_ptr(file) as usize;
+    pools
+        .entry(identity)
+        .and_modify(|retained| *retained = (*retained).max(size))
+        .or_insert(size);
+}
+
+fn retain_pending_buffer(pools: &mut BTreeMap<usize, usize>, pending: &Option<PendingBuffer>) {
+    if let Some(PendingBuffer::Buffer { buffer, .. }) = pending {
+        retain_shm_reference(
+            pools,
+            &buffer.file,
+            buffer.pool_charge.load(Ordering::Relaxed),
+        );
+    }
+}
+
+fn retain_object_shm(pools: &mut BTreeMap<usize, usize>, object: &Object) {
+    match object {
+        Object::Pool(pool) => retain_shm_reference(
+            pools,
+            &pool.file,
+            pool.size.max(pool.charge.load(Ordering::Relaxed)),
+        ),
+        Object::Buffer(buffer) => {
+            retain_shm_reference(
+                pools,
+                &buffer.file,
+                buffer.pool_charge.load(Ordering::Relaxed),
+            );
+        }
+        Object::Surface(surface) => retain_pending_buffer(pools, &surface.pending_buffer),
+        Object::Subsurface { cached, .. } => {
+            retain_pending_buffer(pools, &cached.pending_buffer);
+        }
+        _ => {}
+    }
+}
+
+fn object_retains_shm(object: &Object) -> bool {
+    match object {
+        Object::Pool(_) | Object::Buffer(_) => true,
+        Object::Surface(surface) => {
+            matches!(
+                &surface.pending_buffer,
+                Some(PendingBuffer::Buffer { .. })
+            )
+        }
+        Object::Subsurface { cached, .. } => {
+            matches!(
+                &cached.pending_buffer,
+                Some(PendingBuffer::Buffer { .. })
+            )
+        }
+        _ => false,
+    }
+}
+
+fn shm_usage(pools: BTreeMap<usize, usize>) -> Result<ShmUsage, String> {
+    let mut bytes = 0usize;
+    for size in pools.values() {
+        bytes = bytes
+            .checked_add(*size)
+            .ok_or_else(|| "retained wl_shm byte accounting overflow".to_string())?;
+    }
+    Ok(ShmUsage {
+        pools: pools.len(),
+        bytes,
+    })
+}
+
+fn require_shm_usage(usage: ShmUsage) -> Result<(), String> {
+    if usage.pools > MAX_CLIENT_SHM_POOLS {
+        return Err(format!(
+            "client retains {} wl_shm pools, exceeding {MAX_CLIENT_SHM_POOLS}",
+            usage.pools
+        ));
+    }
+    if usage.bytes > MAX_CLIENT_SHM_BYTES {
+        return Err(format!(
+            "client retains {} declared wl_shm bytes, exceeding {MAX_CLIENT_SHM_BYTES}",
+            usage.bytes
+        ));
+    }
+    Ok(())
+}
+
+fn require_surface_dimensions(
+    buffer: &Buffer,
+    output_width: usize,
+    output_height: usize,
+) -> Result<(), String> {
+    let maximum_width = output_width.saturating_mul(MAX_SURFACE_OUTPUT_MULTIPLIER);
+    let maximum_height = output_height.saturating_mul(MAX_SURFACE_OUTPUT_MULTIPLIER);
+    if buffer.width > maximum_width || buffer.height > maximum_height {
+        return Err(format!(
+            "committed wl_shm surface {}x{} exceeds the {}x scale-1 output bound {}x{}",
+            buffer.width,
+            buffer.height,
+            MAX_SURFACE_OUTPUT_MULTIPLIER,
+            maximum_width,
+            maximum_height
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn request(object: u32, opcode: u16, builder: wire::Builder) -> Result<wire::Message, String> {
     let mut encoded = builder.message(object, opcode)?;
@@ -1738,6 +1878,57 @@ impl Client {
         if let Some(bytes) = self.mapped_bytes.remove(&surface) {
             self.mapped_total = self.mapped_total.saturating_sub(bytes);
         }
+    }
+
+    fn retained_shm_usage_replacing(
+        &self,
+        replaced: Option<u32>,
+        candidate: Option<&Object>,
+    ) -> Result<ShmUsage, String> {
+        let mut pools = BTreeMap::new();
+        for (id, object) in &self.objects {
+            if replaced == Some(*id) {
+                continue;
+            }
+            retain_object_shm(&mut pools, object);
+        }
+        if let Some(candidate) = candidate {
+            retain_object_shm(&mut pools, candidate);
+        }
+        shm_usage(pools)
+    }
+
+    fn pending_frame_callbacks(&self) -> Result<usize, String> {
+        let mut callbacks = 0usize;
+        for object in self.objects.values() {
+            let retained = match object {
+                Object::Surface(surface) => surface.frame_callbacks.len(),
+                Object::Subsurface { cached, .. } => cached.frame_callbacks.len(),
+                _ => 0,
+            };
+            callbacks = callbacks
+                .checked_add(retained)
+                .ok_or_else(|| "frame callback accounting overflow".to_string())?;
+        }
+        Ok(callbacks)
+    }
+
+    fn cached_subsurface_commits(&self) -> usize {
+        self.objects
+            .values()
+            .filter(|object| {
+                matches!(
+                    object,
+                    Object::Subsurface {
+                        cached: CachedSurfaceCommit {
+                            committed: true,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .count()
     }
 
     fn unmap_surface(&mut self, surface: u32) -> Result<(), String> {
@@ -1976,7 +2167,40 @@ impl Client {
     fn send(&mut self, object: u32, opcode: u16, builder: wire::Builder) -> Result<(), String> {
         let message = builder.message(object, opcode)?;
         if let Some(deferred) = self.deferred_outbound.as_mut() {
-            deferred.push(message);
+            let buffer_release = opcode == WL_BUFFER_RELEASE
+                && matches!(self.objects.get(&object), Some(Object::Buffer(_)));
+            let frame_callback = opcode == WL_CALLBACK_DONE
+                && matches!(self.objects.get(&object), Some(Object::Callback));
+            let next_events = deferred
+                .messages
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| "deferred Wayland event accounting overflow".to_string())?;
+            let next_bytes = deferred
+                .bytes
+                .checked_add(message.len())
+                .ok_or_else(|| "deferred Wayland byte accounting overflow".to_string())?;
+            let next_releases = deferred
+                .buffer_releases
+                .checked_add(usize::from(buffer_release))
+                .ok_or_else(|| "deferred buffer release accounting overflow".to_string())?;
+            let next_callbacks = deferred
+                .frame_callbacks
+                .checked_add(usize::from(frame_callback))
+                .ok_or_else(|| "deferred frame callback accounting overflow".to_string())?;
+            if next_events > MAX_DEFERRED_EVENTS
+                || next_bytes > MAX_DEFERRED_EVENT_BYTES
+                || next_releases > MAX_DEFERRED_BUFFER_RELEASES
+                || next_callbacks > MAX_DEFERRED_FRAME_CALLBACKS
+            {
+                return Err(format!(
+                    "compound commit exceeds deferred event bounds: events={next_events} bytes={next_bytes} releases={next_releases} callbacks={next_callbacks}"
+                ));
+            }
+            deferred.messages.push(message);
+            deferred.bytes = next_bytes;
+            deferred.buffer_releases = next_releases;
+            deferred.frame_callbacks = next_callbacks;
             return Ok(());
         }
         self.outbound
@@ -1989,7 +2213,7 @@ impl Client {
         if self.deferred_outbound.is_some() {
             return Err("nested deferred Wayland output".to_string());
         }
-        self.deferred_outbound = Some(Vec::new());
+        self.deferred_outbound = Some(DeferredOutbound::default());
         Ok(())
     }
 
@@ -2006,7 +2230,7 @@ impl Client {
             .outbound
             .lock()
             .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
-        for message in messages {
+        for message in messages.messages {
             outbound.send(&message)?;
         }
         Ok(())
@@ -3112,6 +3336,9 @@ impl Client {
         if self.objects.len() >= MAX_OBJECTS {
             return Err(format!("client exceeded the {MAX_OBJECTS}-object limit"));
         }
+        if object_retains_shm(&object) {
+            require_shm_usage(self.retained_shm_usage_replacing(None, Some(&object))?)?;
+        }
         self.objects.insert(id, object);
         Ok(())
     }
@@ -3306,6 +3533,7 @@ impl Client {
             id,
             Object::Pool(Pool {
                 file: Arc::new(file),
+                charge: Arc::new(AtomicUsize::new(size)),
                 size,
             }),
         )
@@ -3372,6 +3600,7 @@ impl Client {
             Object::Buffer(Buffer {
                 serial: NEXT_BUFFER_SERIAL.fetch_add(1, Ordering::Relaxed),
                 file: pool.file,
+                pool_charge: pool.charge,
                 offset,
                 width,
                 height,
@@ -3504,6 +3733,23 @@ impl Client {
             Some(SurfaceRole::Subsurface(object)) => object,
             _ => return Err(format!("wl_surface {surface} has no subsurface role")),
         };
+        let Some(Object::Subsurface { cached, .. }) = self.objects.get(&object) else {
+            return Err(format!("wl_surface {surface} lost wl_subsurface {object}"));
+        };
+        if !cached.committed
+            && self.cached_subsurface_commits() >= MAX_CACHED_SUBSURFACE_COMMITS
+        {
+            return Err(format!(
+                "client exceeded the {MAX_CACHED_SUBSURFACE_COMMITS} cached subsurface-commit limit"
+            ));
+        }
+        if let Some(PendingBuffer::Buffer { buffer, .. }) = &state.pending_buffer {
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?;
+            require_surface_dimensions(buffer, runtime.width(), runtime.height())?;
+        }
         let replacement = state.pending_buffer.take();
         let previous = {
             let Some(Object::Subsurface { cached, .. }) = self.objects.get_mut(&object) else {
@@ -3648,6 +3894,16 @@ impl Client {
         Ok(())
     }
 
+    fn release_frame_callbacks(&mut self, callbacks: &mut Vec<u32>) -> Result<(), String> {
+        for callback in std::mem::take(callbacks) {
+            if matches!(self.objects.get(&callback), Some(Object::Callback)) {
+                self.objects.remove(&callback);
+                self.delete_id(callback)?;
+            }
+        }
+        Ok(())
+    }
+
     fn release_cached_commit(&mut self, cached: &mut CachedSurfaceCommit) -> Result<(), String> {
         if let Some(PendingBuffer::Buffer { object, buffer, .. }) = cached.pending_buffer.take() {
             if matches!(
@@ -3657,13 +3913,7 @@ impl Client {
                 self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
             }
         }
-        for callback in std::mem::take(&mut cached.frame_callbacks) {
-            if matches!(self.objects.get(&callback), Some(Object::Callback)) {
-                self.objects.remove(&callback);
-                self.delete_id(callback)?;
-            }
-        }
-        Ok(())
+        self.release_frame_callbacks(&mut cached.frame_callbacks)
     }
 
     fn remove_subsurface_role(&mut self, object: u32) -> Result<(), String> {
@@ -3942,7 +4192,7 @@ impl Client {
         self.finish_surface_transaction(operation, settle)
     }
 
-    fn destroy_surface(&mut self, surface: u32, role: Option<SurfaceRole>) -> Result<(), String> {
+    fn destroy_surface(&mut self, surface: u32, mut state: SurfaceState) -> Result<(), String> {
         self.begin_deferred_outbound()?;
         let shared = Arc::clone(&self.runtime);
         let mut runtime = match shared.lock() {
@@ -3957,7 +4207,8 @@ impl Client {
             return Err(error);
         }
         let operation = (|| {
-            if let Some(SurfaceRole::Subsurface(object)) = role {
+            self.release_frame_callbacks(&mut state.frame_callbacks)?;
+            if let Some(SurfaceRole::Subsurface(object)) = state.role {
                 self.retire_subsurface_surface_with_runtime(surface, object, &mut runtime)?;
             }
             self.orphan_popups_of(surface);
@@ -4203,6 +4454,11 @@ impl Client {
             }
         } else if state.role.is_none() && attaching_buffer {
             return Err(format!("wl_surface {id} attached a buffer without a role"));
+        }
+        if !cursor && !(is_popup && popup.is_none()) {
+            if let Some(PendingBuffer::Buffer { buffer, .. }) = &state.pending_buffer {
+                require_surface_dimensions(buffer, runtime.width(), runtime.height())?;
+            }
         }
         if let Some(pending) = state.pending_buffer {
             let key = SurfaceKey {
@@ -4678,13 +4934,17 @@ impl Client {
                             actual.min(MAX_POOL_BYTES)
                         ));
                     }
-                    self.objects.insert(
-                        message.object,
-                        Object::Pool(Pool {
-                            file: pool.file,
-                            size,
-                        }),
-                    );
+                    let replacement = Object::Pool(Pool {
+                        file: pool.file,
+                        charge: Arc::clone(&pool.charge),
+                        size,
+                    });
+                    require_shm_usage(self.retained_shm_usage_replacing(
+                        Some(message.object),
+                        Some(&replacement),
+                    )?)?;
+                    pool.charge.store(size, Ordering::Relaxed);
+                    self.objects.insert(message.object, replacement);
                     Ok(())
                 }
                 _ => Err(format!(
@@ -4712,7 +4972,7 @@ impl Client {
                             message.object
                         ));
                     }
-                    self.destroy_surface(message.object, state.role)
+                    self.destroy_surface(message.object, state)
                 }
                 1 => {
                     let buffer = args.u32()?;
@@ -4755,6 +5015,12 @@ impl Client {
                 3 => {
                     let callback = args.u32()?;
                     args.finish()?;
+                    let retained = self.pending_frame_callbacks()?;
+                    if retained >= MAX_PENDING_FRAME_CALLBACKS {
+                        return Err(format!(
+                            "client exceeded the {MAX_PENDING_FRAME_CALLBACKS} pending frame-callback limit"
+                        ));
+                    }
                     self.insert(callback, Object::Callback)?;
                     state.frame_callbacks.push(callback);
                     self.objects.insert(message.object, Object::Surface(state));
@@ -10542,6 +10808,7 @@ mod tests {
                     Object::Buffer(Buffer {
                         serial: u64::from(object),
                         file: Arc::new(File::open(&pool_path).unwrap()),
+                        pool_charge: Arc::new(AtomicUsize::new(offset.saturating_add(4))),
                         offset,
                         width: 1,
                         height: 1,
@@ -11039,6 +11306,58 @@ mod tests {
     }
 
     #[test]
+    fn hidden_synchronized_commits_stop_at_the_per_client_bound() {
+        let framebuffer_path = std::env::temp_dir().join(format!(
+            "td-wayland-cached-commit-bound-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
+
+        for index in 0..=MAX_CACHED_SUBSURFACE_COMMITS {
+            let index = u32::try_from(index).unwrap();
+            let surface = 10 + index;
+            let role = 200 + index;
+            let state = SurfaceState {
+                role: Some(SurfaceRole::Subsurface(role)),
+                ..SurfaceState::default()
+            };
+            client
+                .insert(surface, Object::Surface(state.clone()))
+                .unwrap();
+            client
+                .insert(
+                    role,
+                    Object::Subsurface {
+                        surface: Some(surface),
+                        parent: Some(5),
+                        position: (0, 0),
+                        pending_position: None,
+                        synchronized: true,
+                        cached: CachedSurfaceCommit::default(),
+                    },
+                )
+                .unwrap();
+            let result = client.cache_subsurface_commit(surface, state);
+            if usize::try_from(index).unwrap() < MAX_CACHED_SUBSURFACE_COMMITS {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("cached subsurface-commit limit"), "{error}");
+            }
+        }
+        assert_eq!(
+            client.cached_subsurface_commits(),
+            MAX_CACHED_SUBSURFACE_COMMITS
+        );
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
     fn subsurface_role_cycles_and_foreign_restack_targets_are_protocol_errors() {
         let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
             subsurface_fixture("errors");
@@ -11342,6 +11661,7 @@ mod tests {
                     buffer: Buffer {
                         serial: 1,
                         file: Arc::new(File::open(&pool_path).unwrap()),
+                        pool_charge: Arc::new(AtomicUsize::new(4)),
                         offset: 0,
                         width: 1,
                         height: 1,
@@ -12170,6 +12490,7 @@ mod tests {
         fs::write(&path, vec![0u8; 64]).unwrap();
         let pool = Pool {
             file: Arc::new(File::open(&path).unwrap()),
+            charge: Arc::new(AtomicUsize::new(64)),
             size: 64,
         };
         let framebuffer_path = path.with_extension("fb");
@@ -12184,6 +12505,567 @@ mod tests {
             .create_buffer(pool, 2, 0, 4, 5, 16, SHM_XRGB8888)
             .is_err());
         fs::remove_file(path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn shm_pool_accounting_follows_buffers_and_refunds_the_last_reference() {
+        let stem = format!(
+            "td-wayland-pool-accounting-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(&pool_path, [0u8; 4]).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
+        let mut pools = Vec::new();
+        let charged_pool_size = MAX_CLIENT_SHM_BYTES / MAX_CLIENT_SHM_POOLS;
+        for id in 10..=18 {
+            let pool = Pool {
+                file: Arc::new(File::open(&pool_path).unwrap()),
+                charge: Arc::new(AtomicUsize::new(charged_pool_size)),
+                size: charged_pool_size,
+            };
+            pools.push(pool.clone());
+            if id < 18 {
+                client
+                    .insert(id, Object::Pool(pool))
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage {
+                pools: MAX_CLIENT_SHM_POOLS,
+                bytes: MAX_CLIENT_SHM_BYTES,
+            }
+        );
+
+        let first = pools.first().unwrap().clone();
+        client
+            .create_buffer(
+                first,
+                20,
+                0,
+                1,
+                1,
+                4,
+                SHM_XRGB8888,
+            )
+            .unwrap();
+        client.remove_object(10).unwrap();
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage {
+                pools: MAX_CLIENT_SHM_POOLS,
+                bytes: MAX_CLIENT_SHM_BYTES,
+            },
+            "destroying a pool object refunded backing a buffer still retains"
+        );
+
+        let ninth = pools.get(8).unwrap().clone();
+        let error = client
+            .insert(18, Object::Pool(ninth.clone()))
+            .unwrap_err();
+        assert!(error.contains("9 wl_shm pools"), "{error}");
+        client.remove_object(20).unwrap();
+        client
+            .insert(18, Object::Pool(ninth))
+            .unwrap();
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage {
+                pools: MAX_CLIENT_SHM_POOLS,
+                bytes: MAX_CLIENT_SHM_BYTES,
+            }
+        );
+        assert!(require_shm_usage(ShmUsage {
+            pools: MAX_CLIENT_SHM_POOLS,
+            bytes: MAX_CLIENT_SHM_BYTES.saturating_add(1),
+        })
+        .is_err());
+
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn resized_pool_charge_remains_until_the_last_buffer_reference() {
+        let stem = format!(
+            "td-wayland-pool-resize-accounting-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(&pool_path, [0u8; 64]).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
+        let pool = Pool {
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            charge: Arc::new(AtomicUsize::new(8)),
+            size: 8,
+        };
+        client.insert(10, Object::Pool(pool.clone())).unwrap();
+        client
+            .create_buffer(pool, 20, 0, 1, 1, 4, SHM_XRGB8888)
+            .unwrap();
+
+        let mut resize = wire::Builder::new();
+        resize.i32(32);
+        client
+            .dispatch(request(10, 2, resize).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage {
+                pools: 1,
+                bytes: 32,
+            }
+        );
+        let resized = client
+            .objects
+            .get(&10)
+            .and_then(|object| match object {
+                Object::Pool(pool) => Some(pool.clone()),
+                _ => None,
+            })
+            .unwrap();
+        client
+            .create_buffer(resized, 21, 28, 1, 1, 4, SHM_XRGB8888)
+            .unwrap();
+        client.remove_object(10).unwrap();
+        client.remove_object(21).unwrap();
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage {
+                pools: 1,
+                bytes: 32,
+            },
+            "a pre-resize buffer partially refunded a live pool resource"
+        );
+        client.remove_object(20).unwrap();
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage::default()
+        );
+
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn aggregate_shm_ceiling_rejects_resize_before_updating_shared_charge() {
+        let stem = format!(
+            "td-wayland-pool-resize-bound-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        let pool_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&pool_path)
+            .unwrap();
+        pool_file.set_len(u64::try_from(MAX_POOL_BYTES).unwrap()).unwrap();
+        drop(pool_file);
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
+        let mib = 1024 * 1024;
+        for (id, size) in [
+            (10, 64 * mib),
+            (11, 64 * mib),
+            (12, 64 * mib),
+            (13, 61 * mib),
+            (14, mib),
+        ] {
+            client
+                .insert(
+                    id,
+                    Object::Pool(Pool {
+                        file: Arc::new(File::open(&pool_path).unwrap()),
+                        charge: Arc::new(AtomicUsize::new(size)),
+                        size,
+                    }),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap().bytes,
+            254 * mib
+        );
+
+        let mut resize = wire::Builder::new();
+        resize.i32(i32::try_from(4 * mib).unwrap());
+        let error = client
+            .dispatch(request(14, 2, resize).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("declared wl_shm bytes"), "{error}");
+        let Some(Object::Pool(pool)) = client.objects.get(&14) else {
+            panic!("pool object disappeared after a refused resize");
+        };
+        assert_eq!(pool.size, mib);
+        assert_eq!(pool.charge.load(Ordering::Relaxed), mib);
+
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn shm_charge_survives_pending_and_cached_attaches_after_objects_die() {
+        let stem = format!(
+            "td-wayland-pool-cached-accounting-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(&pool_path, [0u8; 4]).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 32).unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
+        client.insert(20, Object::Subcompositor).unwrap();
+        for surface in [5, 6] {
+            client
+                .insert(surface, Object::Surface(SurfaceState::default()))
+                .unwrap();
+        }
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+        let pool = Pool {
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            charge: Arc::new(AtomicUsize::new(4)),
+            size: 4,
+        };
+        client.insert(10, Object::Pool(pool.clone())).unwrap();
+        client
+            .create_buffer(pool, 7, 0, 1, 1, 4, SHM_XRGB8888)
+            .unwrap();
+        attach_surface(&mut client, 6, 7).unwrap();
+        client.remove_object(10).unwrap();
+        client.remove_object(7).unwrap();
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage { pools: 1, bytes: 4 },
+            "the pending attach lost its pool charge with the protocol objects"
+        );
+
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage { pools: 1, bytes: 4 },
+            "moving the attach into a synchronized cache lost its charge"
+        );
+        client
+            .dispatch(
+                request(30, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            client.retained_shm_usage_replacing(None, None).unwrap(),
+            ShmUsage::default()
+        );
+
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn noncursor_commits_are_bounded_by_twice_the_scale_one_output_before_copy() {
+        let stem = format!(
+            "td-wayland-output-bound-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(&pool_path, [0u8; 4]).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 60, 320).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(1, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let buffer = Buffer {
+            serial: 1,
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            pool_charge: Arc::new(AtomicUsize::new(161usize.saturating_mul(4))),
+            offset: 0,
+            width: 161,
+            height: 1,
+            stride: 161usize.saturating_mul(4),
+            format: SHM_XRGB8888,
+        };
+        let state = SurfaceState {
+            pending_buffer: Some(PendingBuffer::Buffer {
+                object: 7,
+                buffer: buffer.clone(),
+                offset: (0, 0),
+            }),
+            role: Some(SurfaceRole::Subsurface(30)),
+            ..SurfaceState::default()
+        };
+        let shared = Arc::clone(&runtime);
+        let mut runtime = shared.lock().unwrap();
+        let error = client
+            .commit_surface_with_runtime(5, state, &mut runtime)
+            .unwrap_err();
+        assert!(error.contains("161x1"), "{error}");
+        assert!(error.contains("bound 160x120"), "{error}");
+        drop(runtime);
+        client
+            .insert(
+                30,
+                Object::Subsurface {
+                    surface: Some(5),
+                    parent: Some(4),
+                    position: (0, 0),
+                    pending_position: None,
+                    synchronized: true,
+                    cached: CachedSurfaceCommit::default(),
+                },
+            )
+            .unwrap();
+        let cached = SurfaceState {
+            pending_buffer: Some(PendingBuffer::Buffer {
+                object: 7,
+                buffer,
+                offset: (0, 0),
+            }),
+            role: Some(SurfaceRole::Subsurface(30)),
+            ..SurfaceState::default()
+        };
+        let error = client.cache_subsurface_commit(5, cached).unwrap_err();
+        assert!(error.contains("scale-1 output bound 160x120"), "{error}");
+        assert!(matches!(
+            client.objects.get(&30),
+            Some(Object::Subsurface {
+                cached: CachedSurfaceCommit {
+                    committed: false,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn callback_and_compound_event_queues_stop_at_their_exact_bounds() {
+        let framebuffer_path = std::env::temp_dir().join(format!(
+            "td-wayland-event-bounds-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        for callback in 1000..1000 + u32::try_from(MAX_PENDING_FRAME_CALLBACKS).unwrap() {
+            let mut frame = wire::Builder::new();
+            frame.u32(callback);
+            client
+                .dispatch(request(5, 3, frame).unwrap(), &mut VecDeque::new())
+                .unwrap();
+        }
+        let mut excess = wire::Builder::new();
+        excess.u32(2000);
+        let error = client
+            .dispatch(request(5, 3, excess).unwrap(), &mut VecDeque::new())
+            .unwrap_err();
+        assert!(error.contains("pending frame-callback limit"), "{error}");
+        assert!(!client.objects.contains_key(&2000));
+
+        client.begin_deferred_outbound().unwrap();
+        for _ in 0..MAX_DEFERRED_FRAME_CALLBACKS {
+            client
+                .send(1000, WL_CALLBACK_DONE, wire::Builder::new())
+                .unwrap();
+        }
+        let error = client
+            .send(1000, WL_CALLBACK_DONE, wire::Builder::new())
+            .unwrap_err();
+        assert!(error.contains("callbacks=257"), "{error}");
+        client.discard_deferred_outbound();
+
+        client
+            .insert(
+                7,
+                Object::Buffer(Buffer {
+                    serial: 1,
+                    file: Arc::new(File::open(&framebuffer_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(4)),
+                    offset: 0,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    format: SHM_XRGB8888,
+                }),
+            )
+            .unwrap();
+        client.begin_deferred_outbound().unwrap();
+        for _ in 0..MAX_DEFERRED_BUFFER_RELEASES {
+            client
+                .send(7, WL_BUFFER_RELEASE, wire::Builder::new())
+                .unwrap();
+        }
+        let error = client
+            .send(7, WL_BUFFER_RELEASE, wire::Builder::new())
+            .unwrap_err();
+        assert!(error.contains("releases=513"), "{error}");
+        client.discard_deferred_outbound();
+
+        client.begin_deferred_outbound().unwrap();
+        for _ in 0..MAX_DEFERRED_EVENTS {
+            client.send(1, 0, wire::Builder::new()).unwrap();
+        }
+        let error = client
+            .send(1, 0, wire::Builder::new())
+            .unwrap_err();
+        assert!(error.contains("events=2049"), "{error}");
+        client.discard_deferred_outbound();
+
+        let large = "x".repeat(65_519);
+        client.begin_deferred_outbound().unwrap();
+        for _ in 0..4 {
+            let mut event = wire::Builder::new();
+            event.string(&large).unwrap();
+            client.send(1, 0, event).unwrap();
+        }
+        client.send(1, 0, wire::Builder::new()).unwrap();
+        client.send(1, 0, wire::Builder::new()).unwrap();
+        assert_eq!(
+            client.deferred_outbound.as_ref().unwrap().bytes,
+            MAX_DEFERRED_EVENT_BYTES
+        );
+        let error = client
+            .send(1, 0, wire::Builder::new())
+            .unwrap_err();
+        assert!(error.contains("bytes=262152"), "{error}");
+        client.discard_deferred_outbound();
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn surface_destroy_retires_callbacks_and_flushes_after_runtime_unlock() {
+        let framebuffer_path = std::env::temp_dir().join(format!(
+            "td-wayland-destroy-callbacks-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let key = SurfaceKey {
+            client: 1,
+            object: 5,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                key,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(1, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let callbacks: Vec<u32> =
+            (1000..1000 + u32::try_from(MAX_PENDING_FRAME_CALLBACKS).unwrap()).collect();
+        client
+            .insert(
+                5,
+                Object::Surface(SurfaceState {
+                    frame_callbacks: callbacks.clone(),
+                    ..SurfaceState::default()
+                }),
+            )
+            .unwrap();
+        for callback in &callbacks {
+            client.insert(*callback, Object::Callback).unwrap();
+        }
+
+        // Holding the outbound gate makes the production transaction stop at
+        // its flush. The scene removal proves it got past the runtime work;
+        // taking Runtime then proves that gate is reached only after unlock.
+        let outbound = Arc::clone(&client.outbound);
+        let held = outbound.lock().unwrap();
+        let (started, running) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            let destroyed = client.dispatch(
+                request(5, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            );
+            finished.send((client, destroyed)).unwrap();
+        });
+        running.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut removed_while_flush_blocked = false;
+        for _ in 0..200 {
+            if let Ok(runtime) = runtime.try_lock() {
+                if !runtime.is_mapped(key) {
+                    removed_while_flush_blocked = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(removed_while_flush_blocked);
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        let (mut client, destroyed) = result.recv_timeout(Duration::from_secs(2)).unwrap();
+        destroyed.unwrap();
+        assert!(
+            callbacks
+                .iter()
+                .all(|callback| !client.objects.contains_key(callback))
+        );
+        assert_eq!(client.pending_frame_callbacks().unwrap(), 0);
+        client
+            .insert(7, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        for callback in 2000..2000 + u32::try_from(MAX_PENDING_FRAME_CALLBACKS).unwrap() {
+            let mut frame = wire::Builder::new();
+            frame.u32(callback);
+            client
+                .dispatch(request(7, 3, frame).unwrap(), &mut VecDeque::new())
+                .unwrap();
+        }
+        assert_eq!(
+            client.pending_frame_callbacks().unwrap(),
+            MAX_PENDING_FRAME_CALLBACKS
+        );
+        worker.join().unwrap();
+
         fs::remove_file(framebuffer_path).unwrap();
     }
 
@@ -12244,6 +13126,7 @@ mod tests {
                 Object::Buffer(Buffer {
                     serial: 99,
                     file: Arc::new(File::open(&pool_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(4)),
                     offset: 0,
                     width: 1,
                     height: 1,
@@ -12804,6 +13687,7 @@ mod tests {
         let buffer = Buffer {
             serial: 1,
             file: Arc::new(File::open(&pool_path).unwrap()),
+            pool_charge: Arc::new(AtomicUsize::new(4)),
             offset: 0,
             width: 1,
             height: 1,
@@ -12974,6 +13858,7 @@ mod tests {
         let buffer = Buffer {
             serial: 1,
             file: Arc::new(File::open(&pool_path).unwrap()),
+            pool_charge: Arc::new(AtomicUsize::new(over.saturating_mul(4))),
             offset: 0,
             width: over,
             height: 1,
@@ -13011,6 +13896,7 @@ mod tests {
         let small = Buffer {
             serial: 2,
             file: Arc::new(File::open(&pool_path).unwrap()),
+            pool_charge: Arc::new(AtomicUsize::new(4)),
             offset: 0,
             width: 1,
             height: 1,
@@ -13138,6 +14024,7 @@ mod tests {
                 Object::Buffer(Buffer {
                     serial: 1,
                     file: Arc::new(File::open(&pool_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(16)),
                     offset: 0,
                     width: 2,
                     height: 2,
@@ -13279,6 +14166,7 @@ mod tests {
                 Object::Buffer(Buffer {
                     serial: 99,
                     file: Arc::new(File::open(&pool_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(4)),
                     offset: 0,
                     width: 1,
                     height: 1,
@@ -13606,6 +14494,7 @@ mod tests {
                 Object::Buffer(Buffer {
                     serial: 1,
                     file: Arc::new(File::open(&pool_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(4)),
                     offset: 0,
                     width: 1,
                     height: 1,
@@ -14600,6 +15489,7 @@ mod tests {
                 Object::Buffer(Buffer {
                     serial: 27,
                     file: Arc::new(File::open(&pool_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(4)),
                     offset: 0,
                     width: 1,
                     height: 1,
@@ -15532,6 +16422,7 @@ mod tests {
                 Object::Buffer(Buffer {
                     serial: 63,
                     file: Arc::new(File::open(&pool_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(4)),
                     offset: 0,
                     width: 1,
                     height: 1,
@@ -15744,6 +16635,7 @@ mod tests {
                 Object::Buffer(Buffer {
                     serial: 4,
                     file: Arc::new(File::open(pool_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(4)),
                     offset: 0,
                     width: 1,
                     height: 1,
@@ -16471,6 +17363,7 @@ mod tests {
                 Object::Buffer(Buffer {
                     serial: u64::from(buffer),
                     file: Arc::new(File::open(pool_path).unwrap()),
+                    pool_charge: Arc::new(AtomicUsize::new(4)),
                     offset: 0,
                     width: 1,
                     height: 1,

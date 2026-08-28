@@ -5586,14 +5586,41 @@ one global set, because each yearly runtime rebases Mesa and GTK.
 
 ### Budgets
 
-The current 64 MiB shm-pool cap and 512-object cap are plausible for a
-demo and unmeasured against a browser. Before the Firefox proof: bound a
-client to 4 pools and 256 MiB aggregate declared shm, bound a committed
-surface by output-scaled dimensions, bound aggregate copied pixels
-separately from pool size, bound hidden synchronized subsurface commits
-and the frame-callback and buffer-release queues, and raise the object
-cap only from a captured trace. A malformed or greedy client is
+The browser-scale compositor boundary has landed without raising the
+512-object cap. One client may retain at most eight shm pool resources and
+256 MiB of aggregate declared shm, while each pool retains its existing
+64 MiB ceiling. The charge follows each pool resource through live buffer
+objects, pending attaches and synchronized subsurface caches after the pool
+object is destroyed. A resize raises one monotonic declared charge shared by
+the pool and every buffer created from it; an older buffer cannot partially
+refund that charge, which leaves only with the last reference. This is
+deliberately separate from the 32 MiB aggregate copied-pixel ceiling across
+the client's mapped toplevel, popup and subsurface images.
+
+Every non-cursor buffer commit is checked before copying against twice the
+scale-1 output's width and height; synchronized child commits receive the same
+check when cached and again when applied. The factor admits client-side shadow
+and decoration extents outside an XDG window geometry while keeping the bound
+derived from the actual output; the independent copied-pixel ceiling still
+applies. Cursor surfaces keep their tighter 256-by-256 rule. At most 128
+synchronized subsurfaces may hold an unapplied
+commit and at most 256 frame callbacks may be pending. A compound scene
+transaction retains at most 2,048 events and 256 KiB of encoded event bytes,
+including no more than 512 buffer releases and 256 callback completions,
+before the runtime lock is released. Exact saturation and last-reference
+regressions pin every limit. Ordinary surface destruction also retires all of
+its pending callback objects in one bounded transaction; the regression holds
+client output stalled while proving that scene teardown released the runtime
+lock before the transaction flush. A malformed or greedy client is
 disconnected without taking the compositor down.
+
+The first-window lifecycle showed Firefox requesting a fifth simultaneous
+pool resource, so the exact ceiling keeps bounded headroom above that lower
+bound. Firefox starts under the unchanged 512-object ceiling, but this is not
+yet a browsing trace. The navigation/content oracle must record the observed
+object, pool, callback, synchronized-commit, queued-event and copied-pixel
+high-water marks. A later object-cap change is admitted only from that
+captured trace.
 
 And a performance caveat that belongs in the claim rather than in a
 surprise: the renderer copies client pixels and software-composites the
@@ -5953,7 +5980,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 25 | **`td-audio` crate + surface #11**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients | **sound from the machine** |
 | 26 | `td-audio`'s PulseAudio protocol: frames, tagstruct codec, `AUTH`/`SET_CLIENT_NAME`/sink info, one playback stream; `sockets=pulseaudio` binds the socket into a jail | a jailed fixture app plays audio |
-| 27 | **Firefox policy and first-window image proof — LANDED**; later evidence must tune shm and traces from browsing/content workloads rather than only startup | Firefox starts and paints its first frame |
+| 27 | **Firefox policy and first-window image proof — LANDED**; browser-scale compositor admission now bounds retained shm resources, copied pixels, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The navigation run must capture high-water marks before any tuning from browsing/content workloads | Firefox starts and paints its first frame |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox window, an HTTPS page, and sound** |
 
 **Two other reversals are still absent from this ladder, and that is a

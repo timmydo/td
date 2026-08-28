@@ -910,10 +910,12 @@ last, nested children keep that order recursively, and the topmost accepting
 input region receives pointer coordinates in its own surface-local space. The
 layout, title band, focus, popup ancestry, and window-management identity stay
 with the compound root. Per-client copied-pixel and object ceilings cover
-mapped and hidden children; each synchronized surface retains at most one
-pending buffer and input-region state while callbacks remain under the object
-ceiling. Cached input-region snapshots participate in the same aggregate
-operation quota as live and pending surface regions.
+mapped and hidden children. Each synchronized surface retains at most one
+pending buffer and input-region state; no more than 128 synchronized surfaces
+may hold an unapplied commit, and no more than 256 frame callbacks may be
+pending across live and cached state. Cached input-region snapshots
+participate in the same aggregate operation quota as live and pending surface
+regions.
 
 **The core data device is the one-seat clipboard.**
 `wl_data_device_manager` version 3 is advertised and versions 1 through 3 may
@@ -2952,14 +2954,30 @@ object ID reservation remains held until every earlier keyboard or pointer
 event naming that surface is serialized.
 
 Resource ceilings are part of the protocol boundary: at most 32 clients run
-at once, each has at most 512 objects, 64 queued descriptors, one pending
-layout wakeup, 64 pending seat deliveries, and 32 MiB of retained toplevel
-pixels.
+at once, each has at most 512 objects, eight retained shm pool resources,
+256 MiB of aggregate declared shm, 64 queued descriptors, one pending layout
+wakeup, 64 pending seat deliveries, 128 unapplied synchronized-subsurface
+commits, 256 pending frame callbacks, and 32 MiB of retained surface pixels.
+The pool-resource identity stays charged through live buffer objects, pending
+attaches and synchronized caches after its pool object is destroyed; its
+declared charge rises monotonically with a resize across the pool and all
+buffers made from it, then is refunded only when the last such reference
+goes. The first Firefox window lifecycle showed a fifth simultaneous
+pool-resource request, leaving bounded headroom below eight. A pool alone
+remains capped at 64 MiB.
+The copied-pixel ledger is independent and
+covers toplevels, popups and subsurfaces rather than mistaking shared pool
+address space for memory copied into the compositor.
+One compound commit may defer at most 2,048 events and 256 KiB of encoded
+event bytes while the runtime lock is held, including at most 512 buffer
+releases and 256 frame-callback completions. The cap is checked before each
+message joins the queue; overflow fails that client and the runtime lock is
+released before disconnection.
 Each XDG surface has at most 32 current-generation configures. During remap it
 may additionally retain the previous generation's bounded set while the one
 new initial serial is pending, for at most 33 serials total; the tracker
 enforces the retained-generation bound itself. Output pixels, the bundled
-demo's generated buffer, and one client's aggregate retained toplevel pixels
+demo's generated buffer, and one client's aggregate retained surface pixels
 share the same 32 MiB ceiling, so every accepted output has a representable
 single-client tile. Cursor-role pixels are outside that total and carry their
 own PER-CLIENT ceiling of 1 MiB, which is four cursors at the maximum
@@ -2971,8 +2989,15 @@ and the denial is silent — the others simply show td's cross. A framebuffer's
 stride-padded shadow allocation has a
 separate 64 MiB ceiling. Framebuffer and buffer dimensions share a
 16,384-pixel ceiling. At four bytes per pixel the area ceiling is 8,388,608
-pixels: tight 3840x2160 is accepted, while 4096x2160 is rejected. A CURSOR is
-bounded separately and far more tightly, at 256 pixels on a side: themes stop
+pixels: tight 3840x2160 is accepted, while 4096x2160 is rejected. A non-cursor
+buffer is additionally refused before copying when either committed
+dimension exceeds twice the current scale-1 output. Exact output dimensions
+are too tight: XDG window geometry may crop client-side shadows and decoration
+extents outside the window, and the pinned Firefox startup frame is 1256x824
+on a 1280x800 output. The factor remains output-derived while the independent
+32 MiB pixel ledger bounds area. A synchronized child is checked both when its
+commit enters the cache and when the parent applies it. A CURSOR is bounded
+separately and far more tightly, at 256 pixels on a side: themes stop
 there, so nothing an operator would see is refused, and what it bounds is a
 client naming a surface of output size as its cursor — which the protocol
 permits and which would cost the scene a second framebuffer for an image a few
@@ -3149,6 +3174,13 @@ The landing must prove:
 - wire parsing rejects truncation, overflow, invalid object use, and a
   descriptor-less wl_shm request;
 - an SCM_RIGHTS-backed wl_shm buffer commits and is copied into the scene;
+- a retained shm pool resource survives pool-object destruction in its
+  accounting until the last buffer reference leaves, and a resize shares its
+  monotonic declared charge with buffers made before it; pool count,
+  declarations, scale-1 committed dimensions, synchronized commit caches,
+  pending callbacks, and compound buffer-release/callback queues stop at their
+  exact bounds; ordinary surface destruction retires a full callback ceiling
+  and reaches a stalled outbound flush only after releasing the runtime lock;
 - the boot client discovers globals, completes both initial and tile-sized XDG
   configure/ack cycles, replaces its buffer at the requested size, receives
   wl_buffer release and a frame callback, verifies its exact keymap
