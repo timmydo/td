@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{debug_line_source_root_check, post_bootstrap_path, POST_BOOTSTRAP_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 pub fn recipe() -> Recipe {
@@ -24,6 +24,12 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
     ];
+    steps.push(debug_line_source_root_check(
+        readelf,
+        debug,
+        "main.c",
+        "/td-build",
+    ));
     steps.push(
         Step::run(
             "{root}",
@@ -31,15 +37,9 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "lines=$('{readelf}' --debug-dump=rawline '{debug}' 2>/dev/null) || {{ echo 'cannot read make debug companion' >&2; exit 1; }}; \
-                     printf '%s\\n' \"$lines\" | awk ' \
-                         /The Directory Table/ {{ unit++; in_dirs=1; in_files=0; next }} \
-                         in_dirs && /^[[:space:]]*[0-9]+[[:space:]]/ {{ value=$0; sub(/^.*: /, \"\", value); dirs[unit,$1]=value }} \
-                         /The File Name Table/ {{ in_dirs=0; in_files=1; next }} \
-                         in_files && $2 == 1 && $0 ~ /: main[.]c$/ && dirs[unit,$2] == \"src\" && dirs[unit,0] == \"/td-build\" {{ found=1 }} \
-                         /Line Number Statements:/ {{ in_files=0 }} \
-                         END {{ if (!found) exit 1 }}' || {{ echo 'make main.c does not use the canonical source root' >&2; exit 1; }}; \
-                     if grep -q -a -F 'guix-build' '{debug}'; then echo 'make debug companion exposes a build scratch path' >&2; exit 1; fi"
+                    "if grep -a -Fq 'guix-build' '{debug}'; then \
+                         echo 'make debug companion exposes a build scratch path' >&2; exit 1; \
+                     fi"
                 ),
             ],
         )
@@ -81,7 +81,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
         content:
-            "PASS: final GNU Make 4.4.1 is closed to plugins, carries canonical debug information, and drove a real build\n"
+            "PASS: final GNU Make 4.4.1 is closed to plugins, carries canonical line information, and drove a real build\n"
                 .into(),
         exec: false,
     });
@@ -109,12 +109,13 @@ exec "$TD_RECIPE_EVAL" check-run make-x86-64-self-test 1
 
 #[cfg(test)]
 mod tests {
-    use super::recipe;
+    use super::{recipe, Step};
 
     #[test]
     fn test_uses_only_post_bootstrap_inputs() {
+        let recipe = recipe();
         assert_eq!(
-            recipe()
+            recipe
                 .native_inputs
                 .as_deref()
                 .map(|inputs| inputs.iter().map(String::as_str).collect::<Vec<_>>()),
@@ -124,6 +125,30 @@ mod tests {
                 "busybox-x86-64",
             ])
         );
-        assert!(recipe().inputs.is_none());
+        assert!(recipe.inputs.is_none());
+        let line_validation = recipe
+            .steps
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => argv.get(2),
+                _ => None,
+            })
+            .find(|command| command.contains("--debug-dump=rawline"))
+            .expect("line-only Make source-root validation");
+        assert!(line_validation.contains("main.c"));
+        assert!(line_validation.contains("/td-build"));
+        assert!(!line_validation.contains("DW_AT_comp_dir"));
+        assert!(recipe
+            .steps
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => argv.get(2),
+                _ => None,
+            })
+            .any(|command| command.contains("grep -a -Fq 'guix-build'")));
     }
 }

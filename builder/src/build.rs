@@ -4864,39 +4864,21 @@ fn split_debug_tree(root: &Path, objcopy: &Path, recipe_name: &str) -> Result<()
             )?;
             let remove_debug_strings = runtime_line_exception.is_some()
                 || !crate::elf::debug_line_requires_debug_str(&debug)?;
-            let mut prune_args = vec![
-                "--remove-section=.debug_info",
-                "--remove-section=.debug_abbrev",
-                "--remove-section=.debug_aranges",
-                "--remove-section=.debug_types",
-                "--remove-section=.debug_ranges",
-                "--remove-section=.debug_rnglists",
-                "--remove-section=.debug_frame",
-                "--remove-section=.debug_loc",
-                "--remove-section=.debug_loclists",
-                "--remove-section=.debug_str_offsets",
-                "--remove-section=.debug_addr",
-                "--remove-section=.debug_macro",
-                "--remove-section=.debug_macinfo",
-                "--remove-section=.debug_pubnames",
-                "--remove-section=.debug_pubtypes",
-                "--remove-section=.debug_gnu_pubnames",
-                "--remove-section=.debug_gnu_pubtypes",
-                "--remove-section=.debug_names",
-                "--remove-section=.debug_sup",
-                "--remove-section=.debug_cu_index",
-                "--remove-section=.debug_tu_index",
-                "--remove-section=.gdb_index",
-            ];
+            let mut prune_args: Vec<String> =
+                td_engine::target_profile::ALWAYS_PRUNED_DEBUG_SECTIONS
+                    .iter()
+                    .map(|section| format!("--remove-section={section}"))
+                    .collect();
             // DWARF 2 through 4 carry line-table paths inline. DWARF 5 can
             // reference `.debug_str`, so keep it only when a structurally
             // checked directory/file format declares DW_FORM_strp. The named
             // oversized-line exception deliberately makes no reader claim.
             if remove_debug_strings {
-                prune_args.push("--remove-section=.debug_str");
+                prune_args.push("--remove-section=.debug_str".into());
             }
-            prune_args.push(debug_text);
-            run_cmd(objcopy, &prune_args, cwd, &[], &WATCH_PHASE)?;
+            prune_args.push(debug_text.into());
+            let prune_arg_refs: Vec<&str> = prune_args.iter().map(String::as_str).collect();
+            run_cmd(objcopy, &prune_arg_refs, cwd, &[], &WATCH_PHASE)?;
             fs::set_permissions(&debug, fs::Permissions::from_mode(0o644))
                 .map_err(|e| format!("chmod debug companion {}: {e}", debug.display()))?;
             if let Some(exception) = runtime_line_exception {

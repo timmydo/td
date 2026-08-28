@@ -1,6 +1,6 @@
 use crate::ladder::{
-    post_bootstrap_path, split_target_debug, unpack_into, CODEX_BWRAP_RECIPE_VERSION,
-    CODEX_BWRAP_VERSION_OUTPUT, POST_BOOTSTRAP_SH,
+    debug_line_source_root_check, post_bootstrap_path, split_target_debug, unpack_into,
+    CODEX_BWRAP_RECIPE_VERSION, CODEX_BWRAP_VERSION_OUTPUT, POST_BOOTSTRAP_SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
@@ -116,9 +116,12 @@ pub fn recipe() -> Recipe {
     });
     steps.push(split_target_debug("{out}"));
     steps.push(Step::assert_static(&["{out}/bin/bwrap"]));
-    // Canonical /td/store and /td-build-root paths may occur in debug inherited
-    // from the already-built static libgcc input. Reject noncanonical host and
-    // scratch roots while retaining that deterministic provenance.
+    steps.push(debug_line_source_root_check(
+        "{in:binutils-x86-64-self}/bin/readelf",
+        "{out}/lib/debug/bin/bwrap.debug",
+        "bubblewrap.c",
+        "/td-build/codex-rs/vendor/bubblewrap",
+    ));
     steps.push(
         Step::run(
             "{out}",
@@ -138,13 +141,7 @@ pub fn recipe() -> Recipe {
                  test \"$runtime_id\" = \"$debug_id\" || { echo 'bwrap runtime/debug build IDs differ' >&2; exit 1; }; \
                  if '{in:binutils-x86-64-self}/bin/readelf' -S \"$runtime\" | grep -Fq '.symtab'; then echo 'bwrap runtime was not stripped' >&2; exit 1; fi; \
                  '{in:binutils-x86-64-self}/bin/readelf' -S \"$debug\" | grep -Fq '.symtab' || { echo 'bwrap debug companion lacks symbols' >&2; exit 1; }; \
-                 '{in:binutils-x86-64-self}/bin/readelf' -S \"$debug\" | grep -Fq '.debug_line' || { echo 'bwrap debug companion lacks line tables' >&2; exit 1; }; \
-                 lines=$('{in:binutils-x86-64-self}/bin/readelf' --debug-dump=rawline \"$debug\") || exit 1; \
-                 printf '%s\\n' \"$lines\" | grep -Eq ': /td-build/codex-rs/vendor/bubblewrap$' || { echo 'bwrap debug companion lacks its canonical source root' >&2; exit 1; }; \
-                 for forbidden in '/gnu/store' '/td-input' '/home/' '/tmp/' '/.td/' 'guix-build'; do \
-                     match=$(printf '%s\\n' \"$lines\" | grep -F -m 1 \"$forbidden\") || true; \
-                     if test -n \"$match\"; then echo \"bwrap debug companion retains forbidden path $forbidden: $match\" >&2; exit 1; fi; \
-                 done",
+                 '{in:binutils-x86-64-self}/bin/readelf' -S \"$debug\" | grep -Fq '.debug_line' || { echo 'bwrap debug companion lacks line tables' >&2; exit 1; }",
             ],
         )
         .env("PATH", &post_bootstrap_path())
@@ -284,10 +281,21 @@ mod tests {
             "--argv0",
             "--perms",
             ".debug_line",
-            "/td-build/codex-rs/vendor/bubblewrap",
         ] {
             assert!(validation.contains(required), "validation omits {required}");
         }
+        let line_validation = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => argv.get(2),
+                _ => None,
+            })
+            .find(|command| {
+                command.contains("--debug-dump=rawline") && command.contains("bubblewrap.c")
+            })
+            .expect("line-only bwrap source-root validation");
+        assert!(line_validation.contains("/td-build/codex-rs/vendor/bubblewrap"));
+        assert!(!line_validation.contains("DW_AT_comp_dir"));
         assert!(validation_env.iter().any(|(name, value)| {
             name == "TD_EXPECTED_BWRAP_VERSION" && value == CODEX_BWRAP_VERSION_OUTPUT
         }));

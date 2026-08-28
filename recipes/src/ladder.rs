@@ -193,6 +193,261 @@ pub fn split_target_debug(root: &str) -> Step {
     Step::split_debug_tree(root, "{in:binutils-x86-64-self}/bin/objcopy")
 }
 
+const DEBUG_LINE_AWK: &str = r#"
+function under(path, prefix) {
+  return path == prefix || index(path, prefix "/") == 1
+}
+function allowed(path) {
+  return under(path, "/td-build") || under(path, "/td-build-root") ||
+         under(path, "/td-cargo") || under(path, "/td/store")
+}
+function reject(reason, value) {
+  print "debug line-table " reason ": " value > "/dev/stderr"
+  bad=1
+}
+function clear_dirs(key) {
+  for (key in dirs) delete dirs[key]
+}
+function normalize(path, parts, stack, count, top, i, part, result) {
+  count=split(path, parts, "/")
+  top=0
+  for (i=1; i<=count; i++) {
+    part=parts[i]
+    if (part == "" || part == ".") continue
+    if (part == "..") {
+      if (top == 0) return ""
+      delete stack[top]
+      top--
+      continue
+    }
+    stack[++top]=part
+  }
+  result="/"
+  for (i=1; i<=top; i++) {
+    if (i > 1) result=result "/"
+    result=result stack[i]
+  }
+  return result
+}
+function table_value(line, value) {
+  value=line
+  if (match(value, /\):[[:space:]]/))
+    return substr(value, RSTART + RLENGTH)
+  if (table == "directory")
+    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", value)
+  else
+    sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", value)
+  return value
+}
+function resolve(base, path) {
+  if (substr(path, 1, 1) == "/") return normalize(path)
+  return normalize(base "/" path)
+}
+function record_path(raw, base, resolved) {
+  resolved=resolve(base, raw)
+  if (resolved == "") reject("escapes its source root", raw)
+  else if (!allowed(resolved))
+    reject("resolves outside the stable roots", resolved)
+  return resolved
+}
+/^[[:space:]]*Offset:/ {
+  clear_dirs()
+  table=""
+  version=0
+  next
+}
+/DWARF Version:/ {
+  version=$NF + 0
+  next
+}
+/Directory Table/ {
+  if (version != 5) reject("uses unsupported DWARF version", version)
+  table="directory"
+  next
+}
+/File Name Table/ {
+  table="file"
+  next
+}
+/Line Number Statements/ {
+  table=""
+  next
+}
+index($0, "define new File Table entry") {
+  reject("uses a dynamic file definition", $0)
+}
+index($0, "guix-build") {
+  reject("retains build scratch text", $0)
+}
+table == "directory" && $1 ~ /^[0-9]+$/ {
+  raw=table_value($0)
+  if ($1 == 0 && substr(raw, 1, 1) != "/")
+    reject("has a non-absolute compilation directory", raw)
+  if ($1 != 0 && !(0 in dirs))
+    reject("precedes its compilation directory", raw)
+  base=$1 == 0 ? "/" : dirs[0]
+  dirs[$1]=record_path(raw, base)
+  next
+}
+table == "file" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+  raw=table_value($0)
+  if (!($2 in dirs)) {
+    reject("uses an unknown directory index", $2)
+    next
+  }
+  resolved=record_path(raw, dirs[$2])
+  if (raw == source) {
+    if (under(resolved, root)) seen=1
+    else reject("places " source " outside " root, resolved)
+  }
+  next
+}
+END {
+  if (!seen) reject("does not place " source " below " root, source)
+  if (bad) exit 1
+}
+"#;
+
+fn debug_line_validation_command(producer: &str, source: &str, source_root: &str) -> String {
+    format!(
+        "{producer} | awk -v source='{source}' -v root='{source_root}' '{DEBUG_LINE_AWK}'"
+    )
+}
+
+/// Validate one retained DWARF-5 source file against the line-table-only
+/// companion policy. Every directory and file entry resolves below a declared
+/// stable root; the named source must resolve below `source_root`.
+pub fn debug_line_source_root_check(
+    readelf: &str,
+    debug: &str,
+    source: &str,
+    source_root: &str,
+) -> Step {
+    let producer = format!("'{readelf}' --debug-dump=rawline '{debug}' 2>/dev/null");
+    let command = debug_line_validation_command(&producer, source, source_root);
+    Step::run("{root}", &[POST_BOOTSTRAP_SH, "-c", &command]).env("PATH", &post_bootstrap_path())
+}
+
+/// Execute the shared parser against hostile captured-table shapes. This is a
+/// recipe step so the oracle uses the same declared BusyBox awk as production.
+pub fn debug_line_validator_regression_steps() -> Vec<Step> {
+    const GOOD: &str = r#"  Offset: 0
+  DWARF Version: 5
+ The Directory Table
+  Entry Name
+  0 (indirect line string, offset: 0): /td-build
+  1 (indirect line string, offset: 1): ./src/..
+  2 (indirect line string, offset: 2): /td/store/include
+ The File Name Table
+  Entry Dir Name
+  0 1 (indirect line string, offset: 3): main.c
+  1 2 (indirect line string, offset: 4): stdio.h
+ Line Number Statements:
+"#;
+    const WRONG_DIRECTORY: &str = r#"  Offset: 0
+  DWARF Version: 5
+ The Directory Table
+  Entry Name
+  0 (indirect line string, offset: 0): /td-build
+  1 (indirect line string, offset: 1): /td-cargo/wrong
+ The File Name Table
+  Entry Dir Name
+  0 1 (indirect line string, offset: 2): main.c
+ Line Number Statements:
+"#;
+    const TRAVERSAL: &str = r#"  Offset: 0
+  DWARF Version: 5
+ The Directory Table
+  Entry Name
+  0 (indirect line string, offset: 0): /td-build/../../home/leak
+ The File Name Table
+  Entry Dir Name
+  0 0 (indirect line string, offset: 1): main.c
+ Line Number Statements:
+"#;
+    const SPACED_PATH: &str = r#"  Offset: 0
+  DWARF Version: 5
+ The Directory Table
+  Entry Name
+  0 (indirect line string, offset: 0): /td-build
+  1 (indirect line string, offset: 1): /home/user name
+ The File Name Table
+  Entry Dir Name
+  0 0 (indirect line string, offset: 2): main.c
+ Line Number Statements:
+"#;
+    const DWARF4: &str = r#"  Offset: 0
+  DWARF Version: 4
+ The Directory Table
+  Entry Name
+  1 /td-build
+ The File Name Table
+  Entry Dir Time Size Name
+  1 1 0 0 main.c
+ Line Number Statements:
+"#;
+    const STATEMENT_SCRATCH: &str = r#"  Offset: 0
+  DWARF Version: 5
+ The Directory Table
+  Entry Name
+  0 (indirect line string, offset: 0): /td-build
+ The File Name Table
+  Entry Dir Name
+  0 0 (indirect line string, offset: 1): main.c
+ Line Number Statements:
+  define new File Table entry: /tmp/guix-build-leak/x.c
+"#;
+    const DYNAMIC_OUTSIDE: &str = r#"  Offset: 0
+  DWARF Version: 5
+ The Directory Table
+  Entry Name
+  0 (indirect line string, offset: 0): /td-build
+ The File Name Table
+  Entry Dir Name
+  0 0 (indirect line string, offset: 1): main.c
+ Line Number Statements:
+  define new File Table entry: /home/user name/x.c
+"#;
+
+    fn producer(fixture: &str) -> String {
+        format!("printf '%s' '{fixture}'")
+    }
+
+    fn fixture_command(fixture: &str) -> String {
+        format!(
+            "{} | awk -v source='main.c' -v root='/td-build' \
+             -f '{{root}}/debug-line-validator.awk'",
+            producer(fixture)
+        )
+    }
+
+    let good = fixture_command(GOOD);
+    let wrong = fixture_command(WRONG_DIRECTORY);
+    let traversal = fixture_command(TRAVERSAL);
+    let spaced = fixture_command(SPACED_PATH);
+    let dwarf4 = fixture_command(DWARF4);
+    let statement_scratch = fixture_command(STATEMENT_SCRATCH);
+    let dynamic_outside = fixture_command(DYNAMIC_OUTSIDE);
+    let command = format!(
+        "{good} || {{ echo 'canonical rawline fixture was rejected' >&2; exit 1; }}; \
+         if {wrong} 2>/dev/null; then echo 'wrong-directory rawline fixture passed' >&2; exit 1; fi; \
+         if {traversal} 2>/dev/null; then echo 'traversal rawline fixture passed' >&2; exit 1; fi; \
+         if {spaced} 2>/dev/null; then echo 'spaced-path rawline fixture passed' >&2; exit 1; fi; \
+         if {dwarf4} 2>/dev/null; then echo 'DWARF-4 rawline fixture passed' >&2; exit 1; fi; \
+         if {statement_scratch} 2>/dev/null; then echo 'statement-scratch rawline fixture passed' >&2; exit 1; fi; \
+         if {dynamic_outside} 2>/dev/null; then echo 'dynamic-file rawline fixture passed' >&2; exit 1; fi"
+    );
+    vec![
+        Step::WriteFile {
+            path: "{root}/debug-line-validator.awk".into(),
+            content: DEBUG_LINE_AWK.into(),
+            exec: false,
+        },
+        Step::run("{root}", &[POST_BOOTSTRAP_SH, "-c", &command])
+            .env("PATH", &post_bootstrap_path()),
+    ]
+}
+
 /// The shell and userland beyond the native self-hosting tool boundary. BusyBox
 /// is a reviewed boundary output and must be a declared `native_input` of every
 /// recipe using these paths.
@@ -1002,6 +1257,50 @@ mod tests {
     use crate::catalog;
     use crate::types::{Recipe, Step};
     use std::collections::HashSet;
+
+    #[test]
+    fn line_only_source_check_uses_the_shared_dwarf5_parser() {
+        let step = super::debug_line_source_root_check(
+            "/tools/readelf",
+            "/output/lib/debug/bin/tool.debug",
+            "main.c",
+            "/td-build",
+        );
+        let Step::Run { argv, .. } = step else {
+            panic!("line-table check is not executable");
+        };
+        let command = argv.get(2).expect("line-table check command");
+        for required in [
+            "--debug-dump=rawline",
+            "-v source='main.c'",
+            "-v root='/td-build'",
+            "unsupported DWARF version",
+        ] {
+            assert!(command.contains(required), "line check omits {required}");
+        }
+        assert!(!command.contains("DW_AT_comp_dir"));
+    }
+
+    #[test]
+    fn line_only_parser_regressions_wire_one_real_recipe_probe() {
+        let steps = super::debug_line_validator_regression_steps();
+        assert!(matches!(steps.first(), Some(Step::WriteFile { .. })));
+        let Some(Step::Run { argv, .. }) = steps.get(1) else {
+            panic!("line-table regression check is not executable");
+        };
+        let command = argv.get(2).expect("line-table regression command");
+        for required in [
+            "canonical rawline fixture was rejected",
+            "wrong-directory rawline fixture passed",
+            "traversal rawline fixture passed",
+            "spaced-path rawline fixture passed",
+            "DWARF-4 rawline fixture passed",
+            "statement-scratch rawline fixture passed",
+            "dynamic-file rawline fixture passed",
+        ] {
+            assert!(command.contains(required), "regression omits {required}");
+        }
+    }
 
     #[test]
     fn codex_release_strings_are_one_consistent_pin() {

@@ -33,6 +33,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn split_debug_consumers_require_only_retained_line_data() {
+        let mut compile_directory_consumers = Vec::new();
+        for (stem, recipe) in all() {
+            for step in recipe.steps.as_deref().unwrap_or_default() {
+                let text = match step {
+                    crate::types::Step::Run { argv, .. } => argv.join(" "),
+                    crate::types::Step::WriteFile { content, .. } => content.clone(),
+                    _ => continue,
+                };
+                if text.contains("DW_AT_comp_dir") {
+                    assert!(
+                        !text.contains("lib/debug"),
+                        "{stem}: split debug companion requires DW_AT_comp_dir"
+                    );
+                    compile_directory_consumers.push(stem);
+                }
+                if !text.contains("lib/debug") {
+                    continue;
+                }
+                let non_line_dumps = text.replace("--debug-dump=rawline", "");
+                assert!(
+                    !non_line_dumps.contains("--debug-dump="),
+                    "{stem}: split debug companion requires a pruned debug dump"
+                );
+                for section in td_engine::target_profile::ALWAYS_PRUNED_DEBUG_SECTIONS {
+                    assert!(
+                        !text.contains(section),
+                        "{stem}: split debug companion requires pruned section {section}"
+                    );
+                }
+            }
+        }
+        compile_directory_consumers.sort_unstable();
+        compile_directory_consumers.dedup();
+        assert_eq!(
+            compile_directory_consumers,
+            [
+                "curl-x86-64-test",
+                "libressl-x86-64-test",
+                "zlib-x86-64-self-test",
+            ]
+        );
+    }
+
+    #[test]
     fn every_recipe_emits_canonical_json_and_round_trips() {
         for (stem, r) in all() {
             let canon = r.to_json().to_canonical();

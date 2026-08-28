@@ -1,4 +1,7 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{
+    debug_line_source_root_check, debug_line_validator_regression_steps, post_bootstrap_path,
+    POST_BOOTSTRAP_SH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 pub fn recipe() -> Recipe {
@@ -50,21 +53,6 @@ pub fn recipe() -> Recipe {
                          {{ echo 'Git transport prerequisite did not pass its verified TLS oracle' >&2; exit 1; }}; \
                      grep -Fq 'PASS: OpenSSH Portable 10.5p1 provides the bounded ssh/sshd/ssh-keygen profile' '{openssh_test}/result' || \
                          {{ echo 'Git SSH prerequisite did not pass the OpenSSH package oracle' >&2; exit 1; }}; \
-                     for pair in 'git.c|{git}/lib/debug/bin/git.debug' 'remote-curl.c|{git}/lib/debug/libexec/git-core/git-remote-http.debug' 'sh-i18n--envsubst.c|{git}/lib/debug/libexec/git-core/git-sh-i18n--envsubst.debug'; do \
-                         source=${{pair%%|*}}; debug=${{pair#*|}}; \
-                         grep -a -Fq \"$source\" \"$debug\" || {{ echo \"Git debug companion omits $source\" >&2; exit 1; }}; \
-                         lines=$('{readelf}' --debug-dump=rawline \"$debug\" 2>/dev/null) || {{ echo \"cannot read Git $source line tables\" >&2; exit 1; }}; \
-                         printf '%s\\n' \"$lines\" | awk -v wanted=\"$source\" ' \
-                             /The Directory Table/ {{ unit++; in_dirs=1; in_files=0; next }} \
-                             in_dirs && /^[[:space:]]*[0-9]+[[:space:]]/ {{ value=$0; sub(/^.*: /, \"\", value); dirs[unit,$1]=value }} \
-                             /The File Name Table/ {{ in_dirs=0; in_files=1; next }} \
-                             in_files {{ name=$0; sub(/^.*: /, \"\", name); if (name == wanted && dirs[unit,$2] ~ /^\\/td-build(\\/.*)?$/) found=1 }} \
-                             /Line Number Statements:/ {{ in_files=0 }} \
-                             END {{ if (!found) exit 1 }}' || {{ echo \"Git $source does not use the canonical source root\" >&2; exit 1; }}; \
-                         for forbidden in '/gnu/store' '/home/' '/tmp/' '/.td/' 'guix-build' '/td-input/'; do \
-                             if printf '%s\\n' \"$lines\" | grep -Fq \"$forbidden\"; then echo \"Git $source exposes forbidden debug path $forbidden\" >&2; exit 1; fi; \
-                         done; \
-                     done; \
                      for binary in '{git}/bin/git' '{git}/libexec/git-core/git-remote-http' '{git}/libexec/git-core/git-sh-i18n--envsubst'; do \
                          header=$('{readelf}' -h \"$binary\") || exit 1; \
                          printf '%s\\n' \"$header\" | grep -Fq 'Class:                             ELF64' || exit 1; \
@@ -92,6 +80,25 @@ pub fn recipe() -> Recipe {
             path: "{root}/work".into(),
         },
     ];
+    steps.extend(debug_line_validator_regression_steps());
+    for (debug, source) in [
+        (format!("{git}/lib/debug/bin/git.debug"), "git.c"),
+        (
+            format!("{git}/lib/debug/libexec/git-core/git-remote-http.debug"),
+            "remote-curl.c",
+        ),
+        (
+            format!("{git}/lib/debug/libexec/git-core/git-sh-i18n--envsubst.debug"),
+            "sh-i18n--envsubst.c",
+        ),
+    ] {
+        steps.push(debug_line_source_root_check(
+            readelf,
+            &debug,
+            source,
+            "/td-build",
+        ));
+    }
     steps.push(
         Step::run(
             "{root}/work",
@@ -184,7 +191,7 @@ exec "$TD_RECIPE_EVAL" check-run git-x86-64-test 1
 
 #[cfg(test)]
 mod tests {
-    use super::recipe;
+    use super::{recipe, Step};
 
     #[test]
     fn validation_composes_git_with_both_verified_transport_oracles() {
@@ -206,5 +213,21 @@ mod tests {
             )
         );
         assert!(recipe.inputs.is_none());
+
+        let commands: Vec<&String> = recipe
+            .steps
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => argv.get(2),
+                _ => None,
+            })
+            .filter(|arg| arg.contains("--debug-dump=rawline"))
+            .collect();
+        assert_eq!(commands.len(), 3);
+        assert!(commands.iter().all(|command| {
+            command.contains("/td-build") && !command.contains("DW_AT_comp_dir")
+        }));
     }
 }

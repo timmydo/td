@@ -59,8 +59,11 @@ Rust compilation emits line-table debug information and ordinary symbols.
 Every varying build path is remapped before it reaches either artifact. The
 canonical roots are `/td-build` for package source, `/td-build-root` for other
 build scratch, and `/td-cargo` for Cargo's working state; vendor source is
-mapped below `/td-cargo/vendor`. Timestamps, archive ordering, and other build
-identity inputs remain pinned by the normal recipe reproducibility contract.
+mapped below `/td-cargo/vendor`. Line tables may also name headers or static
+objects from declared inputs below `/td/store`; those content-addressed paths
+are already stable inputs, not varying build paths to remap. Timestamps,
+archive ordering, and other build identity inputs remain pinned by the normal
+recipe reproducibility contract.
 
 Codex 0.148.0 is one of two named source-line attribution exceptions. Its
 shipped ThinLTO CLI contains 18,612,350 numeric line rows and a

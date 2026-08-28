@@ -16,6 +16,34 @@ pub const DIRECT_RUSTC_ARGS: [&str; 6] = [
     "--remap-path-prefix={src}=/td-build",
 ];
 
+/// Debug sections removed from every target companion after its line program
+/// and ordinary symbols have been copied out of the runtime. Keep the producer
+/// and recipe-side consumer guard on this one roster.
+pub const ALWAYS_PRUNED_DEBUG_SECTIONS: [&str; 22] = [
+    ".debug_info",
+    ".debug_abbrev",
+    ".debug_aranges",
+    ".debug_types",
+    ".debug_ranges",
+    ".debug_rnglists",
+    ".debug_frame",
+    ".debug_loc",
+    ".debug_loclists",
+    ".debug_str_offsets",
+    ".debug_addr",
+    ".debug_macro",
+    ".debug_macinfo",
+    ".debug_pubnames",
+    ".debug_pubtypes",
+    ".debug_gnu_pubnames",
+    ".debug_gnu_pubtypes",
+    ".debug_names",
+    ".debug_sup",
+    ".debug_cu_index",
+    ".debug_tu_index",
+    ".gdb_index",
+];
+
 /// Materialize the direct-rustc policy for an independently rooted build. The
 /// ordinary recipe path uses `{root}` and `{src}`; the bounded reproducibility
 /// oracle supplies two different roots which must canonicalize to these same
@@ -217,6 +245,18 @@ pub fn cargo_cflags(build_root: &str, cargo_root: &str, vendor_root: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn always_pruned_debug_roster_is_unique_and_excludes_line_data() {
+        let mut sections = ALWAYS_PRUNED_DEBUG_SECTIONS.to_vec();
+        sections.sort_unstable();
+        sections.dedup();
+        assert_eq!(sections.len(), ALWAYS_PRUNED_DEBUG_SECTIONS.len());
+        assert!(ALWAYS_PRUNED_DEBUG_SECTIONS.contains(&".debug_info"));
+        for not_always_pruned in [".debug_line", ".debug_line_str", ".debug_str"] {
+            assert!(!ALWAYS_PRUNED_DEBUG_SECTIONS.contains(&not_always_pruned));
+        }
+    }
 
     #[test]
     fn target_flags_pin_frames_lines_identity_and_all_varying_roots() {
