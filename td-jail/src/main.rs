@@ -8,6 +8,7 @@
 mod authority;
 mod bus;
 mod cgroup;
+mod firefox;
 #[allow(dead_code)]
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[cfg_attr(
@@ -56,6 +57,7 @@ fn run() -> std::io::Result<()> {
         transition::Mode::ProcessTokenProbe { application, token } => {
             transition::probe_process_token(&application, &token)
         }
+        transition::Mode::FirefoxSupportProbe => transition::probe_firefox_support(),
         transition::Mode::WriteFilter => transition::write_standard_filter(),
         transition::Mode::CgroupCleanupBootstrap { membership } => {
             transition::run_cgroup_cleanup_bootstrap(&membership)
@@ -139,6 +141,7 @@ mod confinement {
     const AUTHORITY: &str = include_str!("authority.rs");
     const BUS: &str = include_str!("bus.rs");
     const CGROUP: &str = include_str!("cgroup.rs");
+    const FIREFOX: &str = include_str!("firefox.rs");
     const MAIN: &str = include_str!("main.rs");
     const PERMISSIONS: &str = include_str!("../../engine/src/permissions.rs");
     const SECCOMP: &str = include_str!("seccomp.rs");
@@ -160,6 +163,8 @@ mod confinement {
         assert_eq!(BUS.matches("unsafe {").count(), 0);
         assert_eq!(CGROUP.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(CGROUP.matches("unsafe {").count(), 0);
+        assert_eq!(FIREFOX.matches("#[allow(unsafe_code)]").count(), 0);
+        assert_eq!(FIREFOX.matches("unsafe {").count(), 0);
         assert_eq!(PERMISSIONS.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(PERMISSIONS.matches("unsafe {").count(), 0);
         assert_eq!(SECCOMP.matches("#[allow(unsafe_code)]").count(), 0);
@@ -738,6 +743,12 @@ mod confinement {
         ] {
             assert!(TRANSITION.contains(call), "missing syscall caller: {call}");
         }
+        assert_eq!(
+            TRANSITION.matches("sys::install_seccomp_filter(").count(),
+            1,
+            "two observed filters prove Firefox nested its own filter only while td-jail installs exactly one"
+        );
+        assert_eq!(FIREFOX.matches("sandbox.filters >= 2").count(), 1);
         assert!(TRANSITION.contains("sys::terminate_namespace,"));
         assert!(!shipped_main.contains("sys::"));
         assert!(!AUTHORITY.contains("sys::"));

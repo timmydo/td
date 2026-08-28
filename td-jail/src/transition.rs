@@ -4,7 +4,7 @@ use crate::{
         paths_overlap, FilesystemGrant, FilesystemSourceKind, LaunchPlan, ResolvedFile,
         ResolvedResourceLimits,
     },
-    cgroup, seccomp, sys,
+    cgroup, firefox, seccomp, sys,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr, OsString};
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 pub const PROBE_ARG: &str = "--probe-transition";
 pub const RESOURCE_PROBE_ARG: &str = "--probe-resource-caps";
 pub const PROCESS_TOKEN_PROBE_ARG: &str = "--probe-process-token";
+pub const FIREFOX_SUPPORT_PROBE_ARG: &str = "--probe-firefox-support";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
 const APPLICATION_SESSION_ARG: &str = "--internal-application-session";
 const CGROUP_CLEANUP_ARG: &str = "--internal-cgroup-cleanup";
@@ -215,6 +216,7 @@ pub enum Mode {
         application: String,
         token: String,
     },
+    FirefoxSupportProbe,
     WriteFilter,
     ApplicationSession {
         parent: u32,
@@ -339,6 +341,12 @@ where
             return Err(usage_error());
         }
         return Ok(Mode::ProcessTokenProbe { application, token });
+    }
+    if mode == FIREFOX_SUPPORT_PROBE_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::FirefoxSupportProbe);
     }
     if mode == FILTER_ARG {
         if args.next().is_some() {
@@ -731,7 +739,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, or --probe-process-token NAME TOKEN; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, or --probe-firefox-support; installed applications are selected by argv[0]",
     )
 }
 
@@ -3326,6 +3334,27 @@ pub fn probe_process_token(application: &str, token: &str) -> io::Result<()> {
     writeln!(io::stdout(), "{diagnostic}")
 }
 
+pub fn probe_firefox_support() -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the Firefox support probe requires the nonzero application identity",
+        ));
+    }
+    let report = firefox::probe_support()?;
+    let limits = authority::resolve_resource_limits("firefox")?;
+    let sandboxes = cgroup::process_sandboxes(
+        "firefox",
+        &firefox::namespace_pids(&report),
+        limits,
+        identity.uid,
+        identity.gid,
+    )?;
+    let diagnostic = firefox::validate_and_render(&report, &sandboxes)?;
+    writeln!(io::stdout(), "{diagnostic}")
+}
+
 pub fn run_cgroup_cleanup_bootstrap(membership: &str) -> io::Result<()> {
     let _identity = cleanup_identity()?;
     cgroup::validate_expected_membership(membership)?;
@@ -4900,6 +4929,12 @@ mod tests {
             "extra"
         ]))
         .is_err());
+
+        assert_eq!(
+            parse_mode(args(&[FIREFOX_SUPPORT_PROBE_ARG])).unwrap(),
+            Mode::FirefoxSupportProbe
+        );
+        assert!(parse_mode(args(&[FIREFOX_SUPPORT_PROBE_ARG, "extra"])).is_err());
     }
 
     #[test]

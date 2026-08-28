@@ -1547,6 +1547,14 @@ kernel token, and disappears on reboot. An ordinary boot launches Firefox
 with its default profile and first-run flow, and the content readiness and
 evidence probes become successful no-ops rather than failing or delaying the
 service while the browser waits for the human's decision.
+The exact autotest launch additionally enables Firefox's Marionette server and
+the Firefox 138-and-later system-access opt-in. Marionette's own pinned server
+implementation binds loopback only with a backlog of one, and the td probe
+accepts protocol version 3 with one active session, bounded frames and one
+60-second end-to-end deadline. This unauthenticated privileged channel is test
+machinery, not a product interface: neither flag reaches an ordinary boot,
+the profile is volatile, and `td.autotest=1` remains supported only in the
+NIC-less or inbound-unreachable QEMU plans described below.
 The compositor considers only toplevels that asserted the exact
 `org.mozilla.firefox` XDG app id and surfaces in their bounded active
 subsurface trees only while every surface from the content leaf through the
@@ -1570,24 +1578,50 @@ withholds evidence rather than weakening attribution.
 
 A root-owned evidence unit independently requires that latched compositor
 record, a currently live Firefox jail with the exact cgroup caps, and an exact
-`-contentproc` argv token on a process revalidated inside that same cgroup. It
-then atomically publishes evidence and emits the existing
+`-contentproc` argv token on a process revalidated inside that same cgroup. A
+nonroot bounded client then opens the test-only loopback Marionette endpoint,
+creates one session, selects the privileged browser context and runs one fixed
+script. The script calls the same `Troubleshoot.snapshot()` provider as
+`about:support`, and requires Wayland, Software WebRender, Seccomp-BPF and
+thread synchronization, the selected no-user-namespace fallback, content and
+media sandbox availability, and configured plus effective content level 6.
+It separately asks Firefox for the live child-process table. The td-owned
+client maps those namespace PIDs through each candidate's `NSpid` row,
+records the host PID's kernel start time, revalidates its namespace PID and
+start time inside the one active Firefox cgroup, and takes the sandbox fields
+from a fresh bounded status read. Dynamic status counters may change across
+that membership check. `NoNewPrivs: 1`, `Seccomp: 2` and
+at least two stacked filters are required for every reported live content,
+GPU, socket and media role: the first filter is inherited from td-jail, so the
+second is direct evidence that Firefox installed its own process-role filter.
+Content, socket and at least one RDD/media-utility role must exist; a separate GPU
+process is required only when Firefox reports one under Software WebRender.
+All of Firefox's pinned content-process types enter the content role. All
+utility processes enter the utility role and need nested-filter evidence, but
+only typed `audioDecoder_*`, `mfMediaEngineCDM`, or GMP processes satisfy the
+media alternative, so the autotest's unrelated `jSOracle` process cannot
+substitute for RDD. Unknown process types and utility actors fail closed; the
+known fork server is explicitly outside these post-fork sandbox classes.
+The session is deleted before its result becomes evidence.
+
+The unit then atomically publishes evidence and emits the existing
 `TD-FIREFOX-FIRST-WINDOW-READY` marker followed by the distinct
-`TD-FIREFOX-HTTPS-CONTENT-READY` marker. The closed autotest boot has no
+`TD-FIREFOX-HTTPS-CONTENT-READY` and `TD-FIREFOX-SUPPORT-READY` markers. The
+closed autotest boot has no
 other programmed producer for the app id and fixed sentinel document, and
 that document exists only behind the declared localhost HTTPS origin.
-Firefox has no console descriptor, and the host oracle accepts only both
+Firefox has no console descriptor, and the host oracle accepts only all three
 exact console lines. The Wayland peer is still not cryptographically bound to
 the cgroup process, but the evidence now proves deterministic HTTPS document
 pixels entered an accepted application buffer, its paint succeeded, and both
 sentinel regions from that surface survived placement, stacking, clipping and
 occlusion into the compositor's rendered output, a process with Firefox's
 exact `-contentproc` role token remained live in the Firefox cgroup, and
-resource accounting remained within the compiled ceilings, without manual
-inspection. It does not yet prove input, portals,
+resource accounting remained within the compiled ceilings, and Firefox's own
+renderer and inner sandbox stayed active in its live process classes, without
+manual inspection. It does not yet prove input, portals,
 external networking policy, audio, pixel-for-pixel correspondence
-between the accepted buffer and the complete decorated output, or the complete
-process-class sandbox report required by §H.
+between the accepted buffer and the complete decorated output.
 
 Firefox also materially increases the first profiler report's symbolization
 work: the initial 60-second capture can finish sampling before its immutable
@@ -2544,13 +2578,14 @@ changes during the scan, then fails only if no stable same-cgroup process
 carries the exact NUL-delimited token. This makes ordinary exit and PID reuse
 fail closed without letting one transient process hide a live content role. It
 atomically publishes the root-owned
-evidence file, emits both Firefox readiness markers, then atomically publishes
-a distinct completion record that releases the autotest greeter. Its own
-bounded one-second probe loop covers a second Firefox cold-start attempt
-without
-inheriting td-svc's exponential restart backoff. The greeter's separate
-allowance also includes the first Firefox ready timeout that can elapse before
-the evidence unit starts. Deployment success does not depend on Firefox or its
+evidence file, emits all three Firefox readiness markers, then atomically
+publishes a distinct completion record that releases the autotest greeter.
+Its bounded cheap polling covers a second Firefox cold-start attempt without
+inheriting td-svc's exponential restart backoff. Once the cheap probes pass,
+the unit allows at most three Firefox support sessions, each with one 60-second
+end-to-end deadline. The greeter's separate allowance includes both those
+sessions and the first Firefox ready timeout that can elapse before the
+evidence unit starts. Deployment success does not depend on Firefox or its
 mutable state. Once deployment health has finished, missing evidence or
 completion releases the greeter when that complete bounded allowance expires,
 so QEMU reports the missing marker instead of waiting for the full boot
@@ -3087,11 +3122,13 @@ Server, RDD, and Extension processes. This is the upstream fallback outcome
 the standard filter was intended to match: denying a nested user namespace
 does not disable Firefox's content seccomp sandbox.
 
-That bounded experiment selects the filter; it does **not** discharge §H's
-stronger oracle. A headless `about:support` page does not exercise ordinary
-web content, GPU, socket, and utility classes together under td-jail. The
-Firefox milestone must still open ordinary content and assert the expected
-sandbox result for every process class that the pinned build creates.
+That bounded experiment selected the filter but did not by itself discharge
+§H's stronger oracle. Rung 27b now does: the shipped GUI browser opens the
+ordinary HTTPS fixture under td-jail, Firefox's own support provider reports
+the selected fallback, and the same privileged snapshot requires a distinct
+nested seccomp filter in every live required child role. This combines the
+global Linux support-page facts with per-process kernel evidence instead of
+pretending `about:support` exposes a per-class level that it does not.
 
 ### `UNSAFE.md` surface #9 (target-state draft)
 
@@ -5866,11 +5903,13 @@ packaged selftest, boot oracle — with **network never in the gate**.
    high-water evidence. An independent trusted evidence unit requires that record, a
    currently live Firefox jail's cgroup-cap readback and a revalidated process
    with an exact same-cgroup `-contentproc` argv token, publishes the evidence
-   file, emits
+   file, requires Firefox's own Wayland, Software WebRender and fallback
+   sandbox report plus nested filters in every reported live child role, emits
    `TD-FIREFOX-FIRST-WINDOW-READY` and
-   `TD-FIREFOX-HTTPS-CONTENT-READY`, then publishes a completion record that
-   lets the autotest greeter exit. QEMU requires both exact markers on every
-   system boot.
+   `TD-FIREFOX-HTTPS-CONTENT-READY` followed by
+   `TD-FIREFOX-SUPPORT-READY`, then publishes a completion record that lets the
+   autotest greeter exit. QEMU requires all three exact markers on every system
+   boot.
    The evidence unit is not a dependency of `bootsuccess`, so user-owned state
    cannot decrement the deployment attempt counter. The application has no
    terminal or console descriptor with which to forge that evidence or alter
@@ -5902,7 +5941,12 @@ packaged selftest, boot oracle — with **network never in the gate**.
    `builder/src/affected.rs`, or its lints and tests never run; the
    kernel config contains every required option; the real system-image launch
    needs no installation or package fetch; packages are read-only in the jail;
-   host sentinel paths are absent; and no test-only probe enters the closure.
+   host sentinel paths are absent; and no separately injected test executable
+   enters the closure. The autotest-only Firefox listener argv and privileged
+   evidence unit remain behind the closed kernel-token path. Shipped
+   unprivileged probe verbs remain callable on an ordinary boot like the
+   resource-cap probes, but have no listener or volatile trust files and
+   therefore cannot produce support evidence there.
 8. **The §B.8 marker's own tests, which are the ones this design most
    depends on** and which nothing else in this list covers:
    - a recipe naming a marked path in `inputs`/`native_inputs` rather
@@ -5933,14 +5977,13 @@ packaged selftest, boot oracle — with **network never in the gate**.
 
 ### Before anyone writes "Firefox runs"
 
-The automated HTTPS-document markers above deliberately do not claim this
-whole section. They prove package selection, jail execution, XDG app identity,
-an accepted buffer with the exact bounded document-background pixel region,
-framebuffer paint, NSS-backed HTTPS to the declared guest-local origin, a
-same-cgroup process with Firefox's exact `-contentproc` argv token and live
-resource high-water/cgroup caps. The complete browser claim still requires
-every item below, notably the full `about:support` process-class report and
-input, portal, download, isolation and soak evidence.
+The automated markers above deliberately do not claim this whole section.
+They prove package selection, jail execution, XDG app identity, attributed
+HTTPS pixels, the declared guest-local NSS path, renderer selection, the
+global fallback sandbox facts, and nested filters in every reported live
+required process role. The complete browser claim still requires the remaining
+items below, notably input, portal, download, isolation, soak and audio
+evidence.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -5971,12 +6014,16 @@ and image commits — showing:
    which is the disclosure per-app uids exist to stop. (A draft written
    before §B.1 put packages under `~/.td/pkg` and argued the second half
    from that; the assertion is unchanged, its reason is not.);
-4. main and content processes inside the jail, **and `about:support`'s
-   sandbox section reporting the expected level for every process class**
-   — content, GPU, socket and utility — because a Firefox whose own
-   sandbox silently failed to install inside td's jail satisfies every
-   other item on this list (§C's nested-sandbox note);
-5. `about:support` reporting Wayland and Software WebRender;
+4. main and content processes inside the jail; `about:support` reporting the
+   expected global sandbox capabilities and configured/effective level; and
+   every live content, GPU, socket and media utility class reporting
+   `NoNewPrivs: 1`, seccomp mode 2 and at least two stacked filters, with
+   content, socket and a media class always required. Firefox's
+   support page does not expose a per-class level on Linux, so claiming that
+   it did would be a false oracle; the per-process status is what proves the
+   inherited td filter did not replace Firefox's own filter (§C);
+5. `about:support` reporting Wayland and Software WebRender — **LANDED in the
+   automated support snapshot together with item 4's sandbox evidence**;
 6. one HTTPS page loading and rendering — served by a **declared
    in-guest TLS origin**, not from the public internet: a fixture server
    on the guest uses the source-built static LibreSSL command. A trusted
@@ -6094,6 +6141,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 26 | `td-audio`'s PulseAudio protocol: frames, tagstruct codec, `AUTH`/`SET_CLIENT_NAME`/sink info, one playback stream; `sockets=pulseaudio` binds the socket into a jail | a jailed fixture app plays audio |
 | 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The initial proof selected a fresh volatile automation profile and fixed local document, then accepted only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributed both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. Rung 27a retains that authority and replaces the local-file transport with verified HTTPS. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints deterministic content without manual inspection |
 | 27a | **Firefox HTTPS/NSS image proof — LANDED**; the source-built LibreSSL command supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The all-interface LibreSSL test listener is supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
+| 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox input, portals, isolation, soak and sound are all proved** |
 
 **Two other reversals are still absent from this ladder, and that is a

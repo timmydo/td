@@ -10,10 +10,10 @@ use crate::ladder::{
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER, TD_INIT_RUNTIME_MARKER,
-    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
-    TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
-    UUTILS_RUNTIME_MARKER,
+    TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
+    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
+    TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -220,15 +220,20 @@ const FIREFOX_COMPLETION: &str = "td-firefox-evidence-complete-v1";
 const FIREFOX_READY_TIMEOUT_SECS: u16 = 180;
 const FIREFOX_READY_ATTEMPTS: u16 = 2;
 const FIREFOX_RETRY_MARGIN_SECS: u16 = 60;
+const FIREFOX_SUPPORT_TIMEOUT_SECS: u16 = 60;
+const FIREFOX_SUPPORT_ATTEMPTS: u16 = 3;
 // The evidence unit polls itself so its deadline is not widened by td-svc's
 // exponential restart backoff. Autotest allows two cold starts plus margin.
 const FIREFOX_EVIDENCE_WAIT_ITERATIONS: u16 =
     FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS
         + FIREFOX_RETRY_MARGIN_SECS;
 // The greeter may observe deployment health before Firefox's first ready
-// timeout starts the evidence unit, so its own allowance includes that offset.
+// timeout starts the evidence unit. Its allowance includes that offset and
+// each separately bounded Firefox support attempt.
 const FIREFOX_GREETER_WAIT_ITERATIONS: u16 =
-    FIREFOX_READY_TIMEOUT_SECS + FIREFOX_EVIDENCE_WAIT_ITERATIONS;
+    FIREFOX_READY_TIMEOUT_SECS
+        + FIREFOX_EVIDENCE_WAIT_ITERATIONS
+        + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS;
 
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
     name: FIREFOX_NAME,
@@ -1204,11 +1209,12 @@ fn build_td_svc_conf() -> String {
          \n\
          # Firefox is also QEMU boot evidence. td-login passes a literal argv and\n\
          # td-jail resolves argv[0] through the immutable image registry. Under\n\
-         # autotest only, Firefox receives the volatile profile and verified URL;\n\
+         # autotest only, Firefox receives the volatile profile, verified URL,\n\
+         # and loopback-only Marionette server used by the support oracle;\n\
          # ordinary boots retain Firefox's own first-run and default-profile flow.\n\
          [firefox]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name} --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name};; esac'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name} --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name};; esac'\n\
          after=busd,wayland,firefox-autotest,firefox-tls-origin\n\
          requires=wayland,firefox-autotest,firefox-tls-origin\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
@@ -1216,15 +1222,16 @@ fn build_td_svc_conf() -> String {
          restart=always\n\
          \n\
          # This application is test evidence, not deployment health. The exact\n\
-         # compositor probe and live td-jail cap probe must both succeed before\n\
+         # compositor, live-cgroup and Firefox support probes must succeed before\n\
          # trusted unit code prints the marker, but mutable user state cannot\n\
          # block bootsuccess.\n\
-         # A failed cold start is covered by this unit's bounded one-second probe\n\
-         # loop, not td-svc's exponential restart backoff. No unit consumes its\n\
-         # spawn-ready state; the marker after atomic publication is the authority.\n\
+         # A failed cold start is covered by bounded cheap polling, not td-svc's\n\
+         # exponential restart backoff. Once those probes pass, at most three\n\
+         # separately deadline-bounded support sessions may run. No unit consumes\n\
+         # this unit's spawn-ready state; atomic marker publication is the authority.\n\
          [firefox-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {firefox_evidence_wait} ]; do if application=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} 2>/dev/null) && content=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} -contentproc 2>/dev/null) && /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-resource-caps {firefox_name}; then /bin/rm -f {firefox_evidence_tmp_path} {firefox_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_evidence} > {firefox_evidence_tmp_path} && /bin/td-util chmod 0644 {firefox_evidence_tmp_path} && /bin/mv {firefox_evidence_tmp_path} {firefox_evidence_path} && /bin/td-util printf \"%s\\n\" \"$application\" && /bin/td-util printf \"%s\\n\" \"$content\" && /bin/echo {firefox_marker} && /bin/echo {firefox_content_marker} && /bin/td-util printf \"%s\\n\" {firefox_completion} > {firefox_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_completion_tmp_path} && /bin/mv {firefox_completion_tmp_path} {firefox_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {firefox_evidence_wait} ]; do if application=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} 2>/dev/null) && content=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} -contentproc 2>/dev/null) && /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-resource-caps {firefox_name}; then if support=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-support); then /bin/rm -f {firefox_evidence_tmp_path} {firefox_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_evidence} > {firefox_evidence_tmp_path} && /bin/td-util chmod 0644 {firefox_evidence_tmp_path} && /bin/mv {firefox_evidence_tmp_path} {firefox_evidence_path} && /bin/td-util printf \"%s\\n\" \"$application\" && /bin/td-util printf \"%s\\n\" \"$content\" && /bin/td-util printf \"%s\\n\" \"$support\" && /bin/echo {firefox_marker} && /bin/echo {firefox_content_marker} && /bin/echo {firefox_support_marker} && /bin/td-util printf \"%s\\n\" {firefox_completion} > {firefox_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_completion_tmp_path} && /bin/mv {firefox_completion_tmp_path} {firefox_completion_path} && exit 0; fi; s=$((s+1)); [ \"$s\" -lt {firefox_support_attempts} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
          after=firefox\n\
          restart=never\n\
          \n\
@@ -1303,6 +1310,7 @@ fn build_td_svc_conf() -> String {
         firefox_window_ready_socket = FIREFOX_WINDOW_READY_SOCKET,
         firefox_marker = TD_FIREFOX_BOOT_MARKER,
         firefox_content_marker = TD_FIREFOX_CONTENT_MARKER,
+        firefox_support_marker = TD_FIREFOX_SUPPORT_MARKER,
         firefox_evidence = FIREFOX_EVIDENCE,
         firefox_evidence_path = FIREFOX_EVIDENCE_PATH,
         firefox_evidence_tmp_path = FIREFOX_EVIDENCE_TMP_PATH,
@@ -1311,6 +1319,7 @@ fn build_td_svc_conf() -> String {
         firefox_completion_tmp_path = FIREFOX_COMPLETION_TMP_PATH,
         firefox_ready_timeout = FIREFOX_READY_TIMEOUT_SECS,
         firefox_evidence_wait = FIREFOX_EVIDENCE_WAIT_ITERATIONS,
+        firefox_support_attempts = FIREFOX_SUPPORT_ATTEMPTS,
     )
 }
 
@@ -4624,6 +4633,12 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             "\\\"/etc/firefox/policies/td-firefox-autotest-ca.pem\\\""
         ));
         assert!(jail_authority.contains(r#""]}}}\n","#));
+        let firefox_probe = include_str!("../../../td-jail/src/firefox.rs");
+        let deadline = format!(
+            "const PROBE_DEADLINE: Duration = Duration::from_secs({});",
+            FIREFOX_SUPPORT_TIMEOUT_SECS
+        );
+        assert_eq!(firefox_probe.matches(&deadline).count(), 1);
         let firefox_autotest =
             unit_key("firefox-autotest", "exec").unwrap_or_default();
         assert!(firefox_autotest.starts_with(&format!(
@@ -4663,7 +4678,8 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             format!(
                 "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in \
                  *\" {AUTOTEST_CMDLINE_TOKEN} \"*) exec /bin/td-login exec-as tester -- \
-                 /bin/{FIREFOX_NAME} --profile {FIREFOX_AUTOTEST_PROFILE} \
+                 /bin/{FIREFOX_NAME} --marionette --remote-allow-system-access \
+                 --profile {FIREFOX_AUTOTEST_PROFILE} \
                  {FIREFOX_TLS_URL};; *) exec \
                  /bin/td-login exec-as tester -- /bin/{FIREFOX_NAME};; esac'")
         );
@@ -4718,6 +4734,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             FIREFOX_GREETER_WAIT_ITERATIONS,
             FIREFOX_READY_TIMEOUT_SECS
                 + FIREFOX_EVIDENCE_WAIT_ITERATIONS
+                + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS
         );
         assert!(
             u64::from(FIREFOX_GREETER_WAIT_ITERATIONS)
@@ -4728,7 +4745,10 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         );
         let evidence = unit_key("firefox-evidence", "exec").unwrap_or_default();
         assert!(evidence.starts_with(&format!(
-            "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {FIREFOX_EVIDENCE_WAIT_ITERATIONS} ]; do if application=$(/bin/td-login exec-as tester -- /bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} {FIREFOX_APP_ID} {FIREFOX_CONTENT_RGB_A} {FIREFOX_CONTENT_RGB_B} 2>/dev/null) && content=$(/bin/td-login exec-as tester -- /bin/td-jail --probe-process-token {FIREFOX_NAME} -contentproc 2>/dev/null) && /bin/td-login exec-as tester -- /bin/td-jail --probe-resource-caps {FIREFOX_NAME}; then "
+            "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {FIREFOX_EVIDENCE_WAIT_ITERATIONS} ]; do if application=$(/bin/td-login exec-as tester -- /bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} {FIREFOX_APP_ID} {FIREFOX_CONTENT_RGB_A} {FIREFOX_CONTENT_RGB_B} 2>/dev/null) && content=$(/bin/td-login exec-as tester -- /bin/td-jail --probe-process-token {FIREFOX_NAME} -contentproc 2>/dev/null) && /bin/td-login exec-as tester -- /bin/td-jail --probe-resource-caps {FIREFOX_NAME}; then if support=$(/bin/td-login exec-as tester -- /bin/td-jail --probe-firefox-support); then "
+        )));
+        assert!(evidence.contains(&format!(
+            "s=$((s+1)); [ \"$s\" -lt {FIREFOX_SUPPORT_ATTEMPTS} ] || exit 1"
         )));
         assert!(evidence.contains(&format!(
             "/bin/rm -f {FIREFOX_EVIDENCE_TMP_PATH} {FIREFOX_COMPLETION_TMP_PATH}"
@@ -4755,6 +4775,12 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         let content_report = evidence
             .find("/bin/td-util printf \"%s\\n\" \"$content\"")
             .expect("Firefox content-process report missing");
+        let support_report = evidence
+            .find("/bin/td-util printf \"%s\\n\" \"$support\"")
+            .expect("Firefox support report missing");
+        let support_marker = evidence
+            .find(&format!("/bin/echo {TD_FIREFOX_SUPPORT_MARKER}"))
+            .expect("Firefox support marker missing");
         let evidence_publish = evidence
             .find(&format!(
                 "/bin/mv {FIREFOX_EVIDENCE_TMP_PATH} {FIREFOX_EVIDENCE_PATH}"
@@ -4780,15 +4806,17 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 && evidence_chmod < evidence_publish
                 && evidence_publish < application_report
                 && application_report < content_report
-                && content_report < evidence_marker
+                && content_report < support_report
+                && support_report < evidence_marker
                 && evidence_marker < content_marker
-                && content_marker < completion_write
+                && content_marker < support_marker
+                && support_marker < completion_write
                 && completion_write < completion_chmod
                 && completion_chmod < completion_publish,
             "evidence, marker and completion must have one exact order"
         );
         assert!(evidence.ends_with(&format!(
-            "&& /bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
+            "&& /bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH} && exit 0; fi; s=$((s+1)); [ \"$s\" -lt {FIREFOX_SUPPORT_ATTEMPTS} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
         )));
         assert_eq!(
             unit_key("firefox-evidence", "type").as_deref(),
@@ -7930,6 +7958,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 "/bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH}"
             )) && !bootsuccess.contains(TD_FIREFOX_BOOT_MARKER)
                 && !bootsuccess.contains(TD_FIREFOX_CONTENT_MARKER)
+                && !bootsuccess.contains(TD_FIREFOX_SUPPORT_MARKER)
                 && profile.contains(&format!(
                     "firefox_complete=$(/bin/td-util cat {FIREFOX_COMPLETION_PATH} 2>/dev/null)"
                 ))
@@ -9207,6 +9236,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             !bootsuccess.contains(TD_FIREFOX_CONTENT_MARKER),
             "browser content evidence must not control deployment boot success"
+        );
+        assert!(
+            !bootsuccess.contains(TD_FIREFOX_SUPPORT_MARKER),
+            "browser support evidence must not control deployment boot success"
         );
         let services = build_td_svc_conf();
         let evidence_probe = services

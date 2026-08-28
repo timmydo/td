@@ -121,6 +121,7 @@ const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MA
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
 const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_BOOT_MARKER;
 const TD_FIREFOX_CONTENT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CONTENT_MARKER;
+const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MARKER;
 const TD_PROFILER_ATTRIBUTION_MARKER: &str =
     td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
@@ -301,6 +302,7 @@ struct ConsoleEvidence {
     td_jail_seccomp: bool,
     td_firefox: bool,
     td_firefox_content: bool,
+    td_firefox_support: bool,
     td_profiler_attribution: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
@@ -1471,6 +1473,16 @@ fn validate_system_boot(
              certificate policy, NSS verification, fixed document pixel region, compositor \
              resource high-water validation, or same-jail Firefox content-role process \
              evidence failed. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_firefox_support {
+        return Err(format!(
+            "Firefox painted verified HTTPS content, but the browser support marker \
+             ({TD_FIREFOX_SUPPORT_MARKER:?}) was absent — the privileged Firefox \
+             snapshot did not prove Wayland, Software WebRender, fallback sandbox \
+             level 6, or nested seccomp filters in every required process role. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -3320,6 +3332,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
         exact_line_window(TD_FIREFOX_BOOT_MARKER),
         exact_line_window(TD_FIREFOX_CONTENT_MARKER),
+        exact_line_window(TD_FIREFOX_SUPPORT_MARKER),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
             .saturating_add(exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER)),
@@ -3500,6 +3513,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_firefox_content,
         buf,
         TD_FIREFOX_CONTENT_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_support,
+        buf,
+        TD_FIREFOX_SUPPORT_MARKER.as_bytes(),
     );
     latch_prefixed_line_marker(
         &mut evidence.td_profiler_attribution,
@@ -4460,7 +4478,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 45] {
+    fn all_console_markers() -> [&'static str; 46] {
         [
             MARKER,
             EROFS_MARKER,
@@ -4503,6 +4521,7 @@ mod tests {
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_FIREFOX_BOOT_MARKER,
             TD_FIREFOX_CONTENT_MARKER,
+            TD_FIREFOX_SUPPORT_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
@@ -4617,6 +4636,19 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_firefox_content);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_SUPPORT_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_support);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_SUPPORT_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_support);
     }
 
     #[test]
@@ -4835,6 +4867,7 @@ mod tests {
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_FIREFOX_BOOT_MARKER,
             TD_FIREFOX_CONTENT_MARKER,
+            TD_FIREFOX_SUPPORT_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_BOOT_SUCCESS_MARKER,
@@ -4895,6 +4928,7 @@ mod tests {
         assert!(evidence.td_jail_seccomp);
         assert!(evidence.td_firefox);
         assert!(evidence.td_firefox_content);
+        assert!(evidence.td_firefox_support);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
         assert!(evidence.boot_success);

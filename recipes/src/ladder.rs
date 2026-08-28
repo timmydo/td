@@ -846,6 +846,11 @@ pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";
 /// token in the same application cgroup.
 pub const TD_FIREFOX_CONTENT_MARKER: &str = "TD-FIREFOX-HTTPS-CONTENT-READY";
 
+/// Emitted only after Firefox's own privileged support snapshot reports the
+/// pinned Wayland/software renderer and fallback sandbox, while every reported
+/// live content, GPU, socket and media-role process retains a nested filter.
+pub const TD_FIREFOX_SUPPORT_MARKER: &str = "TD-FIREFOX-SUPPORT-READY";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
 /// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.

@@ -12,6 +12,8 @@ const MAX_CONTROL_BYTES: u64 = 4096;
 const MAX_ACTIVE_SCAN: usize = 256;
 const MAX_PROCESS_TOKEN_BYTES: usize = 64;
 const MAX_PROCESS_CMDLINE_BYTES: u64 = 64 * 1024;
+const MAX_PROCESS_STATUS_BYTES: u64 = 64 * 1024;
+const MAX_FIREFOX_CHILDREN: usize = 256;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_POLL: Duration = Duration::from_millis(10);
 
@@ -36,6 +38,14 @@ pub(crate) struct Report {
     pub(crate) events: MemoryEvents,
     pub(crate) peak: u64,
     pub(crate) cpu: CpuStat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessSandbox {
+    pub(crate) namespace_pid: u32,
+    pub(crate) no_new_privileges: u32,
+    pub(crate) seccomp: u32,
+    pub(crate) filters: u32,
 }
 
 impl Report {
@@ -342,6 +352,167 @@ pub(crate) fn probe_process_token(
     Err(io::Error::other(format!(
         "no process in active application cgroup {instance:?} has argument {token:?}"
     )))
+}
+
+pub(crate) fn process_sandboxes(
+    application: &str,
+    namespace_pids: &[u32],
+    limits: ResolvedResourceLimits,
+    uid: u32,
+    gid: u32,
+) -> io::Result<Vec<ProcessSandbox>> {
+    if namespace_pids.is_empty()
+        || namespace_pids.len() > MAX_FIREFOX_CHILDREN
+        || namespace_pids
+            .iter()
+            .any(|pid| *pid == 0 || namespace_pids.iter().filter(|seen| *seen == pid).count() != 1)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Firefox namespace PID set is empty, repeated, or over limit",
+        ));
+    }
+    let (instance, directory, _) = active_instance(application, limits, uid, gid)?;
+    let membership = membership_for_instance(&instance)?;
+    let processes = read_control(&directory.join("cgroup.procs"))?;
+    let mut sandboxes = Vec::new();
+    for line in processes.lines() {
+        let host_pid = line.parse::<u32>().map_err(|error| {
+            io::Error::other(format!(
+                "application cgroup {instance:?} has invalid process id {line:?}: {error}"
+            ))
+        })?;
+        let proc_directory = PathBuf::from(format!("/proc/{host_pid}"));
+        let status_path = proc_directory.join("status");
+        let stat_path = proc_directory.join("stat");
+        let Ok(starttime) = read_process_stat(&stat_path).and_then(|stat| process_starttime(&stat))
+        else {
+            continue;
+        };
+        let Ok(status) = read_process_status(&status_path) else {
+            continue;
+        };
+        let Ok(initial) = sandbox_status(&status) else {
+            continue;
+        };
+        let namespace_pid = initial.namespace_pid;
+        if !namespace_pids.contains(&namespace_pid) {
+            continue;
+        }
+        let membership_path = format!("/proc/{host_pid}/cgroup");
+        let Ok(observed) = read_bounded(Path::new(&membership_path)) else {
+            continue;
+        };
+        if require_membership_text(&observed, &membership).is_err() {
+            continue;
+        }
+        let Ok(revalidated_status) = read_process_status(&status_path) else {
+            continue;
+        };
+        let Ok(revalidated) = sandbox_status(&revalidated_status) else {
+            continue;
+        };
+        let Ok(revalidated_starttime) =
+            read_process_stat(&stat_path).and_then(|stat| process_starttime(&stat))
+        else {
+            continue;
+        };
+        let Some(revalidated) =
+            revalidated_sandbox(initial, revalidated, starttime, revalidated_starttime)
+        else {
+            continue;
+        };
+        if sandboxes
+            .iter()
+            .any(|sandbox: &ProcessSandbox| sandbox.namespace_pid == namespace_pid)
+        {
+            return Err(io::Error::other(format!(
+                "application cgroup {instance:?} repeats Firefox namespace PID {namespace_pid}"
+            )));
+        }
+        sandboxes.push(revalidated);
+    }
+    if let Some(missing) = namespace_pids.iter().find(|pid| {
+        !sandboxes
+            .iter()
+            .any(|sandbox| sandbox.namespace_pid == **pid)
+    }) {
+        return Err(io::Error::other(format!(
+            "Firefox namespace PID {missing} is not a revalidated process in cgroup {instance:?}"
+        )));
+    }
+    Ok(sandboxes)
+}
+
+fn read_process_status(path: &Path) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_PROCESS_STATUS_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROCESS_STATUS_BYTES {
+        return Err(io::Error::other(format!(
+            "{} exceeds {MAX_PROCESS_STATUS_BYTES} bytes",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| io::Error::other(format!("{} is not UTF-8: {error}", path.display())))
+}
+
+fn read_process_stat(path: &Path) -> io::Result<String> {
+    read_bounded(path)
+}
+
+fn process_starttime(stat: &str) -> io::Result<u64> {
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| io::Error::other("process stat has no command-field terminator"))?;
+    fields
+        .split_ascii_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::other("process stat has no starttime"))?
+        .parse::<u64>()
+        .map_err(|error| io::Error::other(format!("process stat has invalid starttime: {error}")))
+}
+
+fn sandbox_status(status: &str) -> io::Result<ProcessSandbox> {
+    Ok(ProcessSandbox {
+        namespace_pid: namespace_process_id(status)?,
+        no_new_privileges: decimal_status_field(status, "NoNewPrivs:")?,
+        seccomp: decimal_status_field(status, "Seccomp:")?,
+        filters: decimal_status_field(status, "Seccomp_filters:")?,
+    })
+}
+
+fn revalidated_sandbox(
+    initial: ProcessSandbox,
+    revalidated: ProcessSandbox,
+    starttime: u64,
+    revalidated_starttime: u64,
+) -> Option<ProcessSandbox> {
+    (initial.namespace_pid == revalidated.namespace_pid && starttime == revalidated_starttime)
+        .then_some(revalidated)
+}
+
+fn namespace_process_id(status: &str) -> io::Result<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .and_then(|value| value.split_ascii_whitespace().next_back())
+        .ok_or_else(|| io::Error::other("process status has no terminal NSpid"))?
+        .parse::<u32>()
+        .map_err(|error| io::Error::other(format!("process status has invalid NSpid: {error}")))
+}
+
+fn decimal_status_field(status: &str, name: &str) -> io::Result<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(name))
+        .ok_or_else(|| io::Error::other(format!("process status omitted {name}")))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| io::Error::other(format!("process status has invalid {name} {error}")))
 }
 
 fn configure(directory: &Path, limits: ResolvedResourceLimits) -> io::Result<()> {
@@ -806,5 +977,48 @@ mod tests {
         assert!(read_process_command(&path).is_none());
         fs::remove_file(&path).unwrap();
         assert!(read_process_command(&path).is_none());
+    }
+
+    #[test]
+    fn namespace_pid_and_sandbox_rows_are_exact() {
+        let status =
+            "Name:\tfirefox\nNSpid:\t8123\t17\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n";
+        assert_eq!(namespace_process_id(status).unwrap(), 17);
+        assert_eq!(decimal_status_field(status, "NoNewPrivs:").unwrap(), 1);
+        assert_eq!(decimal_status_field(status, "Seccomp:").unwrap(), 2);
+        assert_eq!(decimal_status_field(status, "Seccomp_filters:").unwrap(), 3);
+        assert!(namespace_process_id(&status.replace("NSpid:", "Pidns:")).is_err());
+        assert!(decimal_status_field(status, "NoNewPriv:").is_err());
+    }
+
+    #[test]
+    fn stable_process_identity_ignores_dynamic_status_rows() {
+        let before = "Name:\tfirefox\nNSpid:\t8123\t17\nVmRSS:\t100 kB\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t2\nvoluntary_ctxt_switches:\t9\n";
+        let after = "Name:\tfirefox\nNSpid:\t8123\t17\nVmRSS:\t180 kB\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\nvoluntary_ctxt_switches:\t12\n";
+        assert_ne!(before, after);
+        let initial = sandbox_status(before).unwrap();
+        let revalidated = sandbox_status(after).unwrap();
+        assert_eq!(
+            revalidated_sandbox(initial, revalidated, 4242, 4242),
+            Some(revalidated)
+        );
+        assert_eq!(revalidated.filters, 3);
+        assert_eq!(
+            revalidated_sandbox(
+                initial,
+                ProcessSandbox {
+                    namespace_pid: 18,
+                    ..revalidated
+                },
+                4242,
+                4242,
+            ),
+            None
+        );
+        assert_eq!(revalidated_sandbox(initial, revalidated, 4242, 4243), None);
+
+        let stat = "8123 (firefox child) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 20";
+        assert_eq!(process_starttime(stat).unwrap(), 4242);
+        assert!(process_starttime("8123 firefox S 1 2").is_err());
     }
 }
