@@ -128,22 +128,33 @@ remains in both files. Pair validation distinguishes it by `SHF_ALLOC` rather
 than by a name allowlist.
 
 Companions carry ordinary symbols plus line tables, not full variable and type
-debugging information. The image recipe records their total bytes and enforces
-a literal compiled ceiling kept outside the measuring code. The source-built
-toolchain and shipped deployment have independent ceilings: four GiB for the
-LLVM/rustc-dominated toolchain and one GiB for the image, which deliberately
-excludes that build-only toolchain. Changing either is reviewed with the
-corresponding size report. This keeps the always-available data useful for
-function and source-line attribution without turning every deployment into a
-full debugger SDK.
+debugging information. The producer removes `.debug_info`, `.debug_abbrev`,
+`.debug_aranges`, `.debug_types`, `.debug_ranges`, `.debug_rnglists`,
+`.debug_frame`, `.debug_loc`, `.debug_loclists`, `.debug_str_offsets`,
+`.debug_addr`, `.debug_macro`, `.debug_macinfo`, `.debug_pubnames`,
+`.debug_pubtypes`, `.debug_gnu_pubnames`, `.debug_gnu_pubtypes`,
+`.debug_names`, `.debug_sup`, `.debug_cu_index`, `.debug_tu_index`, and
+`.gdb_index` from every companion. It also removes `.debug_str` when every
+line-table unit is DWARF 2 through 4, whose path tables are inline, or when a
+structural scan of every DWARF-5 directory and file format finds no
+`DW_FORM_strp`. A declared `DW_FORM_strp` keeps `.debug_str` and subjects it
+to the ordinary reader ceiling. The named Codex exception makes no line-reader
+claim and removes `.debug_str` without this scan. The image recipe records the
+companions' total bytes and enforces a literal compiled ceiling kept outside
+the measuring code. The source-built toolchain and shipped deployment have
+independent ceilings: four GiB for the LLVM/rustc-dominated toolchain and one
+GiB for the image, which deliberately excludes that build-only toolchain.
+Changing either is reviewed with the corresponding size report. This keeps
+the always-available data useful for function and source-line attribution
+without turning every deployment into a full debugger SDK.
 
-The line program and its `.debug_line_str` or `.debug_str` path tables remain
-uncompressed. Pair validation rejects both ELF `SHF_COMPRESSED` and legacy
-`.zdebug_*` forms for those sections, so the dependency-free runtime reader is
-the checked consumer of every ordinary accepted companion rather than silently
-relying on a decompressor that is absent from the image. It also rejects
-duplicate named line/string sections and sections above the runtime's 32-MiB
-input ceiling. The named Codex boundary above raises only the producer's
+The line program and any retained `.debug_line_str` or `.debug_str` path table
+remain uncompressed. Pair validation rejects both ELF `SHF_COMPRESSED` and
+legacy `.zdebug_*` forms for those sections, so the dependency-free runtime
+reader is the checked consumer of every ordinary accepted companion rather
+than silently relying on a decompressor that is absent from the image. It also
+rejects duplicate named line/string sections and sections above the runtime's
+32-MiB input ceiling. The named Codex boundary above raises only the producer's
 structural `.debug_line` ceiling; it does not relax the runtime reader. The
 runtime reads `.debug_str` only when a line-table `DW_FORM_strp` actually
 refers to it.
@@ -393,15 +404,18 @@ One ordinary object accepts at most 32 MiB of `.debug_line`, 32 MiB for either
 external line-string section, one million retained line ranges, and 4,096 bytes
 in one reported source path. The named Codex producer exception is not accepted
 by this reader: function symbols remain available and source-line attribution
-fails explicitly at the 32-MiB check. One unit may declare at most 200,000 transient
-file/directory entries; the section byte ceiling bounds aggregate work across
-units. The section-name roster, symbol state, raw line-parser inputs, and all
-transient and retained line-parser heap state share the 128-MiB object-load
-ceiling. Unit rosters are released between units, and duplicate temporary
-source paths are released after interning, so this is a peak rather than a
-lifetime-allocation counter. Cached parsed objects share the independently
-stated 128-MiB LRU ceiling. Crossing either fails line attribution explicitly
-rather than allocating beyond it.
+fails explicitly at the 32-MiB check. One unit may declare at most 200,000
+combined transient file/directory entries. The producer's pre-prune dependency
+scan applies that same per-unit ceiling and admits at most 6,400,000
+directory/file form values across one object, so zero-width forms cannot
+amplify its work beyond a fixed bound. The section byte ceiling bounds the
+runtime reader's aggregate work across units. The section-name roster, symbol
+state, raw line-parser inputs, and all transient and retained line-parser heap
+state share the 128-MiB object-load ceiling. Unit rosters are released between
+units, and duplicate temporary source paths are released after interning, so
+this is a peak rather than a lifetime-allocation counter. Cached parsed objects
+share the independently stated 128-MiB LRU ceiling. Crossing either fails line
+attribution explicitly rather than allocating beyond it.
 
 The symbolizer never opens a path through a sampled process's mutable root as
 trusted metadata. Store paths are immutable. The first version never copies a
