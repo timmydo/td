@@ -217,6 +217,8 @@ const GUEST_WAIT_MARGIN_SECS: u64 = td_recipe::ladder::QEMU_GUEST_WAIT_MARGIN_SE
 // next kexec kernel remain live. Keep the guest above that enforced application
 // ceiling rather than making host memory pressure look like a browser failure.
 const SYSTEM_GUEST_MEMORY_MIB: &str = "2048";
+const QEMU_USER_NETDEV: &str = "user,id=net0";
+const QEMU_USER_NET_DEVICE: &str = "virtio-net-pci,netdev=net0";
 const POLL: Duration = Duration::from_millis(200);
 
 /// Cap on retained console/diagnostic bytes. The console is scanned incrementally
@@ -1464,11 +1466,11 @@ fn validate_system_boot(
     }
     if !result.evidence.td_firefox_content {
         return Err(format!(
-            "Firefox painted its first window, but the deterministic offline-content marker \
-             ({TD_FIREFOX_CONTENT_MARKER:?}) was absent — the fixed data document did not \
-             produce the exact bounded content-pixel region, compositor resource high-water \
-             validation failed, or the active jail had no process with Firefox's exact \
-             content-role argv token. \
+            "Firefox painted its first window, but the deterministic HTTPS-content marker \
+             ({TD_FIREFOX_CONTENT_MARKER:?}) was absent — the source-built TLS origin, exact \
+             certificate policy, NSS verification, fixed document pixel region, compositor \
+             resource high-water validation, or same-jail Firefox content-role process \
+             evidence failed. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -3013,8 +3015,8 @@ fn boot(
     // with no host network config. virtio-net-pci is the NIC the guest's VIRTIO_NET
     // driver binds; the guest autodetects it (eth0) and brings it up.
     if plan.user_net {
-        cmd.args(["-netdev", "user,id=net0"]);
-        cmd.args(["-device", "virtio-net-pci,netdev=net0"]);
+        cmd.args(["-netdev", QEMU_USER_NETDEV]);
+        cmd.args(["-device", QEMU_USER_NET_DEVICE]);
     } else {
         // -nic none: hermetic, offline; qemu's default is a user-mode NIC, so disable it.
         cmd.args(["-nic", "none"]);
@@ -4615,6 +4617,15 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_firefox_content);
+    }
+
+    #[test]
+    fn autotest_user_network_has_no_inbound_forward() {
+        assert_eq!(QEMU_USER_NETDEV, "user,id=net0");
+        assert_eq!(QEMU_USER_NET_DEVICE, "virtio-net-pci,netdev=net0");
+        assert!(!QEMU_USER_NETDEV.contains("hostfwd"));
+        let enabled = ["user_net:", " true"].concat();
+        assert_eq!(include_str!("qemu_boot.rs").matches(&enabled).count(), 1);
     }
 
     #[test]

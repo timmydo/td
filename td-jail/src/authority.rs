@@ -56,6 +56,20 @@ const MAX_APPLICATION_ARGUMENTS: usize = 256;
 const MAX_APPLICATION_ARGUMENT_BYTES: usize = 64 * 1024;
 const FIREFOX_RUNTIME: &str = "freedesktop-platform-25-08";
 const FIREFOX_LIBRARY_PATH: &str = "/app/lib:/app/lib/firefox";
+const FIREFOX_NAME: &str = "firefox";
+const PROC_CMDLINE_PATH: &str = "/proc/cmdline";
+const MAX_PROC_CMDLINE_BYTES: usize = 4096;
+const AUTOTEST_CMDLINE_TOKEN: &str = "td.autotest=1";
+const FIREFOX_AUTOTEST_POLICY_PATH: &str =
+    "/run/td-firefox-autotest/policies.json";
+const FIREFOX_AUTOTEST_CA_PATH: &str = "/run/td-firefox-autotest/ca.pem";
+const MAX_FIREFOX_AUTOTEST_POLICY_BYTES: u64 = 1024;
+const MAX_FIREFOX_AUTOTEST_CA_BYTES: u64 = 64 * 1024;
+pub(crate) const FIREFOX_AUTOTEST_POLICY: &str = concat!(
+    "{\"policies\":{\"Certificates\":{\"Install\":[",
+    "\"/etc/firefox/policies/td-firefox-autotest-ca.pem\"",
+    "]}}}\n",
+);
 
 #[derive(Debug)]
 pub(crate) struct LaunchPlan {
@@ -68,6 +82,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) runtime_files: PathBuf,
     pub(crate) ca_bundle: ResolvedFile,
     pub(crate) resolv_conf: Option<ResolvedFile>,
+    pub(crate) firefox_autotest_policy: Option<FirefoxAutotestPolicy>,
     pub(crate) state: StatePlan,
     pub(crate) wayland_socket: PathBuf,
     pub(crate) bus_socket: PathBuf,
@@ -174,6 +189,12 @@ pub(crate) struct ResolvedFile {
     pub(crate) device: u64,
     pub(crate) inode: u64,
     pub(crate) size: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct FirefoxAutotestPolicy {
+    pub(crate) policy: ResolvedFile,
+    pub(crate) ca: ResolvedFile,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -364,6 +385,7 @@ where
             MAX_RESOLV_CONF_BYTES,
         )?
     };
+    let firefox_autotest_policy = resolve_firefox_autotest_policy(name)?;
 
     Ok(LaunchPlan {
         name: name.to_string(),
@@ -371,6 +393,7 @@ where
         runtime_files,
         ca_bundle: config.ca_bundle,
         resolv_conf,
+        firefox_autotest_policy,
         state,
         wayland_socket,
         bus_socket,
@@ -2017,6 +2040,110 @@ fn resolve_optional_file(
     }
 }
 
+fn resolve_firefox_autotest_policy(
+    application: &str,
+) -> io::Result<Option<FirefoxAutotestPolicy>> {
+    if application != FIREFOX_NAME {
+        return Ok(None);
+    }
+    let cmdline = read_bounded(PROC_CMDLINE_PATH, MAX_PROC_CMDLINE_BYTES)?;
+    resolve_firefox_autotest_policy_at(
+        application,
+        cmdline_has_autotest_token(&cmdline),
+        Path::new(FIREFOX_AUTOTEST_POLICY_PATH),
+        Path::new(FIREFOX_AUTOTEST_CA_PATH),
+    )
+}
+
+fn cmdline_has_autotest_token(cmdline: &str) -> bool {
+    cmdline
+        .split_ascii_whitespace()
+        .any(|argument| argument == AUTOTEST_CMDLINE_TOKEN)
+}
+
+fn resolve_firefox_autotest_policy_at(
+    application: &str,
+    autotest_boot: bool,
+    policy_path: &Path,
+    ca_path: &Path,
+) -> io::Result<Option<FirefoxAutotestPolicy>> {
+    if application != FIREFOX_NAME || !autotest_boot {
+        return Ok(None);
+    }
+    let policy = resolve_optional_file(
+        policy_path,
+        "Firefox autotest policy",
+        MAX_FIREFOX_AUTOTEST_POLICY_BYTES,
+    )?;
+    let ca = resolve_optional_file(
+        ca_path,
+        "Firefox autotest CA",
+        MAX_FIREFOX_AUTOTEST_CA_BYTES,
+    )?;
+    let Some((policy, ca)) = pair_firefox_autotest_files(policy, ca)? else {
+        return Ok(None);
+    };
+    require_root_read_only(&policy, "Firefox autotest policy")?;
+    require_root_read_only(&ca, "Firefox autotest CA")?;
+    let policy_text = read_bounded_path(
+        &policy.path,
+        usize::try_from(MAX_FIREFOX_AUTOTEST_POLICY_BYTES)
+            .map_err(|_| invalid("Firefox autotest policy bound is not representable"))?,
+    )?;
+    let ca_text = read_bounded_path(
+        &ca.path,
+        usize::try_from(MAX_FIREFOX_AUTOTEST_CA_BYTES)
+            .map_err(|_| invalid("Firefox autotest CA bound is not representable"))?,
+    )?;
+    validate_firefox_autotest_contents(&policy_text, &ca_text)?;
+    Ok(Some(FirefoxAutotestPolicy { policy, ca }))
+}
+
+fn pair_firefox_autotest_files(
+    policy: Option<ResolvedFile>,
+    ca: Option<ResolvedFile>,
+) -> io::Result<Option<(ResolvedFile, ResolvedFile)>> {
+    match (policy, ca) {
+        (Some(policy), Some(ca)) => Ok(Some((policy, ca))),
+        (None, None) => Ok(None),
+        _ => Err(invalid(
+            "Firefox autotest policy and CA must either both exist or both be absent",
+        )),
+    }
+}
+
+fn validate_firefox_autotest_contents(policy: &str, ca: &str) -> io::Result<()> {
+    if policy != FIREFOX_AUTOTEST_POLICY {
+        return Err(invalid(
+            "Firefox autotest policy is not the compiled certificate policy",
+        ));
+    }
+    if !ca.starts_with("-----BEGIN CERTIFICATE-----\n")
+        || !ca.ends_with("-----END CERTIFICATE-----\n")
+        || ca.matches("-----BEGIN CERTIFICATE-----").count() != 1
+    {
+        return Err(invalid(
+            "Firefox autotest CA is not one bounded PEM certificate",
+        ));
+    }
+    Ok(())
+}
+
+fn require_root_read_only(file: &ResolvedFile, label: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(&file.path)?;
+    if !is_root_read_only(metadata.uid(), metadata.gid(), metadata.mode()) {
+        return Err(invalid(format!(
+            "{label} {} is not root-owned mode 0444",
+            file.path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn is_root_read_only(uid: u32, gid: u32, mode: u32) -> bool {
+    uid == 0 && gid == 0 && mode & 0o7777 == 0o444
+}
+
 fn resolve_product_ca_bundle(path: &Path) -> io::Result<ResolvedFile> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         io::Error::new(
@@ -2748,6 +2875,56 @@ mod tests {
             [OsString::from("x".repeat(MAX_APPLICATION_ARGUMENT_BYTES))].into_iter()
         )
         .is_err());
+    }
+
+    #[test]
+    fn firefox_autotest_trust_is_one_exact_policy_and_certificate() {
+        let ca = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+        validate_firefox_autotest_contents(FIREFOX_AUTOTEST_POLICY, ca).unwrap();
+        assert!(validate_firefox_autotest_contents("{}\n", ca).is_err());
+        assert!(validate_firefox_autotest_contents(
+            FIREFOX_AUTOTEST_POLICY,
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n\
+             -----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n",
+        )
+        .is_err());
+        assert!(resolve_firefox_autotest_policy("not-firefox")
+            .unwrap()
+            .is_none());
+        assert!(cmdline_has_autotest_token(
+            "console=ttyS0 td.autotest=1 td.persist=write"
+        ));
+        assert!(!cmdline_has_autotest_token(
+            "console=ttyS0 td.autotest=10 td.persist=write"
+        ));
+        let missing = Path::new("/definitely/missing/td-firefox-autotest");
+        assert!(resolve_firefox_autotest_policy_at(
+            FIREFOX_NAME,
+            false,
+            missing,
+            missing,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn firefox_autotest_trust_refuses_partial_pairs_and_wrong_ownership() {
+        let file = ResolvedFile {
+            path: PathBuf::from("/unused"),
+            device: 1,
+            inode: 2,
+            size: 3,
+        };
+        assert!(pair_firefox_autotest_files(Some(file.clone()), None).is_err());
+        assert!(pair_firefox_autotest_files(None, Some(file)).is_err());
+        assert!(pair_firefox_autotest_files(None, None)
+            .unwrap()
+            .is_none());
+        assert!(is_root_read_only(0, 0, 0o100444));
+        assert!(!is_root_read_only(1000, 0, 0o100444));
+        assert!(!is_root_read_only(0, 1000, 0o100444));
+        assert!(!is_root_read_only(0, 0, 0o100644));
     }
 
     #[test]

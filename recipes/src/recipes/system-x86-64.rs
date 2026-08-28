@@ -190,8 +190,8 @@ const FIREFOX_NAME: &str = "firefox";
 const FIREFOX_APP_ID: &str = "org.mozilla.firefox";
 const FIREFOX_CONTENT_RGB_A: &str = "ff00ff";
 const FIREFOX_CONTENT_RGB_B: &str = "00ff00";
-const FIREFOX_OFFLINE_DOCUMENT: &str = concat!(
-    "<!doctype html><title>TD-FIREFOX-CONTENT-V1</title>",
+const FIREFOX_HTTPS_DOCUMENT: &str = concat!(
+    "<!doctype html><title>TD-FIREFOX-HTTPS-CONTENT-V1</title>",
     "<style>html,body{width:100%;height:100%;margin:0}",
     "body{display:flex}.a,.b{flex:1}.a{background:#ff00ff}",
     ".b{background:#00ff00}</style>",
@@ -199,7 +199,14 @@ const FIREFOX_OFFLINE_DOCUMENT: &str = concat!(
 );
 const FIREFOX_AUTOTEST_HOST_ROOT: &str = "/run/user/1000/td-app/firefox";
 const FIREFOX_AUTOTEST_PROFILE: &str = "/run/user/1000/td-app/profile";
-const FIREFOX_AUTOTEST_DOCUMENT: &str = "/run/user/1000/td-app/content.html";
+const FIREFOX_TLS_ROOT: &str = "/run/td-firefox-autotest";
+const FIREFOX_TLS_ORIGIN: &str = "/run/td-firefox-autotest/origin";
+const FIREFOX_TLS_URL: &str = "https://localhost:8443/content.html";
+const FIREFOX_TLS_POLICY: &str = concat!(
+    "{\"policies\":{\"Certificates\":{\"Install\":[",
+    "\"/etc/firefox/policies/td-firefox-autotest-ca.pem\"",
+    "]}}}\n",
+);
 const FIREFOX_WINDOW_READY_SOCKET: &str = "/run/user/1000/td-firefox-window-ready";
 const FIREFOX_DOWNLOAD_SOURCE: &str = "/var/home/tester/Downloads";
 const FIREFOX_XDG_MOUNT_MARKER: &str = "/run/td-firefox-downloads-mounted";
@@ -932,7 +939,7 @@ fn td_svc_conf_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 17] = [
+const TD_SVC_UNITS: [&str; 19] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -943,6 +950,8 @@ const TD_SVC_UNITS: [&str; 17] = [
     "busd",
     "wayland",
     "terminal",
+    "firefox-tls-setup",
+    "firefox-tls-origin",
     "firefox-autotest",
     "firefox",
     "firefox-evidence",
@@ -976,6 +985,8 @@ mod svc_timeouts {
     /// bound plus the explicit 10-second low-speed transfer bound. Keep the service
     /// above twice that reviewed 336-second worst case.
     pub const NETUP: u32 = 700;
+    /// Mints one RSA test authority and one server identity in the slow VM.
+    pub const FIREFOX_TLS_SETUP: u32 = 120;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
     /// but each runs a large probe farm (ten `su` blocks) and can run four
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
@@ -1160,26 +1171,46 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
+         # The HTTPS origin uses a source-built TLS implementation. Setup mints\n\
+         # an ephemeral CA plus localhost identity under /run; the root-owned CA\n\
+         # and exact policy are the only two extra files td-jail will admit into\n\
+         # Firefox's synthetic /etc. Ordinary boots create neither file.\n\
+         [firefox-tls-setup]\n\
+         type=oneshot\n\
+         exec=/etc/firefox-tls-setup\n\
+         after=seat\n\
+         requires=seat\n\
+         timeout={firefox_tls_setup_timeout}\n\
+         \n\
+         [firefox-tls-origin]\n\
+         type=daemon\n\
+         exec=/bin/td-login exec-as {ui_user} -- /etc/firefox-tls-origin\n\
+         after=firefox-tls-setup\n\
+         requires=firefox-tls-setup\n\
+         ready=/etc/firefox-tls-ready\n\
+         ready-timeout=30\n\
+         restart=on-failure\n\
+         \n\
          # The QEMU-only profile is volatile test state, not consent recorded for\n\
          # the installed browser. Mozilla's own automation preferences suppress\n\
          # first-run pre-onboarding only when td.autotest=1 is on the kernel\n\
-         # command line. The exact HTML lives in the same private runtime bind.\n\
+         # command line. Trust comes from the exact root-owned policy above.\n\
          [firefox-autotest]\n\
          type=oneshot\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) root={firefox_autotest_host_root}; /bin/mkdir -p \"$root/profile\" && /bin/td-util chmod 0700 \"$root\" \"$root/profile\" && /bin/rm -f \"$root/.user.js.tmp\" \"$root/.content.html.tmp\" && /bin/td-util printf \"%s\\n\" \"user_pref(\\\"browser.preonboarding.enabled\\\", false);\" \"user_pref(\\\"termsofuse.bypassNotification\\\", true);\" > \"$root/.user.js.tmp\" && /bin/td-util chmod 0600 \"$root/.user.js.tmp\" && /bin/mv \"$root/.user.js.tmp\" \"$root/profile/user.js\" && /bin/td-util printf \"%s\\n\" \"{firefox_offline_document}\" > \"$root/.content.html.tmp\" && /bin/td-util chmod 0600 \"$root/.content.html.tmp\" && /bin/mv \"$root/.content.html.tmp\" \"$root/content.html\";; *) :;; esac'\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) root={firefox_autotest_host_root}; /bin/mkdir -p \"$root/profile\" && /bin/td-util chmod 0700 \"$root\" \"$root/profile\" && /bin/rm -f \"$root/.user.js.tmp\" && /bin/td-util printf \"%s\\n\" \"user_pref(\\\"browser.preonboarding.enabled\\\", false);\" \"user_pref(\\\"termsofuse.bypassNotification\\\", true);\" > \"$root/.user.js.tmp\" && /bin/td-util chmod 0600 \"$root/.user.js.tmp\" && /bin/mv \"$root/.user.js.tmp\" \"$root/profile/user.js\";; *) :;; esac'\n\
          after=seat\n\
          requires=seat\n\
          timeout=30\n\
          \n\
          # Firefox is also QEMU boot evidence. td-login passes a literal argv and\n\
          # td-jail resolves argv[0] through the immutable image registry. Under\n\
-         # autotest only, Firefox receives the volatile profile and local file;\n\
+         # autotest only, Firefox receives the volatile profile and verified URL;\n\
          # ordinary boots retain Firefox's own first-run and default-profile flow.\n\
          [firefox]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name} --profile {firefox_autotest_profile} file://{firefox_autotest_document};; *) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name};; esac'\n\
-         after=busd,wayland,firefox-autotest\n\
-         requires=wayland,firefox-autotest\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name} --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name};; esac'\n\
+         after=busd,wayland,firefox-autotest,firefox-tls-origin\n\
+         requires=wayland,firefox-autotest,firefox-tls-origin\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
          restart=always\n\
@@ -1261,14 +1292,14 @@ fn build_td_svc_conf() -> String {
         profiler_evidence_service_timeout_secs = PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
         profiler_attribution_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
         autotest_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
+        firefox_tls_setup_timeout = svc_timeouts::FIREFOX_TLS_SETUP,
         firefox_name = FIREFOX_NAME,
         firefox_app_id = FIREFOX_APP_ID,
         firefox_content_rgb_a = FIREFOX_CONTENT_RGB_A,
         firefox_content_rgb_b = FIREFOX_CONTENT_RGB_B,
-        firefox_offline_document = FIREFOX_OFFLINE_DOCUMENT,
         firefox_autotest_host_root = FIREFOX_AUTOTEST_HOST_ROOT,
         firefox_autotest_profile = FIREFOX_AUTOTEST_PROFILE,
-        firefox_autotest_document = FIREFOX_AUTOTEST_DOCUMENT,
+        firefox_tls_url = FIREFOX_TLS_URL,
         firefox_window_ready_socket = FIREFOX_WINDOW_READY_SOCKET,
         firefox_marker = TD_FIREFOX_BOOT_MARKER,
         firefox_content_marker = TD_FIREFOX_CONTENT_MARKER,
@@ -2913,6 +2944,114 @@ fn profiler_application_roots(sys: &SystemDef) -> String {
     table
 }
 
+/// QEMU-only trusted setup for Firefox's real NSS/TLS proof. The authority,
+/// server identity and policy live on `/run`, so neither the CA nor its private
+/// key survives a boot or enters the installed browser's ordinary profile.
+fn build_firefox_tls_setup() -> String {
+    format!(
+        "#!/bin/sh\n\
+         set -eu\n\
+         case \" $(/bin/cat /proc/cmdline) \" in\n\
+         *\" {autotest} \"*) :;;\n\
+         *) exit 0;;\n\
+         esac\n\
+         /bin/td-netd loopback\n\
+         root={root}\n\
+         origin={origin}\n\
+         openssl=/bin/openssl\n\
+         OPENSSL_CONF=\"$root/openssl.cnf\"\n\
+         export OPENSSL_CONF\n\
+         umask 077\n\
+         /bin/mkdir -p \"$origin\"\n\
+         /bin/td-util printf '%s\\n' \
+           '[req]' \
+           'distinguished_name=dn' \
+           '[dn]' \
+           '[server]' \
+           'basicConstraints=critical,CA:FALSE' \
+           'keyUsage=critical,digitalSignature,keyEncipherment' \
+           'extendedKeyUsage=serverAuth' \
+           'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+           > \"$OPENSSL_CONF\"\n\
+         \"$openssl\" req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+           -config \"$OPENSSL_CONF\" \
+           -set_serial 1 -subj '/CN=td Firefox autotest CA' \
+           -addext 'basicConstraints=critical,CA:TRUE' \
+           -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+           -keyout \"$root/ca.key\" -out \"$root/ca.pem\"\n\
+         \"$openssl\" req -new -newkey rsa:2048 -nodes \
+           -config \"$OPENSSL_CONF\" \
+           -subj '/CN=localhost' -keyout \"$root/server.key\" \
+           -out \"$root/server.csr\"\n\
+         \"$openssl\" x509 -req -in \"$root/server.csr\" \
+           -CA \"$root/ca.pem\" -CAkey \"$root/ca.key\" -set_serial 2 \
+           -sha256 -days 1 -extfile \"$OPENSSL_CONF\" -extensions server \
+           -out \"$root/server.pem\"\n\
+         /bin/td-util printf '%s\\n' '{policy}' > \"$root/policies.json\"\n\
+         /bin/td-util printf '%s\\n' '{document}' > \"$origin/content.html\"\n\
+         /bin/td-util chmod 0444 \"$root/ca.pem\" \"$root/policies.json\" \
+           \"$root/server.pem\" \"$origin/content.html\"\n\
+         /bin/td-util chmod 0400 \"$root/server.key\"\n\
+         /bin/chown {ui_uid}:{ui_gid} \"$root/server.key\"\n\
+         /bin/td-util chmod 0755 \"$root\"\n\
+         /bin/td-util chmod 0555 \"$origin\"\n",
+        autotest = AUTOTEST_CMDLINE_TOKEN,
+        root = FIREFOX_TLS_ROOT,
+        origin = FIREFOX_TLS_ORIGIN,
+        policy = FIREFOX_TLS_POLICY.trim_end(),
+        document = FIREFOX_HTTPS_DOCUMENT,
+        ui_uid = UI_UID,
+        ui_gid = UI_GID,
+    )
+}
+
+/// LibreSSL's `-accept` grammar takes only a port, so this listens on all guest
+/// interfaces. The autotest harness uses either `-nic none` or exact QEMU
+/// user-mode NAT without host forwarding; the token is unsupported elsewhere.
+/// `s_server` discards its accept-loop result, so any return is translated to a
+/// service failure; a requested stop is classified separately by td-svc.
+fn build_firefox_tls_origin() -> String {
+    format!(
+        "#!/bin/sh\n\
+         set -eu\n\
+         case \" $(/bin/cat /proc/cmdline) \" in\n\
+         *\" {autotest} \"*) :;;\n\
+         *) exit 0;;\n\
+         esac\n\
+         OPENSSL_CONF=/dev/null\n\
+         export OPENSSL_CONF\n\
+         cd {origin}\n\
+         /bin/openssl s_server \
+           -accept 8443 -cert {root}/server.pem -key {root}/server.key \
+           -WWW -quiet\n\
+         exit 1\n",
+        autotest = AUTOTEST_CMDLINE_TOKEN,
+        origin = FIREFOX_TLS_ORIGIN,
+        root = FIREFOX_TLS_ROOT,
+    )
+}
+
+fn build_firefox_tls_ready() -> String {
+    format!(
+        "#!/bin/sh\n\
+         set -eu\n\
+         case \" $(/bin/cat /proc/cmdline) \" in\n\
+         *\" {autotest} \"*) :;;\n\
+         *) exit 0;;\n\
+         esac\n\
+         OPENSSL_CONF=/dev/null\n\
+         export OPENSSL_CONF\n\
+         /bin/td-util printf 'GET /content.html HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' | \
+           /bin/openssl s_client \
+             -connect 127.0.0.1:8443 -servername localhost \
+             -CAfile {root}/ca.pem -verify 5 -verify_return_error \
+             -quiet 2>/dev/null | \
+           /bin/grep 'TD-FIREFOX-HTTPS-CONTENT-V1' >/dev/null\n",
+        autotest = AUTOTEST_CMDLINE_TOKEN,
+        root = FIREFOX_TLS_ROOT,
+    )
+}
+
 /// The generated /etc files (config + the login-glue and boot-check scripts). `exec`
 /// marks the ones getty/init reference as executables. Shared by the real-root staging
 /// (written under `{root}/real-root/etc`) and the shape check (which asserts they landed).
@@ -2947,6 +3086,9 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         ("shutdown", build_shutdown(), true),
         (ROOTCHECK_ETC_NAME, build_rootcheck(sys), true),
         ("netup", build_netup(), true),
+        ("firefox-tls-setup", build_firefox_tls_setup(), true),
+        ("firefox-tls-origin", build_firefox_tls_origin(), true),
+        ("firefox-tls-ready", build_firefox_tls_ready(), true),
         ("bootsuccess", build_bootsuccess(sys), true),
         ("bootfail", build_bootfail(), true),
     ]
@@ -3178,6 +3320,17 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:ca-certificates}".into(),
         dest: "{root}/real-root{in:ca-certificates}".into(),
     });
+    // The QEMU HTTPS origin needs only LibreSSL's static command and its debug
+    // companion. Keep the development archives and headers out of the image.
+    steps.push(Step::MkDir {
+        path: "{root}/real-root{in:libressl-x86-64}".into(),
+    });
+    for child in ["bin", "lib/debug"] {
+        steps.push(Step::CopyTree {
+            from: format!("{{in:libressl-x86-64}}/{child}"),
+            dest: format!("{{root}}/real-root{{in:libressl-x86-64}}/{child}"),
+        });
+    }
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, fd, OpenSSH, and Codex pull their
     // td glibc closures. The engine admits only direct recipe inputs, so a Rust bootstrap
@@ -3252,6 +3405,7 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             "git-upload-pack",
             "{in:git-x86-64}/bin/git-upload-pack",
         ),
+        ("openssl", "{in:libressl-x86-64}/bin/openssl"),
         ("codex", "{in:codex}/bin/codex"),
         ("bwrap", "{in:codex-bwrap}/bin/bwrap"),
     ] {
@@ -3681,6 +3835,11 @@ fn shape_check() -> String {
      [ -f \"{root}/real-root{in:codex-bwrap}/lib/debug/bin/bwrap.debug\" ] || { echo 'root tree: the staged Codex Bubblewrap package lacks its debug companion' >&2; exit 1; }; \
      [ -s \"{root}/real-root{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: the pinned CA bundle is missing or empty' >&2; exit 1; }; \
      [ \"$(readlink \"$root/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null)\" = \"{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: Git curl CA path does not resolve to the pinned bundle' >&2; exit 1; }; \
+     openssl=\"{root}/real-root{in:libressl-x86-64}/bin/openssl\"; openssltgt=\"{in:libressl-x86-64}/bin/openssl\"; \
+     { [ -f \"$openssl\" ] && [ -x \"$openssl\" ]; } || { echo 'root tree: the source-built LibreSSL command is not packed or executable' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/openssl\" 2>/dev/null)\" = \"$openssltgt\" ] || { echo 'root tree: /bin/openssl is not a symlink to the source-built LibreSSL command' >&2; exit 1; }; \
+     [ -f \"{root}/real-root{in:libressl-x86-64}/lib/debug/bin/openssl.debug\" ] || { echo 'root tree: the source-built LibreSSL command lacks its debug companion' >&2; exit 1; }; \
+     for dev in include lib/libcrypto.a lib/libssl.a; do [ ! -e \"{root}/real-root{in:libressl-x86-64}/$dev\" ] || { echo \"root tree: LibreSSL development path $dev entered the image\" >&2; exit 1; }; done; \
      for rel in bin/ssh bin/ssh-keygen bin/sshd libexec/sshd-session libexec/sshd-auth; do \
          openssh=\"{root}/real-root{in:openssh-x86-64}/$rel\"; \
          { [ -f \"$openssh\" ] && [ -x \"$openssh\" ]; } || { echo \"root tree: OpenSSH $rel is not packed/executable under real-root{in:openssh-x86-64}\" >&2; exit 1; }; \
@@ -3978,6 +4137,7 @@ pub fn recipe() -> Recipe {
             "codex",
             "codex-bwrap",
             "ca-certificates",
+            "libressl-x86-64",
             "glibc-x86-64",
             "openssh-x86-64",
             "td-netd",
@@ -4378,6 +4538,92 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         // Which marker the ORACLE selects cannot be seen from this crate's
         // lib — it is a `const` in the `td-recipe-eval` bin — so the pin for
         // that lives beside it, in `qemu_boot.rs`'s own tests.
+        assert_eq!(
+            unit_key("firefox-tls-setup", "exec").as_deref(),
+            Some("/etc/firefox-tls-setup")
+        );
+        assert_eq!(
+            unit_key("firefox-tls-setup", "requires").as_deref(),
+            Some("seat")
+        );
+        assert_eq!(
+            unit_key("firefox-tls-setup", "timeout").as_deref(),
+            Some("120")
+        );
+        assert_eq!(
+            unit_key("firefox-tls-origin", "exec").as_deref(),
+            Some("/bin/td-login exec-as tester -- /etc/firefox-tls-origin")
+        );
+        assert_eq!(
+            unit_key("firefox-tls-origin", "requires").as_deref(),
+            Some("firefox-tls-setup")
+        );
+        assert_eq!(
+            unit_key("firefox-tls-origin", "ready").as_deref(),
+            Some("/etc/firefox-tls-ready")
+        );
+        let tls_setup = build_firefox_tls_setup();
+        for required in [
+            "/bin/td-netd loopback",
+            "openssl=/bin/openssl",
+            "OPENSSL_CONF=\"$root/openssl.cnf\"",
+            "export OPENSSL_CONF",
+            "distinguished_name=dn",
+            "-config \"$OPENSSL_CONF\"",
+            "req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 1",
+            "basicConstraints=critical,CA:TRUE",
+            "x509 -req",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            FIREFOX_TLS_POLICY.trim_end(),
+            FIREFOX_HTTPS_DOCUMENT,
+            "/bin/td-util chmod 0444 \"$root/ca.pem\" \"$root/policies.json\"",
+            "/bin/chown 1000:1000 \"$root/server.key\"",
+            "/bin/td-util chmod 0555 \"$origin\"",
+        ] {
+            assert!(tls_setup.contains(required), "TLS setup omitted {required:?}");
+        }
+        assert_eq!(tls_setup.matches("-sha256").count(), 2);
+        let tls_origin = build_firefox_tls_origin();
+        assert!(tls_origin.contains("OPENSSL_CONF=/dev/null"));
+        assert!(tls_origin.contains(
+            "openssl s_server -accept 8443 \
+             -cert /run/td-firefox-autotest/server.pem \
+             -key /run/td-firefox-autotest/server.key -WWW -quiet"
+        ));
+        assert!(!tls_origin.contains("exec /bin/openssl s_server"));
+        assert!(tls_origin.ends_with("exit 1\n"));
+        let tls_ready = build_firefox_tls_ready();
+        for required in [
+            "OPENSSL_CONF=/dev/null",
+            "GET /content.html HTTP/1.0\\r\\nHost: localhost",
+            "openssl s_client",
+            "-connect 127.0.0.1:8443",
+            "-servername localhost",
+            "-CAfile /run/td-firefox-autotest/ca.pem",
+            "-verify 5",
+            "-verify_return_error",
+            "TD-FIREFOX-HTTPS-CONTENT-V1",
+        ] {
+            assert!(tls_ready.contains(required), "TLS ready omitted {required:?}");
+        }
+        for forbidden in [
+            "acceptInsecureCerts",
+            "security.tls.insecure_fallback_hosts",
+            "--ignore-certificate-errors",
+        ] {
+            assert!(!tls_setup.contains(forbidden));
+            assert!(!tls_origin.contains(forbidden));
+            assert!(!tls_ready.contains(forbidden));
+        }
+        let jail_authority = include_str!("../../../td-jail/src/authority.rs");
+        assert!(jail_authority.contains("FIREFOX_AUTOTEST_POLICY"));
+        assert!(jail_authority.contains(
+            r#""{\"policies\":{\"Certificates\":{\"Install\":["#
+        ));
+        assert!(jail_authority.contains(
+            "\\\"/etc/firefox/policies/td-firefox-autotest-ca.pem\\\""
+        ));
+        assert!(jail_authority.contains(r#""]}}}\n","#));
         let firefox_autotest =
             unit_key("firefox-autotest", "exec").unwrap_or_default();
         assert!(firefox_autotest.starts_with(&format!(
@@ -4392,9 +4638,6 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             "user_pref(\\\"termsofuse.bypassNotification\\\", true);",
             "/bin/td-util chmod 0600 \"$root/.user.js.tmp\"",
             "/bin/mv \"$root/.user.js.tmp\" \"$root/profile/user.js\"",
-            FIREFOX_OFFLINE_DOCUMENT,
-            "/bin/td-util chmod 0600 \"$root/.content.html.tmp\"",
-            "/bin/mv \"$root/.content.html.tmp\" \"$root/content.html\"",
         ] {
             assert!(
                 firefox_autotest.contains(required),
@@ -4421,31 +4664,27 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in \
                  *\" {AUTOTEST_CMDLINE_TOKEN} \"*) exec /bin/td-login exec-as tester -- \
                  /bin/{FIREFOX_NAME} --profile {FIREFOX_AUTOTEST_PROFILE} \
-                 file://{FIREFOX_AUTOTEST_DOCUMENT};; *) exec \
+                 {FIREFOX_TLS_URL};; *) exec \
                  /bin/td-login exec-as tester -- /bin/{FIREFOX_NAME};; esac'")
         );
-        assert!(FIREFOX_OFFLINE_DOCUMENT.starts_with("<!doctype html>"));
-        assert!(FIREFOX_OFFLINE_DOCUMENT.contains("body{display:flex}"));
-        assert!(FIREFOX_OFFLINE_DOCUMENT.contains(".a{background:#ff00ff}"));
-        assert!(FIREFOX_OFFLINE_DOCUMENT.contains(".b{background:#00ff00}"));
-        assert!(FIREFOX_OFFLINE_DOCUMENT.contains("<div class=a></div>"));
-        assert!(FIREFOX_OFFLINE_DOCUMENT.contains("width:100%;height:100%"));
-        assert!(!FIREFOX_OFFLINE_DOCUMENT.bytes().any(|byte| {
+        assert!(FIREFOX_HTTPS_DOCUMENT.starts_with("<!doctype html>"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("body{display:flex}"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains(".a{background:#ff00ff}"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains(".b{background:#00ff00}"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("<div class=a></div>"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("width:100%;height:100%"));
+        assert!(!FIREFOX_HTTPS_DOCUMENT.bytes().any(|byte| {
             matches!(byte, b'\'' | b'"' | b'$' | b'\\' | b'\n') || byte == 0x60
         }));
         assert_eq!(
-            FIREFOX_OFFLINE_DOCUMENT
-                .matches("TD-FIREFOX-CONTENT-V1")
+            FIREFOX_HTTPS_DOCUMENT
+                .matches("TD-FIREFOX-HTTPS-CONTENT-V1")
                 .count(),
             1
         );
         assert_eq!(
-            std::path::Path::new(FIREFOX_AUTOTEST_PROFILE).parent(),
-            std::path::Path::new(FIREFOX_AUTOTEST_DOCUMENT).parent()
-        );
-        assert_eq!(
             unit_key("firefox", "requires").as_deref(),
-            Some("wayland,firefox-autotest")
+            Some("wayland,firefox-autotest,firefox-tls-origin")
         );
         let firefox_ready = unit_key("firefox", "ready").unwrap_or_default();
         assert_eq!(
@@ -4846,8 +5085,18 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             ("busd", vec!["seat"]),
             ("wayland", vec!["seat"]),
             ("terminal", vec!["wayland"]),
+            ("firefox-tls-setup", vec!["seat"]),
+            ("firefox-tls-origin", vec!["firefox-tls-setup"]),
             ("firefox-autotest", vec!["seat"]),
-            ("firefox", vec!["busd", "wayland", "firefox-autotest"]),
+            (
+                "firefox",
+                vec![
+                    "busd",
+                    "wayland",
+                    "firefox-autotest",
+                    "firefox-tls-origin",
+                ],
+            ),
             ("firefox-evidence", vec!["firefox"]),
             (
                 "bootsuccess",
@@ -5058,8 +5307,9 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             Some("always"),
             "the graphical client is supervised and restartable"
         );
-        // ORDERED after the bus, and STRICT only on the compositor, and the
-        // asymmetry is the point. td-jail RESOLVES /run/user/1000/bus before
+        // ORDERED after the bus, and STRICT on the compositor plus the two
+        // finite QEMU setup authorities, and the asymmetry is the point.
+        // td-jail RESOLVES /run/user/1000/bus before
         // it unshares and fails the launch if it is not a socket owned by the
         // login user, so Firefox needs that socket to EXIST — `busd` and
         // `wayland` are siblings, each requiring only `seat`, so without an
@@ -5093,11 +5343,11 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         // a wedged broker names the instance it could not register.
         assert_eq!(
             unit_key("firefox", "requires").as_deref(),
-            Some("wayland,firefox-autotest"),
+            Some("wayland,firefox-autotest,firefox-tls-origin"),
             "Firefox must not start without its compositor — and \
-             its one-shot autotest preparation — and must not be made strictly \
-             dependent on a broker whose restart backoff td-svc cannot tell \
-             from a permanent failure"
+             its finite autotest preparation and verified origin — and must \
+             not be made strictly dependent on a broker whose restart backoff \
+             td-svc cannot tell from a permanent failure"
         );
         assert_eq!(
             unit_key("firefox", "restart").as_deref(),
@@ -5166,6 +5416,31 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             1,
             "the static Codex Bubblewrap helper must be copied once at its canonical path"
         );
+        let libressl_copies: Vec<(&str, &str)> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::CopyTree { from, dest }
+                    if from.starts_with("{in:libressl-x86-64}/") =>
+                {
+                    Some((from.as_str(), dest.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            libressl_copies,
+            [
+                (
+                    "{in:libressl-x86-64}/bin",
+                    "{root}/real-root{in:libressl-x86-64}/bin",
+                ),
+                (
+                    "{in:libressl-x86-64}/lib/debug",
+                    "{root}/real-root{in:libressl-x86-64}/lib/debug",
+                ),
+            ],
+            "the image needs LibreSSL's command and debug companion, not its development tree"
+        );
         for (name, target) in [
             ("rg", "{in:ripgrep}/bin/rg"),
             ("fd", "{in:fd}/bin/fd"),
@@ -5184,6 +5459,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             ),
             ("codex", "{in:codex}/bin/codex"),
             ("bwrap", "{in:codex-bwrap}/bin/bwrap"),
+            ("openssl", "{in:libressl-x86-64}/bin/openssl"),
         ] {
             let link = format!("{{root}}/real-root/bin/{name}");
             let targets: Vec<&str> = steps
@@ -5204,10 +5480,10 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         }
 
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for required in ["codex", "codex-bwrap"] {
+        for required in ["codex", "codex-bwrap", "libressl-x86-64"] {
             assert!(
                 native_inputs.iter().any(|input| input == required),
-                "shipped Codex input {required} must be declared"
+                "shipped input {required} must be declared"
             );
         }
         for forbidden in [

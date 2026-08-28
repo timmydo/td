@@ -581,15 +581,15 @@ pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 
 /// Compatibility marker emitted by the trusted Firefox-evidence unit after
-/// the stronger offline-content, live-process and resource-cap proof below.
+/// the stronger HTTPS-content, live-process and resource-cap proof below.
 pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";
 
 /// Emitted by the trusted Firefox-evidence unit only after the compositor has
-/// observed the deterministic offline document's exact content-pixel region
+/// observed the verified in-guest HTTPS document's exact content-pixel region
 /// in a painted frame, returned bounded client-resource high-water marks, and
 /// td-jail has found a live process with Firefox's exact `-contentproc` argv
 /// token in the same application cgroup.
-pub const TD_FIREFOX_CONTENT_MARKER: &str = "TD-FIREFOX-OFFLINE-CONTENT-READY";
+pub const TD_FIREFOX_CONTENT_MARKER: &str = "TD-FIREFOX-HTTPS-CONTENT-READY";
 
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
@@ -1111,7 +1111,7 @@ mod tests {
         ("make-x86-64-self", "make-x86-64"),
     ];
     const RECIPE_SHEBANG_INTERPRETERS: [&str; 2] = [super::SH, super::POST_BOOTSTRAP_SH];
-    const GUEST_LITERAL_SHEBANGS: [(&str, &str); 13] = [
+    const GUEST_LITERAL_SHEBANGS: [(&str, &str); 16] = [
         ("linux-x86-64", "{root}/initramfs/init"),
         ("kexec-spike-x86-64", "{root}/inner-init"),
         ("kexec-spike-x86-64", "{root}/outer-init"),
@@ -1126,6 +1126,18 @@ mod tests {
         ("system-x86-64", "{root}/real-root/etc/shutdown"),
         ("system-x86-64", "{root}/real-root/etc/rootcheck"),
         ("system-x86-64", "{root}/real-root/etc/netup"),
+        (
+            "system-x86-64",
+            "{root}/real-root/etc/firefox-tls-setup",
+        ),
+        (
+            "system-x86-64",
+            "{root}/real-root/etc/firefox-tls-origin",
+        ),
+        (
+            "system-x86-64",
+            "{root}/real-root/etc/firefox-tls-ready",
+        ),
         ("system-x86-64", "{root}/real-root/etc/bootsuccess"),
         ("system-x86-64", "{root}/real-root/etc/bootfail"),
     ];

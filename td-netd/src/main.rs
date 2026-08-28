@@ -7,6 +7,8 @@
 //!
 //! Subcommands:
 //!
+//! * `td-netd loopback` — write the static hosts table and bring `lo` up,
+//!   without waiting for an external interface or DHCP.
 //! * `td-netd up [IFACE]` — autodetect a link (or use IFACE), bring it up,
 //!   DHCP-configure it, and write resolv.conf. No usable interface is a clean
 //!   no-op (exit 0), so a diskless/NIC-less boot is unaffected.
@@ -702,16 +704,11 @@ fn autodetect_iface() -> Option<String> {
     names.into_iter().next()
 }
 
-// ── Subcommand: up ──────────────────────────────────────────────────────────
+// ── Subcommands: loopback and up ────────────────────────────────────────────
 
-/// Bring a link up and DHCP-configure it. Always writes /etc/hosts and brings
-/// loopback up; a missing external interface is a clean no-op. Exit status keys the
-/// boot glue's UP marker: `SUCCESS` = an external link was configured; `2` = only
-/// loopback (no NIC), so the marker is NOT emitted; any error propagates as failure.
-fn cmd_up(iface_arg: Option<String>) -> io::Result<ExitCode> {
-    // Write the static hosts table first, unconditionally: it is valid even with no
-    // network (loopback + hostname), so a NIC-less boot still gets a correct
-    // /etc/hosts through the /run symlink.
+fn prepare_loopback() -> io::Result<UdpSocket> {
+    // The static table is valid without an external network, and makes the
+    // loopback operation sufficient for callers that immediately use localhost.
     let hpath = hosts_path();
     fs::write(&hpath, render_hosts(&read_hostname()))
         .map_err(|e| io::Error::new(e.kind(), format!("write {hpath}: {e}")))?;
@@ -719,10 +716,25 @@ fn cmd_up(iface_arg: Option<String>) -> io::Result<ExitCode> {
     // An AF_INET datagram socket serves only as the ioctl handle for the
     // interface-config calls (no packet is ever sent on it).
     let ctl = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
-    let ctlfd = ctl.as_raw_fd();
+    set_loopback_up(ctl.as_raw_fd())?;
+    Ok(ctl)
+}
 
-    // Loopback first, so localhost works regardless of any external NIC.
-    set_loopback_up(ctlfd)?;
+fn cmd_loopback() -> io::Result<ExitCode> {
+    let _ctl = prepare_loopback()?;
+    println!("td-netd: loopback up");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Bring a link up and DHCP-configure it. Always writes /etc/hosts and brings
+/// loopback up; a missing external interface is a clean no-op. Exit status keys the
+/// boot glue's UP marker: `SUCCESS` = an external link was configured; `2` = only
+/// loopback (no NIC), so the marker is NOT emitted; any error propagates as failure.
+fn cmd_up(iface_arg: Option<String>) -> io::Result<ExitCode> {
+    // Loopback and the static hosts table are always established first, so a
+    // NIC-less boot still gets a complete localhost path through /run.
+    let ctl = prepare_loopback()?;
+    let ctlfd = ctl.as_raw_fd();
 
     let ifname = match iface_arg.or_else(autodetect_iface) {
         Some(n) => n,
@@ -818,7 +830,7 @@ fn cmd_reach(host: &str, port: u16) -> io::Result<()> {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-netd up [IFACE] | resolve NAME | reach HOST PORT",
+        "usage: td-netd loopback | up [IFACE] | resolve NAME | reach HOST PORT",
     )
 }
 
@@ -827,6 +839,12 @@ fn run() -> io::Result<ExitCode> {
     let cmd = args.next().ok_or_else(usage)?;
     let rest: Vec<String> = args.map(|a| a.to_string_lossy().into_owned()).collect();
     match cmd.as_bytes() {
+        b"loopback" => {
+            if !rest.is_empty() {
+                return Err(usage());
+            }
+            cmd_loopback()
+        }
         b"up" => {
             if rest.len() > 1 {
                 return Err(usage());
@@ -1122,6 +1140,11 @@ mod tests {
         let h2 = render_hosts("localhost");
         assert!(!h2.contains("127.0.1.1"));
         assert!(h2.contains("127.0.0.1\tlocalhost\n"));
+    }
+
+    #[test]
+    fn usage_lists_the_dhcp_free_loopback_operation() {
+        assert!(usage().to_string().contains("td-netd loopback | up"));
     }
 
     #[test]

@@ -31,6 +31,8 @@ const STAGE2_PROBE_ARG: &str = "--probe";
 const STAGE2_LAUNCH_ARG: &str = "--launch";
 const STAGE2_RESOLV_CONF_ARG: &str = "--resolv-conf";
 const STAGE2_MACHINE_ID_ARG: &str = "--machine-id";
+const STAGE2_FIREFOX_AUTOTEST_POLICY_ARG: &str =
+    "--firefox-autotest-policy";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
@@ -244,6 +246,7 @@ pub enum Stage2Action {
         entry: String,
         resolv_conf: bool,
         machine_id: String,
+        firefox_autotest_policy: bool,
         runtime_aliases: bool,
         environment: Vec<(OsString, OsString)>,
         filesystems: Vec<Stage2Filesystem>,
@@ -264,6 +267,7 @@ struct Stage2MountBinding<'a> {
     filesystems: &'a [FilesystemGrant],
     resolv_conf: bool,
     machine_id: &'a str,
+    firefox_autotest_policy: bool,
     loader_library_path: Option<&'a str>,
 }
 
@@ -456,6 +460,17 @@ where
         if !authority::valid_machine_id(&machine_id) {
             return Err(usage_error());
         }
+        if args.next().as_deref()
+            != Some(STAGE2_FIREFOX_AUTOTEST_POLICY_ARG.as_ref())
+        {
+            return Err(usage_error());
+        }
+        let firefox_autotest_policy =
+            match args.next().as_deref().and_then(OsStr::to_str) {
+                Some("present") => true,
+                Some("absent") => false,
+                _ => return Err(usage_error()),
+            };
         if args.next().as_deref() != Some(STAGE2_LOADER_LIBRARY_PATH_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -559,6 +574,7 @@ where
             entry,
             resolv_conf,
             machine_id,
+            firefox_autotest_policy,
             runtime_aliases: loader_library_path.is_some(),
             environment,
             filesystems,
@@ -648,6 +664,12 @@ fn stage2_launch_arguments(
         }),
         OsString::from(STAGE2_MACHINE_ID_ARG),
         OsString::from(mounts.machine_id),
+        OsString::from(STAGE2_FIREFOX_AUTOTEST_POLICY_ARG),
+        OsString::from(if mounts.firefox_autotest_policy {
+            "present"
+        } else {
+            "absent"
+        }),
     ]);
     stage2.push(OsString::from(STAGE2_LOADER_LIBRARY_PATH_ARG));
     match mounts.loader_library_path {
@@ -1637,6 +1659,20 @@ fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
             "application resolver configuration",
         )?;
     }
+    if let Some(firefox) = &application.firefox_autotest_policy {
+        create_dir(&format!("{etc_text}/firefox"), 0o555)?;
+        create_dir(&format!("{etc_text}/firefox/policies"), 0o555)?;
+        mount_resolved_file(
+            &firefox.policy,
+            &etc.join("firefox/policies/policies.json"),
+            "Firefox autotest policy",
+        )?;
+        mount_resolved_file(
+            &firefox.ca,
+            &etc.join("firefox/policies/td-firefox-autotest-ca.pem"),
+            "Firefox autotest CA",
+        )?;
+    }
     for entry in selected_runtime_etc(&application.runtime_files)? {
         mount_runtime_etc_entry(&entry, &etc)?;
     }
@@ -2400,6 +2436,7 @@ fn grant_scaffold_names(
 fn expected_etc_names(
     runtime_etc: &[RuntimeEtcEntry],
     resolv_conf: bool,
+    firefox_autotest_policy: bool,
 ) -> io::Result<BTreeSet<String>> {
     validate_runtime_etc_allowlist()?;
     let mut expected = TD_OWNED_ETC_NAMES
@@ -2407,6 +2444,11 @@ fn expected_etc_names(
         .filter(|name| resolv_conf || **name != "resolv.conf")
         .map(|name| (*name).to_string())
         .collect::<BTreeSet<_>>();
+    if firefox_autotest_policy && !expected.insert("firefox".to_string()) {
+        return Err(io::Error::other(
+            "Firefox autotest policy collides with selective /etc",
+        ));
+    }
     for entry in runtime_etc {
         if !RUNTIME_ETC_ALLOWLIST.contains(&entry.name) || !expected.insert(entry.name.to_string())
         {
@@ -2422,11 +2464,16 @@ fn require_etc_plan(
     mountinfo: &str,
     token: &[u8; TOKEN_LEN],
     resolv_conf: bool,
+    firefox_autotest_policy: bool,
     expected_machine_id: &str,
     identity: Identity,
 ) -> io::Result<()> {
     let runtime_etc = selected_runtime_etc(Path::new("/usr"))?;
-    let expected = expected_etc_names(&runtime_etc, resolv_conf)?;
+    let expected = expected_etc_names(
+        &runtime_etc,
+        resolv_conf,
+        firefox_autotest_policy,
+    )?;
     let actual = read_dir_names("/etc")?;
     if actual != expected {
         return Err(io::Error::other(format!(
@@ -2438,6 +2485,41 @@ fn require_etc_plan(
     require_mode("/etc", 0o755)?;
     require_mode("/etc/ssl", 0o555)?;
     require_mode("/etc/ssl/certs", 0o555)?;
+    if firefox_autotest_policy {
+        require_names("/etc/firefox", &["policies"])?;
+        require_names(
+            "/etc/firefox/policies",
+            &["policies.json", "td-firefox-autotest-ca.pem"],
+        )?;
+        require_mode("/etc/firefox", 0o555)?;
+        require_mode("/etc/firefox/policies", 0o555)?;
+        require_mode("/etc/firefox/policies/policies.json", 0o444)?;
+        require_mode(
+            "/etc/firefox/policies/td-firefox-autotest-ca.pem",
+            0o444,
+        )?;
+        if read_bounded_text(
+            Path::new("/etc/firefox/policies/policies.json"),
+            1024,
+        )? != authority::FIREFOX_AUTOTEST_POLICY
+        {
+            return Err(io::Error::other(
+                "Firefox autotest policy is not the compiled certificate policy",
+            ));
+        }
+        let firefox_ca = read_bounded_text(
+            Path::new("/etc/firefox/policies/td-firefox-autotest-ca.pem"),
+            64 * 1024,
+        )?;
+        if !firefox_ca.starts_with("-----BEGIN CERTIFICATE-----\n")
+            || !firefox_ca.ends_with("-----END CERTIFICATE-----\n")
+            || firefox_ca.matches("-----BEGIN CERTIFICATE-----").count() != 1
+        {
+            return Err(io::Error::other(
+                "Firefox autotest CA is not one bounded PEM certificate",
+            ));
+        }
+    }
     for path in [
         "/etc/passwd",
         "/etc/group",
@@ -2495,6 +2577,20 @@ fn require_etc_plan(
         &["ro", "nosuid", "nodev", "noexec"],
         &["rw"],
     )?;
+    if firefox_autotest_policy {
+        for path in [
+            "/etc/firefox/policies/policies.json",
+            "/etc/firefox/policies/td-firefox-autotest-ca.pem",
+        ] {
+            require_mount(
+                mountinfo,
+                path,
+                None,
+                &["ro", "nosuid", "nodev", "noexec"],
+                &["rw"],
+            )?;
+        }
+    }
     if resolv_conf {
         if read_bounded_text(
             Path::new("/etc/resolv.conf"),
@@ -2547,6 +2643,7 @@ fn require_mount_plan(
     filesystems: Option<&[Stage2Filesystem]>,
     resolv_conf: bool,
     machine_id: Option<&str>,
+    firefox_autotest_policy: bool,
     runtime_aliases: bool,
     token: &[u8; TOKEN_LEN],
     identity: Identity,
@@ -2659,7 +2756,14 @@ fn require_mount_plan(
         if runtime_aliases {
             require_runtime_aliases()?;
         }
-        require_etc_plan(&mountinfo, token, resolv_conf, machine_id, identity)?;
+        require_etc_plan(
+            &mountinfo,
+            token,
+            resolv_conf,
+            firefox_autotest_policy,
+            machine_id,
+            identity,
+        )?;
         require_names("/run", &["user"])?;
         let runtime = format!("/run/user/{}", identity.uid);
         require_mode(&runtime, 0o700)?;
@@ -3441,18 +3545,26 @@ pub fn run_stage2(
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     let mount_probe_token = random_token()?;
-    let (filesystems, resolv_conf, machine_id, runtime_aliases) = match &action {
-        Stage2Action::Probe => (None, false, None, false),
+    let (
+        filesystems,
+        resolv_conf,
+        machine_id,
+        firefox_autotest_policy,
+        runtime_aliases,
+    ) = match &action {
+        Stage2Action::Probe => (None, false, None, false, false),
         Stage2Action::Launch {
             filesystems,
             resolv_conf,
             machine_id,
+            firefox_autotest_policy,
             runtime_aliases,
             ..
         } => (
             Some(filesystems.as_slice()),
             *resolv_conf,
             Some(machine_id.as_str()),
+            *firefox_autotest_policy,
             *runtime_aliases,
         ),
     };
@@ -3460,6 +3572,7 @@ pub fn run_stage2(
         filesystems,
         resolv_conf,
         machine_id,
+        firefox_autotest_policy,
         runtime_aliases,
         &mount_probe_token,
         identity,
@@ -3491,6 +3604,7 @@ pub fn run_stage2(
             entry,
             resolv_conf: _,
             machine_id: _,
+            firefox_autotest_policy: _,
             runtime_aliases: _,
             environment,
             filesystems: _,
@@ -3950,6 +4064,9 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 filesystems: &application.filesystems,
                 resolv_conf: application.resolv_conf.is_some(),
                 machine_id: &application.state.machine_id,
+                firefox_autotest_policy: application
+                    .firefox_autotest_policy
+                    .is_some(),
                 loader_library_path: application.loader_library_path.as_deref(),
             },
             Stage2ResourceBinding {
@@ -4507,6 +4624,8 @@ mod tests {
                 "present",
                 STAGE2_MACHINE_ID_ARG,
                 machine_id,
+                STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
+                "present",
                 STAGE2_LOADER_LIBRARY_PATH_ARG,
                 "absent",
                 STAGE2_ENVIRONMENT_ARG,
@@ -4543,6 +4662,7 @@ mod tests {
                     entry,
                     resolv_conf,
                     machine_id: parsed_machine_id,
+                    firefox_autotest_policy,
                     runtime_aliases,
                     environment,
                     filesystems,
@@ -4554,6 +4674,7 @@ mod tests {
             } if entry == "/app/bin/app"
                 && resolv_conf
                 && parsed_machine_id == machine_id
+                && firefox_autotest_policy
                 && !runtime_aliases
                 && environment.first() == Some(&(
                     OsString::from("DBUS_SESSION_BUS_ADDRESS"),
@@ -4589,6 +4710,8 @@ mod tests {
             "absent",
             STAGE2_MACHINE_ID_ARG,
             machine_id,
+            STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
+            "absent",
             STAGE2_LOADER_LIBRARY_PATH_ARG,
             "absent",
             STAGE2_ENVIRONMENT_ARG,
@@ -4611,6 +4734,8 @@ mod tests {
             "absent",
             STAGE2_MACHINE_ID_ARG,
             machine_id,
+            STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
+            "absent",
             STAGE2_LOADER_LIBRARY_PATH_ARG,
             "absent",
             STAGE2_ENVIRONMENT_ARG,
@@ -4704,6 +4829,7 @@ mod tests {
                 filesystems: &filesystems,
                 resolv_conf: false,
                 machine_id,
+                firefox_autotest_policy: true,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
             },
             Stage2ResourceBinding {
@@ -4730,6 +4856,7 @@ mod tests {
                     entry: "/app/bin/app".into(),
                     resolv_conf: false,
                     machine_id: machine_id.into(),
+                    firefox_autotest_policy: true,
                     runtime_aliases: true,
                     environment,
                     filesystems: vec![Stage2Filesystem {
@@ -5647,9 +5774,13 @@ mod tests {
                 },
             ]
         );
+        assert!(!expected_etc_names(&selected, false, false)
+            .unwrap()
+            .contains("firefox"));
         assert_eq!(
-            expected_etc_names(&selected, false).unwrap(),
+            expected_etc_names(&selected, false, true).unwrap(),
             BTreeSet::from([
+                "firefox".to_string(),
                 "fonts".to_string(),
                 "group".to_string(),
                 "hostname".to_string(),

@@ -1528,12 +1528,15 @@ The independent target acceptance test is a headless QEMU boot of the built
 system image. The image selects the exact Firefox and Freedesktop 25.08 marked
 payloads, launches `/bin/firefox` through the immutable application registry,
 and, only under the QEMU oracle's exact `td.autotest=1` kernel token, passes it
-a fixed local HTML document whose full-viewport background has equal solid
-panels of exact RGB `#ff00ff` on the left and `#00ff00` on the right. A
-uid-1000 one-shot writes that document and a fresh automation profile into
-the application's private volatile runtime directory before launch. td-jail
-binds that directory at `/run/user/1000/td-app`, and Firefox receives the
-exact profile and `file:` URL there.
+a fixed HTTPS document whose full-viewport background has equal solid panels
+of exact RGB `#ff00ff` on the left and `#00ff00` on the right. A trusted root
+one-shot mints an ephemeral CA and localhost server identity, writes the exact
+certificate-install policy and document under `/run`, and a source-built
+LibreSSL command serves the document. The uid-1000 one-shot writes only the
+fresh automation profile into the application's private volatile runtime
+directory. td-jail binds that directory at `/run/user/1000/td-app`, admits the
+complete root-owned CA/policy pair into Firefox's synthetic immutable `/etc`,
+and Firefox receives the exact profile and `https://localhost:8443` URL.
 
 The profile carries only Mozilla's own
 `browser.preonboarding.enabled=false` and
@@ -1570,18 +1573,19 @@ record, a currently live Firefox jail with the exact cgroup caps, and an exact
 `-contentproc` argv token on a process revalidated inside that same cgroup. It
 then atomically publishes evidence and emits the existing
 `TD-FIREFOX-FIRST-WINDOW-READY` marker followed by the distinct
-`TD-FIREFOX-OFFLINE-CONTENT-READY` marker. The closed autotest boot has no
-other programmed producer for the app id and fixed sentinel document,
+`TD-FIREFOX-HTTPS-CONTENT-READY` marker. The closed autotest boot has no
+other programmed producer for the app id and fixed sentinel document, and
+that document exists only behind the declared localhost HTTPS origin.
 Firefox has no console descriptor, and the host oracle accepts only both
 exact console lines. The Wayland peer is still not cryptographically bound to
-the cgroup process, but the evidence now proves deterministic offline document pixels
-entered an accepted application buffer, its paint succeeded, both sentinel
-regions from that surface survived placement, stacking, clipping and
+the cgroup process, but the evidence now proves deterministic HTTPS document
+pixels entered an accepted application buffer, its paint succeeded, and both
+sentinel regions from that surface survived placement, stacking, clipping and
 occlusion into the compositor's rendered output, a process with Firefox's
-exact `-contentproc` role token remained live
-in the Firefox cgroup, and resource accounting remained within the compiled
-ceilings, without manual inspection. It does not yet prove input, HTTPS/NSS,
-portals, external networking policy, audio, pixel-for-pixel correspondence
+exact `-contentproc` role token remained live in the Firefox cgroup, and
+resource accounting remained within the compiled ceilings, without manual
+inspection. It does not yet prove input, portals,
+external networking policy, audio, pixel-for-pixel correspondence
 between the accepted buffer and the complete decorated output, or the complete
 process-class sandbox report required by §H.
 
@@ -5741,7 +5745,14 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   provenance note says "Mozilla's trust store as rendered by curl", and
   the extraction step Mozilla's own file would need does not exist here.
   PEM blocks are hand-parsed strictly; no host OpenSSL. Firefox brings its own NSS
-  store regardless, and runtime NSS databases stay runtime-owned.
+  store regardless, and runtime NSS databases stay runtime-owned. The QEMU
+  Firefox HTTPS proof is the sole test-only extension to the closed synthetic
+  `/etc` roster: under the exact autotest kernel token, a trusted service creates
+  one ephemeral CA and one exact `Certificates.Install` policy under `/run`.
+  `td-jail` admits the complete root-owned mode-0444 pair or neither, and binds
+  it read-only at `/etc/firefox/policies` only for the compiled Firefox
+  application name. This is test-profile trust, not a shipped root or a
+  general application-controlled `/etc` extension.
 - **Fonts and locale** — the runtime ships fonts, fontconfig caches,
   icons and MIME data; td exposes none of its own (its PSF2 face is not
   an app font). Cache misses rebuild into the app's private
@@ -5840,7 +5851,8 @@ packaged selftest, boot oracle — with **network never in the gate**.
    system image. Its executable personality remains inside the copied
    `td-compositor` store output. The image now selects the exact marked Firefox
    154.0 and Freedesktop 25.08 package outputs, exposes `/bin/firefox` through
-   td-jail, and starts it under supervision on a fixed static local document.
+   td-jail, and starts it under supervision on a fixed document served by the
+   guest-local HTTPS fixture.
    An exact QEMU kernel token selects a fresh `/run`-backed automation profile
    and the document; ordinary boots retain Firefox's own profile and first-run
    flow. `td-compositor` publishes its private observation
@@ -5856,20 +5868,20 @@ packaged selftest, boot oracle — with **network never in the gate**.
    with an exact same-cgroup `-contentproc` argv token, publishes the evidence
    file, emits
    `TD-FIREFOX-FIRST-WINDOW-READY` and
-   `TD-FIREFOX-OFFLINE-CONTENT-READY`, then publishes a completion record that
+   `TD-FIREFOX-HTTPS-CONTENT-READY`, then publishes a completion record that
    lets the autotest greeter exit. QEMU requires both exact markers on every
    system boot.
    The evidence unit is not a dependency of `bootsuccess`, so user-owned state
    cannot decrement the deployment attempt counter. The application has no
    terminal or console descriptor with which to forge that evidence or alter
    terminal state. In the closed boot topology those independent facts are
-   evidence that the imported loader and Firefox reached a painted offline
+   evidence that the imported loader and Firefox reached a painted HTTPS
    document frame through the production package, runtime, broker, jail and
    compositor path while that role-token process remained in the instance.
    The probes do not bind the Wayland peer to the cgroup instance, and both XDG
    fields are client-asserted. The markers also do not prove exact text or
-   glyph rasterization, input, HTTPS/NSS, portals, external-network isolation
-   or audio. The earlier plan's direct in-guest
+   glyph rasterization, input, portals, external-network isolation or audio.
+   The earlier plan's direct in-guest
    `mount(2) == EPERM` subprobe remains deferred: this slice directly reads
    back all five empty capability sets and the standard-filter interpreter
    pins `EPERM` for the complete mount syscall roster, but a target-side
@@ -5921,14 +5933,14 @@ packaged selftest, boot oracle — with **network never in the gate**.
 
 ### Before anyone writes "Firefox runs"
 
-The automated offline-document markers above deliberately do not cross this
-line. They prove package selection, jail execution, XDG app identity, an
-accepted buffer with the exact bounded document-background pixel region,
-framebuffer paint, a same-cgroup process with Firefox's exact `-contentproc`
-argv token and live
+The automated HTTPS-document markers above deliberately do not claim this
+whole section. They prove package selection, jail execution, XDG app identity,
+an accepted buffer with the exact bounded document-background pixel region,
+framebuffer paint, NSS-backed HTTPS to the declared guest-local origin, a
+same-cgroup process with Firefox's exact `-contentproc` argv token and live
 resource high-water/cgroup caps. The complete browser claim still requires
-every item below, notably NSS-backed HTTPS rather than a local file and the
-full `about:support` process-class report.
+every item below, notably the full `about:support` process-class report and
+input, portal, download, isolation and soak evidence.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -5967,21 +5979,43 @@ and image commits — showing:
 5. `about:support` reporting Wayland and Software WebRender;
 6. one HTTPS page loading and rendering — served by a **declared
    in-guest TLS origin**, not from the public internet: a fixture server
-   on the guest, a certificate minted for it at image-build time, and
-   its issuing CA added to **the test profile's `cert9.db`** — never to
-   the shipped bundle, and note that adding it to the bundle would not
-   work either: Firefox trusts NSS's own roots and does not read
-   `/etc/ssl/certs/ca-certificates.crt`, so a fixture that put the CA
+   on the guest uses the source-built static LibreSSL command. A trusted
+   autotest-only boot service mints a one-day CA and localhost server
+   identity under `/run`; neither private key nor certificate survives the
+   boot or enters a recipe output. Before minting it, the same privileged
+   service runs td-netd's DHCP-free loopback operation, so origin readiness
+   has an explicit localhost dependency and does not wait for a NIC. `td-jail`
+   admits the exact root-owned,
+   mode-0444 CA/policy pair only for Firefox and only when its own bounded
+   `/proc/cmdline` parser sees the exact `td.autotest=1` token, revalidates
+   their descriptor identity, and binds them into its otherwise synthetic
+   immutable `/etc` as the supported `Certificates.Install` enterprise
+   policy. Firefox therefore
+   imports the CA into the fresh test profile's NSS database. The exact
+   magenta/lime document paint cannot occur unless NSS accepts that chain and
+   hostname. Ordinary boots create neither pair and expose no Firefox policy
+   subtree. The CA is never added to the shipped bundle, and adding it to the
+   bundle would not work either: Firefox trusts NSS's own roots and does not
+   read `/etc/ssl/certs/ca-certificates.crt`, so a fixture that put the CA
    there would fail with `SEC_ERROR_UNKNOWN_ISSUER` and look like a
    confinement bug. "A valid public certificate" was the earlier
    wording and it is unreachable under item 1; it is also the wrong
    requirement, since what this item proves is that NSS initialises,
    the TLS stack runs inside the jail, and the renderer paints a real
    page — none of which needs the certificate to chain to a public root.
-   The one thing the fixture must NOT do is disable certificate
-   verification, because a Firefox that renders with verification off
-   has proved nothing about the part that could plausibly be broken by
-   confinement;
+   The fixture does not disable certificate verification. Before Firefox
+   starts, its readiness probe independently validates the same origin with
+   the generated CA and refuses a failed chain. A Firefox that rendered with
+   verification off would prove nothing about the part that could plausibly be
+   broken by confinement. LibreSSL 4.3.2's `s_server -accept` accepts a port
+   but no bind address, so the fixture listener binds every guest interface.
+   `td.autotest=1` is an internal harness mode and is unsupported on a physical
+   or otherwise attached machine: the system oracle uses `-nic none`, while
+   the one network oracle uses the exact QEMU user-mode NAT backend with no
+   `hostfwd`. Tests pin that it is the sole autotest plan with a NIC and that
+   its netdev string has no inbound forwarding. The network oracle therefore
+   retains outbound DHCP, DNS and HTTPS without making the fixture reachable
+   from the host or an external network;
 7. keyboard, pointer, cursor, wheel, a right-click menu opening and
    dismissing, and paste from td-term into the URL bar;
 8. a download reaching the app-private or explicitly granted directory;
@@ -6058,8 +6092,9 @@ Each row is one landing or a small family, leaving the tree green.
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 25 | **`td-audio` crate + surface #11**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients | **sound from the machine** |
 | 26 | `td-audio`'s PulseAudio protocol: frames, tagstruct codec, `AUTH`/`SET_CLIENT_NAME`/sink info, one playback stream; `sockets=pulseaudio` binds the socket into a jail | a jailed fixture app plays audio |
-| 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. Every QEMU boot selects a fresh volatile automation profile, opens a fixed local document and accepts only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributes both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints a deterministic offline document without manual inspection |
-| 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox window, an HTTPS page, and sound** |
+| 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The initial proof selected a fresh volatile automation profile and fixed local document, then accepted only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributed both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. Rung 27a retains that authority and replaces the local-file transport with verified HTTPS. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints deterministic content without manual inspection |
+| 27a | **Firefox HTTPS/NSS image proof — LANDED**; the source-built LibreSSL command supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The all-interface LibreSSL test listener is supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
+| 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox input, portals, isolation, soak and sound are all proved** |
 
 **Two other reversals are still absent from this ladder, and that is a
 scheduling gap rather than a decision.** §O made timezone support
