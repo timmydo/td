@@ -1,9 +1,11 @@
+use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
 use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
 use crate::layout::ViewLayout;
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::positioner::{Anchor, Gravity, Positioner, Rect as PositionerRect};
 use crate::runtime::{
+    ApplicationEvidence, MAX_APPLICATION_PIXEL_SCAN, MIN_APPLICATION_CONTENT_PIXELS,
     DataSourceIdentity, ForeignImportIdentity, KeyboardDelivery, KeyboardSubscriptionStop,
     PopupRegistration, PopupRegistrations, Runtime, SelectionSource, SelectionUpdate,
     SubscriptionStop, ToplevelParentError,
@@ -32,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 const GLOBAL_COMPOSITOR: u32 = 1;
 const GLOBAL_SHM: u32 = 2;
@@ -671,6 +674,7 @@ struct Client {
     protocol_error_object: Option<u32>,
     mapped_bytes: BTreeMap<u32, usize>,
     mapped_total: usize,
+    resources: Arc<ClientResourceHighWater>,
 }
 
 struct ClientPermit;
@@ -1844,6 +1848,12 @@ impl Client {
         let writer = stream
             .try_clone()
             .map_err(|e| format!("clone Wayland client stream: {e}"))?;
+        let resources = Arc::new(ClientResourceHighWater::default());
+        resources.observe_objects(objects.len());
+        runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .register_client_resources(id, Arc::clone(&resources))?;
         Ok(Client {
             id,
             stream,
@@ -1871,6 +1881,7 @@ impl Client {
             protocol_error_object: None,
             mapped_bytes: BTreeMap::new(),
             mapped_total: 0,
+            resources,
         })
     }
 
@@ -2201,6 +2212,7 @@ impl Client {
             deferred.bytes = next_bytes;
             deferred.buffer_releases = next_releases;
             deferred.frame_callbacks = next_callbacks;
+            self.resources.observe_deferred(next_events, next_bytes);
             return Ok(());
         }
         self.outbound
@@ -3336,10 +3348,18 @@ impl Client {
         if self.objects.len() >= MAX_OBJECTS {
             return Err(format!("client exceeded the {MAX_OBJECTS}-object limit"));
         }
-        if object_retains_shm(&object) {
-            require_shm_usage(self.retained_shm_usage_replacing(None, Some(&object))?)?;
-        }
+        let shm = if object_retains_shm(&object) {
+            let usage = self.retained_shm_usage_replacing(None, Some(&object))?;
+            require_shm_usage(usage)?;
+            Some(usage)
+        } else {
+            None
+        };
         self.objects.insert(id, object);
+        self.resources.observe_objects(self.objects.len());
+        if let Some(usage) = shm {
+            self.resources.observe_shm(usage.pools, usage.bytes);
+        }
         Ok(())
     }
 
@@ -3736,9 +3756,9 @@ impl Client {
         let Some(Object::Subsurface { cached, .. }) = self.objects.get(&object) else {
             return Err(format!("wl_surface {surface} lost wl_subsurface {object}"));
         };
-        if !cached.committed
-            && self.cached_subsurface_commits() >= MAX_CACHED_SUBSURFACE_COMMITS
-        {
+        let was_committed = cached.committed;
+        let cached_commits = self.cached_subsurface_commits();
+        if !was_committed && cached_commits >= MAX_CACHED_SUBSURFACE_COMMITS {
             return Err(format!(
                 "client exceeded the {MAX_CACHED_SUBSURFACE_COMMITS} cached subsurface-commit limit"
             ));
@@ -3770,6 +3790,8 @@ impl Client {
             cached.frame_callbacks.append(&mut state.frame_callbacks);
             previous
         };
+        self.resources
+            .observe_cached_commits(cached_commits.saturating_add(usize::from(!was_committed)));
         if let Some(PendingBuffer::Buffer { object, buffer, .. }) = previous {
             if matches!(
                 self.objects.get(&object),
@@ -4530,6 +4552,7 @@ impl Client {
                         let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
                         let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
                         let surface = Self::copy_buffer(&buffer)?;
+                        self.resources.observe_copied_bytes(next);
                         runtime.commit_subsurface(
                             key,
                             Some(surface),
@@ -4604,6 +4627,7 @@ impl Client {
                         let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
                         let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
                         let surface = Self::copy_buffer(&buffer)?;
+                        self.resources.observe_copied_bytes(next);
                         runtime.commit_popup(
                             key,
                             Some(surface),
@@ -4664,6 +4688,7 @@ impl Client {
                         let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
                         let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
                         let surface = Self::copy_buffer(&buffer)?;
+                        self.resources.observe_copied_bytes(next);
                         runtime.apply_commit(
                             key,
                             Some(surface),
@@ -4939,12 +4964,14 @@ impl Client {
                         charge: Arc::clone(&pool.charge),
                         size,
                     });
-                    require_shm_usage(self.retained_shm_usage_replacing(
+                    let usage = self.retained_shm_usage_replacing(
                         Some(message.object),
                         Some(&replacement),
-                    )?)?;
+                    )?;
+                    require_shm_usage(usage)?;
                     pool.charge.store(size, Ordering::Relaxed);
                     self.objects.insert(message.object, replacement);
+                    self.resources.observe_shm(usage.pools, usage.bytes);
                     Ok(())
                 }
                 _ => Err(format!(
@@ -5023,6 +5050,8 @@ impl Client {
                     }
                     self.insert(callback, Object::Callback)?;
                     state.frame_callbacks.push(callback);
+                    self.resources
+                        .observe_frame_callbacks(retained.saturating_add(1));
                     self.objects.insert(message.object, Object::Surface(state));
                     Ok(())
                 }
@@ -6308,10 +6337,21 @@ fn serve_client(
     keymap: KeymapFile,
 ) -> Result<(), String> {
     let mut client = Client::new(id, stream, Arc::clone(&runtime), keymap)?;
-    let subscription = runtime
-        .lock()
-        .map_err(|_| "runtime lock poisoned".to_string())?
-        .subscribe(id)?;
+    let subscription = match runtime.lock() {
+        Ok(mut runtime) => match runtime.subscribe(id) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                runtime.unregister_client_resources(id);
+                return Err(error);
+            }
+        },
+        Err(poisoned) => {
+            poisoned
+                .into_inner()
+                .unregister_client_resources(id);
+            return Err("runtime lock poisoned".to_string());
+        }
+    };
     let (receiver, stop) = subscription.split();
     let keyboard_subscription = match runtime.lock() {
         Ok(mut runtime) => {
@@ -6329,7 +6369,9 @@ fn serve_client(
         }
         Err(poisoned) => {
             stop.stop();
-            poisoned.into_inner().unsubscribe(id);
+            let mut runtime = poisoned.into_inner();
+            runtime.unsubscribe(id);
+            runtime.unregister_client_resources(id);
             return Err("runtime lock poisoned".into());
         }
     };
@@ -6340,6 +6382,7 @@ fn serve_client(
             if let Ok(mut runtime) = runtime.lock() {
                 runtime.unsubscribe(id);
                 runtime.unregister_popups(id);
+                runtime.unregister_client_resources(id);
             }
             return Err(error);
         }
@@ -6376,6 +6419,7 @@ fn serve_client(
                 runtime.unsubscribe(id);
                 runtime.unsubscribe_keyboard(id);
                 runtime.unregister_popups(id);
+                runtime.unregister_client_resources(id);
             }
             return Err(format!("spawn Wayland configure worker {id}: {error}"));
         }
@@ -6418,6 +6462,7 @@ fn serve_client(
                 runtime.unsubscribe(id);
                 runtime.unsubscribe_keyboard(id);
                 runtime.unregister_popups(id);
+                runtime.unregister_client_resources(id);
             }
             let _ = configure_thread.join();
             return Err(format!("spawn Wayland seat worker {id}: {error}"));
@@ -6528,14 +6573,184 @@ fn valid_expected_app_id(app_id: &str) -> bool {
         })
 }
 
+fn parse_content_rgb(text: &str) -> Result<[u8; 3], String> {
+    if text.len() != 6
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("expected application content RGB must be six lowercase hexadecimal digits"
+            .to_string());
+    }
+    let red = text
+        .get(0..2)
+        .ok_or_else(|| "application content RGB lacks red".to_string())?;
+    let green = text
+        .get(2..4)
+        .ok_or_else(|| "application content RGB lacks green".to_string())?;
+    let blue = text
+        .get(4..6)
+        .ok_or_else(|| "application content RGB lacks blue".to_string())?;
+    Ok([
+        u8::from_str_radix(red, 16)
+            .map_err(|error| format!("parse application content red: {error}"))?,
+        u8::from_str_radix(green, 16)
+            .map_err(|error| format!("parse application content green: {error}"))?,
+        u8::from_str_radix(blue, 16)
+            .map_err(|error| format!("parse application content blue: {error}"))?,
+    ])
+}
+
+fn content_rgb_text(rgb: [u8; 3]) -> String {
+    let [red, green, blue] = rgb;
+    format!("{red:02x}{green:02x}{blue:02x}")
+}
+
+const MAX_APPLICATION_EVIDENCE_BYTES: usize = 1_024;
+const APPLICATION_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn application_evidence_line(evidence: &ApplicationEvidence) -> Result<String, String> {
+    if !valid_expected_app_id(&evidence.app_id) {
+        return Err("application evidence contains an invalid identity token".to_string());
+    }
+    if !evidence.content_pixels.iter().all(|count| {
+        (MIN_APPLICATION_CONTENT_PIXELS..=MAX_APPLICATION_PIXEL_SCAN).contains(count)
+    }) {
+        return Err("application evidence content-pixel count is outside its bound".to_string());
+    }
+    let [content_rgb_a, content_rgb_b] = evidence.content_rgbs;
+    let [content_pixels_a, content_pixels_b] = evidence.content_pixels;
+    let resources = evidence.resources;
+    Ok(format!(
+        "TD-APPLICATION-CONTENT-READY app-id={} content-rgb-a={} content-rgb-b={} content-pixels-a={} content-pixels-b={} objects={} shm-pools={} shm-bytes={} callbacks={} cached-commits={} deferred-events={} deferred-bytes={} copied-bytes={}\n",
+        evidence.app_id,
+        content_rgb_text(content_rgb_a),
+        content_rgb_text(content_rgb_b),
+        content_pixels_a,
+        content_pixels_b,
+        resources.objects,
+        resources.shm_pools,
+        resources.shm_bytes,
+        resources.frame_callbacks,
+        resources.cached_commits,
+        resources.deferred_events,
+        resources.deferred_bytes,
+        resources.copied_bytes,
+    ))
+}
+
+fn parse_evidence_field<'a>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    name: &str,
+) -> Result<&'a str, String> {
+    fields
+        .next()
+        .and_then(|field| field.strip_prefix(name))
+        .ok_or_else(|| format!("application evidence lacks {name}"))
+}
+
+fn parse_evidence_usize<'a>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    name: &str,
+) -> Result<usize, String> {
+    parse_evidence_field(fields, name)?
+        .parse::<usize>()
+        .map_err(|error| format!("application evidence has invalid {name}: {error}"))
+}
+
+fn parse_application_evidence(
+    line: &str,
+    expected_app_id: &str,
+    expected_content_rgb_a: &str,
+    expected_content_rgb_b: &str,
+) -> Result<ClientResourceSnapshot, String> {
+    let expected_content_rgbs = [
+        parse_content_rgb(expected_content_rgb_a)?,
+        parse_content_rgb(expected_content_rgb_b)?,
+    ];
+    let [expected_rgb_a, expected_rgb_b] = expected_content_rgbs;
+    let Some(body) = line.strip_suffix('\n') else {
+        return Err("application evidence is not exactly one newline-terminated line".to_string());
+    };
+    if body.contains(['\n', '\r']) {
+        return Err("application evidence is not exactly one newline-terminated line".to_string());
+    }
+    let mut fields = body.split_ascii_whitespace();
+    if fields.next() != Some("TD-APPLICATION-CONTENT-READY") {
+        return Err("application evidence has the wrong marker".to_string());
+    }
+    let app_id = parse_evidence_field(&mut fields, "app-id=")?;
+    let observed_content_rgb_a = parse_evidence_field(&mut fields, "content-rgb-a=")?;
+    let observed_content_rgb_b = parse_evidence_field(&mut fields, "content-rgb-b=")?;
+    let content_rgbs = [
+        parse_content_rgb(observed_content_rgb_a)?,
+        parse_content_rgb(observed_content_rgb_b)?,
+    ];
+    if app_id != expected_app_id || content_rgbs != expected_content_rgbs {
+        return Err(format!(
+            "application evidence names app-id={app_id:?} content colors \
+             {observed_content_rgb_a:?}/{observed_content_rgb_b:?}, expected \
+             {expected_app_id:?} and {:?}/{:?}",
+            content_rgb_text(expected_rgb_a),
+            content_rgb_text(expected_rgb_b),
+        ));
+    }
+    let content_pixels = [
+        parse_evidence_usize(&mut fields, "content-pixels-a=")?,
+        parse_evidence_usize(&mut fields, "content-pixels-b=")?,
+    ];
+    if !content_pixels.iter().all(|count| {
+        (MIN_APPLICATION_CONTENT_PIXELS..=MAX_APPLICATION_PIXEL_SCAN).contains(count)
+    }) {
+        return Err("application evidence content-pixel count is outside its bound".to_string());
+    }
+    let resources = ClientResourceSnapshot {
+        objects: parse_evidence_usize(&mut fields, "objects=")?,
+        shm_pools: parse_evidence_usize(&mut fields, "shm-pools=")?,
+        shm_bytes: parse_evidence_usize(&mut fields, "shm-bytes=")?,
+        frame_callbacks: parse_evidence_usize(&mut fields, "callbacks=")?,
+        cached_commits: parse_evidence_usize(&mut fields, "cached-commits=")?,
+        deferred_events: parse_evidence_usize(&mut fields, "deferred-events=")?,
+        deferred_bytes: parse_evidence_usize(&mut fields, "deferred-bytes=")?,
+        copied_bytes: parse_evidence_usize(&mut fields, "copied-bytes=")?,
+    };
+    if fields.next().is_some() {
+        return Err("application evidence contains trailing fields".to_string());
+    }
+    if resources.objects == 0 || resources.objects > MAX_OBJECTS {
+        return Err("application evidence object high-water is outside its bound".to_string());
+    }
+    if resources.shm_pools == 0 || resources.shm_pools > MAX_CLIENT_SHM_POOLS {
+        return Err("application evidence shm-pool high-water is outside its bound".to_string());
+    }
+    if resources.shm_bytes == 0 || resources.shm_bytes > MAX_CLIENT_SHM_BYTES {
+        return Err("application evidence shm-byte high-water is outside its bound".to_string());
+    }
+    if resources.frame_callbacks > MAX_PENDING_FRAME_CALLBACKS
+        || resources.cached_commits > MAX_CACHED_SUBSURFACE_COMMITS
+        || resources.deferred_events > MAX_DEFERRED_EVENTS
+        || resources.deferred_bytes > MAX_DEFERRED_EVENT_BYTES
+        || resources.copied_bytes == 0
+        || resources.copied_bytes > MAX_UI_FRAME_BYTES
+    {
+        return Err("application evidence resource high-water exceeds its bound".to_string());
+    }
+    Ok(resources)
+}
+
 fn announce_application_ready(
     out: &mut impl Write,
     app_id: &str,
+    content_rgbs: [[u8; 3]; 2],
     path: &Path,
 ) -> Result<(), String> {
+    let [content_rgb_a, content_rgb_b] = content_rgbs;
     writeln!(
         out,
-        "TD-APPLICATION-WINDOW-READY app-id={app_id} socket={}",
+        "TD-APPLICATION-WINDOW-READY app-id={app_id} content-rgb-a={} \
+         content-rgb-b={} socket={}",
+        content_rgb_text(content_rgb_a),
+        content_rgb_text(content_rgb_b),
         path.display()
     )
     .map_err(|error| format!("write application-window ready marker: {error}"))?;
@@ -6545,28 +6760,55 @@ fn announce_application_ready(
 
 /// Start the one-shot publisher before clients can connect. Its socket is
 /// deliberately absent until Runtime reports a matching mapped toplevel.
-pub fn watch_application(path: &Path, app_id: &str) -> Result<SyncSender<()>, String> {
+pub fn watch_application(
+    path: &Path,
+    app_id: &str,
+    content_rgb_a: &str,
+    content_rgb_b: &str,
+) -> Result<(SyncSender<ApplicationEvidence>, [[u8; 3]; 2]), String> {
     if !valid_expected_app_id(app_id) {
         return Err(
             "expected application app id must be 1..=128 ASCII letters, digits, dots, underscores, or hyphens"
                 .into(),
         );
     }
+    let content_rgbs = [
+        parse_content_rgb(content_rgb_a)?,
+        parse_content_rgb(content_rgb_b)?,
+    ];
+    let [parsed_rgb_a, parsed_rgb_b] = content_rgbs;
+    if parsed_rgb_a == parsed_rgb_b {
+        return Err("application content colors must be distinct".to_string());
+    }
     socket::remove_stale(path, "application-window readiness")?;
     let path = path.to_path_buf();
     let app_id = app_id.to_string();
-    let (wake, receiver) = mpsc::sync_channel(1);
+    let (wake, receiver) = mpsc::sync_channel::<ApplicationEvidence>(1);
     thread::Builder::new()
         .name("application-window-ready".into())
         .spawn(move || {
-            if receiver.recv().is_err() {
-                return;
+            let evidence = match receiver.recv() {
+                Ok(evidence) => evidence,
+                Err(_) => return,
+            };
+            if evidence.app_id != app_id || evidence.content_rgbs != content_rgbs {
+                eprintln!(
+                    "td-compositor: application readiness identity changed before publication");
+                std::process::exit(1);
             }
-            match socket::publish(&path, "application-ready", Vec::new()) {
+            let answer = match application_evidence_line(&evidence) {
+                Ok(answer) => answer.into_bytes(),
+                Err(error) => {
+                    eprintln!("td-compositor: application readiness: {error}");
+                    std::process::exit(1);
+                }
+            };
+            match socket::publish(&path, "application-ready", answer) {
                 Ok(published) => {
                     if let Err(error) = announce_application_ready(
                         &mut std::io::stdout().lock(),
                         &app_id,
+                        content_rgbs,
                         &path,
                     ) {
                         eprintln!("td-compositor: {error}");
@@ -6589,7 +6831,7 @@ pub fn watch_application(path: &Path, app_id: &str) -> Result<SyncSender<()>, St
             }
         })
         .map_err(|error| format!("spawn application-window observer: {error}"))?;
-    Ok(wake)
+    Ok((wake, content_rgbs))
 }
 
 pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
@@ -6636,15 +6878,54 @@ pub fn probe(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("connect Wayland socket {}: {e}", path.display()))
 }
 
-pub fn probe_application(path: &Path) -> Result<(), String> {
-    UnixStream::connect(path)
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "connect application-window readiness socket {}: {error}",
-                path.display()
-            )
-        })
+pub fn probe_application(
+    path: &Path,
+    expected_app_id: &str,
+    expected_content_rgb_a: &str,
+    expected_content_rgb_b: &str,
+) -> Result<String, String> {
+    if !valid_expected_app_id(expected_app_id) {
+        return Err("probe application identity token is invalid".to_string());
+    }
+    let expected_content_rgbs = [
+        parse_content_rgb(expected_content_rgb_a)?,
+        parse_content_rgb(expected_content_rgb_b)?,
+    ];
+    let [parsed_rgb_a, parsed_rgb_b] = expected_content_rgbs;
+    if parsed_rgb_a == parsed_rgb_b {
+        return Err("probe application content colors must be distinct".to_string());
+    }
+    let mut stream = UnixStream::connect(path).map_err(|error| {
+        format!(
+            "connect application-window readiness socket {}: {error}",
+            path.display()
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(APPLICATION_EVIDENCE_TIMEOUT))
+        .map_err(|error| format!("set application evidence read timeout: {error}"))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut stream)
+        .take(
+            u64::try_from(MAX_APPLICATION_EVIDENCE_BYTES.saturating_add(1))
+                .unwrap_or(u64::MAX),
+        )
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read application evidence: {error}"))?;
+    if bytes.len() > MAX_APPLICATION_EVIDENCE_BYTES {
+        return Err(format!(
+            "application evidence exceeds {MAX_APPLICATION_EVIDENCE_BYTES} bytes"
+        ));
+    }
+    let line = String::from_utf8(bytes)
+        .map_err(|error| format!("application evidence is not UTF-8: {error}"))?;
+    parse_application_evidence(
+        &line,
+        expected_app_id,
+        expected_content_rgb_a,
+        expected_content_rgb_b,
+    )?;
+    Ok(line)
 }
 
 #[cfg(test)]
@@ -6681,18 +6962,61 @@ mod tests {
         path
     }
 
+    const APPLICATION_CONTENT_RGB_A_TEXT: &str = "ff00ff";
+    const APPLICATION_CONTENT_RGB_B_TEXT: &str = "00ff00";
+    const APPLICATION_CONTENT_RGBS: [[u8; 3]; 2] = [[0xff, 0x00, 0xff], [0x00, 0xff, 0x00]];
+
+    fn application_evidence(app_id: &str) -> ApplicationEvidence {
+        ApplicationEvidence {
+            app_id: app_id.to_string(),
+            content_rgbs: APPLICATION_CONTENT_RGBS,
+            content_pixels: [8_000, 9_000],
+            resources: ClientResourceSnapshot {
+                objects: 41,
+                shm_pools: 5,
+                shm_bytes: 20 * 1024 * 1024,
+                frame_callbacks: 12,
+                cached_commits: 3,
+                deferred_events: 9,
+                deferred_bytes: 512,
+                copied_bytes: 4 * 1024 * 1024,
+            },
+        }
+    }
+
     #[test]
     fn application_socket_is_absent_until_the_one_shot_wakes() {
         let directory = test_directory("application-window-ready");
         let path = directory.join("ready");
-        let wake = watch_application(&path, "org.mozilla.firefox").unwrap();
+        let app_id = "org.mozilla.firefox";
+        let (wake, content_rgbs) = watch_application(
+            &path,
+            app_id,
+            APPLICATION_CONTENT_RGB_A_TEXT,
+            APPLICATION_CONTENT_RGB_B_TEXT,
+        )
+        .unwrap();
+        assert_eq!(content_rgbs, APPLICATION_CONTENT_RGBS);
         assert!(!path.exists());
-        assert!(probe_application(&path).is_err());
+        assert!(probe_application(
+            &path,
+            app_id,
+            APPLICATION_CONTENT_RGB_A_TEXT,
+            APPLICATION_CONTENT_RGB_B_TEXT,
+        )
+        .is_err());
 
-        wake.try_send(()).unwrap();
+        wake.try_send(application_evidence(app_id)).unwrap();
         let mut connected = false;
         for _ in 0..200 {
-            if probe_application(&path).is_ok() {
+            if probe_application(
+                &path,
+                app_id,
+                APPLICATION_CONTENT_RGB_A_TEXT,
+                APPLICATION_CONTENT_RGB_B_TEXT,
+            )
+            .is_ok()
+            {
                 connected = true;
                 break;
             }
@@ -6713,19 +7037,168 @@ mod tests {
         let directory = test_directory("application-window-id");
         let path = directory.join("ready");
         for app_id in ["", "bad\nid", "bad value", "bad=value", &"x".repeat(129)] {
-            assert!(watch_application(&path, app_id).is_err());
+            assert!(watch_application(
+                &path,
+                app_id,
+                APPLICATION_CONTENT_RGB_A_TEXT,
+                APPLICATION_CONTENT_RGB_B_TEXT,
+            )
+            .is_err());
         }
+        for rgb in ["", "0b1f3", "0b1f330", "0B1F33", "0b1x33", "0b 133"] {
+            assert!(watch_application(
+                &path,
+                "org.mozilla.firefox",
+                rgb,
+                APPLICATION_CONTENT_RGB_B_TEXT,
+            )
+            .is_err());
+        }
+        assert!(watch_application(
+            &path,
+            "org.mozilla.firefox",
+            APPLICATION_CONTENT_RGB_A_TEXT,
+            APPLICATION_CONTENT_RGB_A_TEXT,
+        )
+        .is_err());
         let mut out = Vec::new();
-        announce_application_ready(&mut out, "org.mozilla.firefox", &path).unwrap();
+        announce_application_ready(
+            &mut out,
+            "org.mozilla.firefox",
+            APPLICATION_CONTENT_RGBS,
+            &path,
+        )
+        .unwrap();
         assert_eq!(
             out,
             format!(
-                "TD-APPLICATION-WINDOW-READY app-id=org.mozilla.firefox socket={}\n",
+                "TD-APPLICATION-WINDOW-READY app-id=org.mozilla.firefox content-rgb-a=ff00ff content-rgb-b=00ff00 socket={}\n",
                 path.display()
             )
             .into_bytes()
         );
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn application_evidence_parser_pins_identity_shape_and_resource_bounds() {
+        let app_id = "org.mozilla.firefox";
+        let evidence = application_evidence(app_id);
+        let line = application_evidence_line(&evidence).unwrap();
+        assert_eq!(
+            parse_application_evidence(
+                &line,
+                app_id,
+                APPLICATION_CONTENT_RGB_A_TEXT,
+                APPLICATION_CONTENT_RGB_B_TEXT,
+            )
+            .unwrap(),
+            evidence.resources
+        );
+
+        for content_pixels in [
+            MIN_APPLICATION_CONTENT_PIXELS - 1,
+            MAX_APPLICATION_PIXEL_SCAN + 1,
+        ] {
+            let invalid = application_evidence_line(&ApplicationEvidence {
+                content_pixels: [content_pixels, 9_000],
+                ..evidence.clone()
+            });
+            assert!(invalid.is_err());
+        }
+
+        for resources in [
+            ClientResourceSnapshot {
+                objects: 0,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                objects: MAX_OBJECTS + 1,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                shm_pools: 0,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                shm_pools: MAX_CLIENT_SHM_POOLS + 1,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                shm_bytes: 0,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                shm_bytes: MAX_CLIENT_SHM_BYTES + 1,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                frame_callbacks: MAX_PENDING_FRAME_CALLBACKS + 1,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                cached_commits: MAX_CACHED_SUBSURFACE_COMMITS + 1,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                deferred_events: MAX_DEFERRED_EVENTS + 1,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                deferred_bytes: MAX_DEFERRED_EVENT_BYTES + 1,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                copied_bytes: 0,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                copied_bytes: MAX_UI_FRAME_BYTES + 1,
+                ..evidence.resources
+            },
+        ] {
+            let invalid = application_evidence_line(&ApplicationEvidence {
+                app_id: app_id.to_string(),
+                resources,
+                ..evidence.clone()
+            })
+            .unwrap();
+            assert!(parse_application_evidence(
+                &invalid,
+                app_id,
+                APPLICATION_CONTENT_RGB_A_TEXT,
+                APPLICATION_CONTENT_RGB_B_TEXT,
+            )
+            .is_err());
+        }
+        assert!(parse_application_evidence(
+            &line,
+            "firefox",
+            APPLICATION_CONTENT_RGB_A_TEXT,
+            APPLICATION_CONTENT_RGB_B_TEXT,
+        )
+        .is_err());
+        assert!(parse_application_evidence(
+            &line,
+            app_id,
+            "ffffff",
+            APPLICATION_CONTENT_RGB_B_TEXT,
+        )
+        .is_err());
+        assert!(parse_application_evidence(
+            &line.replacen('\n', " extra=true\n", 1),
+            app_id,
+            APPLICATION_CONTENT_RGB_A_TEXT,
+            APPLICATION_CONTENT_RGB_B_TEXT,
+        )
+        .is_err());
+        assert!(parse_application_evidence(
+            &format!("{line}TD-INJECTED\n"),
+            app_id,
+            APPLICATION_CONTENT_RGB_A_TEXT,
+            APPLICATION_CONTENT_RGB_B_TEXT,
+        )
+        .is_err());
     }
 
     fn test_keymap() -> KeymapFile {
@@ -9235,11 +9708,15 @@ mod tests {
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
         let framebuffer =
-            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+            Framebuffer::test_file(&framebuffer_path, 800, 600, 800 * 4).unwrap();
         let mut observed_runtime = Runtime::new(framebuffer);
         let (wake, ready) = std::sync::mpsc::sync_channel(1);
         observed_runtime
-            .watch_application("org.td.terminal".to_string(), wake)
+            .watch_application(
+                "org.td.terminal".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
             .unwrap();
         let runtime = Arc::new(Mutex::new(observed_runtime));
         let key = SurfaceKey {
@@ -9306,9 +9783,16 @@ mod tests {
             .apply_commit(
                 key,
                 Some(Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
+                    width: 100,
+                    height: 100,
+                    pixels: {
+                        let mut pixels = Vec::with_capacity(40_000);
+                        for _ in 0..100 {
+                            pixels.extend([0xff, 0x00, 0xff, 0].repeat(50));
+                            pixels.extend([0x00, 0xff, 0x00, 0].repeat(50));
+                        }
+                        pixels
+                    },
                     format: SHM_XRGB8888,
                 }),
                 None,
@@ -9318,7 +9802,10 @@ mod tests {
         assert!(ready.try_recv().is_err());
         locked.finish_compound_commit().unwrap();
         drop(locked);
-        assert_eq!(ready.try_recv(), Ok(()));
+        let evidence = ready.try_recv().unwrap();
+        assert_eq!(evidence.app_id, "org.td.terminal");
+        assert_eq!(evidence.content_rgbs, APPLICATION_CONTENT_RGBS);
+        assert_eq!(evidence.content_pixels, [5_000; 2]);
 
         // Destroying the TOPLEVEL takes the name, where unmapping its surface
         // does not. The wl_surface outlives the role object, so a toplevel
@@ -10901,6 +11388,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(client.mapped_total, 4);
+        assert_eq!(client.resources.snapshot().copied_bytes, 4);
         assert!(fs::read(&framebuffer_path)
             .unwrap()
             .as_chunks::<4>()
@@ -11351,6 +11839,10 @@ mod tests {
         }
         assert_eq!(
             client.cached_subsurface_commits(),
+            MAX_CACHED_SUBSURFACE_COMMITS
+        );
+        assert_eq!(
+            client.resources.snapshot().cached_commits,
             MAX_CACHED_SUBSURFACE_COMMITS
         );
 
@@ -12544,6 +13036,8 @@ mod tests {
                 bytes: MAX_CLIENT_SHM_BYTES,
             }
         );
+        assert_eq!(client.resources.snapshot().shm_pools, MAX_CLIENT_SHM_POOLS);
+        assert_eq!(client.resources.snapshot().shm_bytes, MAX_CLIENT_SHM_BYTES);
 
         let first = pools.first().unwrap().clone();
         client
@@ -12963,6 +13457,11 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("bytes=262152"), "{error}");
         client.discard_deferred_outbound();
+
+        let resources = client.resources.snapshot();
+        assert_eq!(resources.frame_callbacks, MAX_PENDING_FRAME_CALLBACKS);
+        assert_eq!(resources.deferred_events, MAX_DEFERRED_EVENTS);
+        assert_eq!(resources.deferred_bytes, MAX_DEFERRED_EVENT_BYTES);
 
         fs::remove_file(framebuffer_path).unwrap();
     }

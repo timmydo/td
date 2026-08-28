@@ -120,6 +120,7 @@ const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARK
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
 const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_BOOT_MARKER;
+const TD_FIREFOX_CONTENT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CONTENT_MARKER;
 const TD_PROFILER_ATTRIBUTION_MARKER: &str =
     td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
@@ -297,6 +298,7 @@ struct ConsoleEvidence {
     td_jail_transition: bool,
     td_jail_seccomp: bool,
     td_firefox: bool,
+    td_firefox_content: bool,
     td_profiler_attribution: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
@@ -1456,6 +1458,17 @@ fn validate_system_boot(
              registry resolution, canonical spec parsing, the immutable /app and /usr binds, \
              the private runtime and Downloads grant, bus registration, the exact Wayland \
              socket, bounded live cgroup state, or matching XDG frame painting failed. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_firefox_content {
+        return Err(format!(
+            "Firefox painted its first window, but the deterministic offline-content marker \
+             ({TD_FIREFOX_CONTENT_MARKER:?}) was absent — the fixed data document did not \
+             produce the exact bounded content-pixel region, compositor resource high-water \
+             validation failed, or the active jail had no process with Firefox's exact \
+             content-role argv token. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -3304,6 +3317,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
         exact_line_window(TD_FIREFOX_BOOT_MARKER),
+        exact_line_window(TD_FIREFOX_CONTENT_MARKER),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
             .saturating_add(exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER)),
@@ -3479,6 +3493,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_firefox,
         buf,
         TD_FIREFOX_BOOT_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_content,
+        buf,
+        TD_FIREFOX_CONTENT_MARKER.as_bytes(),
     );
     latch_prefixed_line_marker(
         &mut evidence.td_profiler_attribution,
@@ -4439,7 +4458,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 44] {
+    fn all_console_markers() -> [&'static str; 45] {
         [
             MARKER,
             EROFS_MARKER,
@@ -4481,6 +4500,7 @@ mod tests {
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_FIREFOX_BOOT_MARKER,
+            TD_FIREFOX_CONTENT_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
@@ -4582,6 +4602,19 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_firefox);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-ui: {TD_FIREFOX_CONTENT_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_content);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_CONTENT_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_content);
     }
 
     #[test]
@@ -4790,6 +4823,7 @@ mod tests {
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_FIREFOX_BOOT_MARKER,
+            TD_FIREFOX_CONTENT_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_BOOT_SUCCESS_MARKER,
@@ -4849,6 +4883,7 @@ mod tests {
         assert!(evidence.td_jail_transition);
         assert!(evidence.td_jail_seccomp);
         assert!(evidence.td_firefox);
+        assert!(evidence.td_firefox_content);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
         assert!(evidence.boot_success);

@@ -1,4 +1,4 @@
-use crate::scene::Scene;
+use crate::scene::{Scene, SurfaceKey};
 use crate::{MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -16,6 +16,7 @@ pub struct Framebuffer {
     pub height: usize,
     pub stride: usize,
     frame: Vec<u8>,
+    comparison: Vec<u8>,
     // What the device is believed to hold. `resend_all` says that belief is
     // unfounded, so the next paint writes the whole image rather than a band.
     written: Vec<u8>,
@@ -111,6 +112,50 @@ fn damaged_rows(written: &[u8], frame: &[u8], stride: usize) -> Option<(usize, u
     Some((first, last))
 }
 
+fn attributed_rgb_counts(
+    rendered: &[u8],
+    omitted: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    rgbs: [[u8; 3]; 2],
+) -> [usize; 2] {
+    let mut counts = [0usize; 2];
+    let visible = width.saturating_mul(4);
+    for (rendered_row, omitted_row) in rendered
+        .chunks(stride)
+        .zip(omitted.chunks(stride))
+        .take(height)
+    {
+        let (Some(rendered_pixels), Some(omitted_pixels)) = (
+            rendered_row.get(..visible),
+            omitted_row.get(..visible),
+        ) else {
+            return [0; 2];
+        };
+        for (pixel, without) in rendered_pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(omitted_pixels.as_chunks::<4>().0)
+        {
+            if pixel == without {
+                continue;
+            }
+            let [blue, green, red, _] = pixel;
+            let rgb = [*red, *green, *blue];
+            for (index, expected) in rgbs.iter().enumerate() {
+                if rgb == *expected {
+                    if let Some(count) = counts.get_mut(index) {
+                        *count = count.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    counts
+}
+
 impl Framebuffer {
     pub fn open(path: &Path) -> Result<Framebuffer, String> {
         let name = path
@@ -138,6 +183,7 @@ impl Framebuffer {
             height,
             stride,
             frame: vec![0; size],
+            comparison: Vec::new(),
             written: vec![0; size],
             resend_all: true,
             since_resend: 0,
@@ -173,6 +219,7 @@ impl Framebuffer {
             height,
             stride,
             frame: vec![0; size],
+            comparison: Vec::new(),
             written: vec![0; size],
             resend_all: true,
             since_resend: 0,
@@ -270,6 +317,52 @@ impl Framebuffer {
         self.writes.push((at, band.len()));
         Ok(())
     }
+
+    /// Exact final-output pixels attributable to `surface`. Re-rendering with
+    /// only that surface omitted makes hidden, clipped and occluded pixels
+    /// disappear from the count while leaving its descendants in place.
+    pub(crate) fn surface_rgb_pixel_counts(
+        &mut self,
+        scene: &Scene,
+        surface: SurfaceKey,
+        rgbs: [[u8; 3]; 2],
+    ) -> Result<[usize; 2], String> {
+        if self.comparison.len() != self.frame.len() {
+            let additional = self.frame.len().saturating_sub(self.comparison.len());
+            self.comparison
+                .try_reserve_exact(additional)
+                .map_err(|_| "reserve application comparison frame".to_string())?;
+            self.comparison.resize(self.frame.len(), 0);
+        }
+        scene.render_omitting(
+            &mut self.comparison,
+            self.width,
+            self.height,
+            self.stride,
+            Some(surface),
+        );
+        Ok(attributed_rgb_counts(
+            &self.frame,
+            &self.comparison,
+            self.width,
+            self.height,
+            self.stride,
+            rgbs,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rgb_pixel_counts_for_test(&self, rgbs: [[u8; 3]; 2]) -> [usize; 2] {
+        let omitted = vec![0; self.frame.len()];
+        attributed_rgb_counts(
+            &self.frame,
+            &omitted,
+            self.width,
+            self.height,
+            self.stride,
+            rgbs,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +382,30 @@ mod tests {
         let mut framebuffer = Framebuffer::test_file(&path, 8, 4, 40).unwrap();
         framebuffer.paint(&Scene::new()).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), 160);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn application_color_counts_exclude_stride_padding() {
+        let path = std::env::temp_dir().join(format!(
+            "td-framebuffer-color-count-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let rendered = [0xff, 0x00, 0xff, 0, 0x00, 0xff, 0x00, 0, 0x00, 0xff, 0x00, 0];
+        let mut omitted = [0u8; 12];
+        let colors = [[0xff, 0x00, 0xff], [0x00, 0xff, 0x00]];
+        assert_eq!(
+            attributed_rgb_counts(&rendered, &omitted, 2, 1, 12, colors),
+            [1, 1]
+        );
+        omitted[4..8].copy_from_slice(&rendered[4..8]);
+        assert_eq!(
+            attributed_rgb_counts(&rendered, &omitted, 2, 1, 12, colors),
+            [1, 0]
+        );
+        let framebuffer = Framebuffer::test_file(&path, 2, 1, 12).unwrap();
+        drop(framebuffer);
         fs::remove_file(path).unwrap();
     }
 

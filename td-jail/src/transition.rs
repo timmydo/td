@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 pub const PROBE_ARG: &str = "--probe-transition";
 pub const RESOURCE_PROBE_ARG: &str = "--probe-resource-caps";
+pub const PROCESS_TOKEN_PROBE_ARG: &str = "--probe-process-token";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
 const APPLICATION_SESSION_ARG: &str = "--internal-application-session";
 const CGROUP_CLEANUP_ARG: &str = "--internal-cgroup-cleanup";
@@ -208,6 +209,10 @@ pub enum Mode {
     ResourceProbe {
         application: String,
     },
+    ProcessTokenProbe {
+        application: String,
+        token: String,
+    },
     WriteFilter,
     ApplicationSession {
         parent: u32,
@@ -310,6 +315,26 @@ where
         }
         authority::validate_application_name(&application)?;
         return Ok(Mode::ResourceProbe { application });
+    }
+    if mode == PROCESS_TOKEN_PROBE_ARG {
+        let application = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        let token = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        authority::validate_application_name(&application)?;
+        if !cgroup::valid_process_token(&token) {
+            return Err(usage_error());
+        }
+        return Ok(Mode::ProcessTokenProbe { application, token });
     }
     if mode == FILTER_ARG {
         if args.next().is_some() {
@@ -684,7 +709,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition or --probe-resource-caps NAME; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, or --probe-process-token NAME TOKEN; installed applications are selected by argv[0]",
     )
 }
 
@@ -3183,6 +3208,20 @@ pub fn probe_resource_caps(application: &str) -> io::Result<()> {
     writeln!(io::stdout(), "{diagnostic}")
 }
 
+pub fn probe_process_token(application: &str, token: &str) -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "td-jail requires the nonzero application identity",
+        ));
+    }
+    let limits = authority::resolve_resource_limits(application)?;
+    let diagnostic =
+        cgroup::probe_process_token(application, token, limits, identity.uid, identity.gid)?;
+    writeln!(io::stdout(), "{diagnostic}")
+}
+
 pub fn run_cgroup_cleanup_bootstrap(membership: &str) -> io::Result<()> {
     let _identity = cleanup_identity()?;
     cgroup::validate_expected_membership(membership)?;
@@ -4717,6 +4756,23 @@ mod tests {
         assert!(parse_mode(args(&[RESOURCE_PROBE_ARG])).is_err());
         assert!(parse_mode(args(&[RESOURCE_PROBE_ARG, "bad/name"])).is_err());
         assert!(parse_mode(args(&[RESOURCE_PROBE_ARG, "app", "extra"])).is_err());
+
+        assert_eq!(
+            parse_mode(args(&[PROCESS_TOKEN_PROBE_ARG, "firefox", "-contentproc"])).unwrap(),
+            Mode::ProcessTokenProbe {
+                application: "firefox".into(),
+                token: "-contentproc".into(),
+            }
+        );
+        assert!(parse_mode(args(&[PROCESS_TOKEN_PROBE_ARG, "firefox"])).is_err());
+        assert!(parse_mode(args(&[PROCESS_TOKEN_PROBE_ARG, "firefox", "bad token"])).is_err());
+        assert!(parse_mode(args(&[
+            PROCESS_TOKEN_PROBE_ARG,
+            "firefox",
+            "-contentproc",
+            "extra"
+        ]))
+        .is_err());
     }
 
     #[test]

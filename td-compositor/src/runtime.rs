@@ -1,3 +1,4 @@
+use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::ConfigureTracker;
 use crate::framebuffer::Framebuffer;
 use crate::help::HelpAction;
@@ -12,7 +13,7 @@ use crate::pointer::{
 };
 use crate::scene::{
     BandPress, CursorRequest, Fraction, PopupConstraint, PopupPlacement, Scene, SharedInputRegion,
-    Surface, SurfaceKey, WindowGeometry,
+    Surface, SurfaceKey, WindowGeometry, SHM_ARGB8888, SHM_XRGB8888,
 };
 use crate::server::TransferEndpoint;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +22,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const MAX_PENDING_KEYBOARD_DELIVERIES: usize = 64;
+pub(crate) const MIN_APPLICATION_CONTENT_PIXELS: usize = 4_096;
+pub(crate) const MAX_APPLICATION_PIXEL_SCAN: usize = 1_048_576;
+const MAX_APPLICATION_SCAN_DIAGNOSTICS: usize = 8;
 
 #[derive(Clone)]
 pub struct SubscriptionStop {
@@ -359,6 +363,10 @@ pub struct Runtime {
     /// the launcher can activate the service-owned application without spawning
     /// a second process over its state.
     application_ready: Option<ApplicationReady>,
+    /// Per-connection monotonic counters. The dispatch thread owns the live
+    /// objects; atomics let the runtime snapshot the matching client at the
+    /// exact painted-content transition without taking a client-local lock.
+    client_resources: BTreeMap<u64, Arc<ClientResourceHighWater>>,
     /// The window a press picked up, held until the button is released.
     /// Nothing in the pointer model carries it: neither press a drag begins
     /// with is delivered, so no client is told any of this.
@@ -370,14 +378,29 @@ struct CompoundSettle {
     paint: bool,
     focus: bool,
     layout_changed: bool,
-    application_ready: bool,
+    application_ready: Option<(SurfaceKey, SurfaceKey, [usize; 2])>,
 }
 
 struct ApplicationReady {
     expected_app_id: String,
+    expected_content_rgbs: [[u8; 3]; 2],
     candidates: BTreeSet<SurfaceKey>,
-    wake: SyncSender<()>,
+    /// Latest bounded color counts for surfaces owned by a candidate client.
+    /// A child may commit before its synchronized parent edge takes effect;
+    /// the parent commit attributes this retained observation when it makes
+    /// the child part of the painted compound tree.
+    surface_content: BTreeMap<SurfaceKey, [usize; 2]>,
+    diagnosed_messages: usize,
+    wake: SyncSender<ApplicationEvidence>,
     published: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ApplicationEvidence {
+    pub app_id: String,
+    pub content_rgbs: [[u8; 3]; 2],
+    pub content_pixels: [usize; 2],
+    pub resources: ClientResourceSnapshot,
 }
 
 /// How far the pointer must leave the press point, on either axis, before a
@@ -436,6 +459,7 @@ impl Runtime {
             pending_paint: false,
             compound_settle: None,
             application_ready: None,
+            client_resources: BTreeMap::new(),
             dragging: None,
         }
     }
@@ -443,18 +467,40 @@ impl Runtime {
     pub(crate) fn watch_application(
         &mut self,
         expected_app_id: String,
-        wake: SyncSender<()>,
+        expected_content_rgbs: [[u8; 3]; 2],
+        wake: SyncSender<ApplicationEvidence>,
     ) -> Result<(), String> {
         if self.application_ready.is_some() {
             return Err("application-window observer is already configured".to_string());
         }
         self.application_ready = Some(ApplicationReady {
             expected_app_id,
+            expected_content_rgbs,
             candidates: BTreeSet::new(),
+            surface_content: BTreeMap::new(),
+            diagnosed_messages: 0,
             wake,
             published: false,
         });
         Ok(())
+    }
+
+    pub(crate) fn register_client_resources(
+        &mut self,
+        client: u64,
+        resources: Arc<ClientResourceHighWater>,
+    ) -> Result<(), String> {
+        if self.client_resources.contains_key(&client) {
+            return Err(format!(
+                "client {client} registered resource telemetry more than once"
+            ));
+        }
+        self.client_resources.insert(client, resources);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_client_resources(&mut self, client: u64) {
+        self.client_resources.remove(&client);
     }
 
     pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
@@ -554,9 +600,13 @@ impl Runtime {
         let mut painted = false;
         let mut aimed = false;
         let attached = surface.is_some();
+        let measured_application_content = self.application_content_pixels(key, surface.as_ref());
+        let mut application_content = None;
         if let Some(surface) = surface {
             let parent = self.toplevel_parent(key);
             layout_changed = self.scene.commit_parented(key, surface, parent)?;
+            application_content =
+                self.application_content_committed(key, measured_application_content);
             painted = true;
         }
         if let Some(input_region) = input_region {
@@ -568,7 +618,10 @@ impl Runtime {
         if painted {
             self.settle(layout_changed)?;
             if attached {
-                self.application_window_mapped(key)?;
+                if let Some((root, content_pixels)) = application_content {
+                    self.application_window_mapped(root, key, content_pixels)?;
+                }
+                self.application_stored_surfaces(Some(key))?;
             }
             return Ok(());
         }
@@ -589,15 +642,24 @@ impl Runtime {
     ) -> Result<(), String> {
         let mut painted = false;
         let mut aimed = false;
+        let measured_application_content = self.application_content_pixels(key, surface.as_ref());
+        let mut application_content = None;
         if let Some(surface) = surface {
             self.scene.commit_subsurface(key, surface)?;
+            application_content =
+                self.application_content_committed(key, measured_application_content);
             painted = true;
         }
         if let Some(input_region) = input_region {
             aimed |= self.scene.set_input_region(key, input_region);
         }
         if painted {
-            return self.settle(false);
+            self.settle(false)?;
+            if let Some((root, content_pixels)) = application_content {
+                self.application_window_mapped(root, key, content_pixels)?;
+            }
+            self.application_stored_surfaces(Some(key))?;
+            return Ok(());
         }
         if aimed {
             return self.refresh_focus();
@@ -619,12 +681,16 @@ impl Runtime {
         }
         changed |= self.scene.stack_subsurfaces(parent, stack);
         if changed {
-            return self.settle(false);
+            self.settle(false)?;
+            self.application_stored_surfaces(None)?;
         }
         Ok(())
     }
 
     pub fn detach_subsurface(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if let Some(ready) = self.application_ready.as_mut() {
+            ready.surface_content.remove(&key);
+        }
         if self.scene.detach_subsurface(key) {
             return self.settle(false);
         }
@@ -632,6 +698,9 @@ impl Runtime {
     }
 
     pub fn remove_subsurface(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if let Some(ready) = self.application_ready.as_mut() {
+            ready.surface_content.remove(&key);
+        }
         if self.scene.remove_subsurface(key) {
             return self.settle(false);
         }
@@ -900,9 +969,15 @@ impl Runtime {
         if layout_changed && self.refresh_layout() {
             self.publish_layout();
         }
-        if failures.is_empty() && compound.application_ready {
-            if let Err(error) = self.publish_application_ready() {
-                failures.push(error);
+        if failures.is_empty() {
+            if let Some((root, content_surface, content_pixels)) = compound.application_ready {
+                if self.application_evidence_is_current(root, content_surface, content_pixels) {
+                    if let Err(error) =
+                        self.publish_application_ready(root, content_surface, content_pixels)
+                    {
+                        failures.push(error);
+                    }
+                }
             }
         }
         if failures.is_empty() {
@@ -968,45 +1043,282 @@ impl Runtime {
     /// failed paint cannot later be mistaken for a presented window merely
     /// because the surface remains mapped in the scene model.
     pub fn set_application_id(&mut self, key: SurfaceKey, app_id: &str) -> Result<(), String> {
-        let Some(ready) = self.application_ready.as_mut() else {
-            return Ok(());
+        let mapped = self.scene.is_mapped(key);
+        let matched = {
+            let Some(ready) = self.application_ready.as_mut() else {
+                return Ok(());
+            };
+            if ready.expected_app_id == app_id {
+                ready.candidates.insert(key)
+            } else {
+                ready.candidates.remove(&key);
+                ready
+                    .surface_content
+                    .retain(|surface, _| surface.client != key.client);
+                false
+            }
         };
-        if ready.expected_app_id == app_id {
-            ready.candidates.insert(key);
-        } else {
-            ready.candidates.remove(&key);
+        if matched && self.application_diagnostic_slot() {
+            eprintln!(
+                "td-compositor: application observer matched app id \
+                 client={} surface={} mapped={mapped}",
+                key.client, key.object,
+            );
         }
         Ok(())
     }
 
-    fn application_window_mapped(&mut self, key: SurfaceKey) -> Result<(), String> {
-        let matching = self
-            .application_ready
-            .as_ref()
-            .is_some_and(|ready| !ready.published && ready.candidates.contains(&key));
+    fn application_diagnostic_slot(&mut self) -> bool {
+        let Some(ready) = self.application_ready.as_mut() else {
+            return false;
+        };
+        if ready.diagnosed_messages >= MAX_APPLICATION_SCAN_DIAGNOSTICS {
+            return false;
+        }
+        ready.diagnosed_messages = ready.diagnosed_messages.saturating_add(1);
+        true
+    }
+
+    fn application_content_pixels(
+        &mut self,
+        key: SurfaceKey,
+        surface: Option<&Surface>,
+    ) -> Option<[usize; 2]> {
+        let observed_client = self.application_ready.as_ref().is_some_and(|ready| {
+            !ready.published
+                && ready
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.client == key.client)
+        });
+        if !observed_client {
+            return None;
+        }
+        let Some(surface) = surface else {
+            if let Some(ready) = self.application_ready.as_mut() {
+                ready.surface_content.remove(&key);
+            }
+            return None;
+        };
+        let ready = self.application_ready.as_ref()?;
+        let [[red_a, green_a, blue_a], [red_b, green_b, blue_b]] = ready.expected_content_rgbs;
+        let root = self.scene.mapped_subsurface_root(key);
+        let content_pixels = surface
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .take(MAX_APPLICATION_PIXEL_SCAN)
+            .fold([0usize; 2], |counts, (index, pixel)| {
+                let [mut count_a, mut count_b] = counts;
+                let x = if surface.width == 0 {
+                    0
+                } else {
+                    index % surface.width
+                };
+                let opaque = surface.format == SHM_XRGB8888
+                    || (surface.format == SHM_ARGB8888 && pixel.get(3) == Some(&u8::MAX));
+                let color = pixel.get(..3);
+                if opaque
+                    && x.saturating_mul(2) < surface.width
+                    && color == Some(&[blue_a, green_a, red_a])
+                {
+                    count_a = count_a.saturating_add(1);
+                }
+                if opaque
+                    && x.saturating_mul(2) >= surface.width
+                    && color == Some(&[blue_b, green_b, red_b])
+                {
+                    count_b = count_b.saturating_add(1);
+                }
+                [count_a, count_b]
+            });
+        let [content_pixels_a, content_pixels_b] = content_pixels;
+        if self.application_diagnostic_slot() {
+            let sample_a = surface_rgb_at(surface, surface.width / 4, surface.height / 2);
+            let sample_b = surface_rgb_at(
+                surface,
+                surface.width.saturating_mul(3) / 4,
+                surface.height / 2,
+            );
+            eprintln!(
+                "td-compositor: application observer scanned candidate \
+                 client={} surface={} width={} height={} format={} \
+                 content-pixels-a={} content-pixels-b={} \
+                 sample-a={} sample-b={} root={root:?}",
+                key.client,
+                key.object,
+                surface.width,
+                surface.height,
+                surface.format,
+                content_pixels_a,
+                content_pixels_b,
+                rgb_diagnostic(sample_a),
+                rgb_diagnostic(sample_b),
+            );
+        }
+        Some(content_pixels)
+    }
+
+    fn application_content_committed(
+        &mut self,
+        key: SurfaceKey,
+        measured: Option<[usize; 2]>,
+    ) -> Option<(SurfaceKey, [usize; 2])> {
+        let content_pixels = measured?;
+        if let Some(ready) = self.application_ready.as_mut() {
+            ready.surface_content.insert(key, content_pixels);
+        }
+        self.scene
+            .mapped_subsurface_root(key)
+            .map(|root| (root, content_pixels))
+    }
+
+    fn application_window_mapped(
+        &mut self,
+        root: SurfaceKey,
+        content_surface: SurfaceKey,
+        content_pixels: [usize; 2],
+    ) -> Result<(), String> {
+        let matching = self.application_ready.as_ref().is_some_and(|ready| {
+            !ready.published
+                && self.scene.is_mapped(root)
+                && ready.candidates.contains(&root)
+                && content_pixels
+                    .iter()
+                    .all(|count| *count >= MIN_APPLICATION_CONTENT_PIXELS)
+        });
         if !matching {
             return Ok(());
         }
+        if self.application_diagnostic_slot() {
+            eprintln!(
+                "td-compositor: application observer accepted content pixels \
+                 client={} root={} content-surface={}",
+                root.client, root.object, content_surface.object,
+            );
+        }
         if let Some(compound) = self.compound_settle.as_mut() {
-            compound.application_ready = true;
+            compound.application_ready = Some((root, content_surface, content_pixels));
             return Ok(());
         }
-        self.publish_application_ready()
+        self.publish_application_ready(root, content_surface, content_pixels)
     }
 
-    fn publish_application_ready(&mut self) -> Result<(), String> {
+    fn application_evidence_is_current(
+        &self,
+        root: SurfaceKey,
+        content_surface: SurfaceKey,
+        content_pixels: [usize; 2],
+    ) -> bool {
+        self.scene.is_mapped(root)
+            && self.scene.is_mapped(content_surface)
+            && self.scene.mapped_subsurface_root(content_surface) == Some(root)
+            && self.application_ready.as_ref().is_some_and(|ready| {
+                !ready.published
+                    && ready.candidates.contains(&root)
+                    && ready.surface_content.get(&content_surface) == Some(&content_pixels)
+            })
+    }
+
+    fn application_stored_surface(&mut self, key: SurfaceKey) -> Result<(), String> {
+        let Some(root) = self.scene.mapped_subsurface_root(key) else {
+            return Ok(());
+        };
+        let Some(content_pixels) = self
+            .application_ready
+            .as_ref()
+            .filter(|ready| !ready.published && ready.candidates.contains(&root))
+            .and_then(|ready| ready.surface_content.get(&key))
+            .copied()
+        else {
+            return Ok(());
+        };
+        self.application_window_mapped(root, key, content_pixels)
+    }
+
+    fn application_stored_surfaces(&mut self, except: Option<SurfaceKey>) -> Result<(), String> {
+        let keys = self
+            .application_ready
+            .as_ref()
+            .map(|ready| {
+                ready
+                    .surface_content
+                    .keys()
+                    .filter(|key| Some(**key) != except)
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for key in keys {
+            self.application_stored_surface(key)?;
+        }
+        Ok(())
+    }
+
+    fn publish_application_ready(
+        &mut self,
+        key: SurfaceKey,
+        content_surface: SurfaceKey,
+        content_pixels: [usize; 2],
+    ) -> Result<(), String> {
+        if !self.application_evidence_is_current(key, content_surface, content_pixels) {
+            return Ok(());
+        }
+        let Some(expected_content_rgbs) = self
+            .application_ready
+            .as_ref()
+            .map(|ready| ready.expected_content_rgbs)
+        else {
+            return Ok(());
+        };
+        let output_pixels = self.framebuffer.surface_rgb_pixel_counts(
+            &self.scene,
+            content_surface,
+            expected_content_rgbs,
+        )?;
+        if !output_pixels
+            .iter()
+            .all(|count| *count >= MIN_APPLICATION_CONTENT_PIXELS)
+        {
+            if self.application_diagnostic_slot() {
+                eprintln!(
+                    "td-compositor: application observer output lacks content pixels \
+                     client={} surface={} output-pixels-a={} output-pixels-b={}",
+                    key.client, content_surface.object, output_pixels[0], output_pixels[1],
+                );
+            }
+            return Ok(());
+        }
         let Some(ready) = self.application_ready.as_mut() else {
             return Ok(());
         };
         if ready.published {
             return Ok(());
         }
-        match ready.wake.try_send(()) {
-            Ok(()) | Err(TrySendError::Full(())) => {
+        let resources = self
+            .client_resources
+            .get(&key.client)
+            .ok_or_else(|| {
+                format!(
+                    "application client {} has no resource telemetry registration",
+                    key.client
+                )
+            })?
+            .snapshot();
+        let evidence = ApplicationEvidence {
+            app_id: ready.expected_app_id.clone(),
+            content_rgbs: ready.expected_content_rgbs,
+            content_pixels,
+            resources,
+        };
+        match ready.wake.try_send(evidence) {
+            Ok(()) | Err(TrySendError::Full(_)) => {
                 ready.published = true;
                 Ok(())
             }
-            Err(TrySendError::Disconnected(())) => {
+            Err(TrySendError::Disconnected(_)) => {
                 Err("application-window observer stopped before publication".to_string())
             }
         }
@@ -1030,7 +1342,11 @@ impl Runtime {
     pub fn forget_toplevel_state(&mut self, key: SurfaceKey) -> Result<(), String> {
         self.scene.forget_title(key);
         if let Some(ready) = self.application_ready.as_mut() {
-            ready.candidates.remove(&key);
+            if ready.candidates.remove(&key) {
+                ready
+                    .surface_content
+                    .retain(|surface, _| surface.client != key.client);
+            }
         }
         Ok(())
     }
@@ -1055,7 +1371,12 @@ impl Runtime {
     pub fn remove(&mut self, key: SurfaceKey) -> Result<Vec<SurfaceKey>, String> {
         self.forget_drag(|dragged| dragged == key);
         if let Some(ready) = self.application_ready.as_mut() {
-            ready.candidates.remove(&key);
+            ready.surface_content.remove(&key);
+            if ready.candidates.remove(&key) {
+                ready
+                    .surface_content
+                    .retain(|surface, _| surface.client != key.client);
+            }
         }
         let reparented = self.reparent_around_unmap(key);
         self.forget_foreign_surface(key);
@@ -1080,8 +1401,12 @@ impl Runtime {
 
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
         self.forget_drag(|dragged| dragged.client == client);
+        self.unregister_client_resources(client);
         if let Some(ready) = self.application_ready.as_mut() {
             ready.candidates.retain(|key| key.client != client);
+            ready
+                .surface_content
+                .retain(|key, _| key.client != client);
         }
         let reparented = self.reparent_around_client(client);
         self.forget_foreign_client(client);
@@ -2747,6 +3072,26 @@ impl Runtime {
     }
 }
 
+fn surface_rgb_at(surface: &Surface, x: usize, y: usize) -> Option<[u8; 3]> {
+    if x >= surface.width || y >= surface.height {
+        return None;
+    }
+    let offset = y
+        .checked_mul(surface.width)?
+        .checked_add(x)?
+        .checked_mul(4)?;
+    let pixel = surface.pixels.get(offset..offset.checked_add(3)?)?;
+    let [blue, green, red] = <[u8; 3]>::try_from(pixel).ok()?;
+    Some([red, green, blue])
+}
+
+fn rgb_diagnostic(rgb: Option<[u8; 3]>) -> String {
+    match rgb {
+        Some([red, green, blue]) => format!("{red:02x}{green:02x}{blue:02x}"),
+        None => "none".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2754,13 +3099,13 @@ mod tests {
     use crate::keyboard::{KeyState, KeyboardEvent, MOD_SHIFT};
     use crate::layout::{Direction, Presentation};
     use crate::pointer::{PointerButtonState, PointerEvent};
-    use crate::scene::SHM_XRGB8888;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::TryRecvError;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    const APPLICATION_CONTENT_RGBS: [[u8; 3]; 2] = [[0xff, 0x00, 0xff], [0x00, 0xff, 0x00]];
 
     struct Cleanup(PathBuf);
 
@@ -2777,6 +3122,56 @@ mod tests {
             pixels: color.repeat(10_000),
             format: SHM_XRGB8888,
         }
+    }
+
+    fn application_content_surface() -> Surface {
+        let mut pixels = Vec::with_capacity(40_000);
+        for _ in 0..100 {
+            pixels.extend([0xff, 0x00, 0xff, 0].repeat(50));
+            pixels.extend([0x00, 0xff, 0x00, 0].repeat(50));
+        }
+        Surface {
+            width: 100,
+            height: 100,
+            pixels,
+            format: SHM_XRGB8888,
+        }
+    }
+
+    fn reversed_application_content_surface() -> Surface {
+        let mut pixels = Vec::with_capacity(40_000);
+        for _ in 0..100 {
+            pixels.extend([0x00, 0xff, 0x00, 0].repeat(50));
+            pixels.extend([0xff, 0x00, 0xff, 0].repeat(50));
+        }
+        Surface {
+            width: 100,
+            height: 100,
+            pixels,
+            format: SHM_XRGB8888,
+        }
+    }
+
+    fn transparent_application_content_surface() -> Surface {
+        let mut surface = application_content_surface();
+        surface.format = SHM_ARGB8888;
+        for alpha in surface.pixels.iter_mut().skip(3).step_by(4) {
+            *alpha = 0;
+        }
+        surface
+    }
+
+    fn lend_application_resources(runtime: &mut Runtime, client: u64) {
+        let resources = Arc::new(ClientResourceHighWater::default());
+        resources.observe_objects(17);
+        resources.observe_shm(3, 8_192);
+        resources.observe_frame_callbacks(4);
+        resources.observe_cached_commits(2);
+        resources.observe_deferred(7, 320);
+        resources.observe_copied_bytes(40_000);
+        runtime
+            .register_client_resources(client, resources)
+            .unwrap();
     }
 
     /// What a client lends the runtime, for a test that drives a dismissal
@@ -3213,7 +3608,7 @@ mod tests {
                 paint: false,
                 focus: false,
                 layout_changed: false,
-                application_ready: false,
+                application_ready: None,
             })
         ));
         runtime.finish_compound_commit().unwrap();
@@ -8228,16 +8623,21 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let (wake, ready) = mpsc::sync_channel(1);
         runtime
-            .watch_application("org.mozilla.firefox".to_string(), wake)
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
             .unwrap();
         let key = SurfaceKey {
             client: 7,
             object: 11,
         };
+        lend_application_resources(&mut runtime, key.client);
 
         // Replacing the matching id before pixels arrive removes the
         // candidate. Neither the in-progress compound commit nor its settle
@@ -8254,7 +8654,8 @@ mod tests {
         runtime.finish_compound_commit().unwrap();
         assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
 
-        // A later exact id does not retroactively bless the prior commit.
+        // A later exact id does not retroactively bless a prior commit. A
+        // buffer without the content sentinel cannot wake the observer.
         runtime
             .set_application_id(key, "org.mozilla.firefox")
             .unwrap();
@@ -8265,7 +8666,61 @@ mod tests {
             .unwrap();
         assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
         runtime.finish_compound_commit().unwrap();
-        assert_eq!(ready.try_recv(), Ok(()));
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        // Firefox's observed startup frame is a single sentinel color. It
+        // cannot stand in for the fixed document, which contains both.
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .apply_commit(key, Some(surface([0xff, 0x00, 0xff, 0])), None, None)
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        // The same colors in the wrong spatial halves, or transparent ARGB
+        // pixels, are not the fixed opaque document pattern.
+        for wrong in [
+            reversed_application_content_surface(),
+            transparent_application_content_surface(),
+        ] {
+            runtime.begin_compound_commit().unwrap();
+            runtime.apply_commit(key, Some(wrong), None, None).unwrap();
+            runtime.finish_compound_commit().unwrap();
+            assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+        }
+
+        let middle_child = SurfaceKey {
+            client: key.client,
+            object: 12,
+        };
+        let content_child = SurfaceKey {
+            client: key.client,
+            object: 13,
+        };
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .commit_subsurface(content_child, Some(application_content_surface()), None)
+            .unwrap();
+        runtime
+            .configure_subsurfaces(
+                middle_child,
+                &[(content_child, 0, 0)],
+                vec![None, Some(content_child)],
+            )
+            .unwrap();
+        runtime
+            .commit_subsurface(middle_child, Some(surface([4, 5, 6, 0])), None)
+            .unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+        runtime
+            .configure_subsurfaces(key, &[(middle_child, 0, 0)], vec![None, Some(middle_child)])
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        let evidence = ready.try_recv().unwrap();
+        assert_eq!(evidence.app_id, "org.mozilla.firefox");
+        assert_eq!(evidence.content_rgbs, APPLICATION_CONTENT_RGBS);
+        assert_eq!(evidence.content_pixels, [5_000; 2]);
+        assert_eq!(evidence.resources.objects, 17);
         assert!(runtime
             .application_ready
             .as_ref()
@@ -8280,7 +8735,7 @@ mod tests {
             .set_application_id(later, "org.mozilla.firefox")
             .unwrap();
         runtime
-            .apply_commit(later, Some(surface([7, 8, 9, 0])), None, None)
+            .apply_commit(later, Some(surface([10, 11, 12, 0])), None, None)
             .unwrap();
         assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
         assert!(runtime
@@ -8292,6 +8747,73 @@ mod tests {
     }
 
     #[test]
+    fn application_content_must_reach_the_rendered_output() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-rendered-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        let root = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        let content = SurfaceKey {
+            client: root.client,
+            object: 12,
+        };
+        lend_application_resources(&mut runtime, root.client);
+        runtime
+            .set_application_id(root, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(root, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        runtime.command(Command::MoveToWorkspace(2)).unwrap();
+
+        // A visible noncandidate carries the same colors. Global output
+        // counts would wrongly attribute these pixels to the hidden browser.
+        let decoy = SurfaceKey {
+            client: 8,
+            object: 20,
+        };
+        runtime
+            .apply_commit(decoy, Some(application_content_surface()), None, None)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .framebuffer
+                .rgb_pixel_counts_for_test(APPLICATION_CONTENT_RGBS),
+            [5_000; 2]
+        );
+
+        runtime
+            .commit_subsurface(content, Some(application_content_surface()), None)
+            .unwrap();
+        runtime
+            .configure_subsurfaces(root, &[(content, 0, 0)], vec![None, Some(content)])
+            .unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+        runtime
+            .commit_subsurface(content, Some(application_content_surface()), None)
+            .unwrap();
+        assert!(ready.try_recv().is_ok());
+    }
+
+    #[test]
     fn launcher_activation_reuses_the_observed_service_window() {
         let path = std::env::temp_dir().join(format!(
             "td-runtime-application-activate-{}-{}",
@@ -8299,11 +8821,15 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let (wake, ready) = mpsc::sync_channel(1);
         runtime
-            .watch_application("org.mozilla.firefox".to_string(), wake)
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
             .unwrap();
         let application = SurfaceKey {
             client: 7,
@@ -8312,10 +8838,11 @@ mod tests {
         runtime
             .set_application_id(application, "org.mozilla.firefox")
             .unwrap();
+        lend_application_resources(&mut runtime, application.client);
         runtime
-            .apply_commit(application, Some(surface([1, 2, 3, 0])), None, None)
+            .apply_commit(application, Some(application_content_surface()), None, None)
             .unwrap();
-        assert_eq!(ready.try_recv(), Ok(()));
+        assert!(ready.try_recv().is_ok());
         runtime.command(Command::MoveToWorkspace(2)).unwrap();
 
         let other = SurfaceKey {
@@ -8341,11 +8868,15 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let (wake, ready) = mpsc::sync_channel(1);
         runtime
-            .watch_application("org.mozilla.firefox".to_string(), wake)
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
             .unwrap();
         let role = SurfaceKey {
             client: 1,
@@ -8384,12 +8915,13 @@ mod tests {
         runtime
             .set_application_id(live, "org.mozilla.firefox")
             .unwrap();
+        lend_application_resources(&mut runtime, live.client);
         runtime.begin_compound_commit().unwrap();
         runtime
-            .apply_commit(live, Some(surface([4, 5, 6, 0])), None, None)
+            .apply_commit(live, Some(application_content_surface()), None, None)
             .unwrap();
         runtime.finish_compound_commit().unwrap();
-        assert_eq!(ready.try_recv(), Ok(()));
+        assert!(ready.try_recv().is_ok());
     }
 
     #[test]
@@ -8400,11 +8932,15 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 200, 120 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let (wake, ready) = mpsc::sync_channel(1);
         runtime
-            .watch_application("org.mozilla.firefox".to_string(), wake)
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
             .unwrap();
         let key = SurfaceKey {
             client: 9,
@@ -8414,10 +8950,12 @@ mod tests {
             .set_application_id(key, "org.mozilla.firefox")
             .unwrap();
 
+        lend_application_resources(&mut runtime, key.client);
+
         runtime.fail_next_repaint();
         runtime.begin_compound_commit().unwrap();
         runtime
-            .apply_commit(key, Some(surface([4, 5, 6, 0])), None, None)
+            .apply_commit(key, Some(application_content_surface()), None, None)
             .unwrap();
         assert!(runtime.finish_compound_commit().is_err());
         assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
@@ -8425,10 +8963,278 @@ mod tests {
         // A later successful frame retries the still-live observation.
         runtime.begin_compound_commit().unwrap();
         runtime
-            .apply_commit(key, Some(surface([7, 8, 9, 0])), None, None)
+            .apply_commit(key, Some(application_content_surface()), None, None)
             .unwrap();
         runtime.finish_compound_commit().unwrap();
-        assert_eq!(ready.try_recv(), Ok(()));
+        assert!(ready.try_recv().is_ok());
+    }
+
+    #[test]
+    fn an_unmapped_child_cannot_supply_stale_application_content() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-stale-content-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        let root = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        let child = SurfaceKey {
+            client: root.client,
+            object: 12,
+        };
+        lend_application_resources(&mut runtime, root.client);
+        runtime
+            .set_application_id(root, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(root, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        runtime
+            .commit_subsurface(child, Some(application_content_surface()), None)
+            .unwrap();
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .configure_subsurfaces(root, &[(child, 0, 0)], vec![None, Some(child)])
+            .unwrap();
+        runtime.detach_subsurface(child).unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn stored_application_content_waits_for_its_root_to_map() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-unmapped-root-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        let root = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        let child = SurfaceKey {
+            client: root.client,
+            object: 12,
+        };
+        lend_application_resources(&mut runtime, root.client);
+        runtime
+            .set_application_id(root, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .commit_subsurface(child, Some(application_content_surface()), None)
+            .unwrap();
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .configure_subsurfaces(root, &[(child, 0, 0)], vec![None, Some(child)])
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .apply_commit(root, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert!(ready.try_recv().is_ok());
+    }
+
+    #[test]
+    fn root_unmap_cancels_scheduled_application_content_until_remap() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-root-unmap-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        let root = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        let child = SurfaceKey {
+            client: root.client,
+            object: 12,
+        };
+        lend_application_resources(&mut runtime, root.client);
+        runtime
+            .set_application_id(root, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(root, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        runtime
+            .commit_subsurface(child, Some(application_content_surface()), None)
+            .unwrap();
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .configure_subsurfaces(root, &[(child, 0, 0)], vec![None, Some(child)])
+            .unwrap();
+        runtime.unmap(root).unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .apply_commit(root, Some(surface([4, 5, 6, 0])), None, None)
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert!(ready.try_recv().is_ok());
+    }
+
+    #[test]
+    fn stored_application_content_waits_for_every_intermediate_to_map() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-unmapped-middle-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        let root = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        let middle = SurfaceKey {
+            client: root.client,
+            object: 12,
+        };
+        let content = SurfaceKey {
+            client: root.client,
+            object: 13,
+        };
+        lend_application_resources(&mut runtime, root.client);
+        runtime
+            .set_application_id(root, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(root, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        runtime
+            .commit_subsurface(content, Some(application_content_surface()), None)
+            .unwrap();
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .configure_subsurfaces(middle, &[(content, 0, 0)], vec![None, Some(content)])
+            .unwrap();
+        runtime
+            .configure_subsurfaces(root, &[(middle, 0, 0)], vec![None, Some(middle)])
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .commit_subsurface(middle, Some(surface([4, 5, 6, 0])), None)
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert!(ready.try_recv().is_ok());
+    }
+
+    #[test]
+    fn intermediate_detach_cancels_application_content_until_remap() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-middle-detach-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        let root = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        let middle = SurfaceKey {
+            client: root.client,
+            object: 12,
+        };
+        let content = SurfaceKey {
+            client: root.client,
+            object: 13,
+        };
+        lend_application_resources(&mut runtime, root.client);
+        runtime
+            .set_application_id(root, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(root, Some(surface([1, 2, 3, 0])), None, None)
+            .unwrap();
+        runtime
+            .commit_subsurface(middle, Some(surface([4, 5, 6, 0])), None)
+            .unwrap();
+        runtime
+            .configure_subsurfaces(root, &[(middle, 0, 0)], vec![None, Some(middle)])
+            .unwrap();
+        runtime
+            .commit_subsurface(content, Some(application_content_surface()), None)
+            .unwrap();
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .configure_subsurfaces(middle, &[(content, 0, 0)], vec![None, Some(content)])
+            .unwrap();
+        runtime.detach_subsurface(middle).unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .commit_subsurface(middle, Some(surface([7, 8, 9, 0])), None)
+            .unwrap();
+        runtime.finish_compound_commit().unwrap();
+        assert!(ready.try_recv().is_ok());
     }
 
     #[test]

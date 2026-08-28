@@ -13,6 +13,10 @@ const MODULES: &[(&str, &str)] = &[
     ("bar", include_str!("../../../td-compositor/src/bar.rs")),
     ("client", include_str!("../../../td-compositor/src/client.rs")),
     (
+        "client_resources",
+        include_str!("../../../td-compositor/src/client_resources.rs"),
+    ),
+    (
         "configure",
         include_str!("../../../td-compositor/src/configure.rs"),
     ),

@@ -1527,18 +1527,73 @@ Firefox bytes as a recipe tool.
 The independent target acceptance test is a headless QEMU boot of the built
 system image. The image selects the exact Firefox and Freedesktop 25.08 marked
 payloads, launches `/bin/firefox` through the immutable application registry,
-and asks `td-compositor` to observe the client-asserted exact
-`org.mozilla.firefox` XDG app id. The compositor publishes a mode-0600
-readiness socket only after a matching surface has committed a buffer and the
-framebuffer paint has succeeded. A root-owned evidence unit independently
-requires that latched compositor probe and a currently live Firefox jail with
-the exact cgroup caps before it atomically publishes evidence and emits
-`TD-FIREFOX-FIRST-WINDOW-READY`. The closed image has no other programmed
-producer for that app id, but the two probes are not a cryptographic
-same-process binding. The host oracle accepts only the exact console line.
-This makes first-window bring-up non-manual; it does not prove input,
-navigation, HTTPS, content processes, portals, networking, audio or a
-particular visible pixel value.
+and, only under the QEMU oracle's exact `td.autotest=1` kernel token, passes it
+a fixed local HTML document whose full-viewport background has equal solid
+panels of exact RGB `#ff00ff` on the left and `#00ff00` on the right. A
+uid-1000 one-shot writes that document and a fresh automation profile into
+the application's private volatile runtime directory before launch. td-jail
+binds that directory at `/run/user/1000/td-app`, and Firefox receives the
+exact profile and `file:` URL there.
+
+The profile carries only Mozilla's own
+`browser.preonboarding.enabled=false` and
+`termsofuse.bypassNotification=true` test preferences. This is not the
+`SkipTermsOfUse` enterprise policy and records no acceptance on a user's
+behalf: the profile exists only in `/run`, is selected only by the autotest
+kernel token, and disappears on reboot. An ordinary boot launches Firefox
+with its default profile and first-run flow, and the content readiness and
+evidence probes become successful no-ops rather than failing or delaying the
+service while the browser waits for the human's decision.
+The compositor considers only toplevels that asserted the exact
+`org.mozilla.firefox` XDG app id and surfaces in their bounded active
+subsurface trees only while every surface from the content leaf through the
+app-id root is mapped. A chain member that maps after its descendants
+revalidates their retained observations. On each new buffer in such a compound
+window it scans at most 1,048,576 four-byte pixels and requires at least 4,096
+opaque pixels of the first sentinel color in the left half and 4,096 opaque
+pixels of the second in the right half of the same buffer. XRGB is opaque by
+definition; ARGB pixels count only when alpha is 255. It publishes a mode-0600
+readiness socket only after the matching commit painted successfully and a
+comparison render with only that surface omitted attributes at least 4,096
+final-output pixels of each exact color to it. The socket returns the app id,
+both expected colors and observed
+bounded pixel counts, and that client's bounded object, shm-pool, shm-byte,
+callback, synchronized-commit, deferred-event, deferred-byte and copied-byte
+high-water marks. Its probe rejects a malformed, over-limit or
+identity-mismatched record.
+The comparison uses one fallibly allocated, reusable output-sized frame under
+the compositor's 64 MiB stride-padded framebuffer ceiling; allocation failure
+withholds evidence rather than weakening attribution.
+
+A root-owned evidence unit independently requires that latched compositor
+record, a currently live Firefox jail with the exact cgroup caps, and an exact
+`-contentproc` argv token on a process revalidated inside that same cgroup. It
+then atomically publishes evidence and emits the existing
+`TD-FIREFOX-FIRST-WINDOW-READY` marker followed by the distinct
+`TD-FIREFOX-OFFLINE-CONTENT-READY` marker. The closed autotest boot has no
+other programmed producer for the app id and fixed sentinel document,
+Firefox has no console descriptor, and the host oracle accepts only both
+exact console lines. The Wayland peer is still not cryptographically bound to
+the cgroup process, but the evidence now proves deterministic offline document pixels
+entered an accepted application buffer, its paint succeeded, both sentinel
+regions from that surface survived placement, stacking, clipping and
+occlusion into the compositor's rendered output, a process with Firefox's
+exact `-contentproc` role token remained live
+in the Firefox cgroup, and resource accounting remained within the compiled
+ceilings, without manual inspection. It does not yet prove input, HTTPS/NSS,
+portals, external networking policy, audio, pixel-for-pixel correspondence
+between the accepted buffer and the complete decorated output, or the complete
+process-class sandbox report required by §H.
+
+Firefox also materially increases the first profiler report's symbolization
+work: the initial 60-second capture can finish sampling before its immutable
+report is published. The autotest therefore uses `td-profiler evidence`'s
+compiled maximum 300-second wait, with a distinct 315-second service
+backstop. The evidence rules are unchanged: the accepted capture must still
+have complete bounded reports, zero loss, corruption and omitted diagnostics,
+and the exact source-line attribution sample. A persisted capture from the
+first Firefox image boot passed that validator after publication; the longer
+window accommodates report latency rather than accepting weaker evidence.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
@@ -2477,11 +2532,18 @@ reader and bounded diagnostic writer: a filtered watcher treats proof EOF as
 stage-1 death and terminates the namespace, while the diagnostic remains live
 through the application's final status. PID 1 is non-dumpable before the child
 exists, so the same-UID application cannot reopen either descriptor through
-procfs. A separate trusted Firefox evidence unit probes post-frame readiness,
-atomically publishes the root-owned evidence file, emits
-`TD-FIREFOX-FIRST-WINDOW-READY`, then atomically publishes a distinct
-completion record that releases the autotest greeter. Its own bounded
-one-second probe loop covers a second Firefox cold-start attempt without
+procfs. A separate trusted Firefox evidence unit probes post-document-frame
+readiness, the exact compositor high-water record, the cgroup policy, and a
+process with Firefox's exact `-contentproc` role token in the same cgroup. It
+skips a process whose bounded cmdline or cgroup membership cannot be read or
+changes during the scan, then fails only if no stable same-cgroup process
+carries the exact NUL-delimited token. This makes ordinary exit and PID reuse
+fail closed without letting one transient process hide a live content role. It
+atomically publishes the root-owned
+evidence file, emits both Firefox readiness markers, then atomically publishes
+a distinct completion record that releases the autotest greeter. Its own
+bounded one-second probe loop covers a second Firefox cold-start attempt
+without
 inheriting td-svc's exponential restart backoff. The greeter's separate
 allowance also includes the first Firefox ready timeout that can elapse before
 the evidence unit starts. Deployment success does not depend on Firefox or its
@@ -5594,15 +5656,15 @@ objects, pending attaches and synchronized subsurface caches after the pool
 object is destroyed. A resize raises one monotonic declared charge shared by
 the pool and every buffer created from it; an older buffer cannot partially
 refund that charge, which leaves only with the last reference. This is
-deliberately separate from the 32 MiB aggregate copied-pixel ceiling across
-the client's mapped toplevel, popup and subsurface images.
+deliberately separate from the 32 MiB aggregate copied-surface byte ceiling
+across the client's mapped toplevel, popup and subsurface images.
 
 Every non-cursor buffer commit is checked before copying against twice the
 scale-1 output's width and height; synchronized child commits receive the same
 check when cached and again when applied. The factor admits client-side shadow
 and decoration extents outside an XDG window geometry while keeping the bound
-derived from the actual output; the independent copied-pixel ceiling still
-applies. Cursor surfaces keep their tighter 256-by-256 rule. At most 128
+derived from the actual output; the independent copied-surface byte ceiling
+still applies. Cursor surfaces keep their tighter 256-by-256 rule. At most 128
 synchronized subsurfaces may hold an unapplied
 commit and at most 256 frame callbacks may be pending. A compound scene
 transaction retains at most 2,048 events and 256 KiB of encoded event bytes,
@@ -5614,13 +5676,14 @@ client output stalled while proving that scene teardown released the runtime
 lock before the transaction flush. A malformed or greedy client is
 disconnected without taking the compositor down.
 
-The first-window lifecycle showed Firefox requesting a fifth simultaneous
-pool resource, so the exact ceiling keeps bounded headroom above that lower
-bound. Firefox starts under the unchanged 512-object ceiling, but this is not
-yet a browsing trace. The navigation/content oracle must record the observed
-object, pool, callback, synchronized-commit, queued-event and copied-pixel
-high-water marks. A later object-cap change is admitted only from that
-captured trace.
+The deterministic offline-document lifecycle records Firefox's object, pool,
+declared-shm, callback, synchronized-commit, queued-event, queued-byte and
+copied-byte high-water marks on every QEMU boot and rejects the record if any
+compiled ceiling is crossed. It also retains the earlier observation that
+startup requests a fifth simultaneous pool resource, leaving bounded headroom
+below eight. This is a real navigation/content trace, but it is one small fixed
+page rather than the five-minute mixed workload in §H. A later cap change
+therefore still needs evidence from that broader run.
 
 And a performance caveat that belongs in the claim rather than in a
 surprise: the renderer copies client pixels and software-composites the
@@ -5777,25 +5840,36 @@ packaged selftest, boot oracle — with **network never in the gate**.
    system image. Its executable personality remains inside the copied
    `td-compositor` store output. The image now selects the exact marked Firefox
    154.0 and Freedesktop 25.08 package outputs, exposes `/bin/firefox` through
-   td-jail, and starts it under supervision. `td-compositor` publishes its
-   private observation endpoint only after a surface asserting the exact
-   `org.mozilla.firefox` XDG app id commits a buffer that the framebuffer paint
-   accepts. An independent trusted evidence unit requires that latched probe
-   and a currently live Firefox jail's cgroup-cap readback, publishes the
-   evidence file, emits
-   `TD-FIREFOX-FIRST-WINDOW-READY`, then publishes a completion record that
-   lets the autotest greeter exit. QEMU requires that exact marker on every
+   td-jail, and starts it under supervision on a fixed static local document.
+   An exact QEMU kernel token selects a fresh `/run`-backed automation profile
+   and the document; ordinary boots retain Firefox's own profile and first-run
+   flow. `td-compositor` publishes its private observation
+   endpoint only after a surface asserting the exact
+   `org.mozilla.firefox` XDG app id or one of its bounded active subsurfaces
+   commits a buffer with at least 4,096 opaque exact-magenta pixels in its
+   left half and 4,096 opaque exact-lime pixels in its right half from the
+   fixed two-panel document background, and the
+   framebuffer paint accepts the complete compound window.
+   The scan and endpoint carry bounded pixel and per-client resource
+   high-water evidence. An independent trusted evidence unit requires that record, a
+   currently live Firefox jail's cgroup-cap readback and a revalidated process
+   with an exact same-cgroup `-contentproc` argv token, publishes the evidence
+   file, emits
+   `TD-FIREFOX-FIRST-WINDOW-READY` and
+   `TD-FIREFOX-OFFLINE-CONTENT-READY`, then publishes a completion record that
+   lets the autotest greeter exit. QEMU requires both exact markers on every
    system boot.
    The evidence unit is not a dependency of `bootsuccess`, so user-owned state
    cannot decrement the deployment attempt counter. The application has no
    terminal or console descriptor with which to forge that evidence or alter
    terminal state. In the closed boot topology those independent facts are
-   evidence that the imported loader and Firefox reached a painted first frame
-   through the production package, runtime, broker, jail and compositor path.
-   The probes do not bind the Wayland peer to the cgroup instance, and the app
-   id is client-asserted. The marker also does not prove a particular nonblank
-   pixel, input, a content process, navigation, HTTPS, portals or audio. The
-   earlier plan's direct in-guest
+   evidence that the imported loader and Firefox reached a painted offline
+   document frame through the production package, runtime, broker, jail and
+   compositor path while that role-token process remained in the instance.
+   The probes do not bind the Wayland peer to the cgroup instance, and both XDG
+   fields are client-asserted. The markers also do not prove exact text or
+   glyph rasterization, input, HTTPS/NSS, portals, external-network isolation
+   or audio. The earlier plan's direct in-guest
    `mount(2) == EPERM` subprobe remains deferred: this slice directly reads
    back all five empty capability sets and the standard-filter interpreter
    pins `EPERM` for the complete mount syscall roster, but a target-side
@@ -5847,10 +5921,14 @@ packaged selftest, boot oracle — with **network never in the gate**.
 
 ### Before anyone writes "Firefox runs"
 
-The automated first-frame marker above deliberately does not cross this line.
-It proves package selection, jail execution, XDG identity, buffer commit,
-framebuffer paint and live resource caps; the complete browser claim still
-requires every item below.
+The automated offline-document markers above deliberately do not cross this
+line. They prove package selection, jail execution, XDG app identity, an
+accepted buffer with the exact bounded document-background pixel region,
+framebuffer paint, a same-cgroup process with Firefox's exact `-contentproc`
+argv token and live
+resource high-water/cgroup caps. The complete browser claim still requires
+every item below, notably NSS-backed HTTPS rather than a local file and the
+full `about:support` process-class report.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -5980,7 +6058,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 25 | **`td-audio` crate + surface #11**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients | **sound from the machine** |
 | 26 | `td-audio`'s PulseAudio protocol: frames, tagstruct codec, `AUTH`/`SET_CLIENT_NAME`/sink info, one playback stream; `sockets=pulseaudio` binds the socket into a jail | a jailed fixture app plays audio |
-| 27 | **Firefox policy and first-window image proof — LANDED**; browser-scale compositor admission now bounds retained shm resources, copied pixels, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The navigation run must capture high-water marks before any tuning from browsing/content workloads | Firefox starts and paints its first frame |
+| 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. Every QEMU boot selects a fresh volatile automation profile, opens a fixed local document and accepts only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributes both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints a deterministic offline document without manual inspection |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox window, an HTTPS page, and sound** |
 
 **Two other reversals are still absent from this ladder, and that is a

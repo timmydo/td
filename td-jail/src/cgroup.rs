@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 const DELEGATE_COMPONENT: &str = "td-user-1000";
 const MAX_CONTROL_BYTES: u64 = 4096;
 const MAX_ACTIVE_SCAN: usize = 256;
+const MAX_PROCESS_TOKEN_BYTES: usize = 64;
+const MAX_PROCESS_CMDLINE_BYTES: u64 = 64 * 1024;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_POLL: Duration = Duration::from_millis(10);
 
@@ -207,11 +209,24 @@ pub(crate) fn probe_active(
     uid: u32,
     gid: u32,
 ) -> io::Result<String> {
+    let (instance, _, report) = active_instance(application, limits, uid, gid)?;
+    Ok(format!(
+        "TD-JAIL-RESOURCE-CAPS-OK instance={instance} {}",
+        report.diagnostic()
+    ))
+}
+
+fn active_instance(
+    application: &str,
+    limits: ResolvedResourceLimits,
+    uid: u32,
+    gid: u32,
+) -> io::Result<(String, PathBuf, Report)> {
     authority::validate_application_name(application)?;
     let root = Path::new(CGROUP_ROOT);
     require_delegation(root, uid, gid)?;
     let entries = fs::read_dir(root)?;
-    let mut active: Option<(String, Report)> = None;
+    let mut active: Option<(String, PathBuf, Report)> = None;
     let mut seen = 0usize;
     for entry in entries {
         let entry = entry?;
@@ -240,22 +255,93 @@ pub(crate) fn probe_active(
                 "populated application cgroup {name:?} has no process-group leaders"
             )));
         }
-        let candidate = (name, report(&directory)?);
+        let candidate = (name, directory.clone(), report(&directory)?);
         if active.replace(candidate).is_some() {
             return Err(io::Error::other(format!(
                 "more than one active cgroup exists for application {application:?}"
             )));
         }
     }
-    let Some((instance, report)) = active else {
+    let Some(active) = active else {
         return Err(io::Error::other(format!(
             "no active cgroup exists for application {application:?}"
         )));
     };
-    Ok(format!(
-        "TD-JAIL-RESOURCE-CAPS-OK instance={instance} {}",
-        report.diagnostic()
-    ))
+    Ok(active)
+}
+
+pub(crate) fn valid_process_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_PROCESS_TOKEN_BYTES
+        && token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b':' | b'-')
+        })
+}
+
+fn command_has_token(command: &[u8], token: &str) -> bool {
+    command
+        .split(|byte| *byte == 0)
+        .any(|argument| argument == token.as_bytes())
+}
+
+fn read_process_command(path: &Path) -> Option<Vec<u8>> {
+    let mut command = Vec::new();
+    if fs::File::open(path)
+        .and_then(|file| {
+            file.take(MAX_PROCESS_CMDLINE_BYTES.saturating_add(1))
+                .read_to_end(&mut command)
+        })
+        .is_err()
+        || command.len() as u64 > MAX_PROCESS_CMDLINE_BYTES
+    {
+        return None;
+    }
+    Some(command)
+}
+
+pub(crate) fn probe_process_token(
+    application: &str,
+    token: &str,
+    limits: ResolvedResourceLimits,
+    uid: u32,
+    gid: u32,
+) -> io::Result<String> {
+    if !valid_process_token(token) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process token must be 1..=64 restricted ASCII bytes",
+        ));
+    }
+    let (instance, directory, _) = active_instance(application, limits, uid, gid)?;
+    let membership = membership_for_instance(&instance)?;
+    let processes = read_control(&directory.join("cgroup.procs"))?;
+    for line in processes.lines() {
+        let pid = line.parse::<u32>().map_err(|error| {
+            io::Error::other(format!(
+                "application cgroup {instance:?} has invalid process id {line:?}: {error}"
+            ))
+        })?;
+        let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
+        let Some(command) = read_process_command(&path) else {
+            continue;
+        };
+        if !command_has_token(&command, token) {
+            continue;
+        }
+        let membership_path = format!("/proc/{pid}/cgroup");
+        let Ok(observed) = read_bounded(Path::new(&membership_path)) else {
+            continue;
+        };
+        if require_membership_text(&observed, &membership).is_err() {
+            continue;
+        }
+        return Ok(format!(
+            "TD-JAIL-PROCESS-TOKEN-OK instance={instance} token={token} pid={pid}"
+        ));
+    }
+    Err(io::Error::other(format!(
+        "no process in active application cgroup {instance:?} has argument {token:?}"
+    )))
 }
 
 fn configure(directory: &Path, limits: ResolvedResourceLimits) -> io::Result<()> {
@@ -683,5 +769,42 @@ mod tests {
     fn controller_words_are_tokens_not_substrings() {
         require_words("cpu memory pids", &["cpu", "memory", "pids"], "controllers").unwrap();
         assert!(require_words("cpu memoryish pids", &["memory"], "controllers").is_err());
+    }
+
+    #[test]
+    fn process_argument_evidence_is_exact_and_bounded() {
+        assert!(valid_process_token("-contentproc"));
+        assert!(!valid_process_token(""));
+        assert!(!valid_process_token("content proc"));
+        assert!(!valid_process_token("bad\nargument"));
+        assert!(!valid_process_token(
+            &"x".repeat(MAX_PROCESS_TOKEN_BYTES + 1)
+        ));
+        let command = b"/app/lib/firefox/firefox\0-contentproc\0--channel=7\0";
+        assert!(command_has_token(command, "-contentproc"));
+        assert!(!command_has_token(command, "contentproc"));
+        assert!(!command_has_token(command, "-content"));
+    }
+
+    #[test]
+    fn transient_or_oversized_process_commands_are_skipped() {
+        let path = std::env::temp_dir().join(format!(
+            "td-jail-process-command-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::write(&path, b"firefox\0-contentproc\0").unwrap();
+        assert_eq!(
+            read_process_command(&path).unwrap(),
+            b"firefox\0-contentproc\0"
+        );
+        fs::write(
+            &path,
+            vec![0u8; usize::try_from(MAX_PROCESS_CMDLINE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(read_process_command(&path).is_none());
+        fs::remove_file(&path).unwrap();
+        assert!(read_process_command(&path).is_none());
     }
 }

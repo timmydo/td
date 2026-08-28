@@ -2,6 +2,7 @@
 
 mod bar;
 mod client;
+mod client_resources;
 mod configure;
 mod conn;
 mod font;
@@ -49,9 +50,11 @@ const MAX_HELD_KEYS: usize = 256;
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
      (--launcher-client PATH | --launcher-application NAME \
-     --application-ready-socket PATH --application-app-id ID) \
+     --application-ready-socket PATH --application-app-id ID \
+     --application-content-rgb-a RGB --application-content-rgb-b RGB) \
      --terminal-client PATH | \
-     td-compositor probe SOCKET | td-compositor probe-application SOCKET | \
+     td-compositor probe SOCKET | \
+     td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
      td-compositor terminfo PATH | \
      td-compositor selftest"
         .into()
@@ -154,6 +157,8 @@ struct RunOptions {
     terminal_client: PathBuf,
     application_ready_socket: Option<PathBuf>,
     application_app_id: Option<String>,
+    application_content_rgb_a: Option<String>,
+    application_content_rgb_b: Option<String>,
 }
 
 fn parse_run(args: &[String]) -> Result<RunOptions, String> {
@@ -165,6 +170,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut terminal_client = None;
     let mut application_ready_socket = None;
     let mut application_app_id = None;
+    let mut application_content_rgb_a = None;
+    let mut application_content_rgb_b = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args
@@ -192,9 +199,16 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--application-app-id" if application_app_id.is_none() => {
                 application_app_id = Some(value.clone())
             }
+            "--application-content-rgb-a" if application_content_rgb_a.is_none() => {
+                application_content_rgb_a = Some(value.clone())
+            }
+            "--application-content-rgb-b" if application_content_rgb_b.is_none() => {
+                application_content_rgb_b = Some(value.clone())
+            }
             "--framebuffer" | "--input" | "--socket" | "--launcher-client"
             | "--launcher-application" | "--terminal-client"
-            | "--application-ready-socket" | "--application-app-id" => {
+            | "--application-ready-socket" | "--application-app-id"
+            | "--application-content-rgb-a" | "--application-content-rgb-b" => {
                 return Err(format!("duplicate flag '{flag}'"));
             }
             _ => return Err(format!("unrecognised argument '{flag}'")),
@@ -204,10 +218,14 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     if launcher_client.is_some() == launcher_application.is_some() {
         return Err("exactly one --launcher-client or --launcher-application is required".into());
     }
-    if application_ready_socket.is_some() != application_app_id.is_some() {
+    if application_ready_socket.is_some() != application_app_id.is_some()
+        || application_ready_socket.is_some() != application_content_rgb_a.is_some()
+        || application_ready_socket.is_some() != application_content_rgb_b.is_some()
+    {
         return Err(
-            "--application-ready-socket and --application-app-id must be supplied together"
-                .into(),
+            "--application-ready-socket, --application-app-id, and both \
+             --application-content-rgb arguments must be supplied together"
+                .into()
         );
     }
     if application_ready_socket.is_some() != launcher_application.is_some() {
@@ -240,6 +258,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             .ok_or_else(|| "--terminal-client is required".to_string())?,
         application_ready_socket,
         application_app_id,
+        application_content_rgb_a,
+        application_content_rgb_b,
     })
 }
 
@@ -263,13 +283,16 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     let geometry = (framebuffer.width, framebuffer.height, framebuffer.stride);
     let mut runtime = Runtime::new(framebuffer);
     runtime.set_launcher_application(options.launcher_application.as_deref());
-    if let Some((path, app_id)) = options
+    if let Some((((path, app_id), content_rgb_a), content_rgb_b)) = options
         .application_ready_socket
         .as_deref()
         .zip(options.application_app_id.as_deref())
+        .zip(options.application_content_rgb_a.as_deref())
+        .zip(options.application_content_rgb_b.as_deref())
     {
-        let wake = server::watch_application(path, app_id)?;
-        runtime.watch_application(app_id.to_string(), wake)?;
+        let (wake, content_rgbs) =
+            server::watch_application(path, app_id, content_rgb_a, content_rgb_b)?;
+        runtime.watch_application(app_id.to_string(), content_rgbs, wake)?;
     }
     let runtime = Arc::new(Mutex::new(runtime));
     runtime
@@ -362,10 +385,27 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "probe-application" => {
             let socket = args.get(1).ok_or_else(usage)?;
-            if args.get(2).is_some() {
+            let app_id = args.get(2).ok_or_else(usage)?;
+            let content_rgb_a = args.get(3).ok_or_else(usage)?;
+            let content_rgb_b = args.get(4).ok_or_else(usage)?;
+            let quiet = match args.get(5).map(String::as_str) {
+                None => false,
+                Some("--quiet") => true,
+                Some(_) => return Err(usage()),
+            };
+            if args.get(6).is_some() {
                 return Err(usage());
             }
-            server::probe_application(Path::new(socket))
+            let line =
+                server::probe_application(Path::new(socket), app_id, content_rgb_a, content_rgb_b)?;
+            if quiet {
+                return Ok(());
+            }
+            let mut out = std::io::stdout().lock();
+            out.write_all(line.as_bytes())
+                .map_err(|error| format!("write application evidence: {error}"))?;
+            out.flush()
+                .map_err(|error| format!("flush application evidence: {error}"))
         }
         // The build step that installs the entry; the shipped binary is the
         // only encoder, so nothing can compile a second, divergent copy.
@@ -594,6 +634,7 @@ mod confinement {
     const OTHER: &[(&str, &str)] = &[
         ("bar.rs", include_str!("bar.rs")),
         ("client.rs", include_str!("client.rs")),
+        ("client_resources.rs", include_str!("client_resources.rs")),
         ("configure.rs", include_str!("configure.rs")),
         ("conn.rs", include_str!("conn.rs")),
         ("font.rs", include_str!("font.rs")),
@@ -1128,6 +1169,10 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 ready.to_string_lossy().into_owned(),
                 "--application-app-id".into(),
                 "org.mozilla.firefox".into(),
+                "--application-content-rgb-a".into(),
+                "ff00ff".into(),
+                "--application-content-rgb-b".into(),
+                "00ff00".into(),
             ]
         };
         let options = super::parse_run(&valid(&wayland, &ready)).unwrap();
@@ -1144,9 +1189,20 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             options.application_ready_socket,
             Some(resolved_parent.join("firefox-window-ready"))
         );
+        assert_eq!(
+            options.application_content_rgb_a.as_deref(),
+            Some("ff00ff")
+        );
+        assert_eq!(
+            options.application_content_rgb_b.as_deref(),
+            Some("00ff00")
+        );
         let mut activation_without_observer = valid(&wayland, &ready);
-        activation_without_observer.truncate(activation_without_observer.len() - 4);
+        activation_without_observer.truncate(activation_without_observer.len() - 8);
         assert!(super::parse_run(&activation_without_observer).is_err());
+        let mut one_content_color = valid(&wayland, &ready);
+        one_content_color.truncate(one_content_color.len() - 2);
+        assert!(super::parse_run(&one_content_color).is_err());
         assert_eq!(
             options.application_app_id.as_deref(),
             Some("org.mozilla.firefox")
@@ -1170,7 +1226,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         ))
         .is_err());
         assert!(super::parse_run(&valid(&wayland, &alias.join("wayland-0"))).is_err());
-        // The observer is meaningful only as one exact pair around a
+        // The observer is meaningful only as one exact argument set around a
         // configured application launch.
         assert!(super::parse_run(&[
             "--framebuffer".into(),

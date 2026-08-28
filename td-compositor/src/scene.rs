@@ -1221,9 +1221,29 @@ impl Scene {
         self.discard_pixels(key)
     }
 
-    fn subsurface_root(&self, key: SurfaceKey) -> Option<SurfaceKey> {
+    /// The layout-bearing root of an active compound-surface chain. `None`
+    /// means the bounded-depth invariant was somehow escaped; callers must not
+    /// attribute a child to an unproven parent in that case.
+    pub fn subsurface_root(&self, key: SurfaceKey) -> Option<SurfaceKey> {
         let mut at = key;
         for _ in 0..=MAX_SUBSURFACE_DEPTH {
+            let Some(placed) = self.subsurfaces.get(&at) else {
+                return Some(at);
+            };
+            at = placed.parent;
+        }
+        None
+    }
+
+    /// The root only when every surface on the active chain has pixels. The
+    /// renderer stops at the first absent intermediate, so a caller proving
+    /// that a descendant was drawn must ask this stricter question.
+    pub fn mapped_subsurface_root(&self, key: SurfaceKey) -> Option<SurfaceKey> {
+        let mut at = key;
+        for _ in 0..=MAX_SUBSURFACE_DEPTH {
+            if !self.surfaces.contains_key(&at) {
+                return None;
+            }
             let Some(placed) = self.subsurfaces.get(&at) else {
                 return Some(at);
             };
@@ -2571,6 +2591,21 @@ impl Scene {
     }
 
     pub fn render(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
+        self.render_omitting(frame, width, height, stride, None);
+    }
+
+    /// Render the same final scene while withholding one surface's pixels.
+    /// The rest of its role and descendants stay in place, so comparing this
+    /// image with the ordinary render identifies only that surface's final
+    /// visible contribution after clipping, stacking and overlays.
+    pub(crate) fn render_omitting(
+        &self,
+        frame: &mut [u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        omitted: Option<SurfaceKey>,
+    ) {
         // `take(height)`: every other painter here clips to the output, and
         // the shadow buffer being exactly that tall is the framebuffer's
         // arithmetic rather than this function's contract.
@@ -2634,6 +2669,9 @@ impl Scene {
                 continue;
             }
             for layer in self.surface_layers(placement.key, ImageRect::tile(placement.rect)) {
+                if omitted == Some(layer.key) {
+                    continue;
+                }
                 let Some(surface) = self.surfaces.get(&layer.key) else {
                     continue;
                 };
@@ -2653,6 +2691,9 @@ impl Scene {
                 continue;
             };
             for layer in self.surface_layers(key, rect) {
+                if omitted == Some(layer.key) {
+                    continue;
+                }
                 let Some(surface) = self.surfaces.get(&layer.key) else {
                     continue;
                 };
@@ -5884,6 +5925,7 @@ mod tests {
             parent = key;
         }
         assert_eq!(scene.subsurface_root(parent), Some(root));
+        assert_eq!(scene.mapped_subsurface_root(parent), Some(root));
 
         let width = 80;
         let height = least_output_height(8);
@@ -5902,6 +5944,38 @@ mod tests {
             scene.pointer_target(width, height).map(|point| point.key),
             Some(parent)
         );
+    }
+
+    #[test]
+    fn a_subsurface_root_is_drawable_only_through_a_fully_mapped_chain() {
+        let mut scene = Scene::new();
+        let root = SurfaceKey {
+            client: 4,
+            object: 100,
+        };
+        let middle = SurfaceKey {
+            client: 4,
+            object: 101,
+        };
+        let content = SurfaceKey {
+            client: 4,
+            object: 102,
+        };
+        scene.commit(root, surface([1, 2, 3, 0], 1, 1)).unwrap();
+        scene
+            .commit_subsurface(content, surface([7, 8, 9, 0], 1, 1))
+            .unwrap();
+        scene.associate_subsurface(middle, root, 0, 0);
+        scene.associate_subsurface(content, middle, 0, 0);
+        assert_eq!(scene.subsurface_root(content), Some(root));
+        assert_eq!(scene.mapped_subsurface_root(content), None);
+
+        scene
+            .commit_subsurface(middle, surface([4, 5, 6, 0], 1, 1))
+            .unwrap();
+        assert_eq!(scene.mapped_subsurface_root(content), Some(root));
+        scene.detach_subsurface(middle);
+        assert_eq!(scene.mapped_subsurface_root(content), None);
     }
 
     #[test]

@@ -330,7 +330,7 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// Raised again when Git added a ninth, process-heavy health block. The initial
 /// profiler evidence is serialized ahead of that workload so its bounded capture
 /// stays deterministic. The host must outlast the serial identity/root checks, the
-/// slower of that 195-second service and the 700-second network service, then the
+/// slower of that 315-second service and the 700-second network service, then the
 /// clamped 760-second health loop and the diagnostic margin. The tenth Codex block
 /// restores the former 70-second host margin at the value below.
 pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2010;
@@ -580,9 +580,16 @@ pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 /// td-jail's exported filter and observes the compiled errno and kill actions.
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 
-/// Emitted by the trusted Firefox-evidence unit only after the compositor has
-/// painted Firefox's first mapped frame and td-jail's live caps remain bounded.
+/// Compatibility marker emitted by the trusted Firefox-evidence unit after
+/// the stronger offline-content, live-process and resource-cap proof below.
 pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";
+
+/// Emitted by the trusted Firefox-evidence unit only after the compositor has
+/// observed the deterministic offline document's exact content-pixel region
+/// in a painted frame, returned bounded client-resource high-water marks, and
+/// td-jail has found a live process with Firefox's exact `-contentproc` argv
+/// token in the same application cgroup.
+pub const TD_FIREFOX_CONTENT_MARKER: &str = "TD-FIREFOX-OFFLINE-CONTENT-READY";
 
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`

@@ -53,6 +53,9 @@ fn run() -> std::io::Result<()> {
         transition::Mode::ResourceProbe { application } => {
             transition::probe_resource_caps(&application)
         }
+        transition::Mode::ProcessTokenProbe { application, token } => {
+            transition::probe_process_token(&application, &token)
+        }
         transition::Mode::WriteFilter => transition::write_standard_filter(),
         transition::Mode::CgroupCleanupBootstrap { membership } => {
             transition::run_cgroup_cleanup_bootstrap(&membership)

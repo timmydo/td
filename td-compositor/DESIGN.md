@@ -909,7 +909,7 @@ active stack. Children below the parent draw first, children above it draw
 last, nested children keep that order recursively, and the topmost accepting
 input region receives pointer coordinates in its own surface-local space. The
 layout, title band, focus, popup ancestry, and window-management identity stay
-with the compound root. Per-client copied-pixel and object ceilings cover
+with the compound root. Per-client copied-surface byte and object ceilings cover
 mapped and hidden children. Each synchronized surface retains at most one
 pending buffer and input-region state; no more than 128 synchronized surfaces
 may hold an unapplied commit, and no more than 256 frame callbacks may be
@@ -1908,17 +1908,71 @@ compositor pid, so that residual path cannot block a later compositor.
 
 The application-window observer and configured launcher application require
 each other. The observer is configured by the paired
-`--application-ready-socket` and `--application-app-id` arguments. Its socket
-path must be
-an absolute path whose resolved parent and final name differ from the Wayland
+`--application-ready-socket`, `--application-app-id`, and
+`--application-content-rgb-a`/`--application-content-rgb-b` arguments. Its
+socket path must be an absolute
+path whose resolved parent and final name differ from the Wayland
 socket, so the ordinary compositor listener cannot answer its probe before a
 window exists. Both resolved endpoints are retained after validation rather
 than following a mutable parent symlink again. The expected id is at most 128
 ASCII letters, digits, dots, underscores, or hyphens, keeping the diagnostic
-one unambiguous field. Matching surface keys remain after the one-shot
-readiness publication so launcher activation can reuse the service-owned
-window; role, surface and client teardown remove them. `probe-application`
-connects to that distinct socket.
+one unambiguous field. Each distinct RGB is exactly six lowercase hexadecimal
+digits. App-id matches, buffer scans and accepted-content messages share one
+eight-line diagnostic budget, so repeated foreign role churn or repaint
+failure cannot grow the compositor's serial output without bound.
+A bare app-id match would say only that browser chrome painted, so readiness
+also requires a newly committed buffer on that candidate or in its bounded
+active subsurface tree to contain at least 4,096 exact pixels of the first
+expected color in its left half and 4,096 of the second in its right half.
+XRGB pixels are opaque by definition; ARGB pixels count only at alpha 255.
+Requiring both uncommon colors in their prescribed halves of one buffer
+distinguishes the fixed two-panel document from Firefox's ordinary chrome,
+default/error pages and single-color toplevel startup frame. Attribution walks
+the scene's active subsurface edges only while every surface from the content
+leaf through the app-id-bearing root remains mapped; an absent, detached or
+over-depth link is not evidence. The scan examines at most the first 1,048,576
+four-byte pixels, bounding work even at the largest accepted surface size. A
+compound parent/subsurface commit revalidates the exact fully mapped chain,
+counts and current pixels after every cached child update. After its complete
+paint settles successfully, the observer rerenders with only the qualifying
+surface omitted and requires both colors to have reached the compositor's
+rendered output from that surface at the same minimum counts before it
+publishes. A hidden, clipped, unstacked, occluded, failed or superseded
+observation therefore leaves readiness unpublished. Unrelated surfaces with
+the same colors cannot contribute to those counts. The comparison frame is
+allocated fallibly on first qualifying evidence, reused thereafter and bounded
+by the framebuffer's separate 64 MiB stride-padded ceiling.
+
+Firefox can commit a child before the synchronized commit that activates its
+subsurface edge. Until publication, the observer therefore retains the latest
+two bounded color counts for each surface owned by a client with a candidate
+toplevel. A changed association or newly mapped chain member revalidates every
+retained surface whose possibly nested, fully mapped active chain now reaches
+that candidate before using the stored counts. Both scheduling and final
+compound settlement require every chain member to remain mapped. The ordinary
+per-client object ceiling bounds this map;
+detaching or destroying a subsurface, destroying its toplevel role or surface,
+unmapping it with a null buffer, changing the candidate identity, and client
+teardown remove the matching observations so object-id reuse cannot inherit
+evidence. Final compound-settlement revalidation separately prevents a
+scheduled observation from surviving a later detach or buffer replacement in
+the same parent commit.
+
+The readiness answer is one newline-terminated structured line carrying the
+app id, both RGB values, both bounded matching-pixel counts and that
+connection's monotonic high-water counts for objects, retained shm pools and
+bytes, frame callbacks, synchronized commit caches, deferred events and bytes,
+and copied surface bytes. `probe-application` requires the expected app id and
+colors, exact
+field order, no trailing data, the minimum and maximum sentinel-pixel counts,
+at least one object/pool/shm byte/copied byte, and every compiled resource
+ceiling before it reproduces the line. Matching surface keys remain after the
+one-shot publication so launcher activation can reuse the service-owned
+window; role, surface and client teardown remove them and their telemetry
+registration. `probe-application SOCKET ID RGB-A RGB-B` connects to that
+distinct socket and reproduces the structured line; its `--quiet` form applies
+the same validation for supervisor readiness without putting a second evidence
+record on the console.
 A publisher failure exits the compositor for its existing `restart=always`
 supervisor to reconstruct the one-shot observer; losing stdout after the
 socket is live reports an error but does not retract readiness.
@@ -2965,7 +3019,15 @@ buffers made from it, then is refunded only when the last such reference
 goes. The first Firefox window lifecycle showed a fifth simultaneous
 pool-resource request, leaving bounded headroom below eight. A pool alone
 remains capped at 64 MiB.
-The copied-pixel ledger is independent and
+The offline-document boot oracle snapshots the matching connection's
+monotonic high-water counters at the first successfully painted frame with
+the bounded exact content-pixel region and validates every field against
+these same ceilings. This makes the production accounting paths and their
+admission constants part of the QEMU
+answer, while the saturation regressions separately pin every instrumentation
+site at its exact limit. The snapshot is intentionally an early fixed-page
+trace, not authority to tune limits below a later mixed browsing workload.
+The copied-surface byte ledger is independent and
 covers toplevels, popups and subsurfaces rather than mistaking shared pool
 address space for memory copied into the compositor.
 One compound commit may defer at most 2,048 events and 256 KiB of encoded
@@ -2986,8 +3048,11 @@ client rather than one shared ledger, for the reason the tile path is: a
 single first-come total lets one client that pointed with a few full-size
 cursors deny every other client a cursor for as long as it stays connected,
 and the denial is silent — the others simply show td's cross. A framebuffer's
-stride-padded shadow allocation has a
-separate 64 MiB ceiling. Framebuffer and buffer dimensions share a
+render and device-shadow allocations each have a separate 64 MiB
+stride-padded ceiling. The application oracle may lazily allocate one
+same-sized comparison frame; it fails rather than publishing if that bounded
+allocation cannot be made, and reuses it across later attempts. Framebuffer and
+buffer dimensions share a
 16,384-pixel ceiling. At four bytes per pixel the area ceiling is 8,388,608
 pixels: tight 3840x2160 is accepted, while 4096x2160 is rejected. A non-cursor
 buffer is additionally refused before copying when either committed
