@@ -6013,8 +6013,9 @@ They prove package selection, jail execution, XDG app identity, attributed
 HTTPS pixels, the declared guest-local NSS path, renderer selection, the
 global fallback sandbox facts, nested filters in every reported live required
 process role, and the staged physical-input subset of item 7. The complete
-browser claim still requires the remaining items below, notably portal,
-download, isolation, soak and audio evidence.
+browser claim also proves the fixed guest-local HTTPS download through its
+declared writable grant. It still requires the remaining items below, notably
+portal, isolation, soak and audio evidence.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -6152,7 +6153,25 @@ and image commits — showing:
    compositor's cross-client offer, Firefox's MIME receive and the supplied
    endpoint, not merely that td-term admitted its own source. No sleep stands
    in for an acknowledgement.
-8. a download reaching the app-private or explicitly granted directory;
+8. **a download reaching the explicitly granted directory — LANDED.** The
+   authenticated guest-local HTTPS document exposes one fixed download link.
+   A bounded content-context probe verifies its exact URL and filename, focuses
+   it, and admits one real emulated Enter key only after publishing an arm
+   marker. It accepts one through four trusted key events under TCG, suppresses
+   every default action after the first, and requires exactly one trusted link
+   activation. A following physical Shift keyup is the ordered command boundary,
+   so delayed repeats are observed before success. The volatile Firefox
+   profile selects its compiled `/home/td/Downloads` grant without a prompt.
+   Outside the jail, a td-owned
+   unprivileged probe then requires one stable regular inode at the
+   corresponding `/var/home/tester/Downloads` source: uid/gid 1000, no special
+   or executable bits, no group/other write, one link, exact 23-byte size and
+   fixture contents, unchanged path/descriptor identity, and no partial or
+   duplicate proof name in a bounded directory scan. Only that probe emits
+   `TD-FIREFOX-DOWNLOAD-OK bytes=23`, and the input completion record is written
+   afterwards. This proves Firefox's real HTTPS download path through the
+   authenticated read-write grant; it does not claim a public-network download
+   or a FileChooser portal;
 9. the Settings portal succeeding;
 10. five minutes of navigation with no compositor or bus disconnect;
 11. blocked syscall probes still blocked in the outer app process, and
@@ -6231,6 +6250,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
 | 27c | **Firefox physical-input image proof — LANDED**; the first system boot uses a bounded private QMP controller, the already enumerated virtio tablet, and the PC machine's PS/2 keyboard, while staged Firefox content/chrome probes and a compositor-owned cursor marker independently attest the semantic results. The handshake proves typing, pointer motion, scrolling, native right-click menu opening, outside-click dismissal, and a painted Firefox cursor without sleeps or manual observation. The test page retains the authenticated magenta/lime framebuffer sentinel and adds only a fixed focused input, scroll extent, and cursor style | the supported Firefox path accepts real emulated input end to end; rung 27d extends the same handshake across clipboard paste |
 | 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and injects `Control+L`. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two commands plus eight total events are hard bounds. A separate Shift tap ends each command, and Firefox must observe its ordered keyup before classifying the batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |
+| 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input completion record now follows the download marker, so neither a synthetic DOM click nor a stale file can pass | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 
 **Two other reversals are still absent from this ladder, and that is a

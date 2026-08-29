@@ -61,6 +61,7 @@ fn run() -> std::io::Result<()> {
         transition::Mode::FirefoxInputProbe { stage } => {
             transition::probe_firefox_input(stage)
         }
+        transition::Mode::FirefoxDownloadProbe => transition::probe_firefox_download(),
         transition::Mode::WriteFilter => transition::write_standard_filter(),
         transition::Mode::CgroupCleanupBootstrap { membership } => {
             transition::run_cgroup_cleanup_bootstrap(&membership)

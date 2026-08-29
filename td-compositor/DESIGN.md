@@ -4176,6 +4176,20 @@ can pass it. These grid scans, proof markers, and disabled terminal key repeat
 exist only when the exact `td.firefox-input=1` kernel token is present; normal
 boots retain ordinary repeat behavior and execute none of the proof scan.
 
+The same token-gated QMP session continues from the clipboard acknowledgement
+to the authenticated page's fixed download link. Firefox content validates and
+focuses that link before td-jail emits the arm marker; only then does the host
+send one Enter chord through the ordinary keyboard path. The page records one
+through four trusted key events under TCG, suppresses every default action after
+the first, and requires exactly one trusted link activation. A later physical
+Shift keyup terminates that command, so success cannot precede a delayed repeat.
+This compositor input evidence is necessary but not sufficient: the root-owned
+image unit publishes completion only after a separate unprivileged td-jail
+probe, outside
+the application namespace, validates the exact regular file and bytes at the
+source of Firefox's writable Downloads grant. Ordinary boots retain neither
+the fixture link nor any of these listeners or markers.
+
 ## 12. PTY and process lifecycle
 
 After mounting devtmpfs and before graphical services, the system creates

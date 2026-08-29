@@ -1,12 +1,17 @@
 //! Bounded Firefox autotest introspection over Marionette's loopback protocol.
 
 use crate::cgroup::ProcessSandbox;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const MARIONETTE_PORT: u16 = 2828;
 const PROBE_DEADLINE: Duration = Duration::from_secs(60);
+const DOWNLOAD_PROBE_DEADLINE: Duration = Duration::from_secs(40);
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_HEADER_DIGITS: usize = 7;
@@ -28,6 +33,15 @@ const INPUT_CLIPBOARD_RETRY: &str = "TD-FIREFOX-CLIPBOARD-RETRY";
 const INPUT_CLIPBOARD_PUBLIC_ARMED: &str = "TD-FIREFOX-CLIPBOARD-ARMED";
 const INPUT_CLIPBOARD_PUBLIC_RETRY: &str = "TD-FIREFOX-CLIPBOARD-RETRY-ARMED";
 const INPUT_CLIPBOARD_OK: &str = "TD-FIREFOX-CLIPBOARD-OK";
+const INPUT_DOWNLOAD_ARMED: &str = "TD-FIREFOX-DOWNLOAD-CONTENT-ARMED";
+const INPUT_DOWNLOAD_PUBLIC_ARMED: &str = "TD-FIREFOX-DOWNLOAD-ARMED";
+const INPUT_DOWNLOAD_CLICKED: &str = "TD-FIREFOX-DOWNLOAD-CLICKED";
+const DOWNLOAD_DIRECTORY: &str = "/var/home/tester/Downloads";
+const DOWNLOAD_NAME: &str = "td-firefox-download.txt";
+const DOWNLOAD_BYTES: &[u8] = b"TD-FIREFOX-DOWNLOAD-V1\n";
+const DOWNLOAD_UID: u32 = 1000;
+const DOWNLOAD_GID: u32 = 1000;
+const MAX_DOWNLOAD_DIRECTORY_ENTRIES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputStage {
@@ -37,6 +51,7 @@ pub(crate) enum InputStage {
     ClipboardRefocusArm,
     ClipboardRefocus,
     Clipboard,
+    Download,
 }
 
 impl InputStage {
@@ -48,6 +63,7 @@ impl InputStage {
             "clipboard-refocus-arm" => Some(Self::ClipboardRefocusArm),
             "clipboard-refocus" => Some(Self::ClipboardRefocus),
             "clipboard" => Some(Self::Clipboard),
+            "download" => Some(Self::Download),
             _ => None,
         }
     }
@@ -60,6 +76,7 @@ impl InputStage {
             Self::ClipboardRefocusArm => "TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED",
             Self::ClipboardRefocus => "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED",
             Self::Clipboard => "TD-FIREFOX-CLIPBOARD-OK",
+            Self::Download => "TD-FIREFOX-DOWNLOAD-CLICKED",
         }
     }
 }
@@ -285,6 +302,57 @@ const check = () => {
 check();
 "#;
 
+const CONTENT_DOWNLOAD_ARM_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const link = document.getElementById("td-download");
+const expected = "https://localhost:8443/download.txt";
+if (!link || link.href !== expected ||
+    link.download !== "td-firefox-download.txt") {
+  done("TD-FIREFOX-INPUT-ERROR:download-link");
+} else {
+  const state = { keys: 0, clicks: 0, commandEnds: 0, trusted: true };
+  window.__tdDownload = state;
+  link.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      state.keys++;
+      if (state.keys > 1) event.preventDefault();
+      if (!event.isTrusted) state.trusted = false;
+    }
+  }, { capture: true });
+  link.addEventListener("click", event => {
+    state.clicks++;
+    if (!event.isTrusted) state.trusted = false;
+  }, { capture: true });
+  window.addEventListener("keyup", event => {
+    if (event.key === "Shift" && !event.repeat) state.commandEnds++;
+    if (event.key === "Shift" && !event.isTrusted) state.trusted = false;
+  }, { capture: true });
+  link.focus();
+  done(document.hasFocus() && document.activeElement === link ?
+    "TD-FIREFOX-DOWNLOAD-CONTENT-ARMED" :
+    "TD-FIREFOX-INPUT-ERROR:download-focus");
+}
+"#;
+
+const CONTENT_DOWNLOAD_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const state = window.__tdDownload;
+  const ok = state && state.keys >= 1 && state.keys <= 4 &&
+    state.clicks === 1 && state.commandEnds === 1 && state.trusted;
+  if (!ok && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  done(ok ? "TD-FIREFOX-DOWNLOAD-CLICKED" :
+    "TD-FIREFOX-INPUT-ERROR:download:" +
+    [state && state.keys, state && state.clicks, state && state.commandEnds,
+      state && state.trusted].map(String).join(":"));
+};
+check();
+"#;
+
 // This runs only after the exact QEMU autotest launch enabled Marionette and
 // opted into privileged script execution. It reads Firefox's own about:support
 // providers and reports Firefox's own child-role mapping. The Rust side binds
@@ -461,14 +529,128 @@ pub(crate) fn probe_input<W: Write>(
     progress: &mut W,
 ) -> io::Result<&'static str> {
     let address = SocketAddr::from(([127, 0, 0, 1], MARIONETTE_PORT));
+    let timeout = if stage == InputStage::Download {
+        DOWNLOAD_PROBE_DEADLINE
+    } else {
+        PROBE_DEADLINE
+    };
     let deadline = Instant::now()
-        .checked_add(PROBE_DEADLINE)
+        .checked_add(timeout)
         .ok_or_else(|| io::Error::other("Firefox input probe deadline overflow"))?;
     let stream = TcpStream::connect_timeout(&address, remaining(deadline)?)
         .map_err(|error| contextual("connect to Firefox Marionette on loopback", error))?;
     let mut stream = DeadlineStream { stream, deadline };
     probe_input_stream_with_progress(&mut stream, stage, progress)?;
     Ok(stage.marker())
+}
+
+pub(crate) fn probe_download() -> io::Result<String> {
+    validate_download(
+        Path::new(DOWNLOAD_DIRECTORY),
+        DOWNLOAD_BYTES,
+        DOWNLOAD_UID,
+        DOWNLOAD_GID,
+    )?;
+    Ok(format!(
+        "TD-FIREFOX-DOWNLOAD-OK bytes={}",
+        DOWNLOAD_BYTES.len()
+    ))
+}
+
+fn validate_download(
+    directory: &Path,
+    expected: &[u8],
+    uid: u32,
+    gid: u32,
+) -> io::Result<()> {
+    let directory_before = fs::symlink_metadata(directory)
+        .map_err(|error| contextual("inspect Firefox download directory", error))?;
+    if !directory_before.file_type().is_dir()
+        || directory_before.uid() != uid
+        || directory_before.gid() != gid
+        || directory_before.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::other(
+            "Firefox download directory has the wrong type, owner, or mode",
+        ));
+    }
+
+    let path = directory.join(DOWNLOAD_NAME);
+    let path_before = fs::symlink_metadata(&path)
+        .map_err(|error| contextual("inspect Firefox download path", error))?;
+    let mut file = File::open(&path)
+        .map_err(|error| contextual("open Firefox download path", error))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| contextual("inspect open Firefox download", error))?;
+    require_same_file(&path_before, &opened)?;
+    let mode = opened.mode();
+    if !opened.file_type().is_file()
+        || opened.uid() != uid
+        || opened.gid() != gid
+        || opened.nlink() != 1
+        || mode & 0o7000 != 0
+        || mode & 0o700 != 0o600
+        || mode & 0o033 != 0
+        || opened.len() != expected.len() as u64
+    {
+        return Err(io::Error::other(
+            "Firefox download has the wrong type, owner, mode, links, or size",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(expected.len().saturating_add(1));
+    Read::take(&mut file, expected.len().saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| contextual("read Firefox download", error))?;
+    if bytes != expected {
+        return Err(io::Error::other(
+            "Firefox download did not contain the authenticated fixture bytes",
+        ));
+    }
+
+    let opened_after = file
+        .metadata()
+        .map_err(|error| contextual("reinspect open Firefox download", error))?;
+    let path_after = fs::symlink_metadata(&path)
+        .map_err(|error| contextual("reinspect Firefox download path", error))?;
+    require_same_file(&opened, &opened_after)?;
+    require_same_file(&opened, &path_after)?;
+
+    let mut matching = 0_usize;
+    let prefix = b"td-firefox-download";
+    for (index, entry) in fs::read_dir(directory)
+        .map_err(|error| contextual("enumerate Firefox download directory", error))?
+        .enumerate()
+    {
+        if index >= MAX_DOWNLOAD_DIRECTORY_ENTRIES {
+            return Err(io::Error::other(
+                "Firefox download directory exceeded its 64-entry proof bound",
+            ));
+        }
+        let entry = entry.map_err(|error| contextual("read Firefox download entry", error))?;
+        if entry.file_name().as_bytes().starts_with(prefix) {
+            matching = matching.saturating_add(1);
+        }
+    }
+    if matching != 1 {
+        return Err(io::Error::other(
+            "Firefox download proof found a partial or duplicate target",
+        ));
+    }
+
+    let directory_after = fs::symlink_metadata(directory)
+        .map_err(|error| contextual("reinspect Firefox download directory", error))?;
+    require_same_file(&directory_before, &directory_after)
+}
+
+fn require_same_file(before: &fs::Metadata, after: &fs::Metadata) -> io::Result<()> {
+    if before.dev() == after.dev() && before.ino() == after.ino() {
+        return Ok(());
+    }
+    Err(io::Error::other(
+        "Firefox download identity changed during validation",
+    ))
 }
 
 struct DeadlineStream {
@@ -508,7 +690,7 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Firefox probe exceeded its 60-second deadline",
+                "Firefox probe exceeded its wall-clock deadline",
             )
         })
 }
@@ -624,6 +806,13 @@ fn run_input_stage<S: Read + Write, W: Write>(
             writeln!(progress, "{INPUT_CLIPBOARD_PUBLIC_RETRY}")?;
             progress.flush()?;
             require_script_value(stream, 5, CHROME_CLIPBOARD_SCRIPT, INPUT_CLIPBOARD_OK)
+        }
+        InputStage::Download => {
+            set_context(stream, 2, "content")?;
+            require_script_value(stream, 3, CONTENT_DOWNLOAD_ARM_SCRIPT, INPUT_DOWNLOAD_ARMED)?;
+            writeln!(progress, "{INPUT_DOWNLOAD_PUBLIC_ARMED}")?;
+            progress.flush()?;
+            require_script_value(stream, 4, CONTENT_DOWNLOAD_SCRIPT, INPUT_DOWNLOAD_CLICKED)
         }
     }
 }
@@ -1195,6 +1384,21 @@ mod tests {
 
     use super::*;
     use std::io::Cursor;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn download_test_directory() -> std::path::PathBuf {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "td-firefox-download-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
 
     struct ScriptedIo {
         input: Cursor<Vec<u8>>,
@@ -1257,6 +1461,7 @@ mod tests {
     #[test]
     fn production_probe_has_one_end_to_end_deadline() {
         assert_eq!(PROBE_DEADLINE, Duration::from_secs(60));
+        assert_eq!(DOWNLOAD_PROBE_DEADLINE, Duration::from_secs(40));
         assert_eq!(
             remaining(Instant::now()).unwrap_err().kind(),
             io::ErrorKind::TimedOut
@@ -1383,6 +1588,13 @@ mod tests {
                     responses.push(format!("[1,{id},null,{{\"value\":\"{value}\"}}]"));
                 }
             }
+            InputStage::Download => {
+                responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
+                for (index, value) in values.iter().enumerate() {
+                    let id = index + 3;
+                    responses.push(format!("[1,{id},null,{{\"value\":\"{value}\"}}]"));
+                }
+            }
         }
         responses.push(r#"[1,6,null,{"value":null}]"#.to_string());
         let mut input = Vec::new();
@@ -1447,6 +1659,40 @@ mod tests {
         assert_eq!(
             read_frame(&mut commands).unwrap(),
             execute_command_with_id(3, CHROME_FINAL_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+
+        let mut download_io = input_transcript(
+            InputStage::Download,
+            &[INPUT_DOWNLOAD_ARMED, INPUT_DOWNLOAD_CLICKED],
+        );
+        let mut download_progress = Vec::new();
+        probe_input_stream_with_progress(
+            &mut download_io,
+            InputStage::Download,
+            &mut download_progress,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(download_progress).unwrap(),
+            format!("{INPUT_DOWNLOAD_PUBLIC_ARMED}\n")
+        );
+        let mut commands = Cursor::new(download_io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CONTENT_DOWNLOAD_ARM_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(4, CONTENT_DOWNLOAD_SCRIPT).unwrap()
         );
         assert_eq!(
             read_frame(&mut commands).unwrap(),
@@ -1647,6 +1893,13 @@ mod tests {
         assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("!focused || !selected"));
         assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("event.key === \"Shift\""));
         assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("state.commandEnds++"));
+        assert!(CONTENT_DOWNLOAD_ARM_SCRIPT.contains("link.download"));
+        assert!(CONTENT_DOWNLOAD_ARM_SCRIPT.contains("document.hasFocus()"));
+        assert!(CONTENT_DOWNLOAD_ARM_SCRIPT.contains("event.isTrusted"));
+        assert!(CONTENT_DOWNLOAD_ARM_SCRIPT.contains("event.preventDefault()"));
+        assert!(CONTENT_DOWNLOAD_SCRIPT.contains("state.keys <= 4"));
+        assert!(CONTENT_DOWNLOAD_SCRIPT.contains("state.clicks === 1"));
+        assert!(CONTENT_DOWNLOAD_SCRIPT.contains("state.commandEnds === 1"));
         for script in [
             CONTENT_MENU_SCRIPT,
             CHROME_MENU_SCRIPT,
@@ -1654,6 +1907,7 @@ mod tests {
             CONTENT_CLIPBOARD_REFOCUS_SCRIPT,
             CHROME_CLIPBOARD_ARM_SCRIPT,
             CHROME_CLIPBOARD_SCRIPT,
+            CONTENT_DOWNLOAD_SCRIPT,
         ] {
             assert!(script.contains("const expires = Date.now() + 20000"));
             assert!(script.contains("setTimeout(check, 50)"));
@@ -1668,6 +1922,8 @@ mod tests {
             CONTENT_CLIPBOARD_REFOCUS_SCRIPT,
             CHROME_CLIPBOARD_ARM_SCRIPT,
             CHROME_CLIPBOARD_SCRIPT,
+            CONTENT_DOWNLOAD_ARM_SCRIPT,
+            CONTENT_DOWNLOAD_SCRIPT,
         ] {
             assert!(execute_command_with_id(5, script).unwrap().len() < MAX_COMMAND_BYTES);
         }
@@ -1741,6 +1997,82 @@ mod tests {
             classify(2, 1, 6, 6, 1, 5, &"Welcome".repeat(5)),
             "pending-or-error"
         );
+    }
+
+    #[test]
+    fn download_result_waits_for_the_physical_command_boundary() {
+        let accepted = |keys: usize, clicks: usize, command_ends: usize, trusted: bool| {
+            (1..=4).contains(&keys) && clicks == 1 && command_ends == 1 && trusted
+        };
+
+        assert!(!accepted(1, 1, 0, true));
+        assert!(accepted(1, 1, 1, true));
+        // A delayed fifth Enter precedes the separately injected Shift keyup,
+        // so it is visible before the command can complete.
+        assert!(!accepted(5, 1, 0, true));
+        assert!(!accepted(5, 1, 1, true));
+        assert!(!accepted(1, 2, 1, true));
+        assert!(!accepted(1, 1, 1, false));
+    }
+
+    #[test]
+    fn download_probe_requires_one_stable_exact_regular_file() {
+        let directory = download_test_directory();
+        let owner = fs::metadata(&directory).unwrap();
+        let path = directory.join(DOWNLOAD_NAME);
+        fs::write(&path, DOWNLOAD_BYTES).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        validate_download(
+            &directory,
+            DOWNLOAD_BYTES,
+            owner.uid(),
+            owner.gid(),
+        )
+        .unwrap();
+
+        fs::write(&path, b"TD-FIREFOX-DOWNLOAD-V0\n").unwrap();
+        assert!(validate_download(
+            &directory,
+            DOWNLOAD_BYTES,
+            owner.uid(),
+            owner.gid(),
+        )
+        .is_err());
+        fs::write(&path, DOWNLOAD_BYTES).unwrap();
+
+        let duplicate = directory.join("td-firefox-download.txt.part");
+        fs::write(&duplicate, DOWNLOAD_BYTES).unwrap();
+        assert!(validate_download(
+            &directory,
+            DOWNLOAD_BYTES,
+            owner.uid(),
+            owner.gid(),
+        )
+        .is_err());
+        fs::remove_file(&duplicate).unwrap();
+
+        let hardlink = directory.join("unrelated-hardlink");
+        fs::hard_link(&path, &hardlink).unwrap();
+        assert!(validate_download(
+            &directory,
+            DOWNLOAD_BYTES,
+            owner.uid(),
+            owner.gid(),
+        )
+        .is_err());
+        fs::remove_file(&hardlink).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        fs::write(directory.join("elsewhere"), DOWNLOAD_BYTES).unwrap();
+        symlink("elsewhere", &path).unwrap();
+        assert!(validate_download(
+            &directory,
+            DOWNLOAD_BYTES,
+            owner.uid(),
+            owner.gid(),
+        )
+        .is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

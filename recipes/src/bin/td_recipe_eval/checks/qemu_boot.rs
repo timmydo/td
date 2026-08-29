@@ -143,6 +143,9 @@ const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str =
 const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_CLIPBOARD_RETRY_MARKER;
 const TD_FIREFOX_CLIPBOARD_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CLIPBOARD_MARKER;
+const TD_FIREFOX_DOWNLOAD_ARMED_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_DOWNLOAD_ARMED_MARKER;
+const TD_FIREFOX_DOWNLOAD_MARKER: &str = td_recipe::ladder::TD_FIREFOX_DOWNLOAD_MARKER;
 const TD_APPLICATION_CURSOR_PREFIX: &str =
     "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
 const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_INPUT_CMDLINE_TOKEN;
@@ -355,6 +358,8 @@ struct ConsoleEvidence {
     td_firefox_clipboard_armed: bool,
     td_firefox_clipboard_retry: bool,
     td_firefox_clipboard: bool,
+    td_firefox_download_armed: bool,
+    td_firefox_download: bool,
     td_application_cursor: bool,
     td_profiler_attribution: bool,
     td_wayland_runtime: bool,
@@ -988,7 +993,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          seven-byte terminal word ({TD_TERM_CLIPBOARD_TARGET_PREFIX}), selected its visibly \
          settled cells ({TD_TERM_CLIPBOARD_SELECTION_MARKER}), published it through Wayland \
          core selection ({TD_TERM_CLIPBOARD_MARKER}), and pasted it into Firefox's URL bar \
-         ({TD_FIREFOX_CLIPBOARD_MARKER}), \
+         ({TD_FIREFOX_CLIPBOARD_MARKER}), focused the authenticated HTTPS download link \
+         ({TD_FIREFOX_DOWNLOAD_ARMED_MARKER}), activated it through the emulated keyboard, \
+         and validated the exact file outside the jail ({TD_FIREFOX_DOWNLOAD_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1175,6 +1182,16 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
             result.evidence.td_term_clipboard_sent,
             TD_TERM_CLIPBOARD_SENT_MARKER,
             "td-term did not write the exact selection to Firefox's transfer endpoint",
+        ),
+        (
+            result.evidence.td_firefox_download_armed,
+            TD_FIREFOX_DOWNLOAD_ARMED_MARKER,
+            "Firefox did not focus the authenticated HTTPS download link",
+        ),
+        (
+            result.evidence.td_firefox_download,
+            TD_FIREFOX_DOWNLOAD_MARKER,
+            "Firefox did not write the exact download through its writable grant",
         ),
     ] {
         if !seen {
@@ -3810,6 +3827,18 @@ fn latch_console_evidence_from(
         TD_FIREFOX_CLIPBOARD_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
+    latch_line_marker(
+        &mut evidence.td_firefox_download_armed,
+        buf,
+        TD_FIREFOX_DOWNLOAD_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_download,
+        buf,
+        TD_FIREFOX_DOWNLOAD_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
     latch_application_cursor(
         &mut evidence.td_application_cursor,
         buf,
@@ -4258,6 +4287,7 @@ enum PhysicalInputPhase {
     FirefoxPasteArm,
     FirefoxPaste,
     FirefoxPasteRetried,
+    FirefoxDownload,
 }
 
 fn qmp_absolute_pixel(pixel: u32, extent: u32) -> Result<u16, String> {
@@ -4432,8 +4462,25 @@ impl PhysicalInputController {
             qmp.clipboard_paste_until(deadline)?;
             self.phase = PhysicalInputPhase::FirefoxPasteRetried;
         }
+        if download_is_armed(self.phase, evidence) {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before Firefox download".to_string())?;
+            qmp.download_activate_until(deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxDownload;
+        }
         Ok(())
     }
+}
+
+fn download_is_armed(phase: PhysicalInputPhase, evidence: &ConsoleEvidence) -> bool {
+    matches!(
+        phase,
+        PhysicalInputPhase::FirefoxPaste | PhysicalInputPhase::FirefoxPasteRetried
+    ) && evidence.td_firefox_clipboard
+        && evidence.td_firefox_download_armed
 }
 
 struct Qmp {
@@ -4490,6 +4537,13 @@ impl Qmp {
         self.key_chord_until(&["shift"], deadline)
     }
 
+    fn download_activate_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.key_chord_until(&["ret"], deadline)?;
+        // As with paste, a distinct modifier keyup is the guest-observed end
+        // of every event in the activation command.
+        self.key_chord_until(&["shift"], deadline)
+    }
+
     fn key_chord_until(&mut self, keys: &[&str], deadline: Instant) -> Result<(), String> {
         if keys.is_empty()
             || keys.len() > 3
@@ -4498,7 +4552,17 @@ impl Qmp {
                 .any(|key| {
                     !matches!(
                         *key,
-                        "ctrl" | "shift" | "c" | "e" | "l" | "m" | "o" | "v" | "w" | "x"
+                        "ctrl"
+                            | "shift"
+                            | "c"
+                            | "e"
+                            | "l"
+                            | "m"
+                            | "o"
+                            | "ret"
+                            | "v"
+                            | "w"
+                            | "x"
                     )
                 })
         {
@@ -4844,7 +4908,7 @@ mod tests {
                 .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut commands = Vec::new();
-            for _ in 0..28 {
+            for _ in 0..30 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 commands.push(line.trim_end().to_string());
@@ -4892,6 +4956,10 @@ mod tests {
         evidence.td_firefox_clipboard_retry = true;
         controller.progress(&evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteRetried);
+        evidence.td_firefox_clipboard = true;
+        evidence.td_firefox_download_armed = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxDownload);
 
         let commands = server.join().unwrap();
         assert_eq!(commands.first().unwrap(), r#"{"execute":"qmp_capabilities"}"#);
@@ -4921,6 +4989,27 @@ mod tests {
         assert!(commands.get(25).unwrap().contains("\"data\":\"shift\""));
         assert!(commands.get(26).unwrap().contains("\"data\":\"v\""));
         assert!(commands.get(27).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(28).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(29).unwrap().contains("\"data\":\"shift\""));
+    }
+
+    #[test]
+    fn firefox_download_accepts_either_bounded_paste_path() {
+        let mut evidence = ConsoleEvidence::default();
+        evidence.td_firefox_clipboard = true;
+        evidence.td_firefox_download_armed = true;
+        assert!(download_is_armed(
+            PhysicalInputPhase::FirefoxPaste,
+            &evidence
+        ));
+        assert!(download_is_armed(
+            PhysicalInputPhase::FirefoxPasteRetried,
+            &evidence
+        ));
+        assert!(!download_is_armed(
+            PhysicalInputPhase::FirefoxPasteArm,
+            &evidence
+        ));
     }
 
     #[test]
@@ -5000,6 +5089,7 @@ mod tests {
 
     #[test]
     fn firefox_input_wire_constants_match_the_standalone_producers() {
+        const DOWNLOAD: &[u8] = b"TD-FIREFOX-DOWNLOAD-V1\n";
         let firefox = include_str!("../../../../../td-jail/src/firefox.rs");
         for marker in [
             TD_FIREFOX_INPUT_ARMED_MARKER,
@@ -5020,6 +5110,31 @@ mod tests {
         assert!(firefox.contains(&format!(
             "const INPUT_CLIPBOARD_PUBLIC_RETRY: &str = \"{TD_FIREFOX_CLIPBOARD_RETRY_MARKER}\";"
         )));
+        assert!(firefox.contains(&format!(
+            "const INPUT_DOWNLOAD_PUBLIC_ARMED: &str = \"{TD_FIREFOX_DOWNLOAD_ARMED_MARKER}\";"
+        )));
+        assert!(firefox.contains("DOWNLOAD_DIRECTORY: &str = \"/var/home/tester/Downloads\""));
+        assert!(firefox.contains("DOWNLOAD_NAME: &str = \"td-firefox-download.txt\""));
+        assert!(firefox.contains(
+            "const expected = \"https://localhost:8443/download.txt\";"
+        ));
+        assert!(firefox.contains("DOWNLOAD_BYTES: &[u8] = b\"TD-FIREFOX-DOWNLOAD-V1\\n\""));
+        assert!(firefox.contains("\"TD-FIREFOX-DOWNLOAD-OK bytes={}\""));
+        assert_eq!(
+            TD_FIREFOX_DOWNLOAD_MARKER,
+            format!("TD-FIREFOX-DOWNLOAD-OK bytes={}", DOWNLOAD.len())
+        );
+        let system = include_str!("../../../recipes/system-x86-64.rs");
+        assert!(system.contains(
+            "const FIREFOX_DOWNLOAD_FIXTURE: &str = \"TD-FIREFOX-DOWNLOAD-V1\";"
+        ));
+        assert!(system.contains(
+            "const FIREFOX_DOWNLOAD_SOURCE: &str = \"/var/home/tester/Downloads\";"
+        ));
+        assert!(system.contains("https://localhost:8443/content.html"));
+        assert!(system.contains("<a id=td-download href=download.txt "));
+        assert!(system.contains("download=td-firefox-download.txt>Download</a>"));
+        assert!(system.contains("/var/home/tester/Downloads/td-firefox-download.txt"));
         let terminal = include_str!("../../../../../td-compositor/src/term_client.rs");
         assert!(terminal.contains("TD-TERM-CLIPBOARD-TARGET-READY"));
         assert!(terminal.contains("TD-TERM-CLIPBOARD-FOCUS-READY"));
@@ -5992,6 +6107,32 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_firefox_clipboard);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_DOWNLOAD_ARMED_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_download_armed);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_DOWNLOAD_ARMED_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_download_armed);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_DOWNLOAD_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_download);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_DOWNLOAD_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_download);
     }
 
     #[test]

@@ -588,7 +588,11 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// slower of that 315-second service and the 700-second network service, then the
 /// clamped 760-second health loop and the diagnostic margin. The tenth Codex block
 /// restores the former 70-second host margin at the value below.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2010;
+///
+/// The Firefox download proof adds a 40-second one-shot browser boundary and a
+/// separate 20-second asynchronous file-observation window. Raising this by 45
+/// seconds keeps the host beyond both guest bounds and their diagnostic margin.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2055;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// The source release identities and exact `--version` output shared by the
@@ -868,6 +872,8 @@ pub const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str =
 pub const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str = "TD-FIREFOX-CLIPBOARD-RETRY-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_MARKER: &str = "TD-FIREFOX-CLIPBOARD-OK";
+pub const TD_FIREFOX_DOWNLOAD_ARMED_MARKER: &str = "TD-FIREFOX-DOWNLOAD-ARMED";
+pub const TD_FIREFOX_DOWNLOAD_MARKER: &str = "TD-FIREFOX-DOWNLOAD-OK bytes=23";
 /// Selects the physical-input oracle without changing an ordinary Firefox boot.
 pub const FIREFOX_INPUT_CMDLINE_TOKEN: &str = "td.firefox-input=1";
 /// Must match the compositor's independently pinned client-cursor dimension cap.
