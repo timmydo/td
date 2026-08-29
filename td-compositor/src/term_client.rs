@@ -21,7 +21,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
@@ -45,6 +45,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// disagreement between them is what `current_account` refuses on.
 const PROC_STATUS: &str = "/proc/self/status";
 const ETC_PASSWD: &str = "/etc/passwd";
+const PROC_CMDLINE: &str = "/proc/cmdline";
+const MAX_CMDLINE_BYTES: usize = 4096;
+const CLIPBOARD_PROOF_CMDLINE_TOKEN: &[u8] = b"td.firefox-input=1";
 
 /// The two fixed objects only td-term creates. Object-id policy is per client,
 /// so these follow the common fixed terminal objects without depending on the
@@ -75,6 +78,9 @@ const CLIPBOARD_MIME_TYPES: [&str; 3] = [
     "text/plain",
     "UTF8_STRING",
 ];
+const CLIPBOARD_PROOF_BYTES: &[u8; 7] = b"Welcome";
+const CLIPBOARD_TARGET_PREFIX: &str = "TD-TERM-CLIPBOARD-TARGET-READY";
+const CLIPBOARD_FOCUS_PREFIX: &str = "TD-TERM-CLIPBOARD-FOCUS-READY serial=";
 
 /// What an operator sees in a title bar. td's own compositor now KEEPS this
 /// rather than discarding it, so it is the name this window will carry.
@@ -399,6 +405,12 @@ struct Surface {
     pending_key: Option<(u16, bool)>,
     pending_copy: Option<u32>,
     pending_clipboard_marker: Option<usize>,
+    pending_clipboard_focus_marker: Option<u32>,
+    clipboard_focus_pending: Option<u32>,
+    reported_clipboard_focus: bool,
+    reported_clipboard_target: Option<(u16, u16, u16, u16)>,
+    reported_clipboard_selection: bool,
+    clipboard_proof: bool,
     clipboard: ClipboardState,
     /// td-term's scrollback viewport: which line is being looked at, not a
     /// distance from a bottom that moves.
@@ -449,6 +461,12 @@ impl Surface {
             pending_key: None,
             pending_copy: None,
             pending_clipboard_marker: None,
+            pending_clipboard_focus_marker: None,
+            clipboard_focus_pending: None,
+            reported_clipboard_focus: false,
+            reported_clipboard_target: None,
+            reported_clipboard_selection: false,
+            clipboard_proof: false,
             clipboard: ClipboardState::new(),
             viewport: keys::Viewport::new(),
             history: keys::Scrollback::default(),
@@ -457,6 +475,11 @@ impl Surface {
             live_callbacks: BTreeSet::new(),
             frame: None,
         }
+    }
+
+    fn enable_clipboard_proof(&mut self) {
+        self.clipboard_proof = true;
+        self.repeat = keys::Repeat::disabled();
     }
 
     /// Handle one event. `Ok(true)` means a configure completed, so the
@@ -590,7 +613,7 @@ impl Surface {
                 // client does not own is a compositor confusing it with
                 // another client.
                 1 => {
-                    args.u32()?;
+                    let serial = args.u32()?;
                     let surface = args.u32()?;
                     if surface != SURFACE {
                         return Err(format!("wl_keyboard entered unexpected surface {surface}"));
@@ -606,6 +629,9 @@ impl Surface {
                         args.u32()?;
                     }
                     args.finish()?;
+                    if self.clipboard_proof && !self.reported_clipboard_focus {
+                        self.clipboard_focus_pending = Some(serial);
+                    }
                 }
                 2 => {
                     args.u32()?;
@@ -622,6 +648,8 @@ impl Surface {
                     // cost of not keeping it is a word.
                     self.modifiers = 0;
                     self.repeat.cancel();
+                    self.clipboard_focus_pending = None;
+                    self.reported_clipboard_focus = false;
                 }
                 // key: serial, time, key, state.
                 3 => {
@@ -686,6 +714,10 @@ impl Surface {
                         self.repeat.cancel();
                     }
                     self.modifiers = folded;
+                    if let Some(serial) = self.clipboard_focus_pending.take() {
+                        self.reported_clipboard_focus = true;
+                        self.pending_clipboard_focus_marker = Some(serial);
+                    }
                 }
                 // repeat_info: rate and delay, the version-4 event §11's
                 // repeat design reads its timings out of. Parsed and dropped
@@ -696,7 +728,9 @@ impl Surface {
                     let rate = args.i32()?;
                     let delay = args.i32()?;
                     args.finish()?;
-                    self.repeat.retime(&repeat_from(rate, delay));
+                    if !self.clipboard_proof {
+                        self.repeat.retime(&repeat_from(rate, delay));
+                    }
                 }
                 _ => {
                     return Err(format!(
@@ -907,6 +941,7 @@ impl Surface {
             args.finish()?;
             if self.clipboard.current == Some(source)
                 && self.clipboard.sources.contains_key(&source)
+                && self.clipboard_proof
             {
                 self.pending_clipboard_marker = Some(bytes);
             }
@@ -1170,6 +1205,62 @@ impl Surface {
         }
     }
 
+    fn clipboard_target_marker(
+        &mut self,
+        terminal: &Terminal,
+    ) -> Result<Option<String>, String> {
+        if !self.clipboard_proof
+            || self.stale
+            || !self.ready()
+            || self.viewport.offset(terminal.scrollback()) != 0
+        {
+            return Ok(None);
+        }
+        let Some((row, column)) = clipboard_target(terminal) else {
+            return Ok(None);
+        };
+        let (rows, columns) = self
+            .cells
+            .ok_or_else(|| "terminal clipboard target has no grid".to_string())?;
+        let row = u16::try_from(row)
+            .map_err(|_| "terminal clipboard target row escaped u16".to_string())?;
+        let column = u16::try_from(column)
+            .map_err(|_| "terminal clipboard target column escaped u16".to_string())?;
+        let target = (rows, columns, row, column);
+        if self.reported_clipboard_target == Some(target) {
+            return Ok(None);
+        }
+        self.reported_clipboard_target = Some(target);
+        Ok(Some(format!(
+            "{CLIPBOARD_TARGET_PREFIX} rows={rows} columns={columns} row={row} column={column} bytes={}\n",
+            CLIPBOARD_PROOF_BYTES.len()
+        )))
+    }
+
+    fn clipboard_selection_marker(
+        &mut self,
+        terminal: &Terminal,
+    ) -> Result<Option<String>, String> {
+        if !self.clipboard_proof
+            || self.reported_clipboard_selection
+            || self.stale
+            || !self.ready()
+        {
+            return Ok(None);
+        }
+        let Some(selected) = self.selected_text(terminal)? else {
+            return Ok(None);
+        };
+        if selected.as_slice() != CLIPBOARD_PROOF_BYTES {
+            return Ok(None);
+        }
+        self.reported_clipboard_selection = true;
+        Ok(Some(format!(
+            "TD-TERM-CLIPBOARD-SELECTION-READY bytes={}",
+            CLIPBOARD_PROOF_BYTES.len()
+        )))
+    }
+
     fn own_selection(
         &mut self,
         connection: &mut Connection,
@@ -1285,6 +1376,21 @@ impl Surface {
             width != 0 || height != 0,
         ))
     }
+}
+
+fn clipboard_target(terminal: &Terminal) -> Option<(usize, usize)> {
+    let last_start = terminal.columns().checked_sub(CLIPBOARD_PROOF_BYTES.len())?;
+    for row in 0..terminal.rows() {
+        for column in 0..=last_start {
+            if CLIPBOARD_PROOF_BYTES.iter().enumerate().all(|(offset, expected)| {
+                terminal.cell(row, column.saturating_add(offset)).map(|cell| cell.scalar)
+                    == Some(char::from(*expected))
+            }) {
+                return Some((row, column));
+            }
+        }
+    }
+    None
 }
 
 /// What a compositor-supplied size must satisfy before ANYTHING is allocated
@@ -1617,18 +1723,43 @@ struct Child {
 
 struct ClipboardWrite {
     file: File,
+    mime_type: String,
     payload: Arc<[u8]>,
 }
 
-fn spawn_clipboard_writer() -> Result<(SyncSender<ClipboardWrite>, JoinHandle<()>), String> {
+fn clipboard_sent_marker(enabled: bool, payload: &[u8]) -> Option<String> {
+    (enabled && payload == CLIPBOARD_PROOF_BYTES).then(|| {
+        format!(
+            "TD-TERM-CLIPBOARD-SENT bytes={}\n",
+            CLIPBOARD_PROOF_BYTES.len()
+        )
+    })
+}
+
+fn spawn_clipboard_writer(
+    clipboard_proof: bool,
+) -> Result<(SyncSender<ClipboardWrite>, JoinHandle<()>), String> {
     let (sender, writes) = sync_channel::<ClipboardWrite>(MAX_CLIPBOARD_WRITES);
     let thread = thread::Builder::new()
         .name("td-term-clipboard".into())
         .spawn(move || {
             while let Ok(mut write) = writes.recv() {
-                if let Err(error) = conn::write_clipboard(&mut write.file, &write.payload) {
-                    let line = format!("td-term: {error}\n");
-                    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+                match conn::write_clipboard(&mut write.file, &write.payload) {
+                    Ok(()) => {
+                        let detail = format!(
+                            "td-term: clipboard sent mime={} bytes={}\n",
+                            write.mime_type,
+                            write.payload.len()
+                        );
+                        let _ = std::io::stderr().lock().write_all(detail.as_bytes());
+                        if let Some(marker) = clipboard_sent_marker(clipboard_proof, &write.payload) {
+                            let _ = std::io::stderr().lock().write_all(marker.as_bytes());
+                        }
+                    }
+                    Err(error) => {
+                        let line = format!("td-term: {error}\n");
+                        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+                    }
                 }
                 // Closing the endpoint is the transfer delimiter. `File`
                 // drops here before the next bounded write.
@@ -1703,7 +1834,11 @@ fn spawn_wayland_reader(
                                 return;
                             }
                             if CLIPBOARD_MIME_TYPES.contains(&mime_type.as_str()) {
-                                match clipboard.try_send(ClipboardWrite { file, payload }) {
+                                match clipboard.try_send(ClipboardWrite {
+                                    file,
+                                    mime_type,
+                                    payload,
+                                }) {
                                     Ok(()) | Err(TrySendError::Full(_)) => {}
                                     Err(TrySendError::Disconnected(_)) => {
                                         let _ = events.send(Event::Closed(
@@ -1923,6 +2058,14 @@ fn serve_event(
                     }
                 }
             }
+            if let Some(serial) = surface.pending_clipboard_focus_marker.take() {
+                let mut out = std::io::stdout().lock();
+                let marker = format!("{CLIPBOARD_FOCUS_PREFIX}{serial}\n");
+                out.write_all(marker.as_bytes())
+                    .map_err(|e| format!("write terminal clipboard focus marker: {e}"))?;
+                out.flush()
+                    .map_err(|e| format!("flush terminal clipboard focus marker: {e}"))?;
+            }
             if let Some(bytes) = surface.pending_clipboard_marker.take() {
                 let marker = format!("TD-TERM-CLIPBOARD-READY bytes={bytes}\n");
                 let mut out = std::io::stdout().lock();
@@ -1977,7 +2120,25 @@ fn serve_event(
     if let (true, Some(status)) = (child.drained, child.status) {
         return Err(ended(status));
     }
-    settle(connection, surface, model, session)
+    settle(connection, surface, model, session)?;
+    if let Some(terminal) = model.as_ref() {
+        if let Some(marker) = surface.clipboard_target_marker(terminal)? {
+            let mut out = std::io::stdout().lock();
+            out.write_all(marker.as_bytes())
+                .map_err(|e| format!("write terminal clipboard target marker: {e}"))?;
+            out.flush()
+                .map_err(|e| format!("flush terminal clipboard target marker: {e}"))?;
+        }
+        if let Some(marker) = surface.clipboard_selection_marker(terminal)? {
+            let mut out = std::io::stdout().lock();
+            out.write_all(marker.as_bytes())
+                .and_then(|()| out.write_all(b"\n"))
+                .map_err(|e| format!("write terminal clipboard selection marker: {e}"))?;
+            out.flush()
+                .map_err(|e| format!("flush terminal clipboard selection marker: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Put on screen whatever the turn just changed. Extracted because a
@@ -2261,7 +2422,32 @@ pub fn prepare_for_test(
     Ok((connection, prepared))
 }
 
+fn cmdline_has_clipboard_proof(bytes: &[u8]) -> bool {
+    bytes
+        .split(u8::is_ascii_whitespace)
+        .any(|word| word == CLIPBOARD_PROOF_CMDLINE_TOKEN)
+}
+
+fn clipboard_proof_enabled(path: &Path) -> Result<bool, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("open terminal proof authority {}: {error}", path.display()))?;
+    let limit = u64::try_from(MAX_CMDLINE_BYTES.saturating_add(1))
+        .map_err(|_| "terminal command-line limit escaped u64".to_string())?;
+    let mut bytes = Vec::with_capacity(MAX_CMDLINE_BYTES.saturating_add(1));
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read terminal proof authority {}: {error}", path.display()))?;
+    if bytes.len() > MAX_CMDLINE_BYTES {
+        return Err(format!(
+            "terminal proof authority {} exceeded {MAX_CMDLINE_BYTES} bytes",
+            path.display()
+        ));
+    }
+    Ok(cmdline_has_clipboard_proof(&bytes))
+}
+
 pub fn run(options: &Options) -> Result<(), String> {
+    let clipboard_proof = clipboard_proof_enabled(Path::new(PROC_CMDLINE))?;
     let runtime_directory = options
         .socket
         .parent()
@@ -2286,6 +2472,9 @@ pub fn run(options: &Options) -> Result<(), String> {
         &palette,
         Path::new(pty::DEV_PTMX),
     )?;
+    if clipboard_proof {
+        surface.enable_clipboard_proof();
+    }
     // The PTY lives as long as the loop below: the slave the child will be
     // given is allocated from this master, and every later configure resizes
     // it. The model lives that long for the stronger reason — it is the
@@ -2304,7 +2493,7 @@ pub fn run(options: &Options) -> Result<(), String> {
     // that accepted the socket only to watch the terminal exit would have
     // been told something true for less than a second.
     let sources = surface.source_registry();
-    let (clipboard, _clipboard_writer) = spawn_clipboard_writer()?;
+    let (clipboard, _clipboard_writer) = spawn_clipboard_writer(clipboard_proof)?;
     let reader = connection.detach_reader()?;
     let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
     let _wayland = spawn_wayland_reader(reader, sender.clone(), sources, clipboard)?;
@@ -2584,6 +2773,135 @@ mod tests {
             extent: (0, 0),
         });
         assert_eq!(surface.selected_text(&blank).unwrap(), None);
+    }
+
+    #[test]
+    fn clipboard_target_is_reported_only_after_its_frame_is_visible() {
+        let mut terminal = Terminal::new(2, 12).unwrap();
+        terminal.feed(b"  Welcome   next");
+        assert_eq!(clipboard_target(&terminal), Some((0, 2)));
+
+        let mut surface = test_surface();
+        let size = Size { width: 96, height: 32 };
+        surface.current = Some(size);
+        surface.activated = true;
+        surface.drawn = Some(Drawn { size, activated: true });
+        surface.layout_configured = true;
+        surface.cells = Some((2, 12));
+        surface.frame = Some(Frame {
+            buffer: 100,
+            callback: 101,
+            released: true,
+            presented: true,
+        });
+        surface.stale = true;
+        assert_eq!(surface.clipboard_target_marker(&terminal).unwrap(), None);
+
+        surface.stale = false;
+        assert_eq!(surface.clipboard_target_marker(&terminal).unwrap(), None);
+        surface.enable_clipboard_proof();
+        let mut scrolled_terminal = Terminal::new(1, 12).unwrap();
+        scrolled_terminal.feed(b"old\r\n  Welcome");
+        surface.history = scrolled_terminal.scrollback();
+        surface.viewport.by_lines(1, surface.history);
+        assert_eq!(surface.clipboard_target_marker(&scrolled_terminal).unwrap(), None);
+        surface.viewport = keys::Viewport::new();
+        assert_eq!(
+            surface.clipboard_target_marker(&terminal).unwrap().as_deref(),
+            Some(
+                "TD-TERM-CLIPBOARD-TARGET-READY rows=2 columns=12 row=0 column=2 bytes=7\n"
+            )
+        );
+        assert_eq!(surface.clipboard_target_marker(&terminal).unwrap(), None);
+
+        surface.selection = Some(render::Selection {
+            anchor: (0, 2),
+            extent: (0, 8),
+        });
+        surface.stale = true;
+        assert_eq!(surface.clipboard_selection_marker(&terminal).unwrap(), None);
+        surface.stale = false;
+        assert_eq!(
+            surface.clipboard_selection_marker(&terminal).unwrap().as_deref(),
+            Some("TD-TERM-CLIPBOARD-SELECTION-READY bytes=7")
+        );
+        assert_eq!(surface.clipboard_selection_marker(&terminal).unwrap(), None);
+    }
+
+    #[test]
+    fn clipboard_proof_authority_is_exact_and_bounded() {
+        assert!(cmdline_has_clipboard_proof(
+            b"quiet td.firefox-input=1 console=ttyS0"
+        ));
+        for rejected in [
+            b"td.firefox-input=10".as_slice(),
+            b"x-td.firefox-input=1".as_slice(),
+            b"td.firefox-input=1-suffix".as_slice(),
+            b"td.autotest=1".as_slice(),
+        ] {
+            assert!(!cmdline_has_clipboard_proof(rejected));
+        }
+        let path = std::env::temp_dir().join(format!(
+            "td-term-clipboard-proof-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"quiet td.firefox-input=1").unwrap();
+        assert!(clipboard_proof_enabled(&path).unwrap());
+        std::fs::write(&path, vec![b'x'; MAX_CMDLINE_BYTES + 1]).unwrap();
+        assert!(clipboard_proof_enabled(&path).unwrap_err().contains("exceeded"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_focus_marker_follows_enter_modifiers_handshake() {
+        let (mut connection, _peer) = pair();
+        let fallback = Size { width: 8, height: 8 };
+        let mut surface = test_surface();
+        surface.enable_clipboard_proof();
+        surface
+            .dispatch(
+                &mut connection,
+                &words_message(KEYBOARD, 1, &[1, SURFACE, 0]),
+                fallback,
+            )
+            .unwrap();
+        assert_eq!(surface.clipboard_focus_pending, Some(1));
+        assert_eq!(surface.pending_clipboard_focus_marker, None);
+        surface
+            .dispatch(
+                &mut connection,
+                &words_message(KEYBOARD, 4, &[2, 0, 0, 0, 0]),
+                fallback,
+            )
+            .unwrap();
+        assert_eq!(surface.clipboard_focus_pending, None);
+        assert_eq!(surface.pending_clipboard_focus_marker, Some(1));
+        assert!(surface.reported_clipboard_focus);
+
+        surface.pending_clipboard_focus_marker = None;
+        surface
+            .dispatch(
+                &mut connection,
+                &words_message(KEYBOARD, 2, &[3, SURFACE]),
+                fallback,
+            )
+            .unwrap();
+        surface
+            .dispatch(
+                &mut connection,
+                &words_message(KEYBOARD, 1, &[4, SURFACE, 0]),
+                fallback,
+            )
+            .unwrap();
+        surface
+            .dispatch(
+                &mut connection,
+                &words_message(KEYBOARD, 4, &[5, 0, 0, 0, 0]),
+                fallback,
+            )
+            .unwrap();
+        assert_eq!(surface.pending_clipboard_focus_marker, Some(4));
     }
 
     #[test]
@@ -2998,6 +3316,7 @@ mod tests {
     fn copy_owns_three_text_mimes_and_waits_for_the_server_sync() {
         let (mut connection, mut peer) = pair();
         let mut surface = test_surface();
+        surface.enable_clipboard_proof();
         assert!(surface
             .own_selection(&mut connection, 77, b"Welcome".to_vec())
             .unwrap());
@@ -3052,6 +3371,18 @@ mod tests {
     }
 
     #[test]
+    fn transfer_marker_is_reserved_for_the_exact_image_proof_payload() {
+        assert_eq!(
+            clipboard_sent_marker(true, b"Welcome").as_deref(),
+            Some("TD-TERM-CLIPBOARD-SENT bytes=7\n")
+        );
+        assert_eq!(clipboard_sent_marker(false, b"Welcome"), None);
+        assert_eq!(clipboard_sent_marker(true, b"welcome"), None);
+        assert_eq!(clipboard_sent_marker(true, b"1234567"), None);
+        assert_eq!(clipboard_sent_marker(true, b"Welcome\n"), None);
+    }
+
+    #[test]
     fn reader_writes_a_selection_through_the_exact_socket_endpoint() {
         use std::os::fd::OwnedFd;
 
@@ -3063,7 +3394,7 @@ mod tests {
             source,
             Arc::<[u8]>::from(&b"Welcome"[..]),
         )])));
-        let (clipboard, writer) = spawn_clipboard_writer().unwrap();
+        let (clipboard, writer) = spawn_clipboard_writer(true).unwrap();
         let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
         let wayland = spawn_wayland_reader(reader, sender, sources, clipboard).unwrap();
 
@@ -4277,7 +4608,7 @@ mod tests {
         write_event(&mut theirs, &surface_configure(5));
         let reader = connection.detach_reader().unwrap();
         let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
-        let (clipboard, _writer) = spawn_clipboard_writer().unwrap();
+        let (clipboard, _writer) = spawn_clipboard_writer(false).unwrap();
         let thread = spawn_wayland_reader(
             reader,
             sender,
@@ -4305,7 +4636,7 @@ mod tests {
         write_event(&mut theirs, &surface_configure(4));
         let reader = connection.detach_reader().unwrap();
         let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
-        let (clipboard, _writer) = spawn_clipboard_writer().unwrap();
+        let (clipboard, _writer) = spawn_clipboard_writer(false).unwrap();
         let thread = spawn_wayland_reader(
             reader,
             sender,

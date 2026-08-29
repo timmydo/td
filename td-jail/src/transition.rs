@@ -754,7 +754,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, or --probe-firefox-input arm|menu|final; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard; installed applications are selected by argv[0]",
     )
 }
 
@@ -3378,7 +3378,9 @@ pub fn probe_firefox_input(stage: firefox::InputStage) -> io::Result<()> {
             "the Firefox input probe requires the nonzero application identity",
         ));
     }
-    writeln!(io::stdout(), "{}", firefox::probe_input(stage)?)
+    let mut stdout = io::stdout().lock();
+    let marker = firefox::probe_input(stage, &mut stdout)?;
+    writeln!(stdout, "{marker}")
 }
 
 pub fn run_cgroup_cleanup_bootstrap(membership: &str) -> io::Result<()> {
@@ -4965,6 +4967,15 @@ mod tests {
             ("arm", firefox::InputStage::Arm),
             ("menu", firefox::InputStage::Menu),
             ("final", firefox::InputStage::Final),
+            (
+                "clipboard-refocus-arm",
+                firefox::InputStage::ClipboardRefocusArm,
+            ),
+            (
+                "clipboard-refocus",
+                firefox::InputStage::ClipboardRefocus,
+            ),
+            ("clipboard", firefox::InputStage::Clipboard),
         ] {
             assert_eq!(
                 parse_mode(args(&[FIREFOX_INPUT_PROBE_ARG, name])).unwrap(),

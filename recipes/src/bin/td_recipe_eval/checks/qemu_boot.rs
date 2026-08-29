@@ -126,6 +126,23 @@ const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MA
 const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_ARMED_MARKER;
 const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MENU_MARKER;
 const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MARKER;
+const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str =
+    td_recipe::ladder::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
+const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str =
+    td_recipe::ladder::TD_TERM_CLIPBOARD_TARGET_PREFIX;
+const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str =
+    td_recipe::ladder::TD_TERM_CLIPBOARD_SELECTION_MARKER;
+const TD_TERM_CLIPBOARD_MARKER: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_MARKER;
+const TD_TERM_CLIPBOARD_SENT_MARKER: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_SENT_MARKER;
+const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER;
+const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER;
+const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_ARMED_MARKER;
+const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_RETRY_MARKER;
+const TD_FIREFOX_CLIPBOARD_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CLIPBOARD_MARKER;
 const TD_APPLICATION_CURSOR_PREFIX: &str =
     "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
 const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_INPUT_CMDLINE_TOKEN;
@@ -231,6 +248,17 @@ const POLL: Duration = Duration::from_millis(200);
 const QMP_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_QMP_LINE_BYTES: usize = 64 * 1024;
 const MAX_QMP_RESPONSE_LINES: usize = 32;
+const QMP_ABSOLUTE_EXTENT: u32 = 32_768;
+const QMP_OUTPUT_WIDTH: u32 = 1_280;
+const QMP_OUTPUT_HEIGHT: u32 = 800;
+const TERMINAL_CONTENT_X: u32 = 24;
+const TERMINAL_CONTENT_Y: u32 = 68;
+const TERMINAL_CELL_WIDTH: u32 = 8;
+const TERMINAL_CELL_HEIGHT: u32 = 16;
+const TERMINAL_ROWS: u16 = 44;
+const TERMINAL_COLUMNS: u16 = 75;
+const TERMINAL_CLIPBOARD_TEXT: &[u8; 7] = b"Welcome";
+const TERMINAL_CLIPBOARD_CELLS: u16 = TERMINAL_CLIPBOARD_TEXT.len() as u16;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 
 /// Cap on retained console/diagnostic bytes. The console is scanned incrementally
@@ -317,6 +345,16 @@ struct ConsoleEvidence {
     td_firefox_input_armed: bool,
     td_firefox_input_menu: bool,
     td_firefox_input: bool,
+    td_term_clipboard_focus: Option<u32>,
+    td_term_clipboard_target: Option<TerminalClipboardTarget>,
+    td_term_clipboard_selection: bool,
+    td_term_clipboard: bool,
+    td_term_clipboard_sent: bool,
+    td_firefox_clipboard_refocus_armed: bool,
+    td_firefox_clipboard_window_armed: bool,
+    td_firefox_clipboard_armed: bool,
+    td_firefox_clipboard_retry: bool,
+    td_firefox_clipboard: bool,
     td_application_cursor: bool,
     td_profiler_attribution: bool,
     td_wayland_runtime: bool,
@@ -334,6 +372,12 @@ struct ConsoleEvidence {
     git_https: bool,
     kexec_stage1: bool,
     kernel_panic: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalClipboardTarget {
+    row: u16,
+    column: u16,
 }
 
 struct BootResult {
@@ -939,7 +983,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          input, wheel scrolling and a native context menu into the jailed browser \
          ({TD_FIREFOX_INPUT_MENU_MARKER}), observed Firefox's bounded client-owned cursor \
          ({TD_APPLICATION_CURSOR_PREFIX}), and dismissed the menu with an outside click \
-         ({TD_FIREFOX_INPUT_MARKER}), \
+         ({TD_FIREFOX_INPUT_MARKER}), waited for td-term's keyboard-focus acknowledgement \
+         ({TD_TERM_CLIPBOARD_FOCUS_PREFIX}), then physically typed and visibly settled an exact \
+         seven-byte terminal word ({TD_TERM_CLIPBOARD_TARGET_PREFIX}), selected its visibly \
+         settled cells ({TD_TERM_CLIPBOARD_SELECTION_MARKER}), published it through Wayland \
+         core selection ({TD_TERM_CLIPBOARD_MARKER}), and pasted it into Firefox's URL bar \
+         ({TD_FIREFOX_CLIPBOARD_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1081,6 +1130,51 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
             result.evidence.td_firefox_input,
             TD_FIREFOX_INPUT_MARKER,
             "the outside click did not dismiss Firefox's native context menu",
+        ),
+        (
+            result.evidence.td_term_clipboard_focus.is_some(),
+            TD_TERM_CLIPBOARD_FOCUS_PREFIX,
+            "td-term did not acknowledge keyboard focus before physical typing",
+        ),
+        (
+            result.evidence.td_term_clipboard_target.is_some(),
+            TD_TERM_CLIPBOARD_TARGET_PREFIX,
+            "td-term did not render the physically typed clipboard target",
+        ),
+        (
+            result.evidence.td_term_clipboard_selection,
+            TD_TERM_CLIPBOARD_SELECTION_MARKER,
+            "td-term did not visibly settle the exact seven-byte selection",
+        ),
+        (
+            result.evidence.td_term_clipboard,
+            TD_TERM_CLIPBOARD_MARKER,
+            "td-term did not own the exact seven-byte prompt selection",
+        ),
+        (
+            result.evidence.td_firefox_clipboard_refocus_armed,
+            TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER,
+            "Firefox did not arm the post-terminal refocus listener",
+        ),
+        (
+            result.evidence.td_firefox_clipboard_window_armed,
+            TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER,
+            "Firefox did not regain active-window focus before Control+L",
+        ),
+        (
+            result.evidence.td_firefox_clipboard_armed,
+            TD_FIREFOX_CLIPBOARD_ARMED_MARKER,
+            "Firefox did not focus its URL bar before the physical paste",
+        ),
+        (
+            result.evidence.td_firefox_clipboard,
+            TD_FIREFOX_CLIPBOARD_MARKER,
+            "Firefox did not receive the terminal selection in its URL bar",
+        ),
+        (
+            result.evidence.td_term_clipboard_sent,
+            TD_TERM_CLIPBOARD_SENT_MARKER,
+            "td-term did not write the exact selection to Firefox's transfer endpoint",
         ),
     ] {
         if !seen {
@@ -3345,9 +3439,11 @@ fn drain_console(
                     let prior_len = buf.len();
                     buf.extend_from_slice(slice);
                     drained += n;
-                    let scan_from = prior_len.saturating_sub(overlap);
+                    let scan_from = prior_len
+                        .saturating_sub(overlap)
+                        .saturating_sub(1);
                     let scan = buf.get(scan_from..).unwrap_or(buf.as_slice());
-                    latch_console_evidence(evidence, scan, marker);
+                    latch_console_evidence_from(evidence, scan, marker, scan_from == 0);
                     if buf.len() > CAP {
                         let drop = buf.len() - CAP;
                         buf.drain(..drop);
@@ -3427,6 +3523,16 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FIREFOX_INPUT_ARMED_MARKER),
         exact_line_window(TD_FIREFOX_INPUT_MENU_MARKER),
         exact_line_window(TD_FIREFOX_INPUT_MARKER),
+        TD_TERM_CLIPBOARD_FOCUS_PREFIX.len().saturating_add(12),
+        TD_TERM_CLIPBOARD_TARGET_PREFIX.len().saturating_add(96),
+        exact_line_window(TD_TERM_CLIPBOARD_SELECTION_MARKER),
+        exact_line_window(TD_TERM_CLIPBOARD_MARKER),
+        exact_line_window(TD_TERM_CLIPBOARD_SENT_MARKER),
+        exact_line_window(TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_CLIPBOARD_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_CLIPBOARD_RETRY_MARKER),
+        exact_line_window(TD_FIREFOX_CLIPBOARD_MARKER),
         TD_APPLICATION_CURSOR_PREFIX.len().saturating_add(32),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
@@ -3455,7 +3561,17 @@ fn exact_line_window(marker: &str) -> usize {
     marker.len().saturating_add(3)
 }
 
+#[cfg(test)]
 fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[u8]) {
+    latch_console_evidence_from(evidence, buf, target, true);
+}
+
+fn latch_console_evidence_from(
+    evidence: &mut ConsoleEvidence,
+    buf: &[u8],
+    target: &[u8],
+    starts_at_stream_boundary: bool,
+) {
     latch_marker(&mut evidence.target, buf, target);
     latch_marker(&mut evidence.greeter, buf, GREETER_MARKER.as_bytes());
     latch_marker(
@@ -3598,43 +3714,113 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_jail_seccomp,
         buf,
         TD_JAIL_SECCOMP_PROBE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_line_marker(
         &mut evidence.td_firefox,
         buf,
         TD_FIREFOX_BOOT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_line_marker(
         &mut evidence.td_firefox_content,
         buf,
         TD_FIREFOX_CONTENT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_line_marker(
         &mut evidence.td_firefox_support,
         buf,
         TD_FIREFOX_SUPPORT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_line_marker(
         &mut evidence.td_firefox_input_armed,
         buf,
         TD_FIREFOX_INPUT_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_line_marker(
         &mut evidence.td_firefox_input_menu,
         buf,
         TD_FIREFOX_INPUT_MENU_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_line_marker(
         &mut evidence.td_firefox_input,
         buf,
         TD_FIREFOX_INPUT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
-    latch_application_cursor(&mut evidence.td_application_cursor, buf);
+    latch_terminal_clipboard_focus(
+        &mut evidence.td_term_clipboard_focus,
+        buf,
+        starts_at_stream_boundary,
+    );
+    latch_terminal_clipboard_target(
+        &mut evidence.td_term_clipboard_target,
+        buf,
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_term_clipboard_selection,
+        buf,
+        TD_TERM_CLIPBOARD_SELECTION_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_term_clipboard,
+        buf,
+        TD_TERM_CLIPBOARD_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_term_clipboard_sent,
+        buf,
+        TD_TERM_CLIPBOARD_SENT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_clipboard_refocus_armed,
+        buf,
+        TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_clipboard_window_armed,
+        buf,
+        TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_clipboard_armed,
+        buf,
+        TD_FIREFOX_CLIPBOARD_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_clipboard_retry,
+        buf,
+        TD_FIREFOX_CLIPBOARD_RETRY_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_clipboard,
+        buf,
+        TD_FIREFOX_CLIPBOARD_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_application_cursor(
+        &mut evidence.td_application_cursor,
+        buf,
+        starts_at_stream_boundary,
+    );
     latch_prefixed_line_marker(
         &mut evidence.td_profiler_attribution,
         buf,
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX.as_bytes(),
         TD_PROFILER_ATTRIBUTION_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_marker(
         &mut evidence.td_wayland_runtime,
@@ -3711,8 +3897,13 @@ fn latch_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
     }
 }
 
-fn latch_line_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
-    latch_prefixed_line_marker(found, haystack, b"", marker);
+fn latch_line_marker(
+    found: &mut bool,
+    haystack: &[u8],
+    marker: &[u8],
+    starts_at_stream_boundary: bool,
+) {
+    latch_prefixed_line_marker(found, haystack, b"", marker, starts_at_stream_boundary);
 }
 
 fn latch_prefixed_line_marker(
@@ -3720,12 +3911,15 @@ fn latch_prefixed_line_marker(
     haystack: &[u8],
     prefix: &[u8],
     marker: &[u8],
+    starts_at_stream_boundary: bool,
 ) {
     if *found {
         return;
     }
-    for start in 1..haystack.len() {
-        if haystack.get(start - 1) != Some(&b'\n') {
+    for start in 0..haystack.len() {
+        if (start != 0 || !starts_at_stream_boundary)
+            && haystack.get(start.wrapping_sub(1)) != Some(&b'\n')
+        {
             continue;
         }
         let Some(marker_at) = start.checked_add(prefix.len()) else {
@@ -3749,13 +3943,19 @@ fn latch_prefixed_line_marker(
     }
 }
 
-fn latch_application_cursor(found: &mut bool, haystack: &[u8]) {
+fn latch_application_cursor(
+    found: &mut bool,
+    haystack: &[u8],
+    starts_at_stream_boundary: bool,
+) {
     if *found {
         return;
     }
     let prefix = TD_APPLICATION_CURSOR_PREFIX.as_bytes();
-    for start in 1..haystack.len() {
-        if haystack.get(start.saturating_sub(1)) != Some(&b'\n') {
+    for start in 0..haystack.len() {
+        if (start != 0 || !starts_at_stream_boundary)
+            && haystack.get(start.wrapping_sub(1)) != Some(&b'\n')
+        {
             continue;
         }
         let Some(body_start) = start.checked_add(prefix.len()) else {
@@ -3792,6 +3992,117 @@ fn latch_application_cursor(found: &mut bool, haystack: &[u8]) {
         {
             *found = true;
             return;
+        }
+    }
+}
+
+fn latch_terminal_clipboard_focus(
+    found: &mut Option<u32>,
+    haystack: &[u8],
+    starts_at_stream_boundary: bool,
+) {
+    let prefix = TD_TERM_CLIPBOARD_FOCUS_PREFIX.as_bytes();
+    for start in 0..haystack.len() {
+        if (start != 0 || !starts_at_stream_boundary)
+            && haystack.get(start.wrapping_sub(1)) != Some(&b'\n')
+        {
+            continue;
+        }
+        let Some(body_start) = start.checked_add(prefix.len()) else {
+            return;
+        };
+        if haystack.get(start..body_start) != Some(prefix) {
+            continue;
+        }
+        let Some(rest) = haystack.get(body_start..) else {
+            continue;
+        };
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let body = rest.get(..end).unwrap_or_default();
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let Ok(text) = std::str::from_utf8(body) else {
+            continue;
+        };
+        let Some(serial) = text.parse::<u32>().ok().filter(|serial| *serial != 0) else {
+            continue;
+        };
+        if serial.to_string() == text {
+            *found = Some(serial);
+        }
+    }
+}
+
+fn latch_terminal_clipboard_target(
+    found: &mut Option<TerminalClipboardTarget>,
+    haystack: &[u8],
+    starts_at_stream_boundary: bool,
+) {
+    if found.is_some() {
+        return;
+    }
+    let prefix = TD_TERM_CLIPBOARD_TARGET_PREFIX.as_bytes();
+    for start in 0..haystack.len() {
+        if (start != 0 || !starts_at_stream_boundary)
+            && haystack.get(start.wrapping_sub(1)) != Some(&b'\n')
+        {
+            continue;
+        }
+        let Some(body_start) = start.checked_add(prefix.len()) else {
+            return;
+        };
+        if haystack.get(start..body_start) != Some(prefix) {
+            continue;
+        }
+        let Some(rest) = haystack.get(body_start..) else {
+            continue;
+        };
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let body = rest.get(..end).unwrap_or_default();
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let Ok(body) = std::str::from_utf8(body) else {
+            continue;
+        };
+        let fields: Vec<&str> = body.split(' ').collect();
+        let [rows, columns, row, column, bytes] = fields.as_slice() else {
+            continue;
+        };
+        let parsed = [
+            rows.strip_prefix("rows="),
+            columns.strip_prefix("columns="),
+            row.strip_prefix("row="),
+            column.strip_prefix("column="),
+            bytes.strip_prefix("bytes="),
+        ];
+        let Some(values) = parsed
+            .into_iter()
+            .map(|value| {
+                let text = value?;
+                let number = text.parse::<u16>().ok()?;
+                (number.to_string() == text).then_some(number)
+            })
+            .collect::<Option<Vec<u16>>>()
+        else {
+            continue;
+        };
+        let [rows, columns, row, column, bytes] = values.as_slice() else {
+            continue;
+        };
+        if *rows == TERMINAL_ROWS
+            && *columns == TERMINAL_COLUMNS
+            && *bytes == TERMINAL_CLIPBOARD_CELLS
+            && *row < *rows
+            && column
+                .checked_add(*bytes)
+                .is_some_and(|end| end <= *columns)
+        {
+            *found = Some(TerminalClipboardTarget {
+                row: *row,
+                column: *column,
+            });
         }
     }
 }
@@ -3940,12 +4251,61 @@ enum PhysicalInputPhase {
     Arm,
     Menu,
     Final,
+    TerminalPrepare,
+    TerminalSelection,
+    TerminalCopy,
+    FirefoxFocus,
+    FirefoxPasteArm,
+    FirefoxPaste,
+    FirefoxPasteRetried,
+}
+
+fn qmp_absolute_pixel(pixel: u32, extent: u32) -> Result<u16, String> {
+    if extent == 0 || pixel >= extent {
+        return Err(format!("QMP pixel {pixel} is outside extent {extent}"));
+    }
+    let scaled = pixel
+        .checked_mul(QMP_ABSOLUTE_EXTENT)
+        .ok_or_else(|| "QMP absolute coordinate overflow".to_string())?
+        .div_ceil(extent);
+    if scaled >= QMP_ABSOLUTE_EXTENT {
+        return Err(format!("QMP absolute coordinate {scaled} is outside its extent"));
+    }
+    u16::try_from(scaled).map_err(|_| "QMP absolute coordinate escaped u16".to_string())
+}
+
+fn terminal_clipboard_coordinates(
+    target: TerminalClipboardTarget,
+) -> Result<(u16, u16, u16), String> {
+    let end_column = target
+        .column
+        .checked_add(TERMINAL_CLIPBOARD_CELLS.saturating_sub(1))
+        .ok_or_else(|| "terminal clipboard column overflow".to_string())?;
+    if target.row >= TERMINAL_ROWS || end_column >= TERMINAL_COLUMNS {
+        return Err("terminal clipboard target escaped the fixed tile".to_string());
+    }
+    let center = |origin: u32, cell: u32, index: u16| {
+        u32::from(index)
+            .checked_mul(cell)
+            .and_then(|offset| origin.checked_add(offset))
+            .and_then(|edge| edge.checked_add(cell / 2))
+            .ok_or_else(|| "terminal clipboard pixel coordinate overflow".to_string())
+    };
+    let start_x = center(TERMINAL_CONTENT_X, TERMINAL_CELL_WIDTH, target.column)?;
+    let end_x = center(TERMINAL_CONTENT_X, TERMINAL_CELL_WIDTH, end_column)?;
+    let y = center(TERMINAL_CONTENT_Y, TERMINAL_CELL_HEIGHT, target.row)?;
+    Ok((
+        qmp_absolute_pixel(start_x, QMP_OUTPUT_WIDTH)?,
+        qmp_absolute_pixel(end_x, QMP_OUTPUT_WIDTH)?,
+        qmp_absolute_pixel(y, QMP_OUTPUT_HEIGHT)?,
+    ))
 }
 
 struct PhysicalInputController {
     path: PathBuf,
     qmp: Option<Qmp>,
     phase: PhysicalInputPhase,
+    terminal_focus_floor: Option<u32>,
 }
 
 impl PhysicalInputController {
@@ -3954,6 +4314,7 @@ impl PhysicalInputController {
             path,
             qmp: None,
             phase: PhysicalInputPhase::Arm,
+            terminal_focus_floor: None,
         }
     }
 
@@ -3974,6 +4335,7 @@ impl PhysicalInputController {
         }
         if self.phase == PhysicalInputPhase::Menu && evidence.td_firefox_input_menu {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            self.terminal_focus_floor = evidence.td_term_clipboard_focus;
             let qmp = self
                 .qmp
                 .as_mut()
@@ -3981,6 +4343,94 @@ impl PhysicalInputController {
             qmp.move_absolute_until(8_192, 16_384, deadline)?;
             qmp.button_until("left", deadline)?;
             self.phase = PhysicalInputPhase::Final;
+        }
+        if self.phase == PhysicalInputPhase::Final
+            && evidence.td_firefox_input
+            && evidence
+                .td_term_clipboard_focus
+                .is_some_and(|serial| Some(serial) != self.terminal_focus_floor)
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before terminal input".to_string())?;
+            qmp.key_chord_until(&["ctrl", "l"], deadline)?;
+            qmp.type_clipboard_target_until(deadline)?;
+            self.phase = PhysicalInputPhase::TerminalPrepare;
+        }
+        if self.phase == PhysicalInputPhase::TerminalPrepare {
+            let Some(target) = evidence.td_term_clipboard_target else {
+                return Ok(());
+            };
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before terminal copy".to_string())?;
+            let (start_x, end_x, y) = terminal_clipboard_coordinates(target)?;
+            qmp.move_absolute_until(start_x, y, deadline)?;
+            qmp.button_state_until("left", true, deadline)?;
+            qmp.move_absolute_until(end_x, y, deadline)?;
+            qmp.button_state_until("left", false, deadline)?;
+            self.phase = PhysicalInputPhase::TerminalSelection;
+        }
+        if self.phase == PhysicalInputPhase::TerminalSelection
+            && evidence.td_term_clipboard_selection
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before terminal copy".to_string())?;
+            qmp.key_chord_until(&["ctrl", "shift", "c"], deadline)?;
+            self.phase = PhysicalInputPhase::TerminalCopy;
+        }
+        if self.phase == PhysicalInputPhase::TerminalCopy
+            && evidence.td_term_clipboard
+            && evidence.td_firefox_clipboard_refocus_armed
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before Firefox paste".to_string())?;
+            qmp.move_absolute_until(24_576, 16_384, deadline)?;
+            qmp.button_until("left", deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxFocus;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxFocus
+            && evidence.td_firefox_clipboard_window_armed
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before Firefox URL focus".to_string())?;
+            qmp.key_chord_until(&["ctrl", "l"], deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxPasteArm;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxPasteArm
+            && evidence.td_firefox_clipboard_armed
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before Firefox paste".to_string())?;
+            qmp.clipboard_paste_until(deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxPaste;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxPaste
+            && evidence.td_firefox_clipboard_retry
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before Firefox retry".to_string())?;
+            qmp.clipboard_paste_until(deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxPasteRetried;
         }
         Ok(())
     }
@@ -4013,7 +4463,65 @@ impl Qmp {
     }
 
     fn key_x_until(&mut self, deadline: Instant) -> Result<(), String> {
-        self.exchange_until(r#"{"execute":"input-send-event","arguments":{"events":[{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"x"}}},{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"x"}}}]}}"#, deadline)
+        self.key_chord_until(&["x"], deadline)
+    }
+
+    fn type_clipboard_target_until(&mut self, deadline: Instant) -> Result<(), String> {
+        for byte in TERMINAL_CLIPBOARD_TEXT {
+            let chord: &[&str] = match byte {
+                b'W' => &["shift", "w"],
+                b'c' => &["c"],
+                b'e' => &["e"],
+                b'l' => &["l"],
+                b'm' => &["m"],
+                b'o' => &["o"],
+                _ => return Err("terminal clipboard text escaped the closed key set".to_string()),
+            };
+            self.key_chord_until(chord, deadline)?;
+        }
+        Ok(())
+    }
+
+    fn clipboard_paste_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.key_chord_until(&["ctrl", "v"], deadline)?;
+        // This harmless modifier tap follows every key event in the QEMU
+        // command. Firefox observes its keyup before it may classify the
+        // attempt, so no host sleep guesses when TCG finished the batch.
+        self.key_chord_until(&["shift"], deadline)
+    }
+
+    fn key_chord_until(&mut self, keys: &[&str], deadline: Instant) -> Result<(), String> {
+        if keys.is_empty()
+            || keys.len() > 3
+            || keys
+                .iter()
+                .any(|key| {
+                    !matches!(
+                        *key,
+                        "ctrl" | "shift" | "c" | "e" | "l" | "m" | "o" | "v" | "w" | "x"
+                    )
+                })
+        {
+            return Err("QMP input chord is outside the closed set".to_string());
+        }
+        let mut events = Vec::with_capacity(keys.len().saturating_mul(2));
+        for key in keys {
+            events.push(format!(
+                "{{\"type\":\"key\",\"data\":{{\"down\":true,\"key\":{{\"type\":\"qcode\",\"data\":\"{key}\"}}}}}}"
+            ));
+        }
+        for key in keys.iter().rev() {
+            events.push(format!(
+                "{{\"type\":\"key\",\"data\":{{\"down\":false,\"key\":{{\"type\":\"qcode\",\"data\":\"{key}\"}}}}}}"
+            ));
+        }
+        self.exchange_until(
+            &format!(
+                "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{}]}}}}",
+                events.join(",")
+            ),
+            deadline,
+        )
     }
 
     fn button_until(&mut self, button: &str, deadline: Instant) -> Result<(), String> {
@@ -4023,6 +4531,23 @@ impl Qmp {
         self.exchange_until(&format!(
             "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{{\"type\":\"btn\",\"data\":{{\"down\":true,\"button\":\"{button}\"}}}},{{\"type\":\"btn\",\"data\":{{\"down\":false,\"button\":\"{button}\"}}}}]}}}}"
         ), deadline)
+    }
+
+    fn button_state_until(
+        &mut self,
+        button: &str,
+        down: bool,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if !matches!(button, "left" | "right") {
+            return Err("QMP held input button is outside the closed set".to_string());
+        }
+        self.exchange_until(
+            &format!(
+                "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{{\"type\":\"btn\",\"data\":{{\"down\":{down},\"button\":\"{button}\"}}}}]}}}}"
+            ),
+            deadline,
+        )
     }
 
     fn exchange_until(&mut self, command: &str, deadline: Instant) -> Result<(), String> {
@@ -4306,7 +4831,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_qmp_input_waits_for_both_guest_acknowledgements() {
+    fn staged_qmp_input_waits_for_each_guest_acknowledgement() {
         let seq = AtomicU64::new(8_200);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
@@ -4319,7 +4844,7 @@ mod tests {
                 .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut commands = Vec::new();
-            for _ in 0..8 {
+            for _ in 0..28 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 commands.push(line.trim_end().to_string());
@@ -4337,8 +4862,36 @@ mod tests {
         controller.progress(&evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::Menu);
         evidence.td_firefox_input_menu = true;
+        evidence.td_term_clipboard_focus = Some(7);
         controller.progress(&evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::Final);
+        evidence.td_firefox_input = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::Final);
+        evidence.td_term_clipboard_focus = Some(8);
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::TerminalPrepare);
+        evidence.td_term_clipboard_target = Some(TerminalClipboardTarget { row: 0, column: 4 });
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::TerminalSelection);
+        evidence.td_term_clipboard_selection = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::TerminalCopy);
+        evidence.td_term_clipboard = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::TerminalCopy);
+        evidence.td_firefox_clipboard_refocus_armed = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxFocus);
+        evidence.td_firefox_clipboard_window_armed = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteArm);
+        evidence.td_firefox_clipboard_armed = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPaste);
+        evidence.td_firefox_clipboard_retry = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteRetried);
 
         let commands = server.join().unwrap();
         assert_eq!(commands.first().unwrap(), r#"{"execute":"qmp_capabilities"}"#);
@@ -4349,6 +4902,46 @@ mod tests {
         assert!(commands.get(5).unwrap().contains("\"button\":\"right\""));
         assert!(commands.get(6).unwrap().contains("\"axis\":\"x\",\"value\":8192"));
         assert!(commands.get(7).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(8).unwrap().contains("\"data\":\"l\""));
+        assert!(commands.get(9).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(9).unwrap().contains("\"data\":\"w\""));
+        for (index, key) in [(10, "e"), (11, "l"), (12, "c"), (13, "o"), (14, "m"), (15, "e")] {
+            assert!(commands.get(index).unwrap().contains(&format!("\"data\":\"{key}\"")));
+        }
+        assert!(commands.get(16).unwrap().contains("\"axis\":\"x\",\"value\":1536"));
+        assert!(commands.get(17).unwrap().contains("\"down\":true,\"button\":\"left\""));
+        assert!(commands.get(18).unwrap().contains("\"axis\":\"x\",\"value\":2765"));
+        assert!(commands.get(19).unwrap().contains("\"down\":false,\"button\":\"left\""));
+        assert!(commands.get(20).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(20).unwrap().contains("\"data\":\"c\""));
+        assert!(commands.get(21).unwrap().contains("\"axis\":\"x\",\"value\":24576"));
+        assert!(commands.get(22).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(23).unwrap().contains("\"data\":\"l\""));
+        assert!(commands.get(24).unwrap().contains("\"data\":\"v\""));
+        assert!(commands.get(25).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(26).unwrap().contains("\"data\":\"v\""));
+        assert!(commands.get(27).unwrap().contains("\"data\":\"shift\""));
+    }
+
+    #[test]
+    fn clipboard_coordinates_bind_the_fixed_first_workspace() {
+        assert_eq!(
+            terminal_clipboard_coordinates(TerminalClipboardTarget { row: 0, column: 4 })
+                .unwrap(),
+            (1_536, 2_765, 3_113)
+        );
+        let scene = include_str!("../../../../../td-compositor/src/scene.rs");
+        assert!(scene.contains("pub(crate) const GAP: usize = 24;"));
+        assert!(scene.contains("pub(crate) const TITLE_HEIGHT: usize = 20;"));
+        let bar = include_str!("../../../../../td-compositor/src/bar.rs");
+        assert!(bar.contains("pub const BAR_HEIGHT: usize = 24;"));
+        let font = include_str!("../../../../../td-compositor/src/font_data.rs");
+        assert!(font.contains(
+            "UNIFONT_HEX: &str = \"72b54a86000000002000000001000000c1500000100000001000000008000000"
+        ));
+        let editor = include_str!("../../../../../td-sh/src/line.rs");
+        assert!(editor.contains("// Ctrl-L: clear the screen and redraw on the top line."));
+        assert!(editor.contains("let _ = write!(out, \"\\x1b[H\\x1b[2J\");"));
     }
 
     #[test]
@@ -4412,12 +5005,29 @@ mod tests {
             TD_FIREFOX_INPUT_ARMED_MARKER,
             TD_FIREFOX_INPUT_MENU_MARKER,
             TD_FIREFOX_INPUT_MARKER,
+            TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER,
+            TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER,
+            TD_FIREFOX_CLIPBOARD_MARKER,
         ] {
             assert!(
                 firefox.contains(&format!("=> \"{marker}\"")),
                 "td-jail omitted {marker}"
             );
         }
+        assert!(firefox.contains(&format!(
+            "const INPUT_CLIPBOARD_PUBLIC_ARMED: &str = \"{TD_FIREFOX_CLIPBOARD_ARMED_MARKER}\";"
+        )));
+        assert!(firefox.contains(&format!(
+            "const INPUT_CLIPBOARD_PUBLIC_RETRY: &str = \"{TD_FIREFOX_CLIPBOARD_RETRY_MARKER}\";"
+        )));
+        let terminal = include_str!("../../../../../td-compositor/src/term_client.rs");
+        assert!(terminal.contains("TD-TERM-CLIPBOARD-TARGET-READY"));
+        assert!(terminal.contains("TD-TERM-CLIPBOARD-FOCUS-READY"));
+        assert!(terminal.contains("TD-TERM-CLIPBOARD-SELECTION-READY bytes=7"));
+        assert!(terminal.contains("TD-TERM-CLIPBOARD-READY bytes={bytes}"));
+        assert!(terminal.contains("const CLIPBOARD_PROOF_BYTES: &[u8; 7] = b\"Welcome\";"));
+        assert!(terminal.contains("clipboard_sent_marker(clipboard_proof, &write.payload)"));
+        assert!(terminal.contains("clipboard_proof_enabled(Path::new(PROC_CMDLINE))"));
         let scene = include_str!("../../../../../td-compositor/src/scene.rs");
         assert!(scene.contains(&format!(
             "const MAX_CURSOR_DIMENSION: usize = {};",
@@ -5031,7 +5641,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 46] {
+    fn all_console_markers() -> [&'static str; 59] {
         [
             MARKER,
             EROFS_MARKER,
@@ -5075,6 +5685,19 @@ mod tests {
             TD_FIREFOX_BOOT_MARKER,
             TD_FIREFOX_CONTENT_MARKER,
             TD_FIREFOX_SUPPORT_MARKER,
+            TD_FIREFOX_INPUT_ARMED_MARKER,
+            TD_FIREFOX_INPUT_MENU_MARKER,
+            TD_FIREFOX_INPUT_MARKER,
+            TD_TERM_CLIPBOARD_FOCUS_PREFIX,
+            TD_TERM_CLIPBOARD_TARGET_PREFIX,
+            TD_TERM_CLIPBOARD_SELECTION_MARKER,
+            TD_TERM_CLIPBOARD_MARKER,
+            TD_TERM_CLIPBOARD_SENT_MARKER,
+            TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER,
+            TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER,
+            TD_FIREFOX_CLIPBOARD_ARMED_MARKER,
+            TD_FIREFOX_CLIPBOARD_RETRY_MARKER,
+            TD_FIREFOX_CLIPBOARD_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
@@ -5202,6 +5825,173 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_firefox_support);
+
+        for invalid in [
+            format!("noise{TD_TERM_CLIPBOARD_FOCUS_PREFIX}17\n"),
+            format!("\n{TD_TERM_CLIPBOARD_FOCUS_PREFIX}017\n"),
+            format!("\n{TD_TERM_CLIPBOARD_FOCUS_PREFIX}0\n"),
+        ] {
+            latch_console_evidence(&mut evidence, invalid.as_bytes(), b"target");
+            assert_eq!(evidence.td_term_clipboard_focus, None);
+        }
+        latch_console_evidence(
+            &mut evidence,
+            format!("{TD_TERM_CLIPBOARD_FOCUS_PREFIX}17\r\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(evidence.td_term_clipboard_focus, Some(17));
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_TERM_CLIPBOARD_FOCUS_PREFIX}18\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(evidence.td_term_clipboard_focus, Some(18));
+
+        latch_console_evidence(
+            &mut evidence,
+            b"\nTD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=8\n",
+            b"target",
+        );
+        assert_eq!(evidence.td_term_clipboard_target, None);
+        latch_console_evidence(
+            &mut evidence,
+            b"noiseTD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=7\n",
+            b"target",
+        );
+        assert_eq!(evidence.td_term_clipboard_target, None);
+        let mut overlap = ConsoleEvidence::default();
+        latch_console_evidence_from(
+            &mut overlap,
+            b"TD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=7\n",
+            b"target",
+            false,
+        );
+        assert_eq!(overlap.td_term_clipboard_target, None);
+        latch_console_evidence_from(
+            &mut overlap,
+            b"\nTD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=7\n",
+            b"target",
+            false,
+        );
+        assert_eq!(
+            overlap.td_term_clipboard_target,
+            Some(TerminalClipboardTarget { row: 0, column: 4 })
+        );
+        latch_console_evidence(
+            &mut evidence,
+            b"TD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=7\r\n",
+            b"target",
+        );
+        assert_eq!(
+            evidence.td_term_clipboard_target,
+            Some(TerminalClipboardTarget { row: 0, column: 4 })
+        );
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-term: {TD_TERM_CLIPBOARD_SELECTION_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_term_clipboard_selection);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_TERM_CLIPBOARD_SELECTION_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_term_clipboard_selection);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-term: {TD_TERM_CLIPBOARD_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_term_clipboard);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_TERM_CLIPBOARD_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_term_clipboard);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-term: {TD_TERM_CLIPBOARD_SENT_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_term_clipboard_sent);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_TERM_CLIPBOARD_SENT_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_term_clipboard_sent);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER} failed\n")
+                .as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_clipboard_refocus_armed);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_clipboard_refocus_armed);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER} failed\n")
+                .as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_clipboard_window_armed);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_clipboard_window_armed);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_ARMED_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_clipboard_armed);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_CLIPBOARD_ARMED_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_clipboard_armed);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_RETRY_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_clipboard_retry);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_CLIPBOARD_RETRY_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_clipboard_retry);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_clipboard);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_CLIPBOARD_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_clipboard);
     }
 
     #[test]

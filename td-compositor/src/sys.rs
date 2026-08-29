@@ -729,11 +729,6 @@ impl Drop for ReceivedFd {
     }
 }
 
-#[cfg(test)]
-pub fn duplicate_received_writer(fd: RawFd) -> Result<File, String> {
-    reopen_and_close(fd, OpenOptions::new().write(true), "selection transfer")
-}
-
 pub fn discard_received(fds: &[RawFd]) {
     close_all(fds);
 }

@@ -1622,8 +1622,32 @@ renderer and inner sandbox stayed active in its live process classes. The
 first full-system boot now separately proves physical keyboard, absolute
 pointer, wheel, Firefox client-cursor, native context-menu open, and
 outside-click dismissal without manual inspection. It does not yet prove
-paste, portals, external networking policy, audio, pixel-for-pixel correspondence
-between the accepted buffer and the complete decorated output.
+portals, external networking policy, audio, or pixel-for-pixel correspondence
+between the accepted buffer and the complete decorated output. The same boot
+now focuses td-term, waits for its keyboard-focus acknowledgement, clears its
+prompt, physically types `Welcome`, and waits until td-term reports the exact
+rendered target cells in the live viewport. It selects those cells,
+waits until their highlighted frame is visible, then waits for the seven-byte
+core-selection marker. It injects `Control+L` into Firefox and waits for a
+privileged browser-chrome focus acknowledgement before injecting `Control+V`;
+the final privileged observation accepts one through four events from that
+command to tolerate bounded TCG repeat. If the first command boundary exposes
+only empty paste data while leaving the selected URL unchanged, the guest
+emits one exact retry gate and the host may inject `Control+V` once more.
+Across both bounded commands, every nonempty event must carry exact `Welcome`
+text and no other text is accepted. Firefox may expose empty event data while
+its default action asynchronously consumes the Wayland transfer, so the URL
+bar must contain one or more exact `Welcome` copies, no more than the paste
+event count and no fewer than the count of events that expose exact data.
+td-term's independent record proves it wrote the exact payload to Firefox's
+requested endpoint. A
+separate harmless Shift tap follows each paste command; Firefox must observe
+that ordered keyup boundary before it may request the retry or publish success,
+so a delayed event cannot be assigned to an unobserved command. The
+terminal's grid scans, focus/selection
+markers and repeat suppression are enabled only by the exact
+`td.firefox-input=1` boot token; ordinary boots retain normal repeat and do no
+clipboard-proof scanning.
 
 Firefox also materially increases the first profiler report's symbolization
 work: the initial 60-second capture can finish sampling before its immutable
@@ -5989,8 +6013,8 @@ They prove package selection, jail execution, XDG app identity, attributed
 HTTPS pixels, the declared guest-local NSS path, renderer selection, the
 global fallback sandbox facts, nested filters in every reported live required
 process role, and the staged physical-input subset of item 7. The complete
-browser claim still requires the remaining items below, notably paste,
-portal, download, isolation, soak and audio evidence.
+browser claim still requires the remaining items below, notably portal,
+download, isolation, soak and audio evidence.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -6081,22 +6105,53 @@ and image commits — showing:
    Firefox tile, types `x`, scrolls, and right-clicks in separate acknowledged
    input frames. Each post-injection Marionette script waits at most twenty
    seconds for its event state within the probe's enclosing sixty-second
-   deadline. Firefox then requires the focused test input, pointer motion,
-   input event, positive wheel event, document scroll, content context event,
-   and its native `contentAreaContextMenu` `popupshown` state before emitting
-   the intermediate marker. Only then does the host move into td-term and
+   deadline. Under TCG the guest can observe bounded repeats even though the
+   host sends one acknowledged key-down/key-up command, so Firefox accepts one
+   through four `x` characters and refuses zero, another character, or a
+   fifth. It then requires the focused test input, pointer motion, input event,
+   positive wheel event, document scroll, content context event, and its native
+   `contentAreaContextMenu` `popupshown` state before emitting the intermediate
+   marker. Only then does the host move into td-term and
    click; the final Firefox session requires `popuphidden` and closed popup
    state. Independently, the compositor emits one bounded marker only after
    the exact client whose painted content satisfied readiness selects and
    successfully repaints a non-null cursor image. Exact line parsers require
-   all four
-   stages, and the guest greeter cannot finish the input-enabled boot before
-   the final atomic completion record. Other boots expose no QMP socket or
-   Marionette input probe. td-term now supplies a bounded core data-device
-   source: pointer drag selects and visibly inverts cells, `Control+Shift+C`
+   every staged marker, and the guest greeter cannot finish the input-enabled
+   boot before the final atomic completion record. Other boots expose no QMP
+   socket or Marionette input probe. td-term now supplies a bounded core
+   data-device source: pointer drag selects and visibly inverts cells,
+   `Control+Shift+C`
    offers three text MIME types, and a socket-backed SCM_RIGHTS regression
-   receives the exact selected bytes without reopening the descriptor.
-   **Paste from td-term into the URL bar remains an image-level proof.**
+   receives the exact selected bytes and EOF without reopening the descriptor.
+   After the menu closes, the host waits for td-term's keyboard-focus
+   acknowledgement, injects `Control+L`, and physically types `Welcome`.
+   td-term emits a bounded target marker only
+   after a frame containing that exact word is visible; the marker carries the
+   settled grid, row and column. The host converts those cells through the
+   fixed workspace geometry, and drags the inclusive word. A second exact
+   marker waits for the highlighted frame before the host injects the copy
+   chord; it then waits for `TD-TERM-CLIPBOARD-READY bytes=7` evidence before
+   returning focus to Firefox. Separate bounded content sessions arm and
+   acknowledge that physical refocus. After `Control+L`, one continuous
+   browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the
+   URL bar reports focused with its complete prior value selected, stays live
+   while that gate admits physical `Control+V`, and emits
+   `TD-FIREFOX-CLIPBOARD-OK` only when every nonempty event carries exact
+   `Welcome` text and the URL bar contains one or more exact copies, bounded
+   above by all paste events and below by events exposing exact data. This
+   accounts for Firefox's asynchronous default action when an event exposes
+   an empty `DataTransfer`. One guest-acknowledged retry is permitted only
+   when the first command boundary exposes one through four empty events and
+   leaves the selected URL unchanged; the two commands and at most eight total
+   events are hard bounds, and any other nonempty text is fatal. Each command ends with a
+   separate Shift tap, and the chrome listener must observe that ordered keyup
+   before classifying its batch; no sleep substitutes for that boundary. td-term
+   independently emits `TD-TERM-CLIPBOARD-SENT bytes=7` only after writing
+   that exact proof payload to Firefox's supplied endpoint; closing the
+   endpoint then delimits the transfer. Together these records prove the
+   compositor's cross-client offer, Firefox's MIME receive and the supplied
+   endpoint, not merely that td-term admitted its own source. No sleep stands
+   in for an acknowledgement.
 8. a download reaching the app-private or explicitly granted directory;
 9. the Settings portal succeeding;
 10. five minutes of navigation with no compositor or bus disconnect;
@@ -6164,7 +6219,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **E2's GDK, llvmpipe, and Firefox presentation answers are recorded in §F and `td-compositor/DESIGN.md`** | none |
 | 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
-| 20 | **clipboard producer LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status; client cursors landed separately (`1c4b7f88`) | **paste the td-term selection into Firefox; the I-beam already arrived** |
+| 20 | **clipboard producer and cross-client paste LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status. The image oracle physically types `Welcome`, waits until its exact rendered cells are attested, selects them, waits for exact seven-byte source admission, then requires both td-term's exact-payload transfer record and Firefox's browser-chrome observation; client cursors landed separately (`1c4b7f88`) | a real terminal selection reaches Firefox through core Wayland clipboard without manual testing |
 | 21 | **xdg-foreign LANDED**; private portal socket + dialog placement remain | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
@@ -6174,8 +6229,9 @@ Each row is one landing or a small family, leaving the tree green.
 | 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The initial proof selected a fresh volatile automation profile and fixed local document, then accepted only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributed both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. Rung 27a retains that authority and replaces the local-file transport with verified HTTPS. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints deterministic content without manual inspection |
 | 27a | **Firefox HTTPS/NSS image proof — LANDED**; the source-built LibreSSL command supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The all-interface LibreSSL test listener is supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
 | 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
-| 27c | **Firefox physical-input image proof — LANDED**; the first system boot uses a bounded private QMP controller, the already enumerated virtio tablet, and the PC machine's PS/2 keyboard, while staged Firefox content/chrome probes and a compositor-owned cursor marker independently attest the semantic results. The handshake proves typing, pointer motion, scrolling, native right-click menu opening, outside-click dismissal, and a painted Firefox cursor without sleeps or manual observation. The test page retains the authenticated magenta/lime framebuffer sentinel and adds only a fixed focused input, scroll extent, and cursor style | the supported Firefox path accepts real emulated input end to end; clipboard paste remains separate |
-| 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox paste, portals, isolation, soak and sound are all proved** |
+| 27c | **Firefox physical-input image proof — LANDED**; the first system boot uses a bounded private QMP controller, the already enumerated virtio tablet, and the PC machine's PS/2 keyboard, while staged Firefox content/chrome probes and a compositor-owned cursor marker independently attest the semantic results. The handshake proves typing, pointer motion, scrolling, native right-click menu opening, outside-click dismissal, and a painted Firefox cursor without sleeps or manual observation. The test page retains the authenticated magenta/lime framebuffer sentinel and adds only a fixed focused input, scroll extent, and cursor style | the supported Firefox path accepts real emulated input end to end; rung 27d extends the same handshake across clipboard paste |
+| 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and injects `Control+L`. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two commands plus eight total events are hard bounds. A separate Shift tap ends each command, and Firefox must observe its ordered keyup before classifying the batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |
+| 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 
 **Two other reversals are still absent from this ladder, and that is a
 scheduling gap rather than a decision.** §O made timezone support

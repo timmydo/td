@@ -10647,7 +10647,6 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let transfer_path = std::env::temp_dir().join(format!("{stem}.transfer"));
         let framebuffer =
             Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
@@ -10751,16 +10750,15 @@ mod tests {
             "text/plain;charset=utf-8",
         );
 
-        let transfer = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&transfer_path)
+        let (transfer, mut observer) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut receive = wire::Builder::new();
         receive.string("text/plain;charset=utf-8").unwrap();
         let receive = receive.message(destination_offer, 1).unwrap();
         sys::send_with_fd(&destination_peer, &receive, transfer.as_raw_fd()).unwrap();
+        drop(transfer);
 
         let mut received_bytes = Vec::new();
         let mut descriptors = Vec::new();
@@ -10780,10 +10778,12 @@ mod tests {
         payload.finish().unwrap();
         assert_eq!(descriptors.len(), 1);
         let descriptor = descriptors.remove(0);
-        let mut source_endpoint = sys::duplicate_received_writer(descriptor).unwrap();
+        let mut source_endpoint = sys::ReceivedFd::adopt(descriptor).unwrap().into_file();
         source_endpoint.write_all(b"clipboard bytes").unwrap();
         drop(source_endpoint);
-        assert_eq!(fs::read(&transfer_path).unwrap(), b"clipboard bytes");
+        let mut transferred = Vec::new();
+        observer.read_to_end(&mut transferred).unwrap();
+        assert_eq!(transferred, b"clipboard bytes");
 
         send(
             &mut destination_peer,
@@ -10815,13 +10815,11 @@ mod tests {
         );
         assert!(cancelled.payload.is_empty());
 
-        drop(transfer);
         drop(source_peer);
         drop(destination_peer);
         source_worker.join().unwrap().unwrap();
         destination_worker.join().unwrap().unwrap();
         fs::remove_file(framebuffer_path).unwrap();
-        fs::remove_file(transfer_path).unwrap();
     }
 
     #[test]

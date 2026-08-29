@@ -21,12 +21,22 @@ const INPUT_CHROME_ARMED: &str = "TD-FIREFOX-INPUT-CHROME-ARMED";
 const INPUT_CONTENT_OK: &str = "TD-FIREFOX-INPUT-CONTENT-OK";
 const INPUT_MENU_OK: &str = "TD-FIREFOX-INPUT-MENU-OK";
 const INPUT_FINAL_OK: &str = "TD-FIREFOX-INPUT-FINAL-OK";
+const INPUT_CLIPBOARD_REFOCUS_ARMED: &str = "TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED";
+const INPUT_CLIPBOARD_WINDOW_ARMED: &str = "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED";
+const INPUT_CLIPBOARD_ARMED: &str = "TD-FIREFOX-CLIPBOARD-CHROME-ARMED";
+const INPUT_CLIPBOARD_RETRY: &str = "TD-FIREFOX-CLIPBOARD-RETRY";
+const INPUT_CLIPBOARD_PUBLIC_ARMED: &str = "TD-FIREFOX-CLIPBOARD-ARMED";
+const INPUT_CLIPBOARD_PUBLIC_RETRY: &str = "TD-FIREFOX-CLIPBOARD-RETRY-ARMED";
+const INPUT_CLIPBOARD_OK: &str = "TD-FIREFOX-CLIPBOARD-OK";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputStage {
     Arm,
     Menu,
     Final,
+    ClipboardRefocusArm,
+    ClipboardRefocus,
+    Clipboard,
 }
 
 impl InputStage {
@@ -35,6 +45,9 @@ impl InputStage {
             "arm" => Some(Self::Arm),
             "menu" => Some(Self::Menu),
             "final" => Some(Self::Final),
+            "clipboard-refocus-arm" => Some(Self::ClipboardRefocusArm),
+            "clipboard-refocus" => Some(Self::ClipboardRefocus),
+            "clipboard" => Some(Self::Clipboard),
             _ => None,
         }
     }
@@ -44,6 +57,9 @@ impl InputStage {
             Self::Arm => "TD-FIREFOX-INPUT-ARMED",
             Self::Menu => "TD-FIREFOX-INPUT-MENU",
             Self::Final => "TD-FIREFOX-INPUT-OK",
+            Self::ClipboardRefocusArm => "TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED",
+            Self::ClipboardRefocus => "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED",
+            Self::Clipboard => "TD-FIREFOX-CLIPBOARD-OK",
         }
     }
 }
@@ -89,15 +105,17 @@ const expires = Date.now() + 20000;
 const check = () => {
   const state = window.__tdPhysicalInput;
   const input = document.getElementById("td-input");
+  const typed = input && input.value.length > 0 && input.value.length <= 4 &&
+    Array.from(input.value).every(value => value === "x");
   const ok = state && input && state.moves > 0 && state.inputs > 0 &&
-    state.wheels > 0 && state.contexts > 0 && input.value === "x" &&
+    state.wheels > 0 && state.contexts > 0 && typed &&
     window.scrollY > 0;
   if (!ok && Date.now() < expires) {
     setTimeout(check, 50);
     return;
   }
   const detail = state ? [state.moves, state.inputs, state.wheels,
-    state.contexts, input && input.value === "x", window.scrollY].join(",") :
+    state.contexts, input && input.value, window.scrollY].join(",") :
     "no-state";
   done(ok ? "TD-FIREFOX-INPUT-CONTENT-OK" :
     "TD-FIREFOX-INPUT-ERROR:content:" + detail);
@@ -140,6 +158,129 @@ const check = () => {
   done(ok ? "TD-FIREFOX-INPUT-FINAL-OK" :
     "TD-FIREFOX-INPUT-ERROR:final:" + (state ? state.shown + "," +
     state.hidden + "," + (popup && popup.state) : "no-state"));
+};
+check();
+"#;
+
+const CHROME_CLIPBOARD_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  const state = win && win.__tdClipboardPaste;
+  const value = win && win.gURLBar && win.gURLBar.value;
+  const firstBounded = state && state.commandEnds === 1 &&
+    state.retryFloor === 0 &&
+    state.shortcuts >= 1 && state.shortcuts <= 4;
+  const retryEvents = state && state.shortcuts - state.retryFloor;
+  const secondBounded = state && state.commandEnds === 2 &&
+    state.retryFloor >= 1 &&
+    state.retryFloor <= 4 && retryEvents >= 1 && retryEvents <= 4;
+  const bounded = (firstBounded || secondBounded) &&
+    state.pastes === state.shortcuts;
+  const accounted = bounded &&
+    state.emptyPastes + state.exactPastes === state.pastes;
+  const valueRepeats = value && value.length % "Welcome".length === 0 &&
+    value === "Welcome".repeat(value.length / "Welcome".length) ?
+    value.length / "Welcome".length : 0;
+  const pasted = accounted && valueRepeats >= 1 &&
+    valueRepeats <= state.pastes && state.exactPastes <= valueRepeats &&
+    !state.unexpected;
+  const retry = state && state.commandEnds === 1 &&
+    state.retryFloor === 0 &&
+    state.shortcuts >= 1 && state.shortcuts <= 4 &&
+    state.pastes === state.shortcuts && state.emptyPastes === state.pastes &&
+    state.exactPastes === 0 && !state.unexpected && value === state.initial;
+  if (!pasted && !retry && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  if (retry) state.retryFloor = state.shortcuts;
+  done(pasted ? "TD-FIREFOX-CLIPBOARD-OK" : retry ?
+    "TD-FIREFOX-CLIPBOARD-RETRY" :
+    "TD-FIREFOX-INPUT-ERROR:clipboard:" +
+    [state && state.commandEnds, state && state.retryFloor,
+      state && state.shortcuts, state && state.pastes,
+      state && state.emptyPastes, state && state.exactPastes,
+      state && state.text, state && state.unexpected,
+      win && win.gURLBar && win.gURLBar.focused,
+      win && win.document.activeElement && win.document.activeElement.id,
+      value].map(String).join(":"));
+};
+check();
+"#;
+
+const CONTENT_CLIPBOARD_REFOCUS_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const state = window.__tdClipboardRefocus;
+  const refocused = state && state.down === 1;
+  if (!refocused && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  done(refocused ? "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED" :
+    "TD-FIREFOX-INPUT-ERROR:clipboard-refocus");
+};
+check();
+"#;
+
+const CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const state = { down: 0 };
+window.__tdClipboardRefocus = state;
+window.addEventListener("mousedown", () => state.down++, {
+  capture: true, once: true
+});
+done("TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED");
+"#;
+
+const CHROME_CLIPBOARD_ARM_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  const urlbar = win && win.gURLBar;
+  const focused = urlbar && urlbar.focused;
+  const field = urlbar && urlbar.inputField;
+  const selected = field && field.selectionStart === 0 &&
+    field.selectionEnd === urlbar.value.length;
+  const active = win && win.document.activeElement;
+  const detail = [Boolean(win), Boolean(urlbar), Boolean(focused),
+    Boolean(field && field === active), Boolean(selected),
+    Boolean(win && win.document.hasFocus()),
+    Boolean(Services.focus.activeWindow === win),
+    Boolean(urlbar && urlbar.hasAttribute("focused"))].join(",");
+  if ((!focused || !selected) && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  if (!focused || !selected) {
+    done("TD-FIREFOX-INPUT-ERROR:clipboard-arm:" + detail);
+    return;
+  }
+  const state = { commandEnds: 0, shortcuts: 0, pastes: 0, retryFloor: 0,
+    emptyPastes: 0, exactPastes: 0, text: "", unexpected: false,
+    initial: urlbar.value };
+  win.__tdClipboardPaste = state;
+  win.addEventListener("keydown", event => {
+    if (event.ctrlKey && event.key === "v") state.shortcuts++;
+  }, { capture: true });
+  win.addEventListener("keyup", event => {
+    if (event.key === "Shift" && !event.ctrlKey && !event.altKey &&
+        !event.metaKey) state.commandEnds++;
+  }, { capture: true });
+  win.addEventListener("paste", event => {
+    state.pastes++;
+    const text = event.clipboardData ?
+      event.clipboardData.getData("text/plain") : "no-data";
+    state.text = text;
+    if (text === "") state.emptyPastes++;
+    else if (text === "Welcome") state.exactPastes++;
+    else state.unexpected = true;
+  }, { capture: true });
+  done("TD-FIREFOX-CLIPBOARD-CHROME-ARMED");
 };
 check();
 "#;
@@ -315,7 +456,10 @@ pub(crate) fn probe_support() -> io::Result<SupportReport> {
     probe_stream(&mut stream)
 }
 
-pub(crate) fn probe_input(stage: InputStage) -> io::Result<&'static str> {
+pub(crate) fn probe_input<W: Write>(
+    stage: InputStage,
+    progress: &mut W,
+) -> io::Result<&'static str> {
     let address = SocketAddr::from(([127, 0, 0, 1], MARIONETTE_PORT));
     let deadline = Instant::now()
         .checked_add(PROBE_DEADLINE)
@@ -323,7 +467,7 @@ pub(crate) fn probe_input(stage: InputStage) -> io::Result<&'static str> {
     let stream = TcpStream::connect_timeout(&address, remaining(deadline)?)
         .map_err(|error| contextual("connect to Firefox Marionette on loopback", error))?;
     let mut stream = DeadlineStream { stream, deadline };
-    probe_input_stream(&mut stream, stage)?;
+    probe_input_stream_with_progress(&mut stream, stage, progress)?;
     Ok(stage.marker())
 }
 
@@ -384,9 +528,18 @@ fn probe_stream<S: Read + Write>(stream: &mut S) -> io::Result<SupportReport> {
     }
 }
 
+#[cfg(test)]
 fn probe_input_stream<S: Read + Write>(stream: &mut S, stage: InputStage) -> io::Result<()> {
+    probe_input_stream_with_progress(stream, stage, &mut io::sink())
+}
+
+fn probe_input_stream_with_progress<S: Read + Write, W: Write>(
+    stream: &mut S,
+    stage: InputStage,
+    progress: &mut W,
+) -> io::Result<()> {
     start_session(stream)?;
-    let result = run_input_stage(stream, stage);
+    let result = run_input_stage(stream, stage, progress);
     let cleanup = delete_input_session(stream);
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
@@ -411,7 +564,11 @@ fn start_session<S: Read + Write>(stream: &mut S) -> io::Result<()> {
     Ok(())
 }
 
-fn run_input_stage<S: Read + Write>(stream: &mut S, stage: InputStage) -> io::Result<()> {
+fn run_input_stage<S: Read + Write, W: Write>(
+    stream: &mut S,
+    stage: InputStage,
+    progress: &mut W,
+) -> io::Result<()> {
     match stage {
         InputStage::Arm => {
             set_context(stream, 2, "content")?;
@@ -428,6 +585,45 @@ fn run_input_stage<S: Read + Write>(stream: &mut S, stage: InputStage) -> io::Re
         InputStage::Final => {
             set_context(stream, 2, "chrome")?;
             require_script_value(stream, 3, CHROME_FINAL_SCRIPT, INPUT_FINAL_OK)
+        }
+        InputStage::ClipboardRefocusArm => {
+            set_context(stream, 2, "content")?;
+            require_script_value(
+                stream,
+                3,
+                CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT,
+                INPUT_CLIPBOARD_REFOCUS_ARMED,
+            )
+        }
+        InputStage::ClipboardRefocus => {
+            set_context(stream, 2, "content")?;
+            require_script_value(
+                stream,
+                3,
+                CONTENT_CLIPBOARD_REFOCUS_SCRIPT,
+                INPUT_CLIPBOARD_WINDOW_ARMED,
+            )
+        }
+        InputStage::Clipboard => {
+            set_context(stream, 2, "chrome")?;
+            require_script_value(
+                stream,
+                3,
+                CHROME_CLIPBOARD_ARM_SCRIPT,
+                INPUT_CLIPBOARD_ARMED,
+            )?;
+            writeln!(progress, "{INPUT_CLIPBOARD_PUBLIC_ARMED}")?;
+            progress.flush()?;
+            let value = script_value(stream, 4, CHROME_CLIPBOARD_SCRIPT)?;
+            if value == INPUT_CLIPBOARD_OK {
+                return Ok(());
+            }
+            if value != INPUT_CLIPBOARD_RETRY {
+                return Err(unexpected("input script value", &value));
+            }
+            writeln!(progress, "{INPUT_CLIPBOARD_PUBLIC_RETRY}")?;
+            progress.flush()?;
+            require_script_value(stream, 5, CHROME_CLIPBOARD_SCRIPT, INPUT_CLIPBOARD_OK)
         }
     }
 }
@@ -451,6 +647,11 @@ fn require_script_value<S: Read + Write>(
     script: &str,
     expected: &str,
 ) -> io::Result<()> {
+    let value = script_value(stream, id, script)?;
+    require_exact("input script value", &value, expected)
+}
+
+fn script_value<S: Read + Write>(stream: &mut S, id: u8, script: &str) -> io::Result<String> {
     let command = execute_command_with_id(id, script)?;
     write_frame(stream, &command)
         .map_err(|error| contextual("write Firefox input script", error))?;
@@ -461,7 +662,7 @@ fn require_script_value<S: Read + Write>(
         .strip_prefix(&prefix)
         .and_then(|rest| rest.strip_suffix(EXECUTE_RESPONSE_SUFFIX))
         .ok_or_else(|| unexpected("execute-script response", &response))?;
-    require_exact("input script value", value, expected)
+    Ok(value.to_string())
 }
 
 fn delete_input_session<S: Read + Write>(stream: &mut S) -> io::Result<()> {
@@ -1166,12 +1367,21 @@ mod tests {
                     values.get(1).copied().unwrap_or_default()
                 ));
             }
-            InputStage::Final => {
+            InputStage::Final
+            | InputStage::ClipboardRefocusArm
+            | InputStage::ClipboardRefocus => {
                 responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
                 responses.push(format!(
                     "[1,3,null,{{\"value\":\"{}\"}}]",
                     values.first().copied().unwrap_or_default()
                 ));
+            }
+            InputStage::Clipboard => {
+                responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
+                for (index, value) in values.iter().enumerate() {
+                    let id = if index == 0 { 3 } else { index + 3 };
+                    responses.push(format!("[1,{id},null,{{\"value\":\"{value}\"}}]"));
+                }
             }
         }
         responses.push(r#"[1,6,null,{"value":null}]"#.to_string());
@@ -1243,6 +1453,146 @@ mod tests {
             r#"[0,6,"WebDriver:DeleteSession",{}]"#
         );
 
+        let mut retry_io = input_transcript(
+            InputStage::Clipboard,
+            &[
+                INPUT_CLIPBOARD_ARMED,
+                INPUT_CLIPBOARD_RETRY,
+                INPUT_CLIPBOARD_OK,
+            ],
+        );
+        let mut retry_progress = Vec::new();
+        probe_input_stream_with_progress(
+            &mut retry_io,
+            InputStage::Clipboard,
+            &mut retry_progress,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(retry_progress).unwrap(),
+            format!("{INPUT_CLIPBOARD_PUBLIC_ARMED}\n{INPUT_CLIPBOARD_PUBLIC_RETRY}\n")
+        );
+        let mut retry_commands = Cursor::new(retry_io.output);
+        assert_eq!(read_frame(&mut retry_commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut retry_commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"chrome"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut retry_commands).unwrap(),
+            execute_command_with_id(3, CHROME_CLIPBOARD_ARM_SCRIPT).unwrap()
+        );
+        for id in [4, 5] {
+            assert_eq!(
+                read_frame(&mut retry_commands).unwrap(),
+                execute_command_with_id(id, CHROME_CLIPBOARD_SCRIPT).unwrap()
+            );
+        }
+        assert_eq!(
+            read_frame(&mut retry_commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+        assert!(read_frame(&mut retry_commands).is_err());
+
+        let mut exhausted_io = input_transcript(
+            InputStage::Clipboard,
+            &[
+                INPUT_CLIPBOARD_ARMED,
+                INPUT_CLIPBOARD_RETRY,
+                INPUT_CLIPBOARD_RETRY,
+            ],
+        );
+        let mut exhausted_progress = Vec::new();
+        let error = probe_input_stream_with_progress(
+            &mut exhausted_io,
+            InputStage::Clipboard,
+            &mut exhausted_progress,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(INPUT_CLIPBOARD_RETRY));
+        assert_eq!(
+            String::from_utf8(exhausted_progress).unwrap(),
+            format!("{INPUT_CLIPBOARD_PUBLIC_ARMED}\n{INPUT_CLIPBOARD_PUBLIC_RETRY}\n")
+        );
+
+        let mut clipboard_refocus_arm_io = input_transcript(
+            InputStage::ClipboardRefocusArm,
+            &[INPUT_CLIPBOARD_REFOCUS_ARMED],
+        );
+        probe_input_stream(
+            &mut clipboard_refocus_arm_io,
+            InputStage::ClipboardRefocusArm,
+        )
+        .unwrap();
+        let mut commands = Cursor::new(clipboard_refocus_arm_io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+
+        let mut clipboard_refocus_io = input_transcript(
+            InputStage::ClipboardRefocus,
+            &[INPUT_CLIPBOARD_WINDOW_ARMED],
+        );
+        probe_input_stream(&mut clipboard_refocus_io, InputStage::ClipboardRefocus).unwrap();
+        let mut commands = Cursor::new(clipboard_refocus_io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CONTENT_CLIPBOARD_REFOCUS_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+
+        let mut clipboard_io = input_transcript(
+            InputStage::Clipboard,
+            &[INPUT_CLIPBOARD_ARMED, INPUT_CLIPBOARD_OK],
+        );
+        let mut progress = Vec::new();
+        probe_input_stream_with_progress(
+            &mut clipboard_io,
+            InputStage::Clipboard,
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(progress).unwrap(),
+            format!("{INPUT_CLIPBOARD_PUBLIC_ARMED}\n")
+        );
+        let mut commands = Cursor::new(clipboard_io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"chrome"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CHROME_CLIPBOARD_ARM_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(4, CHROME_CLIPBOARD_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+
         let mut rejected = input_transcript(
             InputStage::Menu,
             &[INPUT_CONTENT_OK, "TD-FIREFOX-INPUT-ERROR:menu"],
@@ -1255,17 +1605,55 @@ mod tests {
         for event in ["mousemove", "input", "wheel", "contextmenu"] {
             assert!(CONTENT_ARM_SCRIPT.contains(event));
         }
-        assert!(CONTENT_MENU_SCRIPT.contains("input.value === \"x\""));
+        assert!(CONTENT_MENU_SCRIPT.contains("input.value.length <= 4"));
+        assert!(CONTENT_MENU_SCRIPT.contains("value => value === \"x\""));
         assert!(CONTENT_MENU_SCRIPT.contains("window.scrollY > 0"));
         assert!(CHROME_ARM_SCRIPT.contains("contentAreaContextMenu"));
         assert!(CHROME_ARM_SCRIPT.contains("popupshown"));
         assert!(CHROME_ARM_SCRIPT.contains("popuphidden"));
         assert!(CHROME_MENU_SCRIPT.contains("popup.state === \"open\""));
         assert!(CHROME_FINAL_SCRIPT.contains("popup.state === \"closed\""));
+        assert!(CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT.contains("mousedown"));
+        assert!(CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT.contains("once: true"));
+        assert!(
+            CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT.contains(INPUT_CLIPBOARD_REFOCUS_ARMED)
+        );
+        assert!(CONTENT_CLIPBOARD_REFOCUS_SCRIPT.contains("state.down === 1"));
+        assert!(CONTENT_CLIPBOARD_REFOCUS_SCRIPT.contains(INPUT_CLIPBOARD_WINDOW_ARMED));
+        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("urlbar.focused"));
+        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("event.ctrlKey && event.key === \"v\""));
+        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains(
+            "event.clipboardData.getData(\"text/plain\")"
+        ));
+        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains(INPUT_CLIPBOARD_ARMED));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("win.gURLBar.value"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.shortcuts >= 1"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.shortcuts <= 4"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("retryEvents <= 4"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.commandEnds === 1"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.commandEnds === 2"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.retryFloor === 0"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("if (retry) state.retryFloor"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.pastes === state.shortcuts"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.emptyPastes === state.pastes"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("valueRepeats >= 1"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("valueRepeats <= state.pastes"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("state.exactPastes <= valueRepeats"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains("!state.unexpected"));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains(
+            "value === \"Welcome\".repeat(value.length / \"Welcome\".length)"
+        ));
+        assert!(CHROME_CLIPBOARD_SCRIPT.contains(INPUT_CLIPBOARD_RETRY));
+        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("!focused || !selected"));
+        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("event.key === \"Shift\""));
+        assert!(CHROME_CLIPBOARD_ARM_SCRIPT.contains("state.commandEnds++"));
         for script in [
             CONTENT_MENU_SCRIPT,
             CHROME_MENU_SCRIPT,
             CHROME_FINAL_SCRIPT,
+            CONTENT_CLIPBOARD_REFOCUS_SCRIPT,
+            CHROME_CLIPBOARD_ARM_SCRIPT,
+            CHROME_CLIPBOARD_SCRIPT,
         ] {
             assert!(script.contains("const expires = Date.now() + 20000"));
             assert!(script.contains("setTimeout(check, 50)"));
@@ -1276,9 +1664,83 @@ mod tests {
             CONTENT_MENU_SCRIPT,
             CHROME_MENU_SCRIPT,
             CHROME_FINAL_SCRIPT,
+            CONTENT_CLIPBOARD_REFOCUS_ARM_SCRIPT,
+            CONTENT_CLIPBOARD_REFOCUS_SCRIPT,
+            CHROME_CLIPBOARD_ARM_SCRIPT,
+            CHROME_CLIPBOARD_SCRIPT,
         ] {
             assert!(execute_command_with_id(5, script).unwrap().len() < MAX_COMMAND_BYTES);
         }
+    }
+
+    #[test]
+    fn clipboard_result_waits_for_physical_command_boundaries() {
+        let classify =
+            |command_ends: usize,
+             retry_floor: usize,
+             shortcuts: usize,
+             pastes: usize,
+             empty: usize,
+             exact: usize,
+             value: &str| {
+                let first_bounded = command_ends == 1
+                    && retry_floor == 0
+                    && (1..=4).contains(&shortcuts);
+                let retry_events = shortcuts.saturating_sub(retry_floor);
+                let second_bounded = command_ends == 2
+                    && (1..=4).contains(&retry_floor)
+                    && (1..=4).contains(&retry_events);
+                let bounded = (first_bounded || second_bounded) && pastes == shortcuts;
+                let value_repeats = if !value.is_empty()
+                    && value.len().is_multiple_of("Welcome".len())
+                {
+                    let repeats = value.len() / "Welcome".len();
+                    if value == "Welcome".repeat(repeats) {
+                        repeats
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                let pasted = bounded
+                    && empty.saturating_add(exact) == pastes
+                    && value_repeats >= 1
+                    && value_repeats <= pastes
+                    && exact <= value_repeats;
+                let retry = command_ends == 1
+                    && retry_floor == 0
+                    && (1..=4).contains(&shortcuts)
+                    && pastes == shortcuts
+                    && empty == pastes
+                    && exact == 0
+                    && value == "old";
+                if pasted {
+                    "ok"
+                } else if retry {
+                    "retry"
+                } else {
+                    "pending-or-error"
+                }
+            };
+
+        assert_eq!(classify(0, 0, 1, 1, 1, 0, "old"), "pending-or-error");
+        assert_eq!(classify(1, 0, 1, 1, 1, 0, "old"), "retry");
+        // An event arriving after the retry response is not a second command:
+        // only the host's following Shift keyup may advance that boundary.
+        assert_eq!(
+            classify(1, 1, 2, 2, 1, 1, "Welcome"),
+            "pending-or-error"
+        );
+        assert_eq!(classify(2, 1, 3, 3, 1, 2, "WelcomeWelcome"), "ok");
+        // Firefox may expose an empty DataTransfer while its default action
+        // consumes the asynchronous Wayland transfer. The final URL accounts
+        // that exact insertion even when only the later event exposes bytes.
+        assert_eq!(classify(2, 1, 2, 2, 1, 1, "WelcomeWelcome"), "ok");
+        assert_eq!(
+            classify(2, 1, 6, 6, 1, 5, &"Welcome".repeat(5)),
+            "pending-or-error"
+        );
     }
 
     #[test]

@@ -4150,7 +4150,31 @@ Source cancellation removes both registries and destroys the object. A display
 sync callback prints `TD-TERM-CLIPBOARD-READY bytes=N` only if the new source is
 still current after the compositor has processed `set_selection`. This marker
 proves source admission, not that another client pasted the bytes; the system
-image owns that separate end-to-end proof.
+image's fixed QEMU flow separately focuses td-term, waits for its post-enter
+modifier-state acknowledgement, clears the screen, physically types
+`Welcome`, and waits for a marker naming the live viewport's visible target,
+settled grid and cell coordinates. It selects those cells, waits for their
+highlighted frame to become visible, then injects the copy chord and waits for
+the exact seven-byte source marker. Firefox browser chrome must first report
+that its URL bar is focused after the physical focus and `Control+L` sequence.
+One continuous bounded chrome session stays live after that acknowledgement,
+admits the physical paste chord, and permits one through four events to
+tolerate bounded TCG key-repeat timing. If the first command boundary exposes
+only empty paste data while the selected URL remains unchanged, one exact
+guest marker admits one retry command. Across the at most eight events, every
+nonempty value must be the exact bytes. Because Firefox can expose empty event
+data while its default action asynchronously consumes the Wayland transfer,
+the URL bar must contain one or more exact payload copies, no more than all
+paste events and no fewer than events exposing exact data. A harmless Shift tap follows each paste command,
+and Firefox must observe that ordered keyup before classifying the command;
+there is no timing sleep or success before an unobserved chord. The writer separately
+prints `TD-TERM-CLIPBOARD-SENT bytes=7` only after it has written the exact
+`Welcome` proof payload to the requested endpoint;
+its endpoint close is the transfer delimiter. The image proof requires both
+records, so neither source admission alone nor a synthetic chrome assignment
+can pass it. These grid scans, proof markers, and disabled terminal key repeat
+exist only when the exact `td.firefox-input=1` kernel token is present; normal
+boots retain ordinary repeat behavior and execute none of the proof scan.
 
 ## 12. PTY and process lifecycle
 

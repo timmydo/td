@@ -228,6 +228,9 @@ const FIREFOX_INPUT_COMPLETION: &str = "td-firefox-input-complete-v1";
 // a stalled Marionette endpoint into an hour-long service.
 const FIREFOX_INPUT_TIMEOUT_SECS: u16 = 60;
 const FIREFOX_INPUT_ATTEMPTS: u16 = 3;
+const FIREFOX_INPUT_STAGES: u16 = 6;
+const FIREFOX_INPUT_RETRY_SLEEP_SECS: u16 =
+    FIREFOX_INPUT_STAGES * FIREFOX_INPUT_ATTEMPTS.saturating_sub(1);
 const FIREFOX_READY_TIMEOUT_SECS: u16 = 180;
 const FIREFOX_READY_ATTEMPTS: u16 = 2;
 const FIREFOX_RETRY_MARGIN_SECS: u16 = 60;
@@ -250,7 +253,8 @@ const FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS: u16 =
 const FIREFOX_GREETER_WAIT_ITERATIONS: u16 =
     FIREFOX_READY_TIMEOUT_SECS
         + FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS
-        + FIREFOX_INPUT_TIMEOUT_SECS * FIREFOX_INPUT_ATTEMPTS * 3;
+        + FIREFOX_INPUT_TIMEOUT_SECS * FIREFOX_INPUT_ATTEMPTS * FIREFOX_INPUT_STAGES
+        + FIREFOX_INPUT_RETRY_SLEEP_SECS;
 
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
     name: FIREFOX_NAME,
@@ -1257,10 +1261,11 @@ fn build_td_svc_conf() -> String {
          # stage physical virtio input. It first waits for the support oracle's\n\
          # atomic completion so two Marionette sessions never race. Firefox then\n\
          # arms content and chrome listeners before the host advances through an\n\
-         # open-menu and outside-dismiss handshake.\n\
+         # open-menu, outside-dismiss, and terminal-to-browser clipboard\n\
+         # handshake.\n\
          [firefox-input]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do if /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input final; then /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do if /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard; then /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
          after=firefox-evidence\n\
          restart=never\n\
          \n\
@@ -4780,7 +4785,10 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             FIREFOX_GREETER_WAIT_ITERATIONS,
             FIREFOX_READY_TIMEOUT_SECS
                 + FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS
-                + FIREFOX_INPUT_TIMEOUT_SECS * FIREFOX_INPUT_ATTEMPTS * 3
+                + FIREFOX_INPUT_TIMEOUT_SECS
+                    * FIREFOX_INPUT_ATTEMPTS
+                    * FIREFOX_INPUT_STAGES
+                + FIREFOX_INPUT_RETRY_SLEEP_SECS
         );
         assert_eq!(
             FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
@@ -4896,12 +4904,41 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
              /bin/td-login exec-as tester -- /bin/td-jail \
              --probe-firefox-input arm && break"
         )));
-        for stage in ["arm", "menu", "final"] {
+        let stages = [
+            "arm &&",
+            "menu &&",
+            "final &&",
+            "clipboard-refocus-arm &&",
+            "clipboard-refocus &&",
+            "clipboard;",
+        ];
+        assert_eq!(stages.len(), usize::from(FIREFOX_INPUT_STAGES));
+        for stage in stages {
             assert_eq!(
                 input.matches(&format!("--probe-firefox-input {stage}")).count(),
                 1
             );
         }
+        let arm = input.find("--probe-firefox-input arm &&").unwrap();
+        let menu = input.find("--probe-firefox-input menu &&").unwrap();
+        let final_stage = input.find("--probe-firefox-input final &&").unwrap();
+        let clipboard_refocus_arm = input
+            .find("--probe-firefox-input clipboard-refocus-arm &&")
+            .unwrap();
+        let clipboard_refocus = input
+            .find("--probe-firefox-input clipboard-refocus &&")
+            .unwrap();
+        let clipboard = input.find("--probe-firefox-input clipboard;").unwrap();
+        let completion = input.find(FIREFOX_INPUT_COMPLETION).unwrap();
+        assert!(
+            arm < menu
+                && menu < final_stage
+                && final_stage < clipboard_refocus_arm
+                && clipboard_refocus_arm < clipboard_refocus
+                && clipboard_refocus < clipboard
+                && clipboard < completion,
+            "input evidence and completion must retain their exact stage order"
+        );
         assert!(input.contains(&format!(
             "{FIREFOX_INPUT_COMPLETION} > {FIREFOX_INPUT_COMPLETION_TMP_PATH}"
         )));
