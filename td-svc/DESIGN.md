@@ -217,6 +217,18 @@ bus (`busd requires=seat`) — and per **I5** it can never apply to a `tty=`
 service. An earlier version of this paragraph said no shipped unit needed it,
 which the graphical chain already contradicted.
 
+The first desktop portal follows the same distinction. `portal requires=busd`
+because activation and name ownership are meaningless without the broker, and
+its separate one-shot live client has `portal-evidence requires=portal`.
+Firefox is only `after=portal`: a missing Settings service is application
+evidence failure, not permission for mutable user-service state to prevent
+base deployment acknowledgement. Neither portal unit is in `bootsuccess`'s
+strict chain. The root portal supervisor is intentionally the daemon td-svc
+tracks: it retains td-busd's one-shot activation authority and waits for one
+literal uid-1000 direct child. That child remains in the supervisor's process
+group, so ordinary stop/restart containment covers both without a new td-svc
+primitive.
+
 Note what `requires=` does NOT change, since the difference is easy to read
 backwards: `after=` is already enough to keep a dependent behind its
 dependency, because a unit does not start until every dependency has settled.

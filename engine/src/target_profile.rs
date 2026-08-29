@@ -88,7 +88,7 @@ pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 6] = [
 /// and libgcc boundaries apply to every output passed to the target splitter;
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
 /// recipes by the catalog tests.
-pub const RUST_PROFILED_RECIPES: [&str; 21] = [
+pub const RUST_PROFILED_RECIPES: [&str; 22] = [
     "codex",
     "fd",
     "ripgrep",
@@ -103,6 +103,7 @@ pub const RUST_PROFILED_RECIPES: [&str; 21] = [
     "td-kexec",
     "td-login",
     "td-netd",
+    "td-portal",
     "td-profiler",
     "td-seatd",
     "td-sh",

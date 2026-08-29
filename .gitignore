@@ -93,3 +93,7 @@ td-seatd/target/
 # leaves the output untracked, and `ready` refuses every LATER run over paths
 # that route to a check.
 td-profiler/target/
+
+# td-portal: shipped by a direct rustc recipe, but also compiled directly
+# during host validation; keep those local Cargo artifacts out of selection.
+td-portal/target/

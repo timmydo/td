@@ -164,6 +164,7 @@ mod tests {
             "td-kexec",
             "td-login",
             "td-netd",
+            "td-portal",
             "td-profiler",
             "td-seatd",
             "td-sh",

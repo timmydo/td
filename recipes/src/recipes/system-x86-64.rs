@@ -13,8 +13,9 @@ use crate::ladder::{
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
     TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
     TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
-    TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
+    UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -369,6 +370,8 @@ const UI_UID: u32 = td_engine::application_spec::APPLICATION_UID;
 const UI_GID: u32 = 1000;
 #[cfg(test)]
 const UI_HOME: &str = "/home/tester";
+const TD_PORTAL_SETTINGS_PATH: &str = "/etc/td-portal-settings";
+const TD_PORTAL_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
 // ────────────────────────────────────────────────────────────────────────────────
 
 /// The real-root `/bin` is split across six closed applet farms plus the
@@ -973,13 +976,20 @@ fn td_svc_conf_etc_name() -> &'static str {
     }
 }
 
+fn td_portal_settings_etc_name() -> &'static str {
+    match TD_PORTAL_SETTINGS_PATH.strip_prefix("/etc/") {
+        Some(name) => name,
+        None => TD_PORTAL_SETTINGS_PATH,
+    }
+}
+
 /// Every unit `/etc/td-svc.conf` must resolve into a start order.
 ///
 /// The shape check greps `td-svc check`'s printed plan for each. `check` already reds
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 20] = [
+const TD_SVC_UNITS: [&str; 22] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -988,6 +998,8 @@ const TD_SVC_UNITS: [&str; 20] = [
     "seat",
     "netup",
     "busd",
+    "portal",
+    "portal-evidence",
     "wayland",
     "terminal",
     "firefox-tls-setup",
@@ -1186,6 +1198,37 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
+         # Root holds td-busd's one-shot portal capability and supervises one\n\
+         # literal td-login exec-as child. The child is therefore both uid 1000\n\
+         # and the live direct descendant the broker authorizes to own the\n\
+         # reserved public name. Settings needs no Wayland surface, so this first\n\
+         # portal landing is ordered only after the bus it serves on.\n\
+         [portal]\n\
+         type=daemon\n\
+         exec=/bin/td-portal supervise --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
+         after=busd\n\
+         requires=busd\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
+         # Readiness output is discarded by td-svc. This separate client repeats\n\
+         # the exact live property+ReadAll exchange with console output, making\n\
+         # the route and reply QEMU evidence rather than a startup assertion.\n\
+         # Wait for TLS setup because its key generator writes raw progress to\n\
+         # the console without line framing; once it settles, td-svc's one-write\n\
+         # service prefix is an attributable exact line. This is ordering only:\n\
+         # TLS setup is deliberately not required by portal evidence.\n\
+         # td-recipe-eval requires the exact {portal_runtime_marker} line.\n\
+         [portal-evidence]\n\
+         type=oneshot\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
+         after=portal,firefox-tls-setup\n\
+         requires=portal\n\
+         timeout=30\n\
+         log=/var/log/svc/td-portal-evidence.log\n\
+         console=yes\n\
+         \n\
          # No shell-owned device setup: td-seatd assigned the nodes, td-login drops\n\
          # credentials, and the compositor opens only those fixed paths.\n\
          [wayland]\n\
@@ -1251,7 +1294,7 @@ fn build_td_svc_conf() -> String {
          [firefox]\n\
          type=daemon\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name} --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name};; esac'\n\
-         after=busd,wayland,firefox-autotest,firefox-tls-origin\n\
+         after=busd,portal,wayland,firefox-autotest,firefox-tls-origin\n\
          requires=wayland,firefox-autotest,firefox-tls-origin\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
@@ -1338,6 +1381,8 @@ fn build_td_svc_conf() -> String {
         bootfail = svc_timeouts::BOOTFAIL,
         ui_user = UI_USER,
         ui_uid = UI_UID,
+        portal_settings = TD_PORTAL_SETTINGS_PATH,
+        portal_runtime_marker = TD_PORTAL_RUNTIME_MARKER,
         ui_gid = UI_GID,
         profiler_uid = PROFILER_UID,
         profiler_read_gid = PROFILER_READ_GID,
@@ -3138,6 +3183,11 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         (SHADOW_ETC_NAME, build_shadow(sys), false),
         ("hostname", format!("{}\n", sys.hostname), false),
         ("os-release", build_os_release(sys), false),
+        (
+            td_portal_settings_etc_name(),
+            TD_PORTAL_SETTINGS.to_string(),
+            false,
+        ),
         ("ssh/ssh_config", build_ssh_config(), false),
         ("ssh/sshd_config", build_sshd_config(), false),
         ("mutable-state", build_mutable_state(), false),
@@ -3383,6 +3433,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-busd}".into(),
         dest: "{root}/real-root{in:td-busd}".into(),
     });
+    // The activated Settings portal is a separate static process. Its root
+    // supervisor and unprivileged child execute the same binary, while the
+    // broker retains the capability that authorizes only that direct child.
+    steps.push(Step::CopyTree {
+        from: "{in:td-portal}".into(),
+        dest: "{root}/real-root{in:td-portal}".into(),
+    });
     // Codex's exact Bubblewrap helper is static, so preserve its canonical package
     // directly instead of treating source-provenance strings as runtime edges.
     steps.push(Step::CopyTree {
@@ -3549,6 +3606,10 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::Symlink {
         target: "{in:td-busd}/bin/td-busd".into(),
         link: "{root}/real-root/bin/td-busd".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-portal}/bin/td-portal".into(),
+        link: "{root}/real-root/bin/td-portal".into(),
     });
     // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
     // below is the argv[0] farm the diagnostics names resolve through.
@@ -3731,7 +3792,7 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release mutable-state inittab @TD_SVC_CONF_NAME@ @APPLICATION_CONFIG_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
+     for f in passwd group shadow hostname os-release @TD_PORTAL_SETTINGS_NAME@ mutable-state inittab @TD_SVC_CONF_NAME@ @APPLICATION_CONFIG_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - immutable image config must be a regular file in the erofs, not a hole in the read-only /etc\" >&2; exit 1; fi; \
      done; \
@@ -3844,6 +3905,8 @@ fn shape_check() -> String {
      tdterm=\"{root}/real-root{in:td-compositor}/bin/td-term\"; { [ -f \"$tdterm\" ] && [ -x \"$tdterm\" ]; } || { echo 'root tree: td-term is not packed/executable at real-root{in:td-compositor}/bin/td-term - the /bin/td-term symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-busd\" 2>/dev/null)\" = \"{in:td-busd}/bin/td-busd\" ] || { echo 'root tree: /bin/td-busd is not a symlink to the staged session bus broker - the busd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
      tdbusd=\"{root}/real-root{in:td-busd}/bin/td-busd\"; { [ -f \"$tdbusd\" ] && [ -x \"$tdbusd\" ]; } || { echo 'root tree: td-busd is not packed/executable at real-root{in:td-busd}/bin/td-busd - the /bin/td-busd symlink would dangle' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
+     tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
      for a in @APPLICATIONS@; do \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ] || { echo \"root tree: /bin/$a is not an application launcher pointing to /bin/td-jail - another packed /bin provider replaced it\" >&2; exit 1; }; \
      done; \
@@ -3857,7 +3920,7 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); po=$(svcpos portal); pv=$(svcpos portal-evidence); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$pf\" ] && [ \"$pf\" -lt \"$pe\" ] || { echo 'td-svc would not serialize rootcheck -> profiler -> profiler evidence' >&2; exit 1; }; \
@@ -3867,6 +3930,7 @@ fn shape_check() -> String {
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$ff\" ] && [ \"$ff\" -lt \"$fe\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal+Firefox evidence and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
      [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds inside the runtime directory td-seatd makes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
+     [ \"$bd\" -lt \"$po\" ] && [ \"$po\" -lt \"$pv\" ] && [ \"$po\" -lt \"$ff\" ] || { echo 'td-svc would not serialize busd -> portal -> live portal evidence and Firefox' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
      case \"$tdipiv\" in *'not a mount point'*) : ;; *) echo \"td-init switch_root refused a non-mount NEWROOT for the WRONG reason, so the mount-point guard is untested: $tdipiv\" >&2; exit 1;; esac; \
@@ -3959,6 +4023,10 @@ fn shape_check() -> String {
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
         .replace("@PROFILER_OBJECT_INDEX@", PROFILER_OBJECT_INDEX)
         .replace("@TD_SVC_CONF_NAME@", td_svc_conf_etc_name())
+        .replace(
+            "@TD_PORTAL_SETTINGS_NAME@",
+            td_portal_settings_etc_name(),
+        )
         .replace(
             "@APPLICATION_CONFIG_NAME@",
             application_etc_name(APPLICATION_CONFIG),
@@ -4203,6 +4271,8 @@ pub fn recipe() -> Recipe {
         //   and the Firefox launch both run on every boot.
         // td-seatd/td-compositor: the static single-user UI substrate and terminal.
         // td-busd: the static session D-Bus broker used by every Firefox launch.
+        // td-portal: the static Settings service, activation supervisor, and
+        //   unprivileged live client probe.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -4231,6 +4301,7 @@ pub fn recipe() -> Recipe {
             "td-seatd",
             "td-compositor",
             "td-busd",
+            "td-portal",
         ])
         .steps(steps);
     let application_inputs = application_payload_inputs(&SYSTEM);
@@ -5276,6 +5347,8 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             ("seat", vec!["rootcheck"]),
             ("netup", vec!["rootcheck"]),
             ("busd", vec!["seat"]),
+            ("portal", vec!["busd"]),
+            ("portal-evidence", vec!["portal", "firefox-tls-setup"]),
             ("wayland", vec!["seat"]),
             ("terminal", vec!["wayland"]),
             ("firefox-tls-setup", vec!["seat"]),
@@ -5285,6 +5358,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 "firefox",
                 vec![
                     "busd",
+                    "portal",
                     "wayland",
                     "firefox-autotest",
                     "firefox-tls-origin",
@@ -5330,7 +5404,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
     ///
     /// Which is NOT what this counts, and the gap is stated here rather than
     /// left for a reader to assume away. A package count does not bound peers:
-    /// `td-portal` will speak D-Bus and is not a `ShippedApplication`, and a
+    /// `td-portal` speaks D-Bus and is not a `ShippedApplication`, and a
     /// direct `/bin/firefox` request can add another peer without changing the
     /// package count. The compositor card itself is activation-only.
     ///
@@ -5400,6 +5474,74 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             ordered_before("busd", "bootsuccess"),
             "/etc/bootsuccess probes the RUNNING broker, so it must be ordered \
              after the unit that starts it"
+        );
+    }
+
+    #[test]
+    fn settings_portal_activation_and_live_probe_are_exact() {
+        let probe = format!(
+            "/bin/td-login exec-as {UI_USER} -- /bin/td-portal probe \
+             --bus /run/user/{UI_UID}/bus --settings {TD_PORTAL_SETTINGS_PATH}"
+        );
+        assert_eq!(
+            unit_key("portal", "exec"),
+            Some(format!(
+                "/bin/td-portal supervise --bus /run/user/{UI_UID}/bus \
+                 --settings {TD_PORTAL_SETTINGS_PATH}"
+            )),
+            "root must retain the broker capability while supervising its direct child"
+        );
+        assert_eq!(unit_key("portal", "ready"), Some(probe.clone()));
+        assert_eq!(unit_key("portal", "after").as_deref(), Some("busd"));
+        assert_eq!(unit_key("portal", "requires").as_deref(), Some("busd"));
+        assert_eq!(unit_key("portal", "restart").as_deref(), Some("always"));
+        assert_eq!(unit_key("portal", "ready-timeout").as_deref(), Some("30"));
+
+        assert_eq!(unit_key("portal-evidence", "exec"), Some(probe));
+        assert_eq!(
+            unit_key("portal-evidence", "after").as_deref(),
+            Some("portal,firefox-tls-setup")
+        );
+        assert_eq!(
+            unit_key("portal-evidence", "requires").as_deref(),
+            Some("portal")
+        );
+        assert_eq!(
+            unit_key("portal-evidence", "type").as_deref(),
+            Some("oneshot")
+        );
+        assert_eq!(
+            unit_key("portal-evidence", "timeout").as_deref(),
+            Some("30")
+        );
+        assert_eq!(
+            unit_key("portal-evidence", "log").as_deref(),
+            Some("/var/log/svc/td-portal-evidence.log")
+        );
+        assert_eq!(
+            unit_key("portal-evidence", "console").as_deref(),
+            Some("yes")
+        );
+        assert!(ordered_before("portal", "firefox"));
+        assert!(
+            !unit_key("firefox", "requires")
+                .unwrap_or_default()
+                .split(',')
+                .any(|dependency| dependency == "portal"),
+            "Settings availability is application evidence, not deployment health"
+        );
+    }
+
+    #[test]
+    fn immutable_portal_settings_have_one_canonical_source() {
+        assert_eq!(td_portal_settings_etc_name(), "td-portal-settings");
+        let generated = etc_files(&SYSTEM)
+            .into_iter()
+            .find(|(name, _, _)| *name == td_portal_settings_etc_name());
+        assert_eq!(
+            generated,
+            Some(("td-portal-settings", TD_PORTAL_SETTINGS.to_string(), false)),
+            "the tested policy must be regular immutable /etc content"
         );
     }
 
@@ -10379,6 +10521,34 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             native_inputs.iter().any(|i| i == "td-busd"),
             "td-busd must be a declared native input, or {{in:td-busd}} does not resolve"
+        );
+    }
+
+    #[test]
+    fn td_portal_is_packed_and_not_merely_symlinked() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-portal}"
+                        && dest == "{root}/real-root{in:td-portal}"
+            )),
+            "td-portal must be CopyTree'd into the immutable root"
+        );
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::Symlink { target, link }
+                    if target == "{in:td-portal}/bin/td-portal"
+                        && link == "{root}/real-root/bin/td-portal"
+            )),
+            "/bin/td-portal must name the staged static package"
+        );
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        assert!(
+            native_inputs.iter().any(|input| input == "td-portal"),
+            "td-portal must be a declared native input"
         );
     }
 }

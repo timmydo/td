@@ -111,6 +111,11 @@ const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER
 /// socket inside one process; this is the only place the UNIT, the uid it runs as
 /// and the runtime directory td-seatd made are all exercised at once.
 const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
+/// Printed by the unprivileged live portal probe after a routed Properties.Get
+/// and Settings.ReadAll return the exact immutable session policy.
+const TD_PORTAL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_RUNTIME_MARKER;
+const TD_PORTAL_CONSOLE_MARKER: &str =
+    "portal-evidence: TD-PORTAL-READY namespaces=2 settings=10 version=1";
 /// Printed by the greeter's kernel-capability farm, as the unprivileged login user,
 /// once the RUNNING kernel has been observed to carry the sandbox features §0 pins
 /// that can be witnessed from `/proc` — every one but `CONFIG_MEMCG`, which needs a
@@ -339,6 +344,7 @@ struct ConsoleEvidence {
     td_init_runtime: bool,
     td_login_runtime: bool,
     td_busd_runtime: bool,
+    td_portal_runtime: bool,
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
     td_jail_seccomp: bool,
@@ -967,7 +973,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
          td-login credential switch the switched process read back and confirmed \
          ({TD_LOGIN_RUNTIME_MARKER}), answered an unprivileged client's EXTERNAL handshake on \
-         the session bus started by its own unit ({TD_BUSD_RUNTIME_MARKER}), \
+         the session bus started by its own unit ({TD_BUSD_RUNTIME_MARKER}), routed an \
+         unprivileged Settings client through the activated portal and byte-checked its \
+         version and immutable policy ({TD_PORTAL_RUNTIME_MARKER}), \
          confirmed on the RUNNING kernel that the namespaces, \
          seccomp filtering, inotify and cgroup pids controller a jail needs are all there \
          ({TD_SANDBOX_KERNEL_MARKER}), exercised td-jail's unprivileged namespace transition \
@@ -1518,8 +1526,21 @@ fn validate_system_boot(
              PATH and not a pid: strictly it says a broker is reachable there, not that this \
              unit's process is the one answering — nothing else on this image binds it, which \
              is what makes the marker worth having and is also the assumption to re-check the \
-             day something else could. It proves the bus is REACHABLE and nothing more: \
-             nothing on this image says `Hello` or routes a message yet. \
+             day something else could. The later portal marker separately proves `Hello` \
+             plus directed method-call/reply routing; this marker is only reachability. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_portal_runtime {
+        return Err(format!(
+            "the session bus answered, but the live Settings portal marker \
+             ({TD_PORTAL_CONSOLE_MARKER:?}) was absent — the uid-1000 probe did not complete \
+             both org.freedesktop.DBus.Properties.Get(version) and the synchronous \
+             org.freedesktop.portal.Settings.ReadAll call through td-busd, or their replies \
+             differed from /etc/td-portal-settings. The portal-evidence unit is separate from \
+             deployment health, so its failure cannot make /etc/bootsuccess lie about the \
+             base system; QEMU nevertheless requires this marker on every validated boot. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -3531,6 +3552,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_INIT_RUNTIME_MARKER.len(),
         TD_LOGIN_RUNTIME_MARKER.len(),
         TD_BUSD_RUNTIME_MARKER.len(),
+        exact_line_window(TD_PORTAL_CONSOLE_MARKER),
         TD_SANDBOX_KERNEL_MARKER.len(),
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
@@ -3716,6 +3738,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_busd_runtime,
         buf,
         TD_BUSD_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.td_portal_runtime,
+        buf,
+        TD_PORTAL_CONSOLE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_marker(
         &mut evidence.td_sandbox_kernel,
@@ -5756,7 +5784,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 59] {
+    fn all_console_markers() -> [&'static str; 60] {
         [
             MARKER,
             EROFS_MARKER,
@@ -5794,6 +5822,7 @@ mod tests {
             TD_INIT_RUNTIME_MARKER,
             TD_LOGIN_RUNTIME_MARKER,
             TD_BUSD_RUNTIME_MARKER,
+            TD_PORTAL_CONSOLE_MARKER,
             TD_SANDBOX_KERNEL_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
@@ -5897,6 +5926,33 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_jail_seccomp);
+    }
+
+    #[test]
+    fn portal_evidence_requires_the_exact_supervisor_console_line() {
+        assert_eq!(
+            TD_PORTAL_CONSOLE_MARKER.strip_prefix("portal-evidence: "),
+            Some(TD_PORTAL_RUNTIME_MARKER)
+        );
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_PORTAL_RUNTIME_MARKER}\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_portal_runtime);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\nportal: {TD_PORTAL_RUNTIME_MARKER}\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_portal_runtime);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_PORTAL_CONSOLE_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_portal_runtime);
     }
 
     #[test]
@@ -6347,6 +6403,7 @@ mod tests {
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
             TD_BUSD_RUNTIME_MARKER,
+            TD_PORTAL_CONSOLE_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_FIREFOX_BOOT_MARKER,
@@ -6408,6 +6465,7 @@ mod tests {
         assert!(evidence.td_util_runtime);
         assert!(evidence.td_txt_runtime);
         assert!(evidence.td_busd_runtime);
+        assert!(evidence.td_portal_runtime);
         assert!(evidence.td_jail_transition);
         assert!(evidence.td_jail_seccomp);
         assert!(evidence.td_firefox);

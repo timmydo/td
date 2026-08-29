@@ -738,11 +738,24 @@ pub const TD_LOGIN_RUNTIME_MARKER: &str = "TD-LOGIN-RUN-OK";
 ///
 /// It stops at the handshake, which is what `probe` is. `Hello`, the unique
 /// names, the bus's own interface and directed routing are held up host-side and
-/// against sd-bus, libdbus and GDBus; nothing on this image speaks D-Bus yet to
-/// hold them up HERE, and the portal (APPLICATIONS.md §E) is what will. Recording
-/// the limit is the point: a green marker here means the bus is reachable, not
-/// that anything has been routed over it.
+/// against sd-bus, libdbus and GDBus; the separate portal marker now holds up
+/// one live routed client exchange on the target image. Recording the boundary
+/// is the point: this marker alone means the bus is reachable, not that anything
+/// has been routed over it.
 pub const TD_BUSD_RUNTIME_MARKER: &str = "TD-BUSD-RUN-OK";
+
+/// Printed by a separate unprivileged client only after the supervised portal
+/// owns its reserved public name, answers the Settings version property, and
+/// returns the exact two-namespace dictionary compiled from the immutable
+/// session settings file. The reply is synchronous: no Request object or
+/// Response signal participates in this proof.
+///
+/// DUPLICATED as `READY_MARKER` in td-portal/src/main.rs. The td-portal recipe
+/// pins the literal and the call that emits it. The host recognizes the exact
+/// `portal-evidence: <marker>` line after td-svc applies its trusted service
+/// prefix, not this unframed substring.
+pub const TD_PORTAL_RUNTIME_MARKER: &str =
+    "TD-PORTAL-READY namespaces=2 settings=10 version=1";
 
 /// Printed by the unprivileged compositor only after its first framebuffer
 /// paint succeeded and its mode-0600 Wayland socket is listening.
