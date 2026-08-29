@@ -1,7 +1,8 @@
 use crate::ladder::{
     post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, CODEX_BWRAP_VERSION_OUTPUT, CODEX_RUNTIME_MARKER,
-    CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN, GIT_HTTPS_RUNTIME_MARKER,
+    CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN, FIREFOX_INPUT_CMDLINE_TOKEN,
+    GIT_HTTPS_RUNTIME_MARKER,
     GIT_HTTPS_TEST_URL, GIT_RUNTIME_MARKER, GREETER_MARKER,
     NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
@@ -192,10 +193,12 @@ const FIREFOX_CONTENT_RGB_A: &str = "ff00ff";
 const FIREFOX_CONTENT_RGB_B: &str = "00ff00";
 const FIREFOX_HTTPS_DOCUMENT: &str = concat!(
     "<!doctype html><title>TD-FIREFOX-HTTPS-CONTENT-V1</title>",
-    "<style>html,body{width:100%;height:100%;margin:0}",
-    "body{display:flex}.a,.b{flex:1}.a{background:#ff00ff}",
-    ".b{background:#00ff00}</style>",
-    "<div class=a></div><div class=b></div>",
+    "<style>html,body{width:100%;min-height:300vh;margin:0}",
+    "body{display:grid;grid-template-columns:1fr 1fr;cursor:crosshair}",
+    ".a,.b{height:300vh}.a{background:#ff00ff}.b{background:#00ff00}",
+    "#td-input{position:fixed;left:58%;top:24px;width:28%;z-index:1}",
+    "</style><div class=a></div><div class=b></div>",
+    "<input id=td-input aria-label=td-input>",
 );
 const FIREFOX_AUTOTEST_HOST_ROOT: &str = "/run/user/1000/td-app/firefox";
 const FIREFOX_AUTOTEST_PROFILE: &str = "/run/user/1000/td-app/profile";
@@ -217,6 +220,14 @@ const FIREFOX_COMPLETION_PATH: &str = "/run/td-firefox-evidence-complete";
 const FIREFOX_COMPLETION_TMP_PATH: &str =
     "/run/.td-firefox-evidence-complete.tmp";
 const FIREFOX_COMPLETION: &str = "td-firefox-evidence-complete-v1";
+const FIREFOX_INPUT_COMPLETION_PATH: &str = "/run/td-firefox-input-complete";
+const FIREFOX_INPUT_COMPLETION_TMP_PATH: &str = "/run/.td-firefox-input-complete.tmp";
+const FIREFOX_INPUT_COMPLETION: &str = "td-firefox-input-complete-v1";
+// Each td-jail connection has this independent wall-clock deadline. Three
+// attempts cover the intentional host/guest hand-off race without multiplying
+// a stalled Marionette endpoint into an hour-long service.
+const FIREFOX_INPUT_TIMEOUT_SECS: u16 = 60;
+const FIREFOX_INPUT_ATTEMPTS: u16 = 3;
 const FIREFOX_READY_TIMEOUT_SECS: u16 = 180;
 const FIREFOX_READY_ATTEMPTS: u16 = 2;
 const FIREFOX_RETRY_MARGIN_SECS: u16 = 60;
@@ -227,13 +238,19 @@ const FIREFOX_SUPPORT_ATTEMPTS: u16 = 3;
 const FIREFOX_EVIDENCE_WAIT_ITERATIONS: u16 =
     FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS
         + FIREFOX_RETRY_MARGIN_SECS;
+// `after=` releases this daemon when firefox-evidence starts, not when its
+// atomic completion appears. Cover the evidence poll loop plus every support
+// session that can legally extend one of those iterations.
+const FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS: u16 =
+    FIREFOX_EVIDENCE_WAIT_ITERATIONS
+        + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS;
 // The greeter may observe deployment health before Firefox's first ready
 // timeout starts the evidence unit. Its allowance includes that offset and
-// each separately bounded Firefox support attempt.
+// each separately bounded Firefox support and staged-input attempt.
 const FIREFOX_GREETER_WAIT_ITERATIONS: u16 =
     FIREFOX_READY_TIMEOUT_SECS
-        + FIREFOX_EVIDENCE_WAIT_ITERATIONS
-        + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS;
+        + FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS
+        + FIREFOX_INPUT_TIMEOUT_SECS * FIREFOX_INPUT_ATTEMPTS * 3;
 
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
     name: FIREFOX_NAME,
@@ -944,7 +961,7 @@ fn td_svc_conf_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 19] = [
+const TD_SVC_UNITS: [&str; 20] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -960,6 +977,7 @@ const TD_SVC_UNITS: [&str; 19] = [
     "firefox-autotest",
     "firefox",
     "firefox-evidence",
+    "firefox-input",
     "bootsuccess",
     "bootfail",
     "sshd",
@@ -1235,6 +1253,17 @@ fn build_td_svc_conf() -> String {
          after=firefox\n\
          restart=never\n\
          \n\
+         # The first full-system QEMU boot alone asks this root-owned oracle to\n\
+         # stage physical virtio input. It first waits for the support oracle's\n\
+         # atomic completion so two Marionette sessions never race. Firefox then\n\
+         # arms content and chrome listeners before the host advances through an\n\
+         # open-menu and outside-dismiss handshake.\n\
+         [firefox-input]\n\
+         type=daemon\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do if /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input final; then /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         after=firefox-evidence\n\
+         restart=never\n\
+         \n\
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
@@ -1319,7 +1348,13 @@ fn build_td_svc_conf() -> String {
         firefox_completion_tmp_path = FIREFOX_COMPLETION_TMP_PATH,
         firefox_ready_timeout = FIREFOX_READY_TIMEOUT_SECS,
         firefox_evidence_wait = FIREFOX_EVIDENCE_WAIT_ITERATIONS,
+        firefox_input_evidence_wait = FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
         firefox_support_attempts = FIREFOX_SUPPORT_ATTEMPTS,
+        firefox_input_cmdline_token = FIREFOX_INPUT_CMDLINE_TOKEN,
+        firefox_input_wait = FIREFOX_INPUT_ATTEMPTS,
+        firefox_input_completion = FIREFOX_INPUT_COMPLETION,
+        firefox_input_completion_path = FIREFOX_INPUT_COMPLETION_PATH,
+        firefox_input_completion_tmp_path = FIREFOX_INPUT_COMPLETION_TMP_PATH,
     )
 }
 
@@ -2586,12 +2621,17 @@ fn build_profile(sys: &SystemDef) -> String {
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done; \
          case \"$wait\" in ''|*[!0-9]*|0) wait=1;; esac; \
+         input_required=0; case \" $(/bin/td-util cat /proc/cmdline) \" in \
+         *\" {firefox_input_cmdline_token} \"*) input_required=1;; esac; \
          n=0; firefox_wait=0; while [ \"$n\" -lt \"$wait\" ]; do \
          status=$(/bin/td-util cat /run/td-boot-success-ok 2>/dev/null); \
          firefox=$(/bin/td-util cat {firefox_evidence_path} 2>/dev/null); \
          firefox_complete=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); \
+         input_ok=1; if [ \"$input_required\" = 1 ]; then input_ok=0; \
+         input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); \
+         [ \"$input\" = {firefox_input_completion} ] && input_ok=1; fi; \
          [ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {firefox_evidence} ] && \
-         [ \"$firefox_complete\" = {firefox_completion} ] && break; \
+         [ \"$firefox_complete\" = {firefox_completion} ] && [ \"$input_ok\" = 1 ] && break; \
          if [ \"$status\" = td-boot-success-v1 ]; then \
          firefox_wait=$((firefox_wait+1)); \
          [ \"$firefox_wait\" -ge {firefox_greeter_wait} ] && break; fi; \
@@ -2602,6 +2642,9 @@ fn build_profile(sys: &SystemDef) -> String {
         firefox_evidence_path = FIREFOX_EVIDENCE_PATH,
         firefox_completion = FIREFOX_COMPLETION,
         firefox_completion_path = FIREFOX_COMPLETION_PATH,
+        firefox_input_cmdline_token = FIREFOX_INPUT_CMDLINE_TOKEN,
+        firefox_input_completion = FIREFOX_INPUT_COMPLETION,
+        firefox_input_completion_path = FIREFOX_INPUT_COMPLETION_PATH,
         firefox_greeter_wait = FIREFOX_GREETER_WAIT_ITERATIONS,
     ));
     s
@@ -4684,11 +4727,14 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                  /bin/td-login exec-as tester -- /bin/{FIREFOX_NAME};; esac'")
         );
         assert!(FIREFOX_HTTPS_DOCUMENT.starts_with("<!doctype html>"));
-        assert!(FIREFOX_HTTPS_DOCUMENT.contains("body{display:flex}"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("body{display:grid"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("min-height:300vh"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("cursor:crosshair"));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains(".a{background:#ff00ff}"));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains(".b{background:#00ff00}"));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains("<div class=a></div>"));
-        assert!(FIREFOX_HTTPS_DOCUMENT.contains("width:100%;height:100%"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("width:100%;min-height:300vh"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("<input id=td-input"));
         assert!(!FIREFOX_HTTPS_DOCUMENT.bytes().any(|byte| {
             matches!(byte, b'\'' | b'"' | b'$' | b'\\' | b'\n') || byte == 0x60
         }));
@@ -4733,7 +4779,12 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         assert_eq!(
             FIREFOX_GREETER_WAIT_ITERATIONS,
             FIREFOX_READY_TIMEOUT_SECS
-                + FIREFOX_EVIDENCE_WAIT_ITERATIONS
+                + FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS
+                + FIREFOX_INPUT_TIMEOUT_SECS * FIREFOX_INPUT_ATTEMPTS * 3
+        );
+        assert_eq!(
+            FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
+            FIREFOX_EVIDENCE_WAIT_ITERATIONS
                 + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS
         );
         assert!(
@@ -4830,6 +4881,37 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             unit_after("firefox-evidence").contains(&"firefox".to_string())
         );
         assert!(unit_key("firefox-evidence", "requires").is_none());
+
+        let input = unit_key("firefox-input", "exec").unwrap_or_default();
+        assert!(input.starts_with(&format!(
+            "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" \
+             {FIREFOX_INPUT_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac; \
+             n=0; while [ \"$n\" -lt {FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS} ]; do \
+             evidence=$(/bin/td-util cat {FIREFOX_COMPLETION_PATH} 2>/dev/null); \
+             [ \"$evidence\" = {FIREFOX_COMPLETION} ] && break"
+        )));
+        assert!(input.contains(&format!(
+            "[ \"$n\" -lt {FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS} ] || exit 1; \
+             n=0; while [ \"$n\" -lt {FIREFOX_INPUT_ATTEMPTS} ]; do \
+             /bin/td-login exec-as tester -- /bin/td-jail \
+             --probe-firefox-input arm && break"
+        )));
+        for stage in ["arm", "menu", "final"] {
+            assert_eq!(
+                input.matches(&format!("--probe-firefox-input {stage}")).count(),
+                1
+            );
+        }
+        assert!(input.contains(&format!(
+            "{FIREFOX_INPUT_COMPLETION} > {FIREFOX_INPUT_COMPLETION_TMP_PATH}"
+        )));
+        assert!(input.contains(&format!(
+            "/bin/mv {FIREFOX_INPUT_COMPLETION_TMP_PATH} {FIREFOX_INPUT_COMPLETION_PATH}"
+        )));
+        assert_eq!(unit_after("firefox-input"), vec!["firefox-evidence"]);
+        assert_eq!(unit_key("firefox-input", "type").as_deref(), Some("daemon"));
+        assert_eq!(unit_key("firefox-input", "restart").as_deref(), Some("never"));
+        assert!(unit_key("firefox-input", "requires").is_none());
 
         assert!(
             !build_td_svc_conf().contains("/bin/td-ui-demo"),
@@ -5126,6 +5208,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 ],
             ),
             ("firefox-evidence", vec!["firefox"]),
+            ("firefox-input", vec!["firefox-evidence"]),
             (
                 "bootsuccess",
                 sysinit
@@ -7963,7 +8046,13 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                     "firefox_complete=$(/bin/td-util cat {FIREFOX_COMPLETION_PATH} 2>/dev/null)"
                 ))
                 && profile.contains(&format!(
-                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {FIREFOX_EVIDENCE} ] && [ \"$firefox_complete\" = {FIREFOX_COMPLETION} ] && break"
+                    "input=$(/bin/td-util cat {FIREFOX_INPUT_COMPLETION_PATH} 2>/dev/null)"
+                ))
+                && profile.contains(&format!(
+                    "[ \"$input\" = {FIREFOX_INPUT_COMPLETION} ] && input_ok=1"
+                ))
+                && profile.contains(&format!(
+                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {FIREFOX_EVIDENCE} ] && [ \"$firefox_complete\" = {FIREFOX_COMPLETION} ] && [ \"$input_ok\" = 1 ] && break"
                 )),
             "Firefox evidence must be exact without controlling deployment health"
         );

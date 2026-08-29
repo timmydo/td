@@ -13,13 +13,136 @@ const MAX_HEADER_DIGITS: usize = 7;
 const HELLO: &str = r#"{"applicationType":"gecko","marionetteProtocol":3}"#;
 const NEW_SESSION: &str = r#"[0,1,"WebDriver:NewSession",{}]"#;
 const NEW_SESSION_PREFIX: &str = r#"[1,1,null,{"sessionId":"#;
-const SET_CONTEXT: &str = r#"[0,2,"Marionette:SetContext",{"value":"chrome"}]"#;
-const SET_CONTEXT_RESPONSE: &str = r#"[1,2,null,{"value":null}]"#;
-const DELETE_SESSION: &str = r#"[0,4,"WebDriver:DeleteSession",{}]"#;
-const DELETE_SESSION_RESPONSE: &str = r#"[1,4,null,{"value":null}]"#;
 const EXECUTE_RESPONSE_PREFIX: &str = "[1,3,null,{\"value\":\"";
 const EXECUTE_RESPONSE_SUFFIX: &str = r#""}]"#;
 const REPORT_PREFIX: &str = "TD-FIREFOX-SUPPORT-V1";
+const INPUT_CONTENT_ARMED: &str = "TD-FIREFOX-INPUT-CONTENT-ARMED";
+const INPUT_CHROME_ARMED: &str = "TD-FIREFOX-INPUT-CHROME-ARMED";
+const INPUT_CONTENT_OK: &str = "TD-FIREFOX-INPUT-CONTENT-OK";
+const INPUT_MENU_OK: &str = "TD-FIREFOX-INPUT-MENU-OK";
+const INPUT_FINAL_OK: &str = "TD-FIREFOX-INPUT-FINAL-OK";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputStage {
+    Arm,
+    Menu,
+    Final,
+}
+
+impl InputStage {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "arm" => Some(Self::Arm),
+            "menu" => Some(Self::Menu),
+            "final" => Some(Self::Final),
+            _ => None,
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Arm => "TD-FIREFOX-INPUT-ARMED",
+            Self::Menu => "TD-FIREFOX-INPUT-MENU",
+            Self::Final => "TD-FIREFOX-INPUT-OK",
+        }
+    }
+}
+
+const CONTENT_ARM_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const input = document.getElementById("td-input");
+if (!input) {
+  done("TD-FIREFOX-INPUT-ERROR:no-input");
+} else {
+  const state = { moves: 0, inputs: 0, wheels: 0, contexts: 0 };
+  window.__tdPhysicalInput = state;
+  document.addEventListener("mousemove", () => state.moves++);
+  input.addEventListener("input", () => state.inputs++);
+  document.addEventListener("wheel", event => {
+    if (event.deltaY > 0) state.wheels++;
+  }, { passive: true });
+  document.addEventListener("contextmenu", () => state.contexts++);
+  input.value = "";
+  input.focus();
+  done("TD-FIREFOX-INPUT-CONTENT-ARMED");
+}
+"#;
+
+const CHROME_ARM_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const win = Services.wm.getMostRecentWindow("navigator:browser");
+const popup = win && win.document.getElementById("contentAreaContextMenu");
+if (!popup) {
+  done("TD-FIREFOX-INPUT-ERROR:no-context-menu");
+} else {
+  const state = { shown: 0, hidden: 0 };
+  win.__tdPhysicalInput = state;
+  popup.addEventListener("popupshown", () => state.shown++, { once: true });
+  popup.addEventListener("popuphidden", () => state.hidden++, { once: true });
+  done("TD-FIREFOX-INPUT-CHROME-ARMED");
+}
+"#;
+
+const CONTENT_MENU_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const state = window.__tdPhysicalInput;
+  const input = document.getElementById("td-input");
+  const ok = state && input && state.moves > 0 && state.inputs > 0 &&
+    state.wheels > 0 && state.contexts > 0 && input.value === "x" &&
+    window.scrollY > 0;
+  if (!ok && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  const detail = state ? [state.moves, state.inputs, state.wheels,
+    state.contexts, input && input.value === "x", window.scrollY].join(",") :
+    "no-state";
+  done(ok ? "TD-FIREFOX-INPUT-CONTENT-OK" :
+    "TD-FIREFOX-INPUT-ERROR:content:" + detail);
+};
+check();
+"#;
+
+const CHROME_MENU_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  const popup = win && win.document.getElementById("contentAreaContextMenu");
+  const state = win && win.__tdPhysicalInput;
+  const ok = state && state.shown > 0 && popup && popup.state === "open";
+  if (!ok && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  done(ok ? "TD-FIREFOX-INPUT-MENU-OK" :
+    "TD-FIREFOX-INPUT-ERROR:menu:" + (state ? state.shown + "," +
+    (popup && popup.state) : "no-state"));
+};
+check();
+"#;
+
+const CHROME_FINAL_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  const popup = win && win.document.getElementById("contentAreaContextMenu");
+  const state = win && win.__tdPhysicalInput;
+  const ok = state && state.shown > 0 && state.hidden > 0 && popup &&
+    popup.state === "closed";
+  if (!ok && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  done(ok ? "TD-FIREFOX-INPUT-FINAL-OK" :
+    "TD-FIREFOX-INPUT-ERROR:final:" + (state ? state.shown + "," +
+    state.hidden + "," + (popup && popup.state) : "no-state"));
+};
+check();
+"#;
 
 // This runs only after the exact QEMU autotest launch enabled Marionette and
 // opted into privileged script execution. It reads Firefox's own about:support
@@ -192,6 +315,18 @@ pub(crate) fn probe_support() -> io::Result<SupportReport> {
     probe_stream(&mut stream)
 }
 
+pub(crate) fn probe_input(stage: InputStage) -> io::Result<&'static str> {
+    let address = SocketAddr::from(([127, 0, 0, 1], MARIONETTE_PORT));
+    let deadline = Instant::now()
+        .checked_add(PROBE_DEADLINE)
+        .ok_or_else(|| io::Error::other("Firefox input probe deadline overflow"))?;
+    let stream = TcpStream::connect_timeout(&address, remaining(deadline)?)
+        .map_err(|error| contextual("connect to Firefox Marionette on loopback", error))?;
+    let mut stream = DeadlineStream { stream, deadline };
+    probe_input_stream(&mut stream, stage)?;
+    Ok(stage.marker())
+}
+
 struct DeadlineStream {
     stream: TcpStream,
     deadline: Instant,
@@ -229,22 +364,13 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Firefox support probe exceeded its 60-second deadline",
+                "Firefox probe exceeded its 60-second deadline",
             )
         })
 }
 
 fn probe_stream<S: Read + Write>(stream: &mut S) -> io::Result<SupportReport> {
-    let hello = read_frame(stream)
-        .map_err(|error| contextual("read Firefox Marionette greeting", error))?;
-    require_exact("Marionette greeting", &hello, HELLO)?;
-    write_frame(stream, NEW_SESSION)
-        .map_err(|error| contextual("write Firefox new-session command", error))?;
-    let new_session = read_frame(stream)
-        .map_err(|error| contextual("read Firefox new-session response", error))?;
-    if !new_session.starts_with(NEW_SESSION_PREFIX) || !new_session.ends_with("}}]") {
-        return Err(unexpected("new-session response", &new_session));
-    }
+    start_session(stream)?;
 
     let result = run_session_probe(stream);
     let cleanup = delete_session(stream);
@@ -258,12 +384,92 @@ fn probe_stream<S: Read + Write>(stream: &mut S) -> io::Result<SupportReport> {
     }
 }
 
-fn run_session_probe<S: Read + Write>(stream: &mut S) -> io::Result<SupportReport> {
-    write_frame(stream, SET_CONTEXT)
+fn probe_input_stream<S: Read + Write>(stream: &mut S, stage: InputStage) -> io::Result<()> {
+    start_session(stream)?;
+    let result = run_input_stage(stream, stage);
+    let cleanup = delete_input_session(stream);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe), Err(cleanup)) => Err(io::Error::other(format!(
+            "Firefox input probe failed: {probe}; session cleanup also failed: {cleanup}"
+        ))),
+    }
+}
+
+fn start_session<S: Read + Write>(stream: &mut S) -> io::Result<()> {
+    let hello = read_frame(stream)
+        .map_err(|error| contextual("read Firefox Marionette greeting", error))?;
+    require_exact("Marionette greeting", &hello, HELLO)?;
+    write_frame(stream, NEW_SESSION)
+        .map_err(|error| contextual("write Firefox new-session command", error))?;
+    let response = read_frame(stream)
+        .map_err(|error| contextual("read Firefox new-session response", error))?;
+    if !response.starts_with(NEW_SESSION_PREFIX) || !response.ends_with("}}]") {
+        return Err(unexpected("new-session response", &response));
+    }
+    Ok(())
+}
+
+fn run_input_stage<S: Read + Write>(stream: &mut S, stage: InputStage) -> io::Result<()> {
+    match stage {
+        InputStage::Arm => {
+            set_context(stream, 2, "content")?;
+            require_script_value(stream, 3, CONTENT_ARM_SCRIPT, INPUT_CONTENT_ARMED)?;
+            set_context(stream, 4, "chrome")?;
+            require_script_value(stream, 5, CHROME_ARM_SCRIPT, INPUT_CHROME_ARMED)
+        }
+        InputStage::Menu => {
+            set_context(stream, 2, "content")?;
+            require_script_value(stream, 3, CONTENT_MENU_SCRIPT, INPUT_CONTENT_OK)?;
+            set_context(stream, 4, "chrome")?;
+            require_script_value(stream, 5, CHROME_MENU_SCRIPT, INPUT_MENU_OK)
+        }
+        InputStage::Final => {
+            set_context(stream, 2, "chrome")?;
+            require_script_value(stream, 3, CHROME_FINAL_SCRIPT, INPUT_FINAL_OK)
+        }
+    }
+}
+
+fn set_context<S: Read + Write>(stream: &mut S, id: u8, value: &str) -> io::Result<()> {
+    let command = format!(r#"[0,{id},"Marionette:SetContext",{{"value":"{value}"}}]"#);
+    write_frame(stream, &command)
         .map_err(|error| contextual("write Firefox set-context command", error))?;
-    let context = read_frame(stream)
+    let response = read_frame(stream)
         .map_err(|error| contextual("read Firefox set-context response", error))?;
-    require_exact("set-context response", &context, SET_CONTEXT_RESPONSE)?;
+    require_exact(
+        "set-context response",
+        &response,
+        &format!(r#"[1,{id},null,{{"value":null}}]"#),
+    )
+}
+
+fn require_script_value<S: Read + Write>(
+    stream: &mut S,
+    id: u8,
+    script: &str,
+    expected: &str,
+) -> io::Result<()> {
+    let command = execute_command_with_id(id, script)?;
+    write_frame(stream, &command)
+        .map_err(|error| contextual("write Firefox input script", error))?;
+    let response = read_frame(stream)
+        .map_err(|error| contextual("read Firefox input script response", error))?;
+    let prefix = format!(r#"[1,{id},null,{{"value":""#);
+    let value = response
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(EXECUTE_RESPONSE_SUFFIX))
+        .ok_or_else(|| unexpected("execute-script response", &response))?;
+    require_exact("input script value", value, expected)
+}
+
+fn delete_input_session<S: Read + Write>(stream: &mut S) -> io::Result<()> {
+    delete_session_with_id(stream, 6)
+}
+
+fn run_session_probe<S: Read + Write>(stream: &mut S) -> io::Result<SupportReport> {
+    set_context(stream, 2, "chrome")?;
 
     let command = execute_command(REPORT_SCRIPT)?;
     write_frame(stream, &command)
@@ -288,24 +494,33 @@ fn run_session_probe<S: Read + Write>(stream: &mut S) -> io::Result<SupportRepor
 }
 
 fn delete_session<S: Read + Write>(stream: &mut S) -> io::Result<()> {
-    write_frame(stream, DELETE_SESSION)
+    delete_session_with_id(stream, 4)
+}
+
+fn delete_session_with_id<S: Read + Write>(stream: &mut S, id: u8) -> io::Result<()> {
+    let command = format!(r#"[0,{id},"WebDriver:DeleteSession",{{}}]"#);
+    write_frame(stream, &command)
         .map_err(|error| contextual("write Firefox delete-session command", error))?;
     let response = read_frame(stream)
         .map_err(|error| contextual("read Firefox delete-session response", error))?;
     require_exact(
         "delete-session response",
         &response,
-        DELETE_SESSION_RESPONSE,
+        &format!(r#"[1,{id},null,{{"value":null}}]"#),
     )
 }
 
 fn execute_command(script: &str) -> io::Result<String> {
+    execute_command_with_id(3, script)
+}
+
+fn execute_command_with_id(id: u8, script: &str) -> io::Result<String> {
     let escaped = json_string(script);
     let command =
-        format!("[0,3,\"WebDriver:ExecuteAsyncScript\",{{\"script\":{escaped},\"args\":[]}}]");
+        format!("[0,{id},\"WebDriver:ExecuteAsyncScript\",{{\"script\":{escaped},\"args\":[]}}]");
     if command.len() > MAX_COMMAND_BYTES {
         return Err(io::Error::other(
-            "Firefox support command exceeded its 64 KiB bound",
+            "Firefox Marionette command exceeded its 64 KiB bound",
         ));
     }
     Ok(command)
@@ -898,9 +1113,9 @@ mod tests {
         let responses = [
             HELLO.to_string(),
             r#"[1,1,null,{"sessionId":"td","capabilities":{}}]"#.to_string(),
-            SET_CONTEXT_RESPONSE.to_string(),
+            r#"[1,2,null,{"value":null}]"#.to_string(),
             format!("{EXECUTE_RESPONSE_PREFIX}{GOOD_REPORT}{EXECUTE_RESPONSE_SUFFIX}"),
-            DELETE_SESSION_RESPONSE.to_string(),
+            r#"[1,4,null,{"value":null}]"#.to_string(),
         ];
         let mut input = Vec::new();
         for response in responses {
@@ -918,13 +1133,152 @@ mod tests {
 
         let mut commands = Cursor::new(io.output);
         assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
-        assert_eq!(read_frame(&mut commands).unwrap(), SET_CONTEXT);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"chrome"}]"#
+        );
         assert_eq!(
             read_frame(&mut commands).unwrap(),
             execute_command(REPORT_SCRIPT).unwrap()
         );
-        assert_eq!(read_frame(&mut commands).unwrap(), DELETE_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,4,"WebDriver:DeleteSession",{}]"#
+        );
         assert!(read_frame(&mut commands).is_err());
+    }
+
+    fn input_transcript(stage: InputStage, values: &[&str]) -> ScriptedIo {
+        let mut responses = vec![
+            HELLO.to_string(),
+            r#"[1,1,null,{"sessionId":"td","capabilities":{}}]"#.to_string(),
+        ];
+        match stage {
+            InputStage::Arm | InputStage::Menu => {
+                responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
+                responses.push(format!(
+                    "[1,3,null,{{\"value\":\"{}\"}}]",
+                    values.first().copied().unwrap_or_default()
+                ));
+                responses.push(r#"[1,4,null,{"value":null}]"#.to_string());
+                responses.push(format!(
+                    "[1,5,null,{{\"value\":\"{}\"}}]",
+                    values.get(1).copied().unwrap_or_default()
+                ));
+            }
+            InputStage::Final => {
+                responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
+                responses.push(format!(
+                    "[1,3,null,{{\"value\":\"{}\"}}]",
+                    values.first().copied().unwrap_or_default()
+                ));
+            }
+        }
+        responses.push(r#"[1,6,null,{"value":null}]"#.to_string());
+        let mut input = Vec::new();
+        for response in responses {
+            write_frame(&mut input, &response).unwrap();
+        }
+        ScriptedIo {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn staged_input_protocol_is_exact_and_fail_closed() {
+        for (stage, scripts, values) in [
+            (
+                InputStage::Arm,
+                [CONTENT_ARM_SCRIPT, CHROME_ARM_SCRIPT],
+                [INPUT_CONTENT_ARMED, INPUT_CHROME_ARMED],
+            ),
+            (
+                InputStage::Menu,
+                [CONTENT_MENU_SCRIPT, CHROME_MENU_SCRIPT],
+                [INPUT_CONTENT_OK, INPUT_MENU_OK],
+            ),
+        ] {
+            let mut io = input_transcript(stage, &values);
+            probe_input_stream(&mut io, stage).unwrap();
+            let mut commands = Cursor::new(io.output);
+            assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+            );
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                execute_command_with_id(3, scripts[0]).unwrap()
+            );
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                r#"[0,4,"Marionette:SetContext",{"value":"chrome"}]"#
+            );
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                execute_command_with_id(5, scripts[1]).unwrap()
+            );
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                r#"[0,6,"WebDriver:DeleteSession",{}]"#
+            );
+            assert!(read_frame(&mut commands).is_err());
+        }
+
+        let mut final_io = input_transcript(InputStage::Final, &[INPUT_FINAL_OK]);
+        probe_input_stream(&mut final_io, InputStage::Final).unwrap();
+        let mut commands = Cursor::new(final_io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"chrome"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CHROME_FINAL_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+
+        let mut rejected = input_transcript(
+            InputStage::Menu,
+            &[INPUT_CONTENT_OK, "TD-FIREFOX-INPUT-ERROR:menu"],
+        );
+        assert!(probe_input_stream(&mut rejected, InputStage::Menu).is_err());
+    }
+
+    #[test]
+    fn input_scripts_bind_physical_content_and_chrome_events() {
+        for event in ["mousemove", "input", "wheel", "contextmenu"] {
+            assert!(CONTENT_ARM_SCRIPT.contains(event));
+        }
+        assert!(CONTENT_MENU_SCRIPT.contains("input.value === \"x\""));
+        assert!(CONTENT_MENU_SCRIPT.contains("window.scrollY > 0"));
+        assert!(CHROME_ARM_SCRIPT.contains("contentAreaContextMenu"));
+        assert!(CHROME_ARM_SCRIPT.contains("popupshown"));
+        assert!(CHROME_ARM_SCRIPT.contains("popuphidden"));
+        assert!(CHROME_MENU_SCRIPT.contains("popup.state === \"open\""));
+        assert!(CHROME_FINAL_SCRIPT.contains("popup.state === \"closed\""));
+        for script in [
+            CONTENT_MENU_SCRIPT,
+            CHROME_MENU_SCRIPT,
+            CHROME_FINAL_SCRIPT,
+        ] {
+            assert!(script.contains("const expires = Date.now() + 20000"));
+            assert!(script.contains("setTimeout(check, 50)"));
+        }
+        for script in [
+            CONTENT_ARM_SCRIPT,
+            CHROME_ARM_SCRIPT,
+            CONTENT_MENU_SCRIPT,
+            CHROME_MENU_SCRIPT,
+            CHROME_FINAL_SCRIPT,
+        ] {
+            assert!(execute_command_with_id(5, script).unwrap().len() < MAX_COMMAND_BYTES);
+        }
     }
 
     #[test]

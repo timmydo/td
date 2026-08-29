@@ -58,6 +58,9 @@ fn run() -> std::io::Result<()> {
             transition::probe_process_token(&application, &token)
         }
         transition::Mode::FirefoxSupportProbe => transition::probe_firefox_support(),
+        transition::Mode::FirefoxInputProbe { stage } => {
+            transition::probe_firefox_input(stage)
+        }
         transition::Mode::WriteFilter => transition::write_standard_filter(),
         transition::Mode::CgroupCleanupBootstrap { membership } => {
             transition::run_cgroup_cleanup_bootstrap(&membership)

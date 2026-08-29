@@ -815,6 +815,11 @@ pub struct Scene {
     pointer_x: i32,
     pointer_y: i32,
     surface_bytes: usize,
+    /// Copied current buffers whose permanent subsurface role temporarily has
+    /// no role object. The server owns the pixels, but this reservation keeps
+    /// them inside the one scene-wide byte ceiling until they are restored or
+    /// discarded.
+    inactive_surface_bytes: BTreeMap<SurfaceKey, usize>,
     /// What a drag is drawing INSTEAD of `layout`. Not a second source of
     /// truth: it is derived from `layout` on every pointer frame and dropped
     /// by every mutation of it, so nothing here can outlive what it was
@@ -853,6 +858,7 @@ impl Scene {
             pointer_x: 0,
             pointer_y: 0,
             surface_bytes: 0,
+            inactive_surface_bytes: BTreeMap::new(),
             hint: None,
             cursor: None,
             cursor_images: BTreeMap::new(),
@@ -1007,6 +1013,18 @@ impl Scene {
                 object: *surface,
             }),
             _ => None,
+        }
+    }
+
+    /// The client cursor image which is actually selected for drawing.
+    /// Retained cursor-role buffers which are not current are deliberately
+    /// absent: application evidence must prove a presented cursor, not merely
+    /// bytes a client uploaded.
+    pub(crate) fn drawn_cursor_image(&self) -> Option<(SurfaceKey, usize, usize)> {
+        let key = self.drawn_cursor_key()?;
+        match self.drawn_cursor()? {
+            DrawnCursor::Image { image, .. } => Some((key, image.width, image.height)),
+            DrawnCursor::Nothing => None,
         }
     }
 
@@ -1212,13 +1230,80 @@ impl Scene {
     /// End the association and unmap the role surface immediately. Child
     /// associations remain: they are hidden until this surface is mapped as a
     /// root again, exactly as children of any other unmapped parent are.
-    pub fn remove_subsurface(&mut self, key: SurfaceKey) -> bool {
+    fn remove_subsurface_association(&mut self, key: SurfaceKey) {
         if let Some(placed) = self.subsurfaces.remove(&key) {
             if let Some(stack) = self.subsurface_stacks.get_mut(&placed.parent) {
                 stack.retain(|entry| *entry != Some(key));
             }
         }
-        self.discard_pixels(key)
+    }
+
+    pub fn take_subsurface(&mut self, key: SurfaceKey) -> Result<Option<Surface>, String> {
+        if self.inactive_surface_bytes.contains_key(&key) {
+            return Err("subsurface already has an inactive byte reservation".to_string());
+        }
+        self.remove_subsurface_association(key);
+        self.input_regions.remove(&key);
+        let Some(surface) = self.surfaces.remove(&key) else {
+            return Ok(None);
+        };
+        self.inactive_surface_bytes.insert(key, surface.pixels.len());
+        Ok(Some(surface))
+    }
+
+    pub fn replace_inactive_subsurface(
+        &mut self,
+        key: SurfaceKey,
+        bytes: usize,
+    ) -> Result<(), String> {
+        let prior = self.inactive_surface_bytes.get(&key).copied().unwrap_or(0);
+        let retained = self
+            .surface_bytes
+            .checked_sub(prior)
+            .ok_or_else(|| "scene inactive byte accounting underflow".to_string())?;
+        let next = retained
+            .checked_add(bytes)
+            .ok_or_else(|| "scene inactive byte accounting overflow".to_string())?;
+        if next > MAX_SCENE_BYTES {
+            return Err(format!(
+                "scene surfaces need {next} bytes, exceeding {MAX_SCENE_BYTES}"
+            ));
+        }
+        self.inactive_surface_bytes.insert(key, bytes);
+        self.surface_bytes = next;
+        Ok(())
+    }
+
+    pub fn detach_inactive_subsurface(&mut self, key: SurfaceKey) {
+        if let Some(bytes) = self.inactive_surface_bytes.remove(&key) {
+            self.surface_bytes = self.surface_bytes.saturating_sub(bytes);
+        }
+    }
+
+    pub fn restore_inactive_subsurface(
+        &mut self,
+        key: SurfaceKey,
+        surface: Surface,
+    ) -> Result<(), String> {
+        if self.surfaces.contains_key(&key) {
+            return Err("subsurface is already mapped while restoring inactive pixels".to_string());
+        }
+        let Some(reserved) = self.inactive_surface_bytes.remove(&key) else {
+            return Err("subsurface has no inactive byte reservation".to_string());
+        };
+        if surface.pixels.len() != reserved {
+            self.inactive_surface_bytes.insert(key, reserved);
+            return Err("subsurface inactive byte reservation does not match its image".to_string());
+        }
+        self.surfaces.insert(key, surface);
+        Ok(())
+    }
+
+    pub fn remove_subsurface(&mut self, key: SurfaceKey) -> bool {
+        self.remove_subsurface_association(key);
+        let changed = self.discard_pixels(key);
+        self.detach_inactive_subsurface(key);
+        changed
     }
 
     /// The layout-bearing root of an active compound-surface chain. `None`
@@ -1734,13 +1819,17 @@ impl Scene {
         self.surfaces.contains_key(&key)
     }
 
-    fn discard_pixels(&mut self, key: SurfaceKey) -> bool {
+    fn take_pixels(&mut self, key: SurfaceKey) -> Option<Surface> {
         self.input_regions.remove(&key);
         if let Some(surface) = self.surfaces.remove(&key) {
             self.surface_bytes = self.surface_bytes.saturating_sub(surface.pixels.len());
-            return true;
+            return Some(surface);
         }
-        false
+        None
+    }
+
+    fn discard_pixels(&mut self, key: SurfaceKey) -> bool {
+        self.take_pixels(key).is_some()
     }
 
     pub fn unmap(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
@@ -1798,7 +1887,7 @@ impl Scene {
 
     pub fn remove_client(&mut self, client: u64) -> bool {
         let layout_changed = self.surfaces.keys().any(|key| key.client == client);
-        let removed = self
+        let mut removed = self
             .surfaces
             .iter()
             .filter(|(key, _)| key.client == client)
@@ -1806,6 +1895,13 @@ impl Scene {
                 total.saturating_add(surface.pixels.len())
             });
         self.surfaces.retain(|key, _| key.client != client);
+        self.inactive_surface_bytes.retain(|key, bytes| {
+            if key.client == client {
+                removed = removed.saturating_add(*bytes);
+                return false;
+            }
+            true
+        });
         self.input_regions.retain(|key, _| key.client != client);
         self.geometries.retain(|key, _| key.client != client);
         self.popups.retain(|key, _| key.client != client);
@@ -5799,6 +5895,74 @@ mod tests {
             scene.pointer_target(width, height).map(|point| point.key),
             Some(grandchild)
         );
+    }
+
+    #[test]
+    fn inactive_subsurface_pixels_remain_inside_the_scene_byte_ceiling() {
+        let mut scene = Scene::new();
+        let parent = SurfaceKey {
+            client: 4,
+            object: 20,
+        };
+        let child = SurfaceKey {
+            client: 4,
+            object: 21,
+        };
+        scene.commit(parent, surface([1, 2, 3, 0], 1, 1)).unwrap();
+        scene
+            .commit_subsurface(child, surface([4, 5, 6, 0], 4, 4))
+            .unwrap();
+        scene.associate_subsurface(child, parent, 0, 0);
+        let active_bytes = scene.surface_bytes;
+        let held = scene.take_subsurface(child).unwrap().unwrap();
+        assert_eq!(scene.surface_bytes, active_bytes);
+        assert_eq!(scene.inactive_surface_bytes.get(&child), Some(&64));
+        assert!(!scene.surfaces.contains_key(&child));
+        drop(held);
+
+        scene.replace_inactive_subsurface(child, 16).unwrap();
+        assert_eq!(scene.surface_bytes, active_bytes.saturating_sub(48));
+        assert!(scene
+            .replace_inactive_subsurface(child, MAX_SCENE_BYTES)
+            .is_err());
+        assert_eq!(scene.inactive_surface_bytes.get(&child), Some(&16));
+        scene
+            .restore_inactive_subsurface(child, surface([7, 8, 9, 0], 2, 2))
+            .unwrap();
+        assert_eq!(scene.surface_bytes, active_bytes.saturating_sub(48));
+        assert!(!scene.inactive_surface_bytes.contains_key(&child));
+        assert!(scene.surfaces.contains_key(&child));
+
+        let held = scene.take_subsurface(child).unwrap().unwrap();
+        assert!(!scene.remove_subsurface(child));
+        assert_eq!(scene.surface_bytes, 4);
+        drop(held);
+    }
+
+    #[test]
+    fn client_departure_refunds_inactive_subsurface_pixels() {
+        let mut scene = Scene::new();
+        let parent = SurfaceKey {
+            client: 4,
+            object: 20,
+        };
+        let child = SurfaceKey {
+            client: 4,
+            object: 21,
+        };
+        scene.commit(parent, surface([1, 2, 3, 0], 1, 1)).unwrap();
+        scene
+            .commit_subsurface(child, surface([4, 5, 6, 0], 4, 4))
+            .unwrap();
+        scene.associate_subsurface(child, parent, 0, 0);
+        let held = scene.take_subsurface(child).unwrap().unwrap();
+        assert_eq!(scene.surface_bytes, 68);
+        assert_eq!(scene.inactive_surface_bytes.get(&child), Some(&64));
+
+        assert!(scene.remove_client(4));
+        assert_eq!(scene.surface_bytes, 0);
+        assert!(!scene.inactive_surface_bytes.contains_key(&child));
+        drop(held);
     }
 
     #[test]

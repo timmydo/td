@@ -22,6 +22,7 @@ pub const PROBE_ARG: &str = "--probe-transition";
 pub const RESOURCE_PROBE_ARG: &str = "--probe-resource-caps";
 pub const PROCESS_TOKEN_PROBE_ARG: &str = "--probe-process-token";
 pub const FIREFOX_SUPPORT_PROBE_ARG: &str = "--probe-firefox-support";
+pub const FIREFOX_INPUT_PROBE_ARG: &str = "--probe-firefox-input";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
 const APPLICATION_SESSION_ARG: &str = "--internal-application-session";
 const CGROUP_CLEANUP_ARG: &str = "--internal-cgroup-cleanup";
@@ -217,6 +218,9 @@ pub enum Mode {
         token: String,
     },
     FirefoxSupportProbe,
+    FirefoxInputProbe {
+        stage: firefox::InputStage,
+    },
     WriteFilter,
     ApplicationSession {
         parent: u32,
@@ -347,6 +351,17 @@ where
             return Err(usage_error());
         }
         return Ok(Mode::FirefoxSupportProbe);
+    }
+    if mode == FIREFOX_INPUT_PROBE_ARG {
+        let stage = args
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| firefox::InputStage::parse(&value))
+            .ok_or_else(usage_error)?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::FirefoxInputProbe { stage });
     }
     if mode == FILTER_ARG {
         if args.next().is_some() {
@@ -739,7 +754,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, or --probe-firefox-support; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, or --probe-firefox-input arm|menu|final; installed applications are selected by argv[0]",
     )
 }
 
@@ -3355,6 +3370,17 @@ pub fn probe_firefox_support() -> io::Result<()> {
     writeln!(io::stdout(), "{diagnostic}")
 }
 
+pub fn probe_firefox_input(stage: firefox::InputStage) -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the Firefox input probe requires the nonzero application identity",
+        ));
+    }
+    writeln!(io::stdout(), "{}", firefox::probe_input(stage)?)
+}
+
 pub fn run_cgroup_cleanup_bootstrap(membership: &str) -> io::Result<()> {
     let _identity = cleanup_identity()?;
     cgroup::validate_expected_membership(membership)?;
@@ -4935,6 +4961,19 @@ mod tests {
             Mode::FirefoxSupportProbe
         );
         assert!(parse_mode(args(&[FIREFOX_SUPPORT_PROBE_ARG, "extra"])).is_err());
+        for (name, stage) in [
+            ("arm", firefox::InputStage::Arm),
+            ("menu", firefox::InputStage::Menu),
+            ("final", firefox::InputStage::Final),
+        ] {
+            assert_eq!(
+                parse_mode(args(&[FIREFOX_INPUT_PROBE_ARG, name])).unwrap(),
+                Mode::FirefoxInputProbe { stage }
+            );
+        }
+        assert!(parse_mode(args(&[FIREFOX_INPUT_PROBE_ARG])).is_err());
+        assert!(parse_mode(args(&[FIREFOX_INPUT_PROBE_ARG, "wait"])).is_err());
+        assert!(parse_mode(args(&[FIREFOX_INPUT_PROBE_ARG, "arm", "extra"])).is_err());
     }
 
     #[test]

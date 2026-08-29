@@ -1618,9 +1618,11 @@ sentinel regions from that surface survived placement, stacking, clipping and
 occlusion into the compositor's rendered output, a process with Firefox's
 exact `-contentproc` role token remained live in the Firefox cgroup, and
 resource accounting remained within the compiled ceilings, and Firefox's own
-renderer and inner sandbox stayed active in its live process classes, without
-manual inspection. It does not yet prove input, portals,
-external networking policy, audio, pixel-for-pixel correspondence
+renderer and inner sandbox stayed active in its live process classes. The
+first full-system boot now separately proves physical keyboard, absolute
+pointer, wheel, Firefox client-cursor, native context-menu open, and
+outside-click dismissal without manual inspection. It does not yet prove
+paste, portals, external networking policy, audio, pixel-for-pixel correspondence
 between the accepted buffer and the complete decorated output.
 
 Firefox also materially increases the first profiler report's symbolization
@@ -5689,8 +5691,8 @@ one global set, because each yearly runtime rebases Mesa and GTK.
 
 ### Budgets
 
-The browser-scale compositor boundary has landed without raising the
-512-object cap. One client may retain at most eight shm pool resources and
+The browser-scale compositor boundary retains the 512-object cap. One client
+may retain at most sixteen shm pool resources and
 256 MiB of aggregate declared shm, while each pool retains its existing
 64 MiB ceiling. The charge follows each pool resource through live buffer
 objects, pending attaches and synchronized subsurface caches after the pool
@@ -5721,10 +5723,12 @@ The deterministic offline-document lifecycle records Firefox's object, pool,
 declared-shm, callback, synchronized-commit, queued-event, queued-byte and
 copied-byte high-water marks on every QEMU boot and rejects the record if any
 compiled ceiling is crossed. It also retains the earlier observation that
-startup requests a fifth simultaneous pool resource, leaving bounded headroom
-below eight. This is a real navigation/content trace, but it is one small fixed
-page rather than the five-minute mixed workload in §H. A later cap change
-therefore still needs evidence from that broader run.
+startup requests a fifth simultaneous pool resource. The staged physical-input
+trace added a native Firefox cursor and context menu and reached nine retained
+pools, so the count ceiling rose from eight to sixteen while the independent
+256 MiB byte ceiling stayed fixed. This is a real navigation/content trace,
+but it is one small fixed page rather than the five-minute mixed workload in
+§H. A later cap change therefore still needs evidence from that broader run.
 
 And a performance caveat that belongs in the claim rather than in a
 surprise: the renderer copies client pixels and software-composites the
@@ -5980,10 +5984,10 @@ packaged selftest, boot oracle — with **network never in the gate**.
 The automated markers above deliberately do not claim this whole section.
 They prove package selection, jail execution, XDG app identity, attributed
 HTTPS pixels, the declared guest-local NSS path, renderer selection, the
-global fallback sandbox facts, and nested filters in every reported live
-required process role. The complete browser claim still requires the remaining
-items below, notably input, portal, download, isolation, soak and audio
-evidence.
+global fallback sandbox facts, nested filters in every reported live required
+process role, and the staged physical-input subset of item 7. The complete
+browser claim still requires the remaining items below, notably paste,
+portal, download, isolation, soak and audio evidence.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -6063,8 +6067,29 @@ and image commits — showing:
    its netdev string has no inbound forwarding. The network oracle therefore
    retains outbound DHCP, DNS and HTTPS without making the fixture reachable
    from the host or an external network;
-7. keyboard, pointer, cursor, wheel, a right-click menu opening and
-   dismissing, and paste from td-term into the URL bar;
+7. **keyboard, pointer, cursor, wheel, and a right-click menu opening and
+   dismissing are LANDED** in the first full-system boot. A bounded QMP client
+   connects only after Firefox's privileged test session has installed fixed
+   content and chrome listeners. Its socket lives in a short, exclusively
+   created mode-0700 directory under the host-selected temporary directory,
+   refuses a path above the Unix-socket limit, is removed on every host exit,
+   and every staged exchange shares one five-second wall-clock deadline across
+   all bytes and replies. It moves the existing virtio tablet into the
+   Firefox tile, types `x`, scrolls, and right-clicks in separate acknowledged
+   input frames. Each post-injection Marionette script waits at most twenty
+   seconds for its event state within the probe's enclosing sixty-second
+   deadline. Firefox then requires the focused test input, pointer motion,
+   input event, positive wheel event, document scroll, content context event,
+   and its native `contentAreaContextMenu` `popupshown` state before emitting
+   the intermediate marker. Only then does the host move into td-term and
+   click; the final Firefox session requires `popuphidden` and closed popup
+   state. Independently, the compositor emits one bounded marker only after
+   the exact client whose painted content satisfied readiness selects and
+   successfully repaints a non-null cursor image. Exact line parsers require
+   all four
+   stages, and the guest greeter cannot finish the input-enabled boot before
+   the final atomic completion record. Other boots expose no QMP socket or
+   Marionette input probe. **Paste from td-term into the URL bar remains.**
 8. a download reaching the app-private or explicitly granted directory;
 9. the Settings portal succeeding;
 10. five minutes of navigation with no compositor or bus disconnect;
@@ -6142,7 +6167,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The initial proof selected a fresh volatile automation profile and fixed local document, then accepted only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributed both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. Rung 27a retains that authority and replaces the local-file transport with verified HTTPS. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints deterministic content without manual inspection |
 | 27a | **Firefox HTTPS/NSS image proof — LANDED**; the source-built LibreSSL command supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The all-interface LibreSSL test listener is supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
 | 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
-| 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox input, portals, isolation, soak and sound are all proved** |
+| 27c | **Firefox physical-input image proof — LANDED**; the first system boot uses a bounded private QMP controller, the already enumerated virtio tablet, and the PC machine's PS/2 keyboard, while staged Firefox content/chrome probes and a compositor-owned cursor marker independently attest the semantic results. The handshake proves typing, pointer motion, scrolling, native right-click menu opening, outside-click dismissal, and a painted Firefox cursor without sleeps or manual observation. The test page retains the authenticated magenta/lime framebuffer sentinel and adds only a fixed focused input, scroll extent, and cursor style | the supported Firefox path accepts real emulated input end to end; clipboard paste remains separate |
+| 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox paste, portals, isolation, soak and sound are all proved** |
 
 **Two other reversals are still absent from this ladder, and that is a
 scheduling gap rather than a decision.** §O made timezone support

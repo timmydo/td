@@ -34,6 +34,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -122,6 +123,12 @@ const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PR
 const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_BOOT_MARKER;
 const TD_FIREFOX_CONTENT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CONTENT_MARKER;
 const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MARKER;
+const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_ARMED_MARKER;
+const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MENU_MARKER;
+const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MARKER;
+const TD_APPLICATION_CURSOR_PREFIX: &str =
+    "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
+const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_INPUT_CMDLINE_TOKEN;
 const TD_PROFILER_ATTRIBUTION_MARKER: &str =
     td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
@@ -221,6 +228,10 @@ const SYSTEM_GUEST_MEMORY_MIB: &str = "2048";
 const QEMU_USER_NETDEV: &str = "user,id=net0";
 const QEMU_USER_NET_DEVICE: &str = "virtio-net-pci,netdev=net0";
 const POLL: Duration = Duration::from_millis(200);
+const QMP_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_QMP_LINE_BYTES: usize = 64 * 1024;
+const MAX_QMP_RESPONSE_LINES: usize = 32;
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 
 /// Cap on retained console/diagnostic bytes. The console is scanned incrementally
 /// and only the last CAP bytes are kept, so a kernel that floods ttyS0 without
@@ -303,6 +314,10 @@ struct ConsoleEvidence {
     td_firefox: bool,
     td_firefox_content: bool,
     td_firefox_support: bool,
+    td_firefox_input_armed: bool,
+    td_firefox_input_menu: bool,
+    td_firefox_input: bool,
+    td_application_cursor: bool,
     td_profiler_attribution: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
@@ -367,6 +382,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: true,
             extra_append: "",
             user_net: false,
+            physical_input: false,
         },
         runner.scratch_dir(),
     )?;
@@ -420,6 +436,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: true,
             extra_append: "",
             user_net: false,
+            physical_input: false,
         },
         runner.scratch_dir(),
     )?;
@@ -481,10 +498,11 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     );
 
     let wait_token = autotest_wait_token(boot_timeout());
-    let first_tokens = format!(
+    let install_tokens = format!(
         "{AUTOTEST_CMDLINE_TOKEN} {wait_token} {PERSIST_WRITE_CMDLINE_TOKEN} \
          {DEPLOY_INSTALL_CMDLINE_TOKEN}"
     );
+    let first_tokens = format!("{install_tokens} {FIREFOX_INPUT_CMDLINE_TOKEN}");
     let first = boot_system_once(
         &qemu,
         &bzimage,
@@ -501,6 +519,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         "install",
         SelectionExpectation::Current,
     )?;
+    validate_firefox_input(&first)?;
     require_selected_deployment(
         &first,
         td_boot_protocol::SELECTED_CURRENT_MARKER,
@@ -546,6 +565,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: true,
             extra_append: "",
             user_net: false,
+            physical_input: false,
         },
         runner.scratch_dir(),
     )?;
@@ -671,7 +691,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &bzimage,
         &init_cpio,
         &volume,
-        &first_tokens,
+        &install_tokens,
         "failure-sequence install",
         runner.scratch_dir(),
     )?;
@@ -914,7 +934,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          presented the td-native wl_shm TERMINAL and received its first frame callback \
          ({TD_TERM_RUNTIME_MARKER}), \
          launched Firefox through td-jail and painted its first matching XDG frame \
-         ({TD_FIREFOX_BOOT_MARKER}), \
+         ({TD_FIREFOX_BOOT_MARKER}), armed content and chrome input observers \
+         ({TD_FIREFOX_INPUT_ARMED_MARKER}), drove QMP-acknowledged tablet motion, keyboard \
+         input, wheel scrolling and a native context menu into the jailed browser \
+         ({TD_FIREFOX_INPUT_MENU_MARKER}), observed Firefox's bounded client-owned cursor \
+         ({TD_APPLICATION_CURSOR_PREFIX}), and dismissed the menu with an outside click \
+         ({TD_FIREFOX_INPUT_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -949,6 +974,9 @@ fn boot_system_once(
             kill_on_marker: false,
             extra_append: tokens,
             user_net: false,
+            physical_input: tokens
+                .split_ascii_whitespace()
+                .any(|token| token == FIREFOX_INPUT_CMDLINE_TOKEN),
         },
         scratch,
     )?;
@@ -982,6 +1010,7 @@ fn boot_failed_target_once(
             kill_on_marker: false,
             extra_append: tokens,
             user_net: false,
+            physical_input: false,
         },
         scratch,
     )?;
@@ -1027,6 +1056,39 @@ fn validate_failed_target_boot(result: &BootResult, ordinal: &str) -> Result<(),
             result.reason,
             tail(&result.console, 80)
         ));
+    }
+    Ok(())
+}
+
+fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
+    for (seen, marker, description) in [
+        (
+            result.evidence.td_firefox_input_armed,
+            TD_FIREFOX_INPUT_ARMED_MARKER,
+            "Firefox did not arm its content and chrome listeners",
+        ),
+        (
+            result.evidence.td_firefox_input_menu,
+            TD_FIREFOX_INPUT_MENU_MARKER,
+            "physical pointer, keyboard, wheel, and context-menu input did not reach Firefox",
+        ),
+        (
+            result.evidence.td_application_cursor,
+            TD_APPLICATION_CURSOR_PREFIX,
+            "Firefox did not present a bounded client-owned cursor image",
+        ),
+        (
+            result.evidence.td_firefox_input,
+            TD_FIREFOX_INPUT_MARKER,
+            "the outside click did not dismiss Firefox's native context menu",
+        ),
+    ] {
+        if !seen {
+            return Err(format!(
+                "{description}; missing console evidence {marker:?}. Last serial output:\n{}",
+                tail(&result.console, 80)
+            ));
+        }
     }
     Ok(())
 }
@@ -1740,6 +1802,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: false,
             extra_append: &tokens,
             user_net: true,
+            physical_input: false,
         },
         runner.scratch_dir(),
     )?;
@@ -1867,6 +1930,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: true,
             extra_append: "",
             user_net: false,
+            physical_input: false,
         },
         runner.scratch_dir(),
     )?;
@@ -2936,6 +3000,9 @@ struct BootPlan<'a> {
     /// none`, so the guest's td-netd can DHCP, resolve, and reach a host — the
     /// `qemu-boot-net` mode. `false` (every other mode): no network, hermetic and offline.
     user_net: bool,
+    /// Ask the bounded QMP controller to inject the first boot's staged
+    /// Firefox keyboard, tablet, wheel, and outside-click sequence.
+    physical_input: bool,
 }
 
 /// Boot `bzImage` + `initramfs` under qemu per `plan` (see `BootPlan`), capturing ttyS0 to
@@ -2975,12 +3042,10 @@ fn boot(
     //   tty/stdio games (unlike -nographic, which wants a terminal on stdin).
     // -display none / -monitor none: fully headless. The attached virtio-vga still
     //   exercises fbdev and the software compositor; only its host display is hidden.
-    // -device virtio-tablet-pci: an ABSOLUTE pointer. Headless it delivers no motion
-    //   — there is no host cursor to follow — but it still ENUMERATES, and that is
-    //   the half this proves: the guest binds it, evdev publishes the node, and the
-    //   compositor's EVIOCGABS gets a span back. The oracle latches the marker that
-    //   answer produces, which is the only place a real device answering is visible
-    //   (the unit gate has no absolute device to ask).
+    // -device virtio-tablet-pci: an ABSOLUTE pointer. With no QMP controller a
+    //   headless run has no host cursor to drive it, but it still enumerates. The
+    //   physical-input boot additionally injects acknowledged QMP events through
+    //   this same device, proving both enumeration and delivery.
     // Networking is attached conditionally below (a user-mode NIC for qemu-boot-net,
     // else `-nic none`) — qemu's default is an implicit user-mode NIC, so every mode
     // sets one explicitly.
@@ -2999,6 +3064,17 @@ fn boot(
     // exact path, correct even if the base dir contains a comma. (Do not "escape"
     // this.)
     let serial = format!("file:{}", console_path.display());
+    static QMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let qmp_scratch = if plan.physical_input {
+        Some(Scratch {
+            dir: create_qmp_scratch_dir(&env::temp_dir(), &QMP_SEQ)?,
+        })
+    } else {
+        None
+    };
+    let qmp_path = qmp_scratch
+        .as_ref()
+        .map(|scratch| scratch.dir.join("qmp.sock"));
     // Base cmdline: ttyS0 console, panic-reboots (=> qemu exits), and rdinit=/init runs
     // the stage-1 (or single-stage) init from the initramfs. `extra_append`, when set,
     // appends caller cmdline (qemu-boot-system's autotest token that makes the greeter
@@ -3021,6 +3097,9 @@ fn boot(
         .arg("-initrd")
         .arg(initramfs)
         .args(["-append", &append]);
+    if let Some(path) = qmp_path.as_deref() {
+        cmd.arg("-qmp").arg(qmp_arg(path));
+    }
     // Networking: either a user-mode NIC (qemu-boot-net) or none (every other mode).
     // SLIRP's user net provides DHCP (10.0.2.15/24, gw 10.0.2.2) and a DNS forwarder
     // (10.0.2.3), so the guest's td-netd can DHCP-configure, resolve, and reach a host
@@ -3054,6 +3133,7 @@ fn boot(
     let mut console_file: Option<File> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut evidence = ConsoleEvidence::default();
+    let mut physical_input = qmp_path.map(PhysicalInputController::new);
     let mut end;
     loop {
         if let Err(error) = drain_console(
@@ -3071,6 +3151,17 @@ fn boot(
                 "{error}. Last serial output:\n{}",
                 tail(&console, 80)
             ));
+        }
+        if let Some(controller) = physical_input.as_mut() {
+            if let Err(error) = controller.progress(&evidence) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let console = String::from_utf8_lossy(&buf);
+                return Err(format!(
+                    "drive staged Firefox physical input: {error}. Last serial output:\n{}",
+                    tail(&console, 80)
+                ));
+            }
         }
         if evidence.target && plan.kill_on_marker {
             let _ = child.kill();
@@ -3333,6 +3424,10 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FIREFOX_BOOT_MARKER),
         exact_line_window(TD_FIREFOX_CONTENT_MARKER),
         exact_line_window(TD_FIREFOX_SUPPORT_MARKER),
+        exact_line_window(TD_FIREFOX_INPUT_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_INPUT_MENU_MARKER),
+        exact_line_window(TD_FIREFOX_INPUT_MARKER),
+        TD_APPLICATION_CURSOR_PREFIX.len().saturating_add(32),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
             .saturating_add(exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER)),
@@ -3519,6 +3614,22 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         buf,
         TD_FIREFOX_SUPPORT_MARKER.as_bytes(),
     );
+    latch_line_marker(
+        &mut evidence.td_firefox_input_armed,
+        buf,
+        TD_FIREFOX_INPUT_ARMED_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_input_menu,
+        buf,
+        TD_FIREFOX_INPUT_MENU_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_input,
+        buf,
+        TD_FIREFOX_INPUT_MARKER.as_bytes(),
+    );
+    latch_application_cursor(&mut evidence.td_application_cursor, buf);
     latch_prefixed_line_marker(
         &mut evidence.td_profiler_attribution,
         buf,
@@ -3631,6 +3742,53 @@ fn latch_prefixed_line_marker(
         let after_cr = after.checked_add(1).and_then(|index| haystack.get(index));
         if haystack.get(after) == Some(&b'\n')
             || (haystack.get(after) == Some(&b'\r') && after_cr == Some(&b'\n'))
+        {
+            *found = true;
+            return;
+        }
+    }
+}
+
+fn latch_application_cursor(found: &mut bool, haystack: &[u8]) {
+    if *found {
+        return;
+    }
+    let prefix = TD_APPLICATION_CURSOR_PREFIX.as_bytes();
+    for start in 1..haystack.len() {
+        if haystack.get(start.saturating_sub(1)) != Some(&b'\n') {
+            continue;
+        }
+        let Some(body_start) = start.checked_add(prefix.len()) else {
+            return;
+        };
+        if haystack.get(start..body_start) != Some(prefix) {
+            continue;
+        }
+        let Some(rest) = haystack.get(body_start..) else {
+            continue;
+        };
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let body = rest.get(..end).unwrap_or_default();
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let Ok(body) = std::str::from_utf8(body) else {
+            continue;
+        };
+        let Some((width, height)) = body.split_once(" height=") else {
+            continue;
+        };
+        let Some(width) = width.strip_prefix("width=") else {
+            continue;
+        };
+        let Some(width) = width.parse::<usize>().ok() else {
+            continue;
+        };
+        let Some(height) = height.parse::<usize>().ok() else {
+            continue;
+        };
+        if (1..=td_recipe::ladder::FIREFOX_CURSOR_MAX_DIMENSION).contains(&width)
+            && (1..=td_recipe::ladder::FIREFOX_CURSOR_MAX_DIMENSION).contains(&height)
         {
             *found = true;
             return;
@@ -3761,6 +3919,210 @@ pub(crate) fn drive_arg(disk: &Path, read_only: bool) -> OsString {
     out
 }
 
+fn qmp_arg(path: &Path) -> OsString {
+    // Unlike the neighbouring legacy `-serial file:` value, `-qmp unix:` is
+    // parsed as QemuOpts: double literal path commas so they are not separators.
+    let mut out = OsString::from("unix:");
+    let mut escaped = Vec::with_capacity(path.as_os_str().as_bytes().len());
+    for byte in path.as_os_str().as_bytes() {
+        if *byte == b',' {
+            escaped.push(b',');
+        }
+        escaped.push(*byte);
+    }
+    out.push(OsString::from_vec(escaped));
+    out.push(",server=on,wait=off");
+    out
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalInputPhase {
+    Arm,
+    Menu,
+    Final,
+}
+
+struct PhysicalInputController {
+    path: PathBuf,
+    qmp: Option<Qmp>,
+    phase: PhysicalInputPhase,
+}
+
+impl PhysicalInputController {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            qmp: None,
+            phase: PhysicalInputPhase::Arm,
+        }
+    }
+
+    fn progress(&mut self, evidence: &ConsoleEvidence) -> Result<(), String> {
+        if self.phase == PhysicalInputPhase::Arm && evidence.td_firefox_input_armed {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let mut qmp = Qmp::connect_until(&self.path, deadline)?;
+            qmp.move_absolute_until(24_576, 16_384, deadline)?;
+            // The first absolute position enters Firefox. A second in-window
+            // position is required for a real wl_pointer.motion rather than an
+            // enter event which merely carries the initial coordinates.
+            qmp.move_absolute_until(25_600, 16_384, deadline)?;
+            qmp.key_x_until(deadline)?;
+            qmp.button_until("wheel-down", deadline)?;
+            qmp.button_until("right", deadline)?;
+            self.qmp = Some(qmp);
+            self.phase = PhysicalInputPhase::Menu;
+        }
+        if self.phase == PhysicalInputPhase::Menu && evidence.td_firefox_input_menu {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before menu dismissal".to_string())?;
+            qmp.move_absolute_until(8_192, 16_384, deadline)?;
+            qmp.button_until("left", deadline)?;
+            self.phase = PhysicalInputPhase::Final;
+        }
+        Ok(())
+    }
+}
+
+struct Qmp {
+    stream: UnixStream,
+}
+
+impl Qmp {
+    fn connect_until(path: &Path, deadline: Instant) -> Result<Self, String> {
+        let stream = UnixStream::connect(path)
+            .map_err(|error| format!("connect QMP socket {}: {error}", path.display()))?;
+        let mut qmp = Self { stream };
+        let greeting = qmp.read_line_until(deadline)?;
+        if !greeting.starts_with(b"{\"QMP\":") {
+            return Err(format!(
+                "QMP sent an unexpected greeting: {}",
+                String::from_utf8_lossy(&greeting)
+            ));
+        }
+        qmp.exchange_until(r#"{"execute":"qmp_capabilities"}"#, deadline)?;
+        Ok(qmp)
+    }
+
+    fn move_absolute_until(&mut self, x: u16, y: u16, deadline: Instant) -> Result<(), String> {
+        self.exchange_until(&format!(
+            "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{{\"type\":\"abs\",\"data\":{{\"axis\":\"x\",\"value\":{x}}}}},{{\"type\":\"abs\",\"data\":{{\"axis\":\"y\",\"value\":{y}}}}}]}}}}"
+        ), deadline)
+    }
+
+    fn key_x_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.exchange_until(r#"{"execute":"input-send-event","arguments":{"events":[{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"x"}}},{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"x"}}}]}}"#, deadline)
+    }
+
+    fn button_until(&mut self, button: &str, deadline: Instant) -> Result<(), String> {
+        if !matches!(button, "left" | "right" | "wheel-down") {
+            return Err("QMP input button is outside the closed set".to_string());
+        }
+        self.exchange_until(&format!(
+            "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{{\"type\":\"btn\",\"data\":{{\"down\":true,\"button\":\"{button}\"}}}},{{\"type\":\"btn\",\"data\":{{\"down\":false,\"button\":\"{button}\"}}}}]}}}}"
+        ), deadline)
+    }
+
+    fn exchange_until(&mut self, command: &str, deadline: Instant) -> Result<(), String> {
+        if command.len() > MAX_QMP_LINE_BYTES || command.contains(['\n', '\r']) {
+            return Err("QMP command is over limit or multiline".to_string());
+        }
+        let mut wire = Vec::with_capacity(command.len().saturating_add(1));
+        wire.extend_from_slice(command.as_bytes());
+        wire.push(b'\n');
+        self.write_all_until(&wire, deadline)?;
+        for _ in 0..MAX_QMP_RESPONSE_LINES {
+            let response = self.read_line_until(deadline)?;
+            if contains(&response, b"\"return\"") {
+                return Ok(());
+            }
+            if contains(&response, b"\"error\"") {
+                return Err(format!(
+                    "QMP refused a command: {}",
+                    String::from_utf8_lossy(&response)
+                ));
+            }
+        }
+        Err("QMP response exceeded its line-count bound".to_string())
+    }
+
+    fn write_all_until(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), String> {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let remaining = qmp_remaining(deadline)?;
+            self.stream
+                .set_write_timeout(Some(remaining))
+                .map_err(|error| format!("set QMP write timeout: {error}"))?;
+            let pending = bytes
+                .get(written..)
+                .ok_or_else(|| "QMP write accounting escaped its buffer".to_string())?;
+            match self.stream.write(pending) {
+                Ok(0) => return Err("QMP command socket closed during write".to_string()),
+                Ok(count) => {
+                    written = written
+                        .checked_add(count)
+                        .ok_or_else(|| "QMP write accounting overflow".to_string())?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err("QMP I/O deadline expired during write".to_string());
+                }
+                Err(error) => return Err(format!("write QMP command: {error}")),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_line_until(&mut self, deadline: Instant) -> Result<Vec<u8>, String> {
+        let mut line = Vec::new();
+        loop {
+            if line.len() >= MAX_QMP_LINE_BYTES {
+                return Err("QMP line exceeded its byte bound".to_string());
+            }
+            let remaining = qmp_remaining(deadline)?;
+            self.stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| format!("set QMP read timeout: {error}"))?;
+            let mut byte = [0_u8; 1];
+            if let Err(error) = self.stream.read_exact(&mut byte) {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) {
+                    return Err("QMP I/O deadline expired during read".to_string());
+                }
+                return Err(format!("read QMP line: {error}"));
+            }
+            if byte[0] == b'\n' {
+                return Ok(line);
+            }
+            if byte[0] != b'\r' {
+                line.push(byte[0]);
+            }
+        }
+    }
+}
+
+fn qmp_deadline(timeout: Duration) -> Result<Instant, String> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "QMP I/O deadline overflow".to_string())
+}
+
+fn qmp_remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "QMP I/O deadline expired".to_string())
+}
+
 /// Read at most the last `cap` bytes of `path`, decoded lossily — bounds memory
 /// if qemu floods its diagnostics. A failed seek is propagated (not swallowed), and
 /// the read is itself capped at `cap`, so this can never fall through to an
@@ -3807,6 +4169,35 @@ fn create_scratch_dir(base: &Path, seq: &AtomicU64) -> Result<PathBuf, String> {
     ))
 }
 
+fn qmp_scratch_path(base: &Path, pid: u32, sequence: u64) -> PathBuf {
+    base.join(format!("td-qmp-{pid}-{sequence}"))
+}
+
+/// Keep QMP below `sockaddr_un.sun_path` independently of the checkout and
+/// build scratch lengths while honoring the host's selected temporary
+/// directory. The exclusive 0700 directory also prevents another host user
+/// from connecting to the unauthenticated control socket.
+fn create_qmp_scratch_dir(base: &Path, seq: &AtomicU64) -> Result<PathBuf, String> {
+    for _ in 0..64 {
+        let n = seq.fetch_add(1, Ordering::Relaxed);
+        let dir = qmp_scratch_path(base, std::process::id(), n);
+        let socket = dir.join("qmp.sock");
+        let bytes = socket.as_os_str().as_bytes().len();
+        if bytes > MAX_UNIX_SOCKET_PATH_BYTES {
+            return Err(format!(
+                "QMP socket path is {bytes} bytes, above the {}-byte Unix limit; set TMPDIR to a shorter private or sticky directory",
+                MAX_UNIX_SOCKET_PATH_BYTES
+            ));
+        }
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create {}: {error}", dir.display())),
+        }
+    }
+    Err("could not create a fresh bounded QMP directory after 64 attempts".to_string())
+}
+
 /// Removes its scratch directory on drop, so `boot` leaves no temp files on ANY
 /// return path — the happy path, an early `?` (e.g. a failed `spawn`), or a
 /// mid-loop error return.
@@ -3830,6 +4221,8 @@ fn tail(text: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn contains_matches_substrings_and_boundaries() {
@@ -3870,6 +4263,166 @@ mod tests {
             s.ends_with("file=/scratch/erofs-probe.img"),
             "wrong file: {s}"
         );
+    }
+
+    #[test]
+    fn qmp_arg_doubles_path_commas_and_keeps_option_separators() {
+        assert_eq!(
+            qmp_arg(Path::new("/scratch/a,b.sock")).as_bytes(),
+            b"unix:/scratch/a,,b.sock,server=on,wait=off"
+        );
+        let non_utf8 = PathBuf::from(OsString::from_vec(vec![b'/', 0xff, b',', b'x']));
+        assert_eq!(
+            qmp_arg(&non_utf8).as_bytes(),
+            [
+                b"unix:/".as_slice(),
+                &[0xff],
+                b",,x,server=on,wait=off".as_slice()
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn qmp_socket_path_is_private_and_bounded_at_maximal_identifiers() {
+        let base = env::temp_dir();
+        let dir = qmp_scratch_path(&base, u32::MAX, u64::MAX);
+        let path = dir.join("qmp.sock");
+        assert_eq!(dir.parent(), Some(base.as_path()));
+        assert!(path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+
+        let seq = AtomicU64::new(9_000);
+        let created = create_qmp_scratch_dir(&base, &seq).unwrap();
+        let guard = Scratch {
+            dir: created.clone(),
+        };
+        assert_eq!(fs::metadata(&created).unwrap().permissions().mode() & 0o777, 0o700);
+        drop(guard);
+        assert!(!created.exists());
+
+        let long_base = PathBuf::from(format!("/{}", "x".repeat(108)));
+        let error = create_qmp_scratch_dir(&long_base, &AtomicU64::new(0)).unwrap_err();
+        assert!(error.contains("set TMPDIR to a shorter"));
+    }
+
+    #[test]
+    fn staged_qmp_input_waits_for_both_guest_acknowledgements() {
+        let seq = AtomicU64::new(8_200);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let path = dir.join("qmp.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"{\"QMP\":{\"version\":{}}}\r\n")
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+            for _ in 0..8 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                commands.push(line.trim_end().to_string());
+                stream.write_all(b"{\"event\":\"IGNORED\"}\r\n").unwrap();
+                stream.write_all(b"{\"return\": {}}\r\n").unwrap();
+            }
+            commands
+        });
+
+        let mut controller = PhysicalInputController::new(path);
+        let mut evidence = ConsoleEvidence::default();
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::Arm);
+        evidence.td_firefox_input_armed = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::Menu);
+        evidence.td_firefox_input_menu = true;
+        controller.progress(&evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::Final);
+
+        let commands = server.join().unwrap();
+        assert_eq!(commands.first().unwrap(), r#"{"execute":"qmp_capabilities"}"#);
+        assert!(commands.get(1).unwrap().contains("\"axis\":\"x\",\"value\":24576"));
+        assert!(commands.get(2).unwrap().contains("\"axis\":\"x\",\"value\":25600"));
+        assert!(commands.get(3).unwrap().contains("\"data\":\"x\""));
+        assert!(commands.get(4).unwrap().contains("\"button\":\"wheel-down\""));
+        assert!(commands.get(5).unwrap().contains("\"button\":\"right\""));
+        assert!(commands.get(6).unwrap().contains("\"axis\":\"x\",\"value\":8192"));
+        assert!(commands.get(7).unwrap().contains("\"button\":\"left\""));
+    }
+
+    #[test]
+    fn qmp_greeting_has_one_total_deadline_not_one_timeout_per_byte() {
+        let seq = AtomicU64::new(8_250);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let path = dir.join("qmp-drip.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for byte in b"{\"QMP\":{\"version\":{}}}\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            let mut command = String::new();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            if reader.read_line(&mut command).is_ok() {
+                let _ = stream.write_all(b"{\"return\": {}}\r\n");
+            }
+        });
+
+        let start = Instant::now();
+        let deadline = qmp_deadline(Duration::from_millis(80)).unwrap();
+        let error = match Qmp::connect_until(&path, deadline) {
+            Ok(_) => panic!("a drip-fed greeting escaped the total deadline"),
+            Err(error) => error,
+        };
+        assert!(error.contains("deadline expired"), "{error}");
+        assert!(start.elapsed() < Duration::from_millis(400));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn application_cursor_evidence_requires_one_bounded_exact_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            b"\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=24 height=32\r\n",
+            b"unrelated",
+        );
+        assert!(evidence.td_application_cursor);
+        for invalid in [
+            "\nTD-APPLICATION-CURSOR-READY app-id=other width=24 height=32\n",
+            "\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=0 height=32\n",
+            "\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=257 height=32\n",
+            "\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=24 height=32 trailing\n",
+        ] {
+            let mut rejected = ConsoleEvidence::default();
+            latch_console_evidence(&mut rejected, invalid.as_bytes(), b"unrelated");
+            assert!(!rejected.td_application_cursor, "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn firefox_input_wire_constants_match_the_standalone_producers() {
+        let firefox = include_str!("../../../../../td-jail/src/firefox.rs");
+        for marker in [
+            TD_FIREFOX_INPUT_ARMED_MARKER,
+            TD_FIREFOX_INPUT_MENU_MARKER,
+            TD_FIREFOX_INPUT_MARKER,
+        ] {
+            assert!(
+                firefox.contains(&format!("=> \"{marker}\"")),
+                "td-jail omitted {marker}"
+            );
+        }
+        let scene = include_str!("../../../../../td-compositor/src/scene.rs");
+        assert!(scene.contains(&format!(
+            "const MAX_CURSOR_DIMENSION: usize = {};",
+            td_recipe::ladder::FIREFOX_CURSOR_MAX_DIMENSION
+        )));
     }
 
     #[test]

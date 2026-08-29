@@ -869,9 +869,14 @@ roleless surface, or one whose earlier subsurface object was destroyed, into a
 child of another surface. The role KIND remains permanent: destroying the
 `wl_subsurface` immediately unmaps it and forgets its position and z-order,
 but only a new `wl_subsurface` may make that wl_surface play a role again. A
-destroyed child wl_surface leaves its role object inert; a destroyed parent
-unmaps every direct child and breaks the parent edge before that object id can
-be reused.
+commit while the role object is absent remains legal and replaces the current
+buffer and input state without mapping it. That copied current buffer stays
+inside both the same per-client surface-byte charge and an explicit reservation
+against the scene-wide byte ceiling. A new `wl_subsurface` moves, rather than
+copies, it back into the active scene, where it remains invisible until the
+new association is applied by its parent's commit. A destroyed child
+wl_surface leaves its role object inert; a destroyed parent unmaps every
+direct child and breaks the parent edge before that object id can be reused.
 
 Association, signed position, and the bottom-to-top stack are pending state of
 the PARENT. A new child is pending above the parent and every sibling;
@@ -1973,6 +1978,21 @@ registration. `probe-application SOCKET ID RGB-A RGB-B` connects to that
 distinct socket and reproduces the structured line; its `--quiet` form applies
 the same validation for supervisor readiness without putting a second evidence
 record on the console.
+
+The same configured observer has a second one-shot output for client-cursor
+evidence. It remains gated on successful content publication, then accepts
+only the cursor image currently selected for drawing by the exact client whose
+rendered content satisfied that publication. A second client with the same
+app id is still a launcher candidate, but cannot complete another connection's
+proof. Retained cursor buffers which are not selected, the fallback cross, a
+null cursor, and another client's image cannot satisfy it.
+Publication follows the repaint that selected or committed the image and
+emits exactly one bounded
+`TD-APPLICATION-CURSOR-READY app-id=ID width=N height=N` line from a separate
+publisher thread, so stdout I/O never occurs under the runtime lock. The
+system-image oracle requires that line alongside Firefox's own staged physical
+input assertions; ordinary compositor operation does not consume it.
+
 A publisher failure exits the compositor for its existing `restart=always`
 supervisor to reconstruct the one-shot observer; losing stdout after the
 socket is live reports an error but does not retract readiness.
@@ -3008,7 +3028,7 @@ object ID reservation remains held until every earlier keyboard or pointer
 event naming that surface is serialized.
 
 Resource ceilings are part of the protocol boundary: at most 32 clients run
-at once, each has at most 512 objects, eight retained shm pool resources,
+at once, each has at most 512 objects, sixteen retained shm pool resources,
 256 MiB of aggregate declared shm, 64 queued descriptors, one pending layout
 wakeup, 64 pending seat deliveries, 128 unapplied synchronized-subsurface
 commits, 256 pending frame callbacks, and 32 MiB of retained surface pixels.
@@ -3016,9 +3036,10 @@ The pool-resource identity stays charged through live buffer objects, pending
 attaches and synchronized caches after its pool object is destroyed; its
 declared charge rises monotonically with a resize across the pool and all
 buffers made from it, then is refunded only when the last such reference
-goes. The first Firefox window lifecycle showed a fifth simultaneous
-pool-resource request, leaving bounded headroom below eight. A pool alone
-remains capped at 64 MiB.
+goes. The first Firefox window lifecycle showed a fifth simultaneous pool
+resource. The physical-input trace reached a legitimate ninth pool while a
+native menu and client cursor were live, leaving bounded headroom below
+sixteen. A pool alone remains capped at 64 MiB.
 The offline-document boot oracle snapshots the matching connection's
 monotonic high-water counters at the first successfully painted frame with
 the bounded exact content-pixel region and validates every field against

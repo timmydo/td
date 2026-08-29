@@ -851,6 +851,15 @@ pub const TD_FIREFOX_CONTENT_MARKER: &str = "TD-FIREFOX-HTTPS-CONTENT-READY";
 /// live content, GPU, socket and media-role process retains a nested filter.
 pub const TD_FIREFOX_SUPPORT_MARKER: &str = "TD-FIREFOX-SUPPORT-READY";
 
+/// Staged markers emitted by td-jail's bounded Firefox physical-input probe.
+pub const TD_FIREFOX_INPUT_ARMED_MARKER: &str = "TD-FIREFOX-INPUT-ARMED";
+pub const TD_FIREFOX_INPUT_MENU_MARKER: &str = "TD-FIREFOX-INPUT-MENU";
+pub const TD_FIREFOX_INPUT_MARKER: &str = "TD-FIREFOX-INPUT-OK";
+/// Selects the physical-input oracle without changing an ordinary Firefox boot.
+pub const FIREFOX_INPUT_CMDLINE_TOKEN: &str = "td.firefox-input=1";
+/// Must match the compositor's independently pinned client-cursor dimension cap.
+pub const FIREFOX_CURSOR_MAX_DIMENSION: usize = 256;
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
 /// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.

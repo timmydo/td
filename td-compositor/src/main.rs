@@ -290,9 +290,13 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         .zip(options.application_content_rgb_a.as_deref())
         .zip(options.application_content_rgb_b.as_deref())
     {
-        let (wake, content_rgbs) =
-            server::watch_application(path, app_id, content_rgb_a, content_rgb_b)?;
-        runtime.watch_application(app_id.to_string(), content_rgbs, wake)?;
+        let observer = server::watch_application(path, app_id, content_rgb_a, content_rgb_b)?;
+        runtime.watch_application_with_cursor(
+            app_id.to_string(),
+            observer.content_rgbs,
+            observer.content_wake,
+            observer.cursor_wake,
+        )?;
     }
     let runtime = Arc::new(Mutex::new(runtime));
     runtime

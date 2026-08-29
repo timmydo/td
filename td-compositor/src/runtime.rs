@@ -392,7 +392,12 @@ struct ApplicationReady {
     surface_content: BTreeMap<SurfaceKey, [usize; 2]>,
     diagnosed_messages: usize,
     wake: SyncSender<ApplicationEvidence>,
-    published: bool,
+    /// Client whose rendered content satisfied the one-shot application
+    /// observer. Cursor evidence must come from this same connection: another
+    /// matching toplevel is a launch candidate, not authority for this proof.
+    published_client: Option<u64>,
+    cursor_wake: Option<SyncSender<ApplicationCursorEvidence>>,
+    cursor_published: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -401,6 +406,13 @@ pub(crate) struct ApplicationEvidence {
     pub content_rgbs: [[u8; 3]; 2],
     pub content_pixels: [usize; 2],
     pub resources: ClientResourceSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ApplicationCursorEvidence {
+    pub app_id: String,
+    pub width: usize,
+    pub height: usize,
 }
 
 /// How far the pointer must leave the press point, on either axis, before a
@@ -464,11 +476,37 @@ impl Runtime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn watch_application(
         &mut self,
         expected_app_id: String,
         expected_content_rgbs: [[u8; 3]; 2],
         wake: SyncSender<ApplicationEvidence>,
+    ) -> Result<(), String> {
+        self.watch_application_inner(expected_app_id, expected_content_rgbs, wake, None)
+    }
+
+    pub(crate) fn watch_application_with_cursor(
+        &mut self,
+        expected_app_id: String,
+        expected_content_rgbs: [[u8; 3]; 2],
+        wake: SyncSender<ApplicationEvidence>,
+        cursor_wake: SyncSender<ApplicationCursorEvidence>,
+    ) -> Result<(), String> {
+        self.watch_application_inner(
+            expected_app_id,
+            expected_content_rgbs,
+            wake,
+            Some(cursor_wake),
+        )
+    }
+
+    fn watch_application_inner(
+        &mut self,
+        expected_app_id: String,
+        expected_content_rgbs: [[u8; 3]; 2],
+        wake: SyncSender<ApplicationEvidence>,
+        cursor_wake: Option<SyncSender<ApplicationCursorEvidence>>,
     ) -> Result<(), String> {
         if self.application_ready.is_some() {
             return Err("application-window observer is already configured".to_string());
@@ -480,7 +518,9 @@ impl Runtime {
             surface_content: BTreeMap::new(),
             diagnosed_messages: 0,
             wake,
-            published: false,
+            published_client: None,
+            cursor_wake,
+            cursor_published: false,
         });
         Ok(())
     }
@@ -697,6 +737,47 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn take_subsurface(&mut self, key: SurfaceKey) -> Result<Option<Surface>, String> {
+        if let Some(ready) = self.application_ready.as_mut() {
+            ready.surface_content.remove(&key);
+        }
+        let surface = self.scene.take_subsurface(key)?;
+        if surface.is_some() {
+            self.settle(false)?;
+        }
+        Ok(surface)
+    }
+
+    pub fn replace_inactive_subsurface(
+        &mut self,
+        key: SurfaceKey,
+        bytes: usize,
+    ) -> Result<(), String> {
+        self.scene.replace_inactive_subsurface(key, bytes)
+    }
+
+    pub fn detach_inactive_subsurface(&mut self, key: SurfaceKey) {
+        self.scene.detach_inactive_subsurface(key);
+    }
+
+    pub fn restore_inactive_subsurface(
+        &mut self,
+        key: SurfaceKey,
+        surface: Surface,
+        input_region: Option<SharedInputRegion>,
+    ) -> Result<(), String> {
+        let measured_application_content = self.application_content_pixels(key, Some(&surface));
+        self.scene.restore_inactive_subsurface(key, surface)?;
+        let application_content =
+            self.application_content_committed(key, measured_application_content);
+        self.scene.set_input_region(key, input_region);
+        self.settle(false)?;
+        if let Some((root, content_pixels)) = application_content {
+            self.application_window_mapped(root, key, content_pixels)?;
+        }
+        self.application_stored_surfaces(Some(key))
+    }
+
     pub fn remove_subsurface(&mut self, key: SurfaceKey) -> Result<(), String> {
         if let Some(ready) = self.application_ready.as_mut() {
             ready.surface_content.remove(&key);
@@ -868,7 +949,8 @@ impl Runtime {
         request: Option<CursorRequest>,
     ) -> Result<(), String> {
         if self.scene.set_cursor(client, request) {
-            return self.repaint();
+            self.repaint()?;
+            self.publish_application_cursor()?;
         }
         Ok(())
     }
@@ -889,7 +971,8 @@ impl Runtime {
     ) -> Result<(), String> {
         let contents = self.scene.commit_cursor(key, image);
         if self.scene.offset_cursor(key, offset) || contents {
-            return self.repaint();
+            self.repaint()?;
+            self.publish_application_cursor()?;
         }
         Ok(())
     }
@@ -1085,7 +1168,7 @@ impl Runtime {
         surface: Option<&Surface>,
     ) -> Option<[usize; 2]> {
         let observed_client = self.application_ready.as_ref().is_some_and(|ready| {
-            !ready.published
+            ready.published_client.is_none()
                 && ready
                     .candidates
                     .iter()
@@ -1182,7 +1265,7 @@ impl Runtime {
         content_pixels: [usize; 2],
     ) -> Result<(), String> {
         let matching = self.application_ready.as_ref().is_some_and(|ready| {
-            !ready.published
+            ready.published_client.is_none()
                 && self.scene.is_mapped(root)
                 && ready.candidates.contains(&root)
                 && content_pixels
@@ -1216,7 +1299,7 @@ impl Runtime {
             && self.scene.is_mapped(content_surface)
             && self.scene.mapped_subsurface_root(content_surface) == Some(root)
             && self.application_ready.as_ref().is_some_and(|ready| {
-                !ready.published
+                ready.published_client.is_none()
                     && ready.candidates.contains(&root)
                     && ready.surface_content.get(&content_surface) == Some(&content_pixels)
             })
@@ -1229,7 +1312,9 @@ impl Runtime {
         let Some(content_pixels) = self
             .application_ready
             .as_ref()
-            .filter(|ready| !ready.published && ready.candidates.contains(&root))
+            .filter(|ready| {
+                ready.published_client.is_none() && ready.candidates.contains(&root)
+            })
             .and_then(|ready| ready.surface_content.get(&key))
             .copied()
         else {
@@ -1294,7 +1379,7 @@ impl Runtime {
         let Some(ready) = self.application_ready.as_mut() else {
             return Ok(());
         };
-        if ready.published {
+        if ready.published_client.is_some() {
             return Ok(());
         }
         let resources = self
@@ -1315,11 +1400,40 @@ impl Runtime {
         };
         match ready.wake.try_send(evidence) {
             Ok(()) | Err(TrySendError::Full(_)) => {
-                ready.published = true;
+                ready.published_client = Some(key.client);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err("application-window observer stopped before publication".to_string());
+            }
+        }
+        self.publish_application_cursor()
+    }
+
+    fn publish_application_cursor(&mut self) -> Result<(), String> {
+        let Some((key, width, height)) = self.scene.drawn_cursor_image() else {
+            return Ok(());
+        };
+        let Some(ready) = self.application_ready.as_mut() else {
+            return Ok(());
+        };
+        if ready.published_client != Some(key.client) || ready.cursor_published {
+            return Ok(());
+        }
+        let Some(cursor_wake) = ready.cursor_wake.as_ref() else {
+            return Ok(());
+        };
+        let evidence = ApplicationCursorEvidence {
+            app_id: ready.expected_app_id.clone(),
+            width,
+            height,
+        };
+        match cursor_wake.try_send(evidence) {
+            Ok(()) | Err(TrySendError::Full(_)) => {
+                ready.cursor_published = true;
                 Ok(())
             }
             Err(TrySendError::Disconnected(_)) => {
-                Err("application-window observer stopped before publication".to_string())
+                Err("application cursor observer stopped before publication".to_string())
             }
         }
     }
@@ -8744,6 +8858,140 @@ mod tests {
             .unwrap()
             .candidates
             .contains(&later));
+    }
+
+    #[test]
+    fn application_cursor_wakes_once_for_a_painted_candidate_client() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-application-cursor-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 800, 600, 800 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let (wake, ready) = mpsc::sync_channel(1);
+        let (cursor_wake, cursor_ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application_with_cursor(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+                cursor_wake,
+            )
+            .unwrap();
+
+        let key = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        lend_application_resources(&mut runtime, key.client);
+
+        let decoy_cursor = SurfaceKey {
+            client: 8,
+            object: 30,
+        };
+        let decoy_toplevel = SurfaceKey {
+            client: decoy_cursor.client,
+            object: 29,
+        };
+        runtime
+            .set_application_id(decoy_toplevel, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(
+                decoy_toplevel,
+                Some(surface([4, 5, 6, 0])),
+                None,
+                None,
+            )
+            .unwrap();
+        runtime
+            .set_cursor(
+                decoy_cursor.client,
+                Some(CursorRequest {
+                    surface: decoy_cursor.object,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                }),
+            )
+            .unwrap();
+        runtime
+            .commit_cursor(decoy_cursor, surface([1, 2, 3, 0]), (0, 0))
+            .unwrap();
+        assert_eq!(cursor_ready.try_recv(), Err(TryRecvError::Empty));
+
+        runtime
+            .set_application_id(key, "org.mozilla.firefox")
+            .unwrap();
+        runtime
+            .apply_commit(key, Some(application_content_surface()), None, None)
+            .unwrap();
+        assert!(ready.try_recv().is_ok());
+
+        // A second client with the same app id is a valid launcher candidate,
+        // but its selected cursor cannot complete the evidence produced by
+        // the first client's rendered content.
+        runtime
+            .set_cursor(
+                decoy_cursor.client,
+                Some(CursorRequest {
+                    surface: decoy_cursor.object,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                }),
+            )
+            .unwrap();
+        assert_eq!(cursor_ready.try_recv(), Err(TryRecvError::Empty));
+
+        let cursor = SurfaceKey {
+            client: key.client,
+            object: 31,
+        };
+        runtime
+            .set_cursor(
+                cursor.client,
+                Some(CursorRequest {
+                    surface: cursor.object,
+                    hotspot_x: 1,
+                    hotspot_y: 2,
+                }),
+            )
+            .unwrap();
+        runtime
+            .commit_cursor(
+                cursor,
+                Surface {
+                    width: 4,
+                    height: 5,
+                    pixels: vec![9; 4 * 5 * 4],
+                    format: SHM_XRGB8888,
+                },
+                (0, 0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor_ready.try_recv().unwrap(),
+            ApplicationCursorEvidence {
+                app_id: "org.mozilla.firefox".to_string(),
+                width: 4,
+                height: 5,
+            }
+        );
+
+        runtime
+            .commit_cursor(
+                cursor,
+                Surface {
+                    width: 6,
+                    height: 7,
+                    pixels: vec![8; 6 * 7 * 4],
+                    format: SHM_XRGB8888,
+                },
+                (0, 0),
+            )
+            .unwrap();
+        assert_eq!(cursor_ready.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[test]
