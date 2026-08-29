@@ -5321,6 +5321,18 @@ unit is not a dependency of `bootsuccess`, so absence makes application
 evidence red without granting mutable user service state authority over
 deployment acknowledgement.
 
+A second, likewise non-health-authoritative evidence unit exercises the
+private compositor channel described below. As uid 1000 it performs
+`wl_display.get_registry` followed by `wl_display.sync`, requires the exact
+ten-global public registry in its pinned order and versions, and rejects any
+premature `td_portal_manager_v1`. Only then does it emit
+`TD-PORTAL-CHANNEL-READY globals=10 privileged=0`; QEMU accepts only the exact
+td-svc-prefixed `portal-channel-evidence:` line. This composes the shipped
+socket, compositor server, shared safe Wayland codec, portal binary, service
+argv, and uid without pretending that the privileged manager is served yet.
+One 20-second deadline begins before the Unix connect, so an unavailable or
+backlog-stalled endpoint cannot leave this diagnostic client waiting forever.
+
 ### Request — landed core; Session — staged core
 
 A portal method returns a handle and the answer arrives as
@@ -5511,11 +5523,25 @@ Both mechanisms may be used together — the private socket SHOULD also
 check `SO_PEERCRED`, since defence in depth costs one call here — but the
 socket is the boundary and the credential is the belt.
 
+**The private transport has LANDED, not the privileged interface.**
+`td-compositor` resolves the public, private, and application-evidence
+endpoints once, refuses aliases, binds both mode-0600 Wayland listeners before
+its ordinary readiness marker, and admits their clients through one shared
+32-connection ceiling. The private endpoint is bound before the public
+readiness endpoint, so a successful ordinary readiness connection implies
+both names exist. The private listener currently advertises the same
+exact ten public globals as `/run/user/1000/wayland-0` and deliberately does
+not advertise `td_portal_manager_v1`. `td-portal channel-probe` uses only the
+compositor's safe framing codec — not `conn.rs`, SCM_RIGHTS, or a new unsafe
+surface — to pin that state on the system image. The manager, peer-credential
+check, and dialog operations land together when requests are genuinely
+served; until then the private path confers no compositor privilege.
+
 **What that boundary does not survive is an escape, and it is worth
 naming the consequence rather than leaving it implied by §L.** Path
-visibility is a mount-namespace property. An application that breaks out
-of the filesystem jail is still uid 1000 in v1, so it can open
-`/run/user/1000/td-portal-wayland-0` directly and drive
+visibility is a mount-namespace property. Once the manager lands, an
+application that breaks out of the filesystem jail will still be uid 1000 in
+v1, so it can open `/run/user/1000/td-portal-wayland-0` directly and drive
 `td_portal_manager_v1` with no portal UI in the way — which means
 screenshot and screencast without the dialog that authorizes them, the
 one capability the portal exists to gate. The jail is the boundary; the
@@ -6366,7 +6392,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | **clipboard producer and cross-client paste LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status. The image oracle physically types `Welcome`, waits until its exact rendered cells are attested, selects them, waits for exact seven-byte source admission, then requires both td-term's exact-payload transfer record and Firefox's browser-chrome observation; client cursors landed separately (`1c4b7f88`) | a real terminal selection reaches Firefox through core Wayland clipboard without manual testing |
-| 21 | **xdg-foreign LANDED**; private portal socket + dialog placement remain | modal portal window |
+| 21 | **xdg-foreign + private portal socket LANDED**; privileged manager and dialog placement remain | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |

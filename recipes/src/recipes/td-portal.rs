@@ -4,6 +4,8 @@ use crate::types::{Recipe, Step};
 const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
 const HANDLES_RS: &str = include_str!("../../../td-portal/src/handles.rs");
 const SETTINGS_RS: &str = include_str!("../../../td-portal/src/settings.rs");
+const WAYLAND_CHANNEL_RS: &str = include_str!("../../../td-portal/src/wayland_channel.rs");
+const COMPOSITOR_WIRE_RS: &str = include_str!("../../../td-compositor/src/wire.rs");
 const DEFAULT_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
 const SHARED_DBUS: &[(&str, &str)] = &[
     (
@@ -44,6 +46,9 @@ pub fn recipe() -> Recipe {
         Step::MkDir {
             path: "{src}/td-busd/src".into(),
         },
+        Step::MkDir {
+            path: "{src}/td-compositor/src".into(),
+        },
         Step::WriteFile {
             path: "{src}/td-portal/src/main.rs".into(),
             content: MAIN_RS.into(),
@@ -57,6 +62,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-portal/src/settings.rs".into(),
             content: SETTINGS_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-portal/src/wayland_channel.rs".into(),
+            content: WAYLAND_CHANNEL_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-compositor/src/wire.rs".into(),
+            content: COMPOSITOR_WIRE_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -130,7 +145,10 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::{TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER};
+    use crate::ladder::{
+        TD_PORTAL_CHANNEL_RUNTIME_MARKER, TD_PORTAL_REQUEST_RUNTIME_MARKER,
+        TD_PORTAL_RUNTIME_MARKER,
+    };
 
     #[test]
     fn recipe_stages_the_portal_and_the_canonical_broker_codec() {
@@ -139,6 +157,8 @@ mod tests {
             ("{src}/td-portal/src/main.rs", MAIN_RS),
             ("{src}/td-portal/src/handles.rs", HANDLES_RS),
             ("{src}/td-portal/src/settings.rs", SETTINGS_RS),
+            ("{src}/td-portal/src/wayland_channel.rs", WAYLAND_CHANNEL_RS),
+            ("{src}/td-compositor/src/wire.rs", COMPOSITOR_WIRE_RS),
             ("{src}/td-portal/default-settings.conf", DEFAULT_SETTINGS),
         ] {
             assert!(steps.iter().any(|step| {
@@ -173,6 +193,10 @@ mod tests {
             })
             .collect();
         for module in declared {
+            if module == "wayland_wire" {
+                assert!(MAIN_RS.contains("#[path = \"../../td-compositor/src/wire.rs\"]"));
+                continue;
+            }
             assert!(staged.contains(&module), "module {module} is not staged");
         }
     }
@@ -197,7 +221,14 @@ mod tests {
         assert!(MAIN_RS.contains(&format!(
             "pub const REQUEST_READY_MARKER: &str = \"{TD_PORTAL_REQUEST_RUNTIME_MARKER}\";"
         )));
+        assert!(WAYLAND_CHANNEL_RS.contains("EXPECTED_GLOBALS.len()"));
+        assert!(WAYLAND_CHANNEL_RS.contains("TD-PORTAL-CHANNEL-READY globals={} privileged=0"));
+        assert_eq!(
+            TD_PORTAL_CHANNEL_RUNTIME_MARKER,
+            "TD-PORTAL-CHANNEL-READY globals=10 privileged=0"
+        );
         assert!(MAIN_RS.contains("println!(\"{READY_MARKER}\");"));
         assert!(MAIN_RS.contains("println!(\"{REQUEST_READY_MARKER}\");"));
+        assert!(MAIN_RS.contains("println!(\"{}\", wayland_channel::ready_marker());"));
     }
 }

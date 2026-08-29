@@ -181,6 +181,22 @@ const MAX_DATA_SOURCE_MIME_BYTES: usize = 16 * 1024;
 const MAX_MIME_TYPE_BYTES: usize = 256;
 const DATA_DEVICE_MANAGER_VERSION: u32 = 3;
 const XDG_FOREIGN_VERSION: u32 = 1;
+const ADVERTISED_GLOBALS: [(u32, &str, u32); 10] = [
+    (GLOBAL_COMPOSITOR, "wl_compositor", 4),
+    (GLOBAL_SUBCOMPOSITOR, "wl_subcompositor", 1),
+    (GLOBAL_SHM, "wl_shm", 1),
+    (GLOBAL_OUTPUT, "wl_output", 4),
+    (GLOBAL_XDG_WM_BASE, "xdg_wm_base", XDG_WM_BASE_VERSION),
+    (GLOBAL_DECORATION, "zxdg_decoration_manager_v1", 1),
+    (
+        GLOBAL_DATA_DEVICE_MANAGER,
+        "wl_data_device_manager",
+        DATA_DEVICE_MANAGER_VERSION,
+    ),
+    (GLOBAL_XDG_EXPORTER, "zxdg_exporter_v2", XDG_FOREIGN_VERSION),
+    (GLOBAL_XDG_IMPORTER, "zxdg_importer_v2", XDG_FOREIGN_VERSION),
+    (GLOBAL_SEAT, "wl_seat", SEAT_VERSION),
+];
 const MAX_FOREIGN_HANDLE_BYTES: usize = 128;
 const DND_ACTION_MASK: u32 = 1 | 2 | 4;
 
@@ -3382,36 +3398,10 @@ impl Client {
     }
 
     fn advertise_globals(&mut self, registry: u32) -> Result<(), String> {
-        self.global(registry, GLOBAL_COMPOSITOR, "wl_compositor", 4)?;
-        self.global(registry, GLOBAL_SUBCOMPOSITOR, "wl_subcompositor", 1)?;
-        self.global(registry, GLOBAL_SHM, "wl_shm", 1)?;
-        self.global(registry, GLOBAL_OUTPUT, "wl_output", 4)?;
-        self.global(
-            registry,
-            GLOBAL_XDG_WM_BASE,
-            "xdg_wm_base",
-            XDG_WM_BASE_VERSION,
-        )?;
-        self.global(registry, GLOBAL_DECORATION, "zxdg_decoration_manager_v1", 1)?;
-        self.global(
-            registry,
-            GLOBAL_DATA_DEVICE_MANAGER,
-            "wl_data_device_manager",
-            DATA_DEVICE_MANAGER_VERSION,
-        )?;
-        self.global(
-            registry,
-            GLOBAL_XDG_EXPORTER,
-            "zxdg_exporter_v2",
-            XDG_FOREIGN_VERSION,
-        )?;
-        self.global(
-            registry,
-            GLOBAL_XDG_IMPORTER,
-            "zxdg_importer_v2",
-            XDG_FOREIGN_VERSION,
-        )?;
-        self.global(registry, GLOBAL_SEAT, "wl_seat", SEAT_VERSION)
+        for (name, interface, version) in ADVERTISED_GLOBALS {
+            self.global(registry, name, interface, version)?;
+        }
+        Ok(())
     }
 
     fn bind_global(
@@ -6994,25 +6984,48 @@ pub fn watch_application(
     })
 }
 
-pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
-    let keymap_dir = keymap_directory(path)?.to_path_buf();
-    let keymap = keymap_file(&keymap_dir)?;
-    socket::remove_stale(path, "Wayland")?;
+fn bind_listener(path: &Path, label: &str) -> Result<UnixListener, String> {
+    socket::remove_stale(path, label)?;
     let listener = UnixListener::bind(path)
-        .map_err(|e| format!("bind Wayland socket {}: {e}", path.display()))?;
+        .map_err(|e| format!("bind {label} socket {}: {e}", path.display()))?;
     fs::set_permissions(path, Permissions::from_mode(0o600))
-        .map_err(|e| format!("chmod Wayland socket {}: {e}", path.display()))?;
-    // `writeln!` rather than `println!`, which PANICS on a write failure; and
-    // `lock()` because `println!` held one for the whole write, so an unlocked
-    // handle could interleave this with another thread's line and reach the
-    // oracle as neither.
-    announce(&mut std::io::stdout().lock(), path)?;
+        .map_err(|e| format!("chmod {label} socket {}: {e}", path.display()))?;
+    Ok(listener)
+}
+
+fn start_wayland_channels<T, B, S, W>(
+    path: &Path,
+    portal_path: &Path,
+    out: &mut W,
+    mut bind: B,
+    start_private: S,
+) -> Result<T, String>
+where
+    B: FnMut(&Path, &'static str) -> Result<T, String>,
+    S: FnOnce(T) -> Result<(), String>,
+    W: Write,
+{
+    // The public socket is td-svc's readiness probe. Bind the private socket
+    // first so a successful public connect implies that both endpoints exist.
+    let portal_listener = bind(portal_path, "private portal Wayland")?;
+    let listener = bind(path, "Wayland")?;
+    start_private(portal_listener)?;
+    announce(out, path)?;
+    Ok(listener)
+}
+
+fn accept_clients(
+    listener: UnixListener,
+    channel: &'static str,
+    runtime: Arc<Mutex<Runtime>>,
+    keymap: KeymapFile,
+) -> Result<(), String> {
     for connection in listener.incoming() {
-        let stream = connection.map_err(|e| format!("accept Wayland client: {e}"))?;
+        let stream = connection.map_err(|e| format!("accept {channel} client: {e}"))?;
         let permit = match ClientPermit::acquire() {
             Ok(permit) => permit,
             Err(error) => {
-                eprintln!("td-compositor: {error}");
+                eprintln!("td-compositor: {channel}: {error}");
                 continue;
             }
         };
@@ -7024,12 +7037,47 @@ pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
             .spawn(move || {
                 let _permit = permit;
                 if let Err(error) = serve_client(stream, id, runtime, keymap) {
-                    eprintln!("td-compositor: client {id}: {error}");
+                    eprintln!("td-compositor: {channel} client {id}: {error}");
                 }
             })
-            .map_err(|e| format!("spawn Wayland client {id}: {e}"))?;
+            .map_err(|e| format!("spawn {channel} client {id}: {e}"))?;
     }
     Ok(())
+}
+
+pub fn serve(
+    path: &Path,
+    portal_path: &Path,
+    runtime: Arc<Mutex<Runtime>>,
+) -> Result<(), String> {
+    let keymap_dir = keymap_directory(path)?.to_path_buf();
+    let keymap = keymap_file(&keymap_dir)?;
+    let portal_runtime = Arc::clone(&runtime);
+    let portal_keymap = keymap.clone();
+    let listener = start_wayland_channels(
+        path,
+        portal_path,
+        &mut std::io::stdout().lock(),
+        bind_listener,
+        move |portal_listener| {
+            thread::Builder::new()
+                .name("portal-wayland-accept".into())
+                .spawn(move || {
+                    if let Err(error) = accept_clients(
+                        portal_listener,
+                        "private portal Wayland",
+                        portal_runtime,
+                        portal_keymap,
+                    ) {
+                        eprintln!("td-compositor: {error}");
+                        std::process::exit(1);
+                    }
+                })
+                .map(|_| ())
+                .map_err(|e| format!("spawn private portal Wayland accept loop: {e}"))
+        },
+    )?;
+    accept_clients(listener, "Wayland", runtime, keymap)
 }
 
 pub fn probe(path: &Path) -> Result<(), String> {
@@ -7097,6 +7145,65 @@ mod tests {
         let mut out = Vec::new();
         super::announce(&mut out, std::path::Path::new("/run/user/1000/wayland-0")).unwrap();
         assert_eq!(out, b"TD-WAYLAND-READY socket=/run/user/1000/wayland-0\n");
+    }
+
+    #[test]
+    fn private_then_public_bind_and_accept_precede_readiness() {
+        use std::cell::RefCell;
+
+        struct EventWriter<'a>(&'a RefCell<Vec<&'static str>>);
+
+        impl std::io::Write for EventWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let mut events = self.0.borrow_mut();
+                if events.last() != Some(&"announce") {
+                    events.push("announce");
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let directory = test_directory("dual-wayland-listener");
+        let public = directory.join("wayland-0");
+        let private = directory.join("td-portal-wayland-0");
+        let events = RefCell::new(Vec::new());
+        let mut private_listener = None;
+        let public_listener = super::start_wayland_channels(
+            &public,
+            &private,
+            &mut EventWriter(&events),
+            |path, label| {
+                events.borrow_mut().push(match label {
+                    "private portal Wayland" => "bind-private",
+                    "Wayland" => "bind-public",
+                    _ => "bind-unknown",
+                });
+                super::bind_listener(path, label)
+            },
+            |listener| {
+                events.borrow_mut().push("start-private");
+                private_listener = Some(listener);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events.into_inner(),
+            ["bind-private", "bind-public", "start-private", "announce"]
+        );
+        assert_eq!(fs::metadata(&public).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o600);
+        let _public_peer = UnixStream::connect(&public).unwrap();
+        let _private_peer = UnixStream::connect(&private).unwrap();
+        drop(public_listener);
+        drop(private_listener);
+        fs::remove_file(public).unwrap();
+        fs::remove_file(private).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     use super::*;

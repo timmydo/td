@@ -34,10 +34,11 @@ separately reviewed syscall surface.
 
 `td-compositor` runs as uid 1000. It opens only the assigned framebuffer and
 evdev nodes. It renders XRGB8888 pixels in software, reads Linux input events,
-and owns the Wayland socket below the user's mode-0700 runtime directory. It
-does not run as root and has no device-broker protocol. Readiness is not
-announced until the framebuffer has accepted an initial paint and every
-enumerated input node has been opened.
+and owns the public and private-portal Wayland sockets below the user's
+mode-0700 runtime directory. It does not run as root and has no device-broker
+protocol. Readiness is not announced until the framebuffer has accepted an
+initial paint, every enumerated input node has been opened, and both listeners
+have been bound.
 
 All target-side UI code is dependency-free Rust built by td's source-built
 stage2 toolchain. The target closure contains no Mesa, libdrm userspace,
@@ -658,8 +659,14 @@ the reader active so the launcher can be closed or retried.
 ## 3. Wayland surface
 
 The server accepts local Unix-stream clients at
-`/run/user/1000/wayland-0`. The socket and parent directory are owned by uid
-1000 and are not group/world accessible.
+`/run/user/1000/wayland-0` and the trusted portal at
+`/run/user/1000/td-portal-wayland-0`. Both socket endpoints are resolved once,
+must be distinct from each other and from application readiness, are mode
+0600 below the uid-1000 mode-0700 runtime directory, and are bound before the
+ordinary readiness marker is emitted. The private endpoint is bound first,
+then the public endpoint and private accept loop become live before that
+marker. Both accept loops share the same 32-client ceiling. `td-jail` exposes
+only the first socket to applications.
 
 The first protocol surface is:
 
@@ -682,16 +689,30 @@ pinned by
 A document cannot notice when the code moves under it, and this list has been
 read as a state claim by work outside this crate.
 
+The private listener currently serves that same exact ten-global registry and
+does not advertise `td_portal_manager_v1`. A separate uid-1000
+`td-portal channel-probe` sends `get_registry` plus `sync`, validates the
+ordered names and versions through this crate's safe framing codec, and emits
+an exact system-image marker only while the privileged global remains absent.
+Its 20-second deadline starts before the Unix connect and includes the entire
+registry exchange. The sync callback is the proof boundary; a following
+`delete_id` may be split at any byte without changing the completed proof.
+The later manager landing adds the private global and `SO_PEERCRED` check
+together. If it reuses the compositor's `conn.rs` transport, that landing must
+also amend `UNSAFE.md`'s exact transport-user roster; this transport increment
+adds no unsafe surface or descriptor passing.
+
 The E2 application-compatibility experiment on 2026-08-25 fixes the priority
 of the next globals without changing that current-state list. GTK 4.22.1's
 `gtk4-demo`, run against Weston through a registry-listener filter, completed
 its XDG configure and attached a shm buffer with `wl_subcompositor` hidden. It
 refused the display before creating a surface when
-`wl_data_device_manager` alone was hidden. The data-device manager is therefore
-a first-window blocker for current GTK; the subcompositor is a usability
-requirement whose synchronized-child paths remain to be exercised, not a
-first-toplevel requirement. This compositor's exact six-global registry still
-lacks both, so it does not yet claim a GTK window.
+`wl_data_device_manager` alone was hidden. The data-device manager was
+therefore a first-window blocker for that GTK, while the subcompositor was a
+usability requirement rather than a first-toplevel requirement. Both have
+since landed in td's ten-global registry. The stronger current claim is the
+system-image Firefox proof recorded in `APPLICATIONS.md`; this experiment
+remains the compatibility evidence that set their order.
 
 The same experiment closes the no-GPU presentation question. GTK 4.22.1's
 forced Cairo configuration attached shm with and without the subcompositor.
@@ -3249,8 +3270,10 @@ strictly requires td-svc to declare the graphical service ready, however, so a
 broken UI cannot mark an update healthy or let QEMU power off before testing
 the new boot seam. The
 graphical service prints `TD-WAYLAND-READY` only after the framebuffer has
-been painted and the Wayland socket is listening. The QEMU system oracle
-requires that marker and the first client's later `TD-TERM-READY` marker.
+been painted and both Wayland sockets are listening. A separate evidence unit
+then validates the private socket's exact public registry and the deliberate
+absence of the privileged manager. The QEMU system oracle requires both
+markers and the first client's later `TD-TERM-READY` marker.
 
 ## 6. Required proof
 
@@ -3271,6 +3294,12 @@ The landing must prove:
 - the seat and compositor multicall artifacts are static ELF64 ET_EXEC files,
   and the demo entry point is a relative symlink to that static multicall;
 - the seat assigner rejects symlinks/non-devices and verifies ownership/mode;
+- the compositor resolves and refuses aliases among its public, private
+  portal, and application-readiness endpoints, binds the private then public
+  mode-0600 Wayland listeners before readiness through one client ceiling,
+  and the shipped
+  portal probe accepts only the exact public registry with no premature
+  privileged global;
 - wire parsing rejects truncation, overflow, invalid object use, and a
   descriptor-less wl_shm request;
 - an SCM_RIGHTS-backed wl_shm buffer commits and is copied into the scene;

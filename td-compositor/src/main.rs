@@ -49,6 +49,7 @@ const MAX_HELD_KEYS: usize = 256;
 
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
+     --portal-socket PATH \
      (--launcher-client PATH | --launcher-application NAME \
      --application-ready-socket PATH --application-app-id ID \
      --application-content-rgb-a RGB --application-content-rgb-b RGB) \
@@ -152,6 +153,7 @@ struct RunOptions {
     framebuffer: PathBuf,
     input: PathBuf,
     socket: PathBuf,
+    portal_socket: PathBuf,
     launcher_client: Option<PathBuf>,
     launcher_application: Option<String>,
     terminal_client: PathBuf,
@@ -165,6 +167,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut framebuffer = None;
     let mut input = None;
     let mut socket = None;
+    let mut portal_socket = None;
     let mut launcher_client = None;
     let mut launcher_application = None;
     let mut terminal_client = None;
@@ -184,6 +187,9 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--framebuffer" if framebuffer.is_none() => framebuffer = Some(PathBuf::from(value)),
             "--input" if input.is_none() => input = Some(PathBuf::from(value)),
             "--socket" if socket.is_none() => socket = Some(PathBuf::from(value)),
+            "--portal-socket" if portal_socket.is_none() => {
+                portal_socket = Some(PathBuf::from(value))
+            }
             "--launcher-client" if launcher_client.is_none() => {
                 launcher_client = Some(PathBuf::from(value))
             }
@@ -205,7 +211,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--application-content-rgb-b" if application_content_rgb_b.is_none() => {
                 application_content_rgb_b = Some(value.clone())
             }
-            "--framebuffer" | "--input" | "--socket" | "--launcher-client"
+            "--framebuffer" | "--input" | "--socket" | "--portal-socket" | "--launcher-client"
             | "--launcher-application" | "--terminal-client"
             | "--application-ready-socket" | "--application-app-id"
             | "--application-content-rgb-a" | "--application-content-rgb-b" => {
@@ -233,22 +239,36 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "launcher applications require application-window readiness and vice versa".into(),
         );
     }
-    let mut socket = socket.ok_or_else(|| "--socket is required".to_string())?;
+    let socket = resolve_socket_endpoint(
+        &socket.ok_or_else(|| "--socket is required".to_string())?,
+        "Wayland",
+    )?;
+    let portal_socket = resolve_socket_endpoint(
+        &portal_socket.ok_or_else(|| "--portal-socket is required".to_string())?,
+        "private portal Wayland",
+    )?;
+    if portal_socket == socket {
+        return Err("private portal Wayland must not alias the public Wayland socket".into());
+    }
     if let Some(ready) = application_ready_socket.as_mut() {
-        let resolved_wayland = resolve_socket_endpoint(&socket, "Wayland")?;
         let resolved_ready = resolve_socket_endpoint(ready, "application-window readiness")?;
-        if resolved_ready == resolved_wayland {
+        if resolved_ready == socket {
             return Err("application-window readiness must not alias the Wayland socket".into());
+        }
+        if resolved_ready == portal_socket {
+            return Err(
+                "application-window readiness must not alias private portal Wayland".into(),
+            );
         }
         // Retain the resolved endpoints, not a mutable symlink spelling that
         // could name a different parent between this check and either bind.
-        socket = resolved_wayland;
         *ready = resolved_ready;
     }
     Ok(RunOptions {
         framebuffer: framebuffer.ok_or_else(|| "--framebuffer is required".to_string())?,
         input: input.ok_or_else(|| "--input is required".to_string())?,
         socket,
+        portal_socket,
         launcher_client,
         launcher_application,
         // Required rather than defaulted: the compositor cannot know the store
@@ -328,7 +348,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         "td-compositor: software output {}x{} stride={} inputs={inputs}",
         geometry.0, geometry.1, geometry.2
     );
-    server::serve(&options.socket, runtime)
+    server::serve(&options.socket, &options.portal_socket, runtime)
 }
 
 fn selftest() -> Result<(), String> {
@@ -1247,8 +1267,9 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         std::fs::create_dir_all(&actual).unwrap();
         symlink(&actual, &alias).unwrap();
         let wayland = actual.join("wayland-0");
+        let portal = actual.join("td-portal-wayland-0");
         let ready = actual.join("firefox-window-ready");
-        let valid = |socket: &Path, ready: &Path| {
+        let valid = |socket: &Path, portal: &Path, ready: &Path| {
             vec![
                 "--framebuffer".into(),
                 "/dev/fb0".into(),
@@ -1256,6 +1277,8 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 "/dev/input".into(),
                 "--socket".into(),
                 socket.to_string_lossy().into_owned(),
+                "--portal-socket".into(),
+                portal.to_string_lossy().into_owned(),
                 "--launcher-application".into(),
                 "td-jail-fixture".into(),
                 "--terminal-client".into(),
@@ -1270,7 +1293,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 "00ff00".into(),
             ]
         };
-        let options = super::parse_run(&valid(&wayland, &ready)).unwrap();
+        let options = super::parse_run(&valid(&wayland, &portal, &ready)).unwrap();
         let resolved_parent = std::fs::canonicalize(&actual).unwrap();
         assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
         assert_eq!(options.launcher_client, None);
@@ -1280,6 +1303,10 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             std::path::PathBuf::from("/bin/td-term")
         );
         assert_eq!(options.socket, resolved_parent.join("wayland-0"));
+        assert_eq!(
+            options.portal_socket,
+            resolved_parent.join("td-portal-wayland-0")
+        );
         assert_eq!(
             options.application_ready_socket,
             Some(resolved_parent.join("firefox-window-ready"))
@@ -1292,10 +1319,10 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             options.application_content_rgb_b.as_deref(),
             Some("00ff00")
         );
-        let mut activation_without_observer = valid(&wayland, &ready);
+        let mut activation_without_observer = valid(&wayland, &portal, &ready);
         activation_without_observer.truncate(activation_without_observer.len() - 8);
         assert!(super::parse_run(&activation_without_observer).is_err());
-        let mut one_content_color = valid(&wayland, &ready);
+        let mut one_content_color = valid(&wayland, &portal, &ready);
         one_content_color.truncate(one_content_color.len() - 2);
         assert!(super::parse_run(&one_content_color).is_err());
         assert_eq!(
@@ -1317,10 +1344,18 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         .is_err());
         assert!(super::parse_run(&valid(
             &wayland,
+            &portal,
             &actual.join(".").join("wayland-0")
         ))
         .is_err());
-        assert!(super::parse_run(&valid(&wayland, &alias.join("wayland-0"))).is_err());
+        assert!(super::parse_run(&valid(
+            &wayland,
+            &portal,
+            &alias.join("wayland-0")
+        ))
+        .is_err());
+        assert!(super::parse_run(&valid(&wayland, &wayland, &ready)).is_err());
+        assert!(super::parse_run(&valid(&wayland, &ready, &ready)).is_err());
         // The observer is meaningful only as one exact argument set around a
         // configured application launch.
         assert!(super::parse_run(&[
@@ -1370,7 +1405,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         .is_err());
         // The activation-only application mode cannot also retain a dead
         // direct launcher client.
-        let mut both_modes = valid(&wayland, &ready);
+        let mut both_modes = valid(&wayland, &portal, &ready);
         both_modes.extend([
             "--launcher-client".into(),
             "/bin/td-ui-demo".into(),

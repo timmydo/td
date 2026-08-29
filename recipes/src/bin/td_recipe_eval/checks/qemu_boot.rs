@@ -120,6 +120,9 @@ const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str =
     td_recipe::ladder::TD_PORTAL_REQUEST_RUNTIME_MARKER;
 const TD_PORTAL_REQUEST_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-REQUEST-READY response=2";
+const TD_PORTAL_CHANNEL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_CHANNEL_RUNTIME_MARKER;
+const TD_PORTAL_CHANNEL_CONSOLE_MARKER: &str =
+    "portal-channel-evidence: TD-PORTAL-CHANNEL-READY globals=10 privileged=0";
 /// Printed by the greeter's kernel-capability farm, as the unprivileged login user,
 /// once the RUNNING kernel has been observed to carry the sandbox features §0 pins
 /// that can be witnessed from `/proc` — every one but `CONFIG_MEMCG`, which needs a
@@ -350,6 +353,7 @@ struct ConsoleEvidence {
     td_busd_runtime: bool,
     td_portal_runtime: bool,
     td_portal_request_runtime: bool,
+    td_portal_channel_runtime: bool,
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
     td_jail_seccomp: bool,
@@ -983,6 +987,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          version and immutable policy ({TD_PORTAL_RUNTIME_MARKER}), then pre-subscribed to a \
          caller-derived handle and received both its Background method reply and directed \
          policy-denial Request.Response ({TD_PORTAL_REQUEST_RUNTIME_MARKER}), \
+         connected to the compositor's private portal socket, received its exact public \
+         registry, and proved the privileged manager remained absent until it is served \
+         ({TD_PORTAL_CHANNEL_RUNTIME_MARKER}), \
          confirmed on the RUNNING kernel that the namespaces, \
          seccomp filtering, inotify and cgroup pids controller a jail needs are all there \
          ({TD_SANDBOX_KERNEL_MARKER}), exercised td-jail's unprivileged namespace transition \
@@ -1562,6 +1569,18 @@ fn validate_system_boot(
              background-service policy. The missing marker instead means handle export, \
              reply ordering, directed signal routing, or exact result decoding failed. \
              Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_portal_channel_runtime {
+        return Err(format!(
+            "the public portal proof passed, but the private compositor-channel marker \
+             ({TD_PORTAL_CHANNEL_CONSOLE_MARKER:?}) was absent — the uid-1000 probe did not \
+             connect to /run/user/1000/td-portal-wayland-0, receive the exact ten public \
+             globals through wl_registry, or prove td_portal_manager_v1 remains absent. \
+             The privileged manager is intentionally deferred until its requests are \
+             served; this marker proves the private transport boundary without advertising \
+             authority prematurely. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -3574,6 +3593,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_BUSD_RUNTIME_MARKER.len(),
         exact_line_window(TD_PORTAL_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_REQUEST_CONSOLE_MARKER),
+        exact_line_window(TD_PORTAL_CHANNEL_CONSOLE_MARKER),
         TD_SANDBOX_KERNEL_MARKER.len(),
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
@@ -3770,6 +3790,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_portal_request_runtime,
         buf,
         TD_PORTAL_REQUEST_CONSOLE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_portal_channel_runtime,
+        buf,
+        TD_PORTAL_CHANNEL_CONSOLE_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_marker(
@@ -5811,7 +5837,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 61] {
+    fn all_console_markers() -> [&'static str; 62] {
         [
             MARKER,
             EROFS_MARKER,
@@ -5851,6 +5877,7 @@ mod tests {
             TD_BUSD_RUNTIME_MARKER,
             TD_PORTAL_CONSOLE_MARKER,
             TD_PORTAL_REQUEST_CONSOLE_MARKER,
+            TD_PORTAL_CHANNEL_CONSOLE_MARKER,
             TD_SANDBOX_KERNEL_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
@@ -5966,6 +5993,10 @@ mod tests {
             TD_PORTAL_REQUEST_CONSOLE_MARKER.strip_prefix("portal-evidence: "),
             Some(TD_PORTAL_REQUEST_RUNTIME_MARKER)
         );
+        assert_eq!(
+            TD_PORTAL_CHANNEL_CONSOLE_MARKER.strip_prefix("portal-channel-evidence: "),
+            Some(TD_PORTAL_CHANNEL_RUNTIME_MARKER)
+        );
         let mut evidence = ConsoleEvidence::default();
         latch_console_evidence(
             &mut evidence,
@@ -5992,6 +6023,13 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_portal_request_runtime);
+        assert!(!evidence.td_portal_channel_runtime);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_PORTAL_CHANNEL_CONSOLE_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_portal_channel_runtime);
     }
 
     #[test]
@@ -6444,6 +6482,7 @@ mod tests {
             TD_BUSD_RUNTIME_MARKER,
             TD_PORTAL_CONSOLE_MARKER,
             TD_PORTAL_REQUEST_CONSOLE_MARKER,
+            TD_PORTAL_CHANNEL_CONSOLE_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
             TD_FIREFOX_BOOT_MARKER,
@@ -6507,6 +6546,7 @@ mod tests {
         assert!(evidence.td_busd_runtime);
         assert!(evidence.td_portal_runtime);
         assert!(evidence.td_portal_request_runtime);
+        assert!(evidence.td_portal_channel_runtime);
         assert!(evidence.td_jail_transition);
         assert!(evidence.td_jail_seccomp);
         assert!(evidence.td_firefox);
