@@ -621,6 +621,22 @@ fn a_focused_cursor_over_an_inverse_cell_reads_as_ordinary_text() {
 }
 
 #[test]
+fn selection_inverts_only_its_inclusive_row_major_range() {
+    let mut terminal = Terminal::new(2, 4).unwrap();
+    terminal.feed(b"abcdefgh");
+    let snapshot = Snapshot::new(&terminal, true, false).with_selection(Some(Selection {
+        anchor: (1, 1),
+        extent: (0, 2),
+    }));
+    for (row, column) in [(0, 0), (0, 1), (1, 2), (1, 3)] {
+        assert!(!snapshot.cell(row, column).attributes.inverse);
+    }
+    for (row, column) in [(0, 2), (0, 3), (1, 0), (1, 1)] {
+        assert!(snapshot.cell(row, column).attributes.inverse);
+    }
+}
+
+#[test]
 fn pending_wrap_does_not_move_the_drawn_cursor() {
     let terminal = terminal(1, 3, b"abc");
     let (row, column, pending) = terminal.cursor();

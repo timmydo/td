@@ -758,7 +758,7 @@ mod confinement {
     }
 
     #[test]
-    fn one_scoped_unsafe_body_carries_only_the_reviewed_syscalls() {
+    fn two_scoped_unsafe_bodies_are_the_syscalls_and_exact_fd_adoption() {
         let syscall_body = r#"#[allow(unsafe_code)]
 fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
     let result: isize;
@@ -777,19 +777,30 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
     result
 }"#;
         assert!(MAIN.contains("#![deny(unsafe_code)]"));
-        assert_eq!(occurrences(SYS, "#[allow(unsafe_code)]"), 1);
-        assert_eq!(occurrences(SYS, "unsafe {"), 1);
+        let adoption_body = r#"    #[allow(unsafe_code)]
+    pub fn into_file(self) -> File {
+        let owned = ManuallyDrop::new(self);
+        // SAFETY: `ReceivedFd::adopt` accepted one live SCM_RIGHTS descriptor,
+        // this consumes its sole owner, and `ManuallyDrop` prevents the raw
+        // close path from running after `File` assumes that ownership.
+        unsafe { File::from_raw_fd(owned.fd) }
+    }"#;
+        assert_eq!(occurrences(SYS, "#[allow(unsafe_code)]"), 2);
+        assert_eq!(occurrences(SYS, "unsafe {"), 2);
         assert_eq!(occurrences(SYS, "core::arch::asm!"), 1);
         assert_eq!(occurrences(SYS, syscall_body), 1);
+        assert_eq!(occurrences(SYS, adoption_body), 1);
+        assert_eq!(occurrences(SYS, "File::from_raw_fd("), 1);
         for syscall in [
             "const SYS_CLOSE: usize = 3;",
             "const SYS_IOCTL: usize = 16;",
             "const SYS_SENDMSG: usize = 46;",
             "const SYS_RECVMSG: usize = 47;",
+            "const SYS_FCNTL: usize = 72;",
         ] {
             assert!(SYS.contains(syscall), "{syscall}");
         }
-        assert_eq!(occurrences(SYS, "const SYS_"), 4);
+        assert_eq!(occurrences(SYS, "const SYS_"), 5);
         for (name, source) in OTHER.iter().chain(TEST_ONLY) {
             assert!(
                 !source.contains("unsafe"),
@@ -799,6 +810,44 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 !source.contains("core::arch::asm!"),
                 "{name} introduced another raw syscall body"
             );
+        }
+    }
+
+    #[test]
+    fn the_fcntl_surface_is_two_pinned_file_status_commands() {
+        for command in [
+            "const F_GETFL: usize = 3;",
+            "const F_SETFL: usize = 4;",
+            "const O_NONBLOCK: usize = 0o4000;",
+        ] {
+            assert!(SYS.contains(command), "{command}");
+        }
+        let guard = "    if !matches!(command, F_GETFL | F_SETFL) {";
+        let entry =
+            "    errno_result(syscall3(SYS_FCNTL, fd as usize, command, argument), operation)";
+        assert_eq!(occurrences(SYS, guard), 1);
+        assert_eq!(occurrences(SYS, entry), 1);
+        assert_eq!(occurrences(SYS, "fn fcntl("), 1);
+        assert_eq!(occurrences(production(SYS), "fcntl(file.as_raw_fd(), F_GETFL, 0"), 1);
+        assert_eq!(
+            occurrences(
+                production(SYS),
+                "        F_SETFL,\n        flags | O_NONBLOCK,"
+            ),
+            1
+        );
+        assert_eq!(
+            occurrences(
+                production(SYS),
+                "fcntl(file.as_raw_fd(), F_SETFL, flags, \"restore F_SETFL\")?"
+            ),
+            1
+        );
+        for wrapper in [
+            "pub fn make_nonblocking(",
+            "pub fn restore_status_flags(",
+        ] {
+            assert_eq!(occurrences(SYS, wrapper), 1, "{wrapper}");
         }
     }
 
@@ -926,7 +975,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
     }
 
     #[test]
-    fn syscall_wrapper_is_called_only_by_the_four_reviewed_operations() {
+    fn syscall_wrapper_is_called_only_by_the_five_reviewed_operations() {
         let close = r#"errno_result(syscall3(SYS_CLOSE, fd as usize, 0, 0), "close")?"#;
         let receive = r#"syscall3(
             SYS_RECVMSG,
@@ -940,8 +989,9 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             (&message as *const MsgHdr) as usize,
             0,
         )"#;
-        assert_eq!(occurrences(SYS, "syscall3("), 5);
+        assert_eq!(occurrences(SYS, "syscall3("), 6);
         assert_eq!(occurrences(SYS, "SYS_CLOSE"), 2);
+        assert_eq!(occurrences(SYS, "SYS_FCNTL"), 2);
         assert_eq!(occurrences(SYS, "SYS_IOCTL"), 2);
         assert_eq!(occurrences(SYS, "SYS_SENDMSG"), 2);
         assert_eq!(occurrences(SYS, "SYS_RECVMSG"), 2);
@@ -950,6 +1000,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         assert_eq!(occurrences(SYS, send), 1);
         for operation in [
             "fn close_raw(",
+            "fn fcntl(",
             "pub fn recv_with_fds(",
             "pub fn send_with_fd(",
         ] {
@@ -971,6 +1022,9 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "sys::duplicate_received(",
             "sys::discard_received(",
             "sys::ReceivedFd::adopt(",
+            "sys::ReceivedFd::into_file(",
+            "sys::make_nonblocking(",
+            "sys::restore_status_flags(",
         ];
         const TERMINAL: &[&str] = &[
             "sys::unlock_pty(",
@@ -1067,8 +1121,45 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         assert_eq!(
             occurrences(production(server), "sys::ReceivedFd::adopt("),
             1,
-            "selection descriptor ownership must have one adoption site"
+            "server selection descriptor ownership must have one adoption site"
         );
+        assert_eq!(
+            occurrences(production(conn), "sys::ReceivedFd::adopt("),
+            1,
+            "client selection descriptor ownership must have one adoption site"
+        );
+        assert_eq!(
+            occurrences(production(conn), "sys::ReceivedFd::into_file("),
+            1,
+            "client selection endpoints must have one exact conversion site"
+        );
+        for source in [production(client), production(server)] {
+            assert_eq!(
+                occurrences(source, "sys::ReceivedFd::into_file("),
+                0,
+                "exact endpoint conversion escaped conn.rs"
+            );
+        }
+        assert_eq!(
+            occurrences(
+                production(conn),
+                "let flags = sys::make_nonblocking(file)?;"
+            ),
+            1,
+            "client selection writes must capture the kernel's status word"
+        );
+        assert_eq!(
+            occurrences(
+                production(conn),
+                "let restored = sys::restore_status_flags(file, flags);"
+            ),
+            1,
+            "client selection writes must restore the captured status word"
+        );
+        for source in [production(client), production(server)] {
+            assert_eq!(occurrences(source, "sys::make_nonblocking("), 0);
+            assert_eq!(occurrences(source, "sys::restore_status_flags("), 0);
+        }
         for operation in TRANSPORT {
             assert!(
                 client.contains(operation) || conn.contains(operation) || server.contains(operation),

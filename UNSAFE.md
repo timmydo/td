@@ -18,12 +18,13 @@ engine crate (the shared `engine` lib and
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
-The first nine confine that boundary to their syscall-instruction layer.
-The tenth, `td-busd`, carries a second scoped allow of a DIFFERENT shape —
-a descriptor adoption rather than an instruction — and §10 is where that
-difference is argued, because §6 turned the same allow down. The eleventh,
-`td-profiler`, also owns the pointer accesses into the perf ring mapping
-whose lifetime and bounds that same module controls.
+The first nine confine that boundary to their syscall-instruction layer except
+for `td-compositor`, whose client-side clipboard source consumes one exact
+received descriptor through a second scoped allow. The tenth, `td-busd`,
+carries the same different shape for general descriptor forwarding. Sections
+6 and 10 argue the two separately. The eleventh, `td-profiler`, also owns the
+pointer accesses into the perf ring mapping whose lifetime and bounds that
+same module controls.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -50,7 +51,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `fcntl(2)` with two value-pinned commands, `ioctl(2)`; plus one scoped client-side clipboard descriptor adoption |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation |
@@ -310,7 +311,12 @@ after safe duplication through `/proc/self/fd/N` or after its lifetime as an
 exact clipboard endpoint, and `sendmsg(2)` for the
 td-native demo client's wl_shm pool descriptor, the server's wl_keyboard
 keymap descriptor, and the transport selftest. Stable Rust exposes no
-stable ancillary-data API. It also carries a FOURTH, `ioctl(2)`, for
+stable ancillary-data API. It also carries `fcntl(2)` with only `F_GETFL=3`
+and `F_SETFL=4`: `conn.rs` temporarily adds x86-64 `O_NONBLOCK=0o4000` while
+the bounded clipboard writer drains one destination, then restores the exact
+prior status word. This closes the indefinite-write denial of service without
+holding a registry lock across I/O; another command, caller, or flag is an
+amendment here. The surface also carries `ioctl(2)` for
 td-term's PTY, with FOUR value-pinned requests reached only from `pty.rs`:
 `TIOCSPTLCK` (0x40045431) to unlock the slave, `TIOCGPTPEER` (0x5441) to
 obtain it as a descriptor rather than by `/dev/pts/N` name, and
@@ -360,17 +366,21 @@ syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.
 `TIOCGPTPEER`'s returned number is adopted through the SAME
-`/proc/self/fd/N` reopen the file-backed received-descriptor path uses,
-deliberately NOT `OwnedFd::from_raw_fd`: that would be a second scoped allow
-of a different shape — a descriptor adoption rather than the
-syscall-instruction layer — and the crate can reopen by descriptor identity
-instead. A clipboard transfer endpoint is the narrower exception to the
-REOPEN, not to the unsafe roster: it may be a pipe or socket and SCM_RIGHTS
-requires its original open-file description. `sys.rs` stores that raw number
-in `ReceivedFd`, whose `Drop` calls the existing close wrapper. The one
-`ReceivedFd::adopt` site is source-pinned inside `server.rs`, which wraps it in
-an opaque `TransferEndpoint` before the runtime can route it. No unsafe
-conversion or second scoped allow is added. Deliberately NOT in that surface:
+`/proc/self/fd/N` reopen the file-backed received-descriptor path uses. That
+route remains safe because the crate can reopen this file-backed descriptor by
+identity. A clipboard transfer endpoint is the narrower exception to the
+REOPEN: it may be a pipe or socket and SCM_RIGHTS requires its original
+open-file description. `sys.rs` stores that raw number in `ReceivedFd`, whose
+`Drop` calls the existing close wrapper. One source-pinned server adoption site
+wraps it in an opaque `TransferEndpoint` before the runtime can route it and
+does not use unsafe conversion. The separately pinned client adoption site
+consumes a data-source endpoint through `ReceivedFd::into_file`; its second
+scoped allow calls `File::from_raw_fd`, while `ManuallyDrop` prevents the raw
+owner from closing after `File` assumes sole ownership. This conversion is
+necessary because `/proc/self/fd/N` cannot reopen a socket and would create a
+different open-file description where reopening succeeds. The one conversion
+site is in `conn.rs`; no registry lock spans its eventual write. Deliberately
+NOT in that surface:
 framebuffer and evdev
 READING (ordinary files — every input REPORT td acts on arrives as bytes off
 a `File`; the one thing that does not is the POSITION a resync reads, since
@@ -1384,13 +1394,14 @@ rather than of process-wide state, which is worth the zero it costs.
 
 ### The second scoped allow
 
-This is the ONE surface with two `#[allow(unsafe_code)]` of different
-shapes: the `syscall` instruction, and `OwnedFd::from_raw_fd` for adopting
-a descriptor the kernel has already installed. §6 turned that same allow
-down: it re-derives file-backed descriptors through `/proc/self/fd/N` and
-keeps an exact clipboard endpoint in a small safe owner whose `Drop` reaches
-its already-rostered close syscall. Taking the allow here therefore still
-needs the reason that pair of choices does not cover.
+This surface has two `#[allow(unsafe_code)]` of different shapes: the `syscall`
+instruction, and `OwnedFd::from_raw_fd` for adopting a descriptor the kernel
+has already installed. Section 6 now uses the same adoption shape only when a
+native clipboard source must consume one exact endpoint; it still re-derives
+file-backed descriptors through `/proc/self/fd/N` and keeps server-routed
+clipboard endpoints in a small safe owner whose `Drop` reaches its rostered
+close syscall. Taking the allow here still needs the reason that narrower
+client conversion does not cover a general broker.
 
 It is this: the reopen trick works on the compositor's wl_shm pool files and
 keymap memfds, but not on its clipboard pipes and sockets; those stay in the
@@ -1459,13 +1470,13 @@ time rather than plateauing.
 
 ### Deliberately not here
 
-`close(2)` is NOT on this roster, and its absence is the point of taking
-the adoption: `OwnedFd` means `std` performs every close, so the crate
-needs no close of its own. §6 needs one precisely because it declined the
-unsafe adoption and must dispose both the raw number it reopened from and the
-exact clipboard endpoint held by its safe owner — the two choices are a
-matched pair, and this surface pays for its second allow by giving back a
-syscall.
+`close(2)` is NOT on this roster, and its absence is the point of taking the
+adoption: `OwnedFd` means `std` performs every close, so the crate has no close
+of its own. Section 6 needs one because its server retains exact endpoints in a
+safe raw owner and it must also dispose the raw number behind every reopened
+file-backed descriptor. Its client conversion narrows that owner only after a
+source `send`. This broker instead adopts every admitted descriptor immediately
+and pays for its second allow by giving back a syscall.
 
 There is no `poll(2)` or `epoll_*`. Stable `std` exposes neither, and
 readiness multiplexing would be a FOURTH rostered syscall bought for a

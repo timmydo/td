@@ -19,12 +19,13 @@ use crate::{
     font, keys, pty, ready, render, socket, wire, MAX_HELD_KEYS, MAX_UI_DIMENSION,
     MAX_UI_FRAME_BYTES,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -45,14 +46,35 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const PROC_STATUS: &str = "/proc/self/status";
 const ETC_PASSWD: &str = "/etc/passwd";
 
-/// One past the last fixed id the TERMINAL creates: a seat and a keyboard.
+/// The two fixed objects only td-term creates. Object-id policy is per client,
+/// so these follow the common fixed terminal objects without depending on the
+/// separate demo client's map.
+const DATA_DEVICE_MANAGER: u32 = KEYBOARD + 1;
+const DATA_DEVICE: u32 = DATA_DEVICE_MANAGER + 1;
+
+/// One past the last fixed id the TERMINAL creates: a seat, keyboard, data
+/// manager, and data device.
 /// Its `wl_pointer` is NOT among them, and that is the whole reason it takes
 /// a DYNAMIC id — the pointer is created only where the seat advertises the
 /// capability, so a fixed id reserved for it would be skipped on a
 /// keyboard-only seat, and Wayland forbids the gap. A dynamic id is dense
 /// either way, being one the connection hands out when it is actually asked
 /// for. See `conn`'s note on why this is per-client.
-const FIRST_DYNAMIC_ID: u32 = KEYBOARD + 1;
+const FIRST_DYNAMIC_ID: u32 = DATA_DEVICE + 1;
+
+const DATA_DEVICE_MANAGER_VERSION: u32 = 3;
+const LEFT_BUTTON: u32 = 0x110;
+const CLIPBOARD_KEY: u16 = 46;
+const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+const MAX_CLIPBOARD_SOURCES: usize = 8;
+const MAX_CLIPBOARD_SYNCS: usize = 8;
+const MAX_CLIPBOARD_OFFERS: usize = 8;
+const MAX_CLIPBOARD_WRITES: usize = 4;
+const CLIPBOARD_MIME_TYPES: [&str; 3] = [
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+];
 
 /// What an operator sees in a title bar. td's own compositor now KEEPS this
 /// rather than discarding it, so it is the name this window will carry.
@@ -105,6 +127,7 @@ struct Bound {
     shm: u32,
     xdg_wm_base: u32,
     seat: u32,
+    data_device_manager: u32,
 }
 
 impl Bound {
@@ -114,12 +137,13 @@ impl Bound {
             _ if name == self.shm => Some("wl_shm"),
             _ if name == self.xdg_wm_base => Some("xdg_wm_base"),
             _ if name == self.seat => Some("wl_seat"),
+            _ if name == self.data_device_manager => Some("wl_data_device_manager"),
             _ => None,
         }
     }
 }
 
-/// Bind the four globals a terminal needs. The `wl_seat` is one of them now:
+/// Bind the five globals a terminal needs. The `wl_seat` is one of them now:
 /// a keymap arrives through a keyboard, and a keyboard is a seat's to give.
 fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
     let globals = conn::discover_globals(connection)?;
@@ -132,6 +156,12 @@ fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
         "wl_seat",
         SEAT_VERSION_MINIMUM,
         SEAT_VERSION_MAXIMUM,
+    )?;
+    let (data_manager_name, data_manager_version) = Globals::require(
+        globals.data_device_manager(),
+        "wl_data_device_manager",
+        DATA_DEVICE_MANAGER_VERSION,
+        DATA_DEVICE_MANAGER_VERSION,
     )?;
     conn::bind(
         connection,
@@ -149,11 +179,23 @@ fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
         XDG_WM_BASE,
     )?;
     conn::bind(connection, seat_name, "wl_seat", seat_version, SEAT)?;
+    conn::bind(
+        connection,
+        data_manager_name,
+        "wl_data_device_manager",
+        data_manager_version,
+        DATA_DEVICE_MANAGER,
+    )?;
+    let mut device = wire::Builder::new();
+    device.u32(DATA_DEVICE);
+    device.u32(SEAT);
+    connection.send(DATA_DEVICE_MANAGER, 1, device)?;
     Ok(Bound {
         compositor: compositor_name,
         shm: shm_name,
         xdg_wm_base: xdg_name,
         seat: seat_name,
+        data_device_manager: data_manager_name,
     })
 }
 
@@ -237,6 +279,34 @@ struct Drawn {
     activated: bool,
 }
 
+type SourceRegistry = Arc<Mutex<BTreeMap<u32, Arc<[u8]>>>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PointerSelectionFrame {
+    anchor: Option<(i32, i32)>,
+    extent: (i32, i32),
+}
+
+struct ClipboardState {
+    sources: BTreeMap<u32, Arc<[u8]>>,
+    syncs: BTreeMap<u32, (u32, usize)>,
+    offers: BTreeSet<u32>,
+    current: Option<u32>,
+    registry: SourceRegistry,
+}
+
+impl ClipboardState {
+    fn new() -> Self {
+        Self {
+            sources: BTreeMap::new(),
+            syncs: BTreeMap::new(),
+            offers: BTreeSet::new(),
+            current: None,
+            registry: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+}
+
 /// What the client knows about its surface between configures.
 ///
 /// The toplevel configure carries the size and the SURFACE configure is where
@@ -289,6 +359,12 @@ struct Surface {
     /// the same one — a protocol error. `None` until a seat offers the
     /// capability, which is also how a keyboard-only seat is served.
     pointer: Option<u32>,
+    pointer_x: i32,
+    pointer_y: i32,
+    pointer_left_down: bool,
+    pending_selection_anchor: Option<(i32, i32)>,
+    pending_selection_extent: Option<(i32, i32)>,
+    selection: Option<render::Selection>,
     /// Detents accumulated since the last `wl_pointer.frame`. A frame is the
     /// transaction, so a report that turned the wheel is applied once when it
     /// closes rather than per axis event — which is also what keeps a tilting
@@ -321,6 +397,9 @@ struct Surface {
     /// caller that has a CLOCK. `dispatch` has none and should not: it is
     /// driven by tests that inject events, not time.
     pending_key: Option<(u16, bool)>,
+    pending_copy: Option<u32>,
+    pending_clipboard_marker: Option<usize>,
+    clipboard: ClipboardState,
     /// td-term's scrollback viewport: which line is being looked at, not a
     /// distance from a bottom that moves.
     viewport: keys::Viewport,
@@ -354,6 +433,12 @@ impl Surface {
             seat_capabilities: None,
             keyboard_requested: false,
             pointer: None,
+            pointer_x: 0,
+            pointer_y: 0,
+            pointer_left_down: false,
+            pending_selection_anchor: None,
+            pending_selection_extent: None,
+            selection: None,
             pending_notches: 0,
             keymap_verified: false,
             modifiers: 0,
@@ -362,6 +447,9 @@ impl Surface {
             modes: keys::Modes::default(),
             pending_input: None,
             pending_key: None,
+            pending_copy: None,
+            pending_clipboard_marker: None,
+            clipboard: ClipboardState::new(),
             viewport: keys::Viewport::new(),
             history: keys::Scrollback::default(),
             repeat: keys::Repeat::new(),
@@ -537,7 +625,7 @@ impl Surface {
                 }
                 // key: serial, time, key, state.
                 3 => {
-                    args.u32()?;
+                    let serial = args.u32()?;
                     args.u32()?;
                     let code = args.u32()?;
                     let pressed = match args.u32()? {
@@ -546,10 +634,26 @@ impl Surface {
                         state => return Err(format!("wl_keyboard key has invalid state {state}")),
                     };
                     args.finish()?;
-                    if let Ok(code) = u16::try_from(code) {
-                        self.pending_key = Some((code, pressed));
+                    let copy = u16::try_from(code).ok() == Some(CLIPBOARD_KEY)
+                        && self.modifiers
+                            & !(crate::keyboard::MOD_CAPS | crate::keyboard::MOD_NUM)
+                            == (crate::keyboard::MOD_SHIFT | crate::keyboard::MOD_CONTROL)
+                        && self.group == 0;
+                    if copy {
+                        self.repeat.cancel();
+                        if pressed {
+                            self.pending_copy = Some(serial);
+                        }
+                    } else {
+                        if let Ok(code) = u16::try_from(code) {
+                            self.pending_key = Some((code, pressed));
+                        }
                     }
-                    if pressed {
+                    let modifier = u16::try_from(code).ok().is_some_and(keys::is_modifier);
+                    if pressed && !copy {
+                        if !modifier {
+                            self.clear_selection();
+                        }
                         self.translate(code)?;
                     }
                 }
@@ -620,8 +724,8 @@ impl Surface {
                     if object != SURFACE {
                         return Err(format!("wl_pointer entered unexpected surface {object}"));
                     }
-                    args.i32()?;
-                    args.i32()?;
+                    self.pointer_x = args.i32()?;
+                    self.pointer_y = args.i32()?;
                     args.finish()?;
                 }
                 1 => {
@@ -631,19 +735,47 @@ impl Surface {
                         return Err(format!("wl_pointer left unexpected surface {object}"));
                     }
                     args.finish()?;
+                    self.pointer_left_down = false;
+                    self.pending_selection_anchor = None;
+                    self.pending_selection_extent = None;
                 }
                 2 => {
                     args.u32()?;
-                    args.i32()?;
-                    args.i32()?;
+                    self.pointer_x = args.i32()?;
+                    self.pointer_y = args.i32()?;
+                    if self.pointer_left_down {
+                        self.pending_selection_extent =
+                            Some((self.pointer_x, self.pointer_y));
+                    }
                     args.finish()?;
                 }
                 3 => {
                     args.u32()?;
                     args.u32()?;
-                    args.u32()?;
-                    args.u32()?;
+                    let button = args.u32()?;
+                    let state = args.u32()?;
                     args.finish()?;
+                    if button == LEFT_BUTTON {
+                        match state {
+                            KEY_PRESSED => {
+                                self.pointer_left_down = true;
+                                self.pending_selection_anchor =
+                                    Some((self.pointer_x, self.pointer_y));
+                                self.pending_selection_extent =
+                                    Some((self.pointer_x, self.pointer_y));
+                            }
+                            KEY_RELEASED => {
+                                self.pointer_left_down = false;
+                                self.pending_selection_extent =
+                                    Some((self.pointer_x, self.pointer_y));
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "wl_pointer button has invalid state {state}"
+                                ))
+                            }
+                        }
+                    }
                 }
                 // axis: the DISTANCE, which this client does not read. The
                 // notch count comes from `axis_discrete` instead, that being
@@ -693,6 +825,90 @@ impl Surface {
                         message.opcode
                     ))
                 }
+            }
+            return Ok(false);
+        }
+        if message.object == DATA_DEVICE {
+            let mut args = wire::Cursor::new(&message.payload);
+            match message.opcode {
+                0 => {
+                    let offer = args.u32()?;
+                    args.finish()?;
+                    if offer == 0
+                        || self.clipboard.offers.len() >= MAX_CLIPBOARD_OFFERS
+                        || !self.clipboard.offers.insert(offer)
+                    {
+                        return Err(format!("wl_data_device introduced invalid offer {offer}"));
+                    }
+                }
+                5 => {
+                    let offer = args.u32()?;
+                    args.finish()?;
+                    if offer != 0 {
+                        if !self.clipboard.offers.remove(&offer) {
+                            return Err(format!(
+                                "wl_data_device selected unknown offer {offer}"
+                            ));
+                        }
+                        connection.send(offer, 2, wire::Builder::new())?;
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected wl_data_device event opcode={}",
+                        message.opcode
+                    ))
+                }
+            }
+            return Ok(false);
+        }
+        if self.clipboard.offers.contains(&message.object) {
+            if message.opcode != 0 {
+                return Err(format!(
+                    "unexpected wl_data_offer event opcode={}",
+                    message.opcode
+                ));
+            }
+            let mut args = wire::Cursor::new(&message.payload);
+            args.string()?;
+            args.finish()?;
+            return Ok(false);
+        }
+        if self.clipboard.sources.contains_key(&message.object) {
+            if message.opcode != 2 {
+                return Err(format!(
+                    "unexpected wl_data_source event opcode={}",
+                    message.opcode
+                ));
+            }
+            wire::Cursor::new(&message.payload).finish()?;
+            let source = message.object;
+            self.clipboard.sources.remove(&source);
+            if self.clipboard.current == Some(source) {
+                self.clipboard.current = None;
+            }
+            self.clipboard
+                .registry
+                .lock()
+                .map_err(|_| "clipboard source registry lock poisoned".to_string())?
+                .remove(&source);
+            connection.send(source, 1, wire::Builder::new())?;
+            return Ok(false);
+        }
+        if let Some((source, bytes)) = self.clipboard.syncs.remove(&message.object) {
+            if message.opcode != 0 {
+                return Err(format!(
+                    "unexpected clipboard sync event opcode={}",
+                    message.opcode
+                ));
+            }
+            let mut args = wire::Cursor::new(&message.payload);
+            args.u32()?;
+            args.finish()?;
+            if self.clipboard.current == Some(source)
+                && self.clipboard.sources.contains_key(&source)
+            {
+                self.pending_clipboard_marker = Some(bytes);
             }
             return Ok(false);
         }
@@ -832,6 +1048,9 @@ impl Surface {
         let before = self.viewport.offset(self.history);
         self.viewport.apply(action, rows, self.history);
         self.stale |= self.viewport.offset(self.history) != before;
+        if self.viewport.offset(self.history) != before {
+            self.clear_selection();
+        }
     }
 
     /// Move the view by a wheel's worth. `notches` is the PROTOCOL's sign,
@@ -848,6 +1067,158 @@ impl Surface {
             self.history,
         );
         self.stale |= self.viewport.offset(self.history) != before;
+        if self.viewport.offset(self.history) != before {
+            self.clear_selection();
+        }
+    }
+
+    fn source_registry(&self) -> SourceRegistry {
+        Arc::clone(&self.clipboard.registry)
+    }
+
+    fn clear_selection(&mut self) {
+        if self.selection.take().is_some() {
+            self.stale = true;
+        }
+    }
+
+    fn take_pointer_selection(&mut self) -> Option<PointerSelectionFrame> {
+        let extent = self.pending_selection_extent.take()?;
+        Some(PointerSelectionFrame {
+            anchor: self.pending_selection_anchor.take(),
+            extent,
+        })
+    }
+
+    fn cell_at(&self, fixed: (i32, i32), font: &Font) -> Option<(usize, usize)> {
+        let (rows, columns) = self.cells?;
+        if rows == 0 || columns == 0 || font.width() == 0 || font.height() == 0 {
+            return None;
+        }
+        let pixel = |value: i32| usize::try_from(value.div_euclid(256)).unwrap_or(0);
+        let row = (pixel(fixed.1) / font.height()).min(usize::from(rows).saturating_sub(1));
+        let column =
+            (pixel(fixed.0) / font.width()).min(usize::from(columns).saturating_sub(1));
+        Some((row, column))
+    }
+
+    fn apply_pointer_selection(&mut self, frame: PointerSelectionFrame, font: &Font) {
+        let Some(extent) = self.cell_at(frame.extent, font) else {
+            return;
+        };
+        let next = match frame.anchor.and_then(|anchor| self.cell_at(anchor, font)) {
+            Some(anchor) => Some(render::Selection { anchor, extent }),
+            None => self.selection.map(|selection| render::Selection {
+                anchor: selection.anchor,
+                extent,
+            }),
+        };
+        if next != self.selection {
+            self.selection = next;
+            self.stale = true;
+        }
+    }
+
+    fn selected_text(&self, terminal: &Terminal) -> Result<Option<Vec<u8>>, String> {
+        let Some(selection) = self.selection else {
+            return Ok(None);
+        };
+        let (start, end) = if selection.anchor <= selection.extent {
+            (selection.anchor, selection.extent)
+        } else {
+            (selection.extent, selection.anchor)
+        };
+        let viewport = self.viewport.offset(terminal.scrollback());
+        let snapshot = render::Snapshot::new(terminal, self.activated, false)
+            .scrolled_back(viewport);
+        let mut selected = Vec::new();
+        for row in start.0..=end.0 {
+            if row != start.0 {
+                if selected.len() == MAX_CLIPBOARD_BYTES {
+                    return Err(format!(
+                        "terminal selection exceeds {MAX_CLIPBOARD_BYTES} bytes"
+                    ));
+                }
+                selected.push(b'\n');
+            }
+            let first = if row == start.0 { start.1 } else { 0 };
+            let last = if row == end.0 {
+                end.1
+            } else {
+                snapshot.columns().saturating_sub(1)
+            };
+            let line_start = selected.len();
+            for column in first..=last {
+                let scalar = snapshot.cell(row, column).scalar;
+                let mut encoded = [0u8; 4];
+                let bytes = scalar.encode_utf8(&mut encoded).as_bytes();
+                if selected.len().saturating_add(bytes.len()) > MAX_CLIPBOARD_BYTES {
+                    return Err(format!(
+                        "terminal selection exceeds {MAX_CLIPBOARD_BYTES} bytes"
+                    ));
+                }
+                selected.extend_from_slice(bytes);
+            }
+            while selected.len() > line_start && selected.last() == Some(&b' ') {
+                selected.pop();
+            }
+        }
+        if selected.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(selected))
+        }
+    }
+
+    fn own_selection(
+        &mut self,
+        connection: &mut Connection,
+        serial: u32,
+        bytes: Vec<u8>,
+    ) -> Result<bool, String> {
+        if bytes.is_empty()
+            || self.clipboard.sources.len() >= MAX_CLIPBOARD_SOURCES
+            || self.clipboard.syncs.len() >= MAX_CLIPBOARD_SYNCS
+        {
+            return Ok(false);
+        }
+        let source = connection.allocate_id()?;
+        let callback = connection.allocate_id()?;
+        let payload: Arc<[u8]> = bytes.into();
+        if self.clipboard.sources.contains_key(&source) {
+            return Err(format!("clipboard source {source} was already retained"));
+        }
+        {
+            let mut registry = self
+                .clipboard
+                .registry
+                .lock()
+                .map_err(|_| "clipboard source registry lock poisoned".to_string())?;
+            if registry.contains_key(&source) {
+                return Err(format!("clipboard source {source} was already live"));
+            }
+            self.clipboard.sources.insert(source, Arc::clone(&payload));
+            registry.insert(source, Arc::clone(&payload));
+        }
+        self.clipboard.current = Some(source);
+        self.clipboard.syncs.insert(callback, (source, payload.len()));
+
+        let mut create = wire::Builder::new();
+        create.u32(source);
+        connection.send(DATA_DEVICE_MANAGER, 0, create)?;
+        for mime_type in CLIPBOARD_MIME_TYPES {
+            let mut offer = wire::Builder::new();
+            offer.string(mime_type)?;
+            connection.send(source, 0, offer)?;
+        }
+        let mut selection = wire::Builder::new();
+        selection.u32(source);
+        selection.u32(serial);
+        connection.send(DATA_DEVICE, 1, selection)?;
+        let mut sync = wire::Builder::new();
+        sync.u32(callback);
+        connection.send(conn::DISPLAY, 0, sync)?;
+        Ok(true)
     }
 
     /// Whether the seat's LATEST word still claims a keyboard. Asked here
@@ -970,13 +1341,16 @@ fn build_pixels(
     palette: &render::Palette,
     focused: bool,
     viewport: usize,
+    selection: Option<render::Selection>,
 ) -> Result<Vec<u8>, String> {
     let bytes = frame_bytes(size)?;
     let mut pixels = vec![0u8; bytes];
     // No cursor override: `render.rs` shifts the cursor down by the viewport
     // and drops it once it falls off the bottom, so a scrolled-back view
     // already draws it on the right cell or not at all.
-    let snapshot = render::Snapshot::new(terminal, focused, false).scrolled_back(viewport);
+    let snapshot = render::Snapshot::new(terminal, focused, false)
+        .scrolled_back(viewport)
+        .with_selection(selection);
     render::render(
         &snapshot,
         palette,
@@ -1004,7 +1378,15 @@ fn commit_frame(
         return Err("compositor did not advertise wl_shm XRGB8888".into());
     }
     let viewport = draw_offset(surface, terminal);
-    let pixels = build_pixels(size, terminal, font, palette, surface.activated, viewport)?;
+    let pixels = build_pixels(
+        size,
+        terminal,
+        font,
+        palette,
+        surface.activated,
+        viewport,
+        surface.selection,
+    )?;
     let (buffer, callback) = conn::attach_frame(
         connection,
         directory,
@@ -1087,6 +1469,7 @@ fn adopt_size(
     // the position is a defence in depth, and the comment is what holds it.
     frame_bytes(size)?;
     let (rows, columns) = grid(size, session.font)?;
+    surface.clear_selection();
     let window = session
         .pty
         .resize(usize::from(rows), usize::from(columns))?;
@@ -1232,6 +1615,29 @@ struct Child {
     status: Option<ExitStatus>,
 }
 
+struct ClipboardWrite {
+    file: File,
+    payload: Arc<[u8]>,
+}
+
+fn spawn_clipboard_writer() -> Result<(SyncSender<ClipboardWrite>, JoinHandle<()>), String> {
+    let (sender, writes) = sync_channel::<ClipboardWrite>(MAX_CLIPBOARD_WRITES);
+    let thread = thread::Builder::new()
+        .name("td-term-clipboard".into())
+        .spawn(move || {
+            while let Ok(mut write) = writes.recv() {
+                if let Err(error) = conn::write_clipboard(&mut write.file, &write.payload) {
+                    let line = format!("td-term: {error}\n");
+                    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+                }
+                // Closing the endpoint is the transfer delimiter. `File`
+                // drops here before the next bounded write.
+            }
+        })
+        .map_err(|e| format!("spawn the clipboard writer thread: {e}"))?;
+    Ok((sender, thread))
+}
+
 impl Default for Child {
     /// A child that is not there yet — startup, before `start`. Keys struck
     /// during presentation ARE pushed into this queue, and it is the queue
@@ -1253,22 +1659,66 @@ impl Default for Child {
 fn spawn_wayland_reader(
     mut reader: conn::Reader,
     events: SyncSender<Event>,
+    sources: SourceRegistry,
+    clipboard: SyncSender<ClipboardWrite>,
 ) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("td-term-wayland".into())
         .spawn(move || loop {
             match reader.next() {
                 Ok(message) => {
-                    // The ONE descriptor the terminal expects — its keymap —
-                    // is sent by td's server from `send_keyboard_initial`,
-                    // once, as the keyboard is registered, and a second
-                    // registration of that id is refused there. So it arrives
-                    // and is claimed during `present`, before the reading
-                    // half detaches. A compositor that re-sent one later
-                    // would be closed here rather than verified: §11 puts
-                    // other compositors outside this profile, and an
-                    // unclaimed descriptor would otherwise be held open until
-                    // the process ended.
+                    if message.opcode == 1 {
+                        let payload = match sources.lock() {
+                            Ok(sources) => sources.get(&message.object).cloned(),
+                            Err(_) => {
+                                let _ = events.send(Event::Closed(
+                                    "clipboard source registry lock poisoned".into(),
+                                ));
+                                return;
+                            }
+                        };
+                        if let Some(payload) = payload {
+                            let mut args = wire::Cursor::new(&message.payload);
+                            let mime_type = match args.string().and_then(|value| {
+                                args.finish()?;
+                                Ok(value)
+                            }) {
+                                Ok(mime_type) => mime_type,
+                                Err(error) => {
+                                    let _ = events.send(Event::Closed(error));
+                                    return;
+                                }
+                            };
+                            let file = match reader.take_file("wl_data_source.send") {
+                                Ok(file) => file,
+                                Err(error) => {
+                                    let _ = events.send(Event::Closed(error));
+                                    return;
+                                }
+                            };
+                            if reader.pending_fd_count() != 0 {
+                                let _ = events.send(Event::Closed(
+                                    "wl_data_source.send carried more than one descriptor".into(),
+                                ));
+                                return;
+                            }
+                            if CLIPBOARD_MIME_TYPES.contains(&mime_type.as_str()) {
+                                match clipboard.try_send(ClipboardWrite { file, payload }) {
+                                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        let _ = events.send(Event::Closed(
+                                            "the clipboard writer stopped".into(),
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // The keymap descriptor is claimed during presentation.
+                    // In steady state the only legal descriptor is the exact
+                    // selection endpoint consumed above.
                     let unclaimed = reader.pending_fd_count();
                     if unclaimed != 0 {
                         let _ = events.send(Event::Closed(format!(
@@ -1416,6 +1866,8 @@ fn serve_event(
         Event::Exit(status) => child.status = Some(status),
         Event::Drained => child.drained = true,
         Event::Wayland(message) => {
+            let closes_pointer_frame =
+                Some(message.object) == surface.pointer && message.opcode == 5;
             // Refreshed before rather than after: the mode in force when the
             // key was pressed is the one that spells it, and a child's reply
             // to an earlier key can change it. Only for the keyboard, though
@@ -1441,6 +1893,44 @@ fn serve_event(
             if !connection.handle_common(&message)? {
                 surface.dispatch(connection, &message, fallback)?;
             }
+            if closes_pointer_frame {
+                if let Some(selection) = surface.take_pointer_selection() {
+                    surface.apply_pointer_selection(selection, session.font);
+                }
+            }
+            if let Some(serial) = surface.pending_copy.take() {
+                let selected = match model.as_ref() {
+                    Some(terminal) => surface.selected_text(terminal),
+                    None => Ok(None),
+                };
+                match selected {
+                    Ok(Some(bytes)) => {
+                        if !surface.own_selection(connection, serial, bytes)? {
+                            if let Some(terminal) = model.as_mut() {
+                                terminal.ring();
+                                surface.stale = true;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let line = format!("td-term: copy selection: {error}\n");
+                        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+                        if let Some(terminal) = model.as_mut() {
+                            terminal.ring();
+                            surface.stale = true;
+                        }
+                    }
+                }
+            }
+            if let Some(bytes) = surface.pending_clipboard_marker.take() {
+                let marker = format!("TD-TERM-CLIPBOARD-READY bytes={bytes}\n");
+                let mut out = std::io::stdout().lock();
+                out.write_all(marker.as_bytes())
+                    .map_err(|e| format!("write terminal clipboard marker: {e}"))?;
+                out.flush()
+                    .map_err(|e| format!("flush terminal clipboard marker: {e}"))?;
+            }
             if let Some(sequence) = surface.pending_input.take() {
                 // Refused means the child is not draining, which §10 answers
                 // with the bell rather than by growing the queue or dropping
@@ -1457,6 +1947,7 @@ fn serve_event(
             }
         }
         Event::Output(bytes) => {
+            surface.clear_selection();
             let terminal = model
                 .as_mut()
                 .ok_or_else(|| "the child wrote before the terminal had a model".to_string())?;
@@ -1812,9 +2303,11 @@ pub fn run(options: &Options) -> Result<(), String> {
     // Both of these can — a descriptor limit, a thread limit — and a probe
     // that accepted the socket only to watch the terminal exit would have
     // been told something true for less than a second.
+    let sources = surface.source_registry();
+    let (clipboard, _clipboard_writer) = spawn_clipboard_writer()?;
     let reader = connection.detach_reader()?;
     let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
-    let _wayland = spawn_wayland_reader(reader, sender.clone())?;
+    let _wayland = spawn_wayland_reader(reader, sender.clone(), sources, clipboard)?;
     let (_children, mut child, _ready) = start(
         &pty,
         &sender,
@@ -1929,7 +2422,7 @@ pub fn selftest() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conn::{DISPLAY, KEYBOARD, POINTER, SEAT, SURFACE, SYNC_CALLBACK};
+    use crate::conn::{DISPLAY, KEYBOARD, SEAT, SURFACE, SYNC_CALLBACK};
     use std::io::Read;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1972,6 +2465,14 @@ mod tests {
             opcode,
             payload,
         }
+    }
+
+    fn words_message(object: u32, opcode: u16, words: &[u32]) -> wire::Message {
+        let mut payload = Vec::with_capacity(words.len().saturating_mul(4));
+        for word in words {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        message(object, opcode, payload)
     }
 
     fn toplevel_configure(width: i32, height: i32) -> wire::Message {
@@ -2024,13 +2525,630 @@ mod tests {
         (connection, theirs)
     }
 
+    fn test_surface() -> Surface {
+        Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+            data_device_manager: 6,
+        })
+    }
+
+    #[test]
+    fn pointer_selection_extracts_the_inclusive_utf8_cell_range() {
+        let font = font();
+        let mut surface = test_surface();
+        surface.cells = Some((2, 12));
+        let mut terminal = Terminal::new(2, 12).unwrap();
+        terminal.feed(b"  Welcome   next");
+        let fixed = |column: usize, row: usize| {
+            let x = column
+                .saturating_mul(font.width())
+                .saturating_add(font.width() / 2)
+                .saturating_mul(256);
+            let y = row
+                .saturating_mul(font.height())
+                .saturating_add(font.height() / 2)
+                .saturating_mul(256);
+            (i32::try_from(x).unwrap(), i32::try_from(y).unwrap())
+        };
+        surface.apply_pointer_selection(
+            PointerSelectionFrame {
+                anchor: Some(fixed(8, 0)),
+                extent: fixed(2, 0),
+            },
+            &font,
+        );
+        assert_eq!(
+            surface.selected_text(&terminal).unwrap(),
+            Some(b"Welcome".to_vec())
+        );
+
+        surface.apply_pointer_selection(
+            PointerSelectionFrame {
+                anchor: Some(fixed(9, 0)),
+                extent: fixed(3, 1),
+            },
+            &font,
+        );
+        assert_eq!(
+            surface.selected_text(&terminal).unwrap(),
+            Some(b"\nnext".to_vec()),
+            "trailing spaces in the first selected row were retained"
+        );
+
+        let blank = Terminal::new(1, 1).unwrap();
+        surface.selection = Some(render::Selection {
+            anchor: (0, 0),
+            extent: (0, 0),
+        });
+        assert_eq!(surface.selected_text(&blank).unwrap(), None);
+    }
+
+    #[test]
+    fn pointer_drag_is_applied_by_wire_frames_and_rejects_invalid_state() {
+        let (mut connection, _peer) = pair();
+        let mut surface = test_surface();
+        let pointer = 99;
+        surface.pointer = Some(pointer);
+        surface.cells = Some((2, 12));
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut terminal = Terminal::new(2, 12).unwrap();
+        terminal.feed(b"  Welcome   next");
+        let mut model = Some(terminal);
+        let mut child = Child::default();
+        let fixed = |column: usize, row: usize| {
+            let x = column
+                .saturating_mul(font.width())
+                .saturating_add(font.width() / 2)
+                .saturating_mul(256);
+            let y = row
+                .saturating_mul(font.height())
+                .saturating_add(font.height() / 2)
+                .saturating_mul(256);
+            (i32::try_from(x).unwrap(), i32::try_from(y).unwrap())
+        };
+        let encoded = |value: i32| u32::from_ne_bytes(value.to_ne_bytes());
+        let anchor = fixed(2, 0);
+        let extent = fixed(8, 0);
+
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Wayland(words_message(
+                pointer,
+                0,
+                &[1, SURFACE, encoded(anchor.0), encoded(anchor.1)],
+            )),
+        )
+        .unwrap();
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Wayland(words_message(
+                pointer,
+                3,
+                &[2, 9, LEFT_BUTTON, KEY_PRESSED],
+            )),
+        )
+        .unwrap();
+        assert_eq!(surface.selection, None, "press escaped its pointer frame");
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Wayland(message(pointer, 5, Vec::new())),
+        )
+        .unwrap();
+        assert_eq!(
+            surface.selection,
+            Some(render::Selection {
+                anchor: (0, 2),
+                extent: (0, 2),
+            }),
+            "a click did not select its one cell"
+        );
+
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Wayland(words_message(
+                pointer,
+                2,
+                &[9, encoded(extent.0), encoded(extent.1)],
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            surface.selection.map(|selection| selection.extent),
+            Some((0, 2)),
+            "motion escaped its pointer frame"
+        );
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Wayland(message(pointer, 5, Vec::new())),
+        )
+        .unwrap();
+        assert_eq!(
+            surface
+                .selected_text(model.as_ref().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some(&b"Welcome"[..])
+        );
+
+        let error = surface
+            .dispatch(
+                &mut connection,
+                &words_message(pointer, 3, &[3, 9, LEFT_BUTTON, 2]),
+                fallback,
+            )
+            .unwrap_err();
+        assert!(error.contains("invalid state"), "{error}");
+    }
+
+    #[test]
+    fn clipboard_byte_source_and_offer_ceilings_are_exact() {
+        let columns = MAX_CLIPBOARD_BYTES / 4;
+        let mut terminal = Terminal::new(2, columns).unwrap();
+        terminal.feed("😀".repeat(columns + 1).as_bytes());
+        let mut surface = test_surface();
+        surface.selection = Some(render::Selection {
+            anchor: (0, 0),
+            extent: (0, columns - 1),
+        });
+        assert_eq!(
+            surface.selected_text(&terminal).unwrap().unwrap().len(),
+            MAX_CLIPBOARD_BYTES
+        );
+        surface.selection = Some(render::Selection {
+            anchor: (0, 0),
+            extent: (1, 0),
+        });
+        assert!(surface
+            .selected_text(&terminal)
+            .unwrap_err()
+            .contains("exceeds"));
+
+        let (mut connection, _peer) = pair();
+        let next = connection.next_id_for_test();
+        assert!(!surface
+            .own_selection(&mut connection, 77, Vec::new())
+            .unwrap());
+        assert_eq!(connection.next_id_for_test(), next);
+        for _ in 0..MAX_CLIPBOARD_SOURCES {
+            assert!(surface
+                .own_selection(&mut connection, 77, b"x".to_vec())
+                .unwrap());
+        }
+        assert!(!surface
+            .own_selection(&mut connection, 77, b"x".to_vec())
+            .unwrap());
+        assert_eq!(surface.clipboard.sources.len(), MAX_CLIPBOARD_SOURCES);
+
+        let mut offers = test_surface();
+        for index in 0..MAX_CLIPBOARD_OFFERS {
+            let offer = 0xff00_0000u32 + u32::try_from(index).unwrap();
+            offers
+                .dispatch(
+                    &mut connection,
+                    &message(DATA_DEVICE, 0, offer.to_ne_bytes().to_vec()),
+                    Size {
+                        width: 8,
+                        height: 8,
+                    },
+                )
+                .unwrap();
+        }
+        let excess = 0xff00_0000u32 + u32::try_from(MAX_CLIPBOARD_OFFERS).unwrap();
+        assert!(offers
+            .dispatch(
+                &mut connection,
+                &message(DATA_DEVICE, 0, excess.to_ne_bytes().to_vec()),
+                Size {
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap_err()
+            .contains("invalid offer"));
+    }
+
+    #[test]
+    fn cancelled_sources_cannot_grow_outstanding_syncs_without_bound() {
+        let (mut connection, _peer) = pair();
+        let mut surface = test_surface();
+        for _ in 0..MAX_CLIPBOARD_SYNCS {
+            let source = connection.next_id_for_test();
+            assert!(surface
+                .own_selection(&mut connection, 77, b"x".to_vec())
+                .unwrap());
+            surface
+                .dispatch(
+                    &mut connection,
+                    &message(source, 2, Vec::new()),
+                    Size {
+                        width: 8,
+                        height: 8,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(surface.clipboard.sources.is_empty());
+        assert_eq!(surface.clipboard.syncs.len(), MAX_CLIPBOARD_SYNCS);
+        let next = connection.next_id_for_test();
+        assert!(!surface
+            .own_selection(&mut connection, 77, b"x".to_vec())
+            .unwrap());
+        assert_eq!(connection.next_id_for_test(), next);
+    }
+
+    #[test]
+    fn physical_control_shift_c_preserves_then_copies_the_selection() {
+        let (mut connection, _peer) = pair();
+        let mut surface = test_surface();
+        surface.selection = Some(render::Selection {
+            anchor: (0, 0),
+            extent: (0, 0),
+        });
+        for (serial, code, modifiers) in [
+            (75u32, 29u32, crate::keyboard::MOD_CONTROL),
+            (
+                76,
+                42,
+                crate::keyboard::MOD_CONTROL | crate::keyboard::MOD_SHIFT,
+            ),
+        ] {
+            let mut payload = Vec::new();
+            for word in [serial, 9, code, KEY_PRESSED] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            surface
+                .dispatch(
+                    &mut connection,
+                    &message(KEYBOARD, 3, payload),
+                    Size {
+                        width: 8,
+                        height: 8,
+                    },
+                )
+                .unwrap();
+            arm_repeat(&mut surface, 1);
+            assert!(surface.selection.is_some(), "modifier cleared selection");
+
+            let mut payload = Vec::new();
+            for word in [serial, modifiers, 0, 0, 0] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            surface
+                .dispatch(
+                    &mut connection,
+                    &message(KEYBOARD, 4, payload),
+                    Size {
+                        width: 8,
+                        height: 8,
+                    },
+                )
+                .unwrap();
+        }
+        let mut payload = Vec::new();
+        for word in [77u32, 9, u32::from(CLIPBOARD_KEY), KEY_PRESSED] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(
+                &mut connection,
+                &message(KEYBOARD, 3, payload),
+                Size {
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(surface.pending_copy, Some(77));
+        assert_eq!(surface.pending_input, None);
+        assert_eq!(surface.pending_key, None);
+        assert!(!surface.repeat.armed());
+        assert!(surface.selection.is_some(), "copy cleared its own selection");
+    }
+
+    #[test]
+    fn copy_chord_accepts_locks_and_rejects_extra_modifiers() {
+        let (mut connection, _peer) = pair();
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        for locks in [
+            crate::keyboard::MOD_CAPS,
+            crate::keyboard::MOD_NUM,
+            crate::keyboard::MOD_CAPS | crate::keyboard::MOD_NUM,
+        ] {
+            let mut surface = test_surface();
+            surface.selection = Some(render::Selection {
+                anchor: (0, 0),
+                extent: (0, 0),
+            });
+            surface
+                .dispatch(
+                    &mut connection,
+                    &words_message(
+                        KEYBOARD,
+                        4,
+                        &[
+                            70,
+                            crate::keyboard::MOD_CONTROL | crate::keyboard::MOD_SHIFT,
+                            0,
+                            locks,
+                            0,
+                        ],
+                    ),
+                    fallback,
+                )
+                .unwrap();
+            surface
+                .dispatch(
+                    &mut connection,
+                    &words_message(KEYBOARD, 3, &[71, 9, u32::from(CLIPBOARD_KEY), KEY_PRESSED]),
+                    fallback,
+                )
+                .unwrap();
+            assert_eq!(surface.pending_copy, Some(71), "locks disabled copy");
+        }
+
+        for excluded in [
+            crate::keyboard::MOD_ALT,
+            crate::keyboard::MOD_LOGO,
+            1 << 5,
+        ] {
+            let mut surface = test_surface();
+            surface.selection = Some(render::Selection {
+                anchor: (0, 0),
+                extent: (0, 0),
+            });
+            surface
+                .dispatch(
+                    &mut connection,
+                    &words_message(
+                        KEYBOARD,
+                        4,
+                        &[
+                            72,
+                            crate::keyboard::MOD_CONTROL
+                                | crate::keyboard::MOD_SHIFT
+                                | excluded,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    fallback,
+                )
+                .unwrap();
+            surface
+                .dispatch(
+                    &mut connection,
+                    &words_message(KEYBOARD, 3, &[73, 9, u32::from(CLIPBOARD_KEY), KEY_PRESSED]),
+                    fallback,
+                )
+                .unwrap();
+            assert_eq!(surface.pending_copy, None, "extra modifier copied");
+            assert_eq!(surface.selection, None, "extra modifier swallowed C");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_silent_press_clears_and_repaints_the_selection() {
+        let (mut connection, _peer) = pair();
+        let mut surface = test_surface();
+        surface.selection = Some(render::Selection {
+            anchor: (0, 0),
+            extent: (0, 0),
+        });
+        let mut payload = Vec::new();
+        for word in [77u32, 9, 113, KEY_PRESSED] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(
+                &mut connection,
+                &message(KEYBOARD, 3, payload),
+                Size {
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(surface.selection, None);
+        assert!(surface.stale, "cleared highlight was not scheduled to repaint");
+    }
+
+    #[test]
+    fn copy_owns_three_text_mimes_and_waits_for_the_server_sync() {
+        let (mut connection, mut peer) = pair();
+        let mut surface = test_surface();
+        assert!(surface
+            .own_selection(&mut connection, 77, b"Welcome".to_vec())
+            .unwrap());
+        let source = FIRST_DYNAMIC_ID;
+        let callback = FIRST_DYNAMIC_ID + 1;
+
+        let (object, opcode, payload) = said(&mut peer);
+        assert_eq!((object, opcode, payload), (DATA_DEVICE_MANAGER, 0, source.to_ne_bytes().to_vec()));
+        for mime_type in CLIPBOARD_MIME_TYPES {
+            let (object, opcode, payload) = said(&mut peer);
+            assert_eq!((object, opcode), (source, 0));
+            let mut args = wire::Cursor::new(&payload);
+            assert_eq!(args.string().unwrap(), mime_type);
+            args.finish().unwrap();
+        }
+        let (object, opcode, payload) = said(&mut peer);
+        assert_eq!((object, opcode), (DATA_DEVICE, 1));
+        let mut args = wire::Cursor::new(&payload);
+        assert_eq!(args.u32().unwrap(), source);
+        assert_eq!(args.u32().unwrap(), 77);
+        args.finish().unwrap();
+        assert_eq!(
+            said(&mut peer),
+            (DISPLAY, 0, callback.to_ne_bytes().to_vec())
+        );
+        assert_eq!(surface.pending_clipboard_marker, None);
+        surface
+            .dispatch(
+                &mut connection,
+                &message(callback, 0, 9u32.to_ne_bytes().to_vec()),
+                Size {
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(surface.pending_clipboard_marker, Some(7));
+
+        surface
+            .dispatch(
+                &mut connection,
+                &message(source, 2, Vec::new()),
+                Size {
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(said(&mut peer), (source, 1, Vec::new()));
+        assert!(surface.clipboard.sources.is_empty());
+        assert!(surface.clipboard.registry.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reader_writes_a_selection_through_the_exact_socket_endpoint() {
+        use std::os::fd::OwnedFd;
+
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::over(ours, None, FIRST_DYNAMIC_ID);
+        let reader = connection.detach_reader().unwrap();
+        let source = FIRST_DYNAMIC_ID;
+        let sources = Arc::new(Mutex::new(BTreeMap::from([(
+            source,
+            Arc::<[u8]>::from(&b"Welcome"[..]),
+        )])));
+        let (clipboard, writer) = spawn_clipboard_writer().unwrap();
+        let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+        let wayland = spawn_wayland_reader(reader, sender, sources, clipboard).unwrap();
+
+        let (endpoint, mut watcher) = UnixStream::pair().unwrap();
+        watcher
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let endpoint = File::from(OwnedFd::from(endpoint));
+        let mut payload = wire::Builder::new();
+        payload.string("text/plain;charset=utf-8").unwrap();
+        let event = payload.message(source, 1).unwrap();
+        conn::send_event_with_fd(&peer, &event, &endpoint).unwrap();
+        drop(endpoint);
+        let mut received = [0u8; 7];
+        watcher.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"Welcome");
+
+        let (unsupported, mut unsupported_watcher) = UnixStream::pair().unwrap();
+        unsupported_watcher
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let unsupported = File::from(OwnedFd::from(unsupported));
+        let mut payload = wire::Builder::new();
+        payload.string("application/octet-stream").unwrap();
+        let event = payload.message(source, 1).unwrap();
+        conn::send_event_with_fd(&peer, &event, &unsupported).unwrap();
+        drop(unsupported);
+        assert_eq!(unsupported_watcher.read(&mut [0u8; 1]).unwrap(), 0);
+
+        drop(peer);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Event::Closed(_)
+        ));
+        wayland.join().unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_full_clipboard_handoff_closes_the_excess_endpoint_as_eof() {
+        use std::os::fd::OwnedFd;
+
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::over(ours, None, FIRST_DYNAMIC_ID);
+        let reader = connection.detach_reader().unwrap();
+        let source = FIRST_DYNAMIC_ID;
+        let sources = Arc::new(Mutex::new(BTreeMap::from([(
+            source,
+            Arc::<[u8]>::from(&b"x"[..]),
+        )])));
+        let (clipboard, writes) = sync_channel(MAX_CLIPBOARD_WRITES);
+        let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+        let wayland = spawn_wayland_reader(reader, sender, sources, clipboard).unwrap();
+        let mut watchers = Vec::new();
+        for _ in 0..=MAX_CLIPBOARD_WRITES {
+            let (endpoint, watcher) = UnixStream::pair().unwrap();
+            watcher
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let endpoint = File::from(OwnedFd::from(endpoint));
+            let mut payload = wire::Builder::new();
+            payload.string("text/plain").unwrap();
+            let event = payload.message(source, 1).unwrap();
+            conn::send_event_with_fd(&peer, &event, &endpoint).unwrap();
+            drop(endpoint);
+            watchers.push(watcher);
+        }
+        let last = watchers.last_mut().unwrap();
+        assert_eq!(last.read(&mut [0u8; 1]).unwrap(), 0);
+
+        drop(writes);
+        drop(peer);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Event::Closed(_)
+        ));
+        wayland.join().unwrap();
+    }
+
     /// Wayland ids must be allocated DENSELY, and td's own server only checks
     /// uniqueness — so nothing at runtime would report a gap. What the
     /// terminal uses has to be exactly 1..FIRST_DYNAMIC_ID with nothing
-    /// skipped, and the demo's higher start would skip the pointer's id: the
-    /// terminal's pointer is not a FIXED object, because it exists only where
-    /// a seat offers the capability and an id reserved for one that is never
-    /// created is precisely the gap this guards against.
+    /// skipped. Its pointer is not a FIXED object, because it exists only
+    /// where a seat offers the capability and an id reserved for one that is
+    /// never created is precisely the gap this guards against.
     #[test]
     fn the_terminal_leaves_no_gap_before_its_first_dynamic_id() {
         let mut used = vec![
@@ -2045,6 +3163,8 @@ mod tests {
             XDG_TOPLEVEL,
             SEAT,
             KEYBOARD,
+            DATA_DEVICE_MANAGER,
+            DATA_DEVICE,
         ];
         used.sort_unstable();
         used.dedup();
@@ -2053,11 +3173,6 @@ mod tests {
             (1..FIRST_DYNAMIC_ID).collect::<Vec<u32>>(),
             "the terminal's fixed ids are not dense up to its dynamic range"
         );
-        // The demo reserves one for its pointer; this client must not, or a
-        // keyboard-only seat leaves that id created by nobody. A const block,
-        // since both sides are constants and a build that cannot satisfy it
-        // should not produce a test binary.
-        const { assert!(POINTER >= FIRST_DYNAMIC_ID) };
     }
 
     /// The assertion above is over CONSTANTS, so it cannot see the case that
@@ -2073,6 +3188,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -2100,6 +3216,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let mut capabilities = Vec::new();
         capabilities.extend_from_slice(&(SEAT_KEYBOARD | SEAT_POINTER).to_ne_bytes());
@@ -2126,6 +3243,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 640,
@@ -2161,6 +3279,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 640,
@@ -2200,6 +3319,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -2265,6 +3385,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 640,
@@ -2309,6 +3430,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -2335,6 +3457,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -2379,6 +3502,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -2408,6 +3532,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -2463,6 +3588,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 640,
@@ -2538,6 +3664,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 640,
@@ -2599,6 +3726,7 @@ mod tests {
                 shm: 2,
                 xdg_wm_base: 4,
                 seat: 5,
+            data_device_manager: 6,
             });
             surface
                 .dispatch(
@@ -2624,6 +3752,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface
             .dispatch(&mut connection, &toplevel_configure(0, 0), fallback)
@@ -2649,6 +3778,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -2681,6 +3811,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -2753,6 +3884,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -2824,6 +3956,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let font = font();
         let palette = render::Palette::pinned();
@@ -2880,6 +4013,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -2970,6 +4104,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3070,6 +4205,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3127,11 +4263,11 @@ mod tests {
         );
     }
 
-    /// The terminal asks for no descriptors, so one arriving is an event it
-    /// has misread — and an unclaimed descriptor is held open for as long as
-    /// the session runs. `present` makes this check of the handshake; the
-    /// reader thread makes it of everything after, which is the part nothing
-    /// else looks at.
+    /// An event outside a registered data source asks for no descriptors, so
+    /// one arriving is an event the terminal has misread — and an unclaimed
+    /// descriptor is held open for as long as the session runs. `present`
+    /// makes this check of the handshake; the reader thread makes it of
+    /// everything after, which is the part nothing else looks at.
     #[test]
     fn the_reader_thread_refuses_a_descriptor_it_never_asked_for() {
         let (ours, mut theirs) = UnixStream::pair().unwrap();
@@ -3141,7 +4277,14 @@ mod tests {
         write_event(&mut theirs, &surface_configure(5));
         let reader = connection.detach_reader().unwrap();
         let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
-        let thread = spawn_wayland_reader(reader, sender).unwrap();
+        let (clipboard, _writer) = spawn_clipboard_writer().unwrap();
+        let thread = spawn_wayland_reader(
+            reader,
+            sender,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            clipboard,
+        )
+        .unwrap();
 
         match events.recv_timeout(Duration::from_secs(10)).unwrap() {
             Event::Closed(error) => assert!(error.contains("unexpected descriptor"), "{error}"),
@@ -3162,7 +4305,14 @@ mod tests {
         write_event(&mut theirs, &surface_configure(4));
         let reader = connection.detach_reader().unwrap();
         let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
-        let thread = spawn_wayland_reader(reader, sender).unwrap();
+        let (clipboard, _writer) = spawn_clipboard_writer().unwrap();
+        let thread = spawn_wayland_reader(
+            reader,
+            sender,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            clipboard,
+        )
+        .unwrap();
 
         match events.recv_timeout(Duration::from_secs(10)).unwrap() {
             Event::Wayland(message) => {
@@ -3189,6 +4339,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let font = font();
         let palette = render::Palette::pinned();
@@ -3227,6 +4378,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3292,6 +4444,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3372,6 +4525,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let font = font();
         let palette = render::Palette::pinned();
@@ -3454,6 +4608,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3506,6 +4661,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3594,6 +4750,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3653,6 +4810,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3716,6 +4874,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3779,6 +4938,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3845,6 +5005,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -3974,6 +5135,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4074,6 +5236,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4183,6 +5346,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4234,6 +5398,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4256,6 +5421,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let mut payload = Vec::new();
         payload.extend_from_slice(&SEAT_KEYBOARD.to_ne_bytes());
@@ -4275,6 +5441,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.layout_configured = true;
         surface.current = Some(Size {
@@ -4303,6 +5470,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.layout_configured = true;
         surface.current = Some(Size {
@@ -4338,6 +5506,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let font = font();
         let palette = render::Palette::pinned();
@@ -4500,6 +5669,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4670,6 +5840,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4753,8 +5924,8 @@ mod tests {
         for line in 0..20u32 {
             terminal.feed(format!("L{line}\r\n").as_bytes());
         }
-        let live = build_pixels(size, &terminal, &font, &palette, true, 0).unwrap();
-        let back = build_pixels(size, &terminal, &font, &palette, true, 4).unwrap();
+        let live = build_pixels(size, &terminal, &font, &palette, true, 0, None).unwrap();
+        let back = build_pixels(size, &terminal, &font, &palette, true, 4, None).unwrap();
         assert_ne!(
             live, back,
             "a scrolled viewport drew the live screen anyway"
@@ -4773,6 +5944,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4826,6 +5998,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4878,6 +6051,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -4947,6 +6121,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -5046,6 +6221,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -5162,6 +6338,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -5204,6 +6381,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -5251,6 +6429,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -5291,6 +6470,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let fallback = Size {
             width: 8,
@@ -5379,6 +6559,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         surface.xrgb = true;
         let font = font();
@@ -5501,6 +6682,7 @@ mod tests {
             shm: 2,
             xdg_wm_base: 4,
             seat: 5,
+            data_device_manager: 6,
         });
         let font = font();
         let palette = render::Palette::pinned();

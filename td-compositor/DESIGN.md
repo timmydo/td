@@ -3151,7 +3151,7 @@ handshake rejects any descriptor left over after all expected events. The
 descriptor queue and keymap read are bounded, and every overflow or abandoned
 connection closes all descriptors it owns.
 
-`td-compositor/src/sys.rs` contains the sole scoped `unsafe` block. One raw
+`td-compositor/src/sys.rs` contains the two scoped `unsafe` blocks. One raw
 `syscall3` body carries exactly:
 
 - sendmsg(2), to send the demo client's wl_shm descriptor, the server's XKB
@@ -3160,7 +3160,9 @@ connection closes all descriptors it owns.
   keymap descriptor;
 - close(2), to release a received descriptor after it has either been safely
   duplicated through `/proc/self/fd/N` or exactly transferred as an owned
-  clipboard endpoint; and
+  clipboard endpoint;
+- fcntl(2), with only `F_GETFL` and `F_SETFL`, to add `O_NONBLOCK` while one
+  clipboard source writes and restore the destination's prior status; and
 - ioctl(2), for the four pinned terminal-control requests in section 12 and
   the two pinned `EVIOCGABS` requests that read an absolute pointer's
   declared axis range.
@@ -3175,19 +3177,31 @@ focus-follows-mouse, possibly a keyboard focus change — sourced from an
 ioctl rather than from a file. It is the only one, it happens only at a
 recovery, and §2 is where what it means is argued.
 
-The crate denies unsafe globally; confinement
-tests pin the allow count, assembly body, syscall numbers, callers, and the
-absence of unsafe from every other target source file. Each developer tool is
-a separate crate root that also denies unsafe. Adding a syscall or another
-scoped allow amends this document and the repository-wide unsafe inventory.
+The second block consumes one `ReceivedFd` as a `File` with
+`File::from_raw_fd`. This is the client-side end of a selection transfer: a
+source receives a pipe or socket supplied by the selecting client, so reopening
+through `/proc/self/fd/N` can fail and would not preserve the original open-file
+description. `ManuallyDrop` suppresses the raw owner's close after `File`
+assumes sole ownership. No lock is held across the eventual write. The writer
+temporarily adds `O_NONBLOCK`, retries against a five-second absolute deadline,
+and restores the complete prior status word before closing the endpoint. A
+receiver can therefore lose its own transfer but cannot park every later one.
+
+The crate denies unsafe globally; confinement tests pin the allow count, both
+unsafe bodies, syscall numbers, callers, and the absence of unsafe from every
+other target source file. Each developer tool is a separate crate root that
+also denies unsafe. Adding a syscall or another scoped allow amends this
+document and the repository-wide unsafe inventory.
 
 File-backed wl_shm and keymap descriptors are reopened before their raw
 numbers are closed. A clipboard receiver may instead supply a pipe or socket,
 and reopening would either fail or create another open-file description. The
-syscall module therefore owns that exact raw number in `ReceivedFd`; its one
+syscall module therefore owns that exact raw number in `ReceivedFd`. Its one
 server-side adoption site is pinned by the confinement test, the runtime sees
 only the server's opaque `TransferEndpoint`, and `Drop` reaches the already
-rostered close wrapper. This adds no second unsafe allowance.
+rostered close wrapper. The client transport has one separately pinned
+adoption site and one conversion site for the source endpoint; after conversion
+ordinary `File` ownership performs every close.
 
 The three surfaces behind that one body are disjoint and are pinned to
 disjoint modules: descriptor transport is reachable only from `client.rs`,
@@ -3691,9 +3705,10 @@ The initial cursor is steady rather than clock-blinking. Shift+PageUp and
 Shift+PageDown navigate scrollback. Ordinary text input returns to the live
 bottom. An unmodified End key is consumed for the same purpose while viewing
 scrollback and is forwarded in the selected cursor-key mode at the live
-bottom. Mouse reporting, selection, clipboard, hyperlinks, images, sixel,
-ligatures, search, and shell integration are deferred. A protocol is not
-parsed merely because another terminal implements it.
+bottom. Mouse reporting, hyperlinks, images, sixel, ligatures, search, and
+shell integration are deferred. Pointer selection and the core data-device
+clipboard source are specified below. A protocol is not parsed merely because
+another terminal implements it.
 
 Unsupported CSI operations are ignored as complete sequences. OSC, DCS, SOS,
 APC, and PM strings enter allocation-free streaming ignore states and cannot
@@ -4093,6 +4108,50 @@ The client calls them: td-term routes every press through the adapter and
 holds the viewport across frames, so the corpus is no longer the only thing
 driving either.
 
+Pointer selection is an inclusive row-major range over the visible snapshot.
+A left-button press anchors it, motion extends it, and release retains it;
+`wl_pointer.frame` applies the accumulated transaction so one physical report
+causes at most one repaint. A click without motion selects its one cell.
+Reverse drags normalize only when text is copied.
+The renderer inverts every selected cell. Resizing, new terminal output,
+viewport movement, or an ordinary non-modifier key press clears the range and
+schedules a repaint; modifier-only presses preserve it so the physical Ctrl
+and Shift needed for the copy chord cannot erase it first. The copy chord does
+not clear the bytes it is copying. Each selected row loses trailing ASCII
+spaces, rows are joined with one newline, and UTF-8 encoding is bounded before
+publication at 64 KiB. A range that trims to no bytes is a no-op: it neither
+replaces the seat clipboard nor emits a zero-byte success marker.
+
+`Control+Shift+C` with no Alt, Logo, or unknown modifier is a td-term command,
+not PTY input and not a repeat candidate. It creates a `wl_data_source` at
+version 3, offers `text/plain;charset=utf-8`, `text/plain`, and `UTF8_STRING`,
+and calls `set_selection` with the key event's compositor serial. Caps Lock and
+Num Lock do not disable the chord. td-term retains at most eight live sources,
+eight outstanding sync callbacks, and eight incoming offers. A cancelled
+source retains its callback until `done`, so the callback ceiling also gates
+new copies. It destroys an incoming selection offer immediately because paste
+is not yet implemented; drag and drop remains deferred. td's compositor never
+starts a drag and cancels every attempted version-3 drag source, so DnD-only
+device and offer events are fail-closed arms outside this client profile rather
+than silently implemented partial drag and drop.
+
+The payload enters a shared source registry before any request can make the
+source callable. A data-source `send` event consumes exactly one SCM_RIGHTS
+endpoint, looks up an immutable payload under the registry lock, then releases
+the lock before enqueueing any I/O. One clipboard writer thread owns a bounded
+four-entry queue and writes the supplied `File` in nonblocking mode against a
+five-second deadline, restoring its original status afterwards. An unknown
+MIME type, full queue, or expired destination drops the endpoint and therefore
+answers EOF without blocking the Wayland reader or terminal loop. An excess
+descriptor or stopped writer closes td-term after dropping the endpoint.
+The closed td compositor never sends to a stale source; an event on an
+unregistered object remains a fail-closed protocol error.
+Source cancellation removes both registries and destroys the object. A display
+sync callback prints `TD-TERM-CLIPBOARD-READY bytes=N` only if the new source is
+still current after the compositor has processed `set_selection`. This marker
+proves source admission, not that another client pasted the bytes; the system
+image owns that separate end-to-end proof.
+
 ## 12. PTY and process lifecycle
 
 After mounting devtmpfs and before graphical services, the system creates
@@ -4180,12 +4239,12 @@ not acquire the terminal.
 
 Its nonnegative return is adopted exactly once, through the same
 `/proc/self/fd/N` duplication the received-descriptor path already uses, and
-the raw number is closed. `OwnedFd::from_raw_fd` is `unsafe`, and a second
-scoped allow of a different SHAPE — a descriptor adoption rather than the
-syscall-instruction layer — is a wider amendment than this adapter needs when
-the crate can reopen the descriptor by identity instead. The reopen is by
-descriptor number, not by terminal name: no `/dev/pts/N` path is resolved, so
-it retains the property the peer request was chosen for.
+the raw number is closed. The crate's `File::from_raw_fd` allowance is confined
+to exact clipboard source endpoints that cannot be reopened. Extending that
+conversion to the PTY would widen its caller roster without need: this
+file-backed descriptor can be reopened by identity. The reopen is by descriptor
+number, not by terminal name: no `/dev/pts/N` path is resolved, so it retains
+the property the peer request was chosen for.
 
 No termios construction, signal syscall, process creation, or descriptor
 duplication enters that unsafe surface. The slave's kernel defaults provide
@@ -4207,13 +4266,12 @@ When the compositor declines to choose a size, the terminal falls back to a
 grid rather than to a rectangle: 80 columns by 24 rows, multiplied out by the
 pinned font's cell, since that is what a terminfo entry and anything drawing a
 box assume when they cannot ask. Each axis declines independently. Its fixed
-object ids run densely to one past the last it creates, which is one lower
-than the demo's: it binds a seat and creates a keyboard, and its `wl_pointer`
-is a DYNAMIC object rather than a fixed one because a seat may not offer the
-capability. The density is what matters rather than the number — libwayland's
-object map refuses an insert past the end of its array, so a client that
-skipped an id it never created could be disconnected by a compliant
-compositor.
+object ids run densely through the data-device manager and the seat's data
+device. The first dynamic id follows them. The `wl_pointer` remains a dynamic
+object because a seat may not offer the capability; reserving a fixed id would
+leave a gap on a keyboard-only seat, and a compliant compositor can disconnect
+a client whose object map skips an id it never created. Ids are per-client, so
+an equal numeric id in the separate demo client is unrelated.
 
 Safe `Command` cannot call `setsid(2)`, and `pre_exec` would introduce a second
 unsafe surface. The declared td-init input therefore extends `cttyhack` with
@@ -4287,12 +4345,17 @@ hidden grid never adds history. Growth appends blank rows to both grids. The
 client updates and verifies the PTY size before rendering the replacement
 buffer.
 
-A blocking Wayland reader, PTY reader, PTY writer, and child waiter send
-bounded messages to one main loop. A full PTY-output channel blocks its reader
-thread and lets the kernel PTY buffer backpressure the child. The main loop
-alone mutates the terminal model and writes Wayland requests. No correctness
-condition relies on poll, elapsed sleeps, or scheduler order; the startup
-deadline bounds failure detection rather than ordering state transitions.
+A Wayland reader, blocking PTY reader and writer, bounded clipboard writer, and
+child waiter surround one main loop. A full PTY-output channel blocks its
+reader thread and lets the kernel PTY buffer backpressure the child. The
+clipboard writer instead has the four-entry refusal and five-second endpoint
+deadline above, so a receiver that stops reading cannot backpressure input,
+rendering, the protocol reader, or all later transfers indefinitely. The main
+loop alone mutates the terminal model and writes ordinary Wayland requests;
+the reader transfers only an already-requested clipboard payload to its exact
+endpoint. No correctness condition relies on poll, elapsed sleeps, or
+scheduler order; the startup deadline bounds failure detection rather than
+ordering state transitions.
 
 td-term exposes a mode-0600 readiness socket and prints `TD-TERM-READY` with
 its rows and columns only after the exact tile-sized buffer receives both

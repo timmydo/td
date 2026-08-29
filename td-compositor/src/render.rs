@@ -143,6 +143,27 @@ pub struct Cursor {
     pub visible: bool,
 }
 
+/// An inclusive row-major terminal selection in viewport coordinates.
+/// Keeping the range in cells makes rendering independent of pixel geometry
+/// and gives extraction and highlighting one exact pair of endpoints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selection {
+    pub anchor: (usize, usize),
+    pub extent: (usize, usize),
+}
+
+impl Selection {
+    fn contains(self, row: usize, column: usize) -> bool {
+        let cell = (row, column);
+        let (start, end) = if self.anchor <= self.extent {
+            (self.anchor, self.extent)
+        } else {
+            (self.extent, self.anchor)
+        };
+        cell >= start && cell <= end
+    }
+}
+
 /// A complete screen as one frame sees it: the model, where the cursor is,
 /// how far back the scrollback viewport is scrolled, whether the surface
 /// holds the keyboard, and the one coalesced visual-bell bit.
@@ -152,6 +173,7 @@ pub struct Snapshot<'a> {
     viewport: usize,
     focused: bool,
     bell: bool,
+    selection: Option<Selection>,
 }
 
 impl<'a> Snapshot<'a> {
@@ -170,6 +192,7 @@ impl<'a> Snapshot<'a> {
             viewport: 0,
             focused,
             bell,
+            selection: None,
         }
     }
 
@@ -187,6 +210,11 @@ impl<'a> Snapshot<'a> {
     /// so a partially scrolled viewport shows both at once.
     pub fn scrolled_back(mut self, lines: usize) -> Self {
         self.viewport = lines.min(self.terminal.history_lines());
+        self
+    }
+
+    pub fn with_selection(mut self, selection: Option<Selection>) -> Self {
+        self.selection = selection;
         self
     }
 
@@ -235,7 +263,14 @@ impl<'a> Snapshot<'a> {
                 }
             })
         };
-        found.unwrap_or(BLANK)
+        let mut cell = found.unwrap_or(BLANK);
+        if self
+            .selection
+            .is_some_and(|selection| selection.contains(row, column))
+        {
+            cell.attributes.inverse = !cell.attributes.inverse;
+        }
+        cell
     }
 
     /// Where the cursor is drawn, or `None` when it is hidden or the

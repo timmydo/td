@@ -256,6 +256,13 @@ const KEYS: &[(&str, u16, Kind)] = &[
     ("menu", 127, Kind::Silent),
 ];
 
+/// Whether a physical key changes modifier state without being ordinary
+/// terminal input. Selection survives these presses so the modifiers needed
+/// for a copy chord cannot erase the range before its final key arrives.
+pub fn is_modifier(code: u16) -> bool {
+    matches!(kind(code), Some(Kind::Modifier))
+}
+
 fn kind(code: u16) -> Option<Kind> {
     for (_, candidate, kind) in KEYS {
         if *candidate == code {

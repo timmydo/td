@@ -44,6 +44,8 @@ pub const POINTER: u32 = 12;
 pub const CONNECT_ATTEMPTS: usize = 300;
 pub const MAX_PENDING_FDS: usize = 8;
 pub const RECEIVE_BUFFER_BYTES: usize = 16 * 1024;
+const CLIPBOARD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIPBOARD_WRITE_RETRY: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy)]
 pub struct Global {
@@ -61,6 +63,7 @@ pub struct Globals {
     shm: Option<Global>,
     xdg_wm_base: Option<Global>,
     seat: Option<Global>,
+    data_device_manager: Option<Global>,
 }
 
 impl Globals {
@@ -78,6 +81,10 @@ impl Globals {
 
     pub fn seat(&self) -> Option<Global> {
         self.seat
+    }
+
+    pub fn data_device_manager(&self) -> Option<Global> {
+        self.data_device_manager
     }
 
     pub fn record(&mut self, name: u32, interface: &str, version: u32) {
@@ -102,6 +109,13 @@ impl Globals {
             }
             "wl_seat" if self.seat.is_none_or(|current| version > current.version) => {
                 self.seat = Some(global)
+            }
+            "wl_data_device_manager"
+                if self
+                    .data_device_manager
+                    .is_none_or(|current| version > current.version) =>
+            {
+                self.data_device_manager = Some(global)
             }
             _ => {}
         }
@@ -175,6 +189,79 @@ impl Reader {
     pub fn pending_fd_count(&self) -> usize {
         self.pending_fds.len()
     }
+
+    /// Claim the exact descriptor carried by the event just read. Unlike the
+    /// handshake keymap path this does not reopen through `/proc`: a selection
+    /// endpoint may be a pipe or socket, and its open-file description is the
+    /// capability the destination supplied.
+    pub fn take_file(&mut self, purpose: &str) -> Result<File, String> {
+        let fd = self
+            .pending_fds
+            .pop_front()
+            .ok_or_else(|| format!("{purpose} event arrived without a descriptor"))?;
+        let endpoint = sys::ReceivedFd::adopt(fd)?;
+        Ok(sys::ReceivedFd::into_file(endpoint))
+    }
+}
+
+/// Write one source payload without letting an adversarial destination park
+/// td-term's sole writer forever. `O_NONBLOCK` is restored even on failure
+/// because the receiver may have retained a duplicate of the endpoint.
+pub fn write_clipboard(file: &mut File, bytes: &[u8]) -> Result<(), String> {
+    write_clipboard_with_timeout(file, bytes, CLIPBOARD_WRITE_TIMEOUT)
+}
+
+fn write_clipboard_with_timeout(
+    file: &mut File,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "clipboard write deadline overflowed".to_string())?;
+    let flags = sys::make_nonblocking(file)?;
+    let mut offset = 0usize;
+    let result = loop {
+        let Some(remaining) = bytes.get(offset..) else {
+            break Err("clipboard write offset escaped its payload".into());
+        };
+        if remaining.is_empty() {
+            break Ok(());
+        }
+        if Instant::now() >= deadline {
+            break Err(format!(
+                "clipboard destination exceeded {} milliseconds",
+                timeout.as_millis()
+            ));
+        }
+        match file.write(remaining) {
+            Ok(0) => break Err("clipboard destination accepted zero bytes".into()),
+            Ok(written) if written <= remaining.len() => offset += written,
+            Ok(written) => {
+                break Err(format!(
+                    "clipboard destination accepted invalid byte count {written}"
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    break Err(format!(
+                        "clipboard destination exceeded {} milliseconds",
+                        timeout.as_millis()
+                    ));
+                }
+                thread::sleep(CLIPBOARD_WRITE_RETRY);
+            }
+            Err(error) => break Err(format!("write clipboard selection: {error}")),
+        }
+    };
+    let restored = sys::restore_status_flags(file, flags);
+    match (result, restored) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(write), Err(restore)) => Err(format!("{write}; {restore}")),
+    }
 }
 
 /// The whole wl_keyboard keymap check: format, announced size, the file's own
@@ -227,10 +314,11 @@ pub fn verify_keymap(file: &File, format: u32, size: u32) -> Result<(), String> 
 /// That does not bite today, and the reason is worth naming so nobody removes
 /// this thinking it does nothing: `Connection::take_fd` REOPENS the received
 /// descriptor through `/proc/self/fd/N`, which is a new description with its
-/// own offset. But that reopen exists for descriptor safety — it is what keeps
-/// this crate's confined syscall surface to one scoped allow — so a change
-/// there would be reviewed for that and not for what it does to a file offset.
-/// This is the guard §11 names, and the two are independent.
+/// own offset. That reopen exists for descriptor safety; the separate exact
+/// clipboard-endpoint adoption cannot replace it. A change here would
+/// therefore be reviewed for descriptor ownership and not necessarily for what
+/// it does to a file offset. This is the guard §11 names, and the two are
+/// independent.
 ///
 /// The size is already pinned by the caller's metadata check, so this asks
 /// for exactly that many bytes and treats a short answer as the file being
@@ -791,7 +879,7 @@ pub fn attach_frame(
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{IntoRawFd, OwnedFd};
     use std::time::Duration;
 
     /// The read leaves the offset exactly where it found it, which is §11's
@@ -868,6 +956,34 @@ mod tests {
         ours.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         (Connection::over(ours, None, 10), theirs)
+    }
+
+    #[test]
+    fn a_full_clipboard_endpoint_times_out_and_restores_blocking_status() {
+        let (mut endpoint, _receiver) = UnixStream::pair().unwrap();
+        endpoint.set_nonblocking(true).unwrap();
+        let chunk = [0u8; 4096];
+        let mut full = false;
+        for _ in 0..1024 {
+            match endpoint.write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("fill clipboard endpoint: {error}"),
+            }
+        }
+        assert!(full, "socket capacity escaped the bounded fixture");
+        endpoint.set_nonblocking(false).unwrap();
+        let mut endpoint = File::from(OwnedFd::from(endpoint));
+
+        let error = write_clipboard_with_timeout(&mut endpoint, b"x", Duration::from_millis(5))
+            .unwrap_err();
+        assert!(error.contains("exceeded 5 milliseconds"), "{error}");
+        let flags = sys::make_nonblocking(&endpoint).unwrap();
+        assert_eq!(flags & 0o4000, 0, "blocking status was not restored");
+        sys::restore_status_flags(&endpoint, flags).unwrap();
     }
 
     /// Detaching moves the bytes already READ but not yet parsed, and what

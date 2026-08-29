@@ -3679,11 +3679,14 @@ the transport reads the bytes and hands them to a `settle()` that is pure.
 A confinement test pins the narrower list.
 
 **How a forwarded descriptor is owned.** td-compositor reopens received
-descriptors through `/proc/self/fd/N` rather than `from_raw_fd`, and that
-trick is *unavailable* to a broker — opening a `/proc/self/fd` entry
-naming a **socket** fails with `ENXIO`, and one naming an `anon_inode`
-such as an `eventfd` with `EACCES` (both measured, not assumed), while the
-compositor's descriptors are memfds and files, which reopen faithfully.
+file-backed descriptors through `/proc/self/fd/N`; one native clipboard
+source's client-side conversion of an exact pipe or socket is the documented
+scoped-adoption exception. Server-routed clipboard endpoints remain in its safe
+raw owner. The reopen trick is *unavailable* to a broker — opening a
+`/proc/self/fd` entry
+naming a **socket** fails with `ENXIO`, and one naming an `anon_inode` such as
+an `eventfd` with `EACCES` (both measured, not assumed), while the compositor's
+wl_shm and keymap descriptors are memfds and files, which reopen faithfully.
 Reopening also yields a NEW open file description, so even where it
 succeeds the receiver does not get the shared description `SCM_RIGHTS`
 defines. A forwarded descriptor here is freight: it is recounted
@@ -6089,7 +6092,11 @@ and image commits — showing:
    all four
    stages, and the guest greeter cannot finish the input-enabled boot before
    the final atomic completion record. Other boots expose no QMP socket or
-   Marionette input probe. **Paste from td-term into the URL bar remains.**
+   Marionette input probe. td-term now supplies a bounded core data-device
+   source: pointer drag selects and visibly inverts cells, `Control+Shift+C`
+   offers three text MIME types, and a socket-backed SCM_RIGHTS regression
+   receives the exact selected bytes without reopening the descriptor.
+   **Paste from td-term into the URL bar remains an image-level proof.**
 8. a download reaching the app-private or explicitly granted directory;
 9. the Settings portal succeeding;
 10. five minutes of navigation with no compositor or bus disconnect;
@@ -6157,7 +6164,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **E2's GDK, llvmpipe, and Firefox presentation answers are recorded in §F and `td-compositor/DESIGN.md`** | none |
 | 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
-| 20 | **clipboard LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source; client cursors landed separately (`1c4b7f88`) | **paste, and the I-beam already arrived** |
+| 20 | **clipboard producer LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status; client cursors landed separately (`1c4b7f88`) | **paste the td-term selection into Firefox; the I-beam already arrived** |
 | 21 | **xdg-foreign LANDED**; private portal socket + dialog placement remain | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |

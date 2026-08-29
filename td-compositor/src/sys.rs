@@ -2,7 +2,8 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Write;
-use std::os::fd::{AsRawFd, RawFd};
+use std::mem::ManuallyDrop;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 
@@ -10,6 +11,14 @@ const SYS_CLOSE: usize = 3;
 const SYS_IOCTL: usize = 16;
 const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
+const SYS_FCNTL: usize = 72;
+
+/// The only `fcntl(2)` commands this crate may issue. They temporarily make
+/// one clipboard destination nonblocking so a receiver cannot park td-term's
+/// sole bounded writer forever.
+const F_GETFL: usize = 3;
+const F_SETFL: usize = 4;
+const O_NONBLOCK: usize = 0o4000;
 
 /// The only `ioctl(2)` requests this crate may issue, pinned by value. A request
 /// number encodes direction, argument size, and target driver, so a wrong one is
@@ -111,6 +120,37 @@ fn close_raw(fd: RawFd) -> Result<(), String> {
         return Err(format!("refusing to close invalid descriptor {fd}"));
     }
     errno_result(syscall3(SYS_CLOSE, fd as usize, 0, 0), "close")?;
+    Ok(())
+}
+
+fn fcntl(fd: RawFd, command: usize, argument: usize, operation: &str) -> Result<usize, String> {
+    if !matches!(command, F_GETFL | F_SETFL) {
+        return Err(format!(
+            "{operation}: refusing unreviewed fcntl command {command:#x}"
+        ));
+    }
+    if fd < 0 {
+        return Err(format!("{operation}: invalid descriptor {fd}"));
+    }
+    errno_result(syscall3(SYS_FCNTL, fd as usize, command, argument), operation)
+}
+
+/// Add `O_NONBLOCK` while retaining the complete prior file-status word. The
+/// caller restores that word before dropping the endpoint so a retained
+/// duplicate does not inherit a policy td was not given authority to change.
+pub fn make_nonblocking(file: &impl AsRawFd) -> Result<usize, String> {
+    let flags = fcntl(file.as_raw_fd(), F_GETFL, 0, "F_GETFL")?;
+    fcntl(
+        file.as_raw_fd(),
+        F_SETFL,
+        flags | O_NONBLOCK,
+        "F_SETFL O_NONBLOCK",
+    )?;
+    Ok(flags)
+}
+
+pub fn restore_status_flags(file: &impl AsRawFd, flags: usize) -> Result<(), String> {
+    fcntl(file.as_raw_fd(), F_SETFL, flags, "restore F_SETFL")?;
     Ok(())
 }
 
@@ -662,6 +702,18 @@ impl ReceivedFd {
             return Err(format!("invalid received descriptor {fd}"));
         }
         Ok(ReceivedFd { fd })
+    }
+
+    /// Transfer this exact open-file description into safe `File` ownership.
+    /// Selection endpoints may be pipes or sockets, so reopening through
+    /// `/proc/self/fd` is neither equivalent nor guaranteed to work.
+    #[allow(unsafe_code)]
+    pub fn into_file(self) -> File {
+        let owned = ManuallyDrop::new(self);
+        // SAFETY: `ReceivedFd::adopt` accepted one live SCM_RIGHTS descriptor,
+        // this consumes its sole owner, and `ManuallyDrop` prevents the raw
+        // close path from running after `File` assumes that ownership.
+        unsafe { File::from_raw_fd(owned.fd) }
     }
 }
 
