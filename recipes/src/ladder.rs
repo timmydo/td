@@ -747,8 +747,7 @@ pub const TD_BUSD_RUNTIME_MARKER: &str = "TD-BUSD-RUN-OK";
 /// Printed by a separate unprivileged client only after the supervised portal
 /// owns its reserved public name, answers the Settings version property, and
 /// returns the exact two-namespace dictionary compiled from the immutable
-/// session settings file. The reply is synchronous: no Request object or
-/// Response signal participates in this proof.
+/// session settings file.
 ///
 /// DUPLICATED as `READY_MARKER` in td-portal/src/main.rs. The td-portal recipe
 /// pins the literal and the call that emits it. The host recognizes the exact
@@ -756,6 +755,15 @@ pub const TD_BUSD_RUNTIME_MARKER: &str = "TD-BUSD-RUN-OK";
 /// prefix, not this unframed substring.
 pub const TD_PORTAL_RUNTIME_MARKER: &str =
     "TD-PORTAL-READY namespaces=2 settings=10 version=1";
+
+/// Printed by that same live client only after it pre-subscribes to the exact
+/// caller-derived path, receives the Background method reply carrying that
+/// path, and then receives the directed policy-denial Request.Response.
+///
+/// DUPLICATED as `REQUEST_READY_MARKER` in td-portal/src/main.rs and pinned by
+/// the td-portal recipe.
+pub const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str =
+    "TD-PORTAL-REQUEST-READY response=2";
 
 /// Printed by the unprivileged compositor only after its first framebuffer
 /// paint succeeded and its mode-0600 Wayland socket is listening.

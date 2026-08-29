@@ -11,11 +11,13 @@
 
 //! td-portal — the supervised desktop portal service.
 //!
-//! The first landing serves the synchronous Settings interface. A root
-//! supervisor obtains td-busd's one-shot ownership capability, starts its
-//! direct unprivileged child through `td-login exec-as`, and stays alive while
-//! that child owns `org.freedesktop.portal.Desktop`.
+//! The service owns the synchronous Settings interface and the bounded shared
+//! portal handle core. A root supervisor obtains td-busd's one-shot ownership
+//! capability, starts its direct unprivileged child through `td-login
+//! exec-as`, and stays alive while that child owns
+//! `org.freedesktop.portal.Desktop`.
 
+mod handles;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(
     dead_code,
@@ -43,6 +45,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use handles::{HandleKind, Handles, LookupError, ReserveError};
 use message::{Message, MessageType};
 use settings::{Settings, APPEARANCE, GNOME_INTERFACE, NAMESPACE_COUNT};
 use wire::{Endian, Limits, Value, WireError, Writer};
@@ -54,10 +57,13 @@ const PORTAL_ACTIVATION_PATH: &str = "/td/Portal1";
 const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const SETTINGS_INTERFACE: &str = "org.freedesktop.portal.Settings";
+const BACKGROUND_INTERFACE: &str = "org.freedesktop.portal.Background";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const INTROSPECT_INTERFACE: &str = "org.freedesktop.DBus.Introspectable";
 const PEER_INTERFACE: &str = "org.freedesktop.DBus.Peer";
-const PORTAL_VERSION: u32 = 1;
+const SETTINGS_VERSION: u32 = 1;
+const BACKGROUND_VERSION: u32 = 1;
+const SESSION_VERSION: u32 = 1;
 const REQUEST_NAME_DO_NOT_QUEUE: u32 = 4;
 const REQUEST_NAME_PRIMARY_OWNER: u32 = 1;
 const UI_UID: u32 = 1000;
@@ -69,8 +75,16 @@ const MAX_PORTAL_FRAME: usize = 256 * 1024;
 const MAX_UNRELATED_MESSAGES: usize = 16;
 const MAX_NAMESPACE_FILTERS: usize = 32;
 const MAX_NAMESPACE_BYTES: usize = 255;
+const MAX_PORTAL_OPTIONS: usize = 32;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
+const OWNER_MATCH: &str = "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged'";
 pub const READY_MARKER: &str = "TD-PORTAL-READY namespaces=2 settings=10 version=1";
+pub const REQUEST_READY_MARKER: &str = "TD-PORTAL-REQUEST-READY response=2";
+const BACKGROUND_DENIAL_BODY: &[u8] = &[
+    2, 0, 0, 0, 48, 0, 0, 0, 10, 0, 0, 0, 98, 97, 99, 107, 103, 114, 111, 117, 110, 100, 0, 1, 98,
+    0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 97, 117, 116, 111, 115, 116, 97, 114, 116, 0, 1, 98, 0, 0, 0,
+    0, 0, 0, 0, 0,
+];
 
 const INTROSPECTION_XML: &str = r#"<node>
   <interface name="org.freedesktop.portal.Settings">
@@ -82,6 +96,14 @@ const INTROSPECTION_XML: &str = r#"<node>
       <arg type="s" name="namespace" direction="in"/>
       <arg type="s" name="key" direction="in"/>
       <arg type="v" name="value" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.Background">
+    <method name="RequestBackground">
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
     </method>
     <property name="version" type="u" access="read"/>
   </interface>
@@ -97,6 +119,41 @@ const INTROSPECTION_XML: &str = r#"<node>
   <interface name="org.freedesktop.DBus.Peer">
     <method name="Ping"/>
   </interface>
+</node>"#;
+
+const REQUEST_INTROSPECTION_XML: &str = r#"<node>
+  <interface name="org.freedesktop.portal.Request">
+    <method name="Close"/>
+    <signal name="Response"><arg type="u"/><arg type="a{sv}"/></signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
+    <method name="GetAll"><arg type="s" direction="in"/><arg type="a{sv}" direction="out"/></method>
+    <method name="Set"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/></method>
+    <signal name="PropertiesChanged"><arg type="s"/><arg type="a{sv}"/><arg type="as"/></signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect"><arg type="s" direction="out"/></method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer"><method name="Ping"/></interface>
+</node>"#;
+
+const SESSION_INTROSPECTION_XML: &str = r#"<node>
+  <interface name="org.freedesktop.portal.Session">
+    <method name="Close"/>
+    <signal name="Closed"><arg type="a{sv}"/></signal>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
+    <method name="GetAll"><arg type="s" direction="in"/><arg type="a{sv}" direction="out"/></method>
+    <method name="Set"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/></method>
+    <signal name="PropertiesChanged"><arg type="s"/><arg type="a{sv}"/><arg type="as"/></signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect"><arg type="s" direction="out"/></method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer"><method name="Ping"/></interface>
 </node>"#;
 
 fn usage() -> String {
@@ -210,8 +267,14 @@ struct Connection {
 #[derive(Debug)]
 struct Reply {
     endian: Endian,
+    sender: String,
     signature: String,
     body: Vec<u8>,
+}
+
+struct CallGuard<'a> {
+    signature: &'a str,
+    early_response_path: Option<&'a str>,
 }
 
 enum IncomingFrame {
@@ -258,6 +321,22 @@ impl Reply {
         match values.as_slice() {
             [Value::Str(text)] => Ok((*text).to_string()),
             _ => Err(io::Error::other("the string reply body has another shape")),
+        }
+    }
+
+    fn one_object_path(&self) -> io::Result<String> {
+        if self.signature != "o" {
+            return Err(io::Error::other(format!(
+                "expected an object-path reply, got {:?}",
+                self.signature
+            )));
+        }
+        let values = self.values()?;
+        match values.as_slice() {
+            [Value::ObjectPath(path)] => Ok((*path).to_string()),
+            _ => Err(io::Error::other(
+                "the object-path reply body has another shape",
+            )),
         }
     }
 
@@ -344,11 +423,7 @@ impl Connection {
     }
 
     fn next_serial(&mut self) -> io::Result<u32> {
-        self.serial = self
-            .serial
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("this D-Bus connection ran out of serials"))?;
-        Ok(self.serial)
+        next_serial_value(&mut self.serial)
     }
 
     fn call<F>(
@@ -363,11 +438,36 @@ impl Connection {
     where
         F: FnOnce(&mut Writer) -> Result<(), WireError>,
     {
+        self.call_guarded(
+            destination,
+            path,
+            interface,
+            member,
+            CallGuard {
+                signature,
+                early_response_path: None,
+            },
+            fill,
+        )
+    }
+
+    fn call_guarded<F>(
+        &mut self,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        member: &str,
+        guard: CallGuard<'_>,
+        fill: F,
+    ) -> io::Result<Reply>
+    where
+        F: FnOnce(&mut Writer) -> Result<(), WireError>,
+    {
         let serial = self.next_serial()?;
         let frame = message::Builder::method_call(Endian::Little, path, Some(interface), member)
             .destination(destination)
             .serial(serial)
-            .body(signature, fill)
+            .body(guard.signature, fill)
             .map_err(wire_error)?
             .encode()
             .map_err(message_error)?;
@@ -384,6 +484,13 @@ impl Connection {
             let (reply, consumed) = message::decode(&bytes, 0).map_err(message_error)?;
             if consumed != bytes.len() {
                 return Err(io::Error::other("a D-Bus frame carried trailing bytes"));
+            }
+            if guard.early_response_path.is_some_and(|path| {
+                is_directed_request_response(&reply, path, self.unique.as_deref())
+            }) {
+                return Err(io::Error::other(
+                    "Request.Response arrived before its method reply",
+                ));
             }
             if reply.fields.reply_serial != Some(serial) {
                 continue;
@@ -417,12 +524,56 @@ impl Connection {
             }
             return Ok(Reply {
                 endian: reply.endian,
+                sender: sender.to_string(),
                 signature: reply.fields.signature.unwrap_or("").to_string(),
                 body: reply.body_bytes().to_vec(),
             });
         }
         Err(io::Error::other(format!(
             "the session bus sent no reply to {member} after {MAX_UNRELATED_MESSAGES} unrelated messages"
+        )))
+    }
+
+    fn wait_request_response(&mut self, path: &str, portal_sender: &str) -> io::Result<Reply> {
+        for _ in 0..=MAX_UNRELATED_MESSAGES {
+            let bytes = match read_frame(&mut self.timed()?)? {
+                IncomingFrame::Message(bytes) => bytes,
+                IncomingFrame::Oversized { total, .. } => {
+                    return Err(io::Error::other(format!(
+                        "the Request.Response is {total} bytes, over the portal ceiling"
+                    )))
+                }
+            };
+            let (signal, consumed) = message::decode(&bytes, 0).map_err(message_error)?;
+            if consumed != bytes.len() {
+                return Err(io::Error::other("a D-Bus signal carried trailing bytes"));
+            }
+            if signal.kind != MessageType::Signal
+                || signal.fields.path != Some(path)
+                || signal.fields.interface != Some(handles::REQUEST_INTERFACE)
+                || signal.fields.member != Some("Response")
+                || signal.fields.sender != Some(portal_sender)
+            {
+                continue;
+            }
+            let unique = self
+                .unique
+                .as_deref()
+                .ok_or_else(|| io::Error::other("the portal probe has no unique name"))?;
+            if signal.fields.destination != Some(unique) {
+                return Err(io::Error::other(
+                    "Request.Response was not directed to its caller",
+                ));
+            }
+            return Ok(Reply {
+                endian: signal.endian,
+                sender: portal_sender.to_string(),
+                signature: signal.fields.signature.unwrap_or("").to_string(),
+                body: signal.body_bytes().to_vec(),
+            });
+        }
+        Err(io::Error::other(format!(
+            "the session bus sent no Request.Response after {MAX_UNRELATED_MESSAGES} unrelated messages"
         )))
     }
 
@@ -440,6 +591,25 @@ impl Connection {
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.stream.write_all(bytes)
     }
+}
+
+fn is_directed_request_response(
+    message: &Message<'_>,
+    path: &str,
+    destination: Option<&str>,
+) -> bool {
+    message.kind == MessageType::Signal
+        && message.fields.path == Some(path)
+        && message.fields.interface == Some(handles::REQUEST_INTERFACE)
+        && message.fields.member == Some("Response")
+        && message.fields.destination == destination
+}
+
+fn next_serial_value(serial: &mut u32) -> io::Result<u32> {
+    *serial = serial
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("this D-Bus connection ran out of serials"))?;
+    Ok(*serial)
 }
 
 fn connect_within(socket: &Path, timeout: Duration) -> io::Result<UnixStream> {
@@ -667,6 +837,14 @@ fn request_name(connection: &mut Connection) -> io::Result<()> {
     }
 }
 
+fn subscribe_to_owner_departures(connection: &mut Connection) -> io::Result<()> {
+    connection
+        .call(BUS_NAME, BUS_PATH, BUS_NAME, "AddMatch", "s", |writer| {
+            writer.string(OWNER_MATCH)
+        })?
+        .no_body()
+}
+
 fn child_argv(paths: &Paths, token: &str) -> Vec<OsString> {
     vec![
         OsString::from("exec-as"),
@@ -724,6 +902,8 @@ fn run(paths: &Paths) -> Result<(), String> {
     activate(&mut connection, token)
         .map_err(|error| format!("cannot activate the portal child: {error}"))?;
     request_name(&mut connection).map_err(|error| format!("cannot own {PORTAL_NAME}: {error}"))?;
+    subscribe_to_owner_departures(&mut connection)
+        .map_err(|error| format!("cannot subscribe to caller departures: {error}"))?;
     connection
         .finish_setup()
         .map_err(|error| format!("cannot enter portal service mode: {error}"))?;
@@ -732,6 +912,7 @@ fn run(paths: &Paths) -> Result<(), String> {
 }
 
 fn serve(connection: &mut Connection, settings: &Settings) -> io::Result<()> {
+    let mut handles = Handles::default();
     loop {
         let frame = match connection.next_message()? {
             IncomingFrame::Message(frame) => frame,
@@ -756,28 +937,77 @@ fn serve(connection: &mut Connection, settings: &Settings) -> io::Result<()> {
         if consumed != frame.len() {
             return Err(io::Error::other("a portal call carried trailing bytes"));
         }
-        let serial = connection.next_serial()?;
-        if let Some(reply) = dispatch(&incoming, settings, serial)? {
-            connection.write_frame(&reply)?;
+        let outbound = dispatch(&incoming, settings, &mut handles, &mut connection.serial)?;
+        for frame in &outbound.frames {
+            connection.write_frame(frame)?;
+        }
+        if let Some(path) = outbound.retire {
+            if !handles.retire(&path) {
+                return Err(io::Error::other(
+                    "a completed portal handle disappeared before retirement",
+                ));
+            }
         }
     }
 }
 
-fn dispatch(call: &Message<'_>, settings: &Settings, serial: u32) -> io::Result<Option<Vec<u8>>> {
+#[derive(Debug, Default)]
+struct Outbound {
+    frames: Vec<Vec<u8>>,
+    retire: Option<String>,
+}
+
+impl Outbound {
+    fn reply(wants_reply: bool, frame: Vec<u8>) -> Self {
+        let mut frames = Vec::with_capacity(1);
+        if wants_reply {
+            frames.push(frame);
+        }
+        Self {
+            frames,
+            retire: None,
+        }
+    }
+}
+
+fn dispatch(
+    call: &Message<'_>,
+    settings: &Settings,
+    handles: &mut Handles,
+    serials: &mut u32,
+) -> io::Result<Outbound> {
+    if call.kind == MessageType::Signal {
+        consume_owner_departure(call, handles)?;
+        return Ok(Outbound::default());
+    }
     if call.kind != MessageType::MethodCall {
-        return Ok(None);
+        return Ok(Outbound::default());
     }
     let wants_reply = call.flags & message::FLAG_NO_REPLY_EXPECTED == 0;
     let sender = call
         .fields
         .sender
         .ok_or_else(|| io::Error::other("the broker forwarded a call with no sender"))?;
+    if let (Some(path), Some(interface), Some("Close")) =
+        (call.fields.path, call.fields.interface, call.fields.member)
+    {
+        if matches!(
+            interface,
+            handles::REQUEST_INTERFACE | handles::SESSION_INTERFACE
+        ) {
+            return close_handle(call, handles, serials, sender, path, interface, wants_reply);
+        }
+    }
+    let serial = next_serial_value(serials)?;
     let answer = match (call.fields.path, call.fields.interface, call.fields.member) {
         (Some(PORTAL_PATH), Some(SETTINGS_INTERFACE), Some("ReadAll")) => {
             read_all_reply(call, settings, serial, sender)
         }
         (Some(PORTAL_PATH), Some(SETTINGS_INTERFACE), Some("Read")) => {
             read_reply(call, settings, serial, sender)
+        }
+        (Some(PORTAL_PATH), Some(BACKGROUND_INTERFACE), Some("RequestBackground")) => {
+            return request_background(call, handles, serials, serial, sender, wants_reply)
         }
         (Some(PORTAL_PATH), Some(PROPERTIES_INTERFACE), Some("Get")) => {
             property_get_reply(call, serial, sender)
@@ -788,6 +1018,15 @@ fn dispatch(call: &Message<'_>, settings: &Settings, serial: u32) -> io::Result<
         (Some(PORTAL_PATH), Some(PROPERTIES_INTERFACE), Some("Set")) => {
             property_set_reply(call, serial, sender)
         }
+        (Some(path), Some(PROPERTIES_INTERFACE), Some("Get")) => {
+            handle_property_get(call, handles, serial, sender, path)
+        }
+        (Some(path), Some(PROPERTIES_INTERFACE), Some("GetAll")) => {
+            handle_property_get_all(call, handles, serial, sender, path)
+        }
+        (Some(path), Some(PROPERTIES_INTERFACE), Some("Set")) => {
+            handle_property_set(call, handles, serial, sender, path)
+        }
         (Some(PORTAL_PATH), Some(INTROSPECT_INTERFACE), Some("Introspect")) => {
             if exact_signature(call, "") {
                 method_return(call.endian, serial, call.serial, sender, "s", |writer| {
@@ -796,6 +1035,9 @@ fn dispatch(call: &Message<'_>, settings: &Settings, serial: u32) -> io::Result<
             } else {
                 invalid_args(call, serial, sender, "Introspect takes no arguments")
             }
+        }
+        (Some(path), Some(INTROSPECT_INTERFACE), Some("Introspect")) => {
+            introspect_handle(call, handles, serial, sender, path)
         }
         (_, Some(PEER_INTERFACE), Some("Ping")) => {
             if exact_signature(call, "") {
@@ -813,7 +1055,267 @@ fn dispatch(call: &Message<'_>, settings: &Settings, serial: u32) -> io::Result<
             "td-portal does not serve that method",
         ),
     }?;
-    Ok(wants_reply.then_some(answer))
+    Ok(Outbound::reply(wants_reply, answer))
+}
+
+fn consume_owner_departure(call: &Message<'_>, handles: &mut Handles) -> io::Result<()> {
+    if call.fields.sender != Some(BUS_NAME)
+        || call.fields.path != Some(BUS_PATH)
+        || call.fields.interface != Some(BUS_NAME)
+        || call.fields.member != Some("NameOwnerChanged")
+    {
+        return Ok(());
+    }
+    if !exact_signature(call, "sss") {
+        return Err(io::Error::other(
+            "the broker sent a malformed NameOwnerChanged signal",
+        ));
+    }
+    let [Value::Str(name), Value::Str(old), Value::Str(new)] = call.args() else {
+        return Err(io::Error::other(
+            "the broker sent a malformed NameOwnerChanged body",
+        ));
+    };
+    if new.is_empty() && name == old && name::valid_unique_name(name) {
+        handles.remove_owner(name);
+    }
+    Ok(())
+}
+
+fn introspect_handle(
+    call: &Message<'_>,
+    handles: &Handles,
+    serial: u32,
+    sender: &str,
+    path: &str,
+) -> io::Result<Vec<u8>> {
+    if !exact_signature(call, "") {
+        return invalid_args(call, serial, sender, "Introspect takes no arguments");
+    }
+    let xml = match handles.lookup(path, sender) {
+        Ok(HandleKind::Request) => REQUEST_INTROSPECTION_XML,
+        Ok(HandleKind::Session) => SESSION_INTROSPECTION_XML,
+        Err(LookupError::Missing | LookupError::Foreign) => {
+            return unknown_object(call, serial, sender, "that portal handle does not exist")
+        }
+    };
+    method_return(call.endian, serial, call.serial, sender, "s", |writer| {
+        writer.string(xml)
+    })
+}
+
+fn handle_property_get(
+    call: &Message<'_>,
+    handles: &Handles,
+    serial: u32,
+    sender: &str,
+    path: &str,
+) -> io::Result<Vec<u8>> {
+    let Some((interface, property)) = two_strings(call) else {
+        return invalid_args(
+            call,
+            serial,
+            sender,
+            "Get takes interface and property strings",
+        );
+    };
+    let kind = match handle_kind(call, handles, serial, sender, path)? {
+        Ok(kind) => kind,
+        Err(frame) => return Ok(frame),
+    };
+    if !known_handle_interface(kind, interface) {
+        return unknown_interface(call, serial, sender);
+    }
+    if kind != HandleKind::Session
+        || property != "version"
+        || !matches!(interface, "" | handles::SESSION_INTERFACE)
+    {
+        return unknown_property(call, serial, sender);
+    }
+    method_return(call.endian, serial, call.serial, sender, "v", |writer| {
+        writer.variant("u", |writer| {
+            writer.uint32(SESSION_VERSION);
+            Ok(())
+        })
+    })
+}
+
+fn handle_property_get_all(
+    call: &Message<'_>,
+    handles: &Handles,
+    serial: u32,
+    sender: &str,
+    path: &str,
+) -> io::Result<Vec<u8>> {
+    if !exact_signature(call, "s") {
+        return invalid_args(call, serial, sender, "GetAll takes one interface string");
+    }
+    let Some(interface) = call.args().first().and_then(Value::as_str) else {
+        return invalid_args(call, serial, sender, "GetAll takes one interface string");
+    };
+    let kind = match handle_kind(call, handles, serial, sender, path)? {
+        Ok(kind) => kind,
+        Err(frame) => return Ok(frame),
+    };
+    if !known_handle_interface(kind, interface) {
+        return unknown_interface(call, serial, sender);
+    }
+    method_return(
+        call.endian,
+        serial,
+        call.serial,
+        sender,
+        "a{sv}",
+        |writer| {
+            writer.array("{sv}", |writer| {
+                if kind == HandleKind::Session
+                    && matches!(interface, "" | handles::SESSION_INTERFACE)
+                {
+                    writer.dict_entry(|writer| {
+                        writer.string("version")?;
+                        writer.variant("u", |writer| {
+                            writer.uint32(SESSION_VERSION);
+                            Ok(())
+                        })
+                    })?;
+                }
+                Ok(())
+            })
+        },
+    )
+}
+
+fn handle_property_set(
+    call: &Message<'_>,
+    handles: &Handles,
+    serial: u32,
+    sender: &str,
+    path: &str,
+) -> io::Result<Vec<u8>> {
+    if !exact_signature(call, "ssv") {
+        return invalid_args(
+            call,
+            serial,
+            sender,
+            "Set takes interface, property, and variant arguments",
+        );
+    }
+    let [Value::Str(interface), Value::Str(property), Value::Variant(_)] = call.args() else {
+        return invalid_args(
+            call,
+            serial,
+            sender,
+            "Set takes interface, property, and variant arguments",
+        );
+    };
+    let kind = match handle_kind(call, handles, serial, sender, path)? {
+        Ok(kind) => kind,
+        Err(frame) => return Ok(frame),
+    };
+    if !known_handle_interface(kind, interface) {
+        return unknown_interface(call, serial, sender);
+    }
+    if kind != HandleKind::Session
+        || *property != "version"
+        || !matches!(*interface, "" | handles::SESSION_INTERFACE)
+    {
+        return unknown_property(call, serial, sender);
+    }
+    method_error(
+        call.endian,
+        serial,
+        call.serial,
+        sender,
+        "org.freedesktop.DBus.Error.PropertyReadOnly",
+        "the Session version is read-only",
+    )
+}
+
+fn handle_kind(
+    call: &Message<'_>,
+    handles: &Handles,
+    serial: u32,
+    sender: &str,
+    path: &str,
+) -> io::Result<Result<HandleKind, Vec<u8>>> {
+    Ok(match handles.lookup(path, sender) {
+        Ok(kind) => Ok(kind),
+        Err(LookupError::Missing) => Err(unknown_object(
+            call,
+            serial,
+            sender,
+            "that portal handle does not exist",
+        )?),
+        Err(LookupError::Foreign) => Err(unknown_object(
+            call,
+            serial,
+            sender,
+            "that portal handle does not exist",
+        )?),
+    })
+}
+
+fn handle_interface(kind: HandleKind) -> &'static str {
+    match kind {
+        HandleKind::Request => handles::REQUEST_INTERFACE,
+        HandleKind::Session => handles::SESSION_INTERFACE,
+    }
+}
+
+fn known_handle_interface(kind: HandleKind, interface: &str) -> bool {
+    interface.is_empty()
+        || interface == handle_interface(kind)
+        || matches!(
+            interface,
+            PROPERTIES_INTERFACE | INTROSPECT_INTERFACE | PEER_INTERFACE
+        )
+}
+
+fn close_handle(
+    call: &Message<'_>,
+    handles: &Handles,
+    serials: &mut u32,
+    sender: &str,
+    path: &str,
+    interface: &str,
+    wants_reply: bool,
+) -> io::Result<Outbound> {
+    let serial = next_serial_value(serials)?;
+    if !exact_signature(call, "") {
+        return invalid_args(call, serial, sender, "Close takes no arguments")
+            .map(|frame| Outbound::reply(wants_reply, frame));
+    }
+    let expected = if interface == handles::REQUEST_INTERFACE {
+        HandleKind::Request
+    } else {
+        HandleKind::Session
+    };
+    let kind = match handles.lookup(path, sender) {
+        Ok(kind) => kind,
+        Err(LookupError::Missing | LookupError::Foreign) => {
+            return unknown_object(call, serial, sender, "that portal handle does not exist")
+                .map(|frame| Outbound::reply(wants_reply, frame))
+        }
+    };
+    if kind != expected {
+        return unknown_interface(call, serial, sender)
+            .map(|frame| Outbound::reply(wants_reply, frame));
+    }
+    let mut frames = Vec::with_capacity(2);
+    if wants_reply {
+        frames.push(method_return(
+            call.endian,
+            serial,
+            call.serial,
+            sender,
+            "",
+            |_| Ok(()),
+        )?);
+    }
+    Ok(Outbound {
+        frames,
+        retire: Some(path.to_string()),
+    })
 }
 
 fn exact_signature(call: &Message<'_>, signature: &str) -> bool {
@@ -828,6 +1330,175 @@ fn two_strings<'a>(call: &'a Message<'a>) -> Option<(&'a str, &'a str)> {
         [Value::Str(first), Value::Str(second)] => Some((first, second)),
         _ => None,
     }
+}
+
+fn request_background(
+    call: &Message<'_>,
+    handles: &mut Handles,
+    serials: &mut u32,
+    reply_serial: u32,
+    sender: &str,
+    wants_reply: bool,
+) -> io::Result<Outbound> {
+    let token = match background_token(call) {
+        Ok(Some(token)) => token.to_string(),
+        Ok(None) => format!("td_{}", call.serial),
+        Err(text) => {
+            return invalid_args(call, reply_serial, sender, text)
+                .map(|frame| Outbound::reply(wants_reply, frame))
+        }
+    };
+    let path = match handles.reserve(HandleKind::Request, sender, &token) {
+        Ok(path) => path,
+        Err(ReserveError::InvalidOwner) => {
+            return Err(io::Error::other(
+                "the broker assigned a sender outside td-busd's unique-name shape",
+            ))
+        }
+        Err(ReserveError::InvalidToken) => {
+            return invalid_args(
+                call,
+                reply_serial,
+                sender,
+                "handle_token is not a valid object-path element",
+            )
+            .map(|frame| Outbound::reply(wants_reply, frame))
+        }
+        Err(ReserveError::Duplicate) => {
+            return method_error(
+                call.endian,
+                reply_serial,
+                call.serial,
+                sender,
+                "org.freedesktop.portal.Error.Exists",
+                "that request handle is already active",
+            )
+            .map(|frame| Outbound::reply(wants_reply, frame))
+        }
+        Err(ReserveError::OwnerFull | ReserveError::Full) => {
+            return method_error(
+                call.endian,
+                reply_serial,
+                call.serial,
+                sender,
+                "org.freedesktop.DBus.Error.LimitsExceeded",
+                "this portal has too many active handles",
+            )
+            .map(|frame| Outbound::reply(wants_reply, frame))
+        }
+    };
+    let mut frames = Vec::with_capacity(2);
+    if wants_reply {
+        frames.push(method_return(
+            call.endian,
+            reply_serial,
+            call.serial,
+            sender,
+            "o",
+            |writer| writer.object_path(&path),
+        )?);
+    }
+    let response_serial = next_serial_value(serials)?;
+    frames.push(request_response(
+        call.endian,
+        response_serial,
+        &path,
+        sender,
+        2,
+    )?);
+    Ok(Outbound {
+        frames,
+        retire: Some(path),
+    })
+}
+
+fn background_token<'a>(call: &'a Message<'a>) -> Result<Option<&'a str>, &'static str> {
+    if !exact_signature(call, "sa{sv}") {
+        return Err("RequestBackground takes a parent string and options dictionary");
+    }
+    let [Value::Str(_parent), Value::Array(options)] = call.args() else {
+        return Err("RequestBackground takes a parent string and options dictionary");
+    };
+    let entries = options
+        .values(MAX_PORTAL_OPTIONS)
+        .map_err(|_| "RequestBackground has too many options")?;
+    let mut token = None;
+    for entry in &entries {
+        let pair = entry
+            .as_seq()
+            .ok_or("a RequestBackground option is not a dictionary entry")?
+            .values(2)
+            .map_err(|_| "a RequestBackground option is malformed")?;
+        let [Value::Str(key), Value::Variant(value)] = pair.as_slice() else {
+            return Err("a RequestBackground option has the wrong shape");
+        };
+        if *key != "handle_token" {
+            continue;
+        }
+        if token.is_some() || value.signature() != "s" {
+            return Err("handle_token must appear once as a string");
+        }
+        let values = value
+            .values(1)
+            .map_err(|_| "handle_token has a malformed variant")?;
+        let Some(Value::Str(text)) = values.first() else {
+            return Err("handle_token must be a string");
+        };
+        if !handles::valid_token(text) {
+            return Err("handle_token is not a valid object-path element");
+        }
+        token = Some(*text);
+    }
+    Ok(token)
+}
+
+fn request_response(
+    endian: Endian,
+    serial: u32,
+    path: &str,
+    destination: &str,
+    response: u32,
+) -> io::Result<Vec<u8>> {
+    message::Builder::signal(endian, path, handles::REQUEST_INTERFACE, "Response")
+        .destination(destination)
+        .serial(serial)
+        .body("ua{sv}", |writer| {
+            write_background_response(writer, response)
+        })
+        .map_err(wire_error)?
+        .encode()
+        .map_err(message_error)
+}
+
+fn write_background_response(writer: &mut Writer, response: u32) -> Result<(), WireError> {
+    writer.uint32(response);
+    writer.array("{sv}", |writer| {
+        for key in ["background", "autostart"] {
+            writer.dict_entry(|writer| {
+                writer.string(key)?;
+                writer.variant("b", |writer| {
+                    writer.bool(false);
+                    Ok(())
+                })
+            })?;
+        }
+        Ok(())
+    })
+}
+
+fn session_closed(
+    endian: Endian,
+    serial: u32,
+    path: &str,
+    destination: &str,
+) -> io::Result<Vec<u8>> {
+    message::Builder::signal(endian, path, handles::SESSION_INTERFACE, "Closed")
+        .destination(destination)
+        .serial(serial)
+        .body("a{sv}", |writer| writer.array("{sv}", |_| Ok(())))
+        .map_err(wire_error)?
+        .encode()
+        .map_err(message_error)
 }
 
 fn read_all_reply(
@@ -896,8 +1567,20 @@ fn read_reply(
 fn known_property_interface(interface: &str) -> bool {
     matches!(
         interface,
-        SETTINGS_INTERFACE | PROPERTIES_INTERFACE | INTROSPECT_INTERFACE | PEER_INTERFACE
+        SETTINGS_INTERFACE
+            | BACKGROUND_INTERFACE
+            | PROPERTIES_INTERFACE
+            | INTROSPECT_INTERFACE
+            | PEER_INTERFACE
     )
+}
+
+fn interface_version(interface: &str) -> Option<u32> {
+    match interface {
+        SETTINGS_INTERFACE => Some(SETTINGS_VERSION),
+        BACKGROUND_INTERFACE => Some(BACKGROUND_VERSION),
+        _ => None,
+    }
 }
 
 fn unknown_interface(call: &Message<'_>, serial: u32, sender: &str) -> io::Result<Vec<u8>> {
@@ -908,6 +1591,22 @@ fn unknown_interface(call: &Message<'_>, serial: u32, sender: &str) -> io::Resul
         sender,
         "org.freedesktop.DBus.Error.UnknownInterface",
         "that portal interface is not published",
+    )
+}
+
+fn unknown_object(
+    call: &Message<'_>,
+    serial: u32,
+    sender: &str,
+    text: &str,
+) -> io::Result<Vec<u8>> {
+    method_error(
+        call.endian,
+        serial,
+        call.serial,
+        sender,
+        "org.freedesktop.DBus.Error.UnknownObject",
+        text,
     )
 }
 
@@ -931,15 +1630,15 @@ fn property_get_reply(call: &Message<'_>, serial: u32, sender: &str) -> io::Resu
             "Get takes interface and property strings",
         );
     };
-    if !interface.is_empty() && !known_property_interface(interface) {
+    if !known_property_interface(interface) {
         return unknown_interface(call, serial, sender);
     }
-    if property != "version" || (!interface.is_empty() && interface != SETTINGS_INTERFACE) {
+    let Some(version) = interface_version(interface).filter(|_| property == "version") else {
         return unknown_property(call, serial, sender);
-    }
+    };
     method_return(call.endian, serial, call.serial, sender, "v", |writer| {
         writer.variant("u", |writer| {
-            writer.uint32(PORTAL_VERSION);
+            writer.uint32(version);
             Ok(())
         })
     })
@@ -961,12 +1660,12 @@ fn property_get_all_reply(call: &Message<'_>, serial: u32, sender: &str) -> io::
         call.serial,
         sender,
         "a{sv}",
-        |writer| match interface {
-            SETTINGS_INTERFACE => writer.array("{sv}", |writer| {
+        |writer| match interface_version(interface) {
+            Some(version) => writer.array("{sv}", |writer| {
                 writer.dict_entry(|writer| {
                     writer.string("version")?;
                     writer.variant("u", |writer| {
-                        writer.uint32(PORTAL_VERSION);
+                        writer.uint32(version);
                         Ok(())
                     })
                 })
@@ -993,10 +1692,10 @@ fn property_set_reply(call: &Message<'_>, serial: u32, sender: &str) -> io::Resu
             "Set takes interface, property, and variant arguments",
         );
     };
-    if !interface.is_empty() && !known_property_interface(interface) {
+    if !known_property_interface(interface) {
         return unknown_interface(call, serial, sender);
     }
-    if *property != "version" || (!interface.is_empty() && *interface != SETTINGS_INTERFACE) {
+    if *property != "version" || interface_version(interface).is_none() {
         return unknown_property(call, serial, sender);
     }
     method_error(
@@ -1069,7 +1768,7 @@ fn expected_version() -> io::Result<Vec<u8>> {
     let mut writer = Writer::new(Endian::Little);
     writer
         .variant("u", |writer| {
-            writer.uint32(PORTAL_VERSION);
+            writer.uint32(SETTINGS_VERSION);
             Ok(())
         })
         .map_err(wire_error)?;
@@ -1119,7 +1818,62 @@ fn probe(paths: &Paths) -> Result<(), String> {
     {
         return Err("the live Settings.ReadAll reply differs from the session file".into());
     }
+    let unique = connection
+        .unique
+        .as_deref()
+        .ok_or_else(|| "the portal probe has no unique name".to_string())?;
+    let token = "td_probe_1";
+    let request_path = handles::request_path(unique, token)
+        .ok_or_else(|| "the portal probe cannot derive its Request path".to_string())?;
+    let match_rule = format!(
+        "type='signal',interface='{}',member='Response',path='{request_path}'",
+        handles::REQUEST_INTERFACE
+    );
+    connection
+        .call(BUS_NAME, BUS_PATH, BUS_NAME, "AddMatch", "s", |writer| {
+            writer.string(&match_rule)
+        })
+        .and_then(|reply| reply.no_body())
+        .map_err(|error| format!("cannot subscribe to Request.Response: {error}"))?;
+    let request = connection
+        .call_guarded(
+            PORTAL_NAME,
+            PORTAL_PATH,
+            BACKGROUND_INTERFACE,
+            "RequestBackground",
+            CallGuard {
+                signature: "sa{sv}",
+                early_response_path: Some(&request_path),
+            },
+            |writer| {
+                writer.string("")?;
+                writer.array("{sv}", |writer| {
+                    writer.dict_entry(|writer| {
+                        writer.string("handle_token")?;
+                        writer.variant("s", |writer| writer.string(token))
+                    })
+                })
+            },
+        )
+        .map_err(|error| format!("the Background request call failed: {error}"))?;
+    if request
+        .one_object_path()
+        .map_err(|error| error.to_string())?
+        != request_path
+    {
+        return Err("the live Background reply returned another Request path".into());
+    }
+    let response = connection
+        .wait_request_response(&request_path, &request.sender)
+        .map_err(|error| format!("the Background request response failed: {error}"))?;
+    if response.endian != Endian::Little
+        || response.signature != "ua{sv}"
+        || response.body != BACKGROUND_DENIAL_BODY
+    {
+        return Err("the live Background denial response is not exact".into());
+    }
     println!("{READY_MARKER}");
+    println!("{REQUEST_READY_MARKER}");
     Ok(())
 }
 
@@ -1137,6 +1891,24 @@ fn selftest() -> Result<(), String> {
         .len();
     if count != NAMESPACE_COUNT {
         return Err(format!("selftest produced {count} namespaces"));
+    }
+    let mut handles = Handles::default();
+    let session = handles
+        .reserve(HandleKind::Session, ":1.1", "selftest")
+        .map_err(|error| format!("selftest cannot reserve a Session: {error:?}"))?;
+    let closed_bytes = session_closed(Endian::Little, 1, &session, ":1.1")
+        .map_err(|error| format!("selftest cannot encode Session.Closed: {error}"))?;
+    let (closed, consumed) = message::decode(&closed_bytes, 0)
+        .map_err(|error| format!("selftest cannot decode Session.Closed: {error}"))?;
+    if handles.lookup(&session, ":1.1") != Ok(HandleKind::Session)
+        || handles.len() != 1
+        || consumed != closed_bytes.len()
+        || closed.kind != MessageType::Signal
+        || closed.fields.path != Some(session.as_str())
+        || closed.fields.destination != Some(":1.1")
+        || !handles.retire(&session)
+    {
+        return Err("selftest cannot complete a Session lifecycle".into());
     }
     println!("TD-PORTAL-SELFTEST-OK");
     Ok(())
@@ -1175,14 +1947,37 @@ mod tests {
     where
         F: FnOnce(&mut Writer) -> Result<(), WireError>,
     {
-        message::Builder::method_call(Endian::Little, PORTAL_PATH, Some(interface), member)
+        call_at(PORTAL_PATH, ":1.9", interface, member, signature, fill)
+    }
+
+    fn call_at<F>(
+        path: &str,
+        sender: &str,
+        interface: &str,
+        member: &str,
+        signature: &str,
+        fill: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce(&mut Writer) -> Result<(), WireError>,
+    {
+        message::Builder::method_call(Endian::Little, path, Some(interface), member)
             .destination(PORTAL_NAME)
-            .sender(":1.9")
+            .sender(sender)
             .serial(7)
             .body(signature, fill)
             .unwrap()
             .encode()
             .unwrap()
+    }
+
+    fn dispatch_one(call: &Message<'_>, settings: &Settings, serial: u32) -> Vec<u8> {
+        let mut handles = Handles::default();
+        let mut serials = serial.saturating_sub(1);
+        let outbound = dispatch(call, settings, &mut handles, &mut serials).unwrap();
+        assert!(outbound.retire.is_none());
+        assert_eq!(outbound.frames.len(), 1);
+        outbound.frames.into_iter().next().unwrap()
     }
 
     #[test]
@@ -1257,7 +2052,7 @@ mod tests {
             })
         });
         let (request, _) = message::decode(&bytes, 0).unwrap();
-        let reply = dispatch(&request, &settings, 10).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 10);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(reply.kind, MessageType::MethodReturn);
         assert_eq!(reply.fields.reply_serial, Some(7));
@@ -1274,21 +2069,33 @@ mod tests {
             writer.string("version")
         });
         let (request, _) = message::decode(&bytes, 0).unwrap();
-        let reply = dispatch(&request, &settings, 11).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 11);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(reply.fields.signature, Some("v"));
         assert_eq!(reply.body_bytes(), expected_version().unwrap());
     }
 
     #[test]
-    fn properties_obey_empty_interface_and_read_only_rules() {
+    fn properties_refuse_an_ambiguous_empty_interface_and_are_read_only() {
         let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
         let get = call(PROPERTIES_INTERFACE, "Get", "ss", |writer| {
             writer.string("")?;
             writer.string("version")
         });
         let (request, _) = message::decode(&get, 0).unwrap();
-        let reply = dispatch(&request, &settings, 12).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 12);
+        let (reply, _) = message::decode(&reply, 0).unwrap();
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.UnknownInterface")
+        );
+
+        let background = call(PROPERTIES_INTERFACE, "Get", "ss", |writer| {
+            writer.string(BACKGROUND_INTERFACE)?;
+            writer.string("version")
+        });
+        let (request, _) = message::decode(&background, 0).unwrap();
+        let reply = dispatch_one(&request, &settings, 13);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(reply.body_bytes(), expected_version().unwrap());
 
@@ -1296,7 +2103,7 @@ mod tests {
             writer.string(PEER_INTERFACE)
         });
         let (request, _) = message::decode(&get_all, 0).unwrap();
-        let reply = dispatch(&request, &settings, 13).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 14);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(reply.fields.signature, Some("a{sv}"));
         let values = reply
@@ -1317,12 +2124,376 @@ mod tests {
             })
         });
         let (request, _) = message::decode(&set, 0).unwrap();
-        let reply = dispatch(&request, &settings, 14).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 15);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(
             reply.fields.error_name,
             Some("org.freedesktop.DBus.Error.PropertyReadOnly")
         );
+    }
+
+    #[test]
+    fn background_exports_before_reply_then_directs_an_exact_denial() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let bytes = call(
+            BACKGROUND_INTERFACE,
+            "RequestBackground",
+            "sa{sv}",
+            |writer| {
+                writer.string("")?;
+                writer.array("{sv}", |writer| {
+                    writer.dict_entry(|writer| {
+                        writer.string("handle_token")?;
+                        writer.variant("s", |writer| writer.string("probe_7"))
+                    })
+                })
+            },
+        );
+        let (request, _) = message::decode(&bytes, 0).unwrap();
+        let mut handles = Handles::default();
+        let mut serials = 19;
+        let outbound = dispatch(&request, &settings, &mut handles, &mut serials).unwrap();
+        let path = "/org/freedesktop/portal/desktop/request/1_9/probe_7";
+        assert_eq!(handles.lookup(path, ":1.9"), Ok(HandleKind::Request));
+        assert_eq!(outbound.retire.as_deref(), Some(path));
+        assert_eq!(outbound.frames.len(), 2);
+
+        let (reply, _) = message::decode(&outbound.frames[0], 0).unwrap();
+        assert_eq!(reply.kind, MessageType::MethodReturn);
+        assert_eq!(reply.fields.reply_serial, Some(7));
+        assert_eq!(reply.fields.destination, Some(":1.9"));
+        assert_eq!(reply.args(), vec![Value::ObjectPath(path)]);
+
+        let (response, _) = message::decode(&outbound.frames[1], 0).unwrap();
+        assert_eq!(response.kind, MessageType::Signal);
+        assert_eq!(response.fields.path, Some(path));
+        assert_eq!(response.fields.interface, Some(handles::REQUEST_INTERFACE));
+        assert_eq!(response.fields.member, Some("Response"));
+        assert_eq!(response.fields.destination, Some(":1.9"));
+        assert_eq!(response.fields.signature, Some("ua{sv}"));
+        assert_eq!(response.body_bytes(), BACKGROUND_DENIAL_BODY);
+
+        assert!(handles.retire(path));
+        assert_eq!(handles.lookup(path, ":1.9"), Err(LookupError::Missing));
+    }
+
+    #[test]
+    fn background_options_are_bounded_and_an_absent_token_is_deterministic() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let too_many = call(
+            BACKGROUND_INTERFACE,
+            "RequestBackground",
+            "sa{sv}",
+            |writer| {
+                writer.string("")?;
+                writer.array("{sv}", |writer| {
+                    for _ in 0..=MAX_PORTAL_OPTIONS {
+                        writer.dict_entry(|writer| {
+                            writer.string("unknown")?;
+                            writer.variant("b", |writer| {
+                                writer.bool(false);
+                                Ok(())
+                            })?;
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                })
+            },
+        );
+        let (too_many, _) = message::decode(&too_many, 0).unwrap();
+        let mut handles = Handles::default();
+        let mut serials = 40;
+        let refusal = dispatch(&too_many, &settings, &mut handles, &mut serials).unwrap();
+        let (refusal, _) = message::decode(&refusal.frames[0], 0).unwrap();
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.InvalidArgs")
+        );
+        assert_eq!(handles.len(), 0);
+
+        let no_token = call(
+            BACKGROUND_INTERFACE,
+            "RequestBackground",
+            "sa{sv}",
+            |writer| {
+                writer.string("")?;
+                writer.array("{sv}", |_| Ok(()))
+            },
+        );
+        let (no_token, _) = message::decode(&no_token, 0).unwrap();
+        let outbound = dispatch(&no_token, &settings, &mut handles, &mut serials).unwrap();
+        assert_eq!(
+            outbound.retire.as_deref(),
+            Some("/org/freedesktop/portal/desktop/request/1_9/td_7")
+        );
+    }
+
+    #[test]
+    fn a_no_reply_background_call_still_completes_its_known_request() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let bytes = message::Builder::method_call(
+            Endian::Little,
+            PORTAL_PATH,
+            Some(BACKGROUND_INTERFACE),
+            "RequestBackground",
+        )
+        .destination(PORTAL_NAME)
+        .sender(":1.9")
+        .flags(message::FLAG_NO_REPLY_EXPECTED)
+        .serial(8)
+        .body("sa{sv}", |writer| {
+            writer.string("")?;
+            writer.array("{sv}", |writer| {
+                writer.dict_entry(|writer| {
+                    writer.string("handle_token")?;
+                    writer.variant("s", |writer| writer.string("silent"))
+                })
+            })
+        })
+        .unwrap()
+        .encode()
+        .unwrap();
+        let (request, _) = message::decode(&bytes, 0).unwrap();
+        let mut handles = Handles::default();
+        let mut serials = 50;
+        let outbound = dispatch(&request, &settings, &mut handles, &mut serials).unwrap();
+        assert_eq!(outbound.frames.len(), 1);
+        let (response, _) = message::decode(&outbound.frames[0], 0).unwrap();
+        assert_eq!(response.kind, MessageType::Signal);
+        assert_eq!(response.fields.member, Some("Response"));
+        assert_eq!(
+            outbound.retire.as_deref(),
+            Some("/org/freedesktop/portal/desktop/request/1_9/silent")
+        );
+    }
+
+    #[test]
+    fn request_close_is_owner_only_and_emits_no_response() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let mut handles = Handles::default();
+        let path = handles
+            .reserve(HandleKind::Request, ":1.9", "pending")
+            .unwrap();
+        let foreign = call_at(
+            &path,
+            ":1.8",
+            handles::REQUEST_INTERFACE,
+            "Close",
+            "",
+            |_| Ok(()),
+        );
+        let (foreign, _) = message::decode(&foreign, 0).unwrap();
+        let mut serials = 20;
+        let refusal = dispatch(&foreign, &settings, &mut handles, &mut serials).unwrap();
+        assert!(refusal.retire.is_none());
+        let (refusal, _) = message::decode(&refusal.frames[0], 0).unwrap();
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.UnknownObject")
+        );
+
+        let absent = call_at(
+            "/org/freedesktop/portal/desktop/request/1_9/absent",
+            ":1.8",
+            handles::REQUEST_INTERFACE,
+            "Close",
+            "",
+            |_| Ok(()),
+        );
+        let (absent, _) = message::decode(&absent, 0).unwrap();
+        let absent = dispatch(&absent, &settings, &mut handles, &mut serials).unwrap();
+        let (absent, _) = message::decode(&absent.frames[0], 0).unwrap();
+        assert_eq!(refusal.fields.error_name, absent.fields.error_name);
+
+        let close = call_at(
+            &path,
+            ":1.9",
+            handles::REQUEST_INTERFACE,
+            "Close",
+            "",
+            |_| Ok(()),
+        );
+        let (close, _) = message::decode(&close, 0).unwrap();
+        let closed = dispatch(&close, &settings, &mut handles, &mut serials).unwrap();
+        assert_eq!(closed.frames.len(), 1);
+        let (reply, _) = message::decode(&closed.frames[0], 0).unwrap();
+        assert_eq!(reply.kind, MessageType::MethodReturn);
+        assert_eq!(closed.retire.as_deref(), Some(path.as_str()));
+        assert_eq!(handles.lookup(&path, ":1.9"), Ok(HandleKind::Request));
+        assert!(handles.retire(&path));
+    }
+
+    #[test]
+    fn session_close_replies_without_closed_and_retires() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let mut handles = Handles::default();
+        let path = handles
+            .reserve(HandleKind::Session, ":1.9", "shortcuts")
+            .unwrap();
+        let get = call_at(&path, ":1.9", PROPERTIES_INTERFACE, "Get", "ss", |writer| {
+            writer.string(handles::SESSION_INTERFACE)?;
+            writer.string("version")
+        });
+        let (get, _) = message::decode(&get, 0).unwrap();
+        let mut serials = 30;
+        let property = dispatch(&get, &settings, &mut handles, &mut serials).unwrap();
+        let (property, _) = message::decode(&property.frames[0], 0).unwrap();
+        assert_eq!(property.body_bytes(), expected_version().unwrap());
+
+        let introspect = call_at(
+            &path,
+            ":1.9",
+            INTROSPECT_INTERFACE,
+            "Introspect",
+            "",
+            |_| Ok(()),
+        );
+        let (introspect, _) = message::decode(&introspect, 0).unwrap();
+        let answer = dispatch(&introspect, &settings, &mut handles, &mut serials).unwrap();
+        let (answer, _) = message::decode(&answer.frames[0], 0).unwrap();
+        assert!(answer
+            .args()
+            .first()
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains(handles::SESSION_INTERFACE));
+
+        let close = call_at(
+            &path,
+            ":1.9",
+            handles::SESSION_INTERFACE,
+            "Close",
+            "",
+            |_| Ok(()),
+        );
+        let (close, _) = message::decode(&close, 0).unwrap();
+        let outbound = dispatch(&close, &settings, &mut handles, &mut serials).unwrap();
+        assert_eq!(outbound.frames.len(), 1);
+        let (reply, _) = message::decode(&outbound.frames[0], 0).unwrap();
+        assert_eq!(reply.kind, MessageType::MethodReturn);
+        assert_eq!(outbound.retire.as_deref(), Some(path.as_str()));
+        assert_eq!(handles.lookup(&path, ":1.9"), Ok(HandleKind::Session));
+    }
+
+    #[test]
+    fn handle_properties_accept_empty_and_empty_standard_interfaces() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let mut handles = Handles::default();
+        let path = handles
+            .reserve(HandleKind::Session, ":1.9", "properties")
+            .unwrap();
+        let mut serials = 50;
+
+        let get = call_at(&path, ":1.9", PROPERTIES_INTERFACE, "Get", "ss", |writer| {
+            writer.string("")?;
+            writer.string("version")
+        });
+        let (get, _) = message::decode(&get, 0).unwrap();
+        let get = dispatch(&get, &settings, &mut handles, &mut serials).unwrap();
+        let (get, _) = message::decode(&get.frames[0], 0).unwrap();
+        assert_eq!(get.body_bytes(), expected_version().unwrap());
+
+        let get_all = call_at(
+            &path,
+            ":1.9",
+            PROPERTIES_INTERFACE,
+            "GetAll",
+            "s",
+            |writer| writer.string(PROPERTIES_INTERFACE),
+        );
+        let (get_all, _) = message::decode(&get_all, 0).unwrap();
+        let get_all = dispatch(&get_all, &settings, &mut handles, &mut serials).unwrap();
+        let (get_all, _) = message::decode(&get_all.frames[0], 0).unwrap();
+        assert_eq!(get_all.fields.signature, Some("a{sv}"));
+        assert!(get_all
+            .args()
+            .first()
+            .and_then(Value::as_seq)
+            .unwrap()
+            .values(1)
+            .unwrap()
+            .is_empty());
+
+        let set = call_at(
+            &path,
+            ":1.9",
+            PROPERTIES_INTERFACE,
+            "Set",
+            "ssv",
+            |writer| {
+                writer.string("")?;
+                writer.string("version")?;
+                writer.variant("u", |writer| {
+                    writer.uint32(2);
+                    Ok(())
+                })
+            },
+        );
+        let (set, _) = message::decode(&set, 0).unwrap();
+        let set = dispatch(&set, &settings, &mut handles, &mut serials).unwrap();
+        let (set, _) = message::decode(&set.frames[0], 0).unwrap();
+        assert_eq!(
+            set.fields.error_name,
+            Some("org.freedesktop.DBus.Error.PropertyReadOnly")
+        );
+    }
+
+    #[test]
+    fn portal_initiated_session_closed_is_directed() {
+        let path = "/org/freedesktop/portal/desktop/session/1_9/shortcuts";
+        let bytes = session_closed(Endian::Little, 31, path, ":1.9").unwrap();
+        let (closed, _) = message::decode(&bytes, 0).unwrap();
+        assert_eq!(closed.kind, MessageType::Signal);
+        assert_eq!(closed.fields.path, Some(path));
+        assert_eq!(closed.fields.interface, Some(handles::SESSION_INTERFACE));
+        assert_eq!(closed.fields.member, Some("Closed"));
+        assert_eq!(closed.fields.destination, Some(":1.9"));
+        assert_eq!(closed.fields.signature, Some("a{sv}"));
+    }
+
+    #[test]
+    fn peer_ping_is_path_independent_without_revealing_handles() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let ping = call_at(
+            "/org/example/Thing",
+            ":1.8",
+            PEER_INTERFACE,
+            "Ping",
+            "",
+            |_| Ok(()),
+        );
+        let (ping, _) = message::decode(&ping, 0).unwrap();
+        let reply = dispatch_one(&ping, &settings, 40);
+        let (reply, _) = message::decode(&reply, 0).unwrap();
+        assert_eq!(reply.kind, MessageType::MethodReturn);
+        assert!(reply.body_bytes().is_empty());
+    }
+
+    #[test]
+    fn owner_departure_removes_every_handle_without_output() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let mut handles = Handles::default();
+        handles.reserve(HandleKind::Request, ":1.9", "one").unwrap();
+        handles.reserve(HandleKind::Session, ":1.9", "two").unwrap();
+        let signal =
+            message::Builder::signal(Endian::Little, BUS_PATH, BUS_NAME, "NameOwnerChanged")
+                .sender(BUS_NAME)
+                .serial(50)
+                .body("sss", |writer| {
+                    writer.string(":1.9")?;
+                    writer.string(":1.9")?;
+                    writer.string("")
+                })
+                .unwrap()
+                .encode()
+                .unwrap();
+        let (signal, _) = message::decode(&signal, 0).unwrap();
+        let mut serials = 60;
+        let outbound = dispatch(&signal, &settings, &mut handles, &mut serials).unwrap();
+        assert!(outbound.frames.is_empty());
+        assert_eq!(handles.len(), 0);
+        assert_eq!(serials, 60);
     }
 
     #[test]
@@ -1450,10 +2621,70 @@ mod tests {
         assert_eq!(
             READY_MARKER,
             format!(
-                "TD-PORTAL-READY namespaces={NAMESPACE_COUNT} settings={} version={PORTAL_VERSION}",
+                "TD-PORTAL-READY namespaces={NAMESPACE_COUNT} settings={} version={SETTINGS_VERSION}",
                 settings::SETTING_COUNT
             )
         );
+        assert_eq!(SETTINGS_VERSION, 1);
+    }
+
+    #[test]
+    fn request_ready_marker_is_the_denied_background_contract() {
+        assert_eq!(REQUEST_READY_MARKER, "TD-PORTAL-REQUEST-READY response=2");
+    }
+
+    #[test]
+    fn the_probe_rejects_a_response_before_its_method_reply() {
+        let path = "/org/freedesktop/portal/desktop/request/1_9/early";
+        let bytes =
+            message::Builder::signal(Endian::Little, path, handles::REQUEST_INTERFACE, "Response")
+                .sender(":1.10")
+                .destination(":1.9")
+                .serial(4)
+                .body("ua{sv}", |writer| write_background_response(writer, 2))
+                .unwrap()
+                .encode()
+                .unwrap();
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream.write_all(&bytes).unwrap();
+        let mut connection = Connection {
+            stream: client_stream,
+            serial: 0,
+            unique: Some(":1.9".into()),
+            until: Some(Instant::now() + Duration::from_secs(2)),
+        };
+        let error = connection
+            .call_guarded(
+                PORTAL_NAME,
+                PORTAL_PATH,
+                BACKGROUND_INTERFACE,
+                "RequestBackground",
+                CallGuard {
+                    signature: "sa{sv}",
+                    early_response_path: Some(path),
+                },
+                |writer| {
+                    writer.string("")?;
+                    writer.array("{sv}", |_| Ok(()))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Request.Response arrived before its method reply"
+        );
+    }
+
+    #[test]
+    fn every_introspection_xml_declares_properties_changed_once() {
+        const SIGNAL: &str = "<signal name=\"PropertiesChanged\">";
+        for xml in [
+            INTROSPECTION_XML,
+            REQUEST_INTROSPECTION_XML,
+            SESSION_INTROSPECTION_XML,
+        ] {
+            assert_eq!(xml.matches(SIGNAL).count(), 1, "{xml}");
+        }
     }
 
     #[test]
@@ -1464,7 +2695,7 @@ mod tests {
             writer.string("color-scheme")
         });
         let (request, _) = message::decode(&bytes, 0).unwrap();
-        let reply = dispatch(&request, &settings, 12).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 12);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(reply.fields.signature, Some("v"));
         let outer = reply.args();
@@ -1483,7 +2714,7 @@ mod tests {
             writer.string(APPEARANCE)
         });
         let (request, _) = message::decode(&malformed, 0).unwrap();
-        let reply = dispatch(&request, &settings, 12).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 12);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(
             reply.fields.error_name,
@@ -1495,7 +2726,7 @@ mod tests {
             writer.string("not-there")
         });
         let (request, _) = message::decode(&absent, 0).unwrap();
-        let reply = dispatch(&request, &settings, 13).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 13);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(
             reply.fields.error_name,
@@ -1515,7 +2746,7 @@ mod tests {
             })
         });
         let (request, _) = message::decode(&oversized, 0).unwrap();
-        let reply = dispatch(&request, &settings, 14).unwrap().unwrap();
+        let reply = dispatch_one(&request, &settings, 14);
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(
             reply.fields.error_name,
@@ -1539,6 +2770,10 @@ mod tests {
         .encode()
         .unwrap();
         let (request, _) = message::decode(&bytes, 0).unwrap();
-        assert!(dispatch(&request, &settings, 10).unwrap().is_none());
+        let mut handles = Handles::default();
+        let mut serials = 9;
+        let outbound = dispatch(&request, &settings, &mut handles, &mut serials).unwrap();
+        assert!(outbound.frames.is_empty());
+        assert!(outbound.retire.is_none());
     }
 }

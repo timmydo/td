@@ -517,10 +517,10 @@ writes raw dot progress to the shared console without line framing; waiting
 for it to settle lets td-svc's single-write `portal-evidence:` prefix remain
 an exact attributable line. This edge does not couple portal health to TLS.
 
-`busd` needs `/run/user/1000` (td-seatd's product). The first Settings
-portal needs only that bus and its immutable session file; later UI portals
-add the private compositor socket. Both daemons are `restart=always`, so
-td-svc's backoff bounds crash loops.
+`busd` needs `/run/user/1000` (td-seatd's product). Settings and the denied
+Background request need only that bus and the immutable settings file; later
+UI portals add the private compositor socket. Both daemons are
+`restart=always`, so td-svc's backoff bounds crash loops.
 
 **The `busd` unit has LANDED**, with two things this sketch did not
 settle. It `requires=seat` as well as ordering after it, and not for the
@@ -539,15 +539,18 @@ boot asserts the outcome rather than trusting the unit: `/etc/bootsuccess`
 probes the RUNNING broker in its health farm and prints a marker the
 image oracle requires — §D below.
 
-**The Settings `[portal]` and `[portal-evidence]` units have now LANDED.**
+**The Settings/Request `[portal]` and `[portal-evidence]` units have now
+LANDED.**
 The root supervisor prepares one broker activation capability and starts one
 literal `td-login exec-as tester -- /bin/td-portal run ...` direct child while
 retaining its own bus connection. The child activates that capability before
 claiming `org.freedesktop.portal.Desktop`. Readiness is a separate uid-1000
-client performing live `Properties.Get(version)` and synchronous
-`Settings.ReadAll`; td-svc discards readiness output, so `portal-evidence`
-repeats the same bounded exchange through its captured service log and
-`console=yes` for QEMU. Firefox is ordered after `portal` but does not
+client performing live `Properties.Get(version)`, synchronous
+`Settings.ReadAll`, and a pre-subscribed `Background.RequestBackground` whose
+caller-derived handle receives a directed denial `Request.Response`; td-svc
+discards readiness output, so `portal-evidence` repeats the same bounded
+exchanges through its captured service log and `console=yes` for QEMU.
+Firefox is ordered after `portal` but does not
 `require` it, and neither portal unit is a dependency of `bootsuccess`: a
 user-service failure is evidence failure, not authority to reject an otherwise
 healthy deployment.
@@ -1716,10 +1719,11 @@ dynamic validator, runtime aliases, synthesized `/etc`, narrowed td permission
 and resource policy, and image-capacity accounting for the 993.7 MB base
 deploy. Everything in that list through the aliases and `/etc` is now
 complete. E2's toolkit and nested-sandbox experiments are complete; the exact
-§H Firefox oracle remains. The Settings slice of `td-portal` is now present;
-Request/Session objects, consent UI, file mediation and the other service-side
-interfaces remain separate platform prerequisites. None of those obligations
-is discharged by the bus/compositor list below.
+§H Firefox oracle remains. The Settings slice and bounded Request object core
+of `td-portal` are now present. Session-producing interfaces, consent UI, file
+mediation and the other service-side interfaces remain separate platform
+prerequisites. None of those obligations is discharged by the bus/compositor
+list below.
 
 For `td-busd`, full Firefox fidelity needs:
 
@@ -1751,8 +1755,10 @@ For `td-busd`, full Firefox fidelity needs:
   service rather than missing broker forwarding;
 - per-instance portal activation and Request/Session handle routing are
   landed. The portal namespace remains reserved even while the portal is
-  restarting. Settings now consumes activation in the image; exported
-  Request/Session handle objects remain service-side work;
+  restarting. Settings consumes activation in the image, and the service now
+  exports bounded caller-owned Request objects before their replies. Session
+  routing is ready at the broker and object-table layers, but no shipped portal
+  creates a Session yet;
 - a deliberate decision for the imported requests to
   `org.a11y.Bus`, `org.gtk.vfs.*`, `org.freedesktop.FileManager1` and the
   system-bus `org.freedesktop.NetworkManager`. They are not silently granted.
@@ -3981,9 +3987,10 @@ sandbox asks for anything outside itself.
 
 Three consequences worth stating rather than discovering. First, the shipped
 `td-portal` now makes the activation and routing substrate observable through
-one uniform read-only Settings service. Request/Session objects and every
-consent or compositor-mediated interface remain absent, so this first service
-does not imply the rest of §E. Second, an instance's
+one uniform read-only Settings service and an intentionally denied Background
+Request. No consent or compositor-mediated interface and no Session-producing
+interface is exported, so these services do not imply the rest of §E. Second,
+an instance's
 connections cannot see EACH OTHER: §D's default grants the portal and the
 broker, and same-instance peer-to-peer traffic is not among them. If a real
 application turns out to
@@ -5252,9 +5259,9 @@ APPLICATIONS; the exposures are about PEERS.
 The per-caller filter and per-instance admission key are now landed, so the
 connection-table condition this paragraph used to defer is discharged. The
 remaining shared descriptor budget is named above rather than hidden by that
-statement. The Settings service and its independent live client now make the
-routed policy observable; a second application remains a separate multi-peer
-expansion.
+statement. The Settings service and its independent live Settings/Request
+client now make routed replies and a directed signal observable; a second
+application remains a separate multi-peer expansion.
 
 ---
 
@@ -5275,6 +5282,10 @@ and the historic double-variant `Read`, plus `Properties.Get`/`GetAll`,
 `ReadAll` accepts at most 32 exact or trailing-`.*` namespace filters and
 returns `a{sa{sv}}` directly. No Request object, signal, mutable setting, host
 desktop service, or environment lookup participates.
+Properties calls name the concrete portal interface; the empty-interface
+shortcut is refused now that both Settings and Background publish a `version`
+property and the answer would be ambiguous. `Peer.Ping` remains
+path-independent as required by the standard interface.
 
 The values come from the exact regular immutable
 `/etc/td-portal-settings`. Its closed, 4-KiB-bounded LF keyfile has two
@@ -5299,38 +5310,62 @@ shape permits it.
 
 The system-image oracle does not trust startup or a selftest. A separate
 uid-1000 client completes `Hello`, calls live `Properties.Get(version)` and
-synchronous `Settings.ReadAll` through td-busd, byte-compares both replies to
-the compiled file, and only then emits
-`TD-PORTAL-READY namespaces=2 settings=10 version=1`. QEMU requires that
-marker as the exact td-svc-prefixed
-`portal-evidence: TD-PORTAL-READY namespaces=2 settings=10 version=1` line on
-every validated boot. The evidence unit is not a dependency of
-`bootsuccess`, so absence makes application evidence red without granting
-mutable user service state authority over deployment acknowledgement.
+synchronous `Settings.ReadAll` through td-busd, and byte-compares both replies
+to the compiled file. It then pre-subscribes to its exact caller-derived
+Request path, calls the Background interface described below, checks that the
+method reply carries that path, and byte-compares the directed `Response`.
+Only then does it emit `TD-PORTAL-READY namespaces=2 settings=10 version=1`
+and `TD-PORTAL-REQUEST-READY response=2`. QEMU requires both as exact
+td-svc-prefixed `portal-evidence:` lines on every validated boot. The evidence
+unit is not a dependency of `bootsuccess`, so absence makes application
+evidence red without granting mutable user service state authority over
+deployment acknowledgement.
 
-### Request and Session
+### Request — landed core; Session — staged core
 
 A portal method returns a handle and the answer arrives as
 `Request.Response(u response, a{sv} results)` on that object. The path is
 **caller-derived** so a client can subscribe before calling: sender
 `:1.42` plus `handle_token="t7"` gives
 `/org/freedesktop/portal/desktop/request/1_42/t7`. The request is
-exported *before* the method reply, closing the subscription race.
-Sessions use `…/session/1_42/<token>` with `Close`/`Closed`. Responses:
-0 success, 1 cancelled, 2 other. Getting this exactly right unblocks
-every toolkit and getting it subtly wrong fails as timeouts, so its tests
-are wire-level fixtures against the spec. The broker half is landed and has
-wire-level coverage: a jailed call reaches the activated public portal name,
-the authenticated method reply returns a Request or Session object path, and
-the portal's directed `Response` or `Closed` signal reaches only that caller.
-Export-before-reply and the handle objects themselves remain `td-portal`
-service work.
+exported *before* the method reply, closing the subscription race. `Close` is
+owner-only and completes a Request without a `Response`. Responses are 0
+success, 1 cancelled, and 2 other.
+
+This Request core is now landed. One service-wide table admits at most 64
+combined handles and at most 16 per caller; tokens are 1–64 ASCII
+alphanumeric/underscore bytes, td-busd's exact `:1.N` sender shape maps
+injectively, active paths cannot collide, and a filtered `NameOwnerChanged`
+removes every object owned by a departing caller when that best-effort broker
+signal is delivered. Missing and foreign handles are indistinguishable to
+`Close`, property and introspection calls; standard `Peer.Ping` is
+path-independent and reveals neither. The
+`org.freedesktop.portal.Background`
+version 1 is its first honest consumer: because td has no persistent
+background-service design, `RequestBackground` exports the caller's Request,
+replies with that handle, then directs response 2 with exact false
+`background` and `autostart` results and retires the object. `SetStatus` is a
+version-2 method and is not advertised.
+
+Sessions use `…/session/1_42/<token>` with owner-only `Close` and
+portal-directed `Closed`. A caller's own `Close` receives only its method
+reply; the portal emits `Closed` when it ends a session. The same bounded
+table, dispatch, version property, introspection, departure cleanup and
+unit/selftest coverage are landed, but no public portal creates a Session yet.
+It is therefore staged machinery rather than a claimed live interface. The
+next Session-producing interface must add a live export-before-reply,
+portal-close, client-close and disconnect oracle before claiming it works.
+Because td-busd may drop an ownership signal to a stalled peer, that landing
+must also add a reliable owner-liveness reconciliation path; delivered
+`NameOwnerChanged` is sufficient for today's same-dispatch Background denial,
+not for a persistent Session lifecycle.
 
 ### Order
 
 | # | interface | needs | decision |
 |---|---|---|---|
 | 1 | `.Settings` | nothing | **LANDED** as the version-1 synchronous service above: `org.freedesktop.appearance` `color-scheme`/`accent-color`/`contrast` plus the `org.gnome.desktop.interface` font/theme/cursor keys, from one immutable td session config file — never inferred from absent GNOME services. Removes GTK's startup portal probe as an unknown. |
+| 1a | `.Background` | nothing | **LANDED as an explicit denial**: version 1 `RequestBackground` exercises the real bounded Request lifecycle and returns response 2 with false `background`/`autostart`. Persistent background execution and version-2 `SetStatus` remain unsupported. |
 | 2 | `.Account` | a consent dialog | uid 1000's passwd entry, empty image URI. |
 | 3 | `.FileChooser` | a surface | `OpenFile`/`SaveFile`/`SaveFiles` with filters, `current_filter`, `choices`, `current_folder`, `multiple`, `directory`. |
 | 4 | `.OpenURI` | nothing | scheme→handler registry generated from installed exports; `http`/`https` start the configured browser via its `/bin` entry. The fd-taking `OpenFile` member returns NotSupported in v1. **`file` is REFUSED in v1, not merely restricted to "a path visible to the caller"** — which an earlier draft said and which does not follow: the handler runs in a *different* sandbox, so a path the caller can see is one the handler generally cannot, and launching it would open a file that is not there. Honouring `file:` needs the path to reach the handler's namespace, which is a Documents-portal job (deferred, no FUSE) or an explicit grant to the handler at launch. Refusing is the honest answer until one of those exists; "opened" and then blank is worse. |
@@ -5986,10 +6021,12 @@ packaged selftest, boot oracle — with **network never in the gate**.
    td-busd — real foreign-client interop, not td talking to itself.
 5. **Portal round-trips.** The landed Settings slice has pure dispatch tests
    for the exact nested dictionary, version variant, `Read`, namespace
-   filtering, invalid calls, and the closed settings file; its image test is
-   the independent live client below. Later Request/Session and UI interfaces
-   still need socket-pair coverage: subscribe-before-reply without losing
-   `Response`, cancellation and disconnect cleanup,
+   filtering, invalid calls, and the closed settings file. Request tests pin
+   caller-derived paths, export-before-reply ordering, directed exact denial,
+   owner-only `Close`, capacity, collision, retirement and departure cleanup;
+   the independent live client below pre-subscribes before the real call.
+   Later UI and Session-producing interfaces still need socket-pair coverage
+   for asynchronous cancellation and disconnect cleanup,
    spoofed identity rejection, pid-reuse and start-time rejection,
    nested-mount-namespace attribution, FileChooser flows through the pure
    dialog model, refusal of a file outside grants, screenshot pixel and
@@ -6048,8 +6085,12 @@ packaged selftest, boot oracle — with **network never in the gate**.
    kind of error that presents as "the portal is broken". It byte-compares the
    replies to `/etc/td-portal-settings` and emits the
    exact `portal-evidence: TD-PORTAL-READY namespaces=2 settings=10 version=1`
-   console line. This proves one live routed portal exchange, not that Firefox
-   made it.
+   console line. It separately pre-subscribes to a caller-derived path, calls
+   version-1 `Background.RequestBackground`, requires the method reply before
+   the directed denial signal, byte-compares response 2 and its false results,
+   and emits exact
+   `portal-evidence: TD-PORTAL-REQUEST-READY response=2`. These prove live
+   routed portal exchanges, not that Firefox made them.
 7. **Recipe tests**: every new crate — `td-jail`, `td-busd`, `td-portal`,
    `td-audio` —
    stays a one-package dependency-free crate and joins BOTH
@@ -6257,8 +6298,8 @@ and image commits — showing:
    afterwards. This proves Firefox's real HTTPS download path through the
    authenticated read-write grant; it does not claim a public-network download
    or a FileChooser portal;
-9. **the Settings portal succeeding — LANDED** through the separate uid-1000
-   direct-reply oracle in item 6;
+9. **the Settings portal and Request lifecycle succeeding — LANDED** through
+   the separate uid-1000 direct-reply/directed-signal oracle in item 6;
 10. five minutes of navigation with no compositor or bus disconnect;
 11. blocked syscall probes still blocked in the outer app process, and
     **zero seccomp denials for syscalls the application actually needs**
@@ -6320,7 +6361,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
-| 16 | **`td-portal` static service and Settings LANDED**: broker activation, immutable two-namespace/ten-key policy, version-1 `ReadAll`/`Read`/Properties, supervision and a live QEMU direct-reply oracle. Request/Session core and Account remain | GTK's Settings call has a real routed answer; consent and handle objects remain |
+| 16 | **`td-portal` static service, Settings and Request core LANDED**: broker activation, immutable two-namespace/ten-key policy, version-1 `ReadAll`/`Read`/Properties, a 64-entry caller-owned handle table, owner departure cleanup, and Background v1's exact response-2 denial. QEMU proves the Settings direct reply and a pre-subscribed method-reply/directed-`Response` sequence. Session machinery is staged but no public interface creates one; Account remains behind consent UI | GTK's Settings call has a real routed answer and portal handle routing is live without inventing background permission |
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **E2's GDK, llvmpipe, and Firefox presentation answers are recorded in §F and `td-compositor/DESIGN.md`** | none |
 | 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |

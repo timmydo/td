@@ -13,9 +13,9 @@ use crate::ladder::{
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
     TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
     TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
-    TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
-    UUTILS_RUNTIME_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_REQUEST_RUNTIME_MARKER,
+    TD_PORTAL_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
+    TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -1213,13 +1213,15 @@ fn build_td_svc_conf() -> String {
          restart=always\n\
          \n\
          # Readiness output is discarded by td-svc. This separate client repeats\n\
-         # the exact live property+ReadAll exchange with console output, making\n\
-         # the route and reply QEMU evidence rather than a startup assertion.\n\
+         # the exact live Settings and Request exchanges with console output,\n\
+         # making routing, reply and directed-signal QEMU evidence rather than\n\
+         # a startup assertion.\n\
          # Wait for TLS setup because its key generator writes raw progress to\n\
          # the console without line framing; once it settles, td-svc's one-write\n\
          # service prefix is an attributable exact line. This is ordering only:\n\
          # TLS setup is deliberately not required by portal evidence.\n\
-         # td-recipe-eval requires the exact {portal_runtime_marker} line.\n\
+         # td-recipe-eval requires exact {portal_runtime_marker} and\n\
+         # {portal_request_runtime_marker} lines.\n\
          [portal-evidence]\n\
          type=oneshot\n\
          exec=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
@@ -1383,6 +1385,7 @@ fn build_td_svc_conf() -> String {
         ui_uid = UI_UID,
         portal_settings = TD_PORTAL_SETTINGS_PATH,
         portal_runtime_marker = TD_PORTAL_RUNTIME_MARKER,
+        portal_request_runtime_marker = TD_PORTAL_REQUEST_RUNTIME_MARKER,
         ui_gid = UI_GID,
         profiler_uid = PROFILER_UID,
         profiler_read_gid = PROFILER_READ_GID,

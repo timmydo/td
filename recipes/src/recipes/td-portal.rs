@@ -2,6 +2,7 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
+const HANDLES_RS: &str = include_str!("../../../td-portal/src/handles.rs");
 const SETTINGS_RS: &str = include_str!("../../../td-portal/src/settings.rs");
 const DEFAULT_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
 const SHARED_DBUS: &[(&str, &str)] = &[
@@ -46,6 +47,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-portal/src/main.rs".into(),
             content: MAIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-portal/src/handles.rs".into(),
+            content: HANDLES_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -124,13 +130,14 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::TD_PORTAL_RUNTIME_MARKER;
+    use crate::ladder::{TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER};
 
     #[test]
     fn recipe_stages_the_portal_and_the_canonical_broker_codec() {
         let steps = recipe().steps.expect("td-portal steps");
         for (path, source) in [
             ("{src}/td-portal/src/main.rs", MAIN_RS),
+            ("{src}/td-portal/src/handles.rs", HANDLES_RS),
             ("{src}/td-portal/src/settings.rs", SETTINGS_RS),
             ("{src}/td-portal/default-settings.conf", DEFAULT_SETTINGS),
         ] {
@@ -187,6 +194,10 @@ mod tests {
             )),
             "the target probe and QEMU scanner must share one exact evidence line"
         );
+        assert!(MAIN_RS.contains(&format!(
+            "pub const REQUEST_READY_MARKER: &str = \"{TD_PORTAL_REQUEST_RUNTIME_MARKER}\";"
+        )));
         assert!(MAIN_RS.contains("println!(\"{READY_MARKER}\");"));
+        assert!(MAIN_RS.contains("println!(\"{REQUEST_READY_MARKER}\");"));
     }
 }
