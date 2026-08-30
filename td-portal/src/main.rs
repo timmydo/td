@@ -17,7 +17,14 @@
 //! exec-as`, and stays alive while that child owns
 //! `org.freedesktop.portal.Desktop`.
 
+mod file_chooser;
+#[path = "../../td-compositor/src/font.rs"]
+mod font;
+#[path = "../../td-compositor/src/font_data.rs"]
+mod font_data;
 mod handles;
+#[path = "../../td-compositor/src/filter.rs"]
+mod list_filter;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(
     dead_code,
@@ -1931,6 +1938,7 @@ fn selftest() -> Result<(), String> {
     {
         return Err("selftest cannot complete a Session lifecycle".into());
     }
+    file_chooser::selftest()?;
     println!("TD-PORTAL-SELFTEST-OK");
     Ok(())
 }

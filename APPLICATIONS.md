@@ -5448,6 +5448,30 @@ whole trust-boundary argument runs the other way. Not a `td-term` picker
 authorization depend on a shell. Being "just a client" is also what makes
 it testable with the existing socket-pair harness.
 
+**The chooser's pure model and pixels have LANDED, but its portal method and
+surface have not.** `td-portal` now owns one bounded directory navigator for
+open-file and open-directory modes: 512 directory entries, 64 KiB of names,
+a 64-byte ASCII query, 32 multiple selections, 64 directory descriptors, 4 KiB
+paths, and 512 KiB of aggregate result URIs. It pins the root and every entered
+directory with no-follow descriptors, truncates oversized listings visibly,
+preserves and visibly counts cross-directory selections, escapes raw filename
+bytes, prefixes rows with distinct ordinals, and excludes symlink entries. It
+refuses `/` as either grant root: choosing through the complete host or guest
+namespace is not a supported FileChooser authority. The navigator shares
+launcher's all-term filter implementation rather than copying its semantics,
+and renders a deterministic 640x432 XRGB frame with the cached pinned PSF2
+face. Host tests drive descriptor-swap refusal, transactional navigation,
+filtering, directory ascent, every size ceiling, non-UTF-8 URIs, symlink
+exclusion, terminal completion, stable scrolling, and repeatable pixels; the
+target recipe runs the same composition in `td-portal selftest`.
+
+That is deliberately not described as a FileChooser implementation yet. No
+D-Bus method can create the model, no `wl_shm` buffer carries its pixels, and
+no user input reaches it. The next increment owns those asynchronous Request
+and private-Wayland lifecycles; the image oracle must then open Firefox's
+chooser, observe the modal pixels, drive a selection, and validate the exact
+directed response without a person inspecting the screen.
+
 ### Caller authentication
 
 The portal asks the broker who the caller is and **believes the answer**
@@ -6475,7 +6499,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | **clipboard producer and cross-client paste LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status. The image oracle physically types `Welcome`, waits until its exact rendered cells are attested, selects them, waits for exact seven-byte source admission, then requires both td-term's exact-payload transfer record and Firefox's browser-chrome observation; client cursors landed separately (`1c4b7f88`) | a real terminal selection reaches Firefox through core Wayland clipboard without manual testing |
 | 21 | **xdg-foreign + private portal manager centred/modal presentation LANDED**; the dialog leaves tiling, retains its workspace home, stacks over application popups, captures keyboard/pointer input with owed-release preservation, and unwinds newest-first. A D-Bus dialog consumer remains | compositor-tested modal portal presentation without manual inspection |
-| 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
+| 22 | **FileChooser model/renderer LANDED**: the bounded directory, filter, selection, URI and PSF2 pixel core is host- and target-selftested; D-Bus/Wayland integration remains. OpenURI, Screenshot and Notification remain absent | no visible dialog yet; the next acceptance gate drives Firefox's modal chooser and directed response without manual inspection |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 25 | **`td-audio` crate + surface #11**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients | **sound from the machine** |

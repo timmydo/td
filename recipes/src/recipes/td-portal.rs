@@ -2,10 +2,14 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
+const FILE_CHOOSER_RS: &str = include_str!("../../../td-portal/src/file_chooser.rs");
 const HANDLES_RS: &str = include_str!("../../../td-portal/src/handles.rs");
 const SETTINGS_RS: &str = include_str!("../../../td-portal/src/settings.rs");
 const WAYLAND_CHANNEL_RS: &str = include_str!("../../../td-portal/src/wayland_channel.rs");
 const COMPOSITOR_WIRE_RS: &str = include_str!("../../../td-compositor/src/wire.rs");
+const COMPOSITOR_FILTER_RS: &str = include_str!("../../../td-compositor/src/filter.rs");
+const COMPOSITOR_FONT_RS: &str = include_str!("../../../td-compositor/src/font.rs");
+const COMPOSITOR_FONT_DATA_RS: &str = include_str!("../../../td-compositor/src/font_data.rs");
 const DEFAULT_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
 const SHARED_DBUS: &[(&str, &str)] = &[
     (
@@ -55,6 +59,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-portal/src/file_chooser.rs".into(),
+            content: FILE_CHOOSER_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-portal/src/handles.rs".into(),
             content: HANDLES_RS.into(),
             exec: false,
@@ -72,6 +81,21 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-compositor/src/wire.rs".into(),
             content: COMPOSITOR_WIRE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-compositor/src/filter.rs".into(),
+            content: COMPOSITOR_FILTER_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-compositor/src/font.rs".into(),
+            content: COMPOSITOR_FONT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-compositor/src/font_data.rs".into(),
+            content: COMPOSITOR_FONT_DATA_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -155,10 +179,17 @@ mod tests {
         let steps = recipe().steps.expect("td-portal steps");
         for (path, source) in [
             ("{src}/td-portal/src/main.rs", MAIN_RS),
+            ("{src}/td-portal/src/file_chooser.rs", FILE_CHOOSER_RS),
             ("{src}/td-portal/src/handles.rs", HANDLES_RS),
             ("{src}/td-portal/src/settings.rs", SETTINGS_RS),
             ("{src}/td-portal/src/wayland_channel.rs", WAYLAND_CHANNEL_RS),
             ("{src}/td-compositor/src/wire.rs", COMPOSITOR_WIRE_RS),
+            ("{src}/td-compositor/src/filter.rs", COMPOSITOR_FILTER_RS),
+            ("{src}/td-compositor/src/font.rs", COMPOSITOR_FONT_RS),
+            (
+                "{src}/td-compositor/src/font_data.rs",
+                COMPOSITOR_FONT_DATA_RS,
+            ),
             ("{src}/td-portal/default-settings.conf", DEFAULT_SETTINGS),
         ] {
             assert!(steps.iter().any(|step| {
@@ -193,8 +224,16 @@ mod tests {
             })
             .collect();
         for module in declared {
-            if module == "wayland_wire" {
-                assert!(MAIN_RS.contains("#[path = \"../../td-compositor/src/wire.rs\"]"));
+            if matches!(module, "wayland_wire" | "font" | "font_data" | "list_filter") {
+                let path = match module {
+                    "wayland_wire" => "../../td-compositor/src/wire.rs",
+                    "font" => "../../td-compositor/src/font.rs",
+                    "font_data" => "../../td-compositor/src/font_data.rs",
+                    "list_filter" => "../../td-compositor/src/filter.rs",
+                    _ => "",
+                };
+                assert!(MAIN_RS.contains(&format!("#[path = \"{path}\"]")));
+                assert!(MAIN_RS.contains(&format!("mod {module};")));
                 continue;
             }
             assert!(staged.contains(&module), "module {module} is not staged");

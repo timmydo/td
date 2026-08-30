@@ -21,6 +21,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/configure.rs"),
     ),
     ("conn", include_str!("../../../td-compositor/src/conn.rs")),
+    ("filter", include_str!("../../../td-compositor/src/filter.rs")),
     ("font", include_str!("../../../td-compositor/src/font.rs")),
     (
         "font_data",

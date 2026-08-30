@@ -5,6 +5,7 @@ mod client;
 mod client_resources;
 mod configure;
 mod conn;
+mod filter;
 mod font;
 mod font_data;
 mod framebuffer;
@@ -661,6 +662,7 @@ mod confinement {
         ("client_resources.rs", include_str!("client_resources.rs")),
         ("configure.rs", include_str!("configure.rs")),
         ("conn.rs", include_str!("conn.rs")),
+        ("filter.rs", include_str!("filter.rs")),
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),

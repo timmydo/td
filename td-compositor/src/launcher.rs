@@ -1,5 +1,5 @@
 use crate::ui::{border, fill, intersect};
-use crate::{socket, ui};
+use crate::{filter, socket, ui};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -7,7 +7,6 @@ use std::process::{Child, Command};
 const CARD_WIDTH: usize = 480;
 const CARD_HEIGHT: usize = 210;
 const CARD_PADDING: usize = 24;
-const MAX_QUERY_BYTES: usize = 64;
 const MAX_LAUNCHED_CLIENTS: usize = 16;
 const MAX_APPLICATION_NAME_BYTES: usize = 32;
 const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
@@ -186,7 +185,7 @@ impl Launcher {
         Launcher {
             visible: false,
             selected: 0,
-            query: String::with_capacity(MAX_QUERY_BYTES),
+            query: String::with_capacity(filter::MAX_QUERY_BYTES),
             matches: (0..ENTRY_COUNT).collect(),
             application: None,
         }
@@ -230,12 +229,8 @@ impl Launcher {
                 return request;
             }
             LauncherAction::Insert(character)
-                if self.visible
-                    && character.is_ascii()
-                    && !character.is_ascii_control()
-                    && self.query.len() < MAX_QUERY_BYTES =>
+                if self.visible && filter::insert(&mut self.query, character) =>
             {
-                self.query.push(character.to_ascii_lowercase());
                 self.refresh_matches();
             }
             LauncherAction::Backspace if self.visible && !self.query.is_empty() => {
@@ -253,12 +248,11 @@ impl Launcher {
 
     fn refresh_matches(&mut self) {
         self.matches.clear();
-        let terms = self.query.split_ascii_whitespace();
         for index in 0..ENTRY_COUNT {
             let Some(entry) = entry_at(self.application.as_ref(), index) else {
                 continue;
             };
-            if terms.clone().all(|term| entry.search.contains(term)) {
+            if filter::matches(entry.search, &self.query) {
                 self.matches.push(index);
             }
         }
@@ -708,13 +702,16 @@ mod tests {
         launcher.apply(LauncherAction::Insert('é'));
         launcher.apply(LauncherAction::Insert('\n'));
         assert_eq!(launcher.query(), "");
-        for _ in 0..MAX_QUERY_BYTES.saturating_add(8) {
+        for _ in 0..filter::MAX_QUERY_BYTES.saturating_add(8) {
             launcher.apply(LauncherAction::Insert('x'));
         }
-        assert_eq!(launcher.query().len(), MAX_QUERY_BYTES);
+        assert_eq!(launcher.query().len(), filter::MAX_QUERY_BYTES);
         assert!(launcher.matched_labels().is_empty());
         assert_eq!(launcher.visible_query(8), "xxxxxxxx");
-        assert_eq!(launcher.visible_query(MAX_QUERY_BYTES), launcher.query());
+        assert_eq!(
+            launcher.visible_query(filter::MAX_QUERY_BYTES),
+            launcher.query()
+        );
     }
 
     #[test]
