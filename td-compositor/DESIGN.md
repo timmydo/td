@@ -3233,6 +3233,17 @@ handshake rejects any descriptor left over after all expected events. The
 descriptor queue and keymap read are bounded, and every overflow or abandoned
 connection closes all descriptors it owns.
 
+An unsupported ancillary record marks the whole receive for refusal but does
+not stop the bounded framing walk. Neither does an invalid rights-payload width
+or descriptor number: later SCM_RIGHTS records in the same kernel result were
+already installed into this process and are collected and closed before the
+refusal returns. Regressions fabricate each ordering and prove the later
+descriptor no longer reads its unlinked sentinel file.
+Structural framing errors close every descriptor collected through the last
+trusted boundary and return immediately: once a record boundary is invalid,
+the parser cannot identify later installed descriptors itself and relies on
+the kernel's conforming ancillary framing.
+
 `td-compositor/src/sys.rs` contains the two scoped `unsafe` blocks. One raw
 `syscall5` body carries exactly:
 

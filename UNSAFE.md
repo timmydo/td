@@ -314,7 +314,14 @@ after safe duplication through `/proc/self/fd/N` or after its lifetime as an
 exact clipboard endpoint, and `sendmsg(2)` for the
 td-native demo client's wl_shm pool descriptor, the server's wl_keyboard
 keymap descriptor, and the transport selftest. Stable Rust exposes no
-stable ancillary-data API. The same body carries `getsockopt(2)` once per
+stable ancillary-data API. The bounded parser records the first content or
+policy refusal, including an unsupported kind, invalid rights-payload width,
+or negative descriptor, but continues over valid framing. Any recognizable
+SCM_RIGHTS descriptors that the kernel already installed are collected and
+closed before the receive is refused. A structural framing error instead
+closes everything collected through the last trusted boundary and returns
+immediately because later records cannot be identified. The `syscall5` body
+also carries `getsockopt(2)` once per
 accepted private-portal connection, with level fixed to `SOL_SOCKET=1`, option
 fixed to x86-64 `SO_PEERCRED=17`, and an exact 12-byte `[u32; 3]` result. The
 wrapper refuses a different returned length and exposes only the uid word;
@@ -1562,9 +1569,12 @@ It borrows the stream and the descriptor it sends; no socket creation,
 connection, path lookup, or caller-selected ancillary type enters the surface.
 
 Every receive requests `MSG_CMSG_CLOEXEC`, parses at most 128 ancillary bytes,
-accepts only `SOL_SOCKET`/`SCM_RIGHTS`, closes every parsed installed descriptor
-on malformed or over-cap input, and relies on Linux to close descriptors that
-do not fit the supplied control buffer. The dialog connection admits at most
+accepts only `SOL_SOCKET`/`SCM_RIGHTS`, and records a content or policy refusal
+while valid framing remains walkable. It closes every recognizable installed
+descriptor before returning that refusal. A structural framing error closes
+everything collected through the last trusted boundary and returns because
+later records cannot be identified; Linux closes descriptors that do not fit
+the supplied control buffer. The dialog connection admits at most
 eight queued descriptors. Its only consumer removes one exact descriptor for
 `wl_keyboard.keymap`, reopens `/proc/self/fd/N` as a safe `File`, and then calls
 the rostered close on the received number on both success and reopen failure.

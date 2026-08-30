@@ -418,11 +418,16 @@ fn close_all(fds: &[RawFd]) {
 
 fn parse_fds(control: &[u8]) -> Result<Vec<RawFd>, String> {
     let mut fds = Vec::new();
+    let mut refusal = None;
     let mut offset = 0usize;
     while offset < control.len() {
-        let remaining = control
-            .get(offset..)
-            .ok_or_else(|| "ancillary offset escaped buffer".to_string())?;
+        let remaining = match control.get(offset..) {
+            Some(value) => value,
+            None => {
+                close_all(&fds);
+                return Err("ancillary offset escaped buffer".into());
+            }
+        };
         if remaining.len() < CMSG_HEADER {
             if remaining.iter().all(|byte| *byte == 0) {
                 break;
@@ -473,12 +478,6 @@ fn parse_fds(control: &[u8]) -> Result<Vec<RawFd>, String> {
                 return Err(error);
             }
         };
-        if level != SOL_SOCKET || kind != SCM_RIGHTS {
-            close_all(&fds);
-            return Err(format!(
-                "unsupported ancillary message level={level} type={kind}"
-            ));
-        }
         let data = match remaining.get(CMSG_HEADER..length) {
             Some(value) => value,
             None => {
@@ -486,20 +485,22 @@ fn parse_fds(control: &[u8]) -> Result<Vec<RawFd>, String> {
                 return Err("ancillary data escaped message".into());
             }
         };
-        if data.is_empty() || data.len() % 4 != 0 {
-            close_all(&fds);
-            return Err(format!("invalid SCM_RIGHTS payload length {}", data.len()));
-        }
-        for raw in data.as_chunks::<4>().0 {
-            match read_i32(raw) {
-                Ok(fd) if fd >= 0 => fds.push(fd),
-                Ok(fd) => {
-                    close_all(&fds);
-                    return Err(format!("received invalid descriptor {fd}"));
-                }
-                Err(error) => {
-                    close_all(&fds);
-                    return Err(error);
+        if level != SOL_SOCKET || kind != SCM_RIGHTS {
+            refusal.get_or_insert_with(|| {
+                format!("unsupported ancillary message level={level} type={kind}")
+            });
+        } else {
+            if data.is_empty() || data.len() % 4 != 0 {
+                refusal.get_or_insert_with(|| {
+                    format!("invalid SCM_RIGHTS payload length {}", data.len())
+                });
+            }
+            for raw in data.as_chunks::<4>().0 {
+                let fd = i32::from_ne_bytes(*raw);
+                if fd >= 0 {
+                    fds.push(fd);
+                } else {
+                    refusal.get_or_insert_with(|| format!("received invalid descriptor {fd}"));
                 }
             }
         }
@@ -525,7 +526,12 @@ fn parse_fds(control: &[u8]) -> Result<Vec<RawFd>, String> {
             return Err("aligned ancillary message escaped buffer".into());
         }
     }
-    Ok(fds)
+    if let Some(error) = refusal {
+        close_all(&fds);
+        Err(error)
+    } else {
+        Ok(fds)
+    }
 }
 
 pub struct Received {
@@ -785,7 +791,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Read;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, IntoRawFd};
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -849,6 +855,123 @@ mod tests {
     fn ancillary_buffers_are_aligned_for_message_headers() {
         let control = ControlBuffer([0u8; 24]);
         assert_eq!((control.0.as_ptr() as usize) % CMSG_ALIGN, 0);
+    }
+
+    fn rejected_control_closes_sentinels(
+        mut control: Vec<u8>,
+        fd_offsets: &[usize],
+    ) -> String {
+        let mut sentinels = Vec::new();
+        for fd_offset in fd_offsets {
+            let sequence = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "td-compositor-rejected-fd-test-{}-{}",
+                std::process::id(),
+                sequence
+            ));
+            let sentinel = format!("rejected-close-sentinel-{sequence}");
+            fs::write(&path, sentinel.as_bytes()).unwrap();
+            let raw = File::open(&path).unwrap().into_raw_fd();
+            fs::remove_file(path).unwrap();
+            control[*fd_offset..*fd_offset + 4].copy_from_slice(&raw.to_ne_bytes());
+            sentinels.push((raw, sentinel));
+        }
+
+        let error = parse_fds(&control).unwrap_err();
+        for (raw, sentinel) in sentinels {
+            // Another test thread may reuse `raw` after the parser closes it.
+            // It still must not reopen this uniquely identified sentinel.
+            if let Ok(mut reused) = File::open(format!("/proc/self/fd/{raw}")) {
+                let mut contents = String::new();
+                let _ = reused.read_to_string(&mut contents);
+                assert_ne!(contents, sentinel);
+            }
+        }
+        error
+    }
+
+    #[test]
+    fn unsupported_ancillary_still_closes_later_rights() {
+        let mut control = vec![0u8; 40];
+        control[..8].copy_from_slice(&16usize.to_ne_bytes());
+        control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[12..16].copy_from_slice(&99i32.to_ne_bytes());
+        control[16..24].copy_from_slice(&20usize.to_ne_bytes());
+        control[24..28].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[28..32].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        assert_eq!(
+            rejected_control_closes_sentinels(control, &[32]),
+            "unsupported ancillary message level=1 type=99"
+        );
+    }
+
+    #[test]
+    fn invalid_rights_payload_still_closes_later_rights() {
+        let mut control = vec![0u8; 48];
+        control[..8].copy_from_slice(&17usize.to_ne_bytes());
+        control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        control[24..32].copy_from_slice(&20usize.to_ne_bytes());
+        control[32..36].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[36..40].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        assert_eq!(
+            rejected_control_closes_sentinels(control, &[40]),
+            "invalid SCM_RIGHTS payload length 1"
+        );
+    }
+
+    #[test]
+    fn invalid_descriptor_still_closes_later_rights() {
+        let mut control = vec![0u8; 48];
+        control[..8].copy_from_slice(&20usize.to_ne_bytes());
+        control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        control[16..20].copy_from_slice(&(-1i32).to_ne_bytes());
+        control[24..32].copy_from_slice(&20usize.to_ne_bytes());
+        control[32..36].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[36..40].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        assert_eq!(
+            rejected_control_closes_sentinels(control, &[40]),
+            "received invalid descriptor -1"
+        );
+    }
+
+    #[test]
+    fn invalid_descriptor_between_rights_closes_both_neighbors() {
+        let mut control = vec![0u8; 32];
+        control[..8].copy_from_slice(&28usize.to_ne_bytes());
+        control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        control[20..24].copy_from_slice(&(-1i32).to_ne_bytes());
+        assert_eq!(
+            rejected_control_closes_sentinels(control, &[16, 24]),
+            "received invalid descriptor -1"
+        );
+    }
+
+    #[test]
+    fn the_first_ancillary_refusal_is_the_diagnostic() {
+        let mut control = [0u8; 32];
+        control[..8].copy_from_slice(&16usize.to_ne_bytes());
+        control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[12..16].copy_from_slice(&99i32.to_ne_bytes());
+        control[16..24].copy_from_slice(&16usize.to_ne_bytes());
+        control[24..28].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[28..32].copy_from_slice(&100i32.to_ne_bytes());
+        assert_eq!(
+            parse_fds(&control).unwrap_err(),
+            "unsupported ancillary message level=1 type=99"
+        );
+    }
+
+    #[test]
+    fn structural_error_overrides_a_pending_content_refusal() {
+        let mut control = [0u8; 20];
+        control[..8].copy_from_slice(&16usize.to_ne_bytes());
+        control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        control[12..16].copy_from_slice(&99i32.to_ne_bytes());
+        control[16..].fill(1);
+        assert_eq!(parse_fds(&control).unwrap_err(), "truncated ancillary header");
     }
 
     /// The kernel reads eight bytes and takes the row count from the first
