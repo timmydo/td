@@ -1,15 +1,23 @@
 use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 
+#[cfg(test)]
+use crate::ladder::TD_JAIL_FIXTURE_DOWNLOAD_TARGET;
+#[cfg(test)]
+const SYSTEM_X86_64_RS: &str = include_str!("system-x86-64.rs");
+
 const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
 const FILE_CHOOSER_RS: &str = include_str!("../../../td-portal/src/file_chooser.rs");
 const HANDLES_RS: &str = include_str!("../../../td-portal/src/handles.rs");
 const SETTINGS_RS: &str = include_str!("../../../td-portal/src/settings.rs");
+const SYS_RS: &str = include_str!("../../../td-portal/src/sys.rs");
 const WAYLAND_CHANNEL_RS: &str = include_str!("../../../td-portal/src/wayland_channel.rs");
+const WAYLAND_DIALOG_RS: &str = include_str!("../../../td-portal/src/wayland_dialog.rs");
 const COMPOSITOR_WIRE_RS: &str = include_str!("../../../td-compositor/src/wire.rs");
 const COMPOSITOR_FILTER_RS: &str = include_str!("../../../td-compositor/src/filter.rs");
 const COMPOSITOR_FONT_RS: &str = include_str!("../../../td-compositor/src/font.rs");
 const COMPOSITOR_FONT_DATA_RS: &str = include_str!("../../../td-compositor/src/font_data.rs");
+const COMPOSITOR_KEYBOARD_RS: &str = include_str!("../../../td-compositor/src/keyboard.rs");
 const DEFAULT_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
 const SHARED_DBUS: &[(&str, &str)] = &[
     (
@@ -74,8 +82,18 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-portal/src/sys.rs".into(),
+            content: SYS_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-portal/src/wayland_channel.rs".into(),
             content: WAYLAND_CHANNEL_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-portal/src/wayland_dialog.rs".into(),
+            content: WAYLAND_DIALOG_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -96,6 +114,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-compositor/src/font_data.rs".into(),
             content: COMPOSITOR_FONT_DATA_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-compositor/src/keyboard.rs".into(),
+            content: COMPOSITOR_KEYBOARD_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -182,13 +205,19 @@ mod tests {
             ("{src}/td-portal/src/file_chooser.rs", FILE_CHOOSER_RS),
             ("{src}/td-portal/src/handles.rs", HANDLES_RS),
             ("{src}/td-portal/src/settings.rs", SETTINGS_RS),
+            ("{src}/td-portal/src/sys.rs", SYS_RS),
             ("{src}/td-portal/src/wayland_channel.rs", WAYLAND_CHANNEL_RS),
+            ("{src}/td-portal/src/wayland_dialog.rs", WAYLAND_DIALOG_RS),
             ("{src}/td-compositor/src/wire.rs", COMPOSITOR_WIRE_RS),
             ("{src}/td-compositor/src/filter.rs", COMPOSITOR_FILTER_RS),
             ("{src}/td-compositor/src/font.rs", COMPOSITOR_FONT_RS),
             (
                 "{src}/td-compositor/src/font_data.rs",
                 COMPOSITOR_FONT_DATA_RS,
+            ),
+            (
+                "{src}/td-compositor/src/keyboard.rs",
+                COMPOSITOR_KEYBOARD_RS,
             ),
             ("{src}/td-portal/default-settings.conf", DEFAULT_SETTINGS),
         ] {
@@ -224,11 +253,15 @@ mod tests {
             })
             .collect();
         for module in declared {
-            if matches!(module, "wayland_wire" | "font" | "font_data" | "list_filter") {
+            if matches!(
+                module,
+                "wayland_wire" | "font" | "font_data" | "keyboard" | "list_filter"
+            ) {
                 let path = match module {
                     "wayland_wire" => "../../td-compositor/src/wire.rs",
                     "font" => "../../td-compositor/src/font.rs",
                     "font_data" => "../../td-compositor/src/font_data.rs",
+                    "keyboard" => "../../td-compositor/src/keyboard.rs",
                     "list_filter" => "../../td-compositor/src/filter.rs",
                     _ => "",
                 };
@@ -261,8 +294,9 @@ mod tests {
             "pub const REQUEST_READY_MARKER: &str = \"{TD_PORTAL_REQUEST_RUNTIME_MARKER}\";"
         )));
         assert!(WAYLAND_CHANNEL_RS.contains("EXPECTED_GLOBALS.len()"));
-        assert!(WAYLAND_CHANNEL_RS
-            .contains("TD-PORTAL-CHANNEL-READY globals={} privileged=1 dialog=2"));
+        assert!(
+            WAYLAND_CHANNEL_RS.contains("TD-PORTAL-CHANNEL-READY globals={} privileged=1 dialog=2")
+        );
         assert_eq!(
             TD_PORTAL_CHANNEL_RUNTIME_MARKER,
             "TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2"
@@ -270,5 +304,18 @@ mod tests {
         assert!(MAIN_RS.contains("println!(\"{READY_MARKER}\");"));
         assert!(MAIN_RS.contains("println!(\"{REQUEST_READY_MARKER}\");"));
         assert!(MAIN_RS.contains("println!(\"{}\", wayland_channel::ready_marker());"));
+    }
+
+    #[test]
+    fn portal_and_firefox_share_the_exact_download_grant_pair() {
+        assert_eq!(TD_JAIL_FIXTURE_DOWNLOAD_TARGET, "/home/td/Downloads");
+        assert!(MAIN_RS
+            .contains("const FIREFOX_HOST_DOWNLOADS: &str = \"/var/home/tester/Downloads\";"));
+        assert!(MAIN_RS.contains("const FIREFOX_GUEST_DOWNLOADS: &str = \"/home/td/Downloads\";"));
+        assert!(SYSTEM_X86_64_RS
+            .contains("const FIREFOX_DOWNLOAD_SOURCE: &str = \"/var/home/tester/Downloads\";"));
+        assert!(SYSTEM_X86_64_RS.contains(
+            r#"user_pref(\\\"browser.download.dir\\\", \\\"/home/td/Downloads\\\");"#
+        ));
     }
 }

@@ -26,7 +26,7 @@ const MAX_CHANNEL_BYTES: usize = 256 * 1024;
 const MAX_CHANNEL_MESSAGES: usize = 32;
 const CHANNEL_TIMEOUT: Duration = Duration::from_secs(20);
 
-const EXPECTED_GLOBALS: [(&str, u32); 11] = [
+pub(crate) const EXPECTED_GLOBALS: [(&str, u32); 11] = [
     ("wl_compositor", 4),
     ("wl_subcompositor", 1),
     ("wl_shm", 1),

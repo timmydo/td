@@ -5387,7 +5387,7 @@ not for a persistent Session lifecycle.
 | 1 | `.Settings` | nothing | **LANDED** as the version-1 synchronous service above: `org.freedesktop.appearance` `color-scheme`/`accent-color`/`contrast` plus the `org.gnome.desktop.interface` font/theme/cursor keys, from one immutable td session config file — never inferred from absent GNOME services. Removes GTK's startup portal probe as an unknown. |
 | 1a | `.Background` | nothing | **LANDED as an explicit denial**: version 1 `RequestBackground` exercises the real bounded Request lifecycle and returns response 2 with false `background`/`autostart`. Persistent background execution and version-2 `SetStatus` remain unsupported. |
 | 2 | `.Account` | a consent dialog | uid 1000's passwd entry, empty image URI. |
-| 3 | `.FileChooser` | a surface | `OpenFile`/`SaveFile`/`SaveFiles` with filters, `current_filter`, `choices`, `current_folder`, `multiple`, `directory`. |
+| 3 | `.FileChooser` | a surface | **`OpenFile` v3 LANDED for the authenticated Firefox Downloads grant** with modal keyboard-driven open-file, multiple-file, and directory modes. Standard `SaveFile` and `SaveFiles` are advertised but explicitly `NotSupported`; `choices`, caller-defined labels and filters, and selection outside an existing grant are likewise refused. `current_folder` remains a bounded hint rather than an access control. |
 | 4 | `.OpenURI` | nothing | scheme→handler registry generated from installed exports; `http`/`https` start the configured browser via its `/bin` entry. The fd-taking `OpenFile` member returns NotSupported in v1. **`file` is REFUSED in v1, not merely restricted to "a path visible to the caller"** — which an earlier draft said and which does not follow: the handler runs in a *different* sandbox, so a path the caller can see is one the handler generally cannot, and launching it would open a file that is not there. Honouring `file:` needs the path to reach the handler's namespace, which is a Documents-portal job (deferred, no FUSE) or an explicit grant to the handler at launch. Refusing is the honest answer until one of those exists; "opened" and then blank is worse. |
 | 5 | `.Inhibit` | compositor idle state | **idle flag only.** Suspend/logout/user-switch are refused, because td has no session manager and returning success without an observable inhibitor violates the readback principle. **The mechanism is the private `create_idle_inhibitor` and NOT public `zwp_idle_inhibit_v1`** — a review found both specified, and they cannot both hold: advertising the public global to every sandbox lets an app inhibit idle *directly*, with no portal record of who did it and no way for the user to see or revoke it, which is exactly the attribution the private call exists to provide. §F's `zwp_idle_inhibit_v1` row is therefore **not** required for `.Inhibit` to be honest, which is what it used to say; if it is ever implemented it is for unconfined clients, and it must not be advertised on a jailed connection. |
 | 6 | `.Notification` | private protocol | bounded toasts with title/body/priority/actions and a bounded icon; markup, sound and arbitrary icon paths refused. |
@@ -5436,7 +5436,10 @@ deliberate refusal rather than a gap to be filled opportunistically.
 
 **`td-portal` draws it as an ordinary Wayland client**: a keyboard-first
 list navigator reusing the launcher's filter model, the multicall's PSF2
-font, and the software renderer, titled `Open — <app name>`. Once that
+font, and the software renderer, titled `<authenticated app> — <caller title>`
+(or `<authenticated app> — Open file` for the standard empty title). Keeping
+the authenticated identity first prevents a long caller-controlled title from
+clipping it out of the ordinary viewport. Once that
 toplevel is admitted through the private portal manager, the compositor
 presents it in the centred modal dialog layer described below rather than as
 an ordinary tile. The portal still owns every dialog pixel.
@@ -5448,90 +5451,137 @@ whole trust-boundary argument runs the other way. Not a `td-term` picker
 authorization depend on a shell. Being "just a client" is also what makes
 it testable with the existing socket-pair harness.
 
-**The chooser's pure model and pixels have LANDED, but its portal method and
-surface have not.** `td-portal` now owns one bounded directory navigator for
-open-file and open-directory modes: 512 directory entries, 64 KiB of names,
-a 64-byte ASCII query, 32 multiple selections, 64 directory descriptors, 4 KiB
-paths, and 512 KiB of aggregate result URIs. It pins the root and every entered
-directory with no-follow descriptors, truncates oversized listings visibly,
-preserves and visibly counts cross-directory selections, escapes raw filename
-bytes, prefixes rows with distinct ordinals, and excludes symlink entries. It
-refuses `/` as either grant root: choosing through the complete host or guest
-namespace is not a supported FileChooser authority. The navigator shares
-launcher's all-term filter implementation rather than copying its semantics,
-and renders a deterministic 640x432 XRGB frame with the cached pinned PSF2
-face. Host tests drive descriptor-swap refusal, transactional navigation,
-filtering, directory ascent, every size ceiling, non-UTF-8 URIs, symlink
-exclusion, terminal completion, stable scrolling, and repeatable pixels; the
-target recipe runs the same composition in `td-portal selftest`.
+**The chooser model, `OpenFile` method, and private Wayland surface have
+LANDED.** `td-portal` owns one bounded directory navigator for open-file and
+open-directory modes: 512 directory entries, 64 KiB of names, a 64-byte ASCII
+query, 32 multiple selections, 64 directory descriptors, 4 KiB paths, and
+512 KiB of aggregate result URIs. It pins the root and every entered directory
+with no-follow descriptors, truncates oversized listings visibly, preserves
+and visibly counts cross-directory selections, escapes raw filename bytes,
+prefixes rows with distinct ordinals, and excludes symlink entries. It refuses
+`/` as either grant root: choosing through the complete host or guest namespace
+is not a supported FileChooser authority. The navigator shares the launcher's
+all-term filter implementation rather than copying its semantics. It renders
+the compositor-configured viewport into one XRGB `wl_shm` buffer at a time,
+bounded to 32 MiB so the supported 3840x2160 output's 2880x1582 modal viewport
+fits, with the cached pinned PSF2 face. Smaller nonempty viewports clip safely
+and keep the navigation and scroll arithmetic at a one-row minimum instead of
+failing the request.
 
-That is deliberately not described as a FileChooser implementation yet. No
-D-Bus method can create the model, no `wl_shm` buffer carries its pixels, and
-no user input reaches it. The next increment owns those asynchronous Request
-and private-Wayland lifecycles; the image oracle must then open Firefox's
-chooser, observe the modal pixels, drive a selection, and validate the exact
+The public surface is FileChooser version 3. Its introspection carries the
+standard `OpenFile`, `SaveFile`, and `SaveFiles` method shapes; the two save
+methods return typed `NotSupported` because no save model exists. `OpenFile`
+parses the standard `ssa{sv}` request, exports the caller-derived Request
+before replying, and directs response 0 with `uris`, response 1 on
+cancellation, or response 2 on a worker or presentation failure. `multiple`
+and `directory` select the three implemented model modes;
+multiple-directory selection is refused. Requests must be modal.
+`handle_token`, `accept_label`, filters, `current_filter`, and
+`current_folder` are structurally and numerically bounded. The caller title is
+at most 256 bytes; the internal authenticated title is at most 320 bytes and
+puts the authenticated application id first, with `Open file` substituted
+only for an empty caller title. `accept_label`, filters, and `current_filter`
+are explicitly `NotSupported` after structural validation instead of being
+silently ignored. `current_folder` is the one bounded ignored hint; it never
+changes access authority. Unknown options are ignored for version
+compatibility. `choices` is explicitly `NotSupported`.
+
+One service admits at most 16 pending broker identity replies in total across
+new calls and active-owner audits, four per caller across the same shared
+ledger. New OpenFile calls may occupy only 15 globally and three per caller;
+the remaining global and per-owner lane is permanently reserved for the live
+dialog's audit, even before a dialog exists. One active or
+cancelled-but-unwinding dialog worker and 32 queued bus, audit, or dialog events
+complete the service bounds; the bounded reader queue backpressures td-busd
+instead of accumulating frames while a worker reports. A ten-second cadence
+queues active caller revalidation through `GetConnectionCredentials`, so
+sustained new-call saturation cannot starve it and a best-effort
+`NameOwnerChanged` loss cannot preserve a connected dialog indefinitely. A
+failed audit, a delivered owner departure, or an owner-authorized Request
+`Close` shuts down a connected worker and suppresses its late completion.
+Cancellation before connection keeps the worker in the admitted slot until it
+reports and emits a specific service diagnostic while that sole slot remains
+occupied. A blocking local AF_UNIX connect therefore cannot be turned into
+detached-thread growth. Worker failures before presentation retain their exact
+diagnostic rather than being overwritten by the generic missing-frame error.
+No response 0 or 1 is emitted unless the compositor has acknowledged the
+portal manager's initial standalone/parented state, the first buffer release,
+and its frame callback. The worker's connect retry
+schedule and all registry, keymap, configure, first-buffer transfer, and
+first-presentation work after connection share one 20-second deadline. An
+initial `0x0` xdg-toplevel configure selects the client's bounded 640x432
+default; later nonzero compositor sizes replace it exactly. Rust's
+blocking AF_UNIX connect cannot itself be interrupted; the retained admission
+above bounds that residual to one worker. After that trusted local channel has
+presented, one outstanding `wl_display.sync` at a time pulses after ten
+seconds without a client write, regardless of incoming input traffic. The
+compositor's finite private-peer timeout therefore does not bound user
+think-time; a peer that stops retiring callbacks still fails closed.
+Dismissal starts a new 20-second deadline for the manager acknowledgement.
+
+The Wayland client requires the private registry's exact eleven ordered
+globals and rejects the twelfth before retaining it, binds only compositor,
+shm, xdg-shell, seat, and portal-manager
+objects, creates one xdg-toplevel, and associates it through
+`td_portal_manager_v1`. It verifies the compositor's exact shared XKB keymap
+before accepting keyboard input and requires a matching keyboard enter before
+each pressed key. `Escape`, all four arrows, Backspace, letters, Space, Enter,
+keypad Enter, and Control+either Enter form the closed interaction vocabulary.
+Each frame is
+an unlinked mode-0600 file sent as one SCM_RIGHTS descriptor; received keymap
+descriptors are bounded, reopened through `/proc/self/fd`, and closed through
+the confined surface recorded in `UNSAFE.md` §12.
+
+Host tests retain the pure model coverage and add an actual Unix-socket peer
+that advertises the exact shared registry, sends the real keymap and keyboard
+enter, exercises the initial client-sized and later compositor-sized
+configure sequence, reads and hashes both shared-memory frames, injects a
+`wl_keyboard` Enter event, and observes dismissal plus the exact guest URI.
+Separate dispatch tests pin the asynchronous broker identity query and denial
+before any grant for a missing, foreign, wrong-uid, or malformed identity, plus
+the directed response body. Recipe source contracts cross-check the portal's
+host/guest Downloads pair with the image source and Firefox guest preference.
+The target recipe stages all of those production modules and still runs
+`td-portal selftest`.
+What remains is the system-image oracle: it must make Firefox issue the real
+method, observe the modal pixels, drive a selection, and validate the exact
 directed response without a person inspecting the screen.
 
 ### Caller authentication
 
-The portal asks the broker who the caller is and **believes the answer**
-— it performs no `/proc` check of its own. A draft had it re-verify
-`/proc/<outer-pid>/root/.flatpak-info` beside the broker's reply, and
-that was wrong twice over. It contradicts §D, which abandons that file
-as an identity oracle for a specific reason — a nested Firefox child can
-change its mount namespace and so change what the path resolves to, which
-would make the portal deny the exact application this project exists to
-run. And it asks for something the broker does not return: the reply is
-one of three values (below), not a pid the portal could walk. **The file
-is what an application reads to learn its OWN id**, which is why mount
-step 13 generates it and why host tooling expects it there; it is not
-evidence about anybody.
+The portal asks the broker who the caller is and **believes the answer** — it
+performs no `/proc` check of its own. A draft had it re-verify
+`/proc/<outer-pid>/root/.flatpak-info` beside the broker's reply, and that was
+wrong twice over. It contradicts §D, which abandons that file as an identity
+oracle for a specific reason: a nested Firefox child can change its mount
+namespace and so change what the path resolves to, which would make the portal
+deny the exact application this project exists to run. Even when the standard
+`ProcessID` credential is present, the portal deliberately does not repeat the
+broker's lineage walk through it. **The file is what an application reads to
+learn its OWN id**, which is why mount step 13 generates it and why host tooling
+expects it there; it is not evidence about anybody else.
 
-Same-uid *unsandboxed* processes get no app id and full portal access —
-td's existing model, where ceilings between same-uid clients are
-availability bounds rather than isolation. That sentence belongs in
-`AGENTS.md` so nobody mistakes the portal for an intra-uid boundary.
+The broker's `GetConnectionCredentials` reply always carries the uid and adds
+`td.AppId` only when its accepted-connection lineage resolves to a registered
+jail instance. It does not yet distinguish a positively unconfined peer from
+an identity that could not be resolved. A grant-bearing interface therefore
+cannot treat absence as authority.
 
-**But that rule and §D's collide, and the collision is the security
-question this section most needs to answer.** §D says "a process whose
-lineage cannot be proven is denied"; the sentence above says a process
-with no app id gets everything. Those are opposite resolutions of what is,
-at the socket, *the same observation* — a peer the broker cannot tie to a
-registered instance. Read naively, the portal's rule turns a failure to
-prove containment into a **promotion**: an app that manages to defeat the
-lineage check stops looking sandboxed and starts looking like a trusted
-desktop process. That is fail-open in the one place this design cannot
-afford it, and it arrives not from a weak check but from two components
-each being locally reasonable.
+The landed FileChooser rule is deliberately narrower than a general portal
+identity design: it requires exact uid 1000 and exact `td.AppId="firefox"`.
+Missing, duplicate, mistyped, or any other app identity is `NotAllowed` before
+a Request is exported or the `/var/home/tester/Downloads` descriptor root is
+opened. The host and guest roots are compiled as that one application's
+authenticated grant pair. This fails closed for the unresolved/unconfined
+ambiguity and prevents another jailed app from receiving Firefox's paths.
 
-**The fix is that "unknown" must be a third answer, not a synonym for
-"unsandboxed".** The broker answers a caller-identity query with exactly
-one of:
-
-- **`Jailed { app_id, instance }`** — lineage proved, start times stable
-  across the check. Policy applies.
-- **`Unconfined`** — a *positive* result, not a default: the peer pid is a
-  descendant of no live registered instance, and every registered
-  instance's stage-2 pid is accounted for at query time. This is provable
-  because the registry is complete by construction — nothing enters a
-  jail except through stage 0, which registers before it unshares (§D's
-  two-phase registration) — so "descends from none of them" is a real
-  statement rather than an absence of evidence.
-- **`Unknown`** — anything else: a registration in flight, a start time
-  that moved, an instance whose stage-2 pid died between the two reads,
-  `/proc` unreadable for the peer. **Denied by both the broker and the
-  portal**, with a diagnostic naming the ambiguity.
-
-So §D's rule is the general one and this section's is a statement about
-`Unconfined` specifically. The distinction costs one enum and buys the
-property that no failure of the identity mechanism can ever *increase* a
-caller's authority — which is worth more than the portal access it
-occasionally denies to a legitimate desktop process during a race.
-
-The residual exposure is unchanged and already stated: a genuinely
-unsandboxed uid-1000 process is uid 1000, and the portal is not a
-boundary against it. What this closes is narrower and was open —
-a *sandboxed* process reaching that status by breaking a check.
+This does not make the portal a boundary against a genuinely unsandboxed
+uid-1000 process: such a process can already name the private compositor socket
+and read the user's Downloads directory directly. It does mean that an absence
+of broker lineage evidence never increases authority through this method.
+Generalizing a future grant-bearing interface to unconfined desktop clients
+requires the broker to land a positive `Jailed`/`Unconfined`/`Unknown`
+distinction; FileChooser does not pretend that distinction exists today.
 
 ### The private portal ↔ compositor protocol
 
@@ -5618,15 +5668,18 @@ press or wheel gesture. Dismissal, manager destruction, surface destruction,
 or client departure removes that manager's modal ownership and returns a live
 toplevel to the tiling tree. A later local or ordinary xdg-foreign parent still
 survives that cleanup. The compositor mechanics are pinned by host scene and
-runtime regressions; the normal portal daemon does not yet turn a D-Bus dialog
-request into this association. Screenshots, notifications, and inhibitors
-also remain outside this manager version.
+runtime regressions. The normal portal daemon now turns an authenticated
+FileChooser `OpenFile` Request into this association, renders its own bounded
+pixels through `wl_shm`, accepts the exact shared keyboard profile, and waits
+for the manager's dismissal acknowledgement before completing the Request.
+Screenshots, notifications, and inhibitors remain outside this manager
+version.
 
 `td-portal channel-probe` uses only the compositor's safe framing codec — not
-`conn.rs`, SCM_RIGHTS, or a new unsafe transport surface — to pin the exact
-private registry and both dialog states on the system image. The normal portal
-daemon does not yet retain the private connection or route a D-Bus dialog
-request through it; that belongs to the first dialog-owning portal interface.
+`conn.rs` or SCM_RIGHTS — to pin the exact private registry and both dialog
+states on the system image. The normal portal's separate dialog client retains
+one private connection per active FileChooser and uses only the confined
+descriptor transport in `UNSAFE.md` §12 for keymap and shared-memory messages.
 
 **What that boundary does not survive is an escape, and it is worth
 naming the consequence rather than leaving it implied by §L.** Path
@@ -6156,13 +6209,17 @@ packaged selftest, boot oracle — with **network never in the gate**.
    modal keyboard/pointer routing, application/dialog popup stacking,
    newest-first reveal, pre-existing pointer-grab release accounting, preserved
    fullscreen/focus/lone-window presentation, and inheritance from a floating
-   portal parent.
-   Later UI and Session-producing interfaces still need socket-pair coverage
-   for asynchronous cancellation and disconnect cleanup,
-   spoofed identity rejection, pid-reuse and start-time rejection,
-   nested-mount-namespace attribution, FileChooser flows through the pure
-   dialog model, refusal of a file outside grants, screenshot pixel and
-   PNG hashes, inhibitor acquire/readback/release/crash-cleanup.
+   portal parent. FileChooser tests now pin its bounded option parser, broker
+   credential query, fail-closed non-Firefox identity rule, directed success
+   body, and the pure dialog model's grant confinement. A live socket-pair
+   compositor supplies the exact registry and keymap descriptor, consumes the
+   real shared-memory frame, injects a physical key, and observes the selected
+   guest URI after the dismissal handshake.
+   Session-producing and later UI interfaces still need socket-pair coverage
+   for their own asynchronous cancellation and disconnect cleanup, positive
+   unconfined identity, pid-reuse and start-time rejection,
+   nested-mount-namespace attribution, screenshot pixel and PNG hashes, and
+   inhibitor acquire/readback/release/crash-cleanup.
 6. **The offline QEMU oracle — the centrepiece.** Its synthetic first slice
    established the complete static/empty-runtime jail and first-pixel path;
    that fixture remains lower-level host regression coverage but has no
@@ -6499,7 +6556,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | **clipboard producer and cross-client paste LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status. The image oracle physically types `Welcome`, waits until its exact rendered cells are attested, selects them, waits for exact seven-byte source admission, then requires both td-term's exact-payload transfer record and Firefox's browser-chrome observation; client cursors landed separately (`1c4b7f88`) | a real terminal selection reaches Firefox through core Wayland clipboard without manual testing |
 | 21 | **xdg-foreign + private portal manager centred/modal presentation LANDED**; the dialog leaves tiling, retains its workspace home, stacks over application popups, captures keyboard/pointer input with owed-release preservation, and unwinds newest-first. A D-Bus dialog consumer remains | compositor-tested modal portal presentation without manual inspection |
-| 22 | **FileChooser model/renderer LANDED**: the bounded directory, filter, selection, URI and PSF2 pixel core is host- and target-selftested; D-Bus/Wayland integration remains. OpenURI, Screenshot and Notification remain absent | no visible dialog yet; the next acceptance gate drives Firefox's modal chooser and directed response without manual inspection |
+| 22 | **FileChooser `OpenFile` and modal surface LANDED**: the bounded directory, filter, selection, URI and PSF2 pixel core is joined to asynchronous broker-authenticated D-Bus Request routing and the private Wayland manager. A host peer reads the real shm pixels, supplies the exact keymap, drives a protocol-level selection and checks the directed guest URI. Save, Documents, OpenURI, Screenshot and Notification remain absent | a component-level real modal chooser with no manual inspection; the next acceptance gate drives the request from Firefox inside the system image |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 25 | **`td-audio` crate + surface #11**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients | **sound from the machine** |

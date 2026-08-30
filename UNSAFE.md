@@ -3,7 +3,7 @@
 This file is the normative record of every `unsafe` in td. It exists
 because the roster is the point: the value of writing these down is being
 able to count them and see each one's justification beside the others,
-which is exactly what stops an eleventh being added quietly. Where this file
+which is exactly what stops a twelfth being added quietly. Where this file
 and the code disagree, one of them is a bug.
 
 ## The rule
@@ -14,7 +14,7 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are ELEVEN
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWELVE
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
@@ -24,7 +24,9 @@ received descriptor through a second scoped allow. The tenth, `td-busd`,
 carries the same different shape for general descriptor forwarding. Sections
 6 and 10 argue the two separately. The eleventh, `td-profiler`, also owns the
 pointer accesses into the perf ring mapping whose lifetime and bounds that
-same module controls.
+same module controls. The twelfth, `td-portal`, confines descriptor-carrying
+Wayland I/O to one raw-syscall module and immediately reopens received regular
+files through `/proc/self/fd` so no raw descriptor ownership escapes it.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -57,6 +59,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
+| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the private Wayland client's bounded descriptor transfer |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -434,7 +437,7 @@ descriptors it receives arrive through `Connection` — so the syscall
 roster above is unchanged by it.
 
 "Eventually" is now: the terminal binds a `wl_seat`, creates a
-`wl_keyboard`, and RECEIVES its keymap descriptor, which §12 keeps inside
+`wl_keyboard`, and RECEIVES its keymap descriptor, which §6 keeps inside
 the same transport boundary wl_shm submission is in. That is one more user
 of
 `recvmsg(2)`'s product and no new caller of it — the fd is claimed with
@@ -1547,3 +1550,50 @@ Ordinary capture files, `/proc` and `/sys` reads, fsync, and atomic rename use
 safe `std`. A tenth syscall, a fifth request, another event layout, a second
 scoped unsafe allowance, or any pointer escape from `sys.rs` is an amendment
 here and in `td-profiler/DESIGN.md`.
+
+## 12. `td-portal` — the private Wayland dialog client
+
+The FileChooser client carries exactly THREE syscalls through one x86-64
+`syscall5` instruction in `td-portal/src/sys.rs`: `recvmsg(2)`, `sendmsg(2)`,
+and `close(2)`. Safe `UnixStream` carries descriptor-free Wayland messages.
+The raw layer exists only because `wl_keyboard.keymap` and
+`wl_shm.create_pool` carry one SCM_RIGHTS descriptor in opposite directions.
+It borrows the stream and the descriptor it sends; no socket creation,
+connection, path lookup, or caller-selected ancillary type enters the surface.
+
+Every receive requests `MSG_CMSG_CLOEXEC`, parses at most 128 ancillary bytes,
+accepts only `SOL_SOCKET`/`SCM_RIGHTS`, closes every parsed installed descriptor
+on malformed or over-cap input, and relies on Linux to close descriptors that
+do not fit the supplied control buffer. The dialog connection admits at most
+eight queued descriptors. Its only consumer removes one exact descriptor for
+`wl_keyboard.keymap`, reopens `/proc/self/fd/N` as a safe `File`, and then calls
+the rostered close on the received number on both success and reopen failure.
+The pinned private compositor sends a regular keymap backing file, so this
+narrow reopen preserves the required readable bytes without the second scoped
+raw-descriptor adoption that the general D-Bus broker needs. The exact keymap
+size and contents are checked before input is accepted.
+
+The send path emits exactly one descriptor with a 24-byte control buffer and
+fixed `SOL_SOCKET`/`SCM_RIGHTS`; its only production caller sends the
+FileChooser's unlinked 0600 regular backing file in `wl_shm.create_pool`.
+`sendmsg` pins `MSG_NOSIGNAL` so a compositor departure is an error rather than
+a process-wide signal, and carries the first bytes and descriptor atomically.
+A short body write continues through safe `UnixStream`; the descriptor is not
+sent a second time.
+`close_raw` is private to the raw module. Its crate-visible disposal helper
+still takes descriptor numbers because safe Rust cannot own a descriptor
+installed by `recvmsg` without another scoped adoption allowance. The four
+production call sites pass only numbers returned in that connection's
+`Received` value or moved into its bounded pending queue; confinement tests pin
+those call sites. That provenance is a source-level contract, not something
+the helper's raw-fd type can express.
+
+Confinement tests inventory every portal source file, pin the three syscall
+numbers, the single instruction and scoped allowance, both ancillary constants,
+`MSG_CMSG_CLOEXEC`/`MSG_NOSIGNAL`, the one send, receive, and reopen call site,
+and all four refusal/drop routes.
+There is no general descriptor-forwarding API, raw descriptor owner, mmap,
+fcntl, ioctl, credential call, or network socket. A fourth syscall, a second
+ancillary kind, a second scoped allowance, another production caller, or raw
+descriptor adoption is an amendment here and in `APPLICATIONS.md` in the same
+landing.

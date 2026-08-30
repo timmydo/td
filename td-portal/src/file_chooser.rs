@@ -19,6 +19,8 @@ pub const MAX_SELECTIONS: usize = 32;
 pub const MAX_DIRECTORY_DEPTH: usize = 64;
 pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_RESULT_URI_BYTES: usize = 512 * 1024;
+pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_RENDERED_TITLE_BYTES: usize = 320;
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
 const HEADER_ROWS: usize = 6;
 const FOOTER_ROWS: usize = 2;
@@ -101,8 +103,10 @@ impl Chooser {
         guest_root: &Path,
         mode: Mode,
     ) -> Result<Self, String> {
-        if title.is_empty() || title.len() > 256 || title.chars().any(char::is_control) {
-            return Err("file chooser title is outside the 256-byte text bound".into());
+        if title.len() > MAX_RENDERED_TITLE_BYTES || title.chars().any(char::is_control) {
+            return Err(format!(
+                "file chooser title is outside the {MAX_RENDERED_TITLE_BYTES}-byte text bound"
+            ));
         }
         require_absolute_clean(guest_root, "file chooser guest root")?;
         require_absolute_clean(host_root, "file chooser host root")?;
@@ -112,7 +116,7 @@ impl Chooser {
                 host_root.display()
             )
         })?;
-        let row_capacity = visible_rows(chooser_font()?);
+        let row_capacity = visible_rows(HEIGHT, chooser_font()?);
         let (entries, directory_truncated) = read_entries(&root)?;
         let mut chooser = Self {
             title: title.to_string(),
@@ -185,33 +189,53 @@ impl Chooser {
     }
 
     pub fn render(&self) -> Result<Vec<u8>, String> {
+        self.render_sized(WIDTH, HEIGHT)
+    }
+
+    pub fn set_viewport(&mut self, width: usize, height: usize) -> Result<(), String> {
+        frame_bytes(width, height)?;
+        self.visible_rows = visible_rows(height, chooser_font()?);
+        self.keep_selected_visible();
+        Ok(())
+    }
+
+    pub fn render_sized(&self, width: usize, height: usize) -> Result<Vec<u8>, String> {
         let font = chooser_font()?;
-        let bytes = WIDTH
-            .checked_mul(HEIGHT)
-            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
-            .ok_or_else(|| "file chooser frame size overflow".to_string())?;
+        let bytes = frame_bytes(width, height)?;
         let mut frame = vec![0u8; bytes];
-        fill(&mut frame, 0, 0, WIDTH, HEIGHT, BACKGROUND);
+        let dimensions = (width, height);
+        fill(&mut frame, dimensions, 0, 0, width, height, BACKGROUND);
         fill(
             &mut frame,
+            dimensions,
             font.width(),
             font.height(),
-            WIDTH.saturating_sub(font.width().saturating_mul(2)),
-            HEIGHT.saturating_sub(font.height().saturating_mul(2)),
+            width.saturating_sub(font.width().saturating_mul(2)),
+            height.saturating_sub(font.height().saturating_mul(2)),
             PANEL,
         );
-        draw_text(&mut frame, font, 3, 2, &self.title, TEXT);
+        draw_text(&mut frame, dimensions, font, 3, 2, &self.title, TEXT);
         draw_text(
             &mut frame,
+            dimensions,
             font,
             3,
             3,
             &format!("PATH  {}", file_uri(&self.guest_directory())?),
             MUTED,
         );
-        draw_text(&mut frame, font, 3, 4, &self.status_line(), TEXT);
         draw_text(
             &mut frame,
+            dimensions,
+            font,
+            3,
+            4,
+            &self.status_line(),
+            TEXT,
+        );
+        draw_text(
+            &mut frame,
+            dimensions,
             font,
             3,
             5,
@@ -233,9 +257,10 @@ impl Chooser {
             if match_index == self.selected {
                 fill(
                     &mut frame,
+                    dimensions,
                     font.width().saturating_mul(2),
                     grid_row.saturating_mul(font.height().saturating_add(ROW_GAP)),
-                    WIDTH.saturating_sub(font.width().saturating_mul(4)),
+                    width.saturating_sub(font.width().saturating_mul(4)),
                     font.height(),
                     HIGHLIGHT,
                 );
@@ -249,6 +274,7 @@ impl Chooser {
             };
             draw_text(
                 &mut frame,
+                dimensions,
                 font,
                 3,
                 grid_row,
@@ -257,10 +283,18 @@ impl Chooser {
             );
         }
         if self.matches.is_empty() {
-            draw_text(&mut frame, font, 3, HEADER_ROWS, "NO MATCHES", MUTED);
+            draw_text(
+                &mut frame,
+                dimensions,
+                font,
+                3,
+                HEADER_ROWS,
+                "NO MATCHES",
+                MUTED,
+            );
         }
         let help_row =
-            (HEIGHT / font.height().saturating_add(ROW_GAP).max(1)).saturating_sub(FOOTER_ROWS);
+            (height / font.height().saturating_add(ROW_GAP).max(1)).saturating_sub(FOOTER_ROWS);
         let help = match self.mode {
             Mode::OpenFile { multiple: false } => "MOVE  FILTER  OPEN FILE  PARENT  CANCEL",
             Mode::OpenFile { multiple: true } => {
@@ -268,7 +302,7 @@ impl Chooser {
             }
             Mode::OpenDirectory => "MOVE  FILTER  ENTER FOLDER  ACCEPT HERE  PARENT  CANCEL",
         };
-        draw_text(&mut frame, font, 3, help_row, help, MUTED);
+        draw_text(&mut frame, dimensions, font, 3, help_row, help, MUTED);
         Ok(frame)
     }
 
@@ -635,18 +669,46 @@ pub fn file_uri(path: &Path) -> Result<String, String> {
     Ok(uri)
 }
 
-fn visible_rows(font: &font::Font) -> usize {
-    let rows = HEIGHT / font.height().saturating_add(ROW_GAP).max(1);
+fn visible_rows(height: usize, font: &font::Font) -> usize {
+    let rows = height / font.height().saturating_add(ROW_GAP).max(1);
     rows.saturating_sub(HEADER_ROWS.saturating_add(FOOTER_ROWS))
+        .max(1)
 }
 
-fn fill(frame: &mut [u8], left: usize, top: usize, width: usize, height: usize, color: [u8; 4]) {
-    let bottom = top.saturating_add(height).min(HEIGHT);
-    let right = left.saturating_add(width).min(WIDTH);
-    for y in top.min(HEIGHT)..bottom {
-        for x in left.min(WIDTH)..right {
+fn frame_bytes(width: usize, height: usize) -> Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "file chooser surface {width}x{height} has an empty viewport"
+        ));
+    }
+    let bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+        .ok_or_else(|| "file chooser frame size overflow".to_string())?;
+    if bytes > MAX_FRAME_BYTES {
+        return Err(format!(
+            "file chooser surface {width}x{height} exceeds {MAX_FRAME_BYTES} frame bytes"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn fill(
+    frame: &mut [u8],
+    dimensions: (usize, usize),
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    color: [u8; 4],
+) {
+    let (frame_width, frame_height) = dimensions;
+    let bottom = top.saturating_add(height).min(frame_height);
+    let right = left.saturating_add(width).min(frame_width);
+    for y in top.min(frame_height)..bottom {
+        for x in left.min(frame_width)..right {
             let Some(at) = y
-                .checked_mul(WIDTH)
+                .checked_mul(frame_width)
                 .and_then(|row| row.checked_add(x))
                 .and_then(|pixel| pixel.checked_mul(BYTES_PER_PIXEL))
             else {
@@ -662,17 +724,19 @@ fn fill(frame: &mut [u8], left: usize, top: usize, width: usize, height: usize, 
 
 fn draw_text(
     frame: &mut [u8],
+    dimensions: (usize, usize),
     font: &font::Font,
     column: usize,
     row: usize,
     text: &str,
     color: [u8; 4],
 ) {
+    let (frame_width, _) = dimensions;
     let origin_x = column.saturating_mul(font.width());
     let origin_y = row.saturating_mul(font.height().saturating_add(ROW_GAP));
     for (offset, scalar) in text.chars().enumerate() {
         let x = origin_x.saturating_add(offset.saturating_mul(font.width()));
-        if x >= WIDTH {
+        if x >= frame_width {
             break;
         }
         let glyph = font.index(scalar);
@@ -683,6 +747,7 @@ fn draw_text(
                 }
                 fill(
                     frame,
+                    dimensions,
                     x.saturating_add(glyph_x),
                     origin_y.saturating_add(glyph_y),
                     1,
@@ -1143,6 +1208,10 @@ mod tests {
         assert!(accepted_uris(vec!["x".repeat(MAX_RESULT_URI_BYTES + 1)])
             .unwrap_err()
             .contains("result URIs exceed"));
+        assert!(matches!(
+            accepted_uris(vec!["x".repeat(MAX_PATH_BYTES * 3); MAX_SELECTIONS]),
+            Ok(Outcome::Accepted(_))
+        ));
         assert!(std::ptr::eq(
             chooser_font().unwrap(),
             chooser_font().unwrap()
@@ -1187,5 +1256,65 @@ mod tests {
             .apply(Action::Cancel)
             .unwrap_err()
             .contains("already complete"));
+    }
+
+    #[test]
+    fn configured_viewport_is_exact_and_frame_bounded() {
+        let root = Temp::new("viewport");
+        fs::write(root.0.join("report.txt"), b"x").unwrap();
+        let mut chooser = Chooser::open(
+            "Open",
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+        )
+        .unwrap();
+        let frame = chooser.render_sized(640, 432).unwrap();
+        assert_eq!(frame.len(), 640 * 432 * BYTES_PER_PIXEL);
+        assert!(frame.iter().any(|byte| *byte != 0));
+        assert_eq!(
+            chooser.render_sized(2880, 1582).unwrap().len(),
+            2880 * 1582 * BYTES_PER_PIXEL
+        );
+        chooser.set_viewport(600, 402).unwrap();
+        assert_eq!(chooser.render_sized(600, 402).unwrap().len(), 600 * 402 * 4);
+        let large_rows = chooser.visible_rows;
+        chooser.set_viewport(1, 1).unwrap();
+        assert_eq!(chooser.visible_rows, 1);
+        assert!(large_rows > chooser.visible_rows);
+        assert_eq!(chooser.render_sized(1, 1).unwrap().len(), 4);
+        assert!(chooser.set_viewport(0, 432).is_err());
+        assert!(chooser.render_sized(4096, 2161).is_err());
+    }
+
+    #[test]
+    fn empty_title_uses_the_same_bounded_model() {
+        let root = Temp::new("empty-title");
+        let chooser = Chooser::open(
+            "",
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+        )
+        .unwrap();
+        assert_eq!(chooser.title, "");
+        assert_eq!(chooser.render().unwrap().len(), WIDTH * HEIGHT * 4);
+
+        let maximum = "a".repeat(MAX_RENDERED_TITLE_BYTES);
+        assert!(Chooser::open(
+            &maximum,
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+        )
+        .is_ok());
+        let oversized = "a".repeat(MAX_RENDERED_TITLE_BYTES + 1);
+        assert!(Chooser::open(
+            &oversized,
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+        )
+        .is_err());
     }
 }

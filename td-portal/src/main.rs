@@ -23,6 +23,12 @@ mod font;
 #[path = "../../td-compositor/src/font_data.rs"]
 mod font_data;
 mod handles;
+#[path = "../../td-compositor/src/keyboard.rs"]
+#[allow(
+    dead_code,
+    reason = "the shared keyboard profile is broader than one chooser"
+)]
+mod keyboard;
 #[path = "../../td-compositor/src/filter.rs"]
 mod list_filter;
 #[path = "../../td-busd/src/message.rs"]
@@ -34,7 +40,9 @@ mod message;
 #[path = "../../td-busd/src/name.rs"]
 mod name;
 mod settings;
+mod sys;
 mod wayland_channel;
+mod wayland_dialog;
 #[path = "../../td-compositor/src/wire.rs"]
 #[allow(
     dead_code,
@@ -48,9 +56,19 @@ mod wayland_wire;
 )]
 mod wire;
 
+mod scene {
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    pub struct SurfaceKey {
+        pub client: u64,
+        pub object: u32,
+    }
+}
+
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -72,11 +90,13 @@ const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const SETTINGS_INTERFACE: &str = "org.freedesktop.portal.Settings";
 const BACKGROUND_INTERFACE: &str = "org.freedesktop.portal.Background";
+const FILE_CHOOSER_INTERFACE: &str = "org.freedesktop.portal.FileChooser";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const INTROSPECT_INTERFACE: &str = "org.freedesktop.DBus.Introspectable";
 const PEER_INTERFACE: &str = "org.freedesktop.DBus.Peer";
 const SETTINGS_VERSION: u32 = 1;
 const BACKGROUND_VERSION: u32 = 1;
+const FILE_CHOOSER_VERSION: u32 = 3;
 const SESSION_VERSION: u32 = 1;
 const REQUEST_NAME_DO_NOT_QUEUE: u32 = 4;
 const REQUEST_NAME_PRIMARY_OWNER: u32 = 1;
@@ -90,6 +110,18 @@ const MAX_UNRELATED_MESSAGES: usize = 16;
 const MAX_NAMESPACE_FILTERS: usize = 32;
 const MAX_NAMESPACE_BYTES: usize = 255;
 const MAX_PORTAL_OPTIONS: usize = 32;
+const MAX_PENDING_IDENTITIES: usize = 16;
+const MAX_PENDING_IDENTITIES_PER_OWNER: usize = 4;
+const MAX_PENDING_OPENS: usize = 15;
+const MAX_PENDING_OPENS_PER_OWNER: usize = 3;
+const MAX_ACTIVE_FILE_CHOOSERS: usize = 1;
+const MAX_QUEUED_SERVICE_EVENTS: usize = 32;
+const MAX_FILE_CHOOSER_TITLE_BYTES: usize = 256;
+const OWNER_AUDIT_INTERVAL: Duration = Duration::from_secs(10);
+const FILE_CHOOSER_SOCKET: &str = "/run/user/1000/td-portal-wayland-0";
+const FILE_CHOOSER_RUNTIME: &str = "/run/user/1000";
+const FIREFOX_HOST_DOWNLOADS: &str = "/var/home/tester/Downloads";
+const FIREFOX_GUEST_DOWNLOADS: &str = "/home/td/Downloads";
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const OWNER_MATCH: &str = "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged'";
 pub const READY_MARKER: &str = "TD-PORTAL-READY namespaces=2 settings=10 version=1";
@@ -116,6 +148,27 @@ const INTROSPECTION_XML: &str = r#"<node>
   <interface name="org.freedesktop.portal.Background">
     <method name="RequestBackground">
       <arg type="s" name="parent_window" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.FileChooser">
+    <method name="OpenFile">
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="SaveFile">
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="SaveFiles">
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
       <arg type="a{sv}" name="options" direction="in"/>
       <arg type="o" name="handle" direction="out"/>
     </method>
@@ -612,12 +665,12 @@ impl Connection {
         Ok(())
     }
 
-    fn next_message(&mut self) -> io::Result<IncomingFrame> {
-        read_service_frame(&mut self.stream)
-    }
-
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.stream.write_all(bytes)
+    }
+
+    fn service_reader(&self) -> io::Result<UnixStream> {
+        self.stream.try_clone()
     }
 }
 
@@ -940,42 +993,564 @@ fn run(paths: &Paths) -> Result<(), String> {
 }
 
 fn serve(connection: &mut Connection, settings: &Settings) -> io::Result<()> {
-    let mut handles = Handles::default();
+    let mut reader = connection.service_reader()?;
+    let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_SERVICE_EVENTS);
+    let bus_sender = sender.clone();
+    thread::Builder::new()
+        .name("td-portal-bus-reader".into())
+        .spawn(move || loop {
+            let event = read_service_frame(&mut reader);
+            let terminal = event.is_err();
+            if bus_sender.send(ServiceEvent::Bus(event)).is_err() || terminal {
+                break;
+            }
+        })
+        .map_err(|error| io::Error::other(format!("start portal bus reader: {error}")))?;
+    let audit_sender = sender.clone();
+    thread::Builder::new()
+        .name("td-portal-owner-audit".into())
+        .spawn(move || loop {
+            thread::sleep(OWNER_AUDIT_INTERVAL);
+            if audit_sender.send(ServiceEvent::Audit).is_err() {
+                break;
+            }
+        })
+        .map_err(|error| io::Error::other(format!("start portal owner audit: {error}")))?;
+    let mut state = ServiceState::default();
     loop {
-        let frame = match connection.next_message()? {
-            IncomingFrame::Message(frame) => frame,
-            IncomingFrame::Oversized {
-                call: Some(call), ..
-            } => {
-                let serial = connection.next_serial()?;
-                let reply = method_error(
-                    call.endian,
-                    serial,
-                    call.serial,
-                    &call.sender,
-                    "org.freedesktop.DBus.Error.LimitsExceeded",
-                    "the call is over the portal's decoded-frame ceiling",
-                )?;
-                connection.write_frame(&reply)?;
+        let event = receiver
+            .recv()
+            .map_err(|_| io::Error::other("all portal service workers stopped"))?;
+        match event {
+            ServiceEvent::Audit => {
+                begin_active_audit(connection, &mut state)?;
                 continue;
             }
-            IncomingFrame::Oversized { call: None, .. } => continue,
-        };
-        let (incoming, consumed) = message::decode(&frame, 0).map_err(message_error)?;
-        if consumed != frame.len() {
-            return Err(io::Error::other("a portal call carried trailing bytes"));
-        }
-        let outbound = dispatch(&incoming, settings, &mut handles, &mut connection.serial)?;
-        for frame in &outbound.frames {
-            connection.write_frame(frame)?;
-        }
-        if let Some(path) = outbound.retire {
-            if !handles.retire(&path) {
-                return Err(io::Error::other(
-                    "a completed portal handle disappeared before retirement",
-                ));
+            ServiceEvent::Dialog { path, notice } => {
+                consume_dialog_notice(connection, &mut state, &path, notice)?;
+                continue;
+            }
+            ServiceEvent::Bus(Err(error)) => return Err(error),
+            ServiceEvent::Bus(Ok(frame)) => {
+                consume_bus_frame(connection, settings, &mut state, &sender, frame)?;
             }
         }
+    }
+}
+
+enum ServiceEvent {
+    Bus(io::Result<IncomingFrame>),
+    Audit,
+    Dialog {
+        path: String,
+        notice: wayland_dialog::Notice,
+    },
+}
+
+#[derive(Debug)]
+struct PendingOpen {
+    endian: Endian,
+    call_serial: u32,
+    owner: String,
+    wants_reply: bool,
+    token: String,
+    title: String,
+    parent_handle: String,
+    mode: file_chooser::Mode,
+}
+
+#[derive(Debug)]
+struct ActiveDialog {
+    owner: String,
+    endian: Endian,
+    cancel: Option<UnixStream>,
+    presented: bool,
+    cancelled: bool,
+}
+
+#[derive(Default)]
+struct ServiceState {
+    handles: Handles,
+    pending: BTreeMap<u32, PendingOpen>,
+    pending_audits: BTreeMap<u32, String>,
+    active: BTreeMap<String, ActiveDialog>,
+}
+
+fn consume_bus_frame(
+    connection: &mut Connection,
+    settings: &Settings,
+    state: &mut ServiceState,
+    events: &mpsc::SyncSender<ServiceEvent>,
+    frame: IncomingFrame,
+) -> io::Result<()> {
+    let frame = match frame {
+        IncomingFrame::Message(frame) => frame,
+        IncomingFrame::Oversized {
+            call: Some(call), ..
+        } => {
+            let serial = connection.next_serial()?;
+            let reply = method_error(
+                call.endian,
+                serial,
+                call.serial,
+                &call.sender,
+                "org.freedesktop.DBus.Error.LimitsExceeded",
+                "the call is over the portal's decoded-frame ceiling",
+            )?;
+            connection.write_frame(&reply)?;
+            return Ok(());
+        }
+        IncomingFrame::Oversized { call: None, .. } => return Ok(()),
+    };
+    let (incoming, consumed) = message::decode(&frame, 0).map_err(message_error)?;
+    if consumed != frame.len() {
+        return Err(io::Error::other("a portal call carried trailing bytes"));
+    }
+    if consume_active_audit_reply(connection, state, &incoming)?
+        || consume_identity_reply(connection, state, events, &incoming)?
+    {
+        return Ok(());
+    }
+    if is_open_file_call(&incoming) {
+        begin_open_file(connection, state, &incoming)?;
+        return Ok(());
+    }
+    let departed = owner_departure(&incoming)?.map(str::to_string);
+    let outbound = dispatch(
+        &incoming,
+        settings,
+        &mut state.handles,
+        &mut connection.serial,
+    )?;
+    for frame in &outbound.frames {
+        connection.write_frame(frame)?;
+    }
+    if let Some(path) = outbound.retire {
+        if !state.handles.retire(&path) {
+            return Err(io::Error::other(
+                "a completed portal handle disappeared before retirement",
+            ));
+        }
+        cancel_dialog(state, &path)?;
+    }
+    if let Some(owner) = departed {
+        state.pending.retain(|_, pending| pending.owner != owner);
+        let paths = state
+            .active
+            .iter()
+            .filter_map(|(path, active)| (active.owner == owner).then_some(path.clone()))
+            .collect::<Vec<_>>();
+        for path in paths {
+            cancel_dialog(state, &path)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_open_file_call(call: &Message<'_>) -> bool {
+    call.kind == MessageType::MethodCall
+        && call.fields.path == Some(PORTAL_PATH)
+        && call.fields.interface == Some(FILE_CHOOSER_INTERFACE)
+        && call.fields.member == Some("OpenFile")
+}
+
+fn begin_open_file(
+    connection: &mut Connection,
+    state: &mut ServiceState,
+    call: &Message<'_>,
+) -> io::Result<()> {
+    let wants_reply = call.flags & message::FLAG_NO_REPLY_EXPECTED == 0;
+    let owner = call
+        .fields
+        .sender
+        .ok_or_else(|| io::Error::other("the broker forwarded OpenFile with no sender"))?;
+    let parsed = match parse_open_file(call) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if wants_reply {
+                let reply_serial = connection.next_serial()?;
+                let frame = method_error(
+                    call.endian,
+                    reply_serial,
+                    call.serial,
+                    owner,
+                    error.name,
+                    error.text,
+                )?;
+                connection.write_frame(&frame)?;
+            }
+            return Ok(());
+        }
+    };
+    if state.pending.len() >= MAX_PENDING_OPENS
+        || pending_open_count_for_owner(state, owner) >= MAX_PENDING_OPENS_PER_OWNER
+    {
+        if wants_reply {
+            let reply_serial = connection.next_serial()?;
+            let frame = method_error(
+                call.endian,
+                reply_serial,
+                call.serial,
+                owner,
+                "org.freedesktop.DBus.Error.LimitsExceeded",
+                "too many FileChooser caller identities are pending",
+            )?;
+            connection.write_frame(&frame)?;
+        }
+        return Ok(());
+    }
+    let query_serial = connection.next_serial()?;
+    let query = credentials_query(query_serial, owner)?;
+    state.pending.insert(
+        query_serial,
+        PendingOpen {
+            endian: call.endian,
+            call_serial: call.serial,
+            owner: owner.to_string(),
+            wants_reply,
+            token: parsed.token,
+            title: parsed.title,
+            parent_handle: parsed.parent_handle,
+            mode: parsed.mode,
+        },
+    );
+    connection.write_frame(&query)
+}
+
+fn pending_identity_count(state: &ServiceState) -> usize {
+    state
+        .pending
+        .len()
+        .saturating_add(state.pending_audits.len())
+}
+
+fn pending_identity_count_for_owner(state: &ServiceState, owner: &str) -> usize {
+    pending_open_count_for_owner(state, owner).saturating_add(
+        state
+            .pending_audits
+            .values()
+            .filter_map(|path| state.active.get(path))
+            .filter(|active| active.owner == owner)
+            .count(),
+    )
+}
+
+fn pending_open_count_for_owner(state: &ServiceState, owner: &str) -> usize {
+    state
+        .pending
+        .values()
+        .filter(|pending| pending.owner == owner)
+        .count()
+}
+
+fn credentials_query(serial: u32, owner: &str) -> io::Result<Vec<u8>> {
+    message::Builder::method_call(
+        Endian::Little,
+        BUS_PATH,
+        Some(BUS_NAME),
+        "GetConnectionCredentials",
+    )
+    .destination(BUS_NAME)
+    .serial(serial)
+    .body("s", |writer| writer.string(owner))
+    .map_err(wire_error)?
+    .encode()
+    .map_err(message_error)
+}
+
+fn begin_active_audit(connection: &mut Connection, state: &mut ServiceState) -> io::Result<()> {
+    if !state.pending_audits.is_empty() {
+        return Ok(());
+    }
+    let Some((path, active)) = state.active.iter().find(|(_, active)| !active.cancelled) else {
+        return Ok(());
+    };
+    let path = path.clone();
+    let owner = active.owner.clone();
+    if pending_identity_count(state) >= MAX_PENDING_IDENTITIES
+        || pending_identity_count_for_owner(state, &owner) >= MAX_PENDING_IDENTITIES_PER_OWNER
+    {
+        return Ok(());
+    }
+    let serial = connection.next_serial()?;
+    let query = credentials_query(serial, &owner)?;
+    state.pending_audits.insert(serial, path);
+    connection.write_frame(&query)
+}
+
+fn consume_active_audit_reply(
+    connection: &mut Connection,
+    state: &mut ServiceState,
+    reply: &Message<'_>,
+) -> io::Result<bool> {
+    let Some(reply_serial) = reply.fields.reply_serial else {
+        return Ok(false);
+    };
+    if !state.pending_audits.contains_key(&reply_serial) {
+        return Ok(false);
+    }
+    if !matches!(reply.kind, MessageType::MethodReturn | MessageType::Error)
+        || reply.fields.sender != Some(BUS_NAME)
+        || reply.fields.destination != connection.unique.as_deref()
+    {
+        return Ok(true);
+    }
+    let path = state
+        .pending_audits
+        .remove(&reply_serial)
+        .ok_or_else(|| io::Error::other("an active FileChooser audit disappeared"))?;
+    let live_firefox = reply.kind == MessageType::MethodReturn
+        && credentials_app_id(reply)
+            .map(|app_id| app_id.as_deref() == Some("firefox"))
+            .unwrap_or(false);
+    if live_firefox {
+        return Ok(true);
+    }
+    let response = state
+        .active
+        .get(&path)
+        .filter(|active| !active.cancelled)
+        .map(|active| (active.endian, active.owner.clone()));
+    if state.handles.retire(&path) {
+        eprintln!("td-portal: FileChooser {path} lost its authenticated owner");
+        if let Some((endian, owner)) = response {
+            let outcome = Err("FileChooser lost its authenticated owner".to_string());
+            let serial = connection.next_serial()?;
+            let frame = file_chooser_response(endian, serial, &path, &owner, &outcome)?;
+            connection.write_frame(&frame)?;
+        }
+    }
+    cancel_dialog(state, &path)?;
+    Ok(true)
+}
+
+fn consume_identity_reply(
+    connection: &mut Connection,
+    state: &mut ServiceState,
+    events: &mpsc::SyncSender<ServiceEvent>,
+    reply: &Message<'_>,
+) -> io::Result<bool> {
+    let Some(reply_serial) = reply.fields.reply_serial else {
+        return Ok(false);
+    };
+    if !state.pending.contains_key(&reply_serial) {
+        return Ok(false);
+    }
+    if !matches!(reply.kind, MessageType::MethodReturn | MessageType::Error)
+        || reply.fields.sender != Some(BUS_NAME)
+        || reply.fields.destination != connection.unique.as_deref()
+    {
+        return Ok(true);
+    }
+    let pending = state
+        .pending
+        .remove(&reply_serial)
+        .ok_or_else(|| io::Error::other("a pending FileChooser identity disappeared"))?;
+    if reply.kind == MessageType::Error {
+        return refuse_open_file_identity(
+            connection,
+            &pending,
+            "the broker refused caller identity",
+        )
+        .map(|()| true);
+    }
+    let app_id = match credentials_app_id(reply) {
+        Ok(app_id) => app_id,
+        Err(error) => {
+            eprintln!("td-portal: refused malformed FileChooser identity: {error}");
+            return refuse_open_file_identity(
+                connection,
+                &pending,
+                "the broker returned an invalid caller identity",
+            )
+            .map(|()| true);
+        }
+    };
+    if app_id.as_deref() != Some("firefox") {
+        return refuse_open_file_identity(
+            connection,
+            &pending,
+            "FileChooser currently admits only the authenticated Firefox grant",
+        )
+        .map(|()| true);
+    }
+    if state.active.len() >= MAX_ACTIVE_FILE_CHOOSERS {
+        return refuse_open_file_limit(connection, &pending).map(|()| true);
+    }
+    let path = match state
+        .handles
+        .reserve(HandleKind::Request, &pending.owner, &pending.token)
+    {
+        Ok(path) => path,
+        Err(error) => {
+            return refuse_open_file_reservation(connection, &pending, error).map(|()| true)
+        }
+    };
+    if pending.wants_reply {
+        let serial = connection.next_serial()?;
+        let frame = method_return(
+            pending.endian,
+            serial,
+            pending.call_serial,
+            &pending.owner,
+            "o",
+            |writer| writer.object_path(&path),
+        )?;
+        connection.write_frame(&frame)?;
+    }
+    state.active.insert(
+        path.clone(),
+        ActiveDialog {
+            owner: pending.owner.clone(),
+            endian: pending.endian,
+            cancel: None,
+            presented: false,
+            cancelled: false,
+        },
+    );
+    let config = wayland_dialog::DialogConfig {
+        socket: PathBuf::from(FILE_CHOOSER_SOCKET),
+        runtime_directory: PathBuf::from(FILE_CHOOSER_RUNTIME),
+        title: pending.title,
+        parent_handle: pending.parent_handle,
+        app_id: app_id.unwrap_or_default(),
+        host_root: PathBuf::from(FIREFOX_HOST_DOWNLOADS),
+        guest_root: PathBuf::from(FIREFOX_GUEST_DOWNLOADS),
+        mode: pending.mode,
+    };
+    let event_sender = events.clone();
+    let event_path = path.clone();
+    if let Err(error) = wayland_dialog::spawn(config, move |notice| {
+        event_sender
+            .send(ServiceEvent::Dialog {
+                path: event_path.clone(),
+                notice,
+            })
+            .map_err(|_| "portal service stopped before its dialog worker".to_string())
+    }) {
+        state.active.remove(&path);
+        if !state.handles.retire(&path) {
+            return Err(io::Error::other(
+                "failed FileChooser worker lost its Request handle",
+            ));
+        }
+        let serial = connection.next_serial()?;
+        connection.write_frame(&file_chooser_response(
+            pending.endian,
+            serial,
+            &path,
+            &pending.owner,
+            &Err(error),
+        )?)?;
+    }
+    Ok(true)
+}
+
+fn consume_dialog_notice(
+    connection: &mut Connection,
+    state: &mut ServiceState,
+    path: &str,
+    notice: wayland_dialog::Notice,
+) -> io::Result<()> {
+    match notice {
+        wayland_dialog::Notice::Connected(stream) => {
+            if let Some(active) = state.active.get_mut(path) {
+                if active.cancelled {
+                    shutdown_dialog_stream(&stream)?;
+                    return Ok(());
+                }
+                if active.cancel.replace(stream).is_some() {
+                    return Err(io::Error::other(
+                        "a FileChooser worker sent two cancellation handles",
+                    ));
+                }
+            } else {
+                shutdown_dialog_stream(&stream)?;
+            }
+        }
+        wayland_dialog::Notice::Presented {
+            width,
+            height,
+            checksum,
+        } => {
+            let Some(active) = state.active.get_mut(path) else {
+                return Ok(());
+            };
+            if active.cancelled {
+                return Ok(());
+            }
+            if active.presented {
+                return Err(io::Error::other(
+                    "a FileChooser worker announced its first frame twice",
+                ));
+            }
+            active.presented = true;
+            println!(
+                "TD-PORTAL-FILE-CHOOSER-PRESENTED path={path} size={width}x{height} checksum={checksum:016x}"
+            );
+        }
+        wayland_dialog::Notice::Completed(outcome) => {
+            let Some(active) = state.active.remove(path) else {
+                return Ok(());
+            };
+            state
+                .pending_audits
+                .retain(|_, audited_path| audited_path != path);
+            if active.cancelled {
+                return Ok(());
+            }
+            let outcome = require_presented_outcome(active.presented, outcome);
+            if !state.handles.retire(path) {
+                return Err(io::Error::other(
+                    "a completed FileChooser lost its Request handle",
+                ));
+            }
+            let serial = connection.next_serial()?;
+            let frame =
+                file_chooser_response(active.endian, serial, path, &active.owner, &outcome)?;
+            connection.write_frame(&frame)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_presented_outcome(
+    presented: bool,
+    outcome: Result<file_chooser::Outcome, String>,
+) -> Result<file_chooser::Outcome, String> {
+    if !presented && outcome.is_ok() {
+        Err("FileChooser completed before a presented modal frame".into())
+    } else {
+        outcome
+    }
+}
+
+fn cancel_dialog(state: &mut ServiceState, path: &str) -> io::Result<()> {
+    state
+        .pending_audits
+        .retain(|_, audited_path| audited_path != path);
+    let Some(active) = state.active.get_mut(path) else {
+        return Ok(());
+    };
+    if active.cancelled {
+        return Ok(());
+    }
+    active.cancelled = true;
+    if let Some(stream) = active.cancel.take() {
+        shutdown_dialog_stream(&stream)?;
+    } else {
+        eprintln!(
+            "FileChooser {path} was cancelled before its blocking AF_UNIX connect returned; retaining the sole dialog slot"
+        );
+    }
+    Ok(())
+}
+
+fn shutdown_dialog_stream(stream: &UnixStream) -> io::Result<()> {
+    match stream.shutdown(Shutdown::Both) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1037,6 +1612,25 @@ fn dispatch(
         (Some(PORTAL_PATH), Some(BACKGROUND_INTERFACE), Some("RequestBackground")) => {
             return request_background(call, handles, serials, serial, sender, wants_reply)
         }
+        (Some(PORTAL_PATH), Some(FILE_CHOOSER_INTERFACE), Some("SaveFile" | "SaveFiles")) => {
+            if exact_signature(call, "ssa{sv}") {
+                method_error(
+                    call.endian,
+                    serial,
+                    call.serial,
+                    sender,
+                    UNSUPPORTED_OPEN,
+                    "td FileChooser does not yet implement saving",
+                )
+            } else {
+                invalid_args(
+                    call,
+                    serial,
+                    sender,
+                    "SaveFile and SaveFiles take parent, title, and options",
+                )
+            }
+        }
         (Some(PORTAL_PATH), Some(PROPERTIES_INTERFACE), Some("Get")) => {
             property_get_reply(call, serial, sender)
         }
@@ -1087,12 +1681,19 @@ fn dispatch(
 }
 
 fn consume_owner_departure(call: &Message<'_>, handles: &mut Handles) -> io::Result<()> {
+    if let Some(owner) = owner_departure(call)? {
+        handles.remove_owner(owner);
+    }
+    Ok(())
+}
+
+fn owner_departure<'a>(call: &'a Message<'a>) -> io::Result<Option<&'a str>> {
     if call.fields.sender != Some(BUS_NAME)
         || call.fields.path != Some(BUS_PATH)
         || call.fields.interface != Some(BUS_NAME)
         || call.fields.member != Some("NameOwnerChanged")
     {
-        return Ok(());
+        return Ok(None);
     }
     if !exact_signature(call, "sss") {
         return Err(io::Error::other(
@@ -1105,9 +1706,9 @@ fn consume_owner_departure(call: &Message<'_>, handles: &mut Handles) -> io::Res
         ));
     };
     if new.is_empty() && name == old && name::valid_unique_name(name) {
-        handles.remove_owner(name);
+        return Ok(Some(name));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn introspect_handle(
@@ -1350,6 +1951,348 @@ fn exact_signature(call: &Message<'_>, signature: &str) -> bool {
     call.fields.signature.unwrap_or("") == signature
 }
 
+#[derive(Debug)]
+struct ParsedOpen {
+    token: String,
+    title: String,
+    parent_handle: String,
+    mode: file_chooser::Mode,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PortalCallError {
+    name: &'static str,
+    text: &'static str,
+}
+
+const INVALID_OPEN: &str = "org.freedesktop.DBus.Error.InvalidArgs";
+const UNSUPPORTED_OPEN: &str = "org.freedesktop.portal.Error.NotSupported";
+
+fn open_error(name: &'static str, text: &'static str) -> PortalCallError {
+    PortalCallError { name, text }
+}
+
+fn parse_open_file(call: &Message<'_>) -> Result<ParsedOpen, PortalCallError> {
+    if !exact_signature(call, "ssa{sv}") {
+        return Err(open_error(
+            INVALID_OPEN,
+            "OpenFile takes parent, title, and options",
+        ));
+    }
+    let [Value::Str(parent), Value::Str(title), Value::Array(options)] = call.args() else {
+        return Err(open_error(
+            INVALID_OPEN,
+            "OpenFile arguments have the wrong shape",
+        ));
+    };
+    if title.len() > MAX_FILE_CHOOSER_TITLE_BYTES || title.chars().any(char::is_control) {
+        return Err(open_error(
+            INVALID_OPEN,
+            "OpenFile title is outside the 256-byte text bound",
+        ));
+    }
+    let parent_handle = if parent.is_empty() {
+        String::new()
+    } else if let Some(handle) = parent.strip_prefix("wayland:") {
+        if handle.is_empty()
+            || handle.len() > 128
+            || handle.bytes().any(|byte| !byte.is_ascii_graphic())
+        {
+            return Err(open_error(
+                INVALID_OPEN,
+                "OpenFile has a malformed Wayland parent handle",
+            ));
+        }
+        handle.to_string()
+    } else {
+        return Err(open_error(
+            UNSUPPORTED_OPEN,
+            "td FileChooser supports only Wayland parent identifiers",
+        ));
+    };
+    let entries = options
+        .values(MAX_PORTAL_OPTIONS)
+        .map_err(|_| open_error(INVALID_OPEN, "OpenFile has too many options"))?;
+    let mut token = None;
+    let mut multiple = None;
+    let mut directory = None;
+    let mut modal = None;
+    let mut accept_label = false;
+    let mut filters = false;
+    let mut current_filter = false;
+    let mut current_folder = false;
+    for entry in entries {
+        let pair = entry
+            .as_seq()
+            .ok_or_else(|| open_error(INVALID_OPEN, "an OpenFile option is not an entry"))?
+            .values(2)
+            .map_err(|_| open_error(INVALID_OPEN, "an OpenFile option is malformed"))?;
+        let [Value::Str(key), Value::Variant(value)] = pair.as_slice() else {
+            return Err(open_error(
+                INVALID_OPEN,
+                "an OpenFile option has the wrong shape",
+            ));
+        };
+        match *key {
+            "handle_token" => {
+                if token.is_some() {
+                    return Err(open_error(INVALID_OPEN, "handle_token appears twice"));
+                }
+                let text = variant_string(*value, "handle_token")?;
+                if !handles::valid_token(text) {
+                    return Err(open_error(
+                        INVALID_OPEN,
+                        "handle_token is not a valid object-path element",
+                    ));
+                }
+                token = Some(text.to_string());
+            }
+            "multiple" => {
+                if multiple
+                    .replace(variant_bool(*value, "multiple")?)
+                    .is_some()
+                {
+                    return Err(open_error(INVALID_OPEN, "multiple appears twice"));
+                }
+            }
+            "directory" => {
+                if directory
+                    .replace(variant_bool(*value, "directory")?)
+                    .is_some()
+                {
+                    return Err(open_error(INVALID_OPEN, "directory appears twice"));
+                }
+            }
+            "modal" => {
+                if modal.replace(variant_bool(*value, "modal")?).is_some() {
+                    return Err(open_error(INVALID_OPEN, "modal appears twice"));
+                }
+            }
+            "accept_label" => {
+                if accept_label {
+                    return Err(open_error(INVALID_OPEN, "accept_label appears twice"));
+                }
+                accept_label = true;
+                let label = variant_string(*value, "accept_label")?;
+                if label.is_empty() || label.len() > 64 || label.chars().any(char::is_control) {
+                    return Err(open_error(
+                        INVALID_OPEN,
+                        "accept_label is outside the 64-byte text bound",
+                    ));
+                }
+            }
+            "filters" => {
+                if filters {
+                    return Err(open_error(INVALID_OPEN, "filters appears twice"));
+                }
+                filters = true;
+                validate_filters(*value)?;
+            }
+            "current_filter" => {
+                if current_filter {
+                    return Err(open_error(INVALID_OPEN, "current_filter appears twice"));
+                }
+                current_filter = true;
+                validate_current_filter(*value)?;
+            }
+            "current_folder" => {
+                if current_folder {
+                    return Err(open_error(INVALID_OPEN, "current_folder appears twice"));
+                }
+                current_folder = true;
+                validate_current_folder(*value)?;
+            }
+            "choices" => {
+                return Err(open_error(
+                    UNSUPPORTED_OPEN,
+                    "td FileChooser does not yet implement choices",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if accept_label || filters || current_filter {
+        return Err(open_error(
+            UNSUPPORTED_OPEN,
+            "td FileChooser does not yet implement accept_label, filters, or current_filter",
+        ));
+    }
+    if modal == Some(false) {
+        return Err(open_error(
+            UNSUPPORTED_OPEN,
+            "td FileChooser currently serves modal requests only",
+        ));
+    }
+    let multiple = multiple.unwrap_or(false);
+    let directory = directory.unwrap_or(false);
+    if multiple && directory {
+        return Err(open_error(
+            UNSUPPORTED_OPEN,
+            "td FileChooser does not yet select multiple directories",
+        ));
+    }
+    Ok(ParsedOpen {
+        token: token.unwrap_or_else(|| format!("td_{}", call.serial)),
+        title: title.to_string(),
+        parent_handle,
+        mode: if directory {
+            file_chooser::Mode::OpenDirectory
+        } else {
+            file_chooser::Mode::OpenFile { multiple }
+        },
+    })
+}
+
+fn variant_string<'a>(
+    value: wire::Seq<'a>,
+    option: &'static str,
+) -> Result<&'a str, PortalCallError> {
+    if value.signature() != "s" {
+        return Err(open_error(
+            INVALID_OPEN,
+            "an OpenFile string option is mistyped",
+        ));
+    }
+    let values = value
+        .values(1)
+        .map_err(|_| open_error(INVALID_OPEN, "an OpenFile string option is malformed"))?;
+    match values.as_slice() {
+        [Value::Str(text)] => Ok(*text),
+        _ => Err(open_error(INVALID_OPEN, option)),
+    }
+}
+
+fn variant_bool(value: wire::Seq<'_>, option: &'static str) -> Result<bool, PortalCallError> {
+    if value.signature() != "b" {
+        return Err(open_error(
+            INVALID_OPEN,
+            "an OpenFile boolean option is mistyped",
+        ));
+    }
+    let values = value
+        .values(1)
+        .map_err(|_| open_error(INVALID_OPEN, "an OpenFile boolean option is malformed"))?;
+    match values.as_slice() {
+        [Value::Bool(value)] => Ok(*value),
+        _ => Err(open_error(INVALID_OPEN, option)),
+    }
+}
+
+fn validate_filters(value: wire::Seq<'_>) -> Result<(), PortalCallError> {
+    if value.signature() != "a(sa(us))" {
+        return Err(open_error(INVALID_OPEN, "filters has the wrong type"));
+    }
+    let values = value
+        .values(1)
+        .map_err(|_| open_error(INVALID_OPEN, "filters is malformed"))?;
+    let Some(Value::Array(filters)) = values.first() else {
+        return Err(open_error(INVALID_OPEN, "filters has the wrong shape"));
+    };
+    for filter in filters
+        .values(32)
+        .map_err(|_| open_error(INVALID_OPEN, "filters exceeds 32 entries"))?
+    {
+        validate_filter(filter)?;
+    }
+    Ok(())
+}
+
+fn validate_current_filter(value: wire::Seq<'_>) -> Result<(), PortalCallError> {
+    if value.signature() != "(sa(us))" {
+        return Err(open_error(
+            INVALID_OPEN,
+            "current_filter has the wrong type",
+        ));
+    }
+    let values = value
+        .values(1)
+        .map_err(|_| open_error(INVALID_OPEN, "current_filter is malformed"))?;
+    let Some(filter) = values.first().copied() else {
+        return Err(open_error(INVALID_OPEN, "current_filter is empty"));
+    };
+    validate_filter(filter)
+}
+
+fn validate_filter(filter: Value<'_>) -> Result<(), PortalCallError> {
+    let fields = filter
+        .as_seq()
+        .ok_or_else(|| open_error(INVALID_OPEN, "a file filter is not a structure"))?
+        .values(2)
+        .map_err(|_| open_error(INVALID_OPEN, "a file filter is malformed"))?;
+    let [Value::Str(label), Value::Array(rules)] = fields.as_slice() else {
+        return Err(open_error(
+            INVALID_OPEN,
+            "a file filter has the wrong shape",
+        ));
+    };
+    if label.is_empty() || label.len() > 256 || label.chars().any(char::is_control) {
+        return Err(open_error(
+            INVALID_OPEN,
+            "a file filter label is outside the 256-byte text bound",
+        ));
+    }
+    for rule in rules
+        .values(32)
+        .map_err(|_| open_error(INVALID_OPEN, "a file filter exceeds 32 rules"))?
+    {
+        let pair = rule
+            .as_seq()
+            .ok_or_else(|| open_error(INVALID_OPEN, "a file filter rule is not a structure"))?
+            .values(2)
+            .map_err(|_| open_error(INVALID_OPEN, "a file filter rule is malformed"))?;
+        let [Value::Uint32(kind), Value::Str(pattern)] = pair.as_slice() else {
+            return Err(open_error(
+                INVALID_OPEN,
+                "a file filter rule has the wrong shape",
+            ));
+        };
+        if !matches!(*kind, 0 | 1)
+            || pattern.is_empty()
+            || pattern.len() > 256
+            || pattern.chars().any(char::is_control)
+        {
+            return Err(open_error(
+                INVALID_OPEN,
+                "a file filter rule is outside its closed bound",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_current_folder(value: wire::Seq<'_>) -> Result<(), PortalCallError> {
+    if value.signature() != "ay" {
+        return Err(open_error(
+            INVALID_OPEN,
+            "current_folder has the wrong type",
+        ));
+    }
+    let values = value
+        .values(1)
+        .map_err(|_| open_error(INVALID_OPEN, "current_folder is malformed"))?;
+    let Some(Value::Array(bytes)) = values.first() else {
+        return Err(open_error(
+            INVALID_OPEN,
+            "current_folder has the wrong shape",
+        ));
+    };
+    let bytes = bytes
+        .as_bytes()
+        .ok_or_else(|| open_error(INVALID_OPEN, "current_folder is not bytes"))?;
+    if bytes.len() > file_chooser::MAX_PATH_BYTES.saturating_add(1)
+        || bytes.last().copied() != Some(0)
+        || bytes
+            .get(..bytes.len().saturating_sub(1))
+            .is_some_and(|path| path.contains(&0))
+    {
+        return Err(open_error(
+            INVALID_OPEN,
+            "current_folder is not one bounded NUL-terminated path",
+        ));
+    }
+    Ok(())
+}
+
 fn two_strings<'a>(call: &'a Message<'a>) -> Option<(&'a str, &'a str)> {
     if !exact_signature(call, "ss") {
         return None;
@@ -1480,6 +2423,188 @@ fn background_token<'a>(call: &'a Message<'a>) -> Result<Option<&'a str>, &'stat
     Ok(token)
 }
 
+fn credentials_app_id(reply: &Message<'_>) -> io::Result<Option<String>> {
+    if reply.kind != MessageType::MethodReturn || reply.fields.signature != Some("a{sv}") {
+        return Err(io::Error::other(
+            "GetConnectionCredentials returned the wrong message shape",
+        ));
+    }
+    let [Value::Array(entries)] = reply.args() else {
+        return Err(io::Error::other(
+            "GetConnectionCredentials returned no credential dictionary",
+        ));
+    };
+    let mut uid = None;
+    let mut app_id = None;
+    for entry in entries.values(16).map_err(wire_error)? {
+        let pair = entry
+            .as_seq()
+            .ok_or_else(|| io::Error::other("a credential is not a dictionary entry"))?
+            .values(2)
+            .map_err(wire_error)?;
+        let [Value::Str(key), Value::Variant(value)] = pair.as_slice() else {
+            return Err(io::Error::other("a credential has the wrong shape"));
+        };
+        match *key {
+            "UnixUserID" => {
+                if uid.is_some() || value.signature() != "u" {
+                    return Err(io::Error::other(
+                        "GetConnectionCredentials repeated or mistyped UnixUserID",
+                    ));
+                }
+                let values = value.values(1).map_err(wire_error)?;
+                let Some(Value::Uint32(value)) = values.first() else {
+                    return Err(io::Error::other(
+                        "GetConnectionCredentials malformed UnixUserID",
+                    ));
+                };
+                uid = Some(*value);
+            }
+            "td.AppId" => {
+                if app_id.is_some() || value.signature() != "s" {
+                    return Err(io::Error::other(
+                        "GetConnectionCredentials repeated or mistyped td.AppId",
+                    ));
+                }
+                let values = value.values(1).map_err(wire_error)?;
+                let Some(Value::Str(value)) = values.first() else {
+                    return Err(io::Error::other(
+                        "GetConnectionCredentials malformed td.AppId",
+                    ));
+                };
+                app_id = Some((*value).to_string());
+            }
+            _ => {}
+        }
+    }
+    if uid != Some(UI_UID) {
+        return Err(io::Error::other(format!(
+            "GetConnectionCredentials returned uid {uid:?}, expected {UI_UID}"
+        )));
+    }
+    Ok(app_id)
+}
+
+fn refuse_open_file_identity(
+    connection: &mut Connection,
+    pending: &PendingOpen,
+    text: &str,
+) -> io::Result<()> {
+    if !pending.wants_reply {
+        return Ok(());
+    }
+    let serial = connection.next_serial()?;
+    let frame = method_error(
+        pending.endian,
+        serial,
+        pending.call_serial,
+        &pending.owner,
+        "org.freedesktop.portal.Error.NotAllowed",
+        text,
+    )?;
+    connection.write_frame(&frame)
+}
+
+fn refuse_open_file_limit(connection: &mut Connection, pending: &PendingOpen) -> io::Result<()> {
+    if !pending.wants_reply {
+        return Ok(());
+    }
+    let serial = connection.next_serial()?;
+    let frame = method_error(
+        pending.endian,
+        serial,
+        pending.call_serial,
+        &pending.owner,
+        "org.freedesktop.DBus.Error.LimitsExceeded",
+        "another FileChooser dialog is already active",
+    )?;
+    connection.write_frame(&frame)
+}
+
+fn refuse_open_file_reservation(
+    connection: &mut Connection,
+    pending: &PendingOpen,
+    error: ReserveError,
+) -> io::Result<()> {
+    if matches!(error, ReserveError::InvalidOwner) {
+        return Err(io::Error::other(
+            "the broker assigned a sender outside td-busd's unique-name shape",
+        ));
+    }
+    if !pending.wants_reply {
+        return Ok(());
+    }
+    let (name, text) = match error {
+        ReserveError::Duplicate => (
+            "org.freedesktop.portal.Error.Exists",
+            "that FileChooser Request already exists",
+        ),
+        ReserveError::OwnerFull | ReserveError::Full => (
+            "org.freedesktop.DBus.Error.LimitsExceeded",
+            "this portal has too many active handles",
+        ),
+        ReserveError::InvalidToken => (
+            "org.freedesktop.DBus.Error.InvalidArgs",
+            "the FileChooser handle token is invalid",
+        ),
+        ReserveError::InvalidOwner => return Ok(()),
+    };
+    let serial = connection.next_serial()?;
+    let frame = method_error(
+        pending.endian,
+        serial,
+        pending.call_serial,
+        &pending.owner,
+        name,
+        text,
+    )?;
+    connection.write_frame(&frame)
+}
+
+fn file_chooser_response(
+    endian: Endian,
+    serial: u32,
+    path: &str,
+    destination: &str,
+    outcome: &Result<file_chooser::Outcome, String>,
+) -> io::Result<Vec<u8>> {
+    if let Err(error) = outcome {
+        eprintln!("td-portal: FileChooser {path} failed: {error}");
+    }
+    message::Builder::signal(endian, path, handles::REQUEST_INTERFACE, "Response")
+        .destination(destination)
+        .serial(serial)
+        .body("ua{sv}", |writer| match outcome {
+            Ok(file_chooser::Outcome::Accepted(uris)) => {
+                writer.uint32(0);
+                writer.array("{sv}", |writer| {
+                    writer.dict_entry(|writer| {
+                        writer.string("uris")?;
+                        writer.variant("as", |writer| {
+                            writer.array("s", |writer| {
+                                for uri in uris {
+                                    writer.string(uri)?;
+                                }
+                                Ok(())
+                            })
+                        })
+                    })
+                })
+            }
+            Ok(file_chooser::Outcome::Cancelled) => {
+                writer.uint32(1);
+                writer.array("{sv}", |_| Ok(()))
+            }
+            Ok(file_chooser::Outcome::Pending) | Err(_) => {
+                writer.uint32(2);
+                writer.array("{sv}", |_| Ok(()))
+            }
+        })
+        .map_err(wire_error)?
+        .encode()
+        .map_err(message_error)
+}
+
 fn request_response(
     endian: Endian,
     serial: u32,
@@ -1597,6 +2722,7 @@ fn known_property_interface(interface: &str) -> bool {
         interface,
         SETTINGS_INTERFACE
             | BACKGROUND_INTERFACE
+            | FILE_CHOOSER_INTERFACE
             | PROPERTIES_INTERFACE
             | INTROSPECT_INTERFACE
             | PEER_INTERFACE
@@ -1607,6 +2733,7 @@ fn interface_version(interface: &str) -> Option<u32> {
     match interface {
         SETTINGS_INTERFACE => Some(SETTINGS_VERSION),
         BACKGROUND_INTERFACE => Some(BACKGROUND_VERSION),
+        FILE_CHOOSER_INTERFACE => Some(FILE_CHOOSER_VERSION),
         _ => None,
     }
 }
@@ -1969,6 +3096,100 @@ fn main() {
 }
 
 #[cfg(test)]
+mod confinement {
+    #![allow(clippy::unwrap_used)]
+
+    const SOURCES: &[(&str, &str)] = &[
+        ("file_chooser.rs", include_str!("file_chooser.rs")),
+        ("handles.rs", include_str!("handles.rs")),
+        ("main.rs", include_str!("main.rs")),
+        ("settings.rs", include_str!("settings.rs")),
+        ("sys.rs", include_str!("sys.rs")),
+        ("wayland_channel.rs", include_str!("wayland_channel.rs")),
+        ("wayland_dialog.rs", include_str!("wayland_dialog.rs")),
+    ];
+    const SYS: &str = include_str!("sys.rs");
+    const DIALOG: &str = include_str!("wayland_dialog.rs");
+
+    fn production(source: &str) -> &str {
+        source.split_once("#[cfg(test)]").unwrap().0
+    }
+
+    #[test]
+    fn unsafe_is_one_scoped_syscall_instruction() {
+        let keyword = format!("un{}", "safe");
+        let lint = format!("{keyword}_code");
+        assert_eq!(
+            SOURCES[2].1.matches(&format!("#![deny({lint})]")).count(),
+            1
+        );
+        for (name, source) in SOURCES {
+            let bare = production(source)
+                .matches(&keyword)
+                .count()
+                .saturating_sub(production(source).matches(&lint).count());
+            if *name == "sys.rs" {
+                assert_eq!(bare, 1, "{name}");
+                assert_eq!(source.matches(&format!("#[allow({lint})]")).count(), 1);
+            } else {
+                assert_eq!(bare, 0, "{name}");
+            }
+        }
+        assert_eq!(SYS.matches("core::arch::asm!").count(), 1);
+        assert_eq!(SYS.matches("\"syscall\"").count(), 1);
+    }
+
+    #[test]
+    fn syscall_and_descriptor_rosters_are_exact() {
+        for pin in [
+            "const SYS_CLOSE: usize = 3;",
+            "const SYS_SENDMSG: usize = 46;",
+            "const SYS_RECVMSG: usize = 47;",
+            "const SCM_RIGHTS: i32 = 1;",
+            "const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;",
+            "const MSG_NOSIGNAL: i32 = 0x4000;",
+        ] {
+            assert!(SYS.contains(pin), "missing syscall pin {pin}");
+        }
+        assert_eq!(SYS.matches("const SYS_").count(), 3);
+        assert_eq!(production(SYS).matches("syscall5(SYS_CLOSE,").count(), 1);
+        assert_eq!(production(SYS).matches("SYS_SENDMSG,").count(), 1);
+        assert_eq!(production(SYS).matches("SYS_RECVMSG,").count(), 1);
+        assert_eq!(production(SYS).matches("/proc/self/fd/{fd}").count(), 1);
+        assert_eq!(production(DIALOG).matches("sys::send_with_fd(").count(), 1);
+        assert_eq!(production(DIALOG).matches("sys::recv_with_fds(").count(), 1);
+        assert_eq!(
+            production(DIALOG)
+                .matches("sys::duplicate_received(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production(DIALOG).matches("sys::discard_received(").count(),
+            4
+        );
+    }
+
+    #[test]
+    fn confinement_inventory_covers_every_portal_source() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut actual = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("rs"))
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = SOURCES
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
@@ -2004,6 +3225,69 @@ mod tests {
             .unwrap()
             .encode()
             .unwrap()
+    }
+
+    fn open_file_call<F>(fill_options: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut Writer) -> Result<(), WireError>,
+    {
+        call(FILE_CHOOSER_INTERFACE, "OpenFile", "ssa{sv}", |writer| {
+            writer.string("wayland:0123456789abcdef")?;
+            writer.string("Choose a file")?;
+            writer.array("{sv}", fill_options)
+        })
+    }
+
+    fn credentials_reply(reply_serial: u32, uid: u32, app_id: Option<&str>) -> Vec<u8> {
+        message::Builder::method_return(Endian::Little, reply_serial)
+            .sender(BUS_NAME)
+            .destination(":1.10")
+            .serial(90)
+            .body("a{sv}", |writer| {
+                writer.array("{sv}", |writer| {
+                    writer.dict_entry(|writer| {
+                        writer.string("UnixUserID")?;
+                        writer.variant("u", |writer| {
+                            writer.uint32(uid);
+                            Ok(())
+                        })
+                    })?;
+                    if let Some(app_id) = app_id {
+                        writer.dict_entry(|writer| {
+                            writer.string("td.AppId")?;
+                            writer.variant("s", |writer| writer.string(app_id))
+                        })?;
+                    }
+                    Ok(())
+                })
+            })
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    fn malformed_credentials_reply(reply_serial: u32) -> Vec<u8> {
+        message::Builder::method_return(Endian::Little, reply_serial)
+            .sender(BUS_NAME)
+            .destination(":1.10")
+            .serial(90)
+            .body("s", |writer| writer.string("not a credential dictionary"))
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    fn pending_open(owner: &str, token: &str) -> PendingOpen {
+        PendingOpen {
+            endian: Endian::Little,
+            call_serial: 7,
+            owner: owner.into(),
+            wants_reply: true,
+            token: token.into(),
+            title: "Choose a file".into(),
+            parent_handle: String::new(),
+            mode: file_chooser::Mode::OpenFile { multiple: false },
+        }
     }
 
     fn dispatch_one(call: &Message<'_>, settings: &Settings, serial: u32) -> Vec<u8> {
@@ -2056,15 +3340,632 @@ mod tests {
             strings(&["--wayland", "relative"]),
             strings(&["--wayland"]),
             strings(&["--wayland", "/run/portal", "extra"]),
-            strings(&[
-                "--wayland",
-                "/run/portal",
-                "--wayland",
-                "/run/other"
-            ]),
+            strings(&["--wayland", "/run/portal", "--wayland", "/run/other"]),
         ] {
             assert!(parse_channel_path(&bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn open_file_parser_accepts_the_supported_portal_shape() {
+        let bytes = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("handle_token")?;
+                writer.variant("s", |writer| writer.string("pick_7"))
+            })?;
+            writer.dict_entry(|writer| {
+                writer.string("multiple")?;
+                writer.variant("b", |writer| {
+                    writer.bool(true);
+                    Ok(())
+                })
+            })?;
+            writer.dict_entry(|writer| {
+                writer.string("modal")?;
+                writer.variant("b", |writer| {
+                    writer.bool(true);
+                    Ok(())
+                })
+            })?;
+            writer.dict_entry(|writer| {
+                writer.string("future-option")?;
+                writer.variant("s", |writer| writer.string("ignored"))
+            })
+        });
+        let (call, _) = message::decode(&bytes, 0).unwrap();
+        let parsed = parse_open_file(&call).unwrap();
+        assert_eq!(parsed.token, "pick_7");
+        assert_eq!(parsed.title, "Choose a file");
+        assert_eq!(parsed.parent_handle, "0123456789abcdef");
+        assert_eq!(parsed.mode, file_chooser::Mode::OpenFile { multiple: true });
+
+        let malformed = call_at(
+            PORTAL_PATH,
+            ":1.9",
+            FILE_CHOOSER_INTERFACE,
+            "OpenFile",
+            "ssa{sv}",
+            |writer| {
+                writer.string("wayland:not a handle")?;
+                writer.string("Choose")?;
+                writer.array("{sv}", |_| Ok(()))
+            },
+        );
+        let (malformed, _) = message::decode(&malformed, 0).unwrap();
+        assert_eq!(parse_open_file(&malformed).unwrap_err().name, INVALID_OPEN);
+
+        let empty_title = call_at(
+            PORTAL_PATH,
+            ":1.9",
+            FILE_CHOOSER_INTERFACE,
+            "OpenFile",
+            "ssa{sv}",
+            |writer| {
+                writer.string("wayland:0123456789abcdef")?;
+                writer.string("")?;
+                writer.array("{sv}", |_| Ok(()))
+            },
+        );
+        let (empty_title, _) = message::decode(&empty_title, 0).unwrap();
+        assert_eq!(parse_open_file(&empty_title).unwrap().title, "");
+
+        let maximum_title = "a".repeat(MAX_FILE_CHOOSER_TITLE_BYTES);
+        let maximum = call_at(
+            PORTAL_PATH,
+            ":1.9",
+            FILE_CHOOSER_INTERFACE,
+            "OpenFile",
+            "ssa{sv}",
+            |writer| {
+                writer.string("wayland:0123456789abcdef")?;
+                writer.string(&maximum_title)?;
+                writer.array("{sv}", |_| Ok(()))
+            },
+        );
+        let (maximum, _) = message::decode(&maximum, 0).unwrap();
+        assert_eq!(
+            parse_open_file(&maximum).unwrap().title.len(),
+            MAX_FILE_CHOOSER_TITLE_BYTES
+        );
+    }
+
+    #[test]
+    fn recognized_unimplemented_open_file_options_are_refused() {
+        let accept_label = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("accept_label")?;
+                writer.variant("s", |writer| writer.string("Select"))
+            })
+        });
+        let filters = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("filters")?;
+                writer.variant("a(sa(us))", |writer| {
+                    writer.array("(sa(us))", |writer| {
+                        writer.structure(|writer| {
+                            writer.string("Text")?;
+                            writer.array("(us)", |writer| {
+                                writer.structure(|writer| {
+                                    writer.uint32(0);
+                                    writer.string("*.txt")
+                                })
+                            })
+                        })
+                    })
+                })
+            })
+        });
+        let current_filter = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("current_filter")?;
+                writer.variant("(sa(us))", |writer| {
+                    writer.structure(|writer| {
+                        writer.string("Text")?;
+                        writer.array("(us)", |writer| {
+                            writer.structure(|writer| {
+                                writer.uint32(0);
+                                writer.string("*.txt")
+                            })
+                        })
+                    })
+                })
+            })
+        });
+        for bytes in [accept_label, filters, current_filter] {
+            let (call, _) = message::decode(&bytes, 0).unwrap();
+            assert_eq!(parse_open_file(&call).unwrap_err().name, UNSUPPORTED_OPEN);
+        }
+    }
+
+    #[test]
+    fn save_methods_are_advertised_but_explicitly_unsupported() {
+        for method in ["OpenFile", "SaveFile", "SaveFiles"] {
+            let needle = format!("<method name=\"{method}\">");
+            assert_eq!(INTROSPECTION_XML.matches(&needle).count(), 1);
+        }
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        for method in ["SaveFile", "SaveFiles"] {
+            let bytes = call(FILE_CHOOSER_INTERFACE, method, "ssa{sv}", |writer| {
+                writer.string("")?;
+                writer.string("Save")?;
+                writer.array("{sv}", |_| Ok(()))
+            });
+            let (request, _) = message::decode(&bytes, 0).unwrap();
+            let reply = dispatch_one(&request, &settings, 12);
+            let (reply, _) = message::decode(&reply, 0).unwrap();
+            assert_eq!(reply.fields.error_name, Some(UNSUPPORTED_OPEN));
+
+            let malformed = call(FILE_CHOOSER_INTERFACE, method, "s", |writer| {
+                writer.string("bad")
+            });
+            let (malformed, _) = message::decode(&malformed, 0).unwrap();
+            let reply = dispatch_one(&malformed, &settings, 13);
+            let (reply, _) = message::decode(&reply, 0).unwrap();
+            assert_eq!(reply.fields.error_name, Some(INVALID_OPEN));
+        }
+    }
+
+    #[test]
+    fn open_file_first_queries_the_broker_for_its_sender_identity() {
+        let bytes = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("handle_token")?;
+                writer.variant("s", |writer| writer.string("brokered"))
+            })
+        });
+        let (call, _) = message::decode(&bytes, 0).unwrap();
+        let (service_stream, mut broker_stream) = UnixStream::pair().unwrap();
+        broker_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut connection = Connection {
+            stream: service_stream,
+            serial: 40,
+            unique: Some(":1.10".into()),
+            until: None,
+        };
+        let mut state = ServiceState::default();
+        begin_open_file(&mut connection, &mut state, &call).unwrap();
+        let IncomingFrame::Message(query) = read_frame(&mut broker_stream).unwrap() else {
+            panic!("identity query was not a complete frame");
+        };
+        let (query, _) = message::decode(&query, 0).unwrap();
+        assert_eq!(query.fields.destination, Some(BUS_NAME));
+        assert_eq!(query.fields.member, Some("GetConnectionCredentials"));
+        assert_eq!(query.args(), vec![Value::Str(":1.9")]);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(connection.serial, 41);
+    }
+
+    #[test]
+    fn open_file_identity_queries_have_global_and_per_owner_ceilings() {
+        assert_eq!(MAX_QUEUED_SERVICE_EVENTS, 32);
+        assert_eq!(MAX_PENDING_OPENS + 1, MAX_PENDING_IDENTITIES);
+        assert_eq!(
+            MAX_PENDING_OPENS_PER_OWNER + 1,
+            MAX_PENDING_IDENTITIES_PER_OWNER
+        );
+        let bytes = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("handle_token")?;
+                writer.variant("s", |writer| writer.string("bounded"))
+            })
+        });
+        let (call, _) = message::decode(&bytes, 0).unwrap();
+        for global in [false, true] {
+            let (service_stream, mut broker_stream) = UnixStream::pair().unwrap();
+            broker_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut connection = Connection {
+                stream: service_stream,
+                serial: 40,
+                unique: Some(":1.10".into()),
+                until: None,
+            };
+            let mut state = ServiceState::default();
+            let count = if global {
+                MAX_PENDING_OPENS
+            } else {
+                MAX_PENDING_OPENS_PER_OWNER
+            };
+            for index in 0..count {
+                let owner = if global {
+                    format!(":1.{}", index + 100)
+                } else {
+                    ":1.9".into()
+                };
+                state
+                    .pending
+                    .insert(index as u32 + 1, pending_open(&owner, "existing"));
+            }
+            begin_open_file(&mut connection, &mut state, &call).unwrap();
+            let IncomingFrame::Message(error) = read_frame(&mut broker_stream).unwrap() else {
+                panic!("identity ceiling refusal was not a complete frame");
+            };
+            let (error, _) = message::decode(&error, 0).unwrap();
+            assert_eq!(
+                error.fields.error_name,
+                Some("org.freedesktop.DBus.Error.LimitsExceeded")
+            );
+            assert_eq!(state.pending.len(), count);
+            assert_eq!(connection.serial, 41);
+        }
+    }
+
+    #[test]
+    fn active_audits_share_open_file_identity_ceilings() {
+        let bytes = open_file_call(|_| Ok(()));
+        let (call, _) = message::decode(&bytes, 0).unwrap();
+        for global in [false, true] {
+            let (service_stream, mut broker_stream) = UnixStream::pair().unwrap();
+            broker_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut connection = Connection {
+                stream: service_stream,
+                serial: 40,
+                unique: Some(":1.10".into()),
+                until: None,
+            };
+            let mut state = ServiceState::default();
+            let path = "/org/freedesktop/portal/desktop/request/1_8/audit";
+            let audit_owner = if global { ":1.8" } else { ":1.9" };
+            state.active.insert(
+                path.into(),
+                ActiveDialog {
+                    owner: audit_owner.into(),
+                    endian: Endian::Little,
+                    cancel: None,
+                    presented: true,
+                    cancelled: false,
+                },
+            );
+            state.pending_audits.insert(1, path.into());
+            let count = if global {
+                MAX_PENDING_IDENTITIES - 1
+            } else {
+                MAX_PENDING_IDENTITIES_PER_OWNER - 1
+            };
+            for index in 0..count {
+                let owner = if global {
+                    format!(":1.{}", index + 100)
+                } else {
+                    ":1.9".into()
+                };
+                state
+                    .pending
+                    .insert(index as u32 + 2, pending_open(&owner, "existing"));
+            }
+            begin_open_file(&mut connection, &mut state, &call).unwrap();
+            let IncomingFrame::Message(error) = read_frame(&mut broker_stream).unwrap() else {
+                panic!("shared identity ceiling refusal was not a complete frame");
+            };
+            let (error, _) = message::decode(&error, 0).unwrap();
+            assert_eq!(
+                error.fields.error_name,
+                Some("org.freedesktop.DBus.Error.LimitsExceeded")
+            );
+            assert_eq!(pending_identity_count(&state), count + 1);
+        }
+    }
+
+    #[test]
+    fn owner_audits_keep_a_reserved_lane_through_saturation() {
+        for global in [false, true] {
+            let (service_stream, mut broker_stream) = UnixStream::pair().unwrap();
+            broker_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut connection = Connection {
+                stream: service_stream,
+                serial: 40,
+                unique: Some(":1.10".into()),
+                until: None,
+            };
+            let mut state = ServiceState::default();
+            let path = "/org/freedesktop/portal/desktop/request/1_9/audit";
+            state.active.insert(
+                path.into(),
+                ActiveDialog {
+                    owner: ":1.9".into(),
+                    endian: Endian::Little,
+                    cancel: None,
+                    presented: true,
+                    cancelled: false,
+                },
+            );
+            let count = if global {
+                MAX_PENDING_OPENS
+            } else {
+                MAX_PENDING_OPENS_PER_OWNER
+            };
+            for index in 0..count {
+                let owner = if global {
+                    format!(":1.{}", index + 100)
+                } else {
+                    ":1.9".into()
+                };
+                state
+                    .pending
+                    .insert(index as u32 + 1, pending_open(&owner, "existing"));
+            }
+            begin_active_audit(&mut connection, &mut state).unwrap();
+            let IncomingFrame::Message(first_query) = read_frame(&mut broker_stream).unwrap()
+            else {
+                panic!("reserved owner audit was not a complete frame");
+            };
+            let (first_query, _) = message::decode(&first_query, 0).unwrap();
+            assert_eq!(first_query.fields.member, Some("GetConnectionCredentials"));
+            assert_eq!(
+                state.pending_audits.get(&41).map(String::as_str),
+                Some(path)
+            );
+            assert_eq!(pending_identity_count(&state), count + 1);
+            assert!(pending_identity_count(&state) <= MAX_PENDING_IDENTITIES);
+            assert!(
+                pending_identity_count_for_owner(&state, ":1.9")
+                    <= MAX_PENDING_IDENTITIES_PER_OWNER
+            );
+
+            let live = credentials_reply(41, UI_UID, Some("firefox"));
+            let (live, _) = message::decode(&live, 0).unwrap();
+            assert!(consume_active_audit_reply(&mut connection, &mut state, &live).unwrap());
+            assert!(state.pending_audits.is_empty());
+
+            let bytes = open_file_call(|_| Ok(()));
+            let (call, _) = message::decode(&bytes, 0).unwrap();
+            begin_open_file(&mut connection, &mut state, &call).unwrap();
+            let IncomingFrame::Message(refusal) = read_frame(&mut broker_stream).unwrap() else {
+                panic!("saturated OpenFile refusal was not a complete frame");
+            };
+            let (refusal, _) = message::decode(&refusal, 0).unwrap();
+            assert_eq!(
+                refusal.fields.error_name,
+                Some("org.freedesktop.DBus.Error.LimitsExceeded")
+            );
+
+            begin_active_audit(&mut connection, &mut state).unwrap();
+            let IncomingFrame::Message(second_query) = read_frame(&mut broker_stream).unwrap()
+            else {
+                panic!("second reserved owner audit was not a complete frame");
+            };
+            let (second_query, _) = message::decode(&second_query, 0).unwrap();
+            assert_eq!(second_query.fields.member, Some("GetConnectionCredentials"));
+            assert_eq!(
+                state.pending_audits.get(&43).map(String::as_str),
+                Some(path)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_app_identity_cannot_reach_the_download_grant_or_stop_the_service() {
+        for (uid, app_id, malformed) in [
+            (UI_UID, None, false),
+            (UI_UID, Some("not-firefox"), false),
+            (0, Some("firefox"), false),
+            (UI_UID, Some("firefox"), true),
+        ] {
+            let (service_stream, mut caller_stream) = UnixStream::pair().unwrap();
+            caller_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut connection = Connection {
+                stream: service_stream,
+                serial: 50,
+                unique: Some(":1.10".into()),
+                until: None,
+            };
+            let mut state = ServiceState::default();
+            state.pending.insert(41, pending_open(":1.9", "denied"));
+            let reply = if malformed {
+                malformed_credentials_reply(41)
+            } else {
+                credentials_reply(41, uid, app_id)
+            };
+            let (reply, _) = message::decode(&reply, 0).unwrap();
+            let (events, _) = mpsc::sync_channel(MAX_QUEUED_SERVICE_EVENTS);
+            assert!(consume_identity_reply(&mut connection, &mut state, &events, &reply).unwrap());
+            let IncomingFrame::Message(error) = read_frame(&mut caller_stream).unwrap() else {
+                panic!("identity refusal was not a complete frame");
+            };
+            let (error, _) = message::decode(&error, 0).unwrap();
+            assert_eq!(
+                error.fields.error_name,
+                Some("org.freedesktop.portal.Error.NotAllowed")
+            );
+            assert!(state.pending.is_empty());
+            assert!(state.active.is_empty());
+            assert_eq!(state.handles.len(), 0);
+        }
+    }
+
+    #[test]
+    fn cancelled_connecting_worker_refuses_an_authenticated_second_dialog() {
+        let (service_stream, mut caller_stream) = UnixStream::pair().unwrap();
+        caller_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut connection = Connection {
+            stream: service_stream,
+            serial: 50,
+            unique: Some(":1.10".into()),
+            until: None,
+        };
+        let mut state = ServiceState::default();
+        state.pending.insert(41, pending_open(":1.9", "second"));
+        let first = "/org/freedesktop/portal/desktop/request/1_8/first";
+        state.active.insert(
+            first.into(),
+            ActiveDialog {
+                owner: ":1.8".into(),
+                endian: Endian::Little,
+                cancel: None,
+                presented: true,
+                cancelled: false,
+            },
+        );
+        cancel_dialog(&mut state, first).unwrap();
+        assert!(state.active.get(first).unwrap().cancelled);
+        let reply = credentials_reply(41, UI_UID, Some("firefox"));
+        let (reply, _) = message::decode(&reply, 0).unwrap();
+        let (events, _) = mpsc::sync_channel(MAX_QUEUED_SERVICE_EVENTS);
+        assert!(consume_identity_reply(&mut connection, &mut state, &events, &reply).unwrap());
+        let IncomingFrame::Message(error) = read_frame(&mut caller_stream).unwrap() else {
+            panic!("active-dialog refusal was not a complete frame");
+        };
+        let (error, _) = message::decode(&error, 0).unwrap();
+        assert_eq!(
+            error.fields.error_name,
+            Some("org.freedesktop.DBus.Error.LimitsExceeded")
+        );
+        assert!(state.pending.is_empty());
+        assert_eq!(state.active.len(), MAX_ACTIVE_FILE_CHOOSERS);
+        assert_eq!(state.handles.len(), 0);
+    }
+
+    #[test]
+    fn cancelling_a_dialog_closes_its_worker_connection() {
+        let path = "/org/freedesktop/portal/desktop/request/1_9/cancel";
+        let (service_stream, mut worker_stream) = UnixStream::pair().unwrap();
+        worker_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut state = ServiceState::default();
+        state.active.insert(
+            path.into(),
+            ActiveDialog {
+                owner: ":1.9".into(),
+                endian: Endian::Little,
+                cancel: Some(service_stream),
+                presented: true,
+                cancelled: false,
+            },
+        );
+        cancel_dialog(&mut state, path).unwrap();
+        assert_eq!(state.active.len(), 1);
+        assert!(state.active.get(path).unwrap().cancelled);
+        let mut byte = [0_u8; 1];
+        assert_eq!(worker_stream.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn active_owner_audit_retires_and_cancels_a_departed_caller() {
+        let (service_stream, mut broker_stream) = UnixStream::pair().unwrap();
+        broker_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut connection = Connection {
+            stream: service_stream,
+            serial: 50,
+            unique: Some(":1.10".into()),
+            until: None,
+        };
+        let mut state = ServiceState::default();
+        let path = state
+            .handles
+            .reserve(HandleKind::Request, ":1.9", "audited")
+            .unwrap();
+        let (cancel_stream, mut worker_stream) = UnixStream::pair().unwrap();
+        worker_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        state.active.insert(
+            path.clone(),
+            ActiveDialog {
+                owner: ":1.9".into(),
+                endian: Endian::Little,
+                cancel: Some(cancel_stream),
+                presented: true,
+                cancelled: false,
+            },
+        );
+        begin_active_audit(&mut connection, &mut state).unwrap();
+        let IncomingFrame::Message(query) = read_frame(&mut broker_stream).unwrap() else {
+            panic!("owner audit was not a complete frame");
+        };
+        let (query, _) = message::decode(&query, 0).unwrap();
+        assert_eq!(query.fields.member, Some("GetConnectionCredentials"));
+        assert_eq!(query.args(), vec![Value::Str(":1.9")]);
+        assert_eq!(state.pending_audits.get(&51), Some(&path));
+
+        let error = message::Builder::error(
+            Endian::Little,
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+            51,
+        )
+        .sender(BUS_NAME)
+        .destination(":1.10")
+        .serial(90)
+        .encode()
+        .unwrap();
+        let (error, _) = message::decode(&error, 0).unwrap();
+        assert!(consume_active_audit_reply(&mut connection, &mut state, &error).unwrap());
+        let IncomingFrame::Message(response) = read_frame(&mut broker_stream).unwrap() else {
+            panic!("lost-owner response was not a complete frame");
+        };
+        let (response, _) = message::decode(&response, 0).unwrap();
+        assert_eq!(response.fields.path, Some(path.as_str()));
+        assert_eq!(response.fields.destination, Some(":1.9"));
+        assert_eq!(response.args().first(), Some(&Value::Uint32(2)));
+        assert!(state.pending_audits.is_empty());
+        assert_eq!(state.handles.len(), 0);
+        assert!(state.active.get(&path).unwrap().cancelled);
+        let mut byte = [0_u8; 1];
+        assert_eq!(worker_stream.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn accepted_file_chooser_response_is_directed_and_carries_guest_uris() {
+        let path = "/org/freedesktop/portal/desktop/request/1_9/pick";
+        let bytes = file_chooser_response(
+            Endian::Little,
+            71,
+            path,
+            ":1.9",
+            &Ok(file_chooser::Outcome::Accepted(vec![
+                "file:///home/td/Downloads/report.txt".into(),
+            ])),
+        )
+        .unwrap();
+        let (response, _) = message::decode(&bytes, 0).unwrap();
+        assert_eq!(response.kind, MessageType::Signal);
+        assert_eq!(response.fields.destination, Some(":1.9"));
+        assert_eq!(response.fields.path, Some(path));
+        let [Value::Uint32(0), Value::Array(results)] = response.args() else {
+            panic!("accepted response has the wrong shape");
+        };
+        let entries = results.values(1).unwrap();
+        let pair = entries[0].as_seq().unwrap().values(2).unwrap();
+        assert_eq!(pair[0], Value::Str("uris"));
+        let Value::Variant(uris) = pair[1] else {
+            panic!("uris result is not a variant");
+        };
+        let values = uris.values(1).unwrap();
+        let Value::Array(uris) = values[0] else {
+            panic!("uris result is not an array");
+        };
+        assert_eq!(
+            uris.values(1).unwrap(),
+            vec![Value::Str("file:///home/td/Downloads/report.txt")]
+        );
+    }
+
+    #[test]
+    fn pre_presentation_completion_preserves_the_worker_diagnostic() {
+        let failure = require_presented_outcome(false, Err("registry mismatch".into()));
+        assert_eq!(failure.unwrap_err(), "registry mismatch");
+        let success = require_presented_outcome(
+            false,
+            Ok(file_chooser::Outcome::Accepted(vec![
+                "file:///home/td/Downloads/report.txt".into(),
+            ])),
+        );
+        assert_eq!(
+            success.unwrap_err(),
+            "FileChooser completed before a presented modal frame"
+        );
     }
 
     #[test]
@@ -2128,6 +4029,22 @@ mod tests {
         let (reply, _) = message::decode(&reply, 0).unwrap();
         assert_eq!(reply.fields.signature, Some("v"));
         assert_eq!(reply.body_bytes(), expected_version().unwrap());
+    }
+
+    #[test]
+    fn file_chooser_publishes_version_three() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        let bytes = call(PROPERTIES_INTERFACE, "Get", "ss", |writer| {
+            writer.string(FILE_CHOOSER_INTERFACE)?;
+            writer.string("version")
+        });
+        let (request, _) = message::decode(&bytes, 0).unwrap();
+        let reply = dispatch_one(&request, &settings, 12);
+        let (reply, _) = message::decode(&reply, 0).unwrap();
+        let [Value::Variant(version)] = reply.args() else {
+            panic!("FileChooser version is not a variant");
+        };
+        assert_eq!(version.values(1).unwrap(), vec![Value::Uint32(3)]);
     }
 
     #[test]
