@@ -5323,15 +5323,23 @@ deployment acknowledgement.
 
 A second, likewise non-health-authoritative evidence unit exercises the
 private compositor channel described below. As uid 1000 it performs
-`wl_display.get_registry` followed by `wl_display.sync`, requires the exact
-ten-global public registry in its pinned order and versions, and rejects any
-premature `td_portal_manager_v1`. Only then does it emit
-`TD-PORTAL-CHANNEL-READY globals=10 privileged=0`; QEMU accepts only the exact
-td-svc-prefixed `portal-channel-evidence:` line. This composes the shipped
-socket, compositor server, shared safe Wayland codec, portal binary, service
-argv, and uid without pretending that the privileged manager is served yet.
-One 20-second deadline begins before the Unix connect, so an unavailable or
-backlog-stalled endpoint cannot leave this diagnostic client waiting forever.
+`wl_display.get_registry` followed by `wl_display.sync`, requires the private
+registry's exact eleven globals in their pinned order and versions, binds the
+private-only `td_portal_manager_v1`, constructs an xdg-toplevel, and requires
+the exact standalone and dismissal acknowledgements for an intentionally
+empty parent handle before a second sync. Only then does it emit
+`TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2`; QEMU accepts only
+the exact td-svc-prefixed
+`portal-channel-evidence:` line. This composes the shipped socket, compositor
+server, uid-1000 peer check, shared safe Wayland codec, manager dispatch,
+portal binary, service argv, and uid. One 20-second deadline begins before the
+Unix connect, so an unavailable or backlog-stalled endpoint cannot leave this
+diagnostic client waiting forever; 32 messages and 256 KiB bound the exchange.
+The byte bound is cumulative across both exchanges, including messages already
+decoded into the retained global table. This target probe proves the shipped
+private transport and standalone request lifecycle; a host wire regression
+uses a live mapped export to prove parent association, asynchronous revocation,
+re-association, and dismissal.
 
 ### Request — landed core; Session — staged core
 
@@ -5519,47 +5527,85 @@ socket, `/run/user/1000/td-portal-wayland-0`, that no jail ever mounts —
 so the privileged interface is not reachable to be mis-served. That is
 td-seatd's argument in the same words: the boundary is what a process can
 *name*, and an absent socket fails safe in a way a conditional does not.
-Both mechanisms may be used together — the private socket SHOULD also
-check `SO_PEERCRED`, since defence in depth costs one call here — but the
-socket is the boundary and the credential is the belt.
+Both mechanisms are now used together — the private socket also checks exact
+uid-1000 `SO_PEERCRED` — but the socket is the boundary and the credential is
+the belt.
 
-**The private transport has LANDED, not the privileged interface.**
+**The private transport and first privileged manager slice have LANDED.**
 `td-compositor` resolves the public, private, and application-evidence
 endpoints once, refuses aliases, binds both mode-0600 Wayland listeners before
-its ordinary readiness marker, and admits their clients through one shared
-32-connection ceiling. The private endpoint is bound before the public
-readiness endpoint, so a successful ordinary readiness connection implies
-both names exist. The private listener currently advertises the same
-exact ten public globals as `/run/user/1000/wayland-0` and deliberately does
-not advertise `td_portal_manager_v1`. `td-portal channel-probe` uses only the
-compositor's safe framing codec — not `conn.rs`, SCM_RIGHTS, or a new unsafe
-surface — to pin that state on the system image. The manager, peer-credential
-check, and dialog operations land together when requests are genuinely
-served; until then the private path confers no compositor privilege.
+its ordinary readiness marker, and admits at most 30 public clients plus two
+independently reserved private clients. That preserves the former 32-client
+total without letting public load starve the portal. The private endpoint is
+bound before the public readiness endpoint, so a successful ordinary readiness
+connection implies both names exist. Its accept loop reads one exact 12-byte
+`SO_PEERCRED` result before consuming a private slot and accepts only uid 1000.
+The accepted socket receives finite 30-second read and write inactivity
+timeouts, so two idle or backpressured peers release both reserved slots. The
+path remains the jail boundary; the credential is defence in depth. Uid 1000
+is the system's fixed UI identity and the target QEMU proof cross-checks it.
+An active unconfined same-uid process can keep either slot live by speaking the
+protocol, which is part of the already stated v1 same-uid exposure rather than
+a substitute isolation boundary.
+
+The private listener advertises the same exact ten globals as
+`/run/user/1000/wayland-0`, followed by private-only
+`td_portal_manager_v1` v1. Its current request surface is deliberately small:
+`get_dialog(wl_surface, parent_handle, flags)` accepts only an existing
+xdg-toplevel, a handle of at most 128 bytes, and zero flags; it returns a
+`dialog_state` of `parented` for a live mapped xdg-foreign handle or
+`standalone` for an empty, unknown, or unmapped one. Parent cycles are typed
+errors. `dismiss_dialog(wl_surface)` removes only a relationship still sourced
+from this manager and returns `dismissed`, so a later local or ordinary
+xdg-foreign replacement survives. Export destruction, including
+exporting-client departure, revokes relationships created through that exact
+handle and asynchronously reports `standalone` to the exact live manager
+generation. Per-dialog revisions suppress a queued revocation after a newer
+association or dismissal, object-id reuse cannot
+receive an old event, and manager destruction removes its relationships.
+Bookkeeping retains at most one revision per client-owned surface object and
+retires it with that object, beneath the client's 512-object ceiling. The
+bounded per-client delivery path performs no socket I/O under the shared
+runtime lock. If unmapping discards a portal relationship rather than
+reparenting it to a mapped ancestor, the same exact revision receives a
+`standalone` notice. The shared xdg-foreign engine supplies adjacent
+placement, focus grouping, workspace following, and mapped/unmapped lifecycle;
+the manager does not yet float, centre, modalize, capture, inhibit, or notify.
+
+`td-portal channel-probe` uses only the compositor's safe framing codec — not
+`conn.rs`, SCM_RIGHTS, or a new unsafe transport surface — to pin the exact
+private registry and both dialog states on the system image. The normal portal
+daemon does not yet retain the private connection or route a D-Bus dialog
+request through it; that belongs to the first dialog-owning portal interface.
 
 **What that boundary does not survive is an escape, and it is worth
 naming the consequence rather than leaving it implied by §L.** Path
-visibility is a mount-namespace property. Once the manager lands, an
+visibility is a mount-namespace property. An
 application that breaks out of the filesystem jail will still be uid 1000 in
 v1, so it can open `/run/user/1000/td-portal-wayland-0` directly and drive
-`td_portal_manager_v1` with no portal UI in the way — which means
-screenshot and screencast without the dialog that authorizes them, the
-one capability the portal exists to gate. The jail is the boundary; the
-socket path is an organizing convention behind it, not a second lock.
+`td_portal_manager_v1` with no portal UI in the way. The currently landed
+manager exposes only parent association and dismissal, not pixels or another
+user capability, but adding capture or inhibition would make that bypass
+security-relevant. The jail is the boundary; the socket path is an organizing
+convention behind it, not a second lock.
 
 This is the same v1 same-uid exposure §L records, but it is worth
 separating because its blast radius is worse than the general case: most
 of what an escaped app gains at uid 1000 it could already ask for
-through the portal *with* a prompt, whereas this specific bypass converts
-a prompted capability into a silent one. Per-app uids close it, which is
-a further argument for scheduling them; until then, the honest statement
-is that the portal authorizes **confined** applications and stops meaning
-anything the moment confinement fails.
+through the portal *with* a prompt, whereas a future capture operation on this
+channel would convert a prompted capability into a silent one. Per-app uids
+close it, which is a further argument for scheduling them before that
+operation; until then, the honest statement is that the portal authorizes
+**confined** applications and stops meaning anything the moment confinement
+fails.
 
 ```
 td_portal_manager_v1
-  get_dialog(wl_surface, parent_token, flags)   float, centre, modalize
+  # v1 currently served
+  get_dialog(wl_surface, parent_token, flags)   associate or standalone
   dismiss_dialog(wl_surface)
+
+  # future requests, not in v1's current wire surface
   capture_output(request, output, flags)        bounded screenshot bytes
   capture_toplevel(request, app_id, parent_token)
   create_idle_inhibitor(id, app_id, reason)
@@ -5568,9 +5614,9 @@ td_portal_manager_v1
   get_parent(token)                             resolve an xdg-foreign handle
 ```
 
-The frame crosses as a descriptor into a plain unlinked temp file the
-portal creates under `/run/user/1000` — no memfd syscall, no new surface,
-since td-portal rides `conn.rs`.
+The future capture frame crosses as a descriptor into a plain unlinked temp
+file the portal creates under `/run/user/1000` — no memfd syscall, no new
+surface, since td-portal rides `conn.rs`.
 
 **"No new surface" is right about SYSCALLS and wrong about the roster**,
 which is a distinction `UNSAFE.md` §6 draws deliberately and this
@@ -5582,7 +5628,7 @@ is all the caller scan looks for. A portal personality holding one is a
 FOURTH user, and `UNSAFE.md` says in terms that a module joining that
 roster is an amendment. The confinement test will red the landing, which
 is the mechanism working; what was missing is that §V.2's sequencing of
-the three surface amendments has no row for this one, and it belongs
+the existing unsafe-surface amendments has no row for this one, and it belongs
 beside them.
 
 **Two corrections to that, both from review, and both about the gap
@@ -6392,7 +6438,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | **clipboard producer and cross-client paste LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status. The image oracle physically types `Welcome`, waits until its exact rendered cells are attested, selects them, waits for exact seven-byte source admission, then requires both td-term's exact-payload transfer record and Firefox's browser-chrome observation; client cursors landed separately (`1c4b7f88`) | a real terminal selection reaches Firefox through core Wayland clipboard without manual testing |
-| 21 | **xdg-foreign + private portal socket LANDED**; privileged manager and dialog placement remain | modal portal window |
+| 21 | **xdg-foreign + private portal manager parent association LANDED**; floating/centering, modal capture, and a D-Bus dialog consumer remain | modal portal window |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |

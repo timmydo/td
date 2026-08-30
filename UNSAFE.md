@@ -51,7 +51,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `fcntl(2)` with two value-pinned commands, `ioctl(2)`; plus one scoped client-side clipboard descriptor adoption |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)`; plus one scoped client-side clipboard descriptor adoption |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation |
@@ -304,14 +304,20 @@ delayed).
 
 ## 6. `td-compositor` — the software Wayland server
 
-The `td-compositor` software Wayland server, whose one `syscall3` body in
+The `td-compositor` software Wayland server, whose one `syscall5` body in
 `td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm, clipboard and
 demo-client keymap SCM_RIGHTS reception, `close(2)` for a received descriptor
 after safe duplication through `/proc/self/fd/N` or after its lifetime as an
 exact clipboard endpoint, and `sendmsg(2)` for the
 td-native demo client's wl_shm pool descriptor, the server's wl_keyboard
 keymap descriptor, and the transport selftest. Stable Rust exposes no
-stable ancillary-data API. It also carries `fcntl(2)` with only `F_GETFL=3`
+stable ancillary-data API. The same body carries `getsockopt(2)` once per
+accepted private-portal connection, with level fixed to `SOL_SOCKET=1`, option
+fixed to x86-64 `SO_PEERCRED=17`, and an exact 12-byte `[u32; 3]` result. The
+wrapper refuses a different returned length and exposes only the uid word;
+`server.rs` has one pinned caller and accepts only uid 1000 before allocating a
+private client slot. Stable `std` exposes neither Unix peer credentials nor a
+safe wrapper for this option. It also carries `fcntl(2)` with only `F_GETFL=3`
 and `F_SETFL=4`: `conn.rs` temporarily adds x86-64 `O_NONBLOCK=0o4000` while
 the bounded clipboard writer drains one destination, then restores the exact
 prior status word. This closes the indefinite-write denial of service without
@@ -407,10 +413,11 @@ that outlived a crash would leave a keyboard nothing can type on.
 specification. Its confinement tests pin the allow count, assembly body,
 syscall numbers, callers, and absence of unsafe from every other module;
 adding another syscall or scoped allow is an amendment there AND here. The
-three surfaces behind the one body are pinned to disjoint modules —
+four surfaces behind the one body are pinned to their modules —
 transport to `client.rs`/`conn.rs`/`server.rs`, terminal control to
-`pty.rs`, the absolute-axis range to `input.rs`, and no other module names
-`sys` at all. `conn.rs` is the client
+`pty.rs`, the absolute-axis range to `input.rs`, and private peer
+authentication only to `server.rs`; no other module names `sys` at all.
+`conn.rs` is the client
 transport itself, extracted from `client.rs` so the terminal is a second
 USER of one connection rather than a second copy of it; the descriptor
 queue is intrinsic to that connection, so it moved with it. That widens the
@@ -1340,8 +1347,8 @@ is an amendment here.
 descriptor passing D-Bus requires of a broker, and `getsockopt(2)` for
 exactly TWO value-pinned options at `SOL_SOCKET`, `SO_PEERCRED` and
 `SO_PEERPIDFD`. The body is
-`syscall5` rather than td-compositor's `syscall3` because `getsockopt`
-takes five arguments; the two message calls use three of the five and pass
+`syscall5`, like td-compositor now that its private listener also uses
+`getsockopt`; the two message calls use three of the five arguments and pass
 zero for the rest.
 
 `SO_PEERCRED` is read because the EXTERNAL mechanism in `auth.rs` has

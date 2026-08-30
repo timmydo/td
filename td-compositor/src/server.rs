@@ -7,8 +7,9 @@ use crate::positioner::{Anchor, Gravity, Positioner, Rect as PositionerRect};
 use crate::runtime::{
     ApplicationCursorEvidence, ApplicationEvidence, MAX_APPLICATION_PIXEL_SCAN,
     MIN_APPLICATION_CONTENT_PIXELS, DataSourceIdentity, ForeignImportIdentity, KeyboardDelivery,
-    KeyboardSubscriptionStop, PopupRegistration, PopupRegistrations, Runtime, SelectionSource,
-    SelectionUpdate, SubscriptionStop, ToplevelParentError,
+    KeyboardSubscriptionStop, PopupRegistration, PopupRegistrations, PortalDialogNotice,
+    PortalManagerIdentity, Runtime, SelectionSource, SelectionUpdate, SubscriptionStop,
+    ToplevelParentError,
 };
 use crate::scene::{
     CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, Surface, SurfaceKey,
@@ -46,6 +47,7 @@ const GLOBAL_SUBCOMPOSITOR: u32 = 7;
 const GLOBAL_DATA_DEVICE_MANAGER: u32 = 8;
 const GLOBAL_XDG_EXPORTER: u32 = 9;
 const GLOBAL_XDG_IMPORTER: u32 = 10;
+const GLOBAL_PORTAL_MANAGER: u32 = 11;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 /// Three of `xdg_surface.error`, each named by the protocol for exactly the
 /// mistake it is raised for: a request to an xdg_surface that has no role
@@ -106,6 +108,13 @@ const WL_DATA_OFFER_OFFER: u16 = 0;
 const XDG_FOREIGN_ERROR_INVALID_SURFACE: u32 = 0;
 const XDG_EXPORTED_HANDLE: u16 = 0;
 const XDG_IMPORTED_DESTROYED: u16 = 0;
+const PORTAL_MANAGER_ERROR_INVALID_SURFACE: u32 = 0;
+const PORTAL_MANAGER_ERROR_INVALID_PARENT: u32 = 1;
+const PORTAL_MANAGER_ERROR_INVALID_FLAGS: u32 = 2;
+const PORTAL_DIALOG_STATE: u16 = 0;
+const PORTAL_DIALOG_STANDALONE: u32 = 0;
+const PORTAL_DIALOG_PARENTED: u32 = 1;
+const PORTAL_DIALOG_DISMISSED: u32 = 2;
 /// `wl_pointer.axis_source`'s `wheel`. The other three sources — finger,
 /// continuous, wheel tilt — describe devices this compositor does not read,
 /// and naming one it cannot tell apart would be worse than the silence a
@@ -162,7 +171,10 @@ const MAX_CLIENT_SHM_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CLIENT_BUFFER: usize = 256 * 1024;
 const MAX_PENDING_FDS: usize = 64;
 const MAX_OBJECTS: usize = 512;
-const MAX_CLIENTS: usize = 32;
+const MAX_PUBLIC_CLIENTS: usize = 30;
+const MAX_PORTAL_CLIENTS: usize = 2;
+const PORTAL_UID: u32 = 1000;
+const PORTAL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CACHED_SUBSURFACE_COMMITS: usize = 128;
 const MAX_PENDING_FRAME_CALLBACKS: usize = 256;
 const MAX_SURFACE_OUTPUT_MULTIPLIER: usize = 2;
@@ -181,7 +193,7 @@ const MAX_DATA_SOURCE_MIME_BYTES: usize = 16 * 1024;
 const MAX_MIME_TYPE_BYTES: usize = 256;
 const DATA_DEVICE_MANAGER_VERSION: u32 = 3;
 const XDG_FOREIGN_VERSION: u32 = 1;
-const ADVERTISED_GLOBALS: [(u32, &str, u32); 10] = [
+const PUBLIC_GLOBALS: [(u32, &str, u32); 10] = [
     (GLOBAL_COMPOSITOR, "wl_compositor", 4),
     (GLOBAL_SUBCOMPOSITOR, "wl_subcompositor", 1),
     (GLOBAL_SHM, "wl_shm", 1),
@@ -197,6 +209,8 @@ const ADVERTISED_GLOBALS: [(u32, &str, u32); 10] = [
     (GLOBAL_XDG_IMPORTER, "zxdg_importer_v2", XDG_FOREIGN_VERSION),
     (GLOBAL_SEAT, "wl_seat", SEAT_VERSION),
 ];
+const PORTAL_MANAGER_GLOBAL: (u32, &str, u32) =
+    (GLOBAL_PORTAL_MANAGER, "td_portal_manager_v1", 1);
 const MAX_FOREIGN_HANDLE_BYTES: usize = 128;
 const DND_ACTION_MASK: u32 = 1 | 2 | 4;
 
@@ -206,7 +220,10 @@ static NEXT_BUFFER_SERIAL: AtomicU64 = AtomicU64::new(1);
 static NEXT_KEYMAP_FILE: AtomicU64 = AtomicU64::new(1);
 static NEXT_DATA_SOURCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_FOREIGN_IMPORT: AtomicU64 = AtomicU64::new(1);
-static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+static NEXT_PORTAL_MANAGER: AtomicU64 = AtomicU64::new(1);
+static NEXT_PORTAL_DIALOG_REVISION: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_PUBLIC_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_PORTAL_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 struct Pool {
@@ -396,6 +413,13 @@ impl DataObjectState {
 
 type SharedDataObjects = Arc<DataObjectState>;
 type SharedForeignImports = Arc<Mutex<BTreeMap<u32, u64>>>;
+#[derive(Default)]
+struct PortalManagerState {
+    managers: BTreeMap<u32, PortalManagerIdentity>,
+    dialogs: BTreeMap<u32, (PortalManagerIdentity, u64)>,
+}
+
+type SharedPortalManagers = Arc<Mutex<PortalManagerState>>;
 
 #[derive(Clone, Default)]
 struct SurfaceState {
@@ -573,6 +597,15 @@ enum Object {
     ToplevelDecoration {
         toplevel: u32,
     },
+    PortalManager {
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientAccess {
+    Public,
+    Portal,
 }
 
 #[derive(Clone)]
@@ -634,7 +667,12 @@ impl Outbound {
                 self.disconnected = true;
                 Ok(())
             }
-            Err(error) => Err(format!("write Wayland event: {error}")),
+            Err(error) => {
+                // write_all may already have emitted a prefix. No later event
+                // may be appended to a stream whose framing is now unknown.
+                self.disconnected = true;
+                Err(format!("write Wayland event: {error}"))
+            }
         }
     }
 
@@ -648,7 +686,10 @@ impl Outbound {
                 self.disconnected = true;
                 Ok(())
             }
-            Err(error) => Err(format!("send Wayland descriptor event: {error}")),
+            Err(error) => {
+                self.disconnected = true;
+                Err(format!("send Wayland descriptor event: {error}"))
+            }
         }
     }
 
@@ -660,6 +701,7 @@ impl Outbound {
 
 struct Client {
     id: u64,
+    access: ClientAccess,
     stream: UnixStream,
     outbound: Arc<Mutex<Outbound>>,
     configurations: Arc<Mutex<BTreeMap<SurfaceKey, ConfigureRegistration>>>,
@@ -672,6 +714,7 @@ struct Client {
     data_device_active: Arc<AtomicBool>,
     data_objects: SharedDataObjects,
     foreign_imports: SharedForeignImports,
+    portal_managers: SharedPortalManagers,
     pending_deletes: PendingDeletes,
     objects: BTreeMap<u32, Object>,
     /// Events produced while the runtime lock is held for one compound commit.
@@ -697,24 +740,30 @@ struct Client {
     resources: Arc<ClientResourceHighWater>,
 }
 
-struct ClientPermit;
+struct ClientPermit {
+    access: ClientAccess,
+}
 
 impl ClientPermit {
-    fn acquire() -> Result<ClientPermit, String> {
-        let mut current = ACTIVE_CLIENTS.load(Ordering::Acquire);
+    fn acquire(access: ClientAccess) -> Result<ClientPermit, String> {
+        let (active, limit, label) = match access {
+            ClientAccess::Public => (&ACTIVE_PUBLIC_CLIENTS, MAX_PUBLIC_CLIENTS, "public"),
+            ClientAccess::Portal => (&ACTIVE_PORTAL_CLIENTS, MAX_PORTAL_CLIENTS, "portal"),
+        };
+        let mut current = active.load(Ordering::Acquire);
         loop {
-            if current >= MAX_CLIENTS {
+            if current >= limit {
                 return Err(format!(
-                    "refusing Wayland client: {current} connections already active"
+                    "refusing {label} Wayland client: {current} connections already active"
                 ));
             }
-            match ACTIVE_CLIENTS.compare_exchange_weak(
+            match active.compare_exchange_weak(
                 current,
                 current.saturating_add(1),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(ClientPermit),
+                Ok(_) => return Ok(ClientPermit { access }),
                 Err(observed) => current = observed,
             }
         }
@@ -723,7 +772,10 @@ impl ClientPermit {
 
 impl Drop for ClientPermit {
     fn drop(&mut self) {
-        ACTIVE_CLIENTS.fetch_sub(1, Ordering::AcqRel);
+        match self.access {
+            ClientAccess::Public => ACTIVE_PUBLIC_CLIENTS.fetch_sub(1, Ordering::AcqRel),
+            ClientAccess::Portal => ACTIVE_PORTAL_CLIENTS.fetch_sub(1, Ordering::AcqRel),
+        };
     }
 }
 
@@ -1524,6 +1576,45 @@ fn send_foreign_destroyed(
     Ok(())
 }
 
+fn send_portal_dialogs_standalone(
+    managers: &SharedPortalManagers,
+    outbound: &Arc<Mutex<Outbound>>,
+    notices: &[PortalDialogNotice],
+) -> Result<(), String> {
+    let mut managers = managers
+        .lock()
+        .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
+    let mut messages = Vec::new();
+    for notice in notices {
+        if managers.managers.get(&notice.manager.object).copied() != Some(notice.manager)
+            || managers.dialogs.get(&notice.surface).copied()
+                != Some((notice.manager, notice.revision))
+        {
+            continue;
+        }
+        managers.dialogs.remove(&notice.surface);
+        let mut event = wire::Builder::new();
+        event.u32(notice.surface);
+        event.u32(PORTAL_DIALOG_STANDALONE);
+        messages.push(event.message(notice.manager.object, PORTAL_DIALOG_STATE)?);
+    }
+    if messages.is_empty() {
+        return Ok(());
+    }
+    // Keep the client-local registration gate through delivery. A concurrent
+    // get/dismiss records its newer revision and acknowledgement under this
+    // same gate, so a queued revocation can neither follow that newer answer
+    // nor resurrect a recycled manager id. No Runtime lock is held here, and
+    // the private socket has a finite write timeout.
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    for message in messages {
+        outbound.send(&message)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seat_worker(
     receiver: Receiver<KeyboardDelivery>,
@@ -1535,6 +1626,7 @@ fn seat_worker(
     pending_deletes: PendingDeletes,
     data: SharedDataObjects,
     foreign_imports: SharedForeignImports,
+    portal_managers: SharedPortalManagers,
     outbound: Arc<Mutex<Outbound>>,
 ) -> Result<(), String> {
     while let Ok(delivery) = receiver.recv() {
@@ -1643,6 +1735,17 @@ fn seat_worker(
                 }
                 continue;
             }
+            KeyboardDelivery::PortalDialogsStandalone(notices) => {
+                send_portal_dialogs_standalone(&portal_managers, &outbound, &notices)?;
+                if outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .disconnected
+                {
+                    return Ok(());
+                }
+                continue;
+            }
             KeyboardDelivery::PopupDone { surface, popup } => {
                 dismiss_from_seat(surface, popup, &popups, &outbound)?;
                 if outbound
@@ -1694,6 +1797,7 @@ fn supervise_seat_worker(
     pending_deletes: PendingDeletes,
     data: SharedDataObjects,
     foreign_imports: SharedForeignImports,
+    portal_managers: SharedPortalManagers,
     outbound: Arc<Mutex<Outbound>>,
 ) -> Result<(), String> {
     let result = seat_worker(
@@ -1706,6 +1810,7 @@ fn supervise_seat_worker(
         pending_deletes,
         data,
         foreign_imports,
+        portal_managers,
         Arc::clone(&outbound),
     );
     if let Err(error) = &result {
@@ -1863,6 +1968,25 @@ impl Client {
         runtime: Arc<Mutex<Runtime>>,
         keymap: KeymapFile,
     ) -> Result<Client, String> {
+        Self::new_with_access(id, stream, runtime, keymap, ClientAccess::Public)
+    }
+
+    fn new_portal(
+        id: u64,
+        stream: UnixStream,
+        runtime: Arc<Mutex<Runtime>>,
+        keymap: KeymapFile,
+    ) -> Result<Client, String> {
+        Self::new_with_access(id, stream, runtime, keymap, ClientAccess::Portal)
+    }
+
+    fn new_with_access(
+        id: u64,
+        stream: UnixStream,
+        runtime: Arc<Mutex<Runtime>>,
+        keymap: KeymapFile,
+        access: ClientAccess,
+    ) -> Result<Client, String> {
         let mut objects = BTreeMap::new();
         objects.insert(1, Object::Display);
         let writer = stream
@@ -1876,6 +2000,7 @@ impl Client {
             .register_client_resources(id, Arc::clone(&resources))?;
         Ok(Client {
             id,
+            access,
             stream,
             outbound: Arc::new(Mutex::new(Outbound {
                 stream: writer,
@@ -1891,6 +2016,7 @@ impl Client {
             data_device_active: Arc::new(AtomicBool::new(false)),
             data_objects: Arc::new(DataObjectState::new(DataObjects::default())),
             foreign_imports: Arc::new(Mutex::new(BTreeMap::new())),
+            portal_managers: Arc::new(Mutex::new(PortalManagerState::default())),
             pending_deletes: Arc::new(Mutex::new(BTreeMap::new())),
             objects,
             deferred_outbound: None,
@@ -3280,6 +3406,190 @@ impl Client {
         }
     }
 
+    fn send_portal_dialog_state(
+        &mut self,
+        manager: PortalManagerIdentity,
+        surface: u32,
+        state: u32,
+    ) -> Result<(), String> {
+        let mut event = wire::Builder::new();
+        event.u32(surface);
+        event.u32(state);
+        self.send(manager.object, PORTAL_DIALOG_STATE, event)
+    }
+
+    fn create_portal_manager(&mut self, object: u32) -> Result<(), String> {
+        let generation = NEXT_PORTAL_MANAGER.fetch_add(1, Ordering::Relaxed);
+        let portal_managers = Arc::clone(&self.portal_managers);
+        let mut managers = portal_managers
+            .lock()
+            .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
+        if managers.managers.contains_key(&object) {
+            return Err(format!(
+                "portal-manager object {object} was registered twice"
+            ));
+        }
+        self.insert(object, Object::PortalManager { generation })?;
+        managers.managers.insert(
+            object,
+            PortalManagerIdentity {
+                client: self.id,
+                object,
+                generation,
+            },
+        );
+        Ok(())
+    }
+
+    fn destroy_portal_manager(&mut self, identity: PortalManagerIdentity) -> Result<(), String> {
+        let mut managers = self
+            .portal_managers
+            .lock()
+            .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
+        if managers
+            .managers
+            .get(&identity.object)
+            .copied()
+            != Some(identity)
+        {
+            return Err(format!(
+                "portal-manager object {} lost generation {}",
+                identity.object, identity.generation
+            ));
+        }
+        managers.managers.remove(&identity.object);
+        managers
+            .dialogs
+            .retain(|_, (manager, _)| *manager != identity);
+        drop(managers);
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .destroy_portal_manager(identity);
+        self.remove_object(identity.object)
+    }
+
+    fn get_portal_dialog(
+        &mut self,
+        manager: PortalManagerIdentity,
+        surface: u32,
+        parent_handle: String,
+        flags: u32,
+    ) -> Result<(), String> {
+        if flags != 0 {
+            return self.fail_protocol_on(
+                manager.object,
+                PORTAL_MANAGER_ERROR_INVALID_FLAGS,
+                &format!("td_portal_manager_v1 refuses dialog flags {flags:#x}"),
+            );
+        }
+        if parent_handle.len() > MAX_FOREIGN_HANDLE_BYTES {
+            return self.fail_protocol_on(
+                manager.object,
+                PORTAL_MANAGER_ERROR_INVALID_PARENT,
+                "td_portal_manager_v1 parent handle exceeds its bound",
+            );
+        }
+        if !self.is_toplevel_surface(surface) {
+            return self.fail_protocol_on(
+                manager.object,
+                PORTAL_MANAGER_ERROR_INVALID_SURFACE,
+                &format!("td_portal_manager_v1 references non-toplevel wl_surface {surface}"),
+            );
+        }
+        let revision = NEXT_PORTAL_DIALOG_REVISION.fetch_add(1, Ordering::Relaxed);
+        let portal_managers = Arc::clone(&self.portal_managers);
+        let mut managers = portal_managers
+            .lock()
+            .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
+        if managers
+            .managers
+            .get(&manager.object)
+            .copied()
+            != Some(manager)
+        {
+            return Err(format!(
+                "portal-manager object {} lost generation {}",
+                manager.object, manager.generation
+            ));
+        }
+        let parent = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .set_portal_parent(
+                SurfaceKey {
+                    client: self.id,
+                    object: surface,
+                },
+                &parent_handle,
+                manager,
+                revision,
+            );
+        let state = match parent {
+            Ok(Some(_)) => PORTAL_DIALOG_PARENTED,
+            Ok(None) => PORTAL_DIALOG_STANDALONE,
+            Err(ToplevelParentError::InvalidParent) => {
+                drop(managers);
+                return self.fail_protocol_on(
+                    manager.object,
+                    PORTAL_MANAGER_ERROR_INVALID_PARENT,
+                    "td_portal_manager_v1 parent would create a cycle",
+                );
+            }
+            Err(ToplevelParentError::Failed(error)) => return Err(error),
+        };
+        managers.dialogs.insert(surface, (manager, revision));
+        self.send_portal_dialog_state(manager, surface, state)
+    }
+
+    fn dismiss_portal_dialog(
+        &mut self,
+        manager: PortalManagerIdentity,
+        surface: u32,
+    ) -> Result<(), String> {
+        if !self.is_toplevel_surface(surface) {
+            return self.fail_protocol_on(
+                manager.object,
+                PORTAL_MANAGER_ERROR_INVALID_SURFACE,
+                &format!("td_portal_manager_v1 references non-toplevel wl_surface {surface}"),
+            );
+        }
+        let portal_managers = Arc::clone(&self.portal_managers);
+        let mut managers = portal_managers
+            .lock()
+            .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
+        if managers
+            .managers
+            .get(&manager.object)
+            .copied()
+            != Some(manager)
+        {
+            return Err(format!(
+                "portal-manager object {} lost generation {}",
+                manager.object, manager.generation
+            ));
+        }
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .dismiss_portal_dialog(
+                SurfaceKey {
+                    client: self.id,
+                    object: surface,
+                },
+                manager,
+            );
+        if managers
+            .dialogs
+            .get(&surface)
+            .is_some_and(|(current, _)| *current == manager)
+        {
+            managers.dialogs.remove(&surface);
+        }
+        self.send_portal_dialog_state(manager, surface, PORTAL_DIALOG_DISMISSED)
+    }
+
     fn toplevel_surface(&self, toplevel: u32) -> Option<u32> {
         let Object::XdgToplevel { xdg_surface, .. } = self.objects.get(&toplevel)? else {
             return None;
@@ -3398,7 +3708,11 @@ impl Client {
     }
 
     fn advertise_globals(&mut self, registry: u32) -> Result<(), String> {
-        for (name, interface, version) in ADVERTISED_GLOBALS {
+        for (name, interface, version) in PUBLIC_GLOBALS {
+            self.global(registry, name, interface, version)?;
+        }
+        if self.access == ClientAccess::Portal {
+            let (name, interface, version) = PORTAL_MANAGER_GLOBAL;
             self.global(registry, name, interface, version)?;
         }
         Ok(())
@@ -3459,6 +3773,11 @@ impl Client {
             }
             (GLOBAL_XDG_IMPORTER, "zxdg_importer_v2") if version == XDG_FOREIGN_VERSION => {
                 self.insert(id, Object::XdgImporter)
+            }
+            (GLOBAL_PORTAL_MANAGER, "td_portal_manager_v1")
+                if self.access == ClientAccess::Portal && version == 1 =>
+            {
+                self.create_portal_manager(id)
             }
             _ => Err(format!(
                 "global {name} does not provide {interface} version {version}"
@@ -4305,7 +4624,13 @@ impl Client {
         let settle = runtime.finish_compound_commit();
         drop(runtime);
         self.finish_surface_transaction(operation, settle)?;
-        self.remove_surface_object(surface)
+        self.remove_surface_object(surface)?;
+        self.portal_managers
+            .lock()
+            .map_err(|_| "portal-manager registration lock poisoned".to_string())?
+            .dialogs
+            .remove(&surface);
+        Ok(())
     }
 
     fn commit_surface_with_runtime(
@@ -5523,6 +5848,35 @@ impl Client {
                     message.opcode
                 )),
             },
+            Object::PortalManager { generation } => {
+                let identity = PortalManagerIdentity {
+                    client: self.id,
+                    object: message.object,
+                    generation,
+                };
+                match message.opcode {
+                    0 => {
+                        let surface = args.u32()?;
+                        let parent_handle = args.string()?;
+                        let flags = args.u32()?;
+                        args.finish()?;
+                        self.get_portal_dialog(identity, surface, parent_handle, flags)
+                    }
+                    1 => {
+                        let surface = args.u32()?;
+                        args.finish()?;
+                        self.dismiss_portal_dialog(identity, surface)
+                    }
+                    2 => {
+                        args.finish()?;
+                        self.destroy_portal_manager(identity)
+                    }
+                    _ => Err(format!(
+                        "unsupported td_portal_manager_v1 request {}",
+                        message.opcode
+                    )),
+                }
+            }
             Object::XdgWmBase => match message.opcode {
                 0 => {
                     args.finish()?;
@@ -6425,13 +6779,17 @@ fn dispatch_buffered(
     }
 }
 
-fn serve_client(
+fn serve_client_with_access(
     stream: UnixStream,
     id: u64,
     runtime: Arc<Mutex<Runtime>>,
     keymap: KeymapFile,
+    access: ClientAccess,
 ) -> Result<(), String> {
-    let mut client = Client::new(id, stream, Arc::clone(&runtime), keymap)?;
+    let mut client = match access {
+        ClientAccess::Public => Client::new(id, stream, Arc::clone(&runtime), keymap)?,
+        ClientAccess::Portal => Client::new_portal(id, stream, Arc::clone(&runtime), keymap)?,
+    };
     let subscription = match runtime.lock() {
         Ok(mut runtime) => match runtime.subscribe(id) {
             Ok(subscription) => subscription,
@@ -6527,6 +6885,7 @@ fn serve_client(
     let pending_deletes = Arc::clone(&client.pending_deletes);
     let data_objects = Arc::clone(&client.data_objects);
     let foreign_imports = Arc::clone(&client.foreign_imports);
+    let portal_managers = Arc::clone(&client.portal_managers);
     let outbound = Arc::clone(&client.outbound);
     let worker_outbound = Arc::clone(&outbound);
     let seat_thread = match thread::Builder::new()
@@ -6543,6 +6902,7 @@ fn serve_client(
                 pending_deletes,
                 data_objects,
                 foreign_imports,
+                portal_managers,
                 worker_outbound,
             )
         }) {
@@ -6580,9 +6940,14 @@ fn serve_client(
         let received = match sys::recv_with_fds(&client.stream, &mut incoming) {
             Ok(value) => value,
             Err(sys::ReceiveError::Disconnected) => break Ok(()),
-            Err(sys::ReceiveError::TimedOut) => {
-                break Err("recvmsg: unexpected Wayland receive timeout".into())
-            }
+            Err(sys::ReceiveError::TimedOut) => match access {
+                ClientAccess::Public => {
+                    break Err("recvmsg: unexpected Wayland receive timeout".into())
+                }
+                ClientAccess::Portal => {
+                    break Err("private portal Wayland client inactivity timeout".into())
+                }
+            },
             Err(sys::ReceiveError::Failure(error)) => break Err(error),
         };
         if received.count == 0 {
@@ -6639,6 +7004,16 @@ fn serve_client(
     } else {
         Err(errors.join("; "))
     }
+}
+
+#[cfg(test)]
+fn serve_client(
+    stream: UnixStream,
+    id: u64,
+    runtime: Arc<Mutex<Runtime>>,
+    keymap: KeymapFile,
+) -> Result<(), String> {
+    serve_client_with_access(stream, id, runtime, keymap, ClientAccess::Public)
 }
 
 fn keymap_directory(path: &Path) -> Result<&Path, String> {
@@ -7014,15 +7389,56 @@ where
     Ok(listener)
 }
 
+fn require_portal_peer(uid: u32) -> Result<(), String> {
+    if uid == PORTAL_UID {
+        Ok(())
+    } else {
+        Err(format!(
+            "reject peer uid {uid}, expected {PORTAL_UID}"
+        ))
+    }
+}
+
+fn prepare_client_stream(
+    stream: UnixStream,
+    access: ClientAccess,
+    portal_timeout: Duration,
+) -> Result<UnixStream, String> {
+    if access == ClientAccess::Public {
+        return Ok(stream);
+    }
+    let uid = sys::peer_uid(&stream)?;
+    require_portal_peer(uid)?;
+    set_portal_client_timeout(&stream, portal_timeout)?;
+    Ok(stream)
+}
+
+fn set_portal_client_timeout(stream: &UnixStream, timeout: Duration) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| format!("set private portal client read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| format!("set private portal client write timeout: {error}"))
+}
+
 fn accept_clients(
     listener: UnixListener,
     channel: &'static str,
+    access: ClientAccess,
     runtime: Arc<Mutex<Runtime>>,
     keymap: KeymapFile,
 ) -> Result<(), String> {
     for connection in listener.incoming() {
         let stream = connection.map_err(|e| format!("accept {channel} client: {e}"))?;
-        let permit = match ClientPermit::acquire() {
+        let stream = match prepare_client_stream(stream, access, PORTAL_CLIENT_IO_TIMEOUT) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("td-compositor: {channel}: reject client: {error}");
+                continue;
+            }
+        };
+        let permit = match ClientPermit::acquire(access) {
             Ok(permit) => permit,
             Err(error) => {
                 eprintln!("td-compositor: {channel}: {error}");
@@ -7036,7 +7452,9 @@ fn accept_clients(
             .name(format!("wayland-client-{id}"))
             .spawn(move || {
                 let _permit = permit;
-                if let Err(error) = serve_client(stream, id, runtime, keymap) {
+                if let Err(error) =
+                    serve_client_with_access(stream, id, runtime, keymap, access)
+                {
                     eprintln!("td-compositor: {channel} client {id}: {error}");
                 }
             })
@@ -7066,6 +7484,7 @@ pub fn serve(
                     if let Err(error) = accept_clients(
                         portal_listener,
                         "private portal Wayland",
+                        ClientAccess::Portal,
                         portal_runtime,
                         portal_keymap,
                     ) {
@@ -7077,7 +7496,13 @@ pub fn serve(
                 .map_err(|e| format!("spawn private portal Wayland accept loop: {e}"))
         },
     )?;
-    accept_clients(listener, "Wayland", runtime, keymap)
+    accept_clients(
+        listener,
+        "Wayland",
+        ClientAccess::Public,
+        runtime,
+        keymap,
+    )
 }
 
 pub fn probe(path: &Path) -> Result<(), String> {
@@ -7528,6 +7953,7 @@ mod tests {
     /// `the_registry_advertises_exactly_the_globals_td_serves` is what ties the
     /// two together.
     const GLOBAL_COUNT: usize = 10;
+    const PRIVATE_GLOBAL_COUNT: usize = 11;
 
     fn receive_messages(stream: &mut UnixStream, count: usize) -> Vec<wire::Message> {
         let mut bytes = Vec::new();
@@ -8416,6 +8842,22 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_out_partial_event_disconnects_before_any_later_write() {
+        let (server, _peer) = UnixStream::pair().unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let mut outbound = Outbound {
+            stream: server,
+            disconnected: false,
+        };
+        let error = outbound.send(&vec![0u8; 8 * 1024 * 1024]).unwrap_err();
+        assert!(error.contains("write Wayland event"), "{error}");
+        assert!(outbound.disconnected);
+        assert!(outbound.send(b"must-not-follow-a-partial-frame").is_ok());
+    }
+
+    #[test]
     fn surface_delete_id_follows_its_queued_keyboard_leave() {
         let stem = format!(
             "td-keyboard-surface-barrier-test-{}-{}",
@@ -8473,6 +8915,7 @@ mod tests {
                 worker_pending_deletes,
                 Arc::new(DataObjectState::new(DataObjects::default())),
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(PortalManagerState::default())),
                 worker_outbound,
             )
         });
@@ -8615,6 +9058,7 @@ mod tests {
                 worker_pending_deletes,
                 Arc::new(DataObjectState::new(DataObjects::default())),
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(PortalManagerState::default())),
                 worker_outbound,
             )
         });
@@ -8827,6 +9271,7 @@ mod tests {
                 Arc::new(Mutex::new(BTreeMap::new())),
                 Arc::new(DataObjectState::new(DataObjects::default())),
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(PortalManagerState::default())),
                 worker_outbound,
             )
         });
@@ -8982,6 +9427,7 @@ mod tests {
                 Arc::new(Mutex::new(BTreeMap::new())),
                 Arc::new(DataObjectState::new(DataObjects::default())),
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(PortalManagerState::default())),
                 worker_outbound,
             )
         });
@@ -9384,6 +9830,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(DataObjectState::new(DataObjects::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(PortalManagerState::default())),
             Arc::new(Mutex::new(Outbound {
                 stream: server,
                 disconnected: false,
@@ -9454,6 +9901,7 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(DataObjectState::new(DataObjects::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(PortalManagerState::default())),
             Arc::clone(&outbound),
         )
         .unwrap_err();
@@ -9492,6 +9940,7 @@ mod tests {
             Arc::clone(&pending),
             Arc::new(DataObjectState::new(DataObjects::default())),
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(PortalManagerState::default())),
             Arc::new(Mutex::new(Outbound {
                 stream: server,
                 disconnected: false,
@@ -10312,6 +10761,441 @@ mod tests {
     }
 
     #[test]
+    fn the_private_registry_alone_advertises_and_binds_the_portal_manager() {
+        let stem = format!(
+            "td-wayland-private-globals-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+
+        let (public_server, _public_peer) = UnixStream::pair().unwrap();
+        let mut public =
+            Client::new(88, public_server, Arc::clone(&runtime), test_keymap()).unwrap();
+        assert!(public
+            .bind_global(
+                GLOBAL_PORTAL_MANAGER,
+                "td_portal_manager_v1",
+                1,
+                20,
+            )
+            .is_err());
+
+        let (portal_server, mut portal_peer) = UnixStream::pair().unwrap();
+        portal_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut portal =
+            Client::new_portal(89, portal_server, runtime, test_keymap()).unwrap();
+        portal.advertise_globals(2).unwrap();
+        let globals = receive_messages(&mut portal_peer, PRIVATE_GLOBAL_COUNT);
+        let manager = globals.last().unwrap();
+        let mut payload = wire::Cursor::new(&manager.payload);
+        assert_eq!(payload.u32().unwrap(), GLOBAL_PORTAL_MANAGER);
+        assert_eq!(payload.string().unwrap(), "td_portal_manager_v1");
+        assert_eq!(payload.u32().unwrap(), 1);
+        payload.finish().unwrap();
+        portal
+            .bind_global(
+                GLOBAL_PORTAL_MANAGER,
+                "td_portal_manager_v1",
+                1,
+                20,
+            )
+            .unwrap();
+        assert!(matches!(
+            portal.objects.get(&20),
+            Some(Object::PortalManager { .. })
+        ));
+
+        let _ = fs::remove_file(framebuffer_path);
+    }
+
+    #[test]
+    fn private_portal_peer_admission_is_exactly_uid_1000() {
+        assert_eq!(require_portal_peer(PORTAL_UID), Ok(()));
+        assert!(require_portal_peer(0).is_err());
+        assert!(require_portal_peer(PORTAL_UID + 1).is_err());
+    }
+
+    #[test]
+    fn client_stream_preparation_composes_peer_authentication_and_timeouts() {
+        let timeout = Duration::from_millis(25);
+        let (public, _public_peer) = UnixStream::pair().unwrap();
+        let public = prepare_client_stream(public, ClientAccess::Public, timeout).unwrap();
+        assert_eq!(public.read_timeout().unwrap(), None);
+        assert_eq!(public.write_timeout().unwrap(), None);
+
+        let (portal, _portal_peer) = UnixStream::pair().unwrap();
+        let uid = sys::peer_uid(&portal).unwrap();
+        let inspection = portal.try_clone().unwrap();
+        let prepared = prepare_client_stream(portal, ClientAccess::Portal, timeout);
+        if uid == PORTAL_UID {
+            let prepared = prepared.unwrap();
+            assert_eq!(prepared.read_timeout().unwrap(), Some(timeout));
+            assert_eq!(prepared.write_timeout().unwrap(), Some(timeout));
+        } else {
+            let error = prepared.unwrap_err();
+            assert!(error.contains(&format!("reject peer uid {uid}")), "{error}");
+            assert_eq!(inspection.read_timeout().unwrap(), None);
+            assert_eq!(inspection.write_timeout().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn portal_manager_parents_and_dismisses_a_constructed_toplevel_on_the_wire() {
+        let stem = format!(
+            "td-wayland-portal-dialog-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let mut runtime_state = Runtime::new(framebuffer);
+        let parent = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let dialog = SurfaceKey {
+            client: 89,
+            object: 5,
+        };
+        runtime_state
+            .commit(
+                parent,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        runtime_state
+            .commit(
+                dialog,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![4, 5, 6, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        runtime_state
+            .export_foreign_toplevel(parent, "portal-parent".to_string())
+            .unwrap();
+        let runtime = Arc::new(Mutex::new(runtime_state));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client =
+            Client::new_portal(89, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let surface = SurfaceState {
+            role: Some(SurfaceRole::Xdg(6)),
+            ..SurfaceState::default()
+        };
+        client.insert(5, Object::Surface(surface)).unwrap();
+        client
+            .insert(
+                6,
+                Object::XdgSurface {
+                    surface: 5,
+                    wm_base: 8,
+                    role_object: Some(RoleObject::Toplevel(7)),
+                    assigned: Some(RoleKind::Toplevel),
+                    configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                    pending_geometry: None,
+                },
+            )
+            .unwrap();
+        client
+            .insert(
+                7,
+                Object::XdgToplevel {
+                    xdg_surface: 6,
+                    decoration: None,
+                },
+            )
+            .unwrap();
+        client.create_portal_manager(20).unwrap();
+        let subscription = runtime.lock().unwrap().subscribe_keyboard(89).unwrap();
+        let (receiver, stop) = subscription.split();
+        let worker_stop = stop.clone();
+        let worker = thread::spawn({
+            let keyboards = Arc::clone(&client.keyboards);
+            let pointers = Arc::clone(&client.pointers);
+            let popups = Arc::clone(&client.popups);
+            let pointer_authority = Arc::clone(&client.pointer_authority);
+            let pending_deletes = Arc::clone(&client.pending_deletes);
+            let data = Arc::clone(&client.data_objects);
+            let imports = Arc::clone(&client.foreign_imports);
+            let managers = Arc::clone(&client.portal_managers);
+            let outbound = Arc::clone(&client.outbound);
+            move || {
+                seat_worker(
+                    receiver,
+                    worker_stop,
+                    keyboards,
+                    pointers,
+                    popups,
+                    pointer_authority,
+                    pending_deletes,
+                    data,
+                    imports,
+                    managers,
+                    outbound,
+                )
+            }
+        });
+
+        let mut get = wire::Builder::new();
+        get.u32(5);
+        get.string("portal-parent").unwrap();
+        get.u32(0);
+        client
+            .dispatch(request(20, 0, get).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let state = receive_messages(&mut peer, 1);
+        let mut payload = wire::Cursor::new(&state.first().unwrap().payload);
+        assert_eq!(payload.u32().unwrap(), 5);
+        assert_eq!(payload.u32().unwrap(), PORTAL_DIALOG_PARENTED);
+        payload.finish().unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().effective_toplevel_parent(dialog),
+            Some(parent)
+        );
+
+        runtime
+            .lock()
+            .unwrap()
+            .destroy_foreign_export("portal-parent");
+        let state = receive_messages(&mut peer, 1);
+        let mut payload = wire::Cursor::new(&state.first().unwrap().payload);
+        assert_eq!(payload.u32().unwrap(), 5);
+        assert_eq!(payload.u32().unwrap(), PORTAL_DIALOG_STANDALONE);
+        payload.finish().unwrap();
+        assert_eq!(runtime.lock().unwrap().effective_toplevel_parent(dialog), None);
+
+        runtime
+            .lock()
+            .unwrap()
+            .export_foreign_toplevel(parent, "portal-parent".to_string())
+            .unwrap();
+        let mut get = wire::Builder::new();
+        get.u32(5);
+        get.string("portal-parent").unwrap();
+        get.u32(0);
+        client
+            .dispatch(request(20, 0, get).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let state = receive_messages(&mut peer, 1);
+        let mut payload = wire::Cursor::new(&state.first().unwrap().payload);
+        assert_eq!(payload.u32().unwrap(), 5);
+        assert_eq!(payload.u32().unwrap(), PORTAL_DIALOG_PARENTED);
+        payload.finish().unwrap();
+
+        let mut dismiss = wire::Builder::new();
+        dismiss.u32(5);
+        client
+            .dispatch(request(20, 1, dismiss).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let state = receive_messages(&mut peer, 1);
+        let mut payload = wire::Cursor::new(&state.first().unwrap().payload);
+        assert_eq!(payload.u32().unwrap(), 5);
+        assert_eq!(payload.u32().unwrap(), PORTAL_DIALOG_DISMISSED);
+        payload.finish().unwrap();
+        assert_eq!(runtime.lock().unwrap().effective_toplevel_parent(dialog), None);
+
+        let mut get = wire::Builder::new();
+        get.u32(5);
+        get.string("portal-parent").unwrap();
+        get.u32(0);
+        client
+            .dispatch(request(20, 0, get).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let state = receive_messages(&mut peer, 1);
+        let mut payload = wire::Cursor::new(&state.first().unwrap().payload);
+        assert_eq!(payload.u32().unwrap(), 5);
+        assert_eq!(payload.u32().unwrap(), PORTAL_DIALOG_PARENTED);
+        payload.finish().unwrap();
+        assert_eq!(client.portal_managers.lock().unwrap().dialogs.len(), 1);
+        for object in [7, 6, 5] {
+            client
+                .dispatch(
+                    request(object, 0, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+        }
+        assert!(client.portal_managers.lock().unwrap().dialogs.is_empty());
+
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(89);
+        worker.join().unwrap().unwrap();
+        let _ = fs::remove_file(framebuffer_path);
+    }
+
+    #[test]
+    fn portal_revocation_delivery_ignores_a_reused_manager_id() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let stale = PortalManagerIdentity {
+            client: 89,
+            object: 20,
+            generation: 1,
+        };
+        let live = PortalManagerIdentity {
+            generation: 2,
+            ..stale
+        };
+        let managers = Arc::new(Mutex::new(PortalManagerState {
+            managers: BTreeMap::from([(20, live)]),
+            dialogs: BTreeMap::from([(6, (live, 4))]),
+        }));
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        send_portal_dialogs_standalone(
+            &managers,
+            &outbound,
+            &[
+                PortalDialogNotice {
+                    manager: stale,
+                    surface: 5,
+                    revision: 3,
+                },
+                PortalDialogNotice {
+                    manager: live,
+                    surface: 6,
+                    revision: 3,
+                },
+                PortalDialogNotice {
+                    manager: live,
+                    surface: 6,
+                    revision: 4,
+                },
+            ],
+        )
+        .unwrap();
+        let states = receive_messages(&mut peer, 1);
+        let state = states.first().unwrap();
+        assert_eq!((state.object, state.opcode), (20, PORTAL_DIALOG_STATE));
+        let mut payload = wire::Cursor::new(&state.payload);
+        assert_eq!(payload.u32().unwrap(), 6);
+        assert_eq!(payload.u32().unwrap(), PORTAL_DIALOG_STANDALONE);
+        payload.finish().unwrap();
+        assert!(managers.lock().unwrap().dialogs.is_empty());
+    }
+
+    #[test]
+    fn portal_revocation_delivery_precedes_manager_id_reuse() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let stale = PortalManagerIdentity {
+            client: 89,
+            object: 20,
+            generation: 1,
+        };
+        let live = PortalManagerIdentity {
+            generation: 2,
+            ..stale
+        };
+        let managers = Arc::new(Mutex::new(PortalManagerState {
+            managers: BTreeMap::from([(20, stale)]),
+            dialogs: BTreeMap::from([(5, (stale, 3))]),
+        }));
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+
+        // Stop the old event at the last lock boundary. Once delivery holds
+        // the manager gate, a destroy/recreate request must not pass it and
+        // recycle object 20 before the old event reaches the wire.
+        let outbound_guard = outbound.lock().unwrap();
+        let delivery = thread::spawn({
+            let managers = Arc::clone(&managers);
+            let outbound = Arc::clone(&outbound);
+            move || {
+                send_portal_dialogs_standalone(
+                    &managers,
+                    &outbound,
+                    &[PortalDialogNotice {
+                        manager: stale,
+                        surface: 5,
+                        revision: 3,
+                    }],
+                )
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if managers.try_lock().is_err() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (reused_tx, reused_rx) = mpsc::channel();
+        let reuse = thread::spawn({
+            let managers = Arc::clone(&managers);
+            let outbound = Arc::clone(&outbound);
+            move || -> Result<(), String> {
+                attempted_tx
+                    .send(())
+                    .map_err(|_| "manager-reuse attempt receiver closed".to_string())?;
+                let mut managers = managers
+                    .lock()
+                    .map_err(|_| "portal-manager registration lock poisoned".to_string())?;
+                managers.managers.insert(20, live);
+                managers.dialogs.insert(6, (live, 4));
+                reused_tx
+                    .send(())
+                    .map_err(|_| "manager-reuse receiver closed".to_string())?;
+                let mut event = wire::Builder::new();
+                event.u32(6);
+                event.u32(PORTAL_DIALOG_PARENTED);
+                let message = event.message(20, PORTAL_DIALOG_STATE)?;
+                outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .send(&message)
+            }
+        });
+        attempted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            reused_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(outbound_guard);
+        delivery.join().unwrap().unwrap();
+        reuse.join().unwrap().unwrap();
+        reused_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let states = receive_messages(&mut peer, 2);
+        assert_eq!(states.len(), 2);
+        let mut old = wire::Cursor::new(&states.first().unwrap().payload);
+        assert_eq!(old.u32().unwrap(), 5);
+        assert_eq!(old.u32().unwrap(), PORTAL_DIALOG_STANDALONE);
+        old.finish().unwrap();
+        let mut new = wire::Cursor::new(&states.get(1).unwrap().payload);
+        assert_eq!(new.u32().unwrap(), 6);
+        assert_eq!(new.u32().unwrap(), PORTAL_DIALOG_PARENTED);
+        new.finish().unwrap();
+        let managers = managers.lock().unwrap();
+        assert_eq!(managers.managers.get(&20), Some(&live));
+        assert_eq!(managers.dialogs.get(&6), Some(&(live, 4)));
+    }
+
+    #[test]
     fn xdg_foreign_parents_across_clients_and_revokes_on_the_wire() {
         let stem = format!(
             "td-wayland-foreign-wire-{}-{}",
@@ -10397,6 +11281,7 @@ mod tests {
                     Arc::new(Mutex::new(BTreeMap::new())),
                     Arc::new(DataObjectState::new(DataObjects::default())),
                     imports,
+                    Arc::new(Mutex::new(PortalManagerState::default())),
                     outbound,
                 )
             }
@@ -11017,6 +11902,7 @@ mod tests {
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_data,
                 Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(PortalManagerState::default())),
                 outbound,
             )
         });
@@ -18799,13 +19685,65 @@ mod tests {
             MAX_UI_FRAME_BYTES
         );
         assert!(client_surface_total(MAX_UI_FRAME_BYTES, 0, 1).is_err());
-        let mut permits = Vec::new();
-        for _ in 0..MAX_CLIENTS {
-            permits.push(ClientPermit::acquire().unwrap());
+        let mut public = Vec::new();
+        for _ in 0..MAX_PUBLIC_CLIENTS {
+            public.push(ClientPermit::acquire(ClientAccess::Public).unwrap());
         }
-        assert!(ClientPermit::acquire().is_err());
-        drop(permits);
-        assert_eq!(ACTIVE_CLIENTS.load(Ordering::Relaxed), 0);
+        assert!(ClientPermit::acquire(ClientAccess::Public).is_err());
+        let mut portal = Vec::new();
+        for _ in 0..MAX_PORTAL_CLIENTS {
+            portal.push(ClientPermit::acquire(ClientAccess::Portal).unwrap());
+        }
+        assert!(ClientPermit::acquire(ClientAccess::Portal).is_err());
+        drop(public);
+        drop(portal);
+        assert_eq!(ACTIVE_PUBLIC_CLIENTS.load(Ordering::Relaxed), 0);
+        assert_eq!(ACTIVE_PORTAL_CLIENTS.load(Ordering::Relaxed), 0);
+
+        let stem = format!(
+            "td-portal-idle-limit-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let mut peers = Vec::new();
+        let mut workers = Vec::new();
+        for id in 1..=MAX_PORTAL_CLIENTS {
+            let permit = ClientPermit::acquire(ClientAccess::Portal).unwrap();
+            let (server, peer) = UnixStream::pair().unwrap();
+            let timeout = Duration::from_millis(20);
+            set_portal_client_timeout(&server, timeout).unwrap();
+            assert_eq!(server.read_timeout().unwrap(), Some(timeout));
+            assert_eq!(server.write_timeout().unwrap(), Some(timeout));
+            let worker_runtime = Arc::clone(&runtime);
+            workers.push(thread::spawn(move || {
+                let _permit = permit;
+                serve_client_with_access(
+                    server,
+                    u64::try_from(id).unwrap(),
+                    worker_runtime,
+                    test_keymap(),
+                    ClientAccess::Portal,
+                )
+            }));
+            peers.push(peer);
+        }
+        assert!(ClientPermit::acquire(ClientAccess::Portal).is_err());
+        for worker in workers {
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(error.contains("inactivity timeout"), "{error}");
+        }
+        assert_eq!(ACTIVE_PORTAL_CLIENTS.load(Ordering::Relaxed), 0);
+        let mut released = Vec::new();
+        for _ in 0..MAX_PORTAL_CLIENTS {
+            released.push(ClientPermit::acquire(ClientAccess::Portal).unwrap());
+        }
+        drop(released);
+        drop(peers);
+        fs::remove_file(framebuffer_path).unwrap();
     }
 
     #[test]

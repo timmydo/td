@@ -780,7 +780,7 @@ mod confinement {
     #[test]
     fn two_scoped_unsafe_bodies_are_the_syscalls_and_exact_fd_adoption() {
         let syscall_body = r#"#[allow(unsafe_code)]
-fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
+fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     let result: isize;
     unsafe {
         core::arch::asm!(
@@ -789,6 +789,8 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             in("rdi") a1,
             in("rsi") a2,
             in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack, preserves_flags),
@@ -816,11 +818,12 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "const SYS_IOCTL: usize = 16;",
             "const SYS_SENDMSG: usize = 46;",
             "const SYS_RECVMSG: usize = 47;",
+            "const SYS_GETSOCKOPT: usize = 55;",
             "const SYS_FCNTL: usize = 72;",
         ] {
             assert!(SYS.contains(syscall), "{syscall}");
         }
-        assert_eq!(occurrences(SYS, "const SYS_"), 5);
+        assert_eq!(occurrences(SYS, "const SYS_"), 6);
         for (name, source) in OTHER.iter().chain(TEST_ONLY) {
             assert!(
                 !source.contains("unsafe"),
@@ -843,8 +846,10 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             assert!(SYS.contains(command), "{command}");
         }
         let guard = "    if !matches!(command, F_GETFL | F_SETFL) {";
-        let entry =
-            "    errno_result(syscall3(SYS_FCNTL, fd as usize, command, argument), operation)";
+        let entry = r#"    errno_result(
+        syscall5(SYS_FCNTL, fd as usize, command, argument, 0, 0),
+        operation,
+    )"#;
         assert_eq!(occurrences(SYS, guard), 1);
         assert_eq!(occurrences(SYS, entry), 1);
         assert_eq!(occurrences(SYS, "fn fcntl("), 1);
@@ -869,6 +874,24 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         ] {
             assert_eq!(occurrences(SYS, wrapper), 1, "{wrapper}");
         }
+    }
+
+    #[test]
+    fn the_peer_credential_surface_is_one_exact_uid_query() {
+        for declaration in [
+            "const SOL_SOCKET: i32 = 1;",
+            "const SO_PEERCRED: i32 = 17;",
+            "let mut credentials = [0u32; 3];",
+            "if length != expected {",
+            ".get(1)\n        .copied()",
+        ] {
+            assert!(SYS.contains(declaration), "{declaration}");
+        }
+        assert_eq!(occurrences(SYS, "pub fn peer_uid("), 1);
+        assert_eq!(occurrences(production(SYS), "SO_PEERCRED"), 7);
+        assert_eq!(occurrences(production(SYS), "SOL_SOCKET as usize"), 1);
+        assert_eq!(occurrences(production(SYS), "as *mut [u32; 3]"), 1);
+        assert_eq!(occurrences(production(SYS), "as *mut u32"), 1);
     }
 
     #[test]
@@ -938,7 +961,10 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         TIOCSPTLCK | TIOCGPTPEER | TIOCSWINSZ | TIOCGWINSZ | EVIOCGABS_X | EVIOCGABS_Y
     ) {"#;
         assert_eq!(occurrences(SYS, guard), 1);
-        let entry = r#"    errno_result(syscall3(SYS_IOCTL, fd as usize, request, argument), operation)"#;
+        let entry = r#"    errno_result(
+        syscall5(SYS_IOCTL, fd as usize, request, argument, 0, 0),
+        operation,
+    )"#;
         assert_eq!(occurrences(SYS, entry), 1);
         assert_eq!(occurrences(SYS, "fn ioctl("), 1);
         // One definition plus exactly five call sites: a SIXTH wrapper reusing
@@ -995,32 +1021,47 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
     }
 
     #[test]
-    fn syscall_wrapper_is_called_only_by_the_five_reviewed_operations() {
-        let close = r#"errno_result(syscall3(SYS_CLOSE, fd as usize, 0, 0), "close")?"#;
-        let receive = r#"syscall3(
+    fn syscall_wrapper_is_called_only_by_the_six_reviewed_operations() {
+        let close = r#"errno_result(syscall5(SYS_CLOSE, fd as usize, 0, 0, 0, 0), "close")?"#;
+        let receive = r#"syscall5(
             SYS_RECVMSG,
             stream.as_raw_fd() as usize,
             (&mut message as *mut MsgHdr) as usize,
             MSG_CMSG_CLOEXEC as usize,
+            0,
+            0,
         )"#;
-        let send = r#"syscall3(
+        let send = r#"syscall5(
             SYS_SENDMSG,
             stream.as_raw_fd() as usize,
             (&message as *const MsgHdr) as usize,
             0,
+            0,
+            0,
         )"#;
-        assert_eq!(occurrences(SYS, "syscall3("), 6);
+        let peer = r#"syscall5(
+            SYS_GETSOCKOPT,
+            stream.as_raw_fd() as usize,
+            SOL_SOCKET as usize,
+            SO_PEERCRED as usize,
+            (&mut credentials as *mut [u32; 3]) as usize,
+            (&mut length as *mut u32) as usize,
+        )"#;
+        assert_eq!(occurrences(SYS, "syscall5("), 7);
         assert_eq!(occurrences(SYS, "SYS_CLOSE"), 2);
         assert_eq!(occurrences(SYS, "SYS_FCNTL"), 2);
         assert_eq!(occurrences(SYS, "SYS_IOCTL"), 2);
         assert_eq!(occurrences(SYS, "SYS_SENDMSG"), 2);
         assert_eq!(occurrences(SYS, "SYS_RECVMSG"), 2);
+        assert_eq!(occurrences(SYS, "SYS_GETSOCKOPT"), 2);
         assert_eq!(occurrences(SYS, close), 1);
         assert_eq!(occurrences(SYS, receive), 1);
         assert_eq!(occurrences(SYS, send), 1);
+        assert_eq!(occurrences(SYS, peer), 1);
         for operation in [
             "fn close_raw(",
             "fn fcntl(",
+            "pub fn peer_uid(",
             "pub fn recv_with_fds(",
             "pub fn send_with_fd(",
         ] {
@@ -1028,12 +1069,12 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         }
     }
 
-    /// Three disjoint reviewed surfaces live behind one syscall body, so each
+    /// Four disjoint reviewed surfaces live behind one syscall body, so each
     /// is pinned to its own module: descriptor transport to the protocol
-    /// endpoints, terminal control to the PTY adapter, an absolute device's
-    /// axis range to the evdev reader. Nothing else names `sys` at all — an
-    /// alias elsewhere would give an audited call a name none of these scans
-    /// looks for.
+    /// endpoints, private-peer authentication to the server, terminal control
+    /// to the PTY adapter, and an absolute device's axis range to the evdev
+    /// reader. Nothing else names `sys` at all — an alias elsewhere would give
+    /// an audited call a name none of these scans looks for.
     #[test]
     fn each_confined_operation_is_reachable_only_from_its_own_module() {
         const TRANSPORT: &[&str] = &[
@@ -1046,13 +1087,14 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "sys::make_nonblocking(",
             "sys::restore_status_flags(",
         ];
+        const PEER_AUTH: &[&str] = &["sys::peer_uid("];
         const TERMINAL: &[&str] = &[
             "sys::unlock_pty(",
             "sys::pty_peer(",
             "sys::set_window_size(",
             "sys::window_size(",
         ];
-        // The third surface, and the reason the module list below grew: an
+        // The fourth surface, and the reason the module list below grew: an
         // absolute pointer's range is asked for where the device file is
         // opened, and again only at a recovery.
         const ABSOLUTE: &[&str] = &["sys::absolute_info("];
@@ -1138,6 +1180,22 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         let conn = include_str!("conn.rs");
         let server = include_str!("server.rs");
         let pty = include_str!("pty.rs");
+        let input = include_str!("input.rs");
+        assert_eq!(
+            occurrences(production(server), "sys::peer_uid(&stream)"),
+            1,
+            "private listener peer authentication must have one kernel query"
+        );
+        let accept = production(server)
+            .split("fn accept_clients(")
+            .nth(1)
+            .and_then(|source| source.split("fn serve_client(").next())
+            .unwrap();
+        assert!(
+            accept.find("prepare_client_stream").unwrap()
+                < accept.find("ClientPermit::acquire").unwrap(),
+            "private peer authentication must precede slot admission"
+        );
         assert_eq!(
             occurrences(production(server), "sys::ReceivedFd::adopt("),
             1,
@@ -1187,7 +1245,21 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             );
             assert!(!pty.contains(operation), "pty.rs reached {operation}");
         }
-        let input = include_str!("input.rs");
+        for operation in PEER_AUTH {
+            assert_eq!(occurrences(production(server), operation), 1);
+            for (name, source) in [
+                ("client.rs", production(client)),
+                ("conn.rs", production(conn)),
+                ("pty.rs", production(pty)),
+                ("input.rs", production(input)),
+            ] {
+                assert_eq!(
+                    occurrences(source, operation),
+                    0,
+                    "{name} reached private-peer authentication"
+                );
+            }
+        }
         for operation in TERMINAL {
             assert!(pty.contains(operation), "{operation}");
             assert!(
@@ -1198,7 +1270,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 "a module outside the terminal reached {operation}"
             );
         }
-        // The three surfaces are DISJOINT, which is what makes the roster a
+        // The four surfaces are DISJOINT, which is what makes the roster a
         // statement about each rather than about their union: the input reader
         // may ask a device for its range and nothing else, and no module that
         // speaks the protocol or drives a terminal may ask at all.
@@ -1212,7 +1284,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 "a module outside the input reader reached {operation}"
             );
         }
-        for operation in TRANSPORT.iter().chain(TERMINAL) {
+        for operation in TRANSPORT.iter().chain(PEER_AUTH).chain(TERMINAL) {
             assert!(!input.contains(operation), "input.rs reached {operation}");
         }
         // Both wrappers are generic over `AsRawFd`, so inside pty.rs they

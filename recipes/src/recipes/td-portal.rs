@@ -222,10 +222,11 @@ mod tests {
             "pub const REQUEST_READY_MARKER: &str = \"{TD_PORTAL_REQUEST_RUNTIME_MARKER}\";"
         )));
         assert!(WAYLAND_CHANNEL_RS.contains("EXPECTED_GLOBALS.len()"));
-        assert!(WAYLAND_CHANNEL_RS.contains("TD-PORTAL-CHANNEL-READY globals={} privileged=0"));
+        assert!(WAYLAND_CHANNEL_RS
+            .contains("TD-PORTAL-CHANNEL-READY globals={} privileged=1 dialog=2"));
         assert_eq!(
             TD_PORTAL_CHANNEL_RUNTIME_MARKER,
-            "TD-PORTAL-CHANNEL-READY globals=10 privileged=0"
+            "TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2"
         );
         assert!(MAIN_RS.contains("println!(\"{READY_MARKER}\");"));
         assert!(MAIN_RS.contains("println!(\"{REQUEST_READY_MARKER}\");"));

@@ -665,8 +665,13 @@ must be distinct from each other and from application readiness, are mode
 0600 below the uid-1000 mode-0700 runtime directory, and are bound before the
 ordinary readiness marker is emitted. The private endpoint is bound first,
 then the public endpoint and private accept loop become live before that
-marker. Both accept loops share the same 32-client ceiling. `td-jail` exposes
-only the first socket to applications.
+marker. Public clients have 30 slots and private portal clients have two
+reserved slots, retaining the previous 32-client total while preventing public
+load from starving the portal. `td-jail` exposes only the first socket to
+applications. After authentication, private sockets have 30-second read and
+write inactivity timeouts, so idle or backpressured peers release the two
+reserved slots. An active unconfined uid-1000 peer can keep a slot live; the
+private path and application jail remain the isolation boundary.
 
 The first protocol surface is:
 
@@ -682,25 +687,59 @@ The first protocol surface is:
 - zxdg_decoration_manager_v1 and zxdg_toplevel_decoration_v1
 - wl_callback completion and wl_buffer release
 
-Those ten globals are the whole of what the registry advertises, and the set is
-a TEST rather than a sentence here: the name, order, and version of each are
-pinned by
+Those ten globals are the whole of what the public registry advertises, and
+the set is a TEST rather than a sentence here: the name, order, and version of
+each are pinned by
 `the_registry_advertises_exactly_the_globals_td_serves`.
 A document cannot notice when the code moves under it, and this list has been
 read as a state claim by work outside this crate.
 
-The private listener currently serves that same exact ten-global registry and
-does not advertise `td_portal_manager_v1`. A separate uid-1000
-`td-portal channel-probe` sends `get_registry` plus `sync`, validates the
-ordered names and versions through this crate's safe framing codec, and emits
-an exact system-image marker only while the privileged global remains absent.
-Its 20-second deadline starts before the Unix connect and includes the entire
-registry exchange. The sync callback is the proof boundary; a following
-`delete_id` may be split at any byte without changing the completed proof.
-The later manager landing adds the private global and `SO_PEERCRED` check
-together. If it reuses the compositor's `conn.rs` transport, that landing must
-also amend `UNSAFE.md`'s exact transport-user roster; this transport increment
-adds no unsafe surface or descriptor passing.
+The private listener serves those ten globals followed by the private-only
+`td_portal_manager_v1` v1. Before a private connection consumes either of its
+reserved slots, the accept loop reads one exact 12-byte `SO_PEERCRED` result
+and accepts only uid 1000. The path remains the primary jail boundary; this
+credential check is defence in depth against a peer outside the target user.
+Guessing the manager's global name on the public connection is refused. Uid
+1000 is the fixed system UI identity and is cross-checked by the target QEMU
+channel proof.
+
+This first manager version carries only dialog parent association and
+dismissal. `get_dialog(wl_surface, parent_handle, flags)` requires an existing
+xdg-toplevel surface, a handle no longer than 128 bytes, and flags zero. A live
+mapped xdg-foreign handle installs the same effective cross-client parent
+relationship described below and answers `dialog_state(parented)`. An empty,
+unknown, or unmapped handle clears the effective relationship and answers
+`standalone`; a cycle is a typed protocol error. `dismiss_dialog(wl_surface)`
+removes only a relationship still sourced from this manager and answers
+`dismissed`, so it cannot erase a later local or ordinary xdg-foreign
+replacement. Export destruction, including exporting-client departure,
+removes manager relationships derived from that exact handle and queues
+`standalone` for the exact live manager generation. Per-dialog revisions
+suppress a queued revocation after a newer association or dismissal, and
+manager destruction removes its relationships.
+The client retains at most one revision per client-owned surface object and
+retires it with that object, beneath the 512-object ceiling. Delivery is
+bounded and performs no socket I/O under the Runtime lock. If unmapping drops
+a portal relationship instead of reparenting it to a mapped ancestor, the
+same revision receives `standalone`. The relationship supplies adjacency,
+focus grouping, workspace following, and the mapped/unmapped lifecycle already
+implemented by xdg-foreign. Floating, centering, modal input capture,
+screenshots, notifications, and inhibitors remain outside this version.
+
+A separate uid-1000 `td-portal channel-probe` sends `get_registry` plus
+`sync`, validates the ordered eleven names and versions through this crate's
+safe framing codec, binds the compositor, xdg shell, and private manager,
+constructs an unmapped toplevel, and requires exact standalone and dismissed
+events before a second sync. Only then does it emit
+`TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2`. Its 20-second
+deadline starts before the Unix connect and includes both exchanges; 32
+messages and 256 KiB cumulatively bound all input, including decoded registry
+entries. A following `delete_id` for the first callback may be split at any
+byte without changing the proof. This target path intentionally uses an empty
+handle and proves standalone association plus dismissal acknowledgement; a
+host wire regression proves a mapped relationship, revocation notification,
+re-association, and removal. The probe does not use `conn.rs`, SCM_RIGHTS, or
+another unsafe surface.
 
 The E2 application-compatibility experiment on 2026-08-25 fixes the priority
 of the next globals without changing that current-state list. GTK 4.22.1's
@@ -3173,7 +3212,7 @@ descriptor queue and keymap read are bounded, and every overflow or abandoned
 connection closes all descriptors it owns.
 
 `td-compositor/src/sys.rs` contains the two scoped `unsafe` blocks. One raw
-`syscall3` body carries exactly:
+`syscall5` body carries exactly:
 
 - sendmsg(2), to send the demo client's wl_shm descriptor, the server's XKB
   keymap descriptor, or a test request;
@@ -3182,6 +3221,9 @@ connection closes all descriptors it owns.
 - close(2), to release a received descriptor after it has either been safely
   duplicated through `/proc/self/fd/N` or exactly transferred as an owned
   clipboard endpoint;
+- getsockopt(2), with fixed `SOL_SOCKET` and `SO_PEERCRED`, an exact 12-byte
+  result, and one server caller, to admit only uid 1000 on the private portal
+  listener;
 - fcntl(2), with only `F_GETFL` and `F_SETFL`, to add `O_NONBLOCK` while one
   clipboard source writes and restore the destination's prior status; and
 - ioctl(2), for the four pinned terminal-control requests in section 12 and
@@ -3224,16 +3266,16 @@ rostered close wrapper. The client transport has one separately pinned
 adoption site and one conversion site for the source endpoint; after conversion
 ordinary `File` ownership performs every close.
 
-The three surfaces behind that one body are disjoint and are pinned to
-disjoint modules: descriptor transport is reachable only from `client.rs`,
-`conn.rs`, and `server.rs`, terminal control only from `pty.rs`, the
-absolute-axis range only from `input.rs`, and no other module
-names `sys` at all. The extracted connection is crate-visible, so a module
-holding one reaches the transport without spelling `sys`: who may NAME `conn`
-is therefore pinned by the same confinement test as who may call the
-wrappers. That roster is `client.rs`, `conn.rs`, and `term_client.rs` — the
-two clients and the transport itself. A transport user is not thereby a
-syscall caller: `term_client.rs` names no `sys` and does not appear above.
+The four surfaces behind that one body are pinned to their modules: descriptor
+transport is reachable only from `client.rs`, `conn.rs`, and `server.rs`,
+terminal control only from `pty.rs`, the absolute-axis range only from
+`input.rs`, and private peer authentication only from `server.rs`; no other
+module names `sys` at all. The extracted connection is crate-visible, so a
+module holding one reaches the transport without spelling `sys`: who may NAME
+`conn` is therefore pinned by the same confinement test as who may call the
+wrappers. That roster is `client.rs`, `conn.rs`, and `term_client.rs` — the two
+clients and the transport itself. A transport user is not thereby a syscall
+caller: `term_client.rs` names no `sys` and does not appear above.
 
 `ioctl(2)` is the request-carrying one, so its roster is the
 confinement: a request outside the six is refused before the syscall, and a
@@ -3271,9 +3313,10 @@ broken UI cannot mark an update healthy or let QEMU power off before testing
 the new boot seam. The
 graphical service prints `TD-WAYLAND-READY` only after the framebuffer has
 been painted and both Wayland sockets are listening. A separate evidence unit
-then validates the private socket's exact public registry and the deliberate
-absence of the privileged manager. The QEMU system oracle requires both
-markers and the first client's later `TD-TERM-READY` marker.
+then validates the private socket's exact registry and completes the first
+privileged manager's dialog association and dismissal lifecycle. The QEMU
+system oracle requires both markers and the first client's later
+`TD-TERM-READY` marker.
 
 ## 6. Required proof
 
@@ -3296,10 +3339,10 @@ The landing must prove:
 - the seat assigner rejects symlinks/non-devices and verifies ownership/mode;
 - the compositor resolves and refuses aliases among its public, private
   portal, and application-readiness endpoints, binds the private then public
-  mode-0600 Wayland listeners before readiness through one client ceiling,
-  and the shipped
-  portal probe accepts only the exact public registry with no premature
-  privileged global;
+  mode-0600 Wayland listeners before readiness through independent 30-public
+  and two-private client ceilings, authenticates private peers as uid 1000,
+  and the shipped portal probe accepts only the exact private registry before
+  completing the manager's standalone and dismissed dialog states;
 - wire parsing rejects truncation, overflow, invalid object use, and a
   descriptor-less wl_shm request;
 - an SCM_RIGHTS-backed wl_shm buffer commits and is copied into the scene;

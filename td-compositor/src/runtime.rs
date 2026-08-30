@@ -106,6 +106,10 @@ pub enum KeyboardDelivery {
     /// Each generation makes the queued batch harmless after the client
     /// destroys and reuses an imported object's id.
     ForeignDestroyed(Vec<ForeignImportIdentity>),
+    /// One xdg-foreign export disappeared beneath these portal-owned dialog
+    /// relationships. The manager generation prevents an object id destroyed
+    /// and reused before delivery from receiving stale state.
+    PortalDialogsStandalone(Vec<PortalDialogNotice>),
     /// One menu already taken down: tell its client. Named BOTH ways, and
     /// both are needed. The wl_surface is what the registrations are keyed on
     /// and what the scene places a popup by; the xdg_popup is what the event
@@ -136,6 +140,20 @@ pub struct ForeignImportIdentity {
     pub generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PortalManagerIdentity {
+    pub client: u64,
+    pub object: u32,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortalDialogNotice {
+    pub manager: PortalManagerIdentity,
+    pub surface: u32,
+    pub revision: u64,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum ToplevelParentError {
     InvalidParent,
@@ -147,13 +165,18 @@ struct ForeignExport {
     imports: BTreeSet<ForeignImportIdentity>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ToplevelParentSource {
     Local,
     Foreign(ForeignImportIdentity),
+    Portal {
+        handle: String,
+        manager: PortalManagerIdentity,
+        revision: u64,
+    },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ToplevelParent {
     source: ToplevelParentSource,
     parent: SurfaceKey,
@@ -2256,13 +2279,17 @@ impl Runtime {
             export.imports.remove(&identity);
         }
         self.toplevel_parents.retain(|_, relation| {
-            relation.source != ToplevelParentSource::Foreign(identity)
+            !matches!(
+                &relation.source,
+                ToplevelParentSource::Foreign(current) if *current == identity
+            )
         });
     }
 
     pub fn destroy_foreign_export(&mut self, handle: &str) {
-        let invalidated = self.invalidate_foreign_exports(&[handle.to_string()]);
-        self.queue_foreign_destroyed(invalidated);
+        let (imports, dialogs) = self.invalidate_foreign_exports(&[handle.to_string()]);
+        self.queue_foreign_destroyed(imports);
+        self.queue_portal_standalone(dialogs);
     }
 
     pub fn foreign_import_is_live(&self, identity: ForeignImportIdentity) -> bool {
@@ -2295,6 +2322,74 @@ impl Runtime {
             Some(parent),
             ToplevelParentSource::Foreign(identity),
         )
+    }
+
+    /// Associate one portal-owned toplevel with the mapped toplevel named by
+    /// an xdg-foreign handle. The handle remains the revocation identity: if
+    /// its export is destroyed, only relationships established through that
+    /// exact handle are removed.
+    pub fn set_portal_parent(
+        &mut self,
+        child: SurfaceKey,
+        handle: &str,
+        manager: PortalManagerIdentity,
+        revision: u64,
+    ) -> Result<Option<SurfaceKey>, ToplevelParentError> {
+        let parent = self
+            .foreign_exports
+            .get(handle)
+            .map(|export| export.surface);
+        let Some(parent) = parent else {
+            return self.set_toplevel_parent(
+                child,
+                None,
+                ToplevelParentSource::Portal {
+                    handle: handle.to_string(),
+                    manager,
+                    revision,
+                },
+            );
+        };
+        self.set_toplevel_parent(
+            child,
+            Some(parent),
+            ToplevelParentSource::Portal {
+                handle: handle.to_string(),
+                manager,
+                revision,
+            },
+        )
+    }
+
+    /// Remove only a relationship installed through the portal manager. A
+    /// later ordinary or imported parent request replaces that relationship;
+    /// dismissing stale portal state must not erase the replacement.
+    pub fn dismiss_portal_dialog(
+        &mut self,
+        child: SurfaceKey,
+        manager: PortalManagerIdentity,
+    ) -> bool {
+        if !self.toplevel_parents.get(&child).is_some_and(|relation| {
+            matches!(
+                &relation.source,
+                ToplevelParentSource::Portal { manager: current, .. }
+                    if *current == manager
+            )
+        }) {
+            return false;
+        }
+        self.toplevel_parents.remove(&child);
+        true
+    }
+
+    pub fn destroy_portal_manager(&mut self, manager: PortalManagerIdentity) {
+        self.toplevel_parents.retain(|_, relation| {
+            !matches!(
+                &relation.source,
+                ToplevelParentSource::Portal { manager: current, .. }
+                    if *current == manager
+            )
+        });
     }
 
     fn set_toplevel_parent(
@@ -2414,11 +2509,26 @@ impl Runtime {
     /// the surface loses its own parent, while each child inherits that parent
     /// once. Remapping cannot recreate either discarded edge.
     fn reparent_around_unmap(&mut self, surface: SurfaceKey) -> Vec<(SurfaceKey, SurfaceKey)> {
-        let inherited = self
-            .toplevel_parents
-            .remove(&surface)
+        let removed = self.toplevel_parents.remove(&surface);
+        let inherited = removed
+            .as_ref()
             .map(|relation| relation.parent)
             .filter(|parent| self.scene.is_mapped(*parent));
+        let mut portal_notices = Vec::new();
+        if let Some(ToplevelParent {
+            source:
+                ToplevelParentSource::Portal {
+                    manager, revision, ..
+                },
+            ..
+        }) = removed
+        {
+            portal_notices.push(PortalDialogNotice {
+                manager,
+                surface: surface.object,
+                revision,
+            });
+        }
         let children: Vec<SurfaceKey> = self
             .toplevel_parents
             .iter()
@@ -2427,7 +2537,20 @@ impl Runtime {
         let mut reparented = Vec::new();
         for child in children {
             let Some(parent) = inherited else {
-                self.toplevel_parents.remove(&child);
+                if let Some(ToplevelParent {
+                    source:
+                        ToplevelParentSource::Portal {
+                            manager, revision, ..
+                        },
+                    ..
+                }) = self.toplevel_parents.remove(&child)
+                {
+                    portal_notices.push(PortalDialogNotice {
+                        manager,
+                        surface: child.object,
+                        revision,
+                    });
+                }
                 continue;
             };
             if let Some(relation) = self.toplevel_parents.get_mut(&child) {
@@ -2435,6 +2558,7 @@ impl Runtime {
                 reparented.push((child, parent));
             }
         }
+        self.queue_portal_standalone(portal_notices);
         reparented
     }
 
@@ -2442,7 +2566,11 @@ impl Runtime {
         let snapshot = self.toplevel_parents.clone();
         let mut next = BTreeMap::new();
         let mut reparented = Vec::new();
-        for (child, mut relation) in snapshot.iter().map(|(child, relation)| (*child, *relation)) {
+        let mut portal_notices = Vec::new();
+        for (child, mut relation) in snapshot
+            .iter()
+            .map(|(child, relation)| (*child, relation.clone()))
+        {
             if child.client == client {
                 continue;
             }
@@ -2458,6 +2586,16 @@ impl Runtime {
                 parent = ancestor.parent;
             }
             if parent.client == client || !self.scene.is_mapped(parent) {
+                if let ToplevelParentSource::Portal {
+                    manager, revision, ..
+                } = relation.source
+                {
+                    portal_notices.push(PortalDialogNotice {
+                        manager,
+                        surface: child.object,
+                        revision,
+                    });
+                }
                 continue;
             }
             if parent != relation.parent {
@@ -2467,6 +2605,7 @@ impl Runtime {
             next.insert(child, relation);
         }
         self.toplevel_parents = next;
+        self.queue_portal_standalone(portal_notices);
         reparented
     }
 
@@ -2492,24 +2631,63 @@ impl Runtime {
         }
     }
 
-    fn invalidate_foreign_exports(&mut self, handles: &[String]) -> Vec<ForeignImportIdentity> {
+    fn queue_portal_standalone(&mut self, notices: Vec<PortalDialogNotice>) {
+        let mut by_client: BTreeMap<u64, Vec<PortalDialogNotice>> = BTreeMap::new();
+        for notice in notices {
+            by_client
+                .entry(notice.manager.client)
+                .or_default()
+                .push(notice);
+        }
+        for (client, notices) in by_client {
+            let Some(sender) = self.keyboard_subscribers.get(&client).cloned() else {
+                continue;
+            };
+            match sender.try_send(KeyboardDelivery::PortalDialogsStandalone(notices)) {
+                KeyboardQueueResult::Closed => {
+                    self.keyboard_subscribers.remove(&client);
+                }
+                KeyboardQueueResult::Sent | KeyboardQueueResult::Overflowed => {}
+            }
+        }
+    }
+
+    fn invalidate_foreign_exports(
+        &mut self,
+        handles: &[String],
+    ) -> (Vec<ForeignImportIdentity>, Vec<PortalDialogNotice>) {
         let mut invalidated = BTreeSet::new();
+        let mut invalidated_handles = BTreeSet::new();
         for handle in handles {
             let Some(export) = self.foreign_exports.remove(handle) else {
                 continue;
             };
+            invalidated_handles.insert(handle.clone());
             invalidated.extend(export.imports);
         }
-        self.toplevel_parents.retain(|_, relation| {
-            !matches!(
-                relation.source,
-                ToplevelParentSource::Foreign(identity) if invalidated.contains(&identity)
-            )
-        });
+        let mut notices = Vec::new();
+        self.toplevel_parents
+            .retain(|child, relation| match &relation.source {
+                ToplevelParentSource::Foreign(identity) => !invalidated.contains(identity),
+                ToplevelParentSource::Portal {
+                    handle,
+                    manager,
+                    revision,
+                } if invalidated_handles.contains(handle) => {
+                    notices.push(PortalDialogNotice {
+                        manager: *manager,
+                        surface: child.object,
+                        revision: *revision,
+                    });
+                    false
+                }
+                ToplevelParentSource::Portal { .. } => true,
+                ToplevelParentSource::Local => true,
+            });
         for identity in &invalidated {
             self.foreign_imports.remove(identity);
         }
-        invalidated.into_iter().collect()
+        (invalidated.into_iter().collect(), notices)
     }
 
     fn forget_foreign_surface(&mut self, surface: SurfaceKey) {
@@ -2520,8 +2698,9 @@ impl Runtime {
             .filter(|(_, export)| export.surface == surface)
             .map(|(handle, _)| handle.clone())
             .collect();
-        let invalidated = self.invalidate_foreign_exports(&handles);
-        self.queue_foreign_destroyed(invalidated);
+        let (imports, dialogs) = self.invalidate_foreign_exports(&handles);
+        self.queue_foreign_destroyed(imports);
+        self.queue_portal_standalone(dialogs);
     }
 
     fn forget_foreign_client(&mut self, client: u64) {
@@ -2542,8 +2721,8 @@ impl Runtime {
         self.toplevel_parents.retain(|child, relation| {
             child.client != client
                 && !matches!(
-                    relation.source,
-                    ToplevelParentSource::Foreign(identity) if imports.contains(&identity)
+                    &relation.source,
+                    ToplevelParentSource::Foreign(identity) if imports.contains(identity)
                 )
         });
         let handles: Vec<String> = self
@@ -2552,8 +2731,9 @@ impl Runtime {
             .filter(|(_, export)| export.surface.client == client)
             .map(|(handle, _)| handle.clone())
             .collect();
-        let invalidated = self.invalidate_foreign_exports(&handles);
+        let (invalidated, dialogs) = self.invalidate_foreign_exports(&handles);
         self.queue_foreign_destroyed(invalidated);
+        self.queue_portal_standalone(dialogs);
     }
 
     /// The clipboard visible to a client that currently owns keyboard focus.
@@ -3352,7 +3532,8 @@ mod tests {
             | KeyboardDelivery::SelectionFocusLost(_)
             | KeyboardDelivery::DataSourceCancelled(_)
             | KeyboardDelivery::DataSourceSend { .. }
-            | KeyboardDelivery::ForeignDestroyed(_)) => {
+            | KeyboardDelivery::ForeignDestroyed(_)
+            | KeyboardDelivery::PortalDialogsStandalone(_)) => {
                 panic!("unexpected data-device delivery")
             }
             Err(error) => panic!("no keyboard event was published: {error}"),
@@ -3375,7 +3556,8 @@ mod tests {
             | KeyboardDelivery::SelectionFocusLost(_)
             | KeyboardDelivery::DataSourceCancelled(_)
             | KeyboardDelivery::DataSourceSend { .. }
-            | KeyboardDelivery::ForeignDestroyed(_) => {
+            | KeyboardDelivery::ForeignDestroyed(_)
+            | KeyboardDelivery::PortalDialogsStandalone(_) => {
                 panic!("unexpected data-device delivery");
             }
         }
@@ -3403,7 +3585,8 @@ mod tests {
             | KeyboardDelivery::SelectionFocusLost(_)
             | KeyboardDelivery::DataSourceCancelled(_)
             | KeyboardDelivery::DataSourceSend { .. }
-            | KeyboardDelivery::ForeignDestroyed(_) => {
+            | KeyboardDelivery::ForeignDestroyed(_)
+            | KeyboardDelivery::PortalDialogsStandalone(_) => {
                 panic!("unexpected data-device delivery");
             }
         }
@@ -10319,7 +10502,8 @@ mod tests {
                 | KeyboardDelivery::SelectionFocusLost(_)
                 | KeyboardDelivery::DataSourceCancelled(_)
                 | KeyboardDelivery::DataSourceSend { .. }
-                | KeyboardDelivery::ForeignDestroyed(_) => None,
+                | KeyboardDelivery::ForeignDestroyed(_)
+                | KeyboardDelivery::PortalDialogsStandalone(_) => None,
             })
             .collect();
         assert_eq!(retained.len(), MAX_PENDING_KEYBOARD_DELIVERIES);
@@ -10500,6 +10684,207 @@ mod tests {
             deliveries.recv().unwrap(),
             KeyboardDelivery::ForeignDestroyed(delivery) if delivery == vec![identity]
         ));
+        stop.stop();
+        runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn portal_parenting_is_handle_scoped_and_dismissal_preserves_replacements() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-portal-parent-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let parent = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let replacement = SurfaceKey {
+            client: 1,
+            object: 5,
+        };
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let manager = PortalManagerIdentity {
+            client: 2,
+            object: 20,
+            generation: 1,
+        };
+        let replacement_manager = PortalManagerIdentity {
+            generation: 2,
+            ..manager
+        };
+        let subscription = runtime.subscribe_keyboard(2).unwrap();
+        let (deliveries, stop) = subscription.split();
+        runtime.commit(parent, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(replacement, surface([4, 5, 6, 0])).unwrap();
+        runtime.commit(dialog, surface([7, 8, 9, 0])).unwrap();
+        runtime
+            .export_foreign_toplevel(parent, "portal-handle".to_string())
+            .unwrap();
+
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "portal-handle", manager, 1),
+            Ok(Some(parent))
+        );
+        assert_eq!(runtime.effective_toplevel_parent(dialog), Some(parent));
+        assert!(!runtime.dismiss_portal_dialog(dialog, replacement_manager));
+        assert!(runtime.dismiss_portal_dialog(dialog, manager));
+        assert_eq!(runtime.effective_toplevel_parent(dialog), None);
+
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "portal-handle", manager, 2),
+            Ok(Some(parent))
+        );
+        assert_eq!(
+            runtime.set_local_parent(dialog, Some(replacement)),
+            Ok(Some(replacement))
+        );
+        assert!(!runtime.dismiss_portal_dialog(dialog, manager));
+        assert_eq!(
+            runtime.effective_toplevel_parent(dialog),
+            Some(replacement)
+        );
+
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "portal-handle", manager, 3),
+            Ok(Some(parent))
+        );
+        while deliveries.try_recv().is_ok() {}
+        runtime.destroy_foreign_export("portal-handle");
+        assert_eq!(runtime.effective_toplevel_parent(dialog), None);
+        assert!(matches!(
+            deliveries.recv().unwrap(),
+            KeyboardDelivery::PortalDialogsStandalone(notices)
+                if notices == vec![PortalDialogNotice {
+                    manager,
+                    surface: dialog.object,
+                    revision: 3,
+                }]
+        ));
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "missing", manager, 4),
+            Ok(None)
+        );
+        runtime
+            .export_foreign_toplevel(parent, "replacement-handle".to_string())
+            .unwrap();
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "replacement-handle", manager, 5),
+            Ok(Some(parent))
+        );
+        runtime.destroy_portal_manager(manager);
+        assert_eq!(runtime.effective_toplevel_parent(dialog), None);
+        stop.stop();
+        runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn unmapping_a_portal_parent_reports_the_dialog_standalone() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-portal-unmap-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let parent = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let manager = PortalManagerIdentity {
+            client: 2,
+            object: 20,
+            generation: 1,
+        };
+        let subscription = runtime.subscribe_keyboard(2).unwrap();
+        let (deliveries, stop) = subscription.split();
+        runtime.commit(parent, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(dialog, surface([4, 5, 6, 0])).unwrap();
+        runtime
+            .export_foreign_toplevel(parent, "portal-handle".to_string())
+            .unwrap();
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "portal-handle", manager, 7),
+            Ok(Some(parent))
+        );
+        while deliveries.try_recv().is_ok() {}
+
+        runtime.unmap(parent).unwrap();
+        assert_eq!(runtime.effective_toplevel_parent(dialog), None);
+        assert!(matches!(
+            deliveries.recv().unwrap(),
+            KeyboardDelivery::PortalDialogsStandalone(notices)
+                if notices == vec![PortalDialogNotice {
+                    manager,
+                    surface: dialog.object,
+                    revision: 7,
+                }]
+        ));
+        runtime.destroy_foreign_export("portal-handle");
+        assert!(deliveries.try_recv().is_err());
+        stop.stop();
+        runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn departing_portal_parent_client_reports_the_dialog_standalone() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-portal-parent-departure-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let parent = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let manager = PortalManagerIdentity {
+            client: 2,
+            object: 20,
+            generation: 1,
+        };
+        let subscription = runtime.subscribe_keyboard(2).unwrap();
+        let (deliveries, stop) = subscription.split();
+        runtime.commit(parent, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(dialog, surface([4, 5, 6, 0])).unwrap();
+        runtime
+            .export_foreign_toplevel(parent, "portal-handle".to_string())
+            .unwrap();
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "portal-handle", manager, 9),
+            Ok(Some(parent))
+        );
+        while deliveries.try_recv().is_ok() {}
+
+        runtime.remove_client(parent.client).unwrap();
+        assert_eq!(runtime.effective_toplevel_parent(dialog), None);
+        assert!(matches!(
+            deliveries.recv().unwrap(),
+            KeyboardDelivery::PortalDialogsStandalone(notices)
+                if notices == vec![PortalDialogNotice {
+                    manager,
+                    surface: dialog.object,
+                    revision: 9,
+                }]
+        ));
+        assert!(deliveries.try_recv().is_err());
         stop.stop();
         runtime.unsubscribe_keyboard(2);
     }

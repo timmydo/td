@@ -122,7 +122,7 @@ const TD_PORTAL_REQUEST_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-REQUEST-READY response=2";
 const TD_PORTAL_CHANNEL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_CHANNEL_RUNTIME_MARKER;
 const TD_PORTAL_CHANNEL_CONSOLE_MARKER: &str =
-    "portal-channel-evidence: TD-PORTAL-CHANNEL-READY globals=10 privileged=0";
+    "portal-channel-evidence: TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2";
 /// Printed by the greeter's kernel-capability farm, as the unprivileged login user,
 /// once the RUNNING kernel has been observed to carry the sandbox features §0 pins
 /// that can be witnessed from `/proc` — every one but `CONFIG_MEMCG`, which needs a
@@ -987,8 +987,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          version and immutable policy ({TD_PORTAL_RUNTIME_MARKER}), then pre-subscribed to a \
          caller-derived handle and received both its Background method reply and directed \
          policy-denial Request.Response ({TD_PORTAL_REQUEST_RUNTIME_MARKER}), \
-         connected to the compositor's private portal socket, received its exact public \
-         registry, and proved the privileged manager remained absent until it is served \
+         connected to the compositor's private portal socket, received its exact registry, \
+         bound the privileged manager, and completed standalone and dismissal acknowledgements \
          ({TD_PORTAL_CHANNEL_RUNTIME_MARKER}), \
          confirmed on the RUNNING kernel that the namespaces, \
          seccomp filtering, inotify and cgroup pids controller a jail needs are all there \
@@ -1576,11 +1576,9 @@ fn validate_system_boot(
         return Err(format!(
             "the public portal proof passed, but the private compositor-channel marker \
              ({TD_PORTAL_CHANNEL_CONSOLE_MARKER:?}) was absent — the uid-1000 probe did not \
-             connect to /run/user/1000/td-portal-wayland-0, receive the exact ten public \
-             globals through wl_registry, or prove td_portal_manager_v1 remains absent. \
-             The privileged manager is intentionally deferred until its requests are \
-             served; this marker proves the private transport boundary without advertising \
-             authority prematurely. Last serial output:\n{}",
+             connect to /run/user/1000/td-portal-wayland-0, receive its exact eleven-global \
+             private registry, bind td_portal_manager_v1, or complete standalone dialog \
+             association and dismissal through it. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }

@@ -1245,10 +1245,9 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
-         # The private path is the privileged portal transport boundary, but no\n\
-         # privileged global is served until a later dialog landing. This separate\n\
-         # uid-1000 client proves the socket is live, its public registry remains\n\
-         # exact, and td_portal_manager_v1 has not been advertised prematurely.\n\
+         # The private path is the privileged portal transport boundary. This\n\
+         # separate uid-1000 client proves its exact eleven-global registry and\n\
+         # exercises td_portal_manager_v1 standalone and dismissal acknowledgements.\n\
          # Wait for TLS setup for the same line-framing reason as portal-evidence:\n\
          # its key generator writes raw progress dots to the shared console.\n\
          # td-recipe-eval requires the exact {portal_channel_runtime_marker} line.\n\

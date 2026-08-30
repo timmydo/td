@@ -766,13 +766,13 @@ pub const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str =
     "TD-PORTAL-REQUEST-READY response=2";
 
 /// Printed by a separate unprivileged client only after the compositor's
-/// private portal socket returns the exact public registry and does not
-/// advertise the privileged manager before that manager is implemented.
+/// private portal socket returns its exact registry, binds the privileged
+/// manager, and completes standalone-association and dismissal requests.
 ///
 /// DUPLICATED as `READY_MARKER` in td-portal/src/wayland_channel.rs and pinned
 /// by the td-portal recipe.
 pub const TD_PORTAL_CHANNEL_RUNTIME_MARKER: &str =
-    "TD-PORTAL-CHANNEL-READY globals=10 privileged=0";
+    "TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2";
 
 /// Printed by the unprivileged compositor only after its first framebuffer
 /// paint succeeded and its mode-0600 Wayland socket is listening.

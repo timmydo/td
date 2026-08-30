@@ -11,6 +11,7 @@ const SYS_CLOSE: usize = 3;
 const SYS_IOCTL: usize = 16;
 const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
+const SYS_GETSOCKOPT: usize = 55;
 const SYS_FCNTL: usize = 72;
 
 /// The only `fcntl(2)` commands this crate may issue. They temporarily make
@@ -43,6 +44,7 @@ const O_NOCTTY: i32 = 0o400;
 const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;
 const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
+const SO_PEERCRED: i32 = 17;
 const MSG_CTRUNC: i32 = 0x08;
 const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 const ERRNO_EINTR: isize = -4;
@@ -98,7 +100,7 @@ fn errno_result(value: isize, operation: &str) -> Result<usize, String> {
 }
 
 #[allow(unsafe_code)]
-fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
+fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     let result: isize;
     unsafe {
         core::arch::asm!(
@@ -107,6 +109,8 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             in("rdi") a1,
             in("rsi") a2,
             in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack, preserves_flags),
@@ -119,7 +123,7 @@ fn close_raw(fd: RawFd) -> Result<(), String> {
     if fd < 0 {
         return Err(format!("refusing to close invalid descriptor {fd}"));
     }
-    errno_result(syscall3(SYS_CLOSE, fd as usize, 0, 0), "close")?;
+    errno_result(syscall5(SYS_CLOSE, fd as usize, 0, 0, 0, 0), "close")?;
     Ok(())
 }
 
@@ -132,7 +136,10 @@ fn fcntl(fd: RawFd, command: usize, argument: usize, operation: &str) -> Result<
     if fd < 0 {
         return Err(format!("{operation}: invalid descriptor {fd}"));
     }
-    errno_result(syscall3(SYS_FCNTL, fd as usize, command, argument), operation)
+    errno_result(
+        syscall5(SYS_FCNTL, fd as usize, command, argument, 0, 0),
+        operation,
+    )
 }
 
 /// Add `O_NONBLOCK` while retaining the complete prior file-status word. The
@@ -173,7 +180,43 @@ fn ioctl(fd: RawFd, request: usize, argument: usize, operation: &str) -> Result<
     if fd < 0 {
         return Err(format!("{operation}: invalid descriptor {fd}"));
     }
-    errno_result(syscall3(SYS_IOCTL, fd as usize, request, argument), operation)
+    errno_result(
+        syscall5(SYS_IOCTL, fd as usize, request, argument, 0, 0),
+        operation,
+    )
+}
+
+/// The uid sampled by the kernel when this Unix-stream peer connected.
+///
+/// The option and level are fixed here rather than accepted from a caller.
+/// All three `struct ucred` words are present so the kernel's exact 12-byte
+/// answer is checked before the uid word is believed.
+pub fn peer_uid(stream: &UnixStream) -> Result<u32, String> {
+    let mut credentials = [0u32; 3];
+    let mut length = u32::try_from(std::mem::size_of_val(&credentials))
+        .map_err(|_| "SO_PEERCRED buffer length exceeds u32".to_string())?;
+    errno_result(
+        syscall5(
+            SYS_GETSOCKOPT,
+            stream.as_raw_fd() as usize,
+            SOL_SOCKET as usize,
+            SO_PEERCRED as usize,
+            (&mut credentials as *mut [u32; 3]) as usize,
+            (&mut length as *mut u32) as usize,
+        ),
+        "getsockopt SO_PEERCRED",
+    )?;
+    let expected = u32::try_from(std::mem::size_of_val(&credentials))
+        .map_err(|_| "SO_PEERCRED buffer length exceeds u32".to_string())?;
+    if length != expected {
+        return Err(format!(
+            "getsockopt SO_PEERCRED returned {length} bytes, expected {expected}"
+        ));
+    }
+    credentials
+        .get(1)
+        .copied()
+        .ok_or_else(|| "SO_PEERCRED uid word is absent".to_string())
 }
 
 /// The kernel's `struct winsize`: four native-endian `u16` fields. The pixel
@@ -563,11 +606,13 @@ pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, 
         flags: 0,
     };
     let count = loop {
-        let result = syscall3(
+        let result = syscall5(
             SYS_RECVMSG,
             stream.as_raw_fd() as usize,
             (&mut message as *mut MsgHdr) as usize,
             MSG_CMSG_CLOEXEC as usize,
+            0,
+            0,
         );
         if result != ERRNO_EINTR {
             break receive_result(result)?;
@@ -639,10 +684,12 @@ pub fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<
         flags: 0,
     };
     let sent = loop {
-        let result = syscall3(
+        let result = syscall5(
             SYS_SENDMSG,
             stream.as_raw_fd() as usize,
             (&message as *const MsgHdr) as usize,
+            0,
+            0,
             0,
         );
         if let Some(sent) = sendmsg_result(result)? {
@@ -739,6 +786,7 @@ mod tests {
     use std::fs;
     use std::io::Read;
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -764,6 +812,15 @@ mod tests {
         duplicate.read_to_end(&mut content).unwrap();
         assert_eq!(content, b"pixels");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn peer_uid_is_the_connectors_kernel_credential() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let expected = fs::metadata("/proc/self").unwrap().uid();
+        assert_eq!(peer_uid(&left).unwrap(), expected);
+        assert_eq!(peer_uid(&right).unwrap(), expected);
+        assert_eq!(std::mem::size_of::<[u32; 3]>(), 12);
     }
 
     #[test]
