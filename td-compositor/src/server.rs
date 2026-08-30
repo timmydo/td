@@ -3465,7 +3465,7 @@ impl Client {
         self.runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
-            .destroy_portal_manager(identity);
+            .destroy_portal_manager(identity)?;
         self.remove_object(identity.object)
     }
 
@@ -3579,7 +3579,7 @@ impl Client {
                     object: surface,
                 },
                 manager,
-            );
+            )?;
         if managers
             .dialogs
             .get(&surface)

@@ -182,6 +182,11 @@ struct ToplevelParent {
     parent: SurfaceKey,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PortalDialog {
+    manager: PortalManagerIdentity,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectionSource {
     pub identity: DataSourceIdentity,
@@ -374,6 +379,12 @@ pub struct Runtime {
     /// by xdg-foreign. One map is what makes either request replace the other
     /// and gives mapping, focus, and unmapping lifecycle one answer to read.
     toplevel_parents: BTreeMap<SurfaceKey, ToplevelParent>,
+    /// Manager ownership outlives a mapped parent relationship: an empty or
+    /// revoked handle is still a standalone modal portal dialog, and a later
+    /// ordinary parent request must not let a stale manager dismiss somebody
+    /// else's relationship. Scene state carries placement; this map carries
+    /// the manager generation which authorizes its lifetime.
+    portal_dialogs: BTreeMap<SurfaceKey, PortalDialog>,
     pending_paint: bool,
     /// A compound-surface commit holds the runtime lock across every scene
     /// mutation and settles once. Calls made inside it record what they owe
@@ -491,6 +502,7 @@ impl Runtime {
             foreign_exports: BTreeMap::new(),
             foreign_imports: BTreeMap::new(),
             toplevel_parents: BTreeMap::new(),
+            portal_dialogs: BTreeMap::new(),
             pending_paint: false,
             compound_settle: None,
             application_ready: None,
@@ -1516,6 +1528,7 @@ impl Runtime {
             }
         }
         let reparented = self.reparent_around_unmap(key);
+        self.portal_dialogs.remove(&key);
         self.forget_foreign_surface(key);
         let (mut layout_changed, dropped) = self.scene.remove(key);
         for (child, parent) in reparented {
@@ -1545,6 +1558,7 @@ impl Runtime {
                 .surface_content
                 .retain(|key, _| key.client != client);
         }
+        self.portal_dialogs.retain(|key, _| key.client != client);
         let reparented = self.reparent_around_client(client);
         self.forget_foreign_client(client);
         let mut layout_changed = self.scene.remove_client(client);
@@ -1756,16 +1770,23 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
-        let modal = self.scene.modal();
+        let overlay_modal = self.scene.modal();
+        let portal_modal = self.scene.portal_modal().is_some();
+        let input_modal = overlay_modal || portal_modal;
         // Sampled BEFORE the frame, because the frame is what ENDS a grab: a
         // report carrying the last release along with its motion would
         // otherwise be read as ungrabbed motion, and whether the two arrived
         // together is a property of the device's batching rather than of
         // anything the operator did.
-        let grabbed = self.pointer.grab_surface().is_some();
+        let grab_surface = self.pointer.grab_surface();
+        let grabbed = grab_surface.is_some();
+        let portal_owns_grab = grab_surface
+            .is_some_and(|surface| self.scene.portal_modal_owns_surface(surface));
         let (hover, grab) = self.routed_pointer_targets();
         let mut modal_buttons = Vec::new();
-        let buttons = if modal {
+        let blocks_new_gestures =
+            overlay_modal || (portal_modal && grabbed && !portal_owns_grab);
+        let buttons = if blocks_new_gestures {
             modal_buttons.extend(
                 buttons
                     .iter()
@@ -1787,7 +1808,7 @@ impl Runtime {
         // Dropped by the same road the overlay above drops one, and safe for
         // the same reason — the model suppresses a release it matched no press
         // to, so the half left behind reaches nobody.
-        let dismissed = if modal
+        let dismissed = if overlay_modal
             || !buttons
                 .iter()
                 .any(|input| input.state == PointerButtonState::Pressed)
@@ -1816,12 +1837,12 @@ impl Runtime {
             );
             &kept_buttons
         };
-        // A modal overlay drops the wheel outright, where it lets a RELEASE
-        // through: a release is owed to a client already holding the button,
-        // and a notch is owed to nobody — it is a whole gesture rather than
-        // half of one, so passing it on would scroll a surface the operator
-        // cannot see behind the sheet.
-        let scroll = if modal {
+        // A modal owner drops the wheel where it lets an old RELEASE through:
+        // a release is owed to a client already holding the button, and a
+        // notch is owed to nobody — it is a whole gesture rather than half of
+        // one, so passing it on would scroll a surface the operator cannot see
+        // behind the sheet.
+        let scroll = if blocks_new_gestures {
             PointerScroll::default()
         } else {
             scroll
@@ -1878,7 +1899,7 @@ impl Runtime {
         // arrangement that the reports which moved nothing should not pay
         // for.
         let hovered = if moved
-            && !modal
+            && !input_modal
             && self.dragging.is_none()
             && !grabbed
             && self
@@ -1909,14 +1930,15 @@ impl Runtime {
         // press ESTABLISHED a grab on, which is by construction the one the
         // button event was routed to, so focus cannot disagree with delivery;
         // and a press made DURING a grab establishes nothing, so dragging off
-        // a tile does not take focus with it. A modal overlay filters presses
-        // out above, so nothing is established and the overlay keeps focus.
+        // a tile does not take focus with it. Modal filtering above makes an
+        // underlying press establish nothing and keeps the modal owner in
+        // control.
         if let Some(clicked) = result.pressed_on {
             if let Err(error) = self.focus_surface(clicked) {
                 failures.push(error);
             }
         }
-        if let Err(error) = self.drag(modal, moved, alt_press, buttons) {
+        if let Err(error) = self.drag(input_modal, moved, alt_press, buttons) {
             failures.push(error);
         }
         // LAST, and after the drag rather than before it: the press that
@@ -1944,9 +1966,9 @@ impl Runtime {
     /// no client, so a press on one establishes no grab and delivers nothing.
     /// That is the same seam that makes a band's click reach no client, used
     /// rather than worked around, and an Alt press is withheld to reach it.
-    /// A modal overlay owns every button while it is up, so nothing is picked
-    /// up under one — and anything already held is dropped, since the operator
-    /// can no longer see where it would land.
+    /// A modal surface owns every new button while it is up, so nothing is
+    /// picked up under one — and anything already held is dropped, since the
+    /// operator can no longer see where it would land.
     fn drag(
         &mut self,
         modal: bool,
@@ -2338,27 +2360,32 @@ impl Runtime {
         let parent = self
             .foreign_exports
             .get(handle)
-            .map(|export| export.surface);
-        let Some(parent) = parent else {
-            return self.set_toplevel_parent(
-                child,
-                None,
-                ToplevelParentSource::Portal {
-                    handle: handle.to_string(),
-                    manager,
-                    revision,
-                },
-            );
+            .map(|export| export.surface)
+            .filter(|parent| self.scene.is_mapped(*parent));
+        if parent.is_some_and(|parent| self.parent_would_cycle(child, parent)) {
+            return Err(ToplevelParentError::InvalidParent);
+        }
+        let source = ToplevelParentSource::Portal {
+            handle: handle.to_string(),
+            manager,
+            revision,
         };
-        self.set_toplevel_parent(
-            child,
-            Some(parent),
-            ToplevelParentSource::Portal {
-                handle: handle.to_string(),
-                manager,
-                revision,
-            },
-        )
+        match parent {
+            Some(parent) => {
+                self.toplevel_parents
+                    .insert(child, ToplevelParent { source, parent });
+            }
+            None => {
+                self.toplevel_parents.remove(&child);
+            }
+        }
+        self.portal_dialogs
+            .insert(child, PortalDialog { manager });
+        self.dragging = None;
+        let layout_changed = self.scene.set_portal_dialog(child, parent);
+        self.settle(layout_changed)
+            .map_err(ToplevelParentError::Failed)?;
+        Ok(parent)
     }
 
     /// Remove only a relationship installed through the portal manager. A
@@ -2368,21 +2395,31 @@ impl Runtime {
         &mut self,
         child: SurfaceKey,
         manager: PortalManagerIdentity,
-    ) -> bool {
-        if !self.toplevel_parents.get(&child).is_some_and(|relation| {
+    ) -> Result<bool, String> {
+        if !self
+            .portal_dialogs
+            .get(&child)
+            .is_some_and(|dialog| dialog.manager == manager)
+        {
+            return Ok(false);
+        }
+        self.portal_dialogs.remove(&child);
+        if self.toplevel_parents.get(&child).is_some_and(|relation| {
             matches!(
                 &relation.source,
                 ToplevelParentSource::Portal { manager: current, .. }
                     if *current == manager
             )
         }) {
-            return false;
+            self.toplevel_parents.remove(&child);
         }
-        self.toplevel_parents.remove(&child);
-        true
+        let parent = self.toplevel_parent(child);
+        let layout_changed = self.scene.clear_portal_dialog(child, parent);
+        self.settle(layout_changed)?;
+        Ok(true)
     }
 
-    pub fn destroy_portal_manager(&mut self, manager: PortalManagerIdentity) {
+    pub fn destroy_portal_manager(&mut self, manager: PortalManagerIdentity) -> Result<(), String> {
         self.toplevel_parents.retain(|_, relation| {
             !matches!(
                 &relation.source,
@@ -2390,6 +2427,18 @@ impl Runtime {
                     if *current == manager
             )
         });
+        let children: Vec<SurfaceKey> = self
+            .portal_dialogs
+            .iter()
+            .filter_map(|(child, dialog)| (dialog.manager == manager).then_some(*child))
+            .collect();
+        let mut layout_changed = false;
+        for child in children {
+            self.portal_dialogs.remove(&child);
+            let parent = self.toplevel_parent(child);
+            layout_changed |= self.scene.clear_portal_dialog(child, parent);
+        }
+        self.settle(layout_changed)
     }
 
     fn set_toplevel_parent(
@@ -3288,21 +3337,28 @@ impl Runtime {
         Err(failures.join("; "))
     }
 
-    /// Where the keyboard points. A grabbing menu takes it from the window
-    /// underneath for as long as it holds one, which is the protocol's rule
-    /// and not a preference: "the top most grabbing popup will always have
-    /// keyboard focus". Everything else is the layout's focused tile.
+    /// Where the keyboard points. The active portal dialog and its topmost
+    /// grabbing popup own the seat before any application surface. Without a
+    /// dialog, a grabbing menu takes it from the window underneath for as long
+    /// as it holds one, which is the protocol's rule and not a preference:
+    /// "the top most grabbing popup will always have keyboard focus".
+    /// Everything else is the layout's focused tile.
     ///
     /// Popups are in no layout, so this is an OVERRIDE rather than a focus
     /// the layout could hold. `scene.focused()` keeps naming the window
     /// underneath throughout, which is what the menu closing falls back to
     /// with no second record to keep in step.
     ///
-    /// A modal overlay is not consulted, because it never was: the launcher
-    /// and the cheat sheet stop keys at the input layer rather than by moving
-    /// this, so a menu under one is focused exactly as the window under one
-    /// is, and hears no more than it does.
+    /// The launcher and cheat sheet still stop keys at the input layer rather
+    /// than moving this target. The portal dialog differs because it is a
+    /// client surface owed keyboard enter/leave while it enforces modality.
     fn keyboard_target(&self) -> Option<SurfaceKey> {
+        if let Some(dialog) = self.scene.portal_modal() {
+            return self
+                .scene
+                .topmost_grab(self.framebuffer.width, self.framebuffer.height)
+                .or(Some(dialog));
+        }
         self.scene
             .topmost_grab(self.framebuffer.width, self.framebuffer.height)
             .or_else(|| self.scene.focused().map(|key| self.topmost_parented(key)))
@@ -10733,8 +10789,10 @@ mod tests {
             Ok(Some(parent))
         );
         assert_eq!(runtime.effective_toplevel_parent(dialog), Some(parent));
-        assert!(!runtime.dismiss_portal_dialog(dialog, replacement_manager));
-        assert!(runtime.dismiss_portal_dialog(dialog, manager));
+        assert!(!runtime
+            .dismiss_portal_dialog(dialog, replacement_manager)
+            .unwrap());
+        assert!(runtime.dismiss_portal_dialog(dialog, manager).unwrap());
         assert_eq!(runtime.effective_toplevel_parent(dialog), None);
 
         assert_eq!(
@@ -10745,7 +10803,7 @@ mod tests {
             runtime.set_local_parent(dialog, Some(replacement)),
             Ok(Some(replacement))
         );
-        assert!(!runtime.dismiss_portal_dialog(dialog, manager));
+        assert!(runtime.dismiss_portal_dialog(dialog, manager).unwrap());
         assert_eq!(
             runtime.effective_toplevel_parent(dialog),
             Some(replacement)
@@ -10778,10 +10836,356 @@ mod tests {
             runtime.set_portal_parent(dialog, "replacement-handle", manager, 5),
             Ok(Some(parent))
         );
-        runtime.destroy_portal_manager(manager);
+        runtime.destroy_portal_manager(manager).unwrap();
         assert_eq!(runtime.effective_toplevel_parent(dialog), None);
+        assert_eq!(runtime.scene.portal_modal(), None);
+        assert!(runtime
+            .layout_snapshot()
+            .get(&dialog)
+            .is_some_and(|view| view.visible));
         stop.stop();
         runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn portal_dialogs_float_center_capture_input_and_reveal_in_order() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-portal-modal-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let width = 240;
+        let height = 180;
+        let framebuffer =
+            Framebuffer::test_file(&cleanup.0, width, height, width.saturating_mul(4)).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let parent = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let neighbour = SurfaceKey {
+            client: 1,
+            object: 5,
+        };
+        let first = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 7,
+        };
+        let manager = PortalManagerIdentity {
+            client: 2,
+            object: 20,
+            generation: 1,
+        };
+        for (key, pixel) in [
+            (parent, [1, 2, 3, 0]),
+            (neighbour, [4, 5, 6, 0]),
+            (first, [7, 8, 9, 0]),
+            (second, [10, 11, 12, 0]),
+        ] {
+            runtime.commit(key, surface(pixel)).unwrap();
+        }
+        let tiled_parent_width = runtime.layout_snapshot().get(&parent).unwrap().rect.width;
+        runtime
+            .export_foreign_toplevel(parent, "modal-parent".to_string())
+            .unwrap();
+        let underlying_focus = runtime.scene.focused();
+
+        assert_eq!(
+            runtime.set_portal_parent(first, "modal-parent", manager, 1),
+            Ok(Some(parent))
+        );
+        assert_eq!(runtime.scene.focused(), underlying_focus);
+        assert_eq!(runtime.scene.portal_modal(), Some(first));
+        let layout = runtime.layout_snapshot();
+        let first_view = layout.get(&first).unwrap();
+        assert_eq!(first_view.rect.x, width / 8);
+        assert_eq!(first_view.rect.width, width.saturating_mul(3) / 4);
+        assert!(first_view.visible && first_view.activated && !first_view.fullscreen);
+        assert!(layout
+            .get(&parent)
+            .is_some_and(|view| view.visible && !view.activated));
+        assert!(layout.get(&parent).unwrap().rect.width > tiled_parent_width);
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        runtime
+            .pointer_frame(
+                1,
+                1,
+                i32::try_from(crate::bar::BAR_HEIGHT.saturating_add(1)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        assert_eq!(runtime.pointer_snapshot().focus, None);
+        let dialog_rect = first_view.rect;
+        runtime
+            .pointer_frame(
+                2,
+                i32::try_from(dialog_rect.x).unwrap().saturating_sub(1),
+                i32::try_from(dialog_rect.y)
+                    .unwrap()
+                    .saturating_sub(i32::try_from(crate::bar::BAR_HEIGHT).unwrap())
+                    .saturating_sub(1),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.pointer_snapshot().focus.map(|target| target.surface),
+            Some(first)
+        );
+
+        assert_eq!(
+            runtime.set_portal_parent(second, "missing", manager, 2),
+            Ok(None)
+        );
+        let layout = runtime.layout_snapshot();
+        assert!(layout
+            .get(&first)
+            .is_some_and(|view| !view.visible && !view.activated));
+        assert!(layout
+            .get(&second)
+            .is_some_and(|view| view.visible && view.activated));
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+
+        runtime.unmap(second).unwrap();
+        assert_eq!(runtime.scene.portal_modal(), Some(first));
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+        runtime.commit(second, surface([10, 11, 12, 0])).unwrap();
+        assert_eq!(runtime.scene.portal_modal(), Some(second));
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        assert!(runtime.dismiss_portal_dialog(second, manager).unwrap());
+        assert_eq!(runtime.scene.portal_modal(), Some(first));
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+        assert_eq!(
+            runtime.set_local_parent(first, Some(neighbour)),
+            Ok(Some(neighbour))
+        );
+        assert!(runtime.dismiss_portal_dialog(first, manager).unwrap());
+        assert_eq!(runtime.scene.portal_modal(), None);
+        assert_eq!(runtime.effective_toplevel_parent(first), Some(neighbour));
+        assert!(runtime.layout_snapshot().get(&first).is_some_and(|view| {
+            view.visible && view.activated && view.rect != dialog_rect
+        }));
+    }
+
+    #[test]
+    fn a_portal_dialog_inherits_a_floating_portal_parents_workspace() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-portal-floating-parent-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 100, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let parent = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let child = SurfaceKey {
+            client: 2,
+            object: 7,
+        };
+        let manager = PortalManagerIdentity {
+            client: 2,
+            object: 20,
+            generation: 1,
+        };
+
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+        runtime.commit(parent, surface([1, 2, 3, 0])).unwrap();
+        assert_eq!(
+            runtime.set_portal_parent(parent, "missing", manager, 1),
+            Ok(None)
+        );
+        runtime
+            .export_foreign_toplevel(parent, "floating-parent".to_string())
+            .unwrap();
+        runtime.command(Command::SwitchWorkspace(1)).unwrap();
+        runtime.commit(child, surface([4, 5, 6, 0])).unwrap();
+
+        assert_eq!(
+            runtime.set_portal_parent(child, "floating-parent", manager, 2),
+            Ok(Some(parent))
+        );
+        assert_eq!(runtime.scene.portal_modal(), None);
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+        assert_eq!(runtime.scene.portal_modal(), Some(child));
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(child));
+    }
+
+    #[test]
+    fn an_ordinary_child_follows_a_floating_portal_parent_workspace() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-portal-ordinary-child-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 100, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let parent = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let child = SurfaceKey {
+            client: 2,
+            object: 7,
+        };
+        let manager = PortalManagerIdentity {
+            client: 2,
+            object: 20,
+            generation: 1,
+        };
+
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+        runtime.commit(parent, surface([1, 2, 3, 0])).unwrap();
+        assert_eq!(
+            runtime.set_portal_parent(parent, "missing", manager, 1),
+            Ok(None)
+        );
+        runtime.command(Command::SwitchWorkspace(1)).unwrap();
+        runtime.commit(child, surface([4, 5, 6, 0])).unwrap();
+
+        assert_eq!(runtime.set_local_parent(child, Some(parent)), Ok(Some(parent)));
+        assert!(runtime.scene.toplevels_share_workspace(child, parent));
+        assert!(runtime
+            .layout_snapshot()
+            .get(&child)
+            .is_some_and(|view| !view.visible));
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+        assert!(runtime
+            .layout_snapshot()
+            .get(&child)
+            .is_some_and(|view| view.visible));
+        assert_eq!(runtime.scene.portal_modal(), Some(parent));
+    }
+
+    #[test]
+    fn portal_modal_releases_an_application_grab_without_new_gestures() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-portal-grab-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let width = 120;
+        let height = crate::scene::least_output_height(8);
+        let framebuffer =
+            Framebuffer::test_file(&cleanup.0, width, height, width.saturating_mul(4)).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let application = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        let manager = PortalManagerIdentity {
+            client: 2,
+            object: 20,
+            generation: 1,
+        };
+        runtime
+            .commit(application, surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime.commit(dialog, surface([4, 5, 6, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&application).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+                PointerScroll::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == application
+        ));
+        let press = PointerButtonInput {
+            time: 2,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        runtime
+            .pointer_frame(2, 0, 0, &[press], PointerScroll::default())
+            .unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Button { input, .. }] if *input == press
+        ));
+
+        runtime
+            .export_foreign_toplevel(application, "portal-grab-parent".to_string())
+            .unwrap();
+        assert_eq!(
+            runtime.set_portal_parent(dialog, "portal-grab-parent", manager, 1),
+            Ok(Some(application))
+        );
+        assert!(events.try_recv().is_err());
+        let blocked_press = PointerButtonInput {
+            time: 3,
+            button: 273,
+            state: PointerButtonState::Pressed,
+        };
+        runtime
+            .pointer_frame(
+                3,
+                0,
+                0,
+                &[blocked_press],
+                PointerScroll {
+                    vertical: 1,
+                    horizontal: 0,
+                },
+            )
+            .unwrap();
+        assert!(events.try_recv().is_err());
+
+        let release = PointerButtonInput {
+            time: 4,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        runtime
+            .pointer_frame(4, 0, 0, &[release], PointerScroll::default())
+            .unwrap();
+        assert_eq!(
+            recv_pointer(&events).events,
+            vec![
+                PointerEvent::Button {
+                    surface: application,
+                    input: release,
+                },
+                PointerEvent::Leave {
+                    surface: application,
+                },
+            ]
+        );
+        assert_eq!(
+            runtime.pointer_snapshot().focus.map(|target| target.surface),
+            Some(dialog)
+        );
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(1);
     }
 
     #[test]

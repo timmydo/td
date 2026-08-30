@@ -810,6 +810,13 @@ pub struct Scene {
     /// destroyed, which is the only road a popup that grabbed and never
     /// mapped has, having no mapping to end.
     grabs: BTreeSet<SurfaceKey>,
+    /// Toplevels admitted by the private portal manager. They keep their
+    /// layout home but are not leaves while mapped: the active workspace's
+    /// newest mapped entry is a centered modal layer instead. A separate
+    /// order is required because object ids are reusable and say nothing
+    /// about which dialog was presented last.
+    portal_dialogs: BTreeSet<SurfaceKey>,
+    portal_dialog_order: Vec<SurfaceKey>,
     titles: BTreeMap<SurfaceKey, String>,
     layout: Layout,
     pointer_x: i32,
@@ -853,6 +860,8 @@ impl Scene {
             subsurfaces: BTreeMap::new(),
             subsurface_stacks: BTreeMap::new(),
             grabs: BTreeSet::new(),
+            portal_dialogs: BTreeSet::new(),
+            portal_dialog_order: Vec::new(),
             titles: BTreeMap::new(),
             layout: Layout::new(),
             pointer_x: 0,
@@ -1133,12 +1142,55 @@ impl Scene {
     ) -> Result<bool, String> {
         let is_new = self.store_surface(key, surface)?;
         if is_new {
-            if !parent.is_some_and(|parent| self.layout.place_after(key, parent)) {
+            if self.portal_dialogs.contains(&key) {
+                self.layout.float(key, parent);
+            } else if !parent.is_some_and(|parent| self.layout.place_after(key, parent)) {
                 self.layout.map(key);
             }
             self.hint = None;
         }
         Ok(is_new)
+    }
+
+    /// Move a portal-owned toplevel out of tiling while retaining the
+    /// workspace its parent (or its prior standalone mapping) selected. The
+    /// scene's order is the modal stack; only its newest mapped entry on the
+    /// active workspace is drawn and routed input.
+    pub fn set_portal_dialog(&mut self, key: SurfaceKey, parent: Option<SurfaceKey>) -> bool {
+        let was_last = self.portal_dialog_order.last().copied() == Some(key);
+        self.portal_dialogs.insert(key);
+        self.portal_dialog_order.retain(|candidate| *candidate != key);
+        self.portal_dialog_order.push(key);
+        let moved = self.layout.float(key, parent);
+        self.hint = None;
+        !was_last || moved
+    }
+
+    /// Return a dismissed portal to ordinary tiling. A parent request which
+    /// replaced the manager's relationship survives and determines where the
+    /// window re-enters; otherwise its retained workspace home does.
+    pub fn clear_portal_dialog(&mut self, key: SurfaceKey, parent: Option<SurfaceKey>) -> bool {
+        if !self.portal_dialogs.remove(&key) {
+            return false;
+        }
+        self.portal_dialog_order.retain(|candidate| *candidate != key);
+        if self.is_mapped(key)
+            && !parent.is_some_and(|parent| self.layout.place_after(key, parent))
+        {
+            self.layout.map(key);
+        }
+        self.hint = None;
+        true
+    }
+
+    /// Forget manager policy without remapping a surface which is itself
+    /// being destroyed.
+    pub fn forget_portal_dialog(&mut self, key: SurfaceKey) -> bool {
+        let removed = self.portal_dialogs.remove(&key);
+        if removed {
+            self.portal_dialog_order.retain(|candidate| *candidate != key);
+        }
+        removed
     }
 
     /// Apply a parent request to windows which are already mapped. Unmapped
@@ -1147,6 +1199,13 @@ impl Scene {
     pub fn place_toplevel(&mut self, key: SurfaceKey, parent: SurfaceKey) -> bool {
         if !self.is_mapped(key) || !self.is_mapped(parent) {
             return false;
+        }
+        if self.portal_dialogs.contains(&key) {
+            let changed = self.layout.float(key, Some(parent));
+            if changed {
+                self.hint = None;
+            }
+            return changed;
         }
         let changed = self.layout.place_after(key, parent);
         if changed {
@@ -1461,7 +1520,7 @@ impl Scene {
         if self.grabs.is_empty() {
             return None;
         }
-        let focused = self.layout.focused()?;
+        let focused = self.portal_modal().or_else(|| self.layout.focused())?;
         let placements = self.tiled_placements(width, height);
         let mut stack = self.popups_stacked();
         stack.retain(|key| {
@@ -1508,7 +1567,12 @@ impl Scene {
         let placements = self.tiled_placements(width, height);
         let hit = self.popup_target_from(&placements).map(|point| point.key);
         let mut chain = self.popups_stacked();
-        chain.retain(|key| self.grabs.contains(key) && !self.shelters(*key, hit));
+        let modal = self.portal_modal();
+        chain.retain(|key| {
+            self.grabs.contains(key)
+                && modal.is_none_or(|root| self.popup_root(*key) == Some(root))
+                && !self.shelters(*key, hit)
+        });
         chain.reverse();
         chain
     }
@@ -1521,7 +1585,11 @@ impl Scene {
     /// client's — its own window as much as its menu — and only a press
     /// belonging to somebody else is one td may take.
     pub fn client_holds_grab(&self, client: u64) -> bool {
-        self.grabs.iter().any(|key| key.client == client)
+        let modal = self.portal_modal();
+        self.grabs.iter().any(|key| {
+            key.client == client
+                && modal.is_none_or(|root| self.popup_root(*key) == Some(root))
+        })
     }
 
     /// Whether a press on `hit` is a press INSIDE `key`: on that popup itself,
@@ -1833,7 +1901,8 @@ impl Scene {
     }
 
     pub fn unmap(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
-        let layout_changed = self.layout.contains(key);
+        let layout_changed = self.layout.contains(key)
+            || (self.portal_dialogs.contains(&key) && self.is_mapped(key));
         self.forget_popup(key);
         let dropped = self.drop_popups_of(key);
         self.discard_pixels(key);
@@ -1848,7 +1917,9 @@ impl Scene {
     }
 
     pub fn remove(&mut self, key: SurfaceKey) -> (bool, Vec<SurfaceKey>) {
-        let layout_changed = self.layout.contains(key);
+        let layout_changed = self.layout.contains(key)
+            || (self.portal_dialogs.contains(&key) && self.is_mapped(key));
+        self.forget_portal_dialog(key);
         self.remove_subsurface(key);
         self.subsurface_stacks.remove(&key);
         self.discard_pixels(key);
@@ -1915,6 +1986,9 @@ impl Scene {
             true
         });
         self.grabs.retain(|key| key.client != client);
+        self.portal_dialogs.retain(|key| key.client != client);
+        self.portal_dialog_order
+            .retain(|key| key.client != client);
         self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         // Cursor surfaces are not in `surfaces`, so the sweep above misses
@@ -1996,7 +2070,76 @@ impl Scene {
         for view in &mut views {
             view.rect.y = view.rect.y.saturating_add(BAR_HEIGHT);
         }
+        let modal = self.portal_modal();
+        if modal.is_some() {
+            for view in &mut views {
+                view.activated = false;
+            }
+        }
+        for key in &self.portal_dialog_order {
+            if !self.is_mapped(*key) {
+                continue;
+            }
+            let placement = self.portal_dialog_placement(*key, width, height);
+            views.push(ViewLayout {
+                key: *key,
+                rect: placement.rect,
+                visible: modal == Some(*key),
+                activated: modal == Some(*key),
+                fullscreen: false,
+            });
+        }
         views
+    }
+
+    /// The newest mapped portal dialog belonging to the active workspace.
+    /// Older dialogs remain configured but hidden until the one above them is
+    /// dismissed, which gives the scene one modal input owner at a time.
+    pub fn portal_modal(&self) -> Option<SurfaceKey> {
+        let active = self.layout.active_workspace();
+        self.portal_dialog_order.iter().rev().copied().find(|key| {
+            self.is_mapped(*key) && self.layout.workspace_of(*key) == Some(active)
+        })
+    }
+
+    /// Whether an input surface belongs to the dialog that currently owns
+    /// the portal modal layer. Subsurfaces and the dialog's popup tree belong
+    /// to it; an older dialog or an application surface does not.
+    pub fn portal_modal_owns_surface(&self, key: SurfaceKey) -> bool {
+        let Some(modal) = self.portal_modal() else {
+            return false;
+        };
+        self.subsurface_root(key)
+            .and_then(|root| self.popup_root(root))
+            == Some(modal)
+    }
+
+    fn portal_dialog_placement(&self, key: SurfaceKey, width: usize, height: usize) -> Placement {
+        let usable_height = height.saturating_sub(BAR_HEIGHT);
+        let frame_width = width.saturating_mul(3) / 4;
+        let frame_height = usable_height.saturating_mul(3) / 4;
+        let band_height = TITLE_HEIGHT.min(frame_height);
+        let frame_x = width.saturating_sub(frame_width) / 2;
+        let frame_y = BAR_HEIGHT.saturating_add(usable_height.saturating_sub(frame_height) / 2);
+        Placement {
+            key,
+            rect: Rect {
+                x: frame_x,
+                y: frame_y.saturating_add(band_height),
+                width: frame_width,
+                height: frame_height.saturating_sub(band_height),
+            },
+            band: Rect {
+                x: frame_x,
+                y: frame_y,
+                width: frame_width,
+                height: band_height,
+            },
+            focused: true,
+            run: None,
+            presented: Presentation::Split,
+            visible: true,
+        }
     }
 
     /// The output minus the status bar. EVERY consumer of tiling geometry
@@ -2019,6 +2162,12 @@ impl Scene {
         for placement in &mut placements {
             placement.rect.y = placement.rect.y.saturating_add(BAR_HEIGHT);
             placement.band.y = placement.band.y.saturating_add(BAR_HEIGHT);
+        }
+        if let Some(modal) = self.portal_modal() {
+            for placement in &mut placements {
+                placement.focused = false;
+            }
+            placements.push(self.portal_dialog_placement(modal, width, height));
         }
         placements
     }
@@ -2185,10 +2334,16 @@ impl Scene {
     /// agree on. Small enough that recomputing it per pointer frame during a
     /// drag costs nothing worth caching: nine numbers and a `Vec` of them.
     pub(crate) fn desks(&self) -> Vec<u8> {
+        let (occupied, spare) = self.layout.workspace_bar(
+            self.portal_dialogs
+                .iter()
+                .copied()
+                .filter(|key| self.is_mapped(*key)),
+        );
         bar::desks(
-            self.layout.occupied_workspaces(),
+            occupied,
             self.layout.active_workspace(),
-            self.layout.spare_workspace(),
+            spare,
         )
     }
 
@@ -2255,9 +2410,15 @@ impl Scene {
         }
         if let Some(point) = self.pointer_target_from(&placements) {
             let root = self.subsurface_root(point.key)?;
+            if self.portal_modal().is_some() {
+                return Some(root);
+            }
             if self.layout.contains(root) {
                 return Some(root);
             }
+        }
+        if self.portal_modal().is_some() {
+            return None;
         }
         let (x, y) = self.pointer_at_usize()?;
         Some(placements.get(tile_at(&placements, x, y)?)?.key)
@@ -2330,6 +2491,9 @@ impl Scene {
         &self,
         placement: &Placement,
     ) -> Option<([Rect; BUTTONS.len()], Presentation)> {
+        if self.portal_dialogs.contains(&placement.key) {
+            return None;
+        }
         Some((band_buttons(placement.band)?, placement.presented))
     }
 
@@ -2489,6 +2653,7 @@ impl Scene {
     /// submenu is created after the menu it hangs off and the protocol stacks
     /// it above.
     fn popup_target_from(&self, placements: &[Placement]) -> Option<SurfacePoint> {
+        let modal = self.portal_modal();
         // Under the bar here because it is under the bar on screen. The bar is
         // painted after the popups, so a menu reaching into that strip is
         // already invisible there — and one that still answered for it would
@@ -2499,6 +2664,9 @@ impl Scene {
             return None;
         }
         for key in self.popups_stacked().into_iter().rev() {
+            if modal.is_some_and(|root| self.popup_root(key) != Some(root)) {
+                continue;
+            }
             let Some(rect) = self.popup_rect(key, placements) else {
                 continue;
             };
@@ -2528,7 +2696,11 @@ impl Scene {
         if let Some(popup) = self.popup_target_from(placements) {
             return Some(popup);
         }
+        let modal = self.portal_modal();
         for placement in placements.iter().rev() {
+            if modal.is_some_and(|key| placement.key != key) {
+                continue;
+            }
             if !placement.visible {
                 continue;
             }
@@ -2718,6 +2890,7 @@ impl Scene {
         }
 
         let placements = self.tiled_placements(width, height);
+        let modal = self.portal_modal();
         // EVERY band before ANY border, rather than the two per placement.
         // They are separate rectangles that overlap in a stack — the shown
         // leaf's border rides four pixels up into the run's last band — so
@@ -2725,6 +2898,9 @@ impl Scene {
         // earlier, and only when the shown leaf is not the last of its run.
         // Same argument one pass down as decoration before client pixels.
         for placement in &placements {
+            if modal == Some(placement.key) {
+                continue;
+            }
             if !self.surfaces.contains_key(&placement.key) {
                 continue;
             }
@@ -2733,6 +2909,9 @@ impl Scene {
             self.draw_title(frame, width, height, stride, placement);
         }
         for placement in &placements {
+            if modal == Some(placement.key) {
+                continue;
+            }
             if !self.surfaces.contains_key(&placement.key) || !placement.visible {
                 continue;
             }
@@ -2758,6 +2937,9 @@ impl Scene {
             );
         }
         for placement in &placements {
+            if modal == Some(placement.key) {
+                continue;
+            }
             // The CLIENT area here, where the border pass above wants the
             // frame: a tile too short to hold a band has no client pixels to
             // draw, and `draw_surface` was already a no-op for one.
@@ -2783,6 +2965,12 @@ impl Scene {
         // first, so a submenu lands on the menu it hangs off rather than under
         // it.
         for key in self.popups_stacked() {
+            if self
+                .popup_root(key)
+                .is_some_and(|root| self.portal_dialogs.contains(&root))
+            {
+                continue;
+            }
             let Some(rect) = self.popup_rect(key, &placements) else {
                 continue;
             };
@@ -2804,6 +2992,66 @@ impl Scene {
         if let Some(hint) = self.hint {
             if !matches!(hint.destination, DropDestination::Workspace(_)) {
                 draw_hint(frame, width, height, stride, hint.area);
+            }
+        }
+        // A portal dialog is a client surface but not an ordinary window
+        // layer. Draw its complete frame after application popups so an app
+        // cannot cover the broker's UI, then draw only popups rooted in that
+        // dialog above it. Lower portal dialogs remain configured and hidden.
+        if let Some(modal) = modal {
+            if let Some(placement) = placements
+                .iter()
+                .find(|placement| placement.key == modal)
+            {
+                self.draw_title(frame, width, height, stride, placement);
+                let outline = frame_rect(placement);
+                if outline.width != 0 && outline.height != 0 {
+                    draw_border(
+                        frame,
+                        width,
+                        height,
+                        stride,
+                        i64::try_from(outline.x).unwrap_or(i64::MAX),
+                        i64::try_from(outline.y).unwrap_or(i64::MAX),
+                        outline.width,
+                        outline.height,
+                        true,
+                    );
+                }
+                if placement.rect.width != 0 && placement.rect.height != 0 {
+                    for layer in
+                        self.surface_layers(placement.key, ImageRect::tile(placement.rect))
+                    {
+                        if omitted == Some(layer.key) {
+                            continue;
+                        }
+                        let Some(surface) = self.surfaces.get(&layer.key) else {
+                            continue;
+                        };
+                        draw_surface(
+                            frame, width, height, stride, layer.rect, surface, layer.crop,
+                        );
+                    }
+                }
+                for key in self.popups_stacked() {
+                    if self.popup_root(key) != Some(modal) {
+                        continue;
+                    }
+                    let Some(rect) = self.popup_rect(key, &placements) else {
+                        continue;
+                    };
+                    for layer in self.surface_layers(key, rect) {
+                        if omitted == Some(layer.key) {
+                            continue;
+                        }
+                        let Some(surface) = self.surfaces.get(&layer.key) else {
+                            continue;
+                        };
+                        draw_surface(
+                            frame, width, height, stride, layer.rect, surface, layer.crop,
+                        );
+                    }
+                }
             }
         }
         let active = self.layout.active_workspace();
@@ -7397,6 +7645,164 @@ mod tests {
             width: i32::try_from(side).unwrap(),
             height: i32::try_from(side).unwrap(),
         }
+    }
+
+    #[test]
+    fn a_portal_dialog_draws_and_hits_above_application_popups() {
+        const APP_POPUP: [u8; 4] = [0x31, 0x32, 0x33, 0];
+        const DIALOG: [u8; 4] = [0x41, 0x42, 0x43, 0];
+        const DIALOG_POPUP: [u8; 4] = [0x51, 0x52, 0x53, 0];
+        let width = 240usize;
+        let height = least_output_height(120);
+        let stride = width.saturating_mul(4);
+        let parent = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 5,
+        };
+        let app_popup = SurfaceKey {
+            client: 1,
+            object: 6,
+        };
+        let dialog_popup = SurfaceKey {
+            client: 2,
+            object: 7,
+        };
+        let mut scene = Scene::new();
+        scene
+            .commit(parent, surface(WINDOW, width, height))
+            .unwrap();
+        let parent_rect = scene.tiled_placements(width, height).first().unwrap().rect;
+        let dialog_place = scene.portal_dialog_placement(dialog, width, height);
+        let popup_x = i32::try_from(dialog_place.rect.x.saturating_sub(parent_rect.x)).unwrap();
+        let popup_y = i32::try_from(dialog_place.rect.y.saturating_sub(parent_rect.y)).unwrap();
+        scene
+            .commit_popup(
+                app_popup,
+                surface(APP_POPUP, dialog_place.rect.width, dialog_place.rect.height),
+                PopupPlacement {
+                    parent,
+                    x: popup_x,
+                    y: popup_y,
+                    width: i32::try_from(dialog_place.rect.width).unwrap(),
+                    height: i32::try_from(dialog_place.rect.height).unwrap(),
+                },
+            )
+            .unwrap();
+        assert!(scene.set_portal_dialog(dialog, Some(parent)));
+        scene
+            .commit_parented(
+                dialog,
+                surface(DIALOG, dialog_place.rect.width, dialog_place.rect.height),
+                Some(parent),
+            )
+            .unwrap();
+
+        let mut frame = vec![0; stride.saturating_mul(height)];
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(
+            pixel(&frame, stride, dialog_place.rect.x, dialog_place.rect.y),
+            DIALOG
+        );
+        scene.pointer_x = i32::try_from(dialog_place.rect.x).unwrap();
+        scene.pointer_y = i32::try_from(dialog_place.rect.y).unwrap();
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(dialog)
+        );
+
+        scene
+            .commit_popup(
+                dialog_popup,
+                surface(DIALOG_POPUP, 1, 1),
+                PopupPlacement {
+                    parent: dialog,
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            )
+            .unwrap();
+        frame.fill(0);
+        scene.pointer_x = 0;
+        scene.pointer_y = 0;
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(
+            pixel(&frame, stride, dialog_place.rect.x, dialog_place.rect.y),
+            DIALOG_POPUP
+        );
+        scene.pointer_x = i32::try_from(dialog_place.rect.x).unwrap();
+        scene.pointer_y = i32::try_from(dialog_place.rect.y).unwrap();
+        assert_eq!(
+            scene.pointer_target(width, height).map(|point| point.key),
+            Some(dialog_popup)
+        );
+    }
+
+    #[test]
+    fn a_pre_admitted_dialog_preserves_fullscreen_focus_and_lone_presentation() {
+        let parent = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 5,
+        };
+        let neighbour = SurfaceKey {
+            client: 1,
+            object: 6,
+        };
+        let mut scene = Scene::new();
+        scene.commit(parent, surface(WINDOW, 1, 1)).unwrap();
+        scene.command(Command::SetPresentation(Presentation::Tabbed));
+        scene.command(Command::ToggleFullscreen);
+
+        assert!(scene.set_portal_dialog(dialog, Some(parent)));
+        scene
+            .commit_parented(dialog, surface(WINDOW, 1, 1), Some(parent))
+            .unwrap();
+        assert_eq!(scene.focused(), Some(parent));
+        assert!(scene
+            .views(80, 60)
+            .iter()
+            .any(|view| view.key == parent && view.fullscreen));
+
+        scene.command(Command::ToggleFullscreen);
+        scene.commit(neighbour, surface(WINDOW, 1, 1)).unwrap();
+        assert!(scene
+            .tiled_placements(80, 60)
+            .iter()
+            .filter(|placement| placement.key != dialog)
+            .all(|placement| placement.presented == Presentation::Tabbed));
+        scene.layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_dialog_only_workspace_remains_in_the_strip_until_unmap() {
+        let application = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 5,
+        };
+        let mut scene = Scene::new();
+        scene.commit(application, surface(WINDOW, 1, 1)).unwrap();
+        scene.command(Command::SwitchWorkspace(2));
+        scene.commit(dialog, surface(WINDOW, 1, 1)).unwrap();
+        assert!(scene.set_portal_dialog(dialog, None));
+        scene.command(Command::SwitchWorkspace(1));
+
+        assert_eq!(scene.desks(), [1, 2, 3]);
+        scene.unmap(dialog);
+        assert_eq!(scene.desks(), [1, 2]);
+        scene.layout.check_invariants().unwrap();
     }
 
     /// A popup is drawn OVER the window it belongs to, at the offset its client

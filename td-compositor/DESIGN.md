@@ -721,10 +721,27 @@ The client retains at most one revision per client-owned surface object and
 retires it with that object, beneath the 512-object ceiling. Delivery is
 bounded and performs no socket I/O under the Runtime lock. If unmapping drops
 a portal relationship instead of reparenting it to a mapped ancestor, the
-same revision receives `standalone`. The relationship supplies adjacency,
-focus grouping, workspace following, and the mapped/unmapped lifecycle already
-implemented by xdg-foreign. Floating, centering, modal input capture,
-screenshots, notifications, and inhibitors remain outside this version.
+same revision receives `standalone`.
+
+Association also admits the toplevel to a portal-owned scene layer, including
+when the handle resolves standalone. A mapped dialog leaves the tiling tree
+but keeps its parent's workspace, or its prior workspace when standalone. The
+home transfer reads the parent's retained workspace even when that parent is
+itself floating; it does not transiently insert the dialog into tiling or
+disturb an unrelated fullscreen leaf, focus, or lone-window presentation. The
+newest mapped dialog on the active workspace is centred below the bar in a
+fixed three-quarter-width by three-quarter-usable-height frame, has no tiling
+buttons, and is the sole activated dialog. Older mapped dialogs remain
+configured but hidden and reveal newest-first. Application toplevels and their
+popups render below the dialog; only its own popup tree renders above it. That
+dialog or its grabbing popup owns keyboard focus. Pointer hit testing reaches
+only that tree and withdraws hover outside it. An application implicit grab
+that predates the dialog retains its already-owed motion and releases, while
+new presses and wheel gestures are filtered. Dismissal, manager destruction,
+surface destruction, and client departure clear the manager's modal ownership
+and return a live toplevel to the tiling tree without erasing a later local or
+ordinary xdg-foreign parent. Screenshots, notifications, and inhibitors remain
+outside this manager version.
 
 A separate uid-1000 `td-portal channel-probe` sends `get_registry` plus
 `sync`, validates the ordered eleven names and versions through this crate's
@@ -1098,10 +1115,15 @@ parent. Mapping or reparenting a child exits the workspace's fullscreen state,
 as ordinary toplevel mapping already does, so the focused child cannot remain
 hidden behind a fullscreen parent. A later layout operation may rearrange the
 family within that workspace, but it may not strand its two sides on different
-workspaces. Repair walks the cycle-free relationship forest ancestor first so
-a multi-generation chain follows its ancestor independently of object-id order
-with each relationship visited once. This relationship does not turn the child
-into an `xdg_popup` or itself impose modal input.
+workspaces. A floating portal parent supplies its retained workspace even
+though it is absent from the tiling root, so an ordinary child maps or moves
+onto that workspace rather than falling back to whichever workspace is active.
+Repair walks the cycle-free relationship forest ancestor first so a
+multi-generation chain follows its ancestor independently of object-id order
+with each relationship visited once. This relationship does not turn the
+child into an `xdg_popup` or itself impose modal input. The private portal
+manager's separate ownership record is what promotes one of its related or
+standalone toplevels into the modal dialog layer described above.
 
 The xdg-shell unmap rules are shared too. Naming an unmapped parent is the same
 as naming NULL. When a toplevel unmaps, its own parent is discarded and each
@@ -3455,6 +3477,16 @@ The landing must prove:
   reverse-object-order multi-generation workspace repair, exported-object,
   surface, and client lifetime, one batched delivery for a saturated export,
   and actual imported-object id reuse with a stale generation suppressed;
+- portal-manager runtime and scene tests pin a mapped dialog leaving tiling
+  for the centred three-quarter frame, workspace retention, single activation
+  and keyboard ownership, outside-pointer withdrawal, application-popup
+  occlusion, dialog-popup precedence, newest-first hide/reveal, dismissal and
+  later-parent preservation. A separate implicit-grab regression proves that
+  opening the modal layer preserves an application's owed release while
+  filtering its new presses and wheel gestures. Layout and composed-scene
+  regressions prove that direct floating preserves fullscreen, focus, and a
+  lone workspace's selected presentation, while a child inherits the retained
+  home of a parent which is itself floating;
 - the exact serialized keymap parses with libxkbcommon 1.11, where an ordinary
   key reports repeatable and an excluded modifier reports non-repeating;
   in-tree tests also pin its delimiter, type, explicit repeat exclusions,

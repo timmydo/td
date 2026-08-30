@@ -1,7 +1,5 @@
 use crate::scene::SurfaceKey;
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const INITIAL_WORKSPACE: u8 = 1;
 const FINAL_WORKSPACE: u8 = 9;
@@ -730,12 +728,32 @@ impl Layout {
     /// in the map as soon as anything ASKS for it — switching to an empty one
     /// creates the entry — so holding a root is what separates a workspace
     /// somebody is using from a number nobody has been to.
+    #[cfg(test)]
     pub fn occupied_workspaces(&self) -> Vec<u8> {
-        self.workspaces
+        self.workspace_bar(std::iter::empty()).0
+    }
+
+    /// The occupied and spare workspace records shown by the shell bar.
+    /// `floating` names mapped windows presented outside the tiling roots;
+    /// their retained homes still count as occupied while they have pixels.
+    pub fn workspace_bar(
+        &self,
+        floating: impl IntoIterator<Item = SurfaceKey>,
+    ) -> (Vec<u8>, Option<u8>) {
+        let mut occupied: BTreeSet<u8> = self
+            .workspaces
             .iter()
             .filter(|(_, workspace)| workspace.root.is_some())
             .map(|(number, _)| *number)
-            .collect()
+            .collect();
+        for key in floating {
+            if let Some(number) = self.homes.get(&key) {
+                occupied.insert(*number);
+            }
+        }
+        let spare = (INITIAL_WORKSPACE..=FINAL_WORKSPACE)
+            .find(|number| *number != self.active && !occupied.contains(number));
+        (occupied.into_iter().collect(), spare)
     }
 
     /// An empty workspace to send a window TO, and the reason the strip can be
@@ -758,16 +776,7 @@ impl Layout {
     /// the active one, which is nine windows deep and the one case where the
     /// strip cannot grow.
     pub fn spare_workspace(&self) -> Option<u8> {
-        for number in INITIAL_WORKSPACE..=FINAL_WORKSPACE {
-            let empty = self
-                .workspaces
-                .get(&number)
-                .is_none_or(|workspace| workspace.root.is_none());
-            if number != self.active && empty {
-                return Some(number);
-            }
-        }
-        None
+        self.workspace_bar(std::iter::empty()).1
     }
 
     /// The workspace a window lives on, which is not always the one in view: a
@@ -1072,6 +1081,23 @@ impl Layout {
         self.homes.insert(key, workspace);
     }
 
+    /// Remove a window from tiling while retaining a workspace home for a
+    /// floating presentation. A parent's recorded home is sufficient even
+    /// when that parent is itself floating; deriving it by temporarily
+    /// inserting either window would disturb fullscreen, focus, and a lone
+    /// workspace's pending presentation.
+    pub fn float(&mut self, key: SurfaceKey, parent: Option<SurfaceKey>) -> bool {
+        let prior = self.homes.get(&key).copied();
+        let home = parent
+            .and_then(|parent| self.homes.get(&parent).copied())
+            .or(prior)
+            .unwrap_or(self.active);
+        let was_tiled = self.contains(key);
+        self.unmap(key);
+        self.homes.insert(key, home);
+        was_tiled || prior != Some(home)
+    }
+
     /// Place a mapped child immediately after a mapped parent, moving it to
     /// the parent's workspace when necessary. A relationship whose parent is
     /// absent is deliberately a no-op; the shell layer normalizes that case
@@ -1080,13 +1106,16 @@ impl Layout {
         if key == parent {
             return false;
         }
-        let Some(parent_workspace) = self.workspaces.iter().find_map(|(number, workspace)| {
+        let tiled_parent_workspace = self.workspaces.iter().find_map(|(number, workspace)| {
             workspace
                 .root
                 .as_ref()
                 .is_some_and(|root| root.contains(parent))
                 .then_some(*number)
-        }) else {
+        });
+        let Some(parent_workspace) = tiled_parent_workspace
+            .or_else(|| self.homes.get(&parent).copied())
+        else {
             return false;
         };
         let child_workspace = self.workspaces.iter().find_map(|(number, workspace)| {
@@ -1103,7 +1132,12 @@ impl Layout {
                 changed = true;
             }
         }
-        changed |= self.workspace_mut(parent_workspace).place_after(key, parent);
+        if tiled_parent_workspace.is_some() {
+            changed |= self.workspace_mut(parent_workspace).place_after(key, parent);
+        } else if child_workspace != Some(parent_workspace) {
+            self.workspace_mut(parent_workspace).map(key);
+            changed = true;
+        }
         self.homes.insert(key, parent_workspace);
         changed
     }
@@ -2339,6 +2373,44 @@ mod tests {
     }
 
     #[test]
+    fn floating_a_window_preserves_another_leafs_fullscreen_and_focus() {
+        let mut layout = Layout::new();
+        for object in 1..=4 {
+            layout.map(key(object));
+        }
+        assert!(layout.focus_key(key(3)));
+        layout.apply(Command::ToggleFullscreen);
+
+        assert!(layout.float(key(4), Some(key(1))));
+        assert_eq!(layout.focused(), Some(key(3)));
+        assert_eq!(layout.workspace_of(key(4)), Some(1));
+        assert!(layout
+            .views(80, 60, 9, 20)
+            .iter()
+            .any(|view| view.key == key(3) && view.fullscreen));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn floating_keeps_lone_presentation_and_inherits_a_floating_parent_home() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.apply(Command::SetPresentation(Presentation::Tabbed));
+        assert!(layout.float(key(2), Some(key(1))));
+        layout.map(key(3));
+        assert!(layout
+            .placements(80, 60, 9, 20)
+            .iter()
+            .all(|placement| placement.presented == Presentation::Tabbed));
+
+        assert!(layout.move_key_to_workspace(key(1), 4));
+        assert!(layout.float(key(1), None));
+        assert!(layout.float(key(4), Some(key(1))));
+        assert_eq!(layout.workspace_of(key(4)), Some(4));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
     fn a_new_window_joins_its_neighbours_own_container_not_a_grandparent() {
         // `H[H[1, 3], 2]` — same-axis nesting, which a drop and the collapse
         // after it really do build: 3 is dropped beside 1 across the column
@@ -3014,6 +3086,39 @@ mod tests {
         // keeping a cell for as long as the compositor runs.
         layout.unmap(key(2));
         assert_eq!(layout.occupied_workspaces(), vec![1]);
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_mapped_floating_home_counts_for_the_workspace_bar() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.apply(Command::SwitchWorkspace(2));
+        layout.map(key(2));
+        assert!(layout.float(key(2), None));
+        layout.apply(Command::SwitchWorkspace(1));
+
+        assert_eq!(layout.workspace_bar([key(2)]), (vec![1, 2], Some(3)));
+        assert_eq!(
+            layout.workspace_bar(std::iter::empty()),
+            (vec![1], Some(2))
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn an_ordinary_child_follows_a_floating_parents_home() {
+        let mut layout = Layout::new();
+        layout.apply(Command::SwitchWorkspace(2));
+        layout.map(key(1));
+        assert!(layout.float(key(1), None));
+        layout.apply(Command::SwitchWorkspace(1));
+        layout.map(key(2));
+
+        assert!(layout.place_after(key(2), key(1)));
+        assert_eq!(layout.workspace_of(key(1)), Some(2));
+        assert_eq!(layout.workspace_of(key(2)), Some(2));
+        assert_eq!(layout.occupied_workspaces(), [2]);
         layout.check_invariants().unwrap();
     }
 

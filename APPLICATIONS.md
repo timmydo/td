@@ -5436,8 +5436,10 @@ deliberate refusal rather than a gap to be filled opportunistically.
 
 **`td-portal` draws it as an ordinary Wayland client**: a keyboard-first
 list navigator reusing the launcher's filter model, the multicall's PSF2
-font, and the software renderer, appearing as a normal tiled window
-titled `Open — <app name>`.
+font, and the software renderer, titled `Open — <app name>`. Once that
+toplevel is admitted through the private portal manager, the compositor
+presents it in the centred modal dialog layer described below rather than as
+an ordinary tile. The portal still owns every dialog pixel.
 
 Not a compositor overlay — a file browser inside the compositor process
 couples session survival to directory-listing code, which DESIGN.md's
@@ -5568,9 +5570,33 @@ retires it with that object, beneath the client's 512-object ceiling. The
 bounded per-client delivery path performs no socket I/O under the shared
 runtime lock. If unmapping discards a portal relationship rather than
 reparenting it to a mapped ancestor, the same exact revision receives a
-`standalone` notice. The shared xdg-foreign engine supplies adjacent
-placement, focus grouping, workspace following, and mapped/unmapped lifecycle;
-the manager does not yet float, centre, modalize, capture, inhibit, or notify.
+`standalone` notice.
+
+Association also admits the toplevel to the portal dialog layer, including for
+a standalone handle. A mapped dialog leaves the tiling tree while retaining
+its parent's workspace, or its prior workspace when standalone. The home
+transfer reads the parent's retained workspace even when that parent is
+itself floating; it never transiently inserts the dialog into tiling, so an
+unrelated fullscreen leaf, focus, and lone-window presentation remain intact.
+The workspace strip still counts a home whose only mapped window is a floating
+dialog and never offers that home as its empty drag destination. An ordinary
+toplevel parented to a floating dialog inherits the same retained home rather
+than falling back to the active workspace.
+The newest mapped dialog on the active workspace is centred below the bar in
+a fixed three-quarter-width by three-quarter-usable-height frame, has no
+tiling buttons, and is the only activated dialog; older mapped dialogs remain
+configured but hidden and are revealed newest-first as the layer unwinds. The
+dialog is painted above application toplevels and their popups, while its own
+popup tree remains above it. It owns keyboard focus and pointer input within
+that tree; input outside is withdrawn. An application implicit grab that
+predates the dialog receives its already-owed motion and releases, but no new
+press or wheel gesture. Dismissal, manager destruction, surface destruction,
+or client departure removes that manager's modal ownership and returns a live
+toplevel to the tiling tree. A later local or ordinary xdg-foreign parent still
+survives that cleanup. The compositor mechanics are pinned by host scene and
+runtime regressions; the normal portal daemon does not yet turn a D-Bus dialog
+request into this association. Screenshots, notifications, and inhibitors
+also remain outside this manager version.
 
 `td-portal channel-probe` uses only the compositor's safe framing codec — not
 `conn.rs`, SCM_RIGHTS, or a new unsafe transport surface — to pin the exact
@@ -5584,20 +5610,24 @@ visibility is a mount-namespace property. An
 application that breaks out of the filesystem jail will still be uid 1000 in
 v1, so it can open `/run/user/1000/td-portal-wayland-0` directly and drive
 `td_portal_manager_v1` with no portal UI in the way. The currently landed
-manager exposes only parent association and dismissal, not pixels or another
-user capability, but adding capture or inhibition would make that bypass
-security-relevant. The jail is the boundary; the socket path is an organizing
-convention behind it, not a second lock.
+manager cannot read another client's pixels or input already delivered to it,
+but it can promote the escaped application's own surface above application
+popups and give that surface modal keyboard and pointer focus. An escape can
+therefore spoof portal-owned UI, withhold input from other applications, and
+receive what the operator types or clicks into the impostor. Capture or
+inhibition would expand that already security-relevant bypass. The jail is the
+boundary; the socket path is an organizing convention behind it, not a second
+lock.
 
 This is the same v1 same-uid exposure §L records, but it is worth
 separating because its blast radius is worse than the general case: most
 of what an escaped app gains at uid 1000 it could already ask for
-through the portal *with* a prompt, whereas a future capture operation on this
-channel would convert a prompted capability into a silent one. Per-app uids
-close it, which is a further argument for scheduling them before that
-operation; until then, the honest statement is that the portal authorizes
-**confined** applications and stops meaning anything the moment confinement
-fails.
+through the portal *with* a prompt, whereas the modal operation can imitate the
+prompt itself and a future capture operation would convert a prompted
+capability into a silent one. Per-app uids close it, which is a further
+argument for scheduling them before that operation; until then, the honest
+statement is that the portal authorizes **confined** applications and stops
+meaning anything the moment confinement fails.
 
 ```
 td_portal_manager_v1
@@ -6097,6 +6127,12 @@ packaged selftest, boot oracle — with **network never in the gate**.
    caller-derived paths, export-before-reply ordering, directed exact denial,
    owner-only `Close`, capacity, collision, retirement and departure cleanup;
    the independent live client below pre-subscribes before the real call.
+   Portal-manager scene and runtime tests independently prove centred floating
+   geometry, layout removal and restoration, workspace retention, activation,
+   modal keyboard/pointer routing, application/dialog popup stacking,
+   newest-first reveal, pre-existing pointer-grab release accounting, preserved
+   fullscreen/focus/lone-window presentation, and inheritance from a floating
+   portal parent.
    Later UI and Session-producing interfaces still need socket-pair coverage
    for asynchronous cancellation and disconnect cleanup,
    spoofed identity rejection, pid-reuse and start-time rejection,
@@ -6438,7 +6474,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | **clipboard producer and cross-client paste LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status. The image oracle physically types `Welcome`, waits until its exact rendered cells are attested, selects them, waits for exact seven-byte source admission, then requires both td-term's exact-payload transfer record and Firefox's browser-chrome observation; client cursors landed separately (`1c4b7f88`) | a real terminal selection reaches Firefox through core Wayland clipboard without manual testing |
-| 21 | **xdg-foreign + private portal manager parent association LANDED**; floating/centering, modal capture, and a D-Bus dialog consumer remain | modal portal window |
+| 21 | **xdg-foreign + private portal manager centred/modal presentation LANDED**; the dialog leaves tiling, retains its workspace home, stacks over application popups, captures keyboard/pointer input with owed-release preservation, and unwinds newest-first. A D-Bus dialog consumer remains | compositor-tested modal portal presentation without manual inspection |
 | 22 | FileChooser, OpenURI, Screenshot, Notification | file dialog visible |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
