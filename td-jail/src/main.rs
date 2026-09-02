@@ -468,6 +468,94 @@ mod confinement {
         assert!(resolve.contains("Ok(LaunchPlan {"));
     }
 
+    /// The zone a plan resolved is BOUND, and the bind is READ BACK.
+    ///
+    /// Each half fails silently without the other, which is why one test pins
+    /// both. A plan that resolves a zone and never binds it leaves the
+    /// application on glibc's built-in UTC with nothing having failed — the
+    /// exact symptomless wrong clock this path exists to remove. A bind stage
+    /// 2 does not read back is the one entry in this `/etc` that the mount
+    /// plan only asserts, while every other entry is proved from inside.
+    #[test]
+    fn the_application_zone_is_bound_and_then_read_back() {
+        let prepare = TRANSITION
+            .split_once("fn prepare_etc(")
+            .unwrap()
+            .1
+            .split_once("fn prepare_mount_plan(")
+            .unwrap()
+            .0;
+        assert!(
+            prepare.contains("if let Some(timezone) = &application.timezone {"),
+            "the mount plan no longer binds the zone the launch plan resolved, \
+             so an application reads UTC whatever the system names"
+        );
+        assert!(prepare.contains("&etc.join(\"localtime\"),"));
+        // Bounded to the function, as the half above is: unbounded, this
+        // searches the rest of the file including the test module, so a
+        // readback deleted from the shipped path would still be "found" in a
+        // test that named it.
+        let readback = TRANSITION
+            .split_once("fn require_etc_plan(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            readback.contains("require_bound_zone(zone)?;"),
+            "stage 2 no longer proves the bound zone from inside the jail, so \
+             `/etc/localtime` is asserted by the plan and checked by nothing"
+        );
+        // Both ends check the magic, and for the same reason: glibc reads a
+        // file that is not TZif as UTC and says nothing. Bounded and
+        // comment-stripped like every half above — an assertion satisfied by
+        // a mention in a comment or a test proves the mention, not the check.
+        let authority = without_line_comments(&without_block_comments(AUTHORITY));
+        let resolve_zone = authority
+            .split_once("fn resolve_zoneinfo_file(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(resolve_zone.contains("require_tzif(&file.path)?;"));
+        let transition = without_line_comments(&without_block_comments(TRANSITION));
+        let bound_zone = transition
+            .split_once("fn require_bound_zone_at(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(bound_zone.contains("authority::TZIF_MAGIC"));
+        // Stage 2 asks stage 1's PAIR of containment questions, not one of
+        // them: the zoneinfo root inside the runtime, the zone inside that
+        // root. Checking a different rule on each side of the bind is how a
+        // tree one side accepts aborts a fully-built jail on the other.
+        assert!(bound_zone.contains("if !root.starts_with(&runtime) {"));
+        assert!(bound_zone.contains("if !canonical.starts_with(&root) {"));
+
+        // Host mode carries no zone at all: its inputs are fixture-owned, and
+        // reaching for the developer's ambient `/etc/timezone` refused every
+        // empty-runtime fixture on a machine that names one. Pinned because
+        // nothing else executes `host_config`, so restoring the ambient path
+        // leaves the suite entirely green.
+        let host_config = authority
+            .split_once("fn host_config(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            host_config.contains("timezone: None,"),
+            "host mode resolves a zone again, so a development launch reads \
+             the developer's own `/etc/timezone` instead of the fixture's \
+             configuration"
+        );
+    }
+
     #[test]
     fn cleanup_helper_owns_the_abandoned_leaf_protocol() {
         let managed = TRANSITION

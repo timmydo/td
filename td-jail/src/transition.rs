@@ -35,6 +35,7 @@ const STAGE2_PROBE_ARG: &str = "--probe";
 const STAGE2_LAUNCH_ARG: &str = "--launch";
 const STAGE2_RESOLV_CONF_ARG: &str = "--resolv-conf";
 const STAGE2_MACHINE_ID_ARG: &str = "--machine-id";
+const STAGE2_TIMEZONE_ARG: &str = "--timezone";
 const STAGE2_FIREFOX_AUTOTEST_POLICY_ARG: &str =
     "--firefox-autotest-policy";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
@@ -43,6 +44,9 @@ const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
 const STAGE2_RESOURCES_ARG: &str = "--resources";
 const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
 const NO_CGROUP_MEMBERSHIP: &str = "none";
+/// Stage 2's spelling for "this launch carries no zone". A tzdb zone name
+/// starts every component with a capital, so no zone can be spelled this.
+const NO_TIMEZONE: &str = "absent";
 const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
 const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
 const SURVIVOR_CHILD_ARG: &str = "--internal-survivor-child";
@@ -80,10 +84,13 @@ const STAGE2_OUTPUT_LIMIT: usize = 4096;
 const WRITE_PROBE_PREFIX: &str = ".td-jail-write-probe-";
 const ETC_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const NSSWITCH_CONF: &str = "passwd: files\ngroup: files\nhosts: files dns\n";
+const RUNTIME_ROOT: &str = "/usr";
+const LOCALTIME_PATH: &str = "/etc/localtime";
 const TD_OWNED_ETC_NAMES: &[&str] = &[
     "group",
     "hostname",
     "hosts",
+    "localtime",
     "machine-id",
     "nsswitch.conf",
     "passwd",
@@ -249,21 +256,31 @@ pub enum Mode {
     SurvivorOrphan,
 }
 
+/// Everything stage 2 was told to launch, which is most of what `Mode` is.
+///
+/// Held BEHIND the variant rather than in it: inline, this one case decided
+/// the size of every `Mode` value the parser returns, including the modes that
+/// carry nothing. It is parsed once per process and consumed once, so the
+/// indirection costs a pointer hop on a path that runs a single time.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Stage2Launch {
+    entry: String,
+    resolv_conf: bool,
+    machine_id: String,
+    timezone: Option<String>,
+    firefox_autotest_policy: bool,
+    runtime_aliases: bool,
+    environment: Vec<(OsString, OsString)>,
+    filesystems: Vec<Stage2Filesystem>,
+    resources: ResolvedResourceLimits,
+    cgroup_membership: String,
+    arguments: Vec<OsString>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Stage2Action {
     Probe,
-    Launch {
-        entry: String,
-        resolv_conf: bool,
-        machine_id: String,
-        firefox_autotest_policy: bool,
-        runtime_aliases: bool,
-        environment: Vec<(OsString, OsString)>,
-        filesystems: Vec<Stage2Filesystem>,
-        resources: ResolvedResourceLimits,
-        cgroup_membership: String,
-        arguments: Vec<OsString>,
-    },
+    Launch(Box<Stage2Launch>),
 }
 
 #[derive(Clone, Copy)]
@@ -272,11 +289,26 @@ struct Stage2ResourceBinding<'a> {
     membership: &'a str,
 }
 
+/// What this launch's selective `/etc` CONTAINS, carried as one value.
+///
+/// Four facts rather than four parameters because they are one decision, and
+/// because two adjacent booleans threaded through two frames are two chances
+/// to transpose them — which would build one `/etc` and prove a different one
+/// correct, with both halves agreeing.
+#[derive(Clone, Copy)]
+struct EtcBinding<'a> {
+    resolv_conf: bool,
+    timezone: Option<&'a str>,
+    firefox_autotest_policy: bool,
+    machine_id: Option<&'a str>,
+}
+
 #[derive(Clone, Copy)]
 struct Stage2MountBinding<'a> {
     filesystems: &'a [FilesystemGrant],
     resolv_conf: bool,
     machine_id: &'a str,
+    timezone: Option<&'a str>,
     firefox_autotest_policy: bool,
     loader_library_path: Option<&'a str>,
 }
@@ -499,6 +531,14 @@ where
         if !authority::valid_machine_id(&machine_id) {
             return Err(usage_error());
         }
+        if args.next().as_deref() != Some(STAGE2_TIMEZONE_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let timezone = match args.next().ok_or_else(usage_error)?.into_string() {
+            Ok(value) if value == NO_TIMEZONE => None,
+            Ok(value) if authority::valid_timezone_name(&value) => Some(value),
+            _ => return Err(usage_error()),
+        };
         if args.next().as_deref()
             != Some(STAGE2_FIREFOX_AUTOTEST_POLICY_ARG.as_ref())
         {
@@ -609,10 +649,11 @@ where
         if args.next().as_deref() != Some(STAGE2_ARGUMENTS_ARG.as_ref()) {
             return Err(usage_error());
         }
-        return Ok(Stage2Action::Launch {
+        return Ok(Stage2Action::Launch(Box::new(Stage2Launch {
             entry,
             resolv_conf,
             machine_id,
+            timezone,
             firefox_autotest_policy,
             runtime_aliases: loader_library_path.is_some(),
             environment,
@@ -620,7 +661,7 @@ where
             resources,
             cgroup_membership,
             arguments: authority::collect_arguments(args)?,
-        });
+        })));
     }
     Err(usage_error())
 }
@@ -703,6 +744,8 @@ fn stage2_launch_arguments(
         }),
         OsString::from(STAGE2_MACHINE_ID_ARG),
         OsString::from(mounts.machine_id),
+        OsString::from(STAGE2_TIMEZONE_ARG),
+        OsString::from(mounts.timezone.unwrap_or(NO_TIMEZONE)),
         OsString::from(STAGE2_FIREFOX_AUTOTEST_POLICY_ARG),
         OsString::from(if mounts.firefox_autotest_policy {
             "present"
@@ -1698,6 +1741,17 @@ fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
             "application resolver configuration",
         )?;
     }
+    // glibc reads `/etc/localtime` when `TZ` is unset, so the bind IS the
+    // mechanism: no environment entry, no per-application spec row, and
+    // nothing an application has to be told. Absent when the launch carries no
+    // zone, which leaves glibc on its own built-in UTC.
+    if let Some(timezone) = &application.timezone {
+        mount_resolved_file(
+            &timezone.file,
+            &etc.join("localtime"),
+            "application timezone",
+        )?;
+    }
     if let Some(firefox) = &application.firefox_autotest_policy {
         create_dir(&format!("{etc_text}/firefox"), 0o555)?;
         create_dir(&format!("{etc_text}/firefox/policies"), 0o555)?;
@@ -2472,18 +2526,21 @@ fn grant_scaffold_names(
     Ok(expected)
 }
 
+/// Takes the binding whole rather than the three booleans inside it: adjacent
+/// same-typed arguments at a CALL SITE are the transposition no callee-side
+/// test can see.
 fn expected_etc_names(
     runtime_etc: &[RuntimeEtcEntry],
-    resolv_conf: bool,
-    firefox_autotest_policy: bool,
+    etc: EtcBinding<'_>,
 ) -> io::Result<BTreeSet<String>> {
     validate_runtime_etc_allowlist()?;
     let mut expected = TD_OWNED_ETC_NAMES
         .iter()
-        .filter(|name| resolv_conf || **name != "resolv.conf")
+        .filter(|name| etc.resolv_conf || **name != "resolv.conf")
+        .filter(|name| etc.timezone.is_some() || **name != "localtime")
         .map(|name| (*name).to_string())
         .collect::<BTreeSet<_>>();
-    if firefox_autotest_policy && !expected.insert("firefox".to_string()) {
+    if etc.firefox_autotest_policy && !expected.insert("firefox".to_string()) {
         return Err(io::Error::other(
             "Firefox autotest policy collides with selective /etc",
         ));
@@ -2499,20 +2556,127 @@ fn expected_etc_names(
     Ok(expected)
 }
 
+/// `/etc/localtime` is the runtime's OWN file for the zone this system names,
+/// and not merely some TZif.
+///
+/// Identity is what makes it THE zone rather than A zone: two zones are two
+/// files, so a bind of the wrong one has the wrong inode and this notices. The
+/// source is read back through `/usr`, the same runtime tree stage 1 resolved
+/// the zone in and `require_runtime_etc_source_identity` already pins, so the
+/// question asked inside is the question answered outside.
+///
+/// The magic is checked again here, on the file the application will actually
+/// open, because glibc reads a non-TZif `/etc/localtime` as UTC in silence:
+/// the failure it guards has no symptom other than a wrong clock.
+fn require_bound_zone(zone: &str) -> io::Result<()> {
+    require_bound_zone_at(Path::new(LOCALTIME_PATH), Path::new(RUNTIME_ROOT), zone)
+}
+
+/// The readback's rules, over paths a test can build.
+///
+/// Split out because the shipped caller only ever runs inside a jail that has
+/// already pivoted, so nothing outside a booted image can execute it — and a
+/// readback nothing has executed is a readback whose own bugs are invisible.
+/// A hard link stands in for the bind here: a bind of a regular file and a
+/// second link to it give the same `stat` and the same bytes, which is all
+/// this function looks at.
+///
+/// It takes the RUNTIME root rather than the zoneinfo root so that the pair
+/// of containment rules is the same pair stage 1 applies — canonical zoneinfo
+/// inside the runtime, canonical zone inside that zoneinfo. Checking the zone
+/// against an uncanonicalized `/usr/share/zoneinfo` instead would be a
+/// DIFFERENT rule that neither implies nor is implied by stage 1's, and a
+/// runtime whose `share` is a link to a sibling inside itself would pass
+/// outside and abort a fully-built jail here.
+fn require_bound_zone_at(
+    localtime: &Path,
+    runtime_root: &Path,
+    zone: &str,
+) -> io::Result<()> {
+    if !authority::valid_timezone_name(zone) {
+        return Err(io::Error::other(
+            "stage-2 zone name is outside the compiled grammar",
+        ));
+    }
+    let bound = fs::symlink_metadata(localtime)?;
+    if !bound.file_type().is_file() {
+        return Err(io::Error::other(
+            "selective /etc localtime is not a regular file",
+        ));
+    }
+    // Stage 1's pair, asked again of the same tree: the zoneinfo root stays
+    // inside the runtime, and the zone stays inside that root. A rule proved
+    // on one side of a bind only is a rule this readback is trusting stage 1
+    // for rather than checking.
+    let runtime = fs::canonicalize(runtime_root).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("resolve runtime root {}: {error}", runtime_root.display()),
+        )
+    })?;
+    let zoneinfo = runtime.join(authority::ZONEINFO_SUBDIR);
+    let root = fs::canonicalize(&zoneinfo).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("resolve runtime zoneinfo {}: {error}", zoneinfo.display()),
+        )
+    })?;
+    if !root.starts_with(&runtime) {
+        return Err(io::Error::other(
+            "runtime zoneinfo resolves outside the runtime",
+        ));
+    }
+    let source = root.join(zone);
+    // Follows links, as the resolution outside did: a zone name is routinely
+    // a symlink to another zone in the same tree.
+    let canonical = fs::canonicalize(&source).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("resolve runtime zone {}: {error}", source.display()),
+        )
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(io::Error::other(
+            "runtime zone resolves outside the runtime zoneinfo",
+        ));
+    }
+    let expected = fs::symlink_metadata(&canonical).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("inspect runtime zone {}: {error}", canonical.display()),
+        )
+    })?;
+    if bound.dev() != expected.dev() || bound.ino() != expected.ino() {
+        return Err(io::Error::other(
+            "selective /etc localtime is not the runtime's own file for the system zone",
+        ));
+    }
+    let mut magic = [0u8; authority::TZIF_MAGIC.len()];
+    fs::File::open(localtime)?.read_exact(&mut magic)?;
+    if &magic != authority::TZIF_MAGIC {
+        return Err(io::Error::other(
+            "selective /etc localtime is not a compiled TZif zone",
+        ));
+    }
+    Ok(())
+}
+
 fn require_etc_plan(
     mountinfo: &str,
     token: &[u8; TOKEN_LEN],
-    resolv_conf: bool,
-    firefox_autotest_policy: bool,
-    expected_machine_id: &str,
+    etc: EtcBinding<'_>,
     identity: Identity,
 ) -> io::Result<()> {
-    let runtime_etc = selected_runtime_etc(Path::new("/usr"))?;
-    let expected = expected_etc_names(
-        &runtime_etc,
+    let EtcBinding {
         resolv_conf,
+        timezone,
         firefox_autotest_policy,
-    )?;
+        machine_id,
+    } = etc;
+    let expected_machine_id = machine_id
+        .ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
+    let runtime_etc = selected_runtime_etc(Path::new("/usr"))?;
+    let expected = expected_etc_names(&runtime_etc, etc)?;
     let actual = read_dir_names("/etc")?;
     if actual != expected {
         return Err(io::Error::other(format!(
@@ -2649,6 +2813,16 @@ fn require_etc_plan(
             &["rw"],
         )?;
     }
+    if let Some(zone) = timezone {
+        require_bound_zone(zone)?;
+        require_mount(
+            mountinfo,
+            "/etc/localtime",
+            None,
+            &["ro", "nosuid", "nodev", "noexec"],
+            &["rw"],
+        )?;
+    }
     for entry in runtime_etc {
         require_runtime_etc_source_identity(&entry)?;
         let target = PathBuf::from("/etc").join(entry.name);
@@ -2680,9 +2854,7 @@ fn require_etc_plan(
 
 fn require_mount_plan(
     filesystems: Option<&[Stage2Filesystem]>,
-    resolv_conf: bool,
-    machine_id: Option<&str>,
-    firefox_autotest_policy: bool,
+    etc: EtcBinding<'_>,
     runtime_aliases: bool,
     token: &[u8; TOKEN_LEN],
     identity: Identity,
@@ -2790,19 +2962,10 @@ fn require_mount_plan(
 
     if application {
         let filesystems = filesystems.unwrap_or_default();
-        let machine_id = machine_id
-            .ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
         if runtime_aliases {
             require_runtime_aliases()?;
         }
-        require_etc_plan(
-            &mountinfo,
-            token,
-            resolv_conf,
-            firefox_autotest_policy,
-            machine_id,
-            identity,
-        )?;
+        require_etc_plan(&mountinfo, token, etc, identity)?;
         require_names("/run", &["user"])?;
         let runtime = format!("/run/user/{}", identity.uid);
         require_mode(&runtime, 0o700)?;
@@ -3640,34 +3803,31 @@ pub fn run_stage2(
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     let mount_probe_token = random_token()?;
-    let (
-        filesystems,
-        resolv_conf,
-        machine_id,
-        firefox_autotest_policy,
-        runtime_aliases,
-    ) = match &action {
-        Stage2Action::Probe => (None, false, None, false, false),
-        Stage2Action::Launch {
-            filesystems,
-            resolv_conf,
-            machine_id,
-            firefox_autotest_policy,
-            runtime_aliases,
-            ..
-        } => (
-            Some(filesystems.as_slice()),
-            *resolv_conf,
-            Some(machine_id.as_str()),
-            *firefox_autotest_policy,
-            *runtime_aliases,
+    let (filesystems, etc, runtime_aliases) = match &action {
+        Stage2Action::Probe => (
+            None,
+            EtcBinding {
+                resolv_conf: false,
+                timezone: None,
+                firefox_autotest_policy: false,
+                machine_id: None,
+            },
+            false,
+        ),
+        Stage2Action::Launch(launch) => (
+            Some(launch.filesystems.as_slice()),
+            EtcBinding {
+                resolv_conf: launch.resolv_conf,
+                timezone: launch.timezone.as_deref(),
+                firefox_autotest_policy: launch.firefox_autotest_policy,
+                machine_id: Some(launch.machine_id.as_str()),
+            },
+            launch.runtime_aliases,
         ),
     };
     require_mount_plan(
         filesystems,
-        resolv_conf,
-        machine_id,
-        firefox_autotest_policy,
+        etc,
         runtime_aliases,
         &mount_probe_token,
         identity,
@@ -3675,10 +3835,7 @@ pub fn run_stage2(
     clear_and_require_empty_capabilities()?;
     let host_mode = matches!(
         &action,
-        Stage2Action::Launch {
-            cgroup_membership,
-            ..
-        } if cgroup_membership == NO_CGROUP_MEMBERSHIP
+        Stage2Action::Launch(launch) if launch.cgroup_membership == NO_CGROUP_MEMBERSHIP
     );
     install_standard_seccomp_filter().map_err(|error| {
         if host_mode {
@@ -3695,18 +3852,25 @@ pub fn run_stage2(
             probe_pid1_lifecycle()?;
             writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
         }
-        Stage2Action::Launch {
-            entry,
-            resolv_conf: _,
-            machine_id: _,
-            firefox_autotest_policy: _,
-            runtime_aliases: _,
-            environment,
-            filesystems: _,
-            resources,
-            cgroup_membership,
-            arguments,
-        } => {
+        Stage2Action::Launch(launch) => {
+            // Every field named, none elided. The mount-plan facts are
+            // already spent above, but a `..` here would let the NEXT field
+            // be added and silently never reach this frame — which is the
+            // mistake this very commit had to be threaded through twice to
+            // avoid making.
+            let Stage2Launch {
+                entry,
+                resolv_conf: _,
+                machine_id: _,
+                timezone: _,
+                firefox_autotest_policy: _,
+                runtime_aliases: _,
+                environment,
+                filesystems: _,
+                resources,
+                cgroup_membership,
+                arguments,
+            } = *launch;
             if cgroup_membership != NO_CGROUP_MEMBERSHIP {
                 cgroup::require_current_membership(&cgroup_membership)?;
             }
@@ -4159,6 +4323,10 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 filesystems: &application.filesystems,
                 resolv_conf: application.resolv_conf.is_some(),
                 machine_id: &application.state.machine_id,
+                timezone: application
+                    .timezone
+                    .as_ref()
+                    .map(|zone| zone.name.as_str()),
                 firefox_autotest_policy: application
                     .firefox_autotest_policy
                     .is_some(),
@@ -4719,6 +4887,8 @@ mod tests {
                 "present",
                 STAGE2_MACHINE_ID_ARG,
                 machine_id,
+                STAGE2_TIMEZONE_ARG,
+                "Europe/Berlin",
                 STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
                 "present",
                 STAGE2_LOADER_LIBRARY_PATH_ARG,
@@ -4753,42 +4923,40 @@ mod tests {
             ]))
             .unwrap(),
             Mode::Stage2 {
-                action: Stage2Action::Launch {
-                    entry,
-                    resolv_conf,
-                    machine_id: parsed_machine_id,
-                    firefox_autotest_policy,
-                    runtime_aliases,
-                    environment,
-                    filesystems,
-                    resources,
-                    cgroup_membership,
-                    arguments,
-                },
+                action: Stage2Action::Launch(launch),
                 ..
-            } if entry == "/app/bin/app"
-                && resolv_conf
-                && parsed_machine_id == machine_id
-                && firefox_autotest_policy
-                && !runtime_aliases
-                && environment.first() == Some(&(
-                    OsString::from("DBUS_SESSION_BUS_ADDRESS"),
-                    OsString::from("unix:path=/run/user/1000/bus"),
-                ))
-                && filesystems == [Stage2Filesystem {
+            } if *launch == Stage2Launch {
+                entry: "/app/bin/app".into(),
+                resolv_conf: true,
+                machine_id: machine_id.into(),
+                timezone: Some("Europe/Berlin".into()),
+                firefox_autotest_policy: true,
+                runtime_aliases: false,
+                environment: [
+                    ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                    ("FLATPAK_ID", "org.td.App"),
+                    ("GLIBC_TUNABLES", "glibc.malloc.perturb=1"),
+                    ("HOME", "/home/td"),
+                    ("WAYLAND_DISPLAY", "wayland-0"),
+                    ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ]
+                .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+                .to_vec(),
+                filesystems: vec![Stage2Filesystem {
                     target: PathBuf::from("/home/td/Downloads"),
                     read_only: false,
                     source_kind: FilesystemSourceKind::Directory,
-                }]
-                && resources == ResolvedResourceLimits {
+                }],
+                resources: ResolvedResourceLimits {
                     memory_high_bytes: 50_331_648,
                     memory_max_bytes: 67_108_864,
                     pids_max: 32,
                     cpu_quota_usec: 50_000,
                     cpu_period_usec: 100_000,
-                }
-                && cgroup_membership == "/td-user-1000/app-0123456789abcdef"
-                && arguments == [OsString::from("--flag")]
+                },
+                cgroup_membership: "/td-user-1000/app-0123456789abcdef".into(),
+                arguments: vec![OsString::from("--flag")],
+            }
         ));
         assert!(parse_mode(args(&[STAGE2_ARG, &encoded])).is_err());
         assert!(parse_mode(args(&[STAGE2_ARG, &encoded, "1000", "1000", "extra"])).is_err());
@@ -4805,6 +4973,8 @@ mod tests {
             "absent",
             STAGE2_MACHINE_ID_ARG,
             machine_id,
+            STAGE2_TIMEZONE_ARG,
+            NO_TIMEZONE,
             STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
             "absent",
             STAGE2_LOADER_LIBRARY_PATH_ARG,
@@ -4829,6 +4999,8 @@ mod tests {
             "absent",
             STAGE2_MACHINE_ID_ARG,
             machine_id,
+            STAGE2_TIMEZONE_ARG,
+            NO_TIMEZONE,
             STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
             "absent",
             STAGE2_LOADER_LIBRARY_PATH_ARG,
@@ -4924,6 +5096,7 @@ mod tests {
                 filesystems: &filesystems,
                 resolv_conf: false,
                 machine_id,
+                timezone: Some("Europe/Berlin"),
                 firefox_autotest_policy: true,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
             },
@@ -4933,6 +5106,28 @@ mod tests {
             },
             &arguments,
         );
+        // The sentinel is the value EVERY launch emits until a writer for
+        // `/etc/timezone` exists, so it needs a POSITIVE assertion: every
+        // other `NO_TIMEZONE` in these tests sits in a case that is refused
+        // for some other reason, and would stay green if `absent` became a
+        // parse error.
+        let mut unzoned = emitted.clone();
+        let zone_index = unzoned
+            .iter()
+            .position(|argument| argument == STAGE2_TIMEZONE_ARG)
+            .unwrap();
+        unzoned[zone_index + 1] = OsString::from(NO_TIMEZONE);
+        assert!(matches!(
+            parse_mode(unzoned.into_iter()).unwrap(),
+            Mode::Stage2 {
+                action: Stage2Action::Launch(launch),
+                ..
+            } if launch.timezone.is_none()
+        ));
+        // And a zone name that is not one is refused rather than carried.
+        let mut misspelled = emitted.clone();
+        misspelled[zone_index + 1] = OsString::from("europe/berlin");
+        assert!(parse_mode(misspelled.into_iter()).is_err());
         let mut mismatched = emitted.clone();
         let loader_index = mismatched
             .iter()
@@ -4947,10 +5142,11 @@ mod tests {
                 token,
                 identity,
                 outside_identity,
-                action: Stage2Action::Launch {
+                action: Stage2Action::Launch(Box::new(Stage2Launch {
                     entry: "/app/bin/app".into(),
                     resolv_conf: false,
                     machine_id: machine_id.into(),
+                    timezone: Some("Europe/Berlin".into()),
                     firefox_autotest_policy: true,
                     runtime_aliases: true,
                     environment,
@@ -4962,7 +5158,7 @@ mod tests {
                     resources,
                     cgroup_membership: membership.into(),
                     arguments,
-                },
+                })),
             }
         );
     }
@@ -5886,6 +6082,82 @@ mod tests {
         );
     }
 
+    /// The stage-2 readback answers "is this the runtime's own file for the
+    /// zone the system named", and every way of getting that wrong.
+    ///
+    /// A hard link stands in for the bind: `stat` cannot tell one from the
+    /// other, and `stat` is all this reads.
+    #[test]
+    fn the_bound_zone_must_be_the_runtimes_own_file_for_the_named_zone() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory().unwrap();
+        // Canonical, as the shipped caller's `/usr` is: a `TMPDIR` with a
+        // symlinked component would otherwise put every zone outside the
+        // prefix and fail this for a reason that is not the rule.
+        let root = fs::canonicalize(directory.as_path()).unwrap();
+        let runtime = root.join("runtime");
+        let zoneinfo = runtime.join(authority::ZONEINFO_SUBDIR);
+        fs::create_dir_all(zoneinfo.join("Europe")).unwrap();
+        fs::create_dir_all(zoneinfo.join("Etc")).unwrap();
+        fs::write(zoneinfo.join("Europe/Berlin"), b"TZif2 Berlin").unwrap();
+        fs::write(zoneinfo.join("Etc/UTC"), b"TZif2 UTC").unwrap();
+        symlink("Etc/UTC", zoneinfo.join("UTC")).unwrap();
+        fs::write(zoneinfo.join("Bogus"), b"not a compiled zone").unwrap();
+        let outside = root.join("outside");
+        fs::write(&outside, b"TZif2 outside").unwrap();
+        symlink(&outside, zoneinfo.join("Escape")).unwrap();
+        // A `share` that links to a sibling INSIDE the runtime is legal on
+        // both sides — the pair of rules is the same pair stage 1 applies, so
+        // a tree stage 1 accepts is a tree this accepts.
+        let sibling_runtime = root.join("sibling");
+        fs::create_dir(&sibling_runtime).unwrap();
+        fs::create_dir_all(sibling_runtime.join("real/zoneinfo/Etc")).unwrap();
+        fs::write(
+            sibling_runtime.join("real/zoneinfo/Etc/UTC"),
+            b"TZif2 sibling",
+        )
+        .unwrap();
+        symlink("real", sibling_runtime.join("share")).unwrap();
+
+        let localtime = root.join("localtime");
+        let bind = |source: &Path| {
+            let _ = fs::remove_file(&localtime);
+            fs::hard_link(source, &localtime).unwrap();
+        };
+
+        // The named zone's own file, reached directly and through a link.
+        bind(&zoneinfo.join("Europe/Berlin"));
+        require_bound_zone_at(&localtime, &runtime, "Europe/Berlin").unwrap();
+        bind(&zoneinfo.join("Etc/UTC"));
+        require_bound_zone_at(&localtime, &runtime, "UTC").unwrap();
+        require_bound_zone_at(&localtime, &runtime, "Etc/UTC").unwrap();
+
+        // A zone file, but not the one the system named.
+        assert!(require_bound_zone_at(&localtime, &runtime, "Europe/Berlin").is_err());
+        // A name outside the grammar never reaches the filesystem.
+        assert!(require_bound_zone_at(&localtime, &runtime, "../outside").is_err());
+        // A source that leaves the zoneinfo tree is refused HERE too, not
+        // only by stage 1: containment proved on one side of the bind is
+        // containment this readback is trusting rather than checking.
+        bind(&outside);
+        assert!(require_bound_zone_at(&localtime, &runtime, "Escape").is_err());
+        // Bound bytes that are not a compiled zone: glibc would read them as
+        // UTC in silence.
+        bind(&zoneinfo.join("Bogus"));
+        assert!(require_bound_zone_at(&localtime, &runtime, "Bogus").is_err());
+        // Nothing bound at all, and a directory where the file should be.
+        fs::remove_file(&localtime).unwrap();
+        assert!(require_bound_zone_at(&localtime, &runtime, "UTC").is_err());
+        fs::create_dir(&localtime).unwrap();
+        assert!(require_bound_zone_at(&localtime, &runtime, "UTC").is_err());
+        fs::remove_dir(&localtime).unwrap();
+
+        let sibling_zone = sibling_runtime.join("real/zoneinfo/Etc/UTC");
+        fs::hard_link(&sibling_zone, &localtime).unwrap();
+        require_bound_zone_at(&localtime, &sibling_runtime, "Etc/UTC").unwrap();
+    }
+
     #[test]
     fn selective_etc_identity_is_exact_and_runtime_entries_are_closed() {
         let directory = temporary_directory().unwrap();
@@ -5917,11 +6189,28 @@ mod tests {
                 },
             ]
         );
-        assert!(!expected_etc_names(&selected, false, false)
+        let binding = |timezone, firefox_autotest_policy| EtcBinding {
+            resolv_conf: false,
+            timezone,
+            firefox_autotest_policy,
+            machine_id: Some("0123456789abcdef0123456789abcdef\n"),
+        };
+        assert!(!expected_etc_names(&selected, binding(None, false))
             .unwrap()
             .contains("firefox"));
+        // A launch with no zone expects no `localtime`, and one with a zone
+        // expects exactly one more name — the entry is conditional the way
+        // `resolv.conf` is, not unconditional the way `machine-id` is.
+        assert!(!expected_etc_names(&selected, binding(None, true))
+            .unwrap()
+            .contains("localtime"));
+        assert!(
+            expected_etc_names(&selected, binding(Some("Europe/Berlin"), true))
+                .unwrap()
+                .contains("localtime")
+        );
         assert_eq!(
-            expected_etc_names(&selected, false, true).unwrap(),
+            expected_etc_names(&selected, binding(None, true)).unwrap(),
             BTreeSet::from([
                 "firefox".to_string(),
                 "fonts".to_string(),

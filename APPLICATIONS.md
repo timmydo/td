@@ -2700,12 +2700,16 @@ on a load-bearing bind is fatal, never degraded:
         directory, and each bind plus every nested mount is read-only,
         nosuid, nodev and noexec. Unknown runtime entries remain absent from
         /etc; the complete immutable runtime remains available below /usr/etc.
-        td owns passwd, group, hosts, hostname, machine-id, resolv.conf,
-        nsswitch.conf and ssl/certs/ca-certificates.crt. Identity and name
-        files are synthesized into the tmpfs; machine-id is the validated
-        per-application value from private state; the CA file is a read-only
-        bind of the image's pinned store artifact; resolv.conf is a read-only
-        bind only for shared network and only when td-netd produced it.
+        td owns passwd, group, hosts, hostname, localtime, machine-id,
+        resolv.conf, nsswitch.conf and ssl/certs/ca-certificates.crt.
+        Identity and name files are synthesized into the tmpfs; machine-id
+        is the validated per-application value from private state; the CA
+        file is a read-only bind of the image's pinned store artifact;
+        resolv.conf is a read-only bind only for shared network and only
+        when td-netd produced it; localtime is a read-only bind of the
+        runtime's own compiled zone for the name the system's
+        /etc/timezone carries, and absent entirely when nothing names a
+        zone.
  7  extension mounts at authenticated extension-point directories
  8  /proc  mount point prepared by stage 1; after step 15, stage 2 mounts
         a fresh procfs for the namespace where it is PID 1, before the
@@ -6114,9 +6118,61 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   after td-netd has produced it. Absent with no network or no lease is correct:
   DNS should fail like the network it names. **`/etc/hosts`** carries loopback
   and the inherited UTS hostname; `/etc/hostname` agrees with the same name.
-- **`/etc/localtime`** — td carries no TZif and the bar is proudly UTC.
-  Apps show UTC; a user who cares sets `TZ=` and glibc reads the
-  *runtime's* zoneinfo. Recorded divergence, zero code.
+- **`/etc/localtime`** — **read-only bind of the runtime's own compiled
+  zone**, and the earlier "recorded divergence, zero code" is reversed:
+  §O made timezone support required and the ladder had no rung for it,
+  which is how a required thing was quietly becoming a permanent one.
+  What §O actually answered — *"a per-user `TZ=` reading the runtime's
+  own zoneinfo is zero td code"* — is the split kept here with the
+  environment variable removed. **td owns the NAME and the runtime owns
+  the ZONE FILE.** glibc reads `/etc/localtime` when `TZ` is unset, so
+  the bind is the whole mechanism: no environment entry, no per-app spec
+  row, nothing an application has to be told, and `LC_ALL`-style
+  overrides still work because `TZ` is left alone.
+  The name comes from the system's **`/etc/timezone`** — a bounded IANA
+  zone name, every component capitalised, at most three deep. It cannot
+  be spelled the ordinary way, as an `/etc/localtime` symlink into
+  `/usr/share/zoneinfo`, because **td's own root carries no zoneinfo for
+  such a symlink to name**: the zone data exists only inside a jail.
+  **Unset is not a zone**, and that is the whole of the first case.
+  When `/etc/timezone` is absent — or is the reviewed link out to state
+  nothing has minted yet, which is the same "nobody has said" — there is
+  no bind, and **the runtime is never asked anything**: no dependency on
+  it shipping zoneinfo, and the application keeps the glibc UTC it had
+  before this existed. A draft turned unset into the *name* `UTC` first
+  and then went looking for a zone file, which made an unconfigured
+  machine's launch depend on the runtime carrying a top-level `UTC` and
+  bound a zone on a system where nobody had chosen one.
+  **A named zone must be answerable**, or the launch is refused —
+  including a malformed name, and including `UTC`, which is not special:
+  naming it is still a choice. Refusal rather than a quiet fall back to
+  UTC is the point; showing the operator UTC and saying nothing is the
+  daily irritant §O named, and unset and misconfigured are different
+  facts that must not look the same.
+  The zone file is pinned by identity like every other bound file, and
+  resolution FOLLOWS symlinks where the CA bundle's resolver refuses
+  them — a zoneinfo tree is made of links, `UTC` to `Etc/UTC` and
+  `US/Eastern` to `America/New_York` — so what replaces the refusal is a
+  bound on where a link may LAND: the canonical target, and the zoneinfo
+  root itself, stay inside the runtime. Both halves of that are checked
+  again in stage 2, on the file the application will actually open —
+  containment, the bound inode being the runtime's own file for the
+  named zone, and `TZif` magic. A rule proved on one side of a bind only
+  is a rule the readback is trusting rather than checking, and glibc
+  reads a non-TZif `/etc/localtime` as UTC in silence: the failure would
+  have no symptom but a wrong clock.
+  **Host mode reads no zone at all.** Its inputs come from the fixture's
+  own configuration file, so reaching for the developer's ambient
+  `/etc/timezone` would break that contract and would refuse every
+  empty-runtime fixture on a machine that happens to name a zone. A
+  `timezone=` row at host-config `format=3` is what would change this.
+  **Setting the zone is not yet landed and neither is td's own clock.**
+  `/etc/timezone` has no writer, so today every launch takes the unset
+  path and binds nothing — which is what makes this incapable of
+  regressing a runtime that cannot be booted from this branch. The
+  writer is the `machine-id` shape, and the bar stays UTC and still says
+  so, since reading a zone outside a jail needs a TZif parser td does
+  not have (`td-compositor/DESIGN.md`).
 - **CA bundle** — one consumer now, not two, and it survives the
   network stack's removal. Nothing here needs roots for itself
   (§B.3), but the *applications* still browse the web, so: **add a CA
@@ -6638,6 +6694,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 12g | **selective immutable `/etc` — LANDED**: a bounded tmpfs admits only the closed runtime configuration allowlist, synthesized passwd/group/host/NSS identity, one persisted per-application machine id, the pinned curl-rendered Mozilla CA bundle, and a read-only resolver bind only for declared shared networking. Stage 1 source-identity-checks every external file and recursively hardens selected runtime directories; stage 2 derives the exact tree from `/usr/etc`, checks synthesized contents, mount flags, nested mounts, PEM shape and write refusal. Host mode names fixture-owned CA and resolver inputs rather than borrowing ambient `/etc` | applications get libc/toolkit identity and trust data without seeing the host configuration |
 | 12h | **dynamic Firefox jail runtime — LANDED**: the exact Firefox/Freedesktop 25.08 pair is the sole target policy allowed to carry `LD_LIBRARY_PATH=/app/lib:/app/lib/firefox`; token-gated stage 2 revalidates the value after privileged stage 1 installs the four immutable `/usr` aliases, then reads those aliases back. Every application receives and stage 2 requires writable mode-0700 `$XDG_CACHE_HOME/tmp`. In this pre-image increment, a source-built surrogate ran under Firefox's real compiled spec through the complete host jail and broker path while imported Firefox bytes remained inert | the Firefox package has an automated confinement/runtime preflight without a manual desktop session |
 | 12i | **Firefox selected into the system image — LANDED**: the immutable application registry and `/bin/firefox` pair the exact Firefox 154.0 package with Freedesktop 25.08. The supervised service owns the boot-started instance; the compositor menu activates its observed mapped surface and never starts another jail. Direct `/bin/firefox` remains supported and no global single-instance lock has landed. Headless QEMU accepts an exact marker only after a surface asserting `org.mozilla.firefox` commits a buffer successfully painted to the framebuffer and an independent probe sees a live Firefox jail with its cgroup limits. Mutable Firefox state remains independent of deployment-health authority | **first real Firefox frame without manual testing** |
+| 12j | **application timezone in the mount plan — LANDED**: the launch reads a bounded IANA zone name from the system's `/etc/timezone`, resolves the runtime's own compiled zone for it under `usr/share/zoneinfo`, pins it by identity, and read-only binds it at `/etc/localtime`, which glibc reads whenever `TZ` is unset. Resolution follows symlinks because a zoneinfo tree is made of them, and bounds where one may land: the canonical target and the zoneinfo root both stay inside the runtime. `TZif` magic is checked before the bind and again by stage 2 on the bound file, together with containment and the bound inode being the runtime's own file for the named zone. Unset is not a zone: with nothing named the runtime is never asked and nothing is bound, so a minimal runtime is unaffected; a named zone must be answerable and `UTC` is not special about it, and a malformed name refuses outright. Host mode reads no zone, its inputs being fixture-owned. Nothing writes that file yet, so every launch takes the unset path until rung 12k | a jailed application reads the operator's zone rather than the compositor's UTC |
+| 12k | the system zone's WRITER: `/etc/timezone` as persistent per-machine state on the `machine-id` shape — a reviewed `MUTABLE_ETC` symlink out to `/var/lib/td`, minted by `td-firstboot`, and one named operation that sets it. Rung 12j is the reader and is inert without this | the operator can choose a zone, and it survives a deployment |
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
@@ -6662,18 +6720,25 @@ Each row is one landing or a small family, leaving the tree green.
 | 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content first exposes a full-viewport focus control, then places the authenticated page's visible real file input in a bounded 200x100 rectangle containing that trusted click's exact coordinates and fills it with the native selector button. A second uncancelled physical click at the same coordinates must focus that input; a fresh closed probe confirms the trusted focus before physical Enter invokes Firefox's default action. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter. Firefox then requires one trusted change and the exact selected file name, size and contents before input completion. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
 | 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The deterministic system oracle remains NIC-less; public reachability is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
+| 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
 
-**Two other reversals are still absent from this ladder, and that is a
-scheduling gap rather than a decision.** §O made timezone support
-("must be addressed", 17) and accessibility ("wanted", 13) required, and
-§G still specifies UTC-only and `GTK_A11Y=none` — the *implemented*
-positions, correctly, since nothing has changed them. But neither has a
-rung here, an interface, or an acceptance test, which is how a required
-thing quietly becomes a permanent one. Both belong **after** M28 and
-before "daily usable": timezone is a TZif input plus `/etc/localtime`
-in the mount plan and is small; accessibility is §S's second-bus
-landing and is not. Naming them here is what stops the ladder reading as
-the whole plan.
+**Of the two reversals this ladder used to omit entirely, timezone now
+has a rung and accessibility still does not.** §O made timezone support
+("must be addressed", 17) and accessibility ("wanted", 13) required
+while §G specified UTC-only and `GTK_A11Y=none`, and neither had a rung,
+an interface, or an acceptance test — which is how a required thing
+quietly becomes a permanent one. Naming them here is what stopped the
+ladder reading as the whole plan.
+
+Timezone was described here as "a TZif input plus `/etc/localtime` in
+the mount plan", and the mount-plan half is rung 12j. The **input** half
+turned out not to be a td input at all: §O's own answer reads the
+*runtime's* zoneinfo, so td pins no tzdata, builds no `zic`, and adds no
+foreign source — it carries the zone NAME and binds the runtime's
+compiled file. What remains is the writer for that name and td's own
+clock, which are rungs 12k and 29 rather than an unscheduled gap.
+Accessibility is unchanged: it belongs **after** M28 and before "daily
+usable", it is §S's second-bus landing, and it is not small.
 
 **Rungs 25 and 26 are the audio reversal arriving in the plan**, and
 they were missing from an earlier version of this ladder — which is how
@@ -7735,7 +7800,7 @@ whose answers are not already a section of their own:
 | `.desktop` `Exec=` | **worth doing** — the bounded safe subset (§A) |
 | accessibility | **wanted**, and for a reason that reshapes it: *"especially as it becomes important for ai agents to read the screen"* (§S) |
 | `machine-id` | **mint per-app values** |
-| timezone | **must be addressed** — a per-user `TZ=` reading the runtime's own zoneinfo is zero td code and the difference between a quirk and a daily irritant |
+| timezone | **must be addressed** — a per-user `TZ=` reading the runtime's own zoneinfo is zero td code and the difference between a quirk and a daily irritant. Answered as recorded, with the environment variable dropped: rung 12j binds the runtime's own zone at `/etc/localtime`, which glibc reads when `TZ` is unset, so nothing has to be told anything and an app that sets `TZ` still wins (§G) |
 | architecture scope | **keep the path to other architectures open**; every UAPI layout here is x86-64-specific and marked so |
 
 ## P. Resource caps

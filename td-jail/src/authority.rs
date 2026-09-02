@@ -19,6 +19,8 @@ const PACKAGE_ROOT: &str = "/td/store";
 const STATE_ROOT: &str = ".td/app";
 const CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";
 const RESOLV_CONF_PATH: &str = "/run/resolv.conf";
+const TIMEZONE_PATH: &str = "/etc/timezone";
+pub(crate) const ZONEINFO_SUBDIR: &str = "share/zoneinfo";
 const APPLICATION_UID: u32 = 1000;
 const APPLICATION_GID: u32 = 1000;
 pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";
@@ -44,6 +46,11 @@ const MAX_STATUS_BYTES: usize = 64 * 1024;
 const MAX_PASSWD_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_RESOLV_CONF_BYTES: u64 = 64 * 1024;
+const MAX_TIMEZONE_BYTES: usize = 128;
+const MAX_TIMEZONE_NAME_BYTES: usize = 64;
+const MAX_TIMEZONE_COMPONENTS: usize = 3;
+const MAX_TZIF_BYTES: u64 = 1024 * 1024;
+pub(crate) const TZIF_MAGIC: &[u8; 4] = b"TZif";
 const MAX_APPLICATION_SPEC_BYTES: usize = 48 * 1024;
 const MAX_APPLICATION_TABLE_BYTES: usize = 1024 * 1024;
 const MAX_APPLICATIONS: usize = 256;
@@ -82,6 +89,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) runtime_files: PathBuf,
     pub(crate) ca_bundle: ResolvedFile,
     pub(crate) resolv_conf: Option<ResolvedFile>,
+    pub(crate) timezone: Option<ResolvedTimezone>,
     pub(crate) firefox_autotest_policy: Option<FirefoxAutotestPolicy>,
     pub(crate) state: StatePlan,
     pub(crate) wayland_socket: PathBuf,
@@ -116,6 +124,12 @@ struct ProductConfig {
     registry: PathBuf,
     ca_bundle: ResolvedFile,
     resolv_conf: PathBuf,
+    /// Where the system names its zone, or `None` for a launch that must not
+    /// read one. Host mode is that `None`: its inputs come from the fixture's
+    /// own configuration file, so reaching for the developer's ambient
+    /// `/etc/timezone` would both break the fixture-owned-input contract and
+    /// refuse every empty-runtime fixture on a machine that names a zone.
+    timezone: Option<PathBuf>,
     real_home: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
     enforce_cgroup: bool,
@@ -189,6 +203,26 @@ pub(crate) struct ResolvedFile {
     pub(crate) device: u64,
     pub(crate) inode: u64,
     pub(crate) size: u64,
+}
+
+/// The operator's zone as a NAME, and the compiled TZif the application's own
+/// runtime carries for it.
+///
+/// §O answered the timezone question with "a per-user `TZ=` reading the
+/// runtime's own zoneinfo is zero td code", and the split here is that answer
+/// with the environment variable removed: td owns the NAME, the runtime owns
+/// the ZONE FILE, and neither has to ship the other's half. glibc reads
+/// `/etc/localtime` when `TZ` is unset, so a bind is the whole mechanism and
+/// no application has to be told anything.
+///
+/// The name cannot be spelled the way an ordinary distribution spells it — an
+/// `/etc/localtime` symlink into `/usr/share/zoneinfo` — because td's own root
+/// carries no zoneinfo at all for that symlink to name. The zone data exists
+/// only inside a jail, which is where this resolves it.
+#[derive(Debug)]
+pub(crate) struct ResolvedTimezone {
+    pub(crate) name: String,
+    pub(crate) file: ResolvedFile,
 }
 
 #[derive(Debug)]
@@ -386,6 +420,7 @@ where
         )?
     };
     let firefox_autotest_policy = resolve_firefox_autotest_policy(name)?;
+    let timezone = resolve_timezone(config.timezone.as_deref(), &runtime_files)?;
 
     Ok(LaunchPlan {
         name: name.to_string(),
@@ -393,6 +428,7 @@ where
         runtime_files,
         ca_bundle: config.ca_bundle,
         resolv_conf,
+        timezone,
         firefox_autotest_policy,
         state,
         wayland_socket,
@@ -455,6 +491,7 @@ fn target_config() -> io::Result<ProductConfig> {
         registry: PathBuf::from(REGISTRY_PATH),
         ca_bundle,
         resolv_conf: PathBuf::from(RESOLV_CONF_PATH),
+        timezone: Some(PathBuf::from(TIMEZONE_PATH)),
         real_home: None,
         runtime_root: None,
         enforce_cgroup: true,
@@ -587,6 +624,7 @@ fn host_config(path: &Path, identity: (u32, u32)) -> io::Result<ProductConfig> {
         registry,
         ca_bundle,
         resolv_conf,
+        timezone: None,
         real_home: Some(real_home),
         runtime_root: Some(runtime_root),
         enforce_cgroup: false,
@@ -2025,6 +2063,194 @@ fn resolve_direct_file(path: &Path, label: &str, max_bytes: u64) -> io::Result<R
     resolved_regular(canonical, label, max_bytes)
 }
 
+/// An IANA zone name as `/etc/timezone` spells one: `UTC`, `Europe/Berlin`,
+/// `America/Argentina/Buenos_Aires`.
+///
+/// Closed rather than sanitised, because the name is JOINED onto a directory
+/// and a rejected name never reaches the filesystem at all. Every component
+/// starts with a capital, which is what refuses `.` and `..` — the containment
+/// check in `resolve_zoneinfo_file` is the second line and not the first.
+///
+/// The capital also refuses the `posix/...` and `right/...` spellings of a
+/// zone. Deliberate: they are directory prefixes rather than zone identifiers,
+/// tzdb's own names are the ones an operator writes, and admitting a lowercase
+/// component would put a zone name and stage 2's `absent` in one value space.
+pub(crate) fn valid_timezone_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_TIMEZONE_NAME_BYTES {
+        return false;
+    }
+    let mut components = 0usize;
+    for component in name.split('/') {
+        components = components.saturating_add(1);
+        if components > MAX_TIMEZONE_COMPONENTS || component.is_empty() {
+            return false;
+        }
+        // UPPERCASE, which every tzdb name has and no English word the
+        // stage-2 grammar spells does: it is what keeps `--timezone absent`
+        // unambiguously "no zone" rather than a zone that could be named that.
+        if !component
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+        {
+            return false;
+        }
+        // `Etc/GMT+1` and `America/Port-au-Prince` are real zone names, so the
+        // set is the tzdb one and not an identifier's.
+        if !component.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' || byte == b'+'
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The zone this machine is in, or `None` when nothing has said.
+///
+/// UNSET IS NOT A ZONE. An earlier draft answered `UTC` here and could not
+/// then tell the two apart downstream: an unconfigured machine went looking
+/// for a `UTC` zone file, which made every launch depend on the runtime
+/// carrying one, and made "nobody has chosen" and "somebody chose UTC" the
+/// same request. Nothing to bind is the honest answer, and it is also the
+/// behaviour every launch already had — glibc's own built-in UTC.
+///
+/// `NotFound` is that case however it arises, including a symlink whose
+/// target does not exist yet: `/etc/timezone` is destined to be a reviewed
+/// `MUTABLE_ETC` link out to state that `td-firstboot` mints, and a link
+/// pointing at an unminted file is "nobody has said" and not a misconfigured
+/// machine. A file that IS there and says something wrong is the other fact,
+/// and it is REFUSED — quietly showing UTC instead is what §O called a daily
+/// irritant.
+fn system_timezone_name(path: &Path) -> io::Result<Option<String>> {
+    let text = match read_bounded_path(path, MAX_TIMEZONE_BYTES) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        other => other?,
+    };
+    let name = text.strip_suffix('\n').unwrap_or(&text);
+    if !valid_timezone_name(name) {
+        return Err(invalid(format!(
+            "system timezone {} is not a bounded IANA zone name",
+            path.display()
+        )));
+    }
+    Ok(Some(name.to_string()))
+}
+
+fn resolve_timezone(
+    timezone_path: Option<&Path>,
+    runtime_files: &Path,
+) -> io::Result<Option<ResolvedTimezone>> {
+    match timezone_path {
+        Some(path) => resolve_timezone_at(path, runtime_files),
+        None => Ok(None),
+    }
+}
+
+/// The zone file to bind at `/etc/localtime`, or `None` for a launch that
+/// carries no zone at all.
+///
+/// TWO cases, and the split is where the name is read rather than where the
+/// runtime is inspected. **Nothing names a zone** — `timezone_path` is the
+/// only input consulted — and the runtime is never asked anything: no bind, no
+/// dependency on the runtime carrying zoneinfo, and the application keeps the
+/// glibc UTC it had before this path existed. **A zone IS named** and it must
+/// resolve, or the launch is refused; handing the operator UTC and saying
+/// nothing is the failure this path exists to remove.
+///
+/// An earlier draft asked the runtime in both cases, having turned "unset"
+/// into the name `UTC` first. That made an unconfigured machine's launch
+/// depend on the runtime shipping a top-level `UTC` zone, which is a
+/// regression risk against a runtime this branch cannot boot, and it silently
+/// bound a zone on a system where nobody had chosen one.
+fn resolve_timezone_at(
+    timezone_path: &Path,
+    runtime_files: &Path,
+) -> io::Result<Option<ResolvedTimezone>> {
+    let Some(name) = system_timezone_name(timezone_path)? else {
+        return Ok(None);
+    };
+    let zoneinfo = runtime_files.join(ZONEINFO_SUBDIR);
+    let root = canonical_directory(&zoneinfo, "application runtime zoneinfo")
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "system timezone {name} needs a runtime zoneinfo: {error}"
+                ),
+            )
+        })?;
+    if !root.starts_with(runtime_files) {
+        return Err(invalid(
+            "application runtime zoneinfo resolves outside the runtime",
+        ));
+    }
+    let file = resolve_zoneinfo_file(&root, &name)?;
+    Ok(Some(ResolvedTimezone { name, file }))
+}
+
+/// One zone's compiled file, pinned by identity like every other file the
+/// mount plan binds.
+///
+/// This FOLLOWS symlinks where `resolve_direct_file` refuses them, because a
+/// zoneinfo tree is made of them — `UTC` links to `Etc/UTC` and `US/Eastern`
+/// to `America/New_York` in an ordinary tzdb build — so refusing a link would
+/// refuse most of the zones a person would name. What replaces the refusal is
+/// a bound on where the link may LAND: the canonical target stays inside the
+/// runtime's own zoneinfo, so a runtime cannot aim a zone name at an arbitrary
+/// file and have the jail bind it into `/etc`.
+fn resolve_zoneinfo_file(root: &Path, name: &str) -> io::Result<ResolvedFile> {
+    let requested = root.join(name);
+    let canonical = fs::canonicalize(&requested).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "resolve application timezone {}: {error}",
+                requested.display()
+            ),
+        )
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(invalid(format!(
+            "application timezone {name} resolves outside the runtime zoneinfo"
+        )));
+    }
+    let file = resolved_regular(canonical, "application timezone", MAX_TZIF_BYTES)?;
+    require_tzif(&file.path)?;
+    Ok(file)
+}
+
+/// The four bytes that make a file a compiled zone.
+///
+/// Checked before the bind rather than only after it, because glibc reads a
+/// file that is not TZif as UTC without complaining: the application would
+/// show the wrong time and nothing in the launch would have failed. Stage 2
+/// checks the same magic on the bound file, which is the copy it opens.
+fn require_tzif(path: &Path) -> io::Result<()> {
+    let mut magic = [0u8; TZIF_MAGIC.len()];
+    File::open(path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("open application timezone {}: {error}", path.display()),
+            )
+        })?
+        .read_exact(&mut magic)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("read application timezone {}: {error}", path.display()),
+            )
+        })?;
+    if &magic != TZIF_MAGIC {
+        return Err(invalid(format!(
+            "application timezone {} is not a compiled TZif zone",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_optional_file(
     path: &Path,
     label: &str,
@@ -2973,6 +3199,220 @@ mod tests {
         .is_err());
         assert!(physical_store_directory(&root, Path::new("/elsewhere/object"), "fixture")
             .is_err());
+    }
+
+    /// The zone-name grammar, which is a PATH COMPONENT set before it is a
+    /// name set: everything refused here is something that would otherwise be
+    /// joined onto the runtime's own zoneinfo directory.
+    #[test]
+    fn zone_names_are_bounded_capitalised_tzdb_names() {
+        for name in [
+            "UTC",
+            "GMT",
+            "Zulu",
+            "EST5EDT",
+            "W-SU",
+            "Europe/Berlin",
+            "America/New_York",
+            "America/Port-au-Prince",
+            "America/Argentina/Buenos_Aires",
+            "Etc/GMT+1",
+        ] {
+            assert!(valid_timezone_name(name), "{name} is a real tzdb zone");
+        }
+        for name in [
+            "",
+            "/",
+            "/UTC",
+            "UTC/",
+            "..",
+            "../../etc/shadow",
+            "Europe//Berlin",
+            "Europe/../Berlin",
+            // Stage 2 spells "this launch carries no zone" as `absent`, so a
+            // lowercase first byte has to be refused or the sentinel and a
+            // zone name are the same argument.
+            "absent",
+            "europe/Berlin",
+            "Etc/gmt",
+            "Europe/Berlin\n",
+            "Europe/Berlin\0",
+            "Europe/Berlin ",
+            // One component past the deepest name tzdb actually ships.
+            "A/B/C/D",
+        ] {
+            assert!(!valid_timezone_name(name), "{name:?} is not a zone name");
+        }
+        assert!(valid_timezone_name(&"A".repeat(MAX_TIMEZONE_NAME_BYTES)));
+        assert!(!valid_timezone_name(&"A".repeat(
+            MAX_TIMEZONE_NAME_BYTES.saturating_add(1)
+        )));
+    }
+
+    /// A machine nobody has configured and a machine configured WRONGLY must
+    /// not look the same. The first is UTC; the second is a refusal, because
+    /// the quiet UTC is the answer §O called a daily irritant.
+    #[test]
+    fn an_unset_zone_is_no_zone_and_a_malformed_one_is_a_refusal() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new("timezone-name").unwrap();
+        let path = root.join("timezone");
+        assert_eq!(system_timezone_name(&path).unwrap(), None);
+        fs::write(&path, b"Europe/Berlin\n").unwrap();
+        assert_eq!(
+            system_timezone_name(&path).unwrap().as_deref(),
+            Some("Europe/Berlin")
+        );
+        // One trailing newline is the file's, not the name's, and a file
+        // written without one names the same zone.
+        fs::write(&path, b"Europe/Berlin").unwrap();
+        assert_eq!(
+            system_timezone_name(&path).unwrap().as_deref(),
+            Some("Europe/Berlin")
+        );
+        // The shape `/etc/timezone` is destined to have: a reviewed link out
+        // to per-machine state. Before anything mints that state the link
+        // dangles, and a machine whose state has not been written yet has
+        // NOT been misconfigured — it has said nothing.
+        let dangling = root.join("dangling");
+        symlink(root.join("not-minted-yet"), &dangling).unwrap();
+        assert_eq!(system_timezone_name(&dangling).unwrap(), None);
+        // A link to a file that DOES exist is read through, so the state file
+        // is what names the zone once it is there.
+        let minted = root.join("minted");
+        fs::write(&minted, b"Etc/UTC\n").unwrap();
+        let link = root.join("link");
+        symlink(&minted, &link).unwrap();
+        assert_eq!(
+            system_timezone_name(&link).unwrap().as_deref(),
+            Some("Etc/UTC")
+        );
+        for malformed in [
+            &b""[..],
+            b"\n",
+            b"../../etc/shadow\n",
+            b"Europe/Berlin\nEurope/Paris\n",
+            b"Europe/Berlin\n\n",
+        ] {
+            fs::write(&path, malformed).unwrap();
+            assert!(
+                system_timezone_name(&path).is_err(),
+                "{malformed:?} was accepted as a zone name"
+            );
+        }
+        // Present but not a file at all is a refusal too, not an absence.
+        let directory = root.join("directory-timezone");
+        fs::create_dir(&directory).unwrap();
+        assert!(system_timezone_name(&directory).is_err());
+    }
+
+    /// The plan pins the file the rules are IN, not the name that reached it,
+    /// and a zone may not name anything outside the runtime's zoneinfo.
+    #[test]
+    fn a_zone_resolves_to_the_runtimes_own_file_and_cannot_leave_its_zoneinfo() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new("timezone-zoneinfo").unwrap();
+        let runtime = root.join("files");
+        let zoneinfo = runtime.join("share/zoneinfo");
+        fs::create_dir_all(zoneinfo.join("Europe")).unwrap();
+        fs::create_dir_all(zoneinfo.join("Etc")).unwrap();
+        fs::write(zoneinfo.join("Europe/Berlin"), b"TZif2 Berlin").unwrap();
+        fs::write(zoneinfo.join("Etc/UTC"), b"TZif2 UTC").unwrap();
+        // The name a person writes is routinely a link to the file that holds
+        // the rules, which is why resolution follows one.
+        symlink("Etc/UTC", zoneinfo.join("UTC")).unwrap();
+        let outside = root.join("outside-tzif");
+        fs::write(&outside, b"TZif2 outside").unwrap();
+        symlink(&outside, zoneinfo.join("Escape")).unwrap();
+        fs::write(zoneinfo.join("Bogus"), b"not a compiled zone").unwrap();
+        // The production caller hands over a canonical runtime, so the test
+        // does too rather than proving something about an uncanonical one.
+        let runtime = fs::canonicalize(&runtime).unwrap();
+        let named = root.join("timezone");
+        let resolve = |zone: &str| {
+            fs::write(&named, format!("{zone}\n")).unwrap();
+            resolve_timezone_at(&named, &runtime)
+        };
+
+        let berlin = fs::canonicalize(zoneinfo.join("Europe/Berlin")).unwrap();
+        let berlin_metadata = fs::symlink_metadata(&berlin).unwrap();
+        let resolved = resolve("Europe/Berlin").unwrap().unwrap();
+        assert_eq!(resolved.name, "Europe/Berlin");
+        assert_eq!(resolved.file.path, berlin);
+        assert_eq!(resolved.file.inode, berlin_metadata.ino());
+        assert_eq!(resolved.file.size, berlin_metadata.len());
+
+        // A link resolves to what it names, and the plan pins THAT file: the
+        // bind stage 2 reads back has the target's inode, not the link's.
+        let utc = fs::canonicalize(zoneinfo.join("Etc/UTC")).unwrap();
+        let resolved = resolve("UTC").unwrap().unwrap();
+        assert_eq!(resolved.name, "UTC");
+        assert_eq!(resolved.file.path, utc);
+        assert_eq!(
+            resolved.file.inode,
+            fs::symlink_metadata(&utc).unwrap().ino()
+        );
+
+        // Outside the tree, not a compiled zone, and not there at all.
+        assert!(resolve("Escape").is_err());
+        assert!(resolve("Bogus").is_err());
+        assert!(resolve("Europe/Nowhere").is_err());
+    }
+
+    /// A runtime with no zoneinfo can supply no zone. The DEFAULT is then a
+    /// bind-free launch — glibc's own UTC, which is exactly what the
+    /// application already had — and a zone somebody CHOSE is a refusal.
+    #[test]
+    fn an_unset_zone_never_asks_the_runtime_and_a_named_one_must_be_answered() {
+        let root = TestDirectory::new("timezone-bare-runtime").unwrap();
+        let runtime = root.join("files");
+        fs::create_dir(&runtime).unwrap();
+        let runtime = fs::canonicalize(&runtime).unwrap();
+        let named = root.join("timezone");
+        // No zone named: the runtime carries no zoneinfo and is never asked
+        // for one, so a launch on a minimal runtime is unaffected. This is
+        // the case EVERY launch takes until the writer for `/etc/timezone`
+        // lands, which is what makes this landing incapable of regressing a
+        // runtime this branch cannot boot.
+        assert!(resolve_timezone_at(&named, &runtime).unwrap().is_none());
+        // A named zone must be answerable, and `UTC` is not special: naming
+        // it is still a choice, and a runtime that cannot supply it is a
+        // refusal rather than a silent fall back to the same clock.
+        for chosen in [&b"UTC\n"[..], b"Europe/Berlin\n"] {
+            fs::write(&named, chosen).unwrap();
+            assert!(
+                resolve_timezone_at(&named, &runtime).is_err(),
+                "{chosen:?} resolved against a runtime with no zoneinfo"
+            );
+        }
+    }
+
+    /// The containment check covers the zoneinfo ROOT and not only the zone.
+    /// A runtime whose `share/zoneinfo` is a link out of the runtime would
+    /// otherwise make every zone name inside it a legal bind source.
+    #[test]
+    fn a_zoneinfo_that_leaves_the_runtime_is_refused_whole() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new("timezone-foreign-zoneinfo").unwrap();
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("zoneinfo")).unwrap();
+        fs::write(elsewhere.join("zoneinfo/UTC"), b"TZif2 UTC").unwrap();
+        let runtime = root.join("files");
+        fs::create_dir(&runtime).unwrap();
+        // The escape is through an INTERMEDIATE component. A link at
+        // `zoneinfo` itself is refused a step earlier, by
+        // `canonical_directory`'s own direct-directory rule, so a test built
+        // that way passes with the containment check deleted and proves
+        // nothing about it. A real `zoneinfo` reached through a linked
+        // `share` is the shape only `starts_with` catches.
+        symlink(&elsewhere, runtime.join("share")).unwrap();
+        let runtime = fs::canonicalize(&runtime).unwrap();
+        let named = root.join("timezone");
+        fs::write(&named, b"UTC\n").unwrap();
+        assert!(resolve_timezone_at(&named, &runtime).is_err());
     }
 
     #[test]
