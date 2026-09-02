@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use td_recipe::catalog;
 use td_recipe::types::{OstreePin, Recipe, SourcePin};
 
 use crate::check_runner::{
@@ -304,6 +305,61 @@ fn cold_vendor_jobs(root: &Path, graph: &[RecipeNode]) -> Vec<VendorJob> {
         }
     }
     jobs
+}
+
+/// Every `td-feed warm` argv that vendors a rust rung's locked dep closure in
+/// `target`'s graph, one TAB-joined argv per line (no field can contain a tab:
+/// they are pin basenames, hashes, repo-relative paths and recipe stems).
+///
+/// The derivation lives here because the recipe metadata does. `td-builder`
+/// does not depend on the catalog, so a warm it drove itself had to restate a
+/// rung's source pin, committed lock and stem -- fields it cannot keep honest,
+/// and whose drift nothing would notice until a recipe check failed for an
+/// apparently unrelated reason.
+///
+/// Unlike `cold_vendor_jobs` this reports EVERY rung with a lock, warm or not:
+/// td-feed skips a complete vendor itself, so a caller that decides nothing
+/// cannot disagree with what the recipes declare.
+pub fn vendor_warm_args_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    // Arity before the stem lookup: `vendor-warm-args a b` is a usage error, not
+    // a report that `a' is an unknown recipe.
+    if args.get(1).is_some() {
+        return Err("usage: vendor-warm-args [TARGET]".to_string());
+    }
+    for line in vendor_warm_args_for(args.first().map(String::as_str).unwrap_or(STEM))? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The lines `vendor_warm_args_cli` prints, so the derivation is testable
+/// without capturing stdout -- a CLI whose body is only reachable through
+/// `println!` can be gutted to `Ok(())` with the suite still green.
+fn vendor_warm_args_for(stem: &str) -> Result<Vec<String>, String> {
+    if catalog::lookup(stem).is_none() {
+        return Err(format!("unknown recipe stem '{stem}' (try `list`)"));
+    }
+    Ok(vendor_warm_lines(&recipe_closure(&[stem])?))
+}
+
+/// The printable form, split out so a test can assert the derivation without
+/// capturing stdout.
+fn vendor_warm_lines(graph: &[RecipeNode]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for node in graph {
+        if node.recipe.cargo_lock.is_none() {
+            continue;
+        }
+        match vendor_warm_args(&node.recipe, &node.stem) {
+            Ok(args) => lines.push(args.join("\t")),
+            Err(e) => eprintln!(
+                "   [warm] no warm command for {}'s crate closure ({e}) -- skipping it",
+                node.stem
+            ),
+        }
+    }
+    lines
 }
 
 /// td-feed's OWN completion predicate: the `.warm-complete` marker it renames
@@ -785,6 +841,100 @@ mod tests {
             vec!["warm", "crate", "coreutils", &version, "uutils"]
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The default target's graph derives a vendor warm for every rung that
+    /// declares a committed lock -- codex included.
+    ///
+    /// This is the property `td-builder check`'s prelude now depends on: it asks
+    /// for this list rather than restating it, so a rung that falls out of the
+    /// derivation silently stops being warmed, and `provision_auto_vendor`
+    /// reports it much later as a vendor dir that is simply absent.
+    #[test]
+    fn the_default_target_derives_a_vendor_warm_for_every_locked_rung() {
+        let graph = recipe_closure(&["system-x86-64"]).unwrap();
+        let locked: Vec<&str> = graph
+            .iter()
+            .filter(|node| node.recipe.cargo_lock.is_some())
+            .map(|node| node.stem.as_str())
+            .collect();
+        assert!(
+            locked.contains(&"codex"),
+            "codex declares a committed lock but is not in the default graph: {locked:?}"
+        );
+        let lines = vendor_warm_lines(&graph);
+        for stem in &locked {
+            assert!(
+                lines.iter().any(|line| line.ends_with(&format!("\t{stem}"))),
+                "no vendor warm derived for `{stem}': {lines:?}"
+            );
+        }
+        assert_eq!(
+            lines.len(),
+            locked.len(),
+            "every locked rung derives exactly one warm"
+        );
+    }
+
+    /// No derived field may contain the separator. Asserted BEFORE the join,
+    /// which is the only place it is still visible -- a tab inside a field
+    /// would silently shift every later field and make `vendor_dest` name the
+    /// wrong recipe.
+    #[test]
+    fn no_derived_vendor_warm_field_contains_the_separator() {
+        let graph = recipe_closure(&["system-x86-64"]).unwrap();
+        let mut seen = 0;
+        for node in &graph {
+            if node.recipe.cargo_lock.is_none() {
+                continue;
+            }
+            let args = vendor_warm_args(&node.recipe, &node.stem).unwrap();
+            for field in &args {
+                assert!(
+                    !field.contains('\t') && !field.contains('\n'),
+                    "{}: field `{field}' would break the line format",
+                    node.stem
+                );
+            }
+            seen += 1;
+        }
+        assert!(seen > 0, "no locked rung to check");
+    }
+
+    /// The entry point, not just the derivation behind it.
+    #[test]
+    fn the_vendor_warm_args_verb_checks_its_arguments_and_derives_lines() {
+        let lines = vendor_warm_args_for("system-x86-64").unwrap();
+        assert!(
+            lines.iter().any(|line| line.ends_with("\tcodex")),
+            "the default target derives no codex warm: {lines:?}"
+        );
+        assert!(vendor_warm_args_for("no-such-recipe-stem").is_err());
+        let two = [s("system-x86-64"), s("extra")];
+        assert!(vendor_warm_args_cli(&two).is_err(), "arity is unchecked");
+    }
+
+    /// The line format the prelude parses: TAB-joined, `warm` first, stem last.
+    #[test]
+    fn a_derived_vendor_warm_line_is_tab_joined_with_the_stem_last() {
+        let graph = recipe_closure(&["system-x86-64"]).unwrap();
+        let lines = vendor_warm_lines(&graph);
+        assert!(!lines.is_empty(), "the default graph derives no vendor warm");
+        for line in &lines {
+            let fields: Vec<&str> = line.split('\t').collect();
+            assert!(
+                fields.len() >= 3,
+                "`{line}' is too short to name a warm and a dest"
+            );
+            assert_eq!(fields.first(), Some(&"warm"), "`{line}' is not a warm argv");
+            assert!(
+                !line.contains('\n'),
+                "`{line}' would not survive line-based parsing"
+            );
+            for field in &fields {
+                assert!(!field.is_empty(), "`{line}' has an empty field");
+            }
+        }
     }
 
     #[test]

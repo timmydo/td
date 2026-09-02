@@ -1351,7 +1351,9 @@ fn heavy_warms(root: &Path) {
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
     // cargo build of feed/.
-    let Some(tdfeed) = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed")
+    let newstore = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed");
+    let Some(tdfeed) = newstore
+        .clone()
         .or_else(|| host_net_applet(root, "td-feed", None))
     else {
         eprintln!(
@@ -1390,14 +1392,11 @@ fn heavy_warms(root: &Path) {
     // Corpus crate warms are independent, but compiler memory is the limiting
     // resource on the hosts this scheduler protects.
     let warm_jobs = crate::check_memory::build_jobs().min(4);
-    let specs: [&[&str]; 9] = [
-        &["warm", "crate", "ripgrep", "14.1.1"],
+    let specs: [&[&str]; 6] = [
         &["warm", "crate", "sd", "1.0.0"],
-        &["warm", "crate", "fd-find", "10.2.0", "fd"],
         &["warm", "crate", "procs", "0.14.10"],
         &["warm", "crate", "eza", "0.21.6"],
         &["warm", "crate", "bat", "0.25.0"],
-        &["warm", "crate", "coreutils", "0.9.0", "uutils"],
         &["warm", "crate", "youki", "0.6.0"],
         &["warm", "crate", "uu_cat", "0.9.0", "cat"],
     ];
@@ -1431,6 +1430,218 @@ fn heavy_warms(root: &Path) {
         }
     }
     drain(&mut running);
+    warm_vendor_closures(root, &tdfeed, &envs, newstore.is_some(), warm_jobs);
+}
+
+/// Vendor the locked crate closure of every rust rung the recipe catalog
+/// declares a `Cargo.lock` for.
+///
+/// The catalog already derives these argvs (`vendor_warm_args`), but only two
+/// things drove them: the explicit `td-recipe-eval warm`, and
+/// `warm_operator_inputs`, which is gated on an INTERACTIVE stdin
+/// (`check_runner.rs`). `td-builder check` is neither, so under `check` nothing
+/// vendored codex's closure: `provision_auto_vendor` requires
+/// `crate-vendor/<stem>/vendor` whenever the committed lock has any registry
+/// package (`stage_verified_vendor`'s `allow_missing` is `registry == 0`), and
+/// codex's lock has 1189 -- so `recipe-check codex#1` failed on every fresh
+/// worktree, on unmodified main, for a reason no diff introduced.
+///
+/// The job list is ASKED FOR, not restated here: the pin, its hash, the
+/// committed lock and the stem are recipe data, and a second copy in the
+/// prelude is drift this file could not notice.
+fn warm_vendor_closures(
+    root: &Path,
+    tdfeed: &str,
+    envs: &[(String, String)],
+    tdfeed_from_newstore: bool,
+    warm_jobs: usize,
+) {
+    let Some(eval) = built_recipe_eval(root) else {
+        eprintln!(
+            "td-builder check: vendor warm (best-effort) skipped -- no built \
+             td-recipe-eval to derive the crate closures"
+        );
+        return;
+    };
+    let listing = warm_capture(
+        &[eval.display().to_string(), s("vendor-warm-args")],
+        root,
+        envs,
+    );
+    let jobs: Vec<Vec<String>> = listing
+        .lines()
+        .map(|line| line.split('\t').map(s).collect::<Vec<String>>())
+        .filter(|argv| argv.len() >= 3)
+        .collect();
+    if jobs.is_empty() {
+        // warm_capture returns "" for a failed spawn, a non-zero exit and an
+        // empty listing alike, and discards the child's stderr -- so name all
+        // three rather than blame the recipes for a stale evaluator.
+        eprintln!(
+            "td-builder check: vendor warm (best-effort) skipped -- \
+             `{} vendor-warm-args' printed nothing, or could not run (an \
+             evaluator predating the verb reports it as unknown)",
+            eval.display()
+        );
+        return;
+    }
+    let cold = run_vendor_warms(root, tdfeed, envs, &jobs, warm_jobs);
+    if cold.is_empty() {
+        return;
+    }
+    // Retry only what a DIFFERENT binary could plausibly fix: a warm that
+    // rejected the verb exits non-zero. A clean exit that left no marker is
+    // td-feed declining on purpose (an absent pinned archive), and 124 is the
+    // timeout -- neither is helped by rebuilding feed/ and spending a second
+    // budget on it.
+    let retry: Vec<Vec<String>> = cold
+        .iter()
+        .filter(|c| c.code.is_some_and(|code| code != 0 && code != 124))
+        .map(|c| c.job.clone())
+        .collect();
+    // A stale newstore td-feed predates the `crate-source` verb and rejects it,
+    // exiting non-zero without writing a vendor dir. Same shape as the
+    // kernel-headers seed (issue #546): build the source `feed/` once and retry
+    // only what is still absent. A source build already IS this tree, so a
+    // non-newstore pick has nothing better to retry with.
+    if retry.is_empty() || !tdfeed_from_newstore {
+        report_cold_vendors(&cold, "");
+        return;
+    }
+    let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
+    let Some(fresh) = host_net_applet(root, "td-feed", deadline) else {
+        report_cold_vendors(&cold, " and no source-built td-feed to retry with");
+        return;
+    };
+    let still = run_vendor_warms(root, &fresh.display().to_string(), envs, &retry, warm_jobs);
+    report_cold_vendors(&still, " after retry");
+}
+
+/// Run each warm argv, `warm_jobs` at a time, and return the ones whose vendor
+/// is still not COMPLETE afterwards. Re-surveys rather than trusting the exit
+/// status, like `warm_kernel_headers_seed`: a warm can exit 0 and still leave
+/// nothing the consumer accepts.
+fn run_vendor_warms(
+    root: &Path,
+    tdfeed: &str,
+    envs: &[(String, String)],
+    jobs: &[Vec<String>],
+    warm_jobs: usize,
+) -> Vec<ColdVendor> {
+    let mut codes: Vec<(String, Option<i32>)> = Vec::new();
+    let mut running: Vec<(std::process::Child, Vec<String>)> = Vec::new();
+    let drain = |running: &mut Vec<(std::process::Child, Vec<String>)>,
+                 codes: &mut Vec<(String, Option<i32>)>| {
+        for (mut child, argv) in running.drain(..) {
+            let status = child.wait().ok();
+            let code = status.and_then(|st| st.code());
+            if !status.is_some_and(|st| st.success()) {
+                eprintln!(
+                    "td-builder check: vendor warm (best-effort) failed/timed out \
+                     (raise TD_WARM_TIMEOUT if the closure is large): {}",
+                    argv.join(" ")
+                );
+            }
+            codes.push((vendor_dest(&argv).to_string(), code));
+        }
+    };
+    for job in jobs {
+        let mut argv = vec![tdfeed.to_string()];
+        argv.extend(job.iter().cloned());
+        let wrapped = warm_argv(&argv);
+        if let Some(child) = spawn_argv(&wrapped, root, envs) {
+            running.push((child, argv));
+        } else {
+            eprintln!(
+                "td-builder check: vendor warm (best-effort) could not spawn: {}",
+                argv.join(" ")
+            );
+            codes.push((vendor_dest(job).to_string(), None));
+        }
+        if running.len() >= warm_jobs.max(1) {
+            drain(&mut running, &mut codes);
+        }
+    }
+    drain(&mut running, &mut codes);
+    jobs.iter()
+        .filter(|job| !vendor_is_complete(root, vendor_dest(job)))
+        .map(|job| ColdVendor {
+            code: codes
+                .iter()
+                .find(|(dest, _)| dest == vendor_dest(job))
+                .and_then(|(_, code)| *code),
+            job: job.clone(),
+        })
+        .collect()
+}
+
+/// A vendor that is still not complete, with the exit status of the warm that
+/// was supposed to fill it -- the two together are what decide a retry.
+struct ColdVendor {
+    job: Vec<String>,
+    code: Option<i32>,
+}
+
+fn report_cold_vendors(cold: &[ColdVendor], suffix: &str) {
+    for c in cold {
+        eprintln!(
+            "td-builder check: crate vendor for {} still incomplete{suffix} -- the \
+             recipe check will report it",
+            vendor_dest(&c.job)
+        );
+    }
+}
+
+/// The recipe stem a vendor warm targets: the last field of every
+/// `warm crate`/`crate-local`/`crate-source` argv the catalog derives.
+fn vendor_dest(job: &[String]) -> &str {
+    job.last().map(String::as_str).unwrap_or("?")
+}
+
+/// td-feed's own completion predicate -- the marker it renames in only once the
+/// whole locked closure is published. Anything weaker reads an interrupted warm
+/// as done, which is what `provision_auto_vendor` then rejects.
+fn vendor_is_complete(root: &Path, dest: &str) -> bool {
+    root.join(".td-build-cache/crate-vendor")
+        .join(dest)
+        .join("vendor")
+        .join(".warm-complete")
+        .is_file()
+}
+
+/// An already-built `td-recipe-eval`, WITHOUT building one: the operator
+/// override, else the workspace binary `provision_userland` built earlier in
+/// this same run, else the cargo-less host's sentinel.
+///
+/// Deliberately no `cargo` fallback. `bootstrap::recipe_source_pins_output`
+/// has one, and it compiles the recipes crate into a target dir of its own --
+/// a second full build tree, unbounded and unarmed, which a best-effort warm
+/// cannot afford. By this point `provision_userland` has already built the
+/// evaluator this run, so there is one to find.
+fn built_recipe_eval(root: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let executable = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if let Some(v) = std::env::var_os("TD_RECIPE_EVAL") {
+        let p = PathBuf::from(v);
+        if executable(&p) {
+            return Some(p);
+        }
+    }
+    let built = root.join("target/release/td-recipe-eval");
+    if executable(&built) {
+        return Some(built);
+    }
+    let sentinel = root.join(".td-build-cache/recipe-eval/recipe-eval-path");
+    let path = PathBuf::from(
+        std::fs::read_to_string(&sentinel)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default(),
+    );
+    executable(&path).then_some(path)
 }
 
 /// The daemon's runtime dir (sockets, pid files, lineage records):

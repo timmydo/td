@@ -32,6 +32,10 @@
 //!   application-closure TARGET
 //!                         build an application and prove its compiled full-path
 //!                         runtime edge through the registered store closure
+//!   vendor-warm-args [TARGET]
+//!                         print the `td-feed warm ...` argv that vendors each
+//!                         locked rung of TARGET's graph, one tab-separated
+//!                         argv per line (the recipe stem last)
 //!   source-pins           print recipe-owned fixed-output source pins as:
 //!                         <key>\t<url>\t<sha256>\t<file>
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
@@ -339,6 +343,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("vendor-warm-args") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = warm::vendor_warm_args_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("source-pins") => {
             if args.get(2).is_some() {
                 die("usage: source-pins");
@@ -387,7 +397,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|warm|verify-store|payload-closure|application-closure|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
     }
 }
 
