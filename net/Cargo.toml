@@ -3,9 +3,10 @@ name = "td-net"
 version = "0.1.0"
 edition = "2021"
 
-# The engine root `exclude`s net, but that only stops cargo at THAT manifest.
+# The engine root carries no `exclude` list and never needed one: an `exclude`
+# stops cargo only at THAT manifest.
 # From a nested checkout (`.claude/worktrees/*` lives physically under the main
-# checkout) cargo walks past the excluding root and is captured by the OUTER
+# checkout) cargo walks past this repo's root manifest and is captured by the OUTER
 # manifest. An explicit empty `[workspace]` pins THIS as the root and stops the
 # walk — without it the host-prep warm's `cargo build` in net/ fails from a
 # worktree. Same reason td-sh carries one.

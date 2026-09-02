@@ -5,9 +5,10 @@ edition = "2021"
 description = "td's minimal static network bring-up daemon: link-up + DHCP + resolv.conf, a confined single-ioctl surface"
 license = "GPL-3.0-or-later"
 
-# Own workspace root. The engine root manifest lists this crate in `exclude` (so
-# its lock never mixes into the dependency-free engine lock), but that exclude only
-# stops cargo at that manifest — from a nested checkout (e.g. .claude/worktrees/*,
+# Own workspace root. The engine root manifest carries no `exclude` list, and
+# never needed one: an `exclude` stops cargo only at that manifest, and this
+# crate's lock must never mix into the dependency-free engine lock. From a
+# nested checkout (e.g. .claude/worktrees/*,
 # which lives physically under the main checkout) cargo would keep walking up and
 # be captured by the outer manifest, which lists neither member nor exclude for the
 # nested path. An explicit empty `[workspace]` pins THIS as the root and stops the

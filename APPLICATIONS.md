@@ -6384,9 +6384,9 @@ packaged selftest, boot oracle — with **network never in the gate**.
    routed portal exchanges, not that Firefox made them.
 7. **Recipe tests**: every new crate — `td-jail`, `td-busd`, `td-portal`,
    `td-audio` —
-   stays a one-package dependency-free crate and joins BOTH
-   `DEPENDENCY_FREE_LOCKS` and `CARGO_TEST_CMDS` in
-   `builder/src/affected.rs`, or its lints and tests never run; the
+   stays a one-package dependency-free crate and is picked up by
+   `builder/src/affected.rs`'s tree-derived gate roster — which happens by
+   existing as a `td-*/Cargo.toml`, with its `Cargo.lock` committed; the
    kernel config contains every required option; the real system-image launch
    needs no installation or package fetch; packages are read-only in the jail;
    host sentinel paths are absent; and no separately injected test executable
@@ -8081,17 +8081,36 @@ an undocumented environment variable or a portal required before first paint,
 that is the finding; the package inspection is not allowed to predeclare the
 execution result.
 
-**The new-crate de-collision.** Adding a crate touches three central
-tables, and every one is a line four agents will edit at once:
+**The new-crate de-collision.** Adding a crate used to touch three
+central tables, and every one was a line four agents would edit at once.
+Two are gone; the third is a standing instruction:
 
-1. `builder/src/affected.rs` — `DEPENDENCY_FREE_LOCKS` and
-   `CARGO_TEST_CMDS` carry **hardcoded array lengths**. Every new crate
-   adds a row and changes the length, so every pair of agents conflicts
-   on both. Deriving the lengths removes the count line; it does not
-   remove the row, so the real fix is **self-registration** — a crate
-   declares itself and the tables are built from what is present.
-2. `Cargo.toml`'s `exclude` is **one line** holding every target crate.
-   Reformat it one entry per line.
+1. `builder/src/affected.rs` — **LANDED**: `DEPENDENCY_FREE_LOCKS` and
+   `CARGO_TEST_CMDS` were two hand-written copies of one crate set, each
+   carrying a hardcoded array length, so every pair of agents conflicted
+   on the row AND on the count. Both are now derived from the tree: a
+   crate joins the gate by existing as a `td-*/Cargo.toml` at the repo
+   root, and declares any non-default gating in its own
+   `[package.metadata.td-gate]`. Deriving the lengths alone would have
+   removed the count and kept the row; self-registration removes both.
+   Selection is derived too, not just the roster: a path inside a
+   discovered crate reaches the preflight that compiles it, so a branch
+   adding only a new crate does not skip its own lock guard, tests and
+   lints. **One copy is left**: `builder/src/gate_defs/325-cargo-test.rs`
+   still hand-lists the crate set, and is already three crates stale
+   (`td-jail`, `td-portal`, `td-profiler`). It causes no live coverage
+   loss — that gate degrades to an Unprovisioned SKIP and this preflight
+   is the tier that runs — but until it derives from the same roster,
+   "adding a crate edits nothing central" is true of the preflight and
+   not yet of the whole tree.
+2. `Cargo.toml`'s `exclude` — **LANDED**, and by deletion rather than the
+   reformat this section asked for. Every standalone crate already
+   carried its own empty `[workspace]` table, which is what actually
+   stops cargo's upward walk, so the list was doing nothing: `td-portal`
+   and `td-login` were absent from it and built correctly anyway.
+   Removing it leaves the workspace member set byte-identical and leaves
+   no line to collide on, which one entry per line would only have
+   narrowed.
 3. `recipes/src/recipes/system-x86-64.rs` is over 7000 lines and everything
    touches it. Do not touch it during development: each component gets
    its own `td-<name>-test.rs` recipe and is tested without the image,

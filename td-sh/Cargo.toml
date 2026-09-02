@@ -31,14 +31,15 @@ name = "td_sh"
 path = "src/lib.rs"
 
 # td-sh is a TARGET-built program, NOT part of the control-plane engine workspace.
-# It is standalone (workspace `exclude`) with its own one-self-entry Cargo.lock, so
+# It is standalone — its own workspace root — with its own one-self-entry lock, so
 # the engine's 3-package lock gate never inspects it. Zero external dependencies
 # (pure std) — a POSIX sh is a thin layer over exactly the OS services std wraps,
 # and std is the pinned toolchain, not a cargo dep (AGENTS.md "std, not no_std").
 #
-# The engine root `exclude`s td-sh, but that only stops cargo at THAT manifest.
+# The engine root carries no `exclude` list and never needed one: an `exclude`
+# stops cargo only at THAT manifest.
 # From a nested checkout (.claude/worktrees/* lives physically under the main
-# checkout) cargo walks past the excluding root and is captured by the OUTER
+# checkout) cargo walks past this repo's root manifest and is captured by the OUTER
 # manifest, which lists the nested path as neither member nor exclude. An explicit
 # empty `[workspace]` pins THIS as the root and stops the walk, so `cargo
 # clippy/test` behave identically from the main checkout or a worktree (mirrors

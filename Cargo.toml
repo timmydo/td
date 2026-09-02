@@ -3,62 +3,33 @@
 # root so the shared JSON + SHA-256 code lives in exactly one place and the two
 # bins pull it as a path dependency — no third diverged copy.
 #
-# The other crates in this repo stay OUT of the workspace and build standalone:
-#   net/            — the network tools (td-net); the ONLY crates allowed
-#                     external deps (ureq/rustls/sha2/ring), so their vendored
-#                     closure must not mix into the engine's dependency-free lock.
-#   td-kexec/       — a target-side guest helper, deliberately outside the
-#                     builder/recipes trust boundary (its own confined unsafe).
-#   td-jail/        — the target-side application confinement boundary; its
-#                     raw-syscall surface is confined and recorded in UNSAFE.md.
-#   td-sh/          — the target-built POSIX /bin/sh (busybox-sh replacement),
-#                     a standalone std-only crate like td-kexec: the shipped
-#                     binary is src/main.rs compiled directly by rustc, and its
-#                     conformance harness (src/lib.rs) is host-side test tooling.
-#   td-netd/        — a target-side network bring-up daemon, likewise outside the
-#                     engine trust boundary (its own confined single-ioctl unsafe).
-#   td-boot/        — the target-side verified deployment selector and boot
-#                     shim; pure std, sharing the engine SHA-256, SHA-512
-#                     and ed25519 sources.
-#   td-txt/         — the target-built static TEXT multicall (grep, sed): the
-#                     two applets uutils does not provide and busybox still
-#                     owns on the image, plus the host-side conformance harness
-#                     that scores them against the vendored GNU corpora.
-#   td-util/        — the target-built static diagnostics multicall (clear,
-#                     which, free, ps, dmesg): the busybox applets uutils does
-#                     not provide, in pure safe std with no syscall surface.
-#   td-init/        — the target-built static boot-glue multicall (init, reboot,
-#                     poweroff, halt, switch_root, cttyhack, hostname): td-util's
-#                     complement, the applets that DO need raw syscalls, with its
-#                     own confined eight-syscall unsafe surface.
-#   td-firstboot/   — the target-built static per-machine identity provisioner
-#                     (machine-id, SSH host key, deny-all authorized_keys under
-#                     /var/lib/td, which the image's read-only /etc reaches
-#                     through one reviewed symlink each). Pure safe std: it
-#                     delegates Ed25519 generation to OpenSSH `ssh-keygen` and
-#                     reads its entropy from /dev/random as an ordinary file.
-#   td-busd/        — the target-built session D-Bus broker: the wire codec, and
-#                     eventually the socket, auth and per-connection policy that
-#                     APPLICATIONS.md §D specifies. Pure std with no syscall
-#                     surface until its reviewed transport surface lands.
-#   td-seatd/       — the target-built single-user framebuffer/evdev seat
-#                     assigner; pure safe std with no broker daemon.
-#   td-compositor/  — the target-built software Wayland compositor; its only
-#                     unsafe is the confined SCM_RIGHTS syscall layer.
-#   td-profiler/    — the target-built continuous system profiler and offline
-#                     report generator; dependency-free, with its perf/ring
-#                     syscall surface confined and recorded in UNSAFE.md.
-#   td-install/     — the disk installer: GPT + the FAT32 EFI System Partition
-#                     + the td volume, onto a block device or a regular file.
-#                     Pure std, sharing the engine GPT/FAT32/CRC-32 writers and
-#                     td-boot's on-disk protocol so the layout is stated once.
-#   td-review/      — a HOST-side integrator utility (branch review + squash
-#                     landing TUI). In neither bootstrap graph: it is not a
-#                     control-plane build program and never enters a closure.
+# The other crates in this repo stay OUT of the workspace and build standalone.
+# There is no `exclude` list: each of them carries its own empty `[workspace]`
+# table, which is what actually pins it as its own root and stops cargo's upward
+# walk from a nested checkout (.claude/worktrees/* lives physically under the
+# main checkout). An `exclude` here only stops cargo at THIS manifest, so the
+# list was redundant — `td-portal` and `td-login` were never in it and always
+# built correctly. Removing it also removes a line every agent adding a crate
+# would have edited at once (APPLICATIONS.md §V.0).
+#
+# Each standalone crate states its own reason for being outside the workspace in
+# its own manifest, which is where a reader adding one will be. Two that are not
+# obvious from a crate name:
+#   net/       — the network tools (td-net); the ONLY crates allowed external
+#                deps (ureq/rustls/sha2/ring), so their vendored closure must
+#                not mix into the engine's dependency-free lock. It is
+#                deliberately NOT `td-`-prefixed: that prefix is what
+#                builder/src/affected.rs discovers as a dependency-free crate.
+#   td-review/ — a HOST-side integrator utility (branch review + squash landing
+#                TUI). In neither bootstrap graph: it is not a control-plane
+#                build program and never enters a closure.
+
 [workspace]
 resolver = "2"
+# Keep this array on ONE line: builder/src/affected.rs reads it to derive the
+# workspace lock's expected package count, and refuses a members list that
+# does not close on its own line rather than guessing at a count.
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-jail", "td-busd", "td-sh", "td-txt", "td-netd", "td-boot", "td-install", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-profiler", "td-review", "td-svc"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

@@ -5,8 +5,9 @@ edition = "2021"
 description = "td's disk installer: GPT, the EFI System Partition, and the td volume"
 license = "GPL-3.0-or-later"
 
-# Own workspace root, for td-boot's reason: the engine root manifest excludes this
-# crate, but that exclude only stops cargo at that manifest — from a nested checkout
+# Own workspace root, for td-boot's reason: the engine root manifest carries no
+# `exclude` list, and an `exclude` would stop cargo only at that manifest. From
+# a nested checkout
 # (.claude/worktrees/*, which lives physically under the main checkout) cargo would
 # keep walking up and be captured by the outer manifest, which lists neither member
 # nor exclude for the nested path. An explicit empty `[workspace]` pins THIS as the

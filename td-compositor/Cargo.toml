@@ -5,6 +5,10 @@ edition = "2021"
 description = "Software-rendered minimal Wayland compositor for td"
 license = "GPL-3.0-or-later"
 
+# How builder/src/affected.rs gates this crate; absent keys take the defaults.
+[package.metadata.td-gate]
+clippy-all-targets = true
+
 [[bin]]
 name = "td-compositor"
 path = "src/main.rs"

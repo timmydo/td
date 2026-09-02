@@ -428,7 +428,7 @@ pub fn main(args: &[String]) -> ExitCode {
     // config would otherwise hide the very files this is here to catch, and it
     // expands directories the default collapses to one entry. `-z` because
     // porcelain v1 QUOTES a path with a space in it, and a quoted path is not
-    // the path `selects_checks` would be asked about.
+    // the path `blocking_untracked` would be asked about.
     let Some(status) = git_try(
         &root,
         &["status", "--porcelain", "-z", "--untracked-files=all"],
@@ -453,10 +453,7 @@ pub fn main(args: &[String]) -> ExitCode {
         .iter()
         .filter_map(|l| l.strip_prefix("?? "))
         .collect();
-    let blocking: Vec<&&str> = untracked
-        .iter()
-        .filter(|p| affected::selects_checks(&root, p))
-        .collect();
+    let blocking: Vec<&str> = affected::blocking_untracked(&root, &untracked);
 
     let Some(rev_list) = git_try(&root, &["rev-list", "--reverse", &format!("{base}..HEAD")])
     else {

@@ -274,9 +274,15 @@ message.
   Target crates and `td-review` are standalone one-package locks. The `td-net`
   multicall is the sole external-dependency tier and may use only its existing
   reviewed vendored closure. Any new dependency needs principle-2 sign-off.
-- A new standalone crate must join both `DEPENDENCY_FREE_LOCKS` and the cargo
-  test/clippy commands in `builder/src/affected.rs`; otherwise the gate does not
-  compile it.
+- A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`
+  discovers every `td-*/Cargo.toml` at the repo root and derives both the
+  dependency-free lock roster and the cargo test/clippy commands from it. Commit
+  the crate's `Cargo.lock` or the gate reds. A crate wanting non-default gating
+  declares it in its own `[package.metadata.td-gate]`; a crate that cannot wear
+  the `td-` prefix is an amendment to that discovery rule.
+  `builder/src/gate_defs/325-cargo-test.rs` still hand-lists the same set and
+  has not been converted, so a crate added today is gated by the preflight that
+  runs and absent from that non-running gate's script.
 - Use `std`, not `no_std`. Allocate buffers and collections outside hot loops
   where practical. Keep comments terse and explain a non-obvious why; design
   rationale and review history belong in the commit message or normative doc.

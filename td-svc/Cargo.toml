@@ -5,15 +5,20 @@ edition = "2021"
 description = "Static dependency-free service supervisor for td (ordering, backoff, log capture, shutdown)"
 license = "GPL-3.0-or-later"
 
+# How builder/src/affected.rs gates this crate; absent keys take the defaults.
+[package.metadata.td-gate]
+clippy-all-targets = true
+
 [[bin]]
 name = "td-svc"
 path = "src/main.rs"
 
-# The engine root `exclude`s td-svc, but that only stops cargo at THAT manifest.
+# The engine root carries no `exclude` list and never needed one: an `exclude`
+# stops cargo only at THAT manifest.
 # From a nested checkout (`.claude/worktrees/*` lives physically under the main
-# checkout) cargo walks past the excluding root and is captured by the OUTER
+# checkout) cargo walks past this repo's root manifest and is captured by the OUTER
 # manifest. An explicit empty `[workspace]` pins THIS as the root and stops the
-# walk, and is what actually makes this crate standalone — the exclude entry
+# walk, and is what actually makes this crate standalone — a root `exclude` entry
 # only keeps the root's inventory honest. Same reason td-sh/td-util/td-init/
 # td-login carry one.
 [workspace]

@@ -23,14 +23,15 @@ name = "td_txt"
 path = "src/lib.rs"
 
 # td-txt is a TARGET-built program, NOT part of the control-plane engine
-# workspace. It is standalone (workspace `exclude`) with its own one-self-entry
+# workspace. It is standalone — its own workspace root — with its own one-self-entry
 # Cargo.lock, so the engine's 3-package lock gate never inspects it. Zero
 # external dependencies (pure std) — a grep/sed is a regex engine plus line I/O,
 # both of which std covers.
 #
-# The engine root `exclude`s td-txt, but that only stops cargo at THAT manifest.
+# The engine root carries no `exclude` list and never needed one: an `exclude`
+# stops cargo only at THAT manifest.
 # From a nested checkout (.claude/worktrees/* lives physically under the main
-# checkout) cargo walks past the excluding root and is captured by the OUTER
+# checkout) cargo walks past this repo's root manifest and is captured by the OUTER
 # manifest, which lists the nested path as neither member nor exclude. An
 # explicit empty `[workspace]` pins THIS as the root and stops the walk (mirrors
 # td-sh/td-kexec/td-netd).

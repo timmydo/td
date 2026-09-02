@@ -5,6 +5,13 @@ edition = "2021"
 description = "Host-side integrator TUI: review branches against main, squash-land them, push to every remote"
 license = "GPL-3.0-or-later"
 
+# How builder/src/affected.rs gates this crate; absent keys take the defaults.
+# The App-level tests drive a real git repo and are `#[ignore]`d so the
+# git-less sandbox gate stays honest — this preflight is their only tier.
+[package.metadata.td-gate]
+clippy-all-targets = true
+test-args = "--include-ignored"
+
 # Own workspace root, so cargo behaves the same from the main checkout as from a
 # worktree nested under it.
 [workspace]

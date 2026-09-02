@@ -9,9 +9,10 @@ license = "GPL-3.0-or-later"
 name = "td-init"
 path = "src/main.rs"
 
-# The engine root `exclude`s td-init, but that only stops cargo at THAT manifest.
+# The engine root carries no `exclude` list and never needed one: an `exclude`
+# stops cargo only at THAT manifest.
 # From a nested checkout (`.claude/worktrees/*` lives physically under the main
-# checkout) cargo walks past the excluding root and is captured by the OUTER
+# checkout) cargo walks past this repo's root manifest and is captured by the OUTER
 # manifest. An explicit empty `[workspace]` pins THIS as the root and stops the
 # walk. Same reason td-sh/td-util carry one.
 [workspace]

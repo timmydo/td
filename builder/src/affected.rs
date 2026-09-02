@@ -554,7 +554,7 @@ fn add_chain_targets(sel: &mut Selection) {
 // map_path — the `case` ladder, arm-for-arm with the shell (first match wins).
 // ---------------------------------------------------------------------------
 
-fn map_path(root: &Path, p: &str, sel: &mut Selection) {
+fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: &mut Selection) {
     // Ignored local metadata. `target/*` is the shared workspace build dir
     // (builder/recipes/engine); `*` crosses `/`, so this covers target/release/…
     if pattern_matches(".claude/*|.td-build-cache/*|target/*", p) {
@@ -1379,6 +1379,45 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // A path inside a crate the roster DISCOVERED, that no arm above maps: the
+    // crate is new. Deriving the roster is only half of "a crate joins the gate
+    // by existing" — the other half is being SELECTED. Without this the roster
+    // would carry the crate while a branch touching only that crate never ran
+    // the commands that compile it, so its lock guard, tests and clippy would
+    // be listed and never executed. The targets stay the catch-all's: which
+    // recipe embeds a new crate, if any, is exactly what an author still has to
+    // say, and the note keeps asking them to.
+    match roster {
+        Ok(crates) => {
+            let mine = crates.iter().find(|c| {
+                // The separator matters: `td-shell/x` is not `td-sh/x`.
+                p.starts_with(&c.name) && p.as_bytes().get(c.name.len()) == Some(&b'/')
+            });
+            if let Some(krate) = mine.map(|c| c.name.as_str()) {
+                sel.add_preflight("cargo-test");
+                sel.add_target("check");
+                // Deliberately NOT the "No mapping for" wording: that
+                // prefix is how `selects_checks_with` tells a mapped path
+                // from scratch, and an untracked file in a new crate DOES
+                // route to a real check now. Calling it unmapped would let
+                // `ready` wave it through as a scratch note.
+                sel.add_note(&format!(
+                    "{p} is in discovered crate {krate} — running its cargo-test \
+                     preflight and the full check. Add a mapping in \
+                     builder/src/affected.rs for a narrower answer."
+                ));
+                return;
+            }
+        }
+        // Never in silence: the fallback below is still the whole behavioural
+        // tier, but it is NOT the preflight, and a reader has to be told which
+        // answer they got.
+        Err(e) => sel.add_note(&format!(
+            "the gate roster could not be read ({e}) — no cargo-test preflight \
+             was selected for {p}"
+        )),
+    }
+
     // Catch-all: an unmapped path used to require the FULL loop; it now runs
     // the whole behavioral tier — there is no narrower honest answer.
     sel.add_target("check");
@@ -1392,14 +1431,20 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 // Rendering — byte-for-byte with the shell's stdout.
 // ---------------------------------------------------------------------------
 
-fn preflight_cmd(name: &str, changed: &[String]) -> Option<String> {
+fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> {
     match name {
         "shell-syntax" => Some("  bash -n start tests/*.sh ci/*.sh tools/*.sh".to_string()),
         "start-bootstrap" => Some("  bash tests/start.sh".to_string()),
         "heal-revert" => Some("  bash tests/heal-revert.sh".to_string()),
         // Rendered from the SAME list that runs, so a scoped run cannot print a
         // command it will not issue — the dry run is what a reader trusts.
-        "cargo-test" => Some(render_cargo_test(&cargo_test_cmds(changed))),
+        "cargo-test" => match cargo_test_cmds(root, changed) {
+            Ok(cmds) => Some(render_cargo_test(&cmds)),
+            // A dry run must not print a command set it could not compute. The
+            // render is what a reader trusts, so an unreadable roster says so
+            // here rather than quietly advertising a narrower run.
+            Err(e) => Some(format!("  cargo-test: UNAVAILABLE — {e}")),
+        },
         "net-test" => {
             Some("  CC=gcc cargo test --frozen --manifest-path net/Cargo.toml".to_string())
         }
@@ -1411,7 +1456,7 @@ fn preflight_cmd(name: &str, changed: &[String]) -> Option<String> {
 
 /// The one-line summary of a cargo-test command set: the historical wording,
 /// with the manifests it will actually visit.
-fn render_cargo_test(cmds: &[&str]) -> String {
+fn render_cargo_test(cmds: &[String]) -> String {
     let workspace = cmds.iter().any(|c| c.contains("--workspace"));
     let mut o = String::from("  cargo test + clippy --frozen");
     if workspace {
@@ -1428,17 +1473,29 @@ fn render_cargo_test(cmds: &[&str]) -> String {
                 o.push_str(" --manifest-path ");
                 o.push_str(krate);
                 o.push_str("/Cargo.toml");
+                // Beside the crate that DECLARED them. The old wording appended
+                // the args once at the end of the whole line, which read
+                // correctly only while the one crate that has them sorted last;
+                // over a derived roster that spelling names whichever crate
+                // happens to be final instead. `--all-targets` stays
+                // unrendered, as it always was: this line summarises which
+                // manifests are visited, and clippy flags do not change that.
+                if let Some(args) = declared_test_args(cmds, krate) {
+                    o.push_str(" -- ");
+                    o.push_str(args);
+                }
             }
         }
     }
-    // ANY, not all — as the full-table wording always was. The line is a
-    // summary of a command set, not a per-crate transcript, and the same
-    // approximation already covers `--all-targets`/`--bins` differing per
-    // entry.
-    if cmds.iter().any(|c| c.contains("--include-ignored")) {
-        o.push_str(" -- --include-ignored");
-    }
     o
+}
+
+/// The `--` suffix of `krate`'s own `cargo test` command, if it declared one.
+fn declared_test_args<'a>(cmds: &'a [String], krate: &str) -> Option<&'a str> {
+    cmds.iter()
+        .find(|c| c.starts_with("cargo test ") && cmd_manifest_crate(c) == Some(krate))?
+        .split_once(" -- ")
+        .map(|(_, args)| args)
 }
 
 struct Header<'a> {
@@ -1449,7 +1506,13 @@ struct Header<'a> {
 
 /// Produce the full dry-run stdout (the text the shell prints before executing),
 /// including the trailing "Dry run only" note when `run` is false.
-fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool) -> String {
+fn format_output(
+    root: &Path,
+    header: &Header,
+    changed: &[String],
+    sel: &Selection,
+    run: bool,
+) -> String {
     let mut o = String::new();
     if header.explicit {
         o.push_str("affected-checks: explicit path mode\n");
@@ -1471,7 +1534,7 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     } else {
         o.push_str("Selected checks:\n");
         for pre in &sel.preflights {
-            if let Some(cmd) = preflight_cmd(pre, changed) {
+            if let Some(cmd) = preflight_cmd(root, pre, changed) {
                 o.push_str(&cmd);
                 o.push('\n');
             }
@@ -1505,12 +1568,34 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     o
 }
 
-/// Whether this path routes to any check at all — the question `ready` asks of
-/// an UNTRACKED file, which the committed-only checks do not see but a compile
-/// does. Asking the real mapping beats guessing by extension.
-pub(crate) fn selects_checks(root: &Path, path: &str) -> bool {
+/// The untracked paths that route to a real check, with the roster read ONCE.
+///
+/// `ready` asks this of every untracked file, which the committed-only checks
+/// do not see but a compile does. The roster is hoisted out of the filter
+/// rather than re-scanning the tree and re-parsing every manifest per path
+/// (AGENTS.md, 'Rust code': keep work out of hot loops), and an empty list
+/// scans nothing at all.
+pub(crate) fn blocking_untracked<'a>(root: &Path, paths: &[&'a str]) -> Vec<&'a str> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let roster = discover_gate_crates(root);
+    paths
+        .iter()
+        .copied()
+        .filter(|p| selects_checks_with(root, &roster, p))
+        .collect()
+}
+
+/// Whether ONE path routes to any check at all. Asking the real mapping beats
+/// guessing by extension.
+fn selects_checks_with(
+    root: &Path,
+    roster: &Result<Vec<GateCrate>, String>,
+    path: &str,
+) -> bool {
     let mut sel = Selection::default();
-    map_path(root, path, &mut sel);
+    map_path(root, roster, path, &mut sel);
     // The catch-all arm adds `check` to EVERY unmapped path, so "selected
     // something" is true of any file at all — scratch notes included. The note
     // it leaves behind is what tells a mapped path from an unmapped one, and
@@ -1521,9 +1606,14 @@ pub(crate) fn selects_checks(root: &Path, path: &str) -> bool {
 
 fn compute_selection(root: &Path, changed: &[String]) -> Selection {
     let mut sel = Selection::default();
+    // Resolved ONCE for the whole diff: the new-crate arm would otherwise
+    // re-scan the tree for every unmapped path (AGENTS.md, 'Rust code': keep
+    // work out of hot loops), and two scans in one run could disagree about
+    // which crates exist.
+    let roster = discover_gate_crates(root);
     for p in changed {
         if !p.is_empty() {
-            map_path(root, p, &mut sel);
+            map_path(root, &roster, p, &mut sel);
         }
     }
     sel
@@ -1561,7 +1651,7 @@ fn path_output(root: &Path, path: &str) -> String {
         base: "origin/main",
         merge_base: "",
     };
-    format_output(&header, &changed, &sel, false)
+    format_output(root, &header, &changed, &sel, false)
 }
 
 /// The command that runs `targets`, printed VERBATIM as `--run` executes it.
@@ -2569,36 +2659,354 @@ fn dependency_free(lock: &str, text: &str, expected: usize) -> Result<(), String
     Ok(())
 }
 
+/// A standalone target crate the `cargo-test` preflight gates, discovered from
+/// the tree rather than listed here.
+///
+/// APPLICATIONS.md §V.0 named the shape this replaces as the thing concurrent
+/// agents collide on: two central tables, each carrying a hardcoded array
+/// length, so every pair of agents adding a crate conflicted on the row AND on
+/// the count. Both are now derived. A crate joins the gate by EXISTING — a
+/// `td-*/Cargo.toml` at the repo root — so adding one touches no file outside
+/// the new crate's own directory.
+///
+/// The prefix is the whole of the discovery rule because it already describes
+/// exactly the gated set: the three workspace members are compiled by
+/// `--workspace`, `net` is the external-dependency tier whose lock is
+/// deliberately NOT dependency-free, and none of them wears it. A crate that
+/// wants the gate and cannot wear the prefix is an amendment here, which is the
+/// same reviewed act that adding a row used to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateCrate {
+    /// The directory name, which is also the crate name and the manifest path
+    /// the commands are spelled with: `td-sh`.
+    name: String,
+    /// Whether clippy lints test and bench targets too. DECLARED rather than
+    /// assumed in either direction: turning it on repo-wide is more lint
+    /// coverage and a separate reviewed change, and defaulting it on would red
+    /// crates never clean under it on a diff that did not touch the target that
+    /// is unclean.
+    clippy_all_targets: bool,
+    /// Extra arguments after `cargo test`'s `--` separator. Declared for the
+    /// same reason: `--include-ignored` runs a DIFFERENT suite rather than more
+    /// of the same one, and inheriting it repo-wide would run every crate's
+    /// deliberately-ignored tests.
+    test_args: Option<String>,
+}
+
+/// The `td-*` directories under `root` carrying a `Cargo.toml`, alphabetically
+/// so a rendered command list never depends on readdir order.
+///
+/// An unreadable root, an unreadable manifest, and a malformed declaration are
+/// ERRORS rather than skips. This list decides which crates are compiled at
+/// all, so a discovery that quietly returns fewer of them is the dispatcher
+/// narrowing its own coverage — the exact failure `HOST_ONLY_ENGINE_SOURCES`
+/// refuses to allow for `affected.rs` itself. An empty answer is refused for
+/// the same reason: a preflight looping over nothing exits 0 having compiled
+/// nothing.
+fn discover_gate_crates(root: &Path) -> Result<Vec<GateCrate>, String> {
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| format!("{} could not be read: {e}", root.display()))?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{} could not be walked: {e}", root.display()))?;
+        let raw = entry.file_name();
+        // Candidacy is decided on the lossy form: whether a name that is not
+        // UTF-8 matters is answered below, once we know it is a crate at all.
+        if !raw.to_string_lossy().starts_with("td-") {
+            continue;
+        }
+        let path = entry.path();
+        // Only a DIRECTORY holding a manifest is a gate member, and both
+        // questions come BEFORE any judgement of the name. `read_dir` yields
+        // plain files too, so asking about the name first makes a stray
+        // `td-notes.txt` — or a `td-sh.orig` backup with no manifest in it —
+        // red every check on the branch. `metadata` rather than `is_dir()`, so
+        // "not a directory" and "could not tell" stay different answers.
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{} could not be inspected: {e}", path.display())),
+        }
+        // `is_file()` answers false for a permission error or a symlink loop as
+        // readily as for a missing file, which would drop a real crate from the
+        // roster without a word.
+        let manifest = path.join("Cargo.toml");
+        match std::fs::metadata(&manifest) {
+            Ok(meta) if meta.is_file() => {}
+            // A `td-*` directory that is not a crate is not a gate member.
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{} could not be inspected: {e}", manifest.display())),
+        }
+        // It IS a crate. Only now must its name be one a command can spell: the
+        // name is interpolated into the same `bash -c` string as the declared
+        // args, and into a `--manifest-path`. A crate-shaped directory under an
+        // unusable name is refused rather than gated, because the alternative is
+        // running cargo against a backup copy of a crate.
+        let Some(name) = raw.to_str() else {
+            return Err(format!(
+                "{}: a crate directory whose name is not UTF-8 cannot be gated",
+                path.display()
+            ));
+        };
+        let bad = name
+            .chars()
+            .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_');
+        if let Some(bad) = bad {
+            return Err(format!(
+                "{name}: a gated crate directory may not contain `{bad}` — rename \
+                 it or move it out of the repo root"
+            ));
+        }
+        names.push(name.to_string());
+    }
+    names.sort();
+    let mut out: Vec<GateCrate> = Vec::new();
+    for name in names {
+        let manifest = root.join(&name).join("Cargo.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .map_err(|e| format!("{} could not be read: {e}", manifest.display()))?;
+        out.push(parse_gate_crate(&name, &text)?);
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "no `td-*/Cargo.toml` under {} — the gate roster must not be empty",
+            root.display()
+        ));
+    }
+    Ok(out)
+}
+
+/// The table a crate declares its gating in, normalized (no brackets).
+const GATE_SECTION: &str = "package.metadata.td-gate";
+
+/// A section header line reduced to the table it names: no trailing comment, no
+/// brackets, no per-segment quoting, no incidental whitespace.
+///
+/// `[ package.metadata."td-gate" ] # note` and `[package.metadata.td-gate]` are
+/// the same table to cargo, so they must be the same table here — otherwise the
+/// spellings cargo accepts are exactly the ones that read as silence.
+fn normalize_header(line: &str) -> Option<(String, bool)> {
+    let head = line.split('#').next().unwrap_or(line).trim();
+    let inner = head.strip_prefix('[')?.strip_suffix(']')?;
+    // `[[x]]` is an array of tables, not the table. Unwrapping the second pair
+    // lets the NEAR-MISS check below see it; `array` keeps it from being read
+    // as a declaration.
+    let (inner, array) = match inner.strip_prefix('[').and_then(|i| i.strip_suffix(']')) {
+        Some(i) => (i, true),
+        None => (inner, false),
+    };
+    let mut out = String::new();
+    for seg in inner.split('.') {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(seg.trim().trim_matches(['"', '\'']).trim());
+    }
+    Some((out, array))
+}
+
+/// Whether a normalized header is a NEAR MISS for the gate table: the same
+/// block, misspelled. Case and `_`/`-` are folded because those are the typos a
+/// manifest author actually makes.
+fn resembles_gate_section(header: &str) -> bool {
+    let relaxed = header.replace('_', "-").to_ascii_lowercase();
+    if relaxed == GATE_SECTION {
+        return true;
+    }
+    match relaxed.strip_prefix("package.metadata.") {
+        Some(rest) => rest.starts_with("td"),
+        None => false,
+    }
+}
+
+/// The optional `[package.metadata.td-gate]` block, over the manifest TEXT so
+/// its cases are literals in the test rather than a fixture tree.
+///
+/// Cargo ignores `package.metadata`, which makes it the crate's own place to
+/// say how it wants to be gated without a central table hearing about it.
+/// Absent means the defaults, which is what most crates want and what makes
+/// adding one a zero-central-edit act. An UNKNOWN key is an error rather than a
+/// shrug: a mistyped `clippy-all-targets` that parsed as nothing would silently
+/// drop lint coverage, which is the failure this whole roster exists to stop.
+fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
+    let mut out = GateCrate {
+        name: name.to_string(),
+        clippy_all_targets: false,
+        test_args: None,
+    };
+    let mut inside = false;
+    let mut in_metadata_root = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            let Some((header, array)) = normalize_header(line) else {
+                return Err(format!("{name}: `{line}` is not a section header"));
+            };
+            inside = !array && header == GATE_SECTION;
+            in_metadata_root = !array && header == "package.metadata";
+            // A NEAR MISS is an error rather than an unrelated table. The
+            // per-key strictness below buys nothing if the block that NAMES
+            // those keys can be misspelled into silence: `td_gate`, `td-gat`
+            // and `TD-GATE` would each take every default and say nothing,
+            // which is the exact failure the unknown-key refusal exists to
+            // prevent. Anything else under `package.metadata.td*` is refused
+            // too — a future unrelated `td-` table there is a reviewed rename,
+            // which is cheaper than a silent default.
+            if !inside && resembles_gate_section(&header) {
+                // `[[package.metadata.td-gate]]` reaches here too: an array of
+                // tables is not the table, and reading it as one would be a
+                // guess about what its author meant.
+                return Err(format!(
+                    "{name}: `[{header}]` is not `[{GATE_SECTION}]` — fix the \
+                     name or remove it, rather than leaving a block that \
+                     declares nothing"
+                ));
+            }
+            continue;
+        }
+        // Cargo also accepts the dotted (`td-gate.clippy-all-targets = …`) and
+        // inline-table (`td-gate = { … }`) spellings of the same table. This
+        // parser reads neither, so it REFUSES them rather than taking the
+        // defaults and saying nothing.
+        if in_metadata_root {
+            if let Some((key, _)) = line.split_once('=') {
+                // Folded the way the header is, and with every quote removed
+                // rather than trimmed: `"td-gate".clippy-all-targets` leaves a
+                // quote in the middle that a trim would keep.
+                let key: String = key
+                    .chars()
+                    .filter(|c| *c != '"' && *c != '\'' && !c.is_whitespace())
+                    .collect::<String>()
+                    .replace('_', "-")
+                    .to_ascii_lowercase();
+                if key == "td-gate" || key.starts_with("td-gate.") {
+                    return Err(format!(
+                        "{name}: spell the gate block as `[{GATE_SECTION}]`, \
+                         not as `{line}`"
+                    ));
+                }
+            }
+        }
+        if !inside || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("{name}: `{line}` is not `key = value`"));
+        };
+        match key.trim() {
+            "clippy-all-targets" => {
+                out.clippy_all_targets = gate_bool(name, "clippy-all-targets", value.trim())?;
+            }
+            "test-args" => out.test_args = Some(gate_string(name, "test-args", value.trim())?),
+            other => {
+                return Err(format!(
+                    "{name}: unknown [package.metadata.td-gate] key `{other}`"
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A declared boolean. The first word, so a trailing `# comment` is tolerated
+/// the way the rest of these manifests write one.
+fn gate_bool(krate: &str, key: &str, value: &str) -> Result<bool, String> {
+    // Up to a trailing comment, which TOML does not require a space before.
+    // `gate_string` gets the same tolerance for free by halting at its closing
+    // quote, and the two should not disagree about what a comment is.
+    match value.split('#').next().unwrap_or(value).trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("{krate}: `{key}` wants true or false, got `{value}`")),
+    }
+}
+
+/// A declared string, read to its closing quote so a trailing comment is
+/// tolerated. Empty is refused: it would render a `--` separator with nothing
+/// after it and change the command for no stated reason.
+fn gate_string(krate: &str, key: &str, value: &str) -> Result<String, String> {
+    let rest = value
+        .strip_prefix('"')
+        .ok_or_else(|| format!("{krate}: `{key}` wants a quoted string, got `{value}`"))?;
+    let end = rest
+        .find('"')
+        .ok_or_else(|| format!("{krate}: `{key}` has no closing quote: `{value}`"))?;
+    let inner = rest.get(..end).unwrap_or_default();
+    if inner.trim().is_empty() {
+        return Err(format!("{krate}: `{key}` is empty"));
+    }
+    // These args are interpolated into a command string that `run_shell` hands
+    // to `bash -c`, so they are VALIDATED rather than quoted: quoting would
+    // change the rendered command a reader is asked to trust, and no legitimate
+    // cargo flag needs a shell metacharacter. Before this commit both halves of
+    // that string were Rust consts; a manifest can now contribute to it.
+    if let Some(bad) = inner.chars().find(|c| !is_shell_safe(*c)) {
+        return Err(format!(
+            "{krate}: `{key}` may not contain `{bad}` — it is interpolated \
+             into a shell command"
+        ));
+    }
+    Ok(inner.to_string())
+}
+
+/// The characters a declared value may contribute to a `bash -c` string: enough
+/// for any cargo flag, and nothing a shell acts on.
+fn is_shell_safe(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '=' | ',' | '.' | '/' | '+' | ':' | ' ')
+}
+
+/// How many `[[package]]` entries the workspace lock must carry: one per
+/// member, since the workspace is dependency-free. Read from the root manifest
+/// so adding a member does not need a count changed here as well.
+fn workspace_member_count(root: &Path) -> Result<usize, String> {
+    let manifest = root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("{} could not be read: {e}", manifest.display()))?;
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("members") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('[') else {
+            return Err("root Cargo.toml `members` is not an inline array".to_string());
+        };
+        let Some(end) = rest.find(']') else {
+            return Err("root Cargo.toml `members` does not close on its line".to_string());
+        };
+        let n = rest
+            .get(..end)
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .count();
+        if n == 0 {
+            return Err("root Cargo.toml lists no workspace members".to_string());
+        }
+        return Ok(n);
+    }
+    Err("root Cargo.toml has no `members =` line".to_string())
+}
+
 /// Every lock this preflight answers for, and the `[[package]]` count it must
-/// carry: the engine workspace's three path members, one apiece for the
-/// standalone crates.
+/// carry: one per member for the workspace root, one apiece for the standalone
+/// crates.
 ///
 /// Gate 325 asserts these too, but it degrades to a tolerated Unprovisioned
 /// SKIP on every host today (re #469) and names this preflight the authoritative
 /// enforcement — so in the only tier that executes, this is where the
 /// dependency-free claim is actually checked. `--frozen` does not stand in: it
 /// demands that the committed lock RESOLVE, not that it be empty.
-const DEPENDENCY_FREE_LOCKS: [(&str, usize); 19] = [
-    ("Cargo.lock", 3),
-    ("td-kexec/Cargo.lock", 1),
-    ("td-jail/Cargo.lock", 1),
-    ("td-busd/Cargo.lock", 1),
-    ("td-portal/Cargo.lock", 1),
-    ("td-sh/Cargo.lock", 1),
-    ("td-txt/Cargo.lock", 1),
-    ("td-netd/Cargo.lock", 1),
-    ("td-boot/Cargo.lock", 1),
-    ("td-util/Cargo.lock", 1),
-    ("td-init/Cargo.lock", 1),
-    ("td-firstboot/Cargo.lock", 1),
-    ("td-login/Cargo.lock", 1),
-    ("td-svc/Cargo.lock", 1),
-    ("td-install/Cargo.lock", 1),
-    ("td-seatd/Cargo.lock", 1),
-    ("td-compositor/Cargo.lock", 1),
-    ("td-profiler/Cargo.lock", 1),
-    ("td-review/Cargo.lock", 1),
-];
+fn dependency_free_locks(root: &Path) -> Result<Vec<(String, usize)>, String> {
+    let mut out = vec![("Cargo.lock".to_string(), workspace_member_count(root)?)];
+    for krate in discover_gate_crates(root)? {
+        out.push((format!("{}/Cargo.lock", krate.name), 1));
+    }
+    Ok(out)
+}
 
 /// Standalone crates that NO recipe embeds, and so the only ones whose diff
 /// cannot reach the engine workspace.
@@ -2628,21 +3036,22 @@ const UNEMBEDDED_CRATES: [&str; 1] = ["td-review"];
 /// `host_only_sources_are_not_reachable_from_the_engine`.
 const HOST_ONLY_ENGINE_SOURCES: [&str; 1] = ["builder/src/ready.rs"];
 
-/// The subset of `CARGO_TEST_CMDS` a diff over `changed` can actually
+/// The subset of the derived command list a diff over `changed` can actually
 /// invalidate.
 ///
 /// Narrow ONLY where it is provably sound: every changed path must sit inside
 /// an `UNEMBEDDED_CRATES` directory. Anything else — `builder/`, `recipes/`, a
 /// crate a recipe embeds, an unmapped file, an empty diff — takes the whole
-/// table, so every unknown fails safe.
-fn cargo_test_cmds(changed: &[String]) -> Vec<&'static str> {
+/// list, so every unknown fails safe.
+fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, String> {
+    let all = cargo_test_cmds_all(root)?;
     let mut scoped: Vec<&'static str> = Vec::new();
     for p in changed {
         // A `..` is refused rather than resolved: `td-review/../td-sh/x.rs`
         // starts with the crate and names another. git never emits one, so this
         // is reachable only through `--path`.
         if p.contains("..") {
-            return CARGO_TEST_CMDS.to_vec();
+            return Ok(all);
         }
         let owner = UNEMBEDDED_CRATES.iter().find(|c| {
             // The separator matters: `td-reviewer/x` is not `td-review/x`.
@@ -2651,24 +3060,26 @@ fn cargo_test_cmds(changed: &[String]) -> Vec<&'static str> {
         match owner {
             Some(c) if !scoped.contains(c) => scoped.push(c),
             Some(_) => {}
-            None => return CARGO_TEST_CMDS.to_vec(),
+            None => return Ok(all),
         }
     }
     if scoped.is_empty() {
-        return CARGO_TEST_CMDS.to_vec();
+        return Ok(all);
     }
-    let narrowed: Vec<&'static str> = CARGO_TEST_CMDS
+    let narrowed: Vec<String> = all
         .iter()
-        .copied()
-        .filter(|cmd| cmd_manifest_crate(cmd).is_some_and(|c| scoped.contains(&c)))
+        .filter(|cmd| {
+            cmd_manifest_crate(cmd).is_some_and(|c| scoped.contains(&c))
+        })
+        .cloned()
         .collect();
     // An EMPTY narrowing must never be taken at face value: the preflight's
     // loop over nothing exits 0 having run no cargo at all — a green that
     // tested the crate not at all. `unembedded_crates_have_cargo_commands`
     // keeps this unreachable; this is what happens if it ever is not.
     match narrowed.is_empty() {
-        true => CARGO_TEST_CMDS.to_vec(),
-        false => narrowed,
+        true => Ok(all),
+        false => Ok(narrowed),
     }
 }
 
@@ -2678,49 +3089,34 @@ fn cmd_manifest_crate(cmd: &str) -> Option<&str> {
     Some(cmd.split_once("--manifest-path ")?.1.split_once('/')?.0)
 }
 
-/// What the `cargo-test` preflight runs, in order. A const so the lock roster
-/// above can be checked against it: a crate tested here whose lock is not
-/// guarded there would be dependency-free by assertion only.
-const CARGO_TEST_CMDS: [&str; 38] = [
-    "cargo test --frozen --workspace",
-    "cargo test --frozen --manifest-path td-kexec/Cargo.toml",
-    "cargo test --frozen --manifest-path td-jail/Cargo.toml",
-    "cargo test --frozen --manifest-path td-busd/Cargo.toml",
-    "cargo test --frozen --manifest-path td-portal/Cargo.toml",
-    "cargo test --frozen --manifest-path td-sh/Cargo.toml",
-    "cargo test --frozen --manifest-path td-txt/Cargo.toml",
-    "cargo test --frozen --manifest-path td-netd/Cargo.toml",
-    "cargo test --frozen --manifest-path td-boot/Cargo.toml",
-    "cargo test --frozen --manifest-path td-install/Cargo.toml",
-    "cargo test --frozen --manifest-path td-util/Cargo.toml",
-    "cargo test --frozen --manifest-path td-init/Cargo.toml",
-    "cargo test --frozen --manifest-path td-firstboot/Cargo.toml",
-    "cargo test --frozen --manifest-path td-login/Cargo.toml",
-    "cargo test --frozen --manifest-path td-svc/Cargo.toml",
-    "cargo test --frozen --manifest-path td-seatd/Cargo.toml",
-    "cargo test --frozen --manifest-path td-compositor/Cargo.toml",
-    "cargo test --frozen --manifest-path td-profiler/Cargo.toml",
-    "cargo test --frozen --manifest-path td-review/Cargo.toml -- --include-ignored",
-    "cargo clippy --frozen --workspace",
-    "cargo clippy --frozen --manifest-path td-kexec/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-jail/Cargo.toml --all-targets",
-    "cargo clippy --frozen --manifest-path td-busd/Cargo.toml --all-targets",
-    "cargo clippy --frozen --manifest-path td-portal/Cargo.toml --all-targets",
-    "cargo clippy --frozen --manifest-path td-sh/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-txt/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-netd/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-boot/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-install/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-util/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-init/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-firstboot/Cargo.toml --all-targets",
-    "cargo clippy --frozen --manifest-path td-login/Cargo.toml",
-    "cargo clippy --frozen --manifest-path td-svc/Cargo.toml --all-targets",
-    "cargo clippy --frozen --manifest-path td-seatd/Cargo.toml --all-targets",
-    "cargo clippy --frozen --manifest-path td-compositor/Cargo.toml --all-targets",
-    "cargo clippy --frozen --manifest-path td-profiler/Cargo.toml --all-targets",
-    "cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets",
-];
+/// What the `cargo-test` preflight runs, in order: every `cargo test` before
+/// every `cargo clippy`, the workspace before the standalone crates.
+///
+/// Derived from the SAME roster the lock guard reads, so the two can no longer
+/// be two hand-written copies of one crate set that drift apart — which is what
+/// `every_crate_the_preflight_tests_has_its_lock_guarded` and its reverse were
+/// written to catch after `td-install` landed guarded but uncompiled.
+fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
+    let crates = discover_gate_crates(root)?;
+    let mut out = vec!["cargo test --frozen --workspace".to_string()];
+    for k in &crates {
+        let mut cmd = format!("cargo test --frozen --manifest-path {}/Cargo.toml", k.name);
+        if let Some(args) = &k.test_args {
+            cmd.push_str(" -- ");
+            cmd.push_str(args);
+        }
+        out.push(cmd);
+    }
+    out.push("cargo clippy --frozen --workspace".to_string());
+    for k in &crates {
+        let mut cmd = format!("cargo clippy --frozen --manifest-path {}/Cargo.toml", k.name);
+        if k.clippy_all_targets {
+            cmd.push_str(" --all-targets");
+        }
+        out.push(cmd);
+    }
+    Ok(out)
+}
 
 fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
     match name {
@@ -2735,35 +3131,47 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
         "cargo-test" => {
             // Before any cargo call, and for EVERY lock rather than only the
             // crate whose path selected this: gate 325 asserts these, and gate
-            // 325 does not run (see DEPENDENCY_FREE_LOCKS). So a td-sh-only
+            // 325 does not run (see `dependency_free_locks`). So a td-sh-only
             // branch reds here on a td-review lock — deliberate. The claim is
             // repo-wide, the roster is the same either way, and a guard that
             // only looks where the diff already pointed is one that never
             // catches the crate nobody was looking at.
-            for (lock, packages) in DEPENDENCY_FREE_LOCKS {
-                if let Err(e) = assert_dependency_free(root, lock, packages) {
+            let locks = match dependency_free_locks(root) {
+                Ok(locks) => locks,
+                Err(e) => {
+                    eprintln!("affected-checks: {e}");
+                    return 1;
+                }
+            };
+            for (lock, packages) in locks {
+                if let Err(e) = assert_dependency_free(root, &lock, packages) {
                     eprintln!("affected-checks: {e}");
                     return 1;
                 }
             }
             // The target-built guest programs ride the SAME preflight: all are
-            // dependency-free pure std, while their static TARGET links ride recipe-checks.
-            // builder + recipes + the shared engine lib are one cargo workspace,
-            // so --workspace lints/tests all three in one invocation; the target
-            // programs (td-kexec, td-jail, td-sh, td-txt, td-netd, td-boot, td-util,
-            // td-init, td-firstboot, td-login, td-svc, td-seatd, and
-            // td-compositor, and td-profiler) are
-            // standalone crates and ride the preflight explicitly, as does the
-            // host-side td-review integrator tool. td-sh's conformance corpus run
-            // is NOT `#[ignore]`d: this plain `cargo test` runs the whole corpus,
-            // so a regression, an unexpected pass or a stale overlay entry reds
-            // the preflight rather than waiting for a tier nothing runs.
-            // td-review goes the other way: its
-            // App-level tests drive a real git repo, are `#[ignore]`d so the
-            // git-less sandbox gate stays honest, and run HERE via
-            // --include-ignored — this preflight is their only tier.
-            for cmd in cargo_test_cmds(changed) {
-                let code = run_shell(root, cmd);
+            // dependency-free pure std, while their static TARGET links ride
+            // recipe-checks. builder + recipes + the shared engine lib are one
+            // cargo workspace, so --workspace lints/tests all three in one
+            // invocation; every `td-*` crate is standalone and rides the
+            // preflight explicitly, discovered rather than listed (the roster
+            // above). td-sh's conformance corpus run is NOT `#[ignore]`d: this
+            // plain `cargo test` runs the whole corpus, so a regression, an
+            // unexpected pass or a stale overlay entry reds the preflight
+            // rather than waiting for a tier nothing runs. td-review goes the
+            // other way: its App-level tests drive a real git repo, are
+            // `#[ignore]`d so the git-less sandbox gate stays honest, and run
+            // HERE through the `test-args` it declares — this preflight is
+            // their only tier.
+            let cmds = match cargo_test_cmds(root, changed) {
+                Ok(cmds) => cmds,
+                Err(e) => {
+                    eprintln!("affected-checks: {e}");
+                    return 1;
+                }
+            };
+            for cmd in cmds {
+                let code = run_shell(root, &cmd);
                 if code != 0 {
                     return code;
                 }
@@ -2968,7 +3376,7 @@ pub fn run(args: &[String]) -> u8 {
         base: &base,
         merge_base: &merge_base,
     };
-    print!("{}", format_output(&header, &changed, &sel, run));
+    print!("{}", format_output(&root, &header, &changed, &sel, run));
 
     if !run {
         return 0;
@@ -3055,14 +3463,30 @@ mod tests {
     }
 
     fn require_sibling_locks(root: &Path) {
-        let Some((first, _)) = DEPENDENCY_FREE_LOCKS.first() else {
-            panic!("DEPENDENCY_FREE_LOCKS is empty");
+        let locks = gate_locks();
+        let Some((first, _)) = locks.first() else {
+            panic!("the lock roster is empty");
         };
         assert!(
             root.join(first).is_file(),
             "{first} absent at {} — the lock roster's own first entry",
             root.display()
         );
+    }
+
+    /// The three derived rosters, resolved against the real tree. Tests may
+    /// panic where production code may not (AGENTS.md, 'Rust code'), and a
+    /// roster that cannot be read is a broken checkout rather than a finding.
+    fn gate_roster() -> Vec<GateCrate> {
+        discover_gate_crates(&repo_root()).expect("gate roster")
+    }
+
+    fn gate_cmds() -> Vec<String> {
+        cargo_test_cmds_all(&repo_root()).expect("cargo command list")
+    }
+
+    fn gate_locks() -> Vec<(String, usize)> {
+        dependency_free_locks(&repo_root()).expect("lock roster")
     }
 
     /// Every `.rs` under `dir`, recursively — the recipes crate nests its
@@ -4563,10 +4987,11 @@ mod tests {
     /// nothing exits 0 having run no cargo at all.
     #[test]
     fn unembedded_crates_have_cargo_commands() {
+        let cmds = gate_cmds();
         for krate in UNEMBEDDED_CRATES {
-            let mine: Vec<&str> = CARGO_TEST_CMDS
+            let mine: Vec<&str> = cmds
                 .iter()
-                .copied()
+                .map(String::as_str)
                 .filter(|c| cmd_manifest_crate(c) == Some(krate))
                 .collect();
             // Both KINDS, not merely two commands: `render_cargo_test` prints
@@ -4589,7 +5014,8 @@ mod tests {
     /// this is what keeps it that way.
     #[test]
     fn every_cargo_command_has_the_shape_the_parser_assumes() {
-        for cmd in CARGO_TEST_CMDS {
+        for cmd in gate_cmds() {
+            let cmd = cmd.as_str();
             if cmd.contains("--workspace") {
                 assert_eq!(cmd_manifest_crate(cmd), None, "{cmd:?}");
                 continue;
@@ -4607,8 +5033,9 @@ mod tests {
     /// whole table, so a new crate or an unmapped path fails safe.
     #[test]
     fn cargo_commands_narrow_only_for_unembedded_crates() {
-        let all = CARGO_TEST_CMDS.len();
-        let one = |p: &str| cargo_test_cmds(&[p.to_string()]);
+        let root = repo_root();
+        let all = gate_cmds().len();
+        let one = |p: &str| cargo_test_cmds(&root, &[p.to_string()]).expect("narrowing");
         // td-review alone: its own manifest and nothing else — no --workspace,
         // which is where the seed-recipe builds and tarball decoding live.
         let scoped = one("td-review/src/land.rs");
@@ -4622,17 +5049,21 @@ mod tests {
         assert_eq!(one("builder/src/affected.rs").len(), all);
         assert_eq!(one("recipes/src/recipes/td-sh.rs").len(), all);
         assert_eq!(one("who/knows.rs").len(), all);
-        assert_eq!(cargo_test_cmds(&[]).len(), all);
+        assert_eq!(cargo_test_cmds(&root, &[]).expect("narrowing").len(), all);
         // A prefix is not a directory: `td-reviewer/` is a different crate.
         assert_eq!(one("td-reviewer/src/main.rs").len(), all);
         // Nor may a `..` that starts with the crate and names another.
         assert_eq!(one("td-review/../td-sh/src/main.rs").len(), all);
         // One narrowable path does not license the OTHERS in the same diff.
         assert_eq!(
-            cargo_test_cmds(&[
-                "td-review/src/land.rs".to_string(),
-                "builder/src/gates.rs".to_string(),
-            ])
+            cargo_test_cmds(
+                &root,
+                &[
+                    "td-review/src/land.rs".to_string(),
+                    "builder/src/gates.rs".to_string(),
+                ]
+            )
+            .expect("narrowing")
             .len(),
             all,
             "a mixed diff must take the whole table"
@@ -4643,19 +5074,18 @@ mod tests {
     /// run cannot advertise a command the run will not issue.
     #[test]
     fn the_printed_cargo_line_matches_what_would_run() {
+        let root = repo_root();
         let changed = vec!["td-review/src/land.rs".to_string()];
-        let line = preflight_cmd("cargo-test", &changed).unwrap_or_default();
-        let running: Vec<&str> = cargo_test_cmds(&changed)
-            .iter()
-            .filter_map(|c| cmd_manifest_crate(c))
-            .collect();
+        let line = preflight_cmd(&root, "cargo-test", &changed).unwrap_or_default();
+        let ran = cargo_test_cmds(&root, &changed).expect("narrowing");
+        let running: Vec<&str> = ran.iter().filter_map(|c| cmd_manifest_crate(c)).collect();
         assert!(!running.is_empty(), "nothing would run: {line:?}");
         // Both directions, over EVERY crate the full table names. The "names
         // each one that runs" half is vacuous on its own: a render that printed
         // all thirteen manifests would satisfy it, and printing a command the
         // preflight will not run is exactly the lie this test exists to catch.
-        for cmd in CARGO_TEST_CMDS {
-            let Some(krate) = cmd_manifest_crate(cmd) else {
+        for cmd in gate_cmds() {
+            let Some(krate) = cmd_manifest_crate(&cmd) else {
                 continue;
             };
             let manifest = format!("--manifest-path {krate}/Cargo.toml");
@@ -4667,10 +5097,24 @@ mod tests {
         }
         assert!(!line.contains("--workspace"), "{line:?}");
         // …and the unnarrowed line is unchanged from what it always printed.
-        let full =
-            preflight_cmd("cargo-test", &["builder/src/main.rs".to_string()]).unwrap_or_default();
-        assert!(full.starts_with("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml"));
-        assert!(full.ends_with("--manifest-path td-review/Cargo.toml -- --include-ignored"));
+        let full = preflight_cmd(&root, "cargo-test", &["builder/src/main.rs".to_string()])
+            .unwrap_or_default();
+        assert!(full.starts_with(
+            "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path "
+        ));
+        // Every gated crate by name rather than one pinned spelling of the
+        // whole line: the roster is derived now, so an expectation that listed
+        // it would be the central table this change removed, in a test's
+        // clothes. The declared `test-args` are checked because they are the
+        // one part a crate can change without changing the set.
+        for krate in gate_roster() {
+            let manifest = format!("--manifest-path {}/Cargo.toml", krate.name);
+            assert!(full.contains(&manifest), "{full:?} omits {}", krate.name);
+        }
+        assert!(
+            full.contains("--manifest-path td-review/Cargo.toml -- --include-ignored"),
+            "{full:?} lost td-review's declared test args"
+        );
     }
 
     /// A listing error must RED rather than come back short: the caller's loop
@@ -4683,6 +5127,320 @@ mod tests {
         let got = gate_files(&root);
         std::fs::remove_dir_all(&root).ok();
         assert!(got.is_err(), "a missing gate dir must be an error: {got:?}");
+    }
+
+    /// The declaration parser, over manifest TEXT so its cases are literals
+    /// rather than a fixture tree.
+    #[test]
+    fn a_crate_declares_how_it_is_gated_and_a_typo_reds() {
+        // Absent block: the defaults, which is what most crates want and what
+        // makes adding a crate a zero-central-edit act.
+        let bare = "[package]\nname = \"td-x\"\n\n[workspace]\n";
+        let got = parse_gate_crate("td-x", bare).expect("defaults");
+        assert!(!got.clippy_all_targets);
+        assert_eq!(got.test_args, None);
+
+        // Both keys, with the trailing comments these manifests write.
+        let full = "[package.metadata.td-gate]\n\
+                    clippy-all-targets = true # lints test targets too\n\
+                    test-args = \"--include-ignored\" # its only tier\n";
+        let got = parse_gate_crate("td-x", full).expect("declared");
+        assert!(got.clippy_all_targets);
+        assert_eq!(got.test_args.as_deref(), Some("--include-ignored"));
+
+        // Every spelling cargo accepts for the SAME table is the same table
+        // here. Each of these was a silent default before review found it.
+        for ok in [
+            "[package.metadata.td-gate] # how this crate is gated\nclippy-all-targets = true\n",
+            "[ package.metadata.td-gate ]\nclippy-all-targets = true\n",
+            "[package.metadata.\"td-gate\"]\nclippy-all-targets = true\n",
+        ] {
+            assert!(
+                parse_gate_crate("td-x", ok).expect("accepted spelling").clippy_all_targets,
+                "{ok:?} declares the flag and must be read"
+            );
+        }
+        // …and every NEAR MISS reds rather than declaring nothing, including the
+        // dotted and inline-table spellings this parser does not read.
+        for miss in [
+            "[package.metadata.td-gat]\nclippy-all-targets = true\n",
+            "[package.metadata.td-gate2]\nclippy-all-targets = true\n",
+            "[package.metadata.td_gate]\nclippy-all-targets = true\n",
+            "[package.metadata.TD-GATE]\nclippy-all-targets = true\n",
+            "[package.metadata]\ntd-gate.clippy-all-targets = true\n",
+            "[package.metadata]\ntd-gate = { clippy-all-targets = true }\n",
+        ] {
+            assert!(parse_gate_crate("td-x", miss).is_err(), "{miss:?} must red");
+        }
+        // The dotted and inline-table spellings are folded the same way the
+        // header is — case, `_`, and quoting anywhere in the key.
+        for miss in [
+            "[package.metadata]\ntd_gate = { clippy-all-targets = true }\n",
+            "[package.metadata]\ntd_gate.clippy-all-targets = true\n",
+            "[package.metadata]\nTD-GATE = { clippy-all-targets = true }\n",
+            "[package.metadata]\n\"td-gate\".clippy-all-targets = true\n",
+            // TOML ignores whitespace around a dotted key's parts, and the
+            // header path folds it, so this path must too.
+            "[package.metadata]\ntd-gate . clippy-all-targets = true\n",
+            "[[package.metadata.td-gate]]\nclippy-all-targets = true\n",
+        ] {
+            assert!(parse_gate_crate("td-x", miss).is_err(), "{miss:?} must red");
+        }
+
+        // An unrelated table under `[package.metadata]` is still nobody's
+        // business but its owner's.
+        let docs = "[package.metadata.docs.rs]\nall-features = true\n";
+        assert!(parse_gate_crate("td-x", docs).is_ok(), "{docs:?}");
+
+        // A declared value reaches a `bash -c` string, so a shell metacharacter
+        // is refused rather than quoted.
+        for evil in [
+            "[package.metadata.td-gate]\ntest-args = \"--x; rm -rf /\"\n",
+            "[package.metadata.td-gate]\ntest-args = \"--x $(id)\"\n",
+            "[package.metadata.td-gate]\ntest-args = \"--x `id`\"\n",
+            "[package.metadata.td-gate]\ntest-args = \"--x && id\"\n",
+        ] {
+            assert!(parse_gate_crate("td-x", evil).is_err(), "{evil:?} must red");
+        }
+
+        // A trailing comment on the HEADER does not hide the block…
+        let commented = "[package.metadata.td-gate] # how this crate is gated\n\
+                         clippy-all-targets = true\n";
+        assert!(parse_gate_crate("td-x", commented).expect("commented").clippy_all_targets);
+        // …a bool tolerates the comment a string already did, space or not…
+        let tight = "[package.metadata.td-gate]\nclippy-all-targets = true#no space\n";
+        assert!(parse_gate_crate("td-x", tight).expect("tight").clippy_all_targets);
+        // …and a NEAR-MISS header reds rather than declaring nothing, which is
+        // the one way the per-key strictness below could be talked out of.
+        for miss in [
+            "[package.metadata.td-gat]\nclippy-all-targets = true\n",
+            "[package.metadata.td-gate2]\nclippy-all-targets = true\n",
+        ] {
+            assert!(parse_gate_crate("td-x", miss).is_err(), "{miss:?} must red");
+        }
+
+        // A later section ENDS the block, so a key below it is not ours…
+        let after = "[package.metadata.td-gate]\nclippy-all-targets = true\n\
+                     [profile.release]\nclippy-all-targets = false\n";
+        assert!(parse_gate_crate("td-x", after).expect("scoped").clippy_all_targets);
+        // …and neither is a different metadata table.
+        let other = "[package.metadata.docs.rs]\nclippy-all-targets = true\n";
+        assert!(!parse_gate_crate("td-x", other).expect("other").clippy_all_targets);
+
+        // Every malformed shape REDS rather than reading as a default. A typo
+        // that parsed as "no flag" would silently drop lint coverage, which is
+        // the failure the whole roster exists to stop.
+        for bad in [
+            "[package.metadata.td-gate]\nclipy-all-targets = true\n",
+            "[package.metadata.td-gate]\nclippy-all-targets = yes\n",
+            "[package.metadata.td-gate]\nclippy-all-targets\n",
+            "[package.metadata.td-gate]\ntest-args = --include-ignored\n",
+            "[package.metadata.td-gate]\ntest-args = \"\"\n",
+            "[package.metadata.td-gate]\ntest-args = \"unterminated\n",
+        ] {
+            assert!(parse_gate_crate("td-x", bad).is_err(), "{bad:?} must red");
+        }
+    }
+
+    /// Discovery is over the TREE, so a crate joins the gate by existing — and
+    /// a `td-*` directory that is not a crate does not join it by name alone.
+    #[test]
+    fn a_new_crate_joins_the_roster_by_existing() {
+        let root = std::env::temp_dir().join(format!("td-gate-discover-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("td-new")).unwrap();
+        std::fs::write(root.join("td-new/Cargo.toml"), "[package]\nname = \"td-new\"\n").unwrap();
+        std::fs::create_dir_all(root.join("td-loud")).unwrap();
+        std::fs::write(
+            root.join("td-loud/Cargo.toml"),
+            "[package]\n[package.metadata.td-gate]\nclippy-all-targets = true\n",
+        )
+        .unwrap();
+        // A `td-*` directory that is NOT a crate, and a crate that is not `td-*`
+        // — `net` is the external-dependency tier and must never be gated here.
+        std::fs::create_dir_all(root.join("td-notacrate")).unwrap();
+        std::fs::create_dir_all(root.join("net")).unwrap();
+        std::fs::write(root.join("net/Cargo.toml"), "[package]\nname = \"td-net\"\n").unwrap();
+
+        let got = discover_gate_crates(&root);
+        std::fs::remove_dir_all(&root).ok();
+        let got = got.expect("discovery");
+        let names: Vec<&str> = got.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["td-loud", "td-new"], "alphabetical, crates only");
+        assert!(got.iter().any(|c| c.name == "td-loud" && c.clippy_all_targets));
+        assert!(got.iter().any(|c| c.name == "td-new" && !c.clippy_all_targets));
+    }
+
+    /// A crate the roster discovered, that no arm above maps, still reaches the
+    /// preflight that COMPILES it.
+    ///
+    /// Deriving the roster is only half of "a crate joins the gate by existing";
+    /// the other half is being selected. A branch touching only a new crate used
+    /// to take the catch-all, which runs the behavioural tier and NOT the cargo
+    /// preflight — so the new crate's lock guard, tests and clippy were listed
+    /// in the roster and never executed. Found in review.
+    #[test]
+    fn a_new_crate_selects_the_preflight_that_compiles_it() {
+        let root = std::env::temp_dir().join(format!("td-gate-select-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("td-fresh/src")).unwrap();
+        std::fs::write(
+            root.join("td-fresh/Cargo.toml"),
+            "[package]\nname = \"td-fresh\"\n",
+        )
+        .unwrap();
+
+        let roster = discover_gate_crates(&root);
+        let mut mine = Selection::default();
+        map_path(&root, &roster, "td-fresh/src/main.rs", &mut mine);
+        // A path in NO discovered crate must keep the catch-all exactly, or this
+        // arm has become a second catch-all that runs cargo for anything.
+        let mut other = Selection::default();
+        map_path(&root, &roster, "who/knows.rs", &mut other);
+        // …and a crate whose name is only a PREFIX of the discovered one is a
+        // different crate.
+        let mut near = Selection::default();
+        map_path(&root, &roster, "td-fresher/src/main.rs", &mut near);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            mine.preflights.iter().any(|x| x == "cargo-test"),
+            "a new crate must reach its own preflight: {:?}",
+            mine.preflights
+        );
+        assert!(
+            mine.targets.iter().any(|x| x == "check"),
+            "and keep the catch-all's target: {:?}",
+            mine.targets
+        );
+        assert!(
+            !other.preflights.iter().any(|x| x == "cargo-test"),
+            "an unmapped non-crate path must not: {:?}",
+            other.preflights
+        );
+        assert!(
+            !near.preflights.iter().any(|x| x == "cargo-test"),
+            "td-fresher is not td-fresh: {:?}",
+            near.preflights
+        );
+    }
+
+    /// A `td-`-prefixed thing that is NOT a crate leaves the roster alone.
+    ///
+    /// Discovery judges a name only after it knows the entry is a directory
+    /// holding a manifest. Asking in the other order made a stray `td-notes.txt`
+    /// — or a `td-sh.orig` backup — an error that reds every check on the
+    /// branch, which is a new failure mode rather than a guard. Found in the
+    /// confirmation pass.
+    #[test]
+    fn a_stray_td_entry_does_not_red_the_roster() {
+        let root = std::env::temp_dir().join(format!("td-gate-stray-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("td-real")).unwrap();
+        std::fs::write(root.join("td-real/Cargo.toml"), "[package]\n").unwrap();
+        // A scratch FILE, and a backup DIRECTORY with no manifest in it. Both
+        // carry a `.` that a crate directory may not, and neither is a crate.
+        std::fs::write(root.join("td-notes.txt"), "scratch\n").unwrap();
+        std::fs::create_dir_all(root.join("td-sh.orig")).unwrap();
+
+        let got = discover_gate_crates(&root);
+        std::fs::remove_dir_all(&root).ok();
+        let got = got.expect("a stray td- entry must not red the roster");
+        let names: Vec<&str> = got.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["td-real"]);
+    }
+
+    /// …but a crate-SHAPED directory under a name no command can spell is
+    /// refused rather than gated: the alternative is running cargo against a
+    /// backup copy of a crate.
+    #[test]
+    fn a_crate_under_an_unusable_name_is_refused() {
+        let root = std::env::temp_dir().join(format!("td-gate-badname-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("td-real")).unwrap();
+        std::fs::write(root.join("td-real/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(root.join("td-sh.orig")).unwrap();
+        std::fs::write(root.join("td-sh.orig/Cargo.toml"), "[package]\n").unwrap();
+
+        let got = discover_gate_crates(&root);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(got.is_err(), "a crate-shaped `td-sh.orig` must red: {got:?}");
+    }
+
+    /// An EMPTY discovery is refused rather than returned: the preflight's loop
+    /// over nothing exits 0 having compiled nothing at all.
+    #[test]
+    fn an_empty_gate_roster_is_an_error() {
+        let root = std::env::temp_dir().join(format!("td-gate-empty-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let got = discover_gate_crates(&root);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(got.is_err(), "an empty roster must red: {got:?}");
+    }
+
+    /// The workspace lock's expected package count follows the members list
+    /// rather than being a number written twice, and it must agree with the
+    /// lock actually committed.
+    #[test]
+    fn the_workspace_lock_count_follows_the_members_list() {
+        let root = repo_root();
+        let members = workspace_member_count(&root).expect("members");
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+        let packages = lock.lines().filter(|l| l.trim() == "[[package]]").count();
+        assert_eq!(
+            members, packages,
+            "the members list and the committed workspace lock disagree"
+        );
+
+        let bad = std::env::temp_dir().join(format!("td-gate-members-{}", std::process::id()));
+        std::fs::remove_dir_all(&bad).ok();
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("Cargo.toml"), "[workspace]\nresolver = \"2\"\n").unwrap();
+        let got = workspace_member_count(&bad);
+        std::fs::remove_dir_all(&bad).ok();
+        assert!(got.is_err(), "a manifest with no members must red: {got:?}");
+    }
+
+    /// Every `td-*` crate in the tree reaches BOTH rosters.
+    ///
+    /// Both are derived from one scan, so this cannot fail today — which is the
+    /// point: it is what replaces the AGENTS.md instruction to remember two
+    /// tables, and it reds if a future filter is added to one roster and not
+    /// the other. `td-install` landed guarded but uncompiled once already.
+    #[test]
+    fn every_td_crate_in_the_tree_is_gated() {
+        let root = repo_root();
+        let locks = gate_locks();
+        let cmds = gate_cmds();
+        let mut seen = 0usize;
+        for entry in std::fs::read_dir(&root).expect("repo root") {
+            let name = entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if !name.starts_with("td-") || !root.join(&name).join("Cargo.toml").is_file() {
+                continue;
+            }
+            seen = seen.saturating_add(1);
+            let lock = format!("{name}/Cargo.lock");
+            assert!(
+                locks.iter().any(|(l, _)| *l == lock),
+                "{name} is a crate in the tree but {lock} is not guarded"
+            );
+            let manifest = format!("--manifest-path {name}/Cargo.toml");
+            for driver in ["cargo test", "cargo clippy"] {
+                assert!(
+                    cmds.iter()
+                        .any(|c| c.starts_with(driver) && c.contains(&manifest)),
+                    "{name} has no `{driver}` command — its lints and tests never run"
+                );
+            }
+        }
+        // A positive control: a scan that found nothing would pass every
+        // assertion above without checking a single crate.
+        assert!(seen > 1, "the tree scan found {seen} td-* crates");
     }
 
     /// Gate 325 asserts these lock shapes and does not run (re #469), so this
@@ -4720,9 +5478,9 @@ mod tests {
         // its `cargo test` copy was skipping for the same six weeks.
         let root = repo_root();
         require_sibling_locks(&root);
-        for (lock, packages) in DEPENDENCY_FREE_LOCKS {
+        for (lock, packages) in gate_locks() {
             assert!(
-                assert_dependency_free(&root, lock, packages).is_ok(),
+                assert_dependency_free(&root, &lock, packages).is_ok(),
                 "the committed {lock} must pass its own guard"
             );
         }
@@ -4732,17 +5490,19 @@ mod tests {
         );
     }
 
-    /// The roster and the command list are two hand-written copies of the same
-    /// crate set. A crate tested by the preflight whose lock is not guarded
-    /// would be dependency-free by assertion only — which is how gate 325's own
-    /// hand-written list would drift too.
+    /// The roster and the command list are one derived set, and this holds the
+    /// two halves to each other. It cannot fail while both come from a single
+    /// scan — which is the point: it is what reds if a later filter is added to
+    /// one and not the other. It caught a real drift when the two WERE
+    /// hand-written copies, and gate 325's own hand-written list still is one.
     #[test]
     fn every_crate_the_preflight_tests_has_its_lock_guarded() {
-        for cmd in CARGO_TEST_CMDS {
+        let locks = gate_locks();
+        for cmd in gate_cmds() {
             let Some(rest) = cmd.split("--manifest-path ").nth(1) else {
                 // `--workspace`: the root lock, which the roster carries.
                 assert!(
-                    DEPENDENCY_FREE_LOCKS.iter().any(|(l, _)| *l == "Cargo.lock"),
+                    locks.iter().any(|(l, _)| l == "Cargo.lock"),
                     "the workspace lock must be guarded"
                 );
                 continue;
@@ -4750,8 +5510,8 @@ mod tests {
             let Some(krate) = rest.split('/').next() else { continue };
             let lock = format!("{krate}/Cargo.lock");
             assert!(
-                DEPENDENCY_FREE_LOCKS.iter().any(|(l, _)| *l == lock),
-                "{cmd}: {lock} is not in DEPENDENCY_FREE_LOCKS"
+                locks.iter().any(|(l, _)| *l == lock),
+                "{cmd}: {lock} is not in the lock roster"
             );
         }
     }
@@ -4770,7 +5530,8 @@ mod tests {
     /// driver.
     #[test]
     fn every_guarded_lock_has_a_preflight_that_compiles_it() {
-        for (lock, _) in DEPENDENCY_FREE_LOCKS {
+        let cmds = gate_cmds();
+        for (lock, _) in gate_locks() {
             let krate = match lock.strip_suffix("/Cargo.lock") {
                 // The workspace root, which `--workspace` covers.
                 None => continue,
@@ -4779,11 +5540,11 @@ mod tests {
             let manifest = format!("--manifest-path {krate}/Cargo.toml");
             for driver in ["cargo test", "cargo clippy"] {
                 assert!(
-                    CARGO_TEST_CMDS
+                    cmds
                         .iter()
                         .any(|cmd| cmd.starts_with(driver) && cmd.contains(&manifest)),
-                    "{krate} is in DEPENDENCY_FREE_LOCKS but no `{driver}` in \
-                     CARGO_TEST_CMDS compiles it — its lints and tests never run \
+                    "{krate} is in the lock roster but no `{driver}` in the \
+                     command list compiles it — its lints and tests never run \
                      (AGENTS.md, 'Rust code')"
                 );
             }
@@ -4842,12 +5603,25 @@ mod tests {
     // DURABLE renderer guard (replaces the now-deleted shell differential — the
     // shell oracle was the removable migration leg, retired with the cutover,
     // directive 4). Asserts the FULL `--path` render byte-for-byte for paths whose
-    // mapping is INDEPENDENT of repo files, so it is fully deterministic and runs
-    // EVERYWHERE — including the builder-only package sandbox (no repo tree needed).
+    // mapping is INDEPENDENT of repo files.
+    //
+    // It no longer runs with NO repo tree: one line of each expectation is the
+    // cargo-test render, which is derived from the sibling `td-*` crates rather
+    // than read from a constant. In the builder-only package sandbox it SKIPS,
+    // the way `unembedded_crates_are_really_unembedded` does. Pinning the crate
+    // list here instead would rebuild the central table this mechanism removed.
     // The dynamic mappings stay covered by `self_test_passes_against_repo`.
     #[test]
     fn renders_exact_output_for_static_paths() {
         let root = repo_root();
+        // The unnarrowed cargo line, derived for the same reason as above: the
+        // rest of each expectation below stays pinned byte-for-byte, which is
+        // what these tests are for.
+        let Ok(cmds) = cargo_test_cmds_all(&root) else {
+            eprintln!("SKIP: no sibling td-* crates (builder-only sandbox)");
+            return;
+        };
+        let full_cargo = render_cargo_test(&cmds);
         let expect = |lines: &[&str]| -> String {
             let mut s = lines.join("\n");
             s.push('\n');
@@ -4864,7 +5638,7 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-jail/Cargo.toml + --manifest-path td-busd/Cargo.toml + --manifest-path td-portal/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-install/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-profiler/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                &full_cargo,
                 "  td-builder check check-engine check",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -4888,7 +5662,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n start tests/*.sh ci/*.sh tools/*.sh",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-jail/Cargo.toml + --manifest-path td-busd/Cargo.toml + --manifest-path td-portal/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-install/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-profiler/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                &full_cargo,
                 "  td-builder check check",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
