@@ -3,7 +3,7 @@
 This file is the normative record of every `unsafe` in td. It exists
 because the roster is the point: the value of writing these down is being
 able to count them and see each one's justification beside the others,
-which is exactly what stops a twelfth being added quietly. Where this file
+which is exactly what stops a thirteenth being added quietly. Where this file
 and the code disagree, one of them is a bug.
 
 ## The rule
@@ -14,7 +14,7 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWELVE
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are THIRTEEN
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
@@ -26,7 +26,12 @@ carries the same different shape for general descriptor forwarding. Sections
 pointer accesses into the perf ring mapping whose lifetime and bounds that
 same module controls. The twelfth, `td-portal`, confines descriptor-carrying
 Wayland I/O to one raw-syscall module and immediately reopens received regular
-files through `/proc/self/fd` so no raw descriptor ownership escapes it.
+files through `/proc/self/fd` so no raw descriptor ownership escapes it. The
+thirteenth, `td-audio`, is back to the plain shape: one syscall-instruction
+layer, no descriptor adoption and no mapping, because the ALSA transfer mode
+it uses is `SNDRV_PCM_ACCESS_RW_INTERLEAVED` and that mode has none. It is
+also the only surface whose scoped `#[allow]` sits on the entry point ALONE
+and not on the module — see §13 for the escape a module-level one permits.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -60,6 +65,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the private Wayland client's bounded descriptor transfer |
+| 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -1667,3 +1673,170 @@ fcntl, ioctl, credential call, or network socket. A fourth syscall, a second
 ancillary kind, a second scoped allowance, another production caller, or raw
 descriptor adoption is an amendment here and in `APPLICATIONS.md` in the same
 landing.
+
+## 13. `td-audio` — the ALSA playback back end
+
+`td-audio` is the audio daemon `APPLICATIONS.md` §K designs: the PCM back
+end, the mixer above it, a tone fixture, and the PulseAudio-protocol server
+that serves clients over a Unix socket. The dedicated `audio` account §K.5
+specifies is a rung of its own and lands separately; nothing here creates an
+account or a directory.
+
+§I's rung 25 and §K.5 both call this "surface #11". That was already
+`td-profiler` when the audio reversal reached the ladder, and `td-portal`
+has since taken #12, so both are corrected to #13 in the landing that adds
+this section. A surface number that names a different crate is the one
+error this roster cannot absorb, because the roster is the number.
+
+**Three syscalls.** `ioctl(2)`, carrying exactly the eleven PCM requests
+§K.4 pins; `poll(2)`, which is how a writer waits for the device to make
+room and how the daemon waits on its clients and its device together; and
+`getsockopt(2)`, pinned to `SOL_SOCKET`/`SO_PEERCRED` with a 12-byte
+`struct ucred`, which is how §K.5 authorizes a peer. Everything else rides
+`std`: the PCM node is an ordinary `std::fs::File` opened
+`O_WRONLY|O_NONBLOCK`, `/proc/asound/pcm` is an ordinary read, and the
+socket is a `std::os::unix::net::UnixListener`. There is no descriptor
+adoption and no mapping — this is the plain shape §§1–5 and 7–9 have.
+
+**`getsockopt(2)` is one syscall onto a wide space of operations, exactly as
+`ioctl(2)` is,** so the surface is the (level, option) PAIR rather than the
+number in `rax`: `SOL_SOCKET` (1) and `SO_PEERCRED` (17), both pinned by
+value, with the 12-byte length pinned too and the length the kernel writes
+back checked rather than assumed. `SO_PASSCRED` is 18 and `setsockopt(2)` is
+syscall 54 — the neighbours a slip reaches — and the confinement tests refuse
+both by name. A second option, or `setsockopt`, is an amendment here.
+
+**One scoped `#[allow]`, on the raw entry point and nowhere else.** Not on
+`mod sys;`: a module-level allowance exempts every line of the module, and a
+review demonstrated the consequence by appending a second, arbitrary
+`unsafe` block to `sys.rs` and watching every confinement test still pass.
+The function-level allowance is sufficient on its own, so the module-level
+one does not exist.
+
+**The bound is a count of the keyword, not a match on its shape.** Matching
+shapes was tried and does not hold. A second review broke every shape-based
+assertion three ways, compiling and running each: a block comment between the
+keyword and its brace, which is not whitespace and so survived the squeeze; a
+`cfg_attr` wrapping the allowance, which is not the literal the attribute
+counter looked for; and `//` inside an ordinary string literal, which blinded
+the line-comment strip for the rest of that line. Stripping comments cannot
+be made exact either — Rust block comments nest, and a string may contain a
+comment opener — so the tests count occurrences of the keyword itself, per
+file, against a pinned number. Rust has one spelling of it and no way to
+introduce a region without the text being present.
+
+**The pins carry no slack, and that is what makes them a bound.** A
+confirmation pass broke the first version of this rule, which pinned counts
+that were mostly prose. A count with room in it is a budget: delete a sentence
+that names the keyword, add a region that uses it, and the total does not
+move. That escape compiled, read arbitrary memory, and passed every test and
+the staged-source scan. So the budget is spent to nothing. Each pin equals
+exactly the tokens that must be there — the crate-level denial in the root,
+the scoped allowance and its block in `sys.rs`, three across the scanned set —
+and no comment in either file may name the keyword; the prose says "the
+keyword" instead. The staged-source scan in the recipe pins the same numbers
+over the bytes that ship, and the conditional-attribute form is refused
+outright, since it can spell any attribute the other assertions name.
+
+**And the scanned set is derived, not written down.** Three passes broke this
+confinement and the third one named the reason the first two kept working:
+both scans read a list somebody typed, and neither list was checked against
+the files the compiler actually reads or the recipe actually stages. A file
+in `src/` that no list mentions is reached by an include-by-path, which needs
+no module declaration, and it was staged, compiled and shipped with its own
+allowance while every assertion passed. So the crate's list is now checked
+against the directory, subdirectories are refused, include-by-path is
+refused, module declarations are read from whole file text rather than line by
+line, and the recipe's scan is built from the `WriteFile` steps the recipe
+emits rather than from the module table those steps happen to be generated
+from. The counts and the shapes bound what is scanned; these are what make
+"what is scanned" mean the crate.
+
+**One inline-assembly block, with five argument registers.** `getsockopt(2)`
+takes five arguments; the ioctls and `poll` reach the same block through a
+three-argument forwarder that supplies zeros. That is deliberately one
+register mapping rather than two: `r10`, not `rcx`, is the fourth syscall
+argument, and a second block would be a second place to get that wrong.
+
+**The eleven requests, each pinned by value:** `PVERSION` (`0x80044100`),
+`INFO` (`0x81204101`), `HW_REFINE` (`0xC2604110`), `HW_PARAMS`
+(`0xC2604111`), `SW_PARAMS` (`0xC0884113`), `DELAY` (`0x80084121`),
+`PREPARE` (`0x00004140`), `START` (`0x00004142`), `DROP` (`0x00004143`),
+`DRAIN` (`0x00004144`), `WRITEI_FRAMES` (`0x40184150`). A twelfth request
+is an amendment here. `ioctl(2)` is one syscall onto an unbounded space of
+operations, so the number in `rax` is not the surface — the request in
+`rsi` is.
+
+**No `mmap(2)`, and that is the design rather than an omission.** §K.4
+refuses the mapped-ring machinery outright: `SNDRV_PCM_ACCESS_RW_INTERLEAVED`
+drives the device through write ioctls and `poll`, and the kernel paces the
+writer. Taking the mapped ring would add a status page, a control page,
+`SYNC_PTR` and shared-memory boundary arithmetic to the surface in order to
+save a copy that is under 200 KiB/s at 48 kHz stereo `S16_LE`. The
+confinement tests refuse `SYNC_PTR` by name.
+
+**No control device.** `/dev/snd`'s `controlC*` nodes and the whole
+`SNDRV_CTL_IOCTL_*` universe are never opened: output volume is
+multiplication in the mixer, not a mixer element on a card. The tests refuse
+the `controlC` path literal anywhere in the crate and refuse a constant
+DECLARED under any of these names; that is a narrower claim than "refuse the
+path crate-wide" and it is the accurate one, because a request number the
+code composed inline would not be caught by a name-based scan. What closes
+that gap is a different test: every call site is pinned WHOLE, and the
+composer is used only where a request constant is declared, so an operation
+outside the roster has nowhere to be written.
+
+**No capture.** `READI_FRAMES` and `READN_FRAMES` are outside the surface,
+which is what makes §K.5's "no microphone in v1" a property of the code
+rather than a policy that could be forgotten.
+
+**The request numbers are composed from the pinned struct lengths.** The
+size field of an `_IOC` request encodes how many bytes the kernel copies, so
+`0xC2604111` and the 608-byte `snd_pcm_hw_params` are the same fact written
+twice. `sys.rs` writes it once: `ioc(dir, nr, LEN)` derives the request from
+the length, and changing the length changes the request, which the kernel's
+dispatch answers with `ENOTTY` rather than with a copy of a size nobody
+intended. A test pins the resulting values against a compile of the UAPI
+header, so a WRONG length cannot hold still either.
+
+That prevents one of the two failures, not both. The kernel copies the
+encoded number of bytes through whatever pointer it is handed and cannot
+know how large the caller's allocation is, so a correct request with an
+undersized buffer is still an out-of-bounds write. The second half is
+discharged by type: `PcmInfo`, `HwParams` and `SwParams` are newtypes over
+fixed-size arrays, one per request, and no call site sizes a buffer or
+composes a request by hand. `WRITEI_FRAMES` is the one request whose payload
+length is not fixed by its type — it names a frame count the kernel reads
+through a caller pointer — and its wrapper refuses a count the slice cannot
+back before any pointer is passed.
+
+**Every constant here is an x86-64 fact.** `snd_pcm_uframes_t` and
+`snd_pcm_sframes_t` are pointer-width, so the 608-byte layout, the request
+that encodes it, `DELAY`'s argument and `snd_xferi` all differ on a 32-bit
+target, and `_IOC`'s own bit layout differs on some architectures again. A
+`compile_error!` refuses any other target rather than letting a second
+architecture inherit these numbers and issue well-formed ioctls with the
+wrong size field — which is exactly the out-of-bounds case above.
+
+**The socket is not the gate; the peer's uid is.** §K.5 puts the socket at
+`/run/td-audio/native` with mode 0666 in a 0755 directory, deliberately, so
+that a jailed application can reach it — and authorizes on `SO_PEERCRED`
+instead, "in code that can say why it refused". The credentials are set by
+the kernel at `connect(2)` and cannot be forged by the peer, which is why
+§K.3 authenticates this way rather than by the cookie; the cookie is still
+parsed at its exact 256-byte length and then ignored.
+
+Confinement tests inventory every source file, pin all three syscall numbers
+by value, pin the socket level and option by value, pin all eleven request
+compositions, pin the single inline-assembly block whole and every call site
+whole, hold the raw entry point private and unnamed outside its definition
+and calls, pin the per-file count of the keyword itself, count unsafe regions
+in every syntactic form, check the scanned list against the files on disk and
+the recipe's scan against the steps it stages, refuse the inner attribute form
+of the allowance, refuse a conditionally written attribute, a block comment, an
+include-by-path, a subdirectory, and a module declared outside the crate root,
+and refuse the mmap family, the capture transfers, the control-device path
+literal and constants declared under the
+`SNDRV_CTL` names. A fourth syscall, a twelfth request, a second socket
+option, a second scoped allowance, or any descriptor adoption is an
+amendment here and in `APPLICATIONS.md` §K in the same landing.

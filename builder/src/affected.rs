@@ -337,6 +337,7 @@ const DQUOTE: u8 = 0x22;
 /// `every_recipe_that_stages_rust_sources_is_in_the_roster` holds this to the
 /// tree, so an entry cannot be quietly omitted.
 const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
+    ("td-audio/src", "recipes/src/recipes/td-audio.rs"),
     ("td-boot/src", "recipes/src/recipes/td-boot.rs"),
     ("td-busd/src", "recipes/src/recipes/td-busd.rs"),
     ("td-compositor/src", "recipes/src/recipes/td-compositor.rs"),
@@ -1114,6 +1115,23 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // same full cargo and recipe tiers.
     if pattern_matches(
         "td-portal/*|td-portal/src/*|td-portal/Cargo.toml|td-portal/Cargo.lock",
+        p,
+    ) {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
+    // td-audio: the audio daemon. A dependency-free crate embedded into its
+    // target-static recipe. Host cargo holds its PCM struct-layout, discovery,
+    // mixer, tone and unsafe-confinement assertions; recipe-checks holds the
+    // source-built static link. It is not selected into an image yet — the
+    // `/dev/snd` ownership, the unit, and the service-only credential class
+    // APPLICATIONS.md §K.5 names are still owed — so there is no image
+    // assertion to route to.
+    if pattern_matches(
+        "td-audio/*|td-audio/src/*|td-audio/Cargo.toml|td-audio/Cargo.lock",
         p,
     ) {
         sel.add_preflight("cargo-test");
@@ -2165,6 +2183,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-portal/default-settings.conf", "cargo-test");
     assert_target!("td-portal/Cargo.lock", "check");
     assert_target!("td-portal/Cargo.lock", "recipe-checks");
+    assert_preflight!("td-audio/src/main.rs", "cargo-test");
+    assert_preflight!("td-audio/src/sys.rs", "cargo-test");
+    assert_preflight!("td-audio/src/pcm.rs", "cargo-test");
+    assert_preflight!("td-audio/Cargo.lock", "cargo-test");
+    assert_target!("td-audio/src/main.rs", "check");
+    assert_target!("td-audio/src/main.rs", "recipe-checks");
+    assert_target!("td-audio/Cargo.lock", "recipe-checks");
     assert_preflight!("td-profiler/src/main.rs", "cargo-test");
     assert_preflight!("td-profiler/src/perf.rs", "cargo-test");
     assert_preflight!("td-profiler/src/raw.rs", "cargo-test");

@@ -236,7 +236,7 @@ Consequences worth stating plainly:
   daemon's identity is governed by a policy written for humans logging
   in. `system-x86-64` writes `!` for any user with `passwordless:
   false`, which is `Locked`, which `exec-as` refuses — so the first unit
-  that runs as a service uid (APPLICATIONS.md rung 25's planned `audio`)
+  that runs as a service uid (APPLICATIONS.md rung 24a's landed `audio`)
   would fail on every boot unless that account were `passwordless: true`,
   and an empty
   shadow field is one `login` and `su` will start an interactive session

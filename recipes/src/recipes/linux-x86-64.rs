@@ -426,8 +426,20 @@ pub fn recipe() -> Recipe {
     //    olddefconfig mechanism that handed us NET_NS would hand us an IPC namespace
     //    the moment somebody pins SYSVIPC for an unrelated reason. td-jail omits
     //    CLONE_NEWIPC until that is a decision rather than a side effect.
-    //    Audio (CONFIG_SND*) and FUSE_FS are deliberately absent: they land with
-    //    td-audio and the Documents portal respectively, each with its own argument.
+    //    Audio arrives here with td-audio (§K.4). SOUND/SND/SND_PCM are the core;
+    //    SND_PCI plus SND_HDA_INTEL and SND_HDA_GENERIC are the codec path that
+    //    covers both QEMU's `-device intel-hda` and ordinary desktop hardware, and
+    //    SND_ALOOP is the loopback device that lets a test capture what was played
+    //    without a speaker. SND_HDA itself is NOT pinned: SND_HDA_INTEL selects it
+    //    and it has no prompt of its own, so olddefconfig drops a line naming it
+    //    and writing one would read as a pin without being one. SND_PCM_OSS is
+    //    pinned OFF rather than left to
+    //    olddefconfig: §K.4 refuses OSS emulation on the merits ("Choosing a
+    //    deprecated compatibility shim to make an unsafe roster smaller is precisely
+    //    the bad trade the maintainer's premise forbids"), and a `default y` that
+    //    quietly enabled `sound/core/oss/pcm_oss.c` would put that shim in the image
+    //    while every td-audio ioctl kept using the native interface. FUSE_FS is
+    //    still deliberately absent: it lands with the Documents portal.
     //
     //    SECURITY_DMESG_RESTRICT (pinned OFF): with it on, an unprivileged
     //    /dev/kmsg open is EPERM, so the /bin/dmesg system-x86-64 ships from
@@ -531,7 +543,15 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_CFS_BANDWIDTH[ =]/d; \
                   /^#? *CONFIG_RT_GROUP_SCHED[ =]/d; \
                   /^#? *CONFIG_MEMCG[ =]/d; \
-                  /^#? *CONFIG_CGROUP_PIDS[ =]/d' .config && \
+                  /^#? *CONFIG_CGROUP_PIDS[ =]/d; \
+                  /^#? *CONFIG_SOUND[ =]/d; \
+                  /^#? *CONFIG_SND[ =]/d; \
+                  /^#? *CONFIG_SND_PCM[ =]/d; \
+                  /^#? *CONFIG_SND_PCM_OSS[ =]/d; \
+                  /^#? *CONFIG_SND_PCI[ =]/d; \
+                  /^#? *CONFIG_SND_HDA_INTEL[ =]/d; \
+                  /^#? *CONFIG_SND_HDA_GENERIC[ =]/d; \
+                  /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
@@ -615,7 +635,15 @@ pub fn recipe() -> Recipe {
                    'CONFIG_CFS_BANDWIDTH=y' \
                    '# CONFIG_RT_GROUP_SCHED is not set' \
                    'CONFIG_MEMCG=y' \
-                   'CONFIG_CGROUP_PIDS=y' >> .config",
+                   'CONFIG_CGROUP_PIDS=y' \
+                   'CONFIG_SOUND=y' \
+                   'CONFIG_SND=y' \
+                   'CONFIG_SND_PCM=y' \
+                   '# CONFIG_SND_PCM_OSS is not set' \
+                   'CONFIG_SND_PCI=y' \
+                   'CONFIG_SND_HDA_INTEL=y' \
+                   'CONFIG_SND_HDA_GENERIC=y' \
+                   'CONFIG_SND_ALOOP=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -697,6 +725,12 @@ pub fn recipe() -> Recipe {
                  if grep -q '^CONFIG_RT_GROUP_SCHED=y' .config; then echo 'RT_GROUP_SCHED on — real-time tasks in the populated root can block enabling the cpu controller, and td does not delegate real-time bandwidth' >&2; exit 1; fi; \
                  grep -q '^CONFIG_MEMCG=y' .config || { echo 'MEMCG off — memory.max/memory.high do not exist, so a multi-process app is bounded only per process' >&2; exit 1; }; \
                  grep -q '^CONFIG_CGROUP_PIDS=y' .config || { echo 'CGROUP_PIDS off — pids.max does not exist, so nothing bounds a fork bomb inside a jail' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_PCM=y' .config || { echo 'SND_PCM off — /dev/snd/pcmC*D*p would not exist, so td-audio has no device to open (APPLICATIONS.md K.4)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_INTEL=y' .config || { echo 'SND_HDA_INTEL off — QEMU -device intel-hda and ordinary desktop codecs both go through it, so /proc/asound/pcm would be empty' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_GENERIC=y' .config || { echo 'SND_HDA_GENERIC off — the HDA controller would bind no codec, so the card would enumerate with no playback device' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_ALOOP=y' .config || { echo 'SND_ALOOP off — nothing can capture what was played, so the tone fixture has no in-image oracle' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off — td-audio discovers devices through /proc/asound/pcm' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_SND_PCM_OSS=y' .config; then echo 'SND_PCM_OSS on — APPLICATIONS.md K.4 refuses the deprecated OSS emulation layer on the merits, and olddefconfig must not bring it back as a default' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi",
             ],
         )

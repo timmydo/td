@@ -23,11 +23,11 @@ symlinks, assigns them to the graphical user with mode 0600, verifies the
 result, and exits. It also verifies the root-owned mode-0755 `/run` parent and
 creates the audio-owned mode-0755 `/run/td-audio` directory for the future
 audio service. It assigns no sound device and starts no audio process yet; the
-current kernel has no `/dev/snd`. This gives the active user the seat
-capability directly without making the future audio identity a compositor
-capability. It deliberately provides no multi-user arbitration, descriptor
-revocation, hotplug, suspend/resume, or VT switching. `APPLICATIONS.md` §K.5
-owns the audio boundary.
+kernel builds ALSA as of rung 25, but no seat assigns `/dev/snd`. This gives
+the active user the seat capability directly without making the future audio
+identity a compositor capability. It deliberately provides no multi-user
+arbitration, descriptor revocation, hotplug, suspend/resume, or VT
+switching. `APPLICATIONS.md` §K.5 owns the audio boundary.
 
 The assignment is path-based because safe `std` exposes path ownership and
 permission operations, not `fchown(2)`. There is consequently a check/use

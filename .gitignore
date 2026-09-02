@@ -97,3 +97,8 @@ td-profiler/target/
 # td-portal: shipped by a direct rustc recipe, but also compiled directly
 # during host validation; keep those local Cargo artifacts out of selection.
 td-portal/target/
+
+# td-audio: shipped by a direct rustc recipe, but also compiled directly by the
+# cargo-test preflight and during host validation of the PCM back end; keep
+# those local Cargo artifacts out of selection.
+td-audio/target/

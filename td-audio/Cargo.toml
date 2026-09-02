@@ -1,0 +1,37 @@
+[package]
+name = "td-audio"
+version = "0.1.0"
+edition = "2021"
+description = "td's audio daemon: the ALSA PCM back end and its mixer"
+license = "GPL-3.0-or-later"
+
+# This crate's confinement assertions live in test targets, so the lint pass
+# has to reach them.
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[workspace]
+
+[[bin]]
+name = "td-audio"
+path = "src/main.rs"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+# Host builds only. The SHIPPED binary goes through the recipe's
+# `target_rustc`, which supplies -Cforce-frame-pointers=yes,
+# -Cdebuginfo=line-tables-only and -Cstrip=none plus a split debug companion,
+# as td-profiler/DESIGN.md requires. Stripping here keeps a `cargo build
+# --release` on a development machine small; profile that binary and there is
+# nothing to symbolise, which is the trap this comment exists to name.
+strip = true
