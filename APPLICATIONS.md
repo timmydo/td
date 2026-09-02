@@ -6650,6 +6650,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 22 | **FileChooser `OpenFile`, modal surface and Firefox image oracle LANDED**: the bounded directory, filter, selection, URI and PSF2 pixel core is joined to asynchronous broker-authenticated D-Bus Request routing and the private Wayland manager. A host peer reads the real shm pixels, supplies the exact keymap, drives a protocol-level selection and checks the directed guest URI. The offline system boot additionally makes Firefox issue the call, hashes the captured centred modal pixels, selects physically, and validates the returned file bytes in content. Save, Documents, OpenURI, Screenshot and Notification remain absent | a real modal chooser completes from Firefox without manual inspection |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
+| 24a | **dedicated audio service identity — LANDED**: the immutable account table carries locked, non-login `audio` uid/gid 994, and the seat assignment receives both the distinct graphical and audio identities. It creates and reads back `/run/td-audio` as audio-owned mode 0755 while retaining `/run/user/1000` as tester-owned mode 0700. Sound-device ownership and the service-only `td-login` credential class wait for the first ALSA backend, because no daemon starts in this precursor and the current kernel intentionally creates no `/dev/snd` nodes | the privilege and socket-directory boundary exists before an adversarial audio parser does |
 | 25 | **`td-audio` crate + surface #11**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients | **sound from the machine** |
 | 26 | `td-audio`'s PulseAudio protocol: frames, tagstruct codec, `AUTH`/`SET_CLIENT_NAME`/sink info, one playback stream; `sockets=pulseaudio` binds the socket into a jail | a jailed fixture app plays audio |
 | 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The initial proof selected a fresh volatile automation profile and fixed local document, then accepted only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributed both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. Rung 27a retains that authority and replaces the local-file transport with verified HTTPS. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints deterministic content without manual inspection |
@@ -7094,21 +7095,22 @@ exists — and not the user's files, sockets or session.
 reviews found all three. They are the cost side of the decision, not
 arguments against it.**
 
-*The account does not exist, and the image refuses to invent one
-quietly.* `system-x86-64.rs` declares exactly `root` and `tester`, and
-its group builder materialises exactly `root`, `tester`, `wheel` (10)
-and `tty` (5) — any other supplementary group is rejected at `cargo
-test` until it is given a gid there, which is the check working rather
-than an obstacle. So the audio uid needs: an account and gid in that
-table, `td-seatd` chowning `/dev/snd/*` to it beside its existing
-device duty, and a unit that starts the daemon under it — which today
-means `exec=/bin/su -s /bin/sh audio -c …`, since `td-svc` has no
-`User=`. None of that is on §I's ladder, where rungs 25 and 26 are the
-crate and the protocol; it is a rung of its own and it comes first,
-because a daemon with no account to run as cannot be started at all.
-`system-x86-64.rs` is on §V.2's do-not-touch list, so this is also the
-one place the audio work reaches into the image recipe and it should be
-sequenced with whoever owns it.
+*The dedicated account and runtime-directory prerequisite is landed.*
+`system-x86-64.rs` now declares locked `audio` uid/gid 994 beside the
+existing system identities, and the seat unit passes that exact identity
+to `td-seatd`. The assigner creates `/run/td-audio` as mode 0755 owned by
+`audio`, reads the result back, and keeps the uid/gid distinct from the
+graphical account. The account has a non-login `/bin/false` shell.
+Its home is the same volatile `/run/td-audio` directory; image generation
+does not create, chown, or probe a persistent `/var`-backed audio home.
+`/dev/snd/*` ownership and the daemon unit remain with the
+hardware/backend landing: the current kernel deliberately has no sound
+nodes, and claiming them before that rung would make a missing device
+indistinguishable from a supported machine. A locked account is also
+correctly refused by today's `td-login exec-as`; the daemon landing must
+add the service-only credential class specified by
+`td-login/THREAT-MODEL.md`, then use that typed path rather than `su` or a
+passwordless account. `td-svc` still has no `User=` directive.
 
 *The socket's permissions have to be stated, because the obvious two
 choices are each wrong.* If `/run/td-audio` is private to `audio` (0700),
@@ -7200,7 +7202,7 @@ sound server. Budget the middle.
 | component | uid | why |
 |---|---|---|
 | `td-svc` | root | the supervisor |
-| `td-seatd` | root, oneshot | assigns `/dev/fb0`, `/dev/input/*`, `/dev/snd/*`; makes `/run/user/1000` and `/run/td-audio`; exits before any uid-1000 code |
+| `td-seatd` | root, oneshot | assigns `/dev/fb0` and `/dev/input/*`; makes `/run/user/1000` and the audio-owned `/run/td-audio`; the ALSA landing extends its device duty to `/dev/snd/*` |
 | `td-compositor` | 1000 | owns the session |
 | `td-busd` | 1000 | **required**, see below |
 | `td-portal` | 1000 | reads the user's files in order to show them |
@@ -7391,7 +7393,7 @@ convention among cooperating processes, not a boundary.
 
 1. **`td-seatd` does not hand the compositor exclusive devices; it
    CHOWNS them to the seat user.** `assign_path`
-   (`td-seatd/src/main.rs:110-117`) `lchown`s `/dev/fb0` and every
+   (`td-seatd/src/main.rs`) `lchown`s `/dev/fb0` and every
    `/dev/input/event*` to the seat account at mode 0600, so **every
    uid-1000 process can open them** — read every keystroke including the
    approval one, and open `/dev/fb0` `O_RDWR` to paint over a

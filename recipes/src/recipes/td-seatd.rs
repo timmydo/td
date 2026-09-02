@@ -81,11 +81,16 @@ pub fn recipe() -> Recipe {
 
 #[cfg(test)]
 mod tests {
+    use super::super::system_x86_64::AUDIO_RUNTIME;
     use super::*;
 
     #[test]
     fn recipe_embeds_the_linted_crate_source() {
         let steps = recipe().steps.expect("td-seatd steps");
+        let production = MAIN_RS
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("td-seatd production source");
         assert!(steps.iter().any(|step| {
             matches!(
                 step,
@@ -93,10 +98,17 @@ mod tests {
                     if path == "{src}/main.rs" && content == MAIN_RS
             )
         }));
-        assert!(MAIN_RS.contains("#![forbid(unsafe_code)]"));
-        assert!(MAIN_RS.contains(
-            "fs::set_permissions(path, Permissions::from_mode(0o700))"
+        assert!(production.contains("#![forbid(unsafe_code)]"));
+        assert!(production.contains("prepare_owned_runtime(path, account, 0o700)"));
+        assert!(production.contains("verify_owner_mode(path, account, mode)"));
+        assert!(production.contains(&format!("const AUDIO_RUNTIME: &str = {AUDIO_RUNTIME:?};")));
+        assert!(production.contains("verify_runtime_base(base, require_root_base)?;"));
+        assert!(production.contains("prepare_owned_runtime(path, account, 0o755)"));
+        assert!(production.contains(
+            "prepare_audio_runtime(audio_runtime, assignment.audio, require_char)?;"
         ));
-        assert!(MAIN_RS.contains("verify_owner_mode(path, account, 0o700)"));
+        assert!(production.contains(
+            "verify_owner_mode(audio_runtime, assignment.audio, 0o755)?;"
+        ));
     }
 }

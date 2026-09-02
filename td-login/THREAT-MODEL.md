@@ -236,35 +236,39 @@ Consequences worth stating plainly:
   daemon's identity is governed by a policy written for humans logging
   in. `system-x86-64` writes `!` for any user with `passwordless:
   false`, which is `Locked`, which `exec-as` refuses — so the first unit
-  that runs as a service uid (APPLICATIONS.md rung 5's `audio`) fails on
-  every boot unless that account is `passwordless: true`, and an empty
+  that runs as a service uid (APPLICATIONS.md rung 25's planned `audio`)
+  would fail on every boot unless that account were `passwordless: true`,
+  and an empty
   shadow field is one `login` and `su` will start an interactive session
   for with no authentication at all. Hardening a daemon identity the
   ordinary way breaks the unit; the spelling that works makes the
   account world-loginable, which is the opposite of what AGENTS.md
   principle 7 wants.
 
-  The shipped image has one locked service identity: OpenSSH's `sshd`
-  privilege-separation account. It is not a td-svc `exec-as` target; OpenSSH
-  performs its own fixed-purpose drop. The account has a `!` shadow field,
-  `/bin/false` shell, and an empty root-owned `/run/sshd-empty` chroot recreated
-  before the daemon starts, so neither td-login forced modes nor an interactive
-  login can enter it.
+  The shipped image has three locked service identities. OpenSSH's `sshd`
+  privilege-separation account and `td-profiler`'s `profiler` account are not
+  td-svc `exec-as` targets; each daemon performs its own fixed-purpose drop.
+  The `sshd` account has a `/bin/false` shell and an empty root-owned
+  `/run/sshd-empty` chroot recreated before the daemon starts. The `audio`
+  account likewise has a `/bin/false` shell and a volatile `/run/td-audio`
+  home, but no process runs as it before the planned backend landing. None of
+  the three can be entered through td-login's forced modes or an interactive
+  login.
 
   What closes the remaining `exec-as` constraint is a THIRD `Secret` class —
   locked for login, permitted for `exec-as` — and that is a policy amendment to
-  this section, landing with the first td-svc service account that needs it rather
-  than speculatively before one exists. It is written down here so that account is
-  not made world-loginable by accident.
+  this section, landing with the audio backend's first td-svc service account
+  rather than speculatively before it exists. It is written down here so that
+  account is not made world-loginable by accident.
 - `system-x86-64`'s `system_def_is_self_consistent` test refuses to ship
   a `SYSTEM` definition whose auto-login user is not passwordless, so the
   image cannot be tailored into a machine that will not let anyone in.
-- Every account on the stock image is `passwordless: true`, so the
-  console is trusted **by image configuration**, not by td-login. That
-  is a property of the shipped `SYSTEM` const — set `passwordless:
-  false` to lock an account — and it is unchanged from the busybox
-  chain this replaces, which also accepted the empty shadow field
-  without prompting.
+- Both interactive accounts on the stock image, `root` and `tester`, are
+  `passwordless: true`, so the console is trusted **by image
+  configuration**, not by td-login. The service identities above are
+  locked. These are properties of the shipped `SYSTEM` const, and the
+  interactive behavior is unchanged from the busybox chain this replaces,
+  which also accepted the empty shadow field without prompting.
 
 ## 4. Privilege can only be dropped, never gained
 

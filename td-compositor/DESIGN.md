@@ -20,17 +20,23 @@ Linux devtmpfs + sysfs + fbdev + evdev
 one permanently configured local seat. It creates `/run/user/1000`, validates
 `/dev/fb0` and every `/dev/input/eventN` as real character devices rather than
 symlinks, assigns them to the graphical user with mode 0600, verifies the
-result, and exits. This gives the active user the seat capability directly.
-It deliberately provides no multi-user arbitration, descriptor revocation,
-hotplug, suspend/resume, or VT switching.
+result, and exits. It also verifies the root-owned mode-0755 `/run` parent and
+creates the audio-owned mode-0755 `/run/td-audio` directory for the future
+audio service. It assigns no sound device and starts no audio process yet; the
+current kernel has no `/dev/snd`. This gives the active user the seat
+capability directly without making the future audio identity a compositor
+capability. It deliberately provides no multi-user arbitration, descriptor
+revocation, hotplug, suspend/resume, or VT switching. `APPLICATIONS.md` §K.5
+owns the audio boundary.
 
 The assignment is path-based because safe `std` exposes path ownership and
 permission operations, not `fchown(2)`. There is consequently a check/use
-window between rejecting a symlink and changing the node. The fixed `/dev` and
-`/run/user` parents remain root-owned, and `td-seatd` runs before any uid 1000
-process, so the assigned user cannot replace a checked name in that window.
-Supporting hot seat reassignment after login would require an fd-based,
-separately reviewed syscall surface.
+window between rejecting a symlink and changing the node. The fixed `/dev`,
+`/run`, and `/run/user` parents remain root-owned, so neither assigned identity
+can replace a checked entry even if another unprivileged service is already
+running. No audio process exists in this precursor. Supporting hot seat
+reassignment after login would require an fd-based, separately reviewed
+syscall surface.
 
 `td-compositor` runs as uid 1000. It opens only the assigned framebuffer and
 evdev nodes. It renders XRGB8888 pixels in software, reads Linux input events,

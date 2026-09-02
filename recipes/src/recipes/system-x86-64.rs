@@ -186,6 +186,10 @@ const SSHD_PRIVSEP_USER: &str = "sshd";
 const SSHD_PRIVSEP_UID: u32 = 995;
 const SSHD_PRIVSEP_GID: u32 = 995;
 const SSHD_PRIVSEP_PATH: &str = "/run/sshd-empty";
+const AUDIO_USER: &str = "audio";
+const AUDIO_UID: u32 = 994;
+const AUDIO_GID: u32 = 994;
+pub(super) const AUDIO_RUNTIME: &str = "/run/td-audio";
 const PROFILER_CAPTURE_SECS: u16 = 60;
 const PROFILER_EVIDENCE_TIMEOUT_SECS: u16 = 300;
 const PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS: u16 = 315;
@@ -318,6 +322,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == 0 {
         return home == "/root";
     }
+    if uid == AUDIO_UID {
+        return home == AUDIO_RUNTIME;
+    }
     home.strip_prefix("/home/").is_some_and(|name| {
         name != "."
             && name != ".."
@@ -361,6 +368,16 @@ const SYSTEM: SystemDef = SystemDef {
             gecos: "System Profiler",
             home: "/home/profiler",
             shell: "/bin/sh",
+            groups: &[],
+            passwordless: false,
+        },
+        User {
+            name: AUDIO_USER,
+            uid: AUDIO_UID,
+            gid: AUDIO_GID,
+            gecos: "System Audio",
+            home: AUDIO_RUNTIME,
+            shell: "/bin/false",
             groups: &[],
             passwordless: false,
         },
@@ -912,6 +929,11 @@ fn build_group(sys: &SystemDef) -> String {
     s
 }
 
+fn gets_generic_persistent_home_setup(user: &User) -> bool {
+    // Root is handled explicitly; audio's home is volatile.
+    user.uid != 0 && user.name != AUDIO_USER
+}
+
 fn build_shadow(sys: &SystemDef) -> String {
     let mut s = String::new();
     for u in sys.users {
@@ -1178,10 +1200,10 @@ fn build_td_svc_conf() -> String {
          log=/var/log/svc/td-profiler-evidence.log\n\
          console=yes\n\
          \n\
-         # The one graphical user owns the fixed framebuffer and evdev seat.\n\
+         # The graphical user owns the framebuffer and evdev seat; audio gets its volatile runtime.\n\
          [seat]\n\
          type=oneshot\n\
-         exec=/bin/td-seatd assign --uid {ui_uid} --gid {ui_gid}\n\
+         exec=/bin/td-seatd assign --uid {ui_uid} --gid {ui_gid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
          after=rootcheck\n\
          timeout={seat}\n\
          \n\
@@ -1420,6 +1442,8 @@ fn build_td_svc_conf() -> String {
         bootfail = svc_timeouts::BOOTFAIL,
         ui_user = UI_USER,
         ui_uid = UI_UID,
+        audio_uid = AUDIO_UID,
+        audio_gid = AUDIO_GID,
         portal_settings = TD_PORTAL_SETTINGS_PATH,
         portal_runtime_marker = TD_PORTAL_RUNTIME_MARKER,
         portal_request_runtime_marker = TD_PORTAL_REQUEST_RUNTIME_MARKER,
@@ -1538,7 +1562,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/td-util mkdir -p /sysroot/var/log /sysroot/var/home"
         .to_string();
     for user in sys.users {
-        if user.home != "/root" {
+        if gets_generic_persistent_home_setup(user) {
             init.push_str(&format!(" /sysroot/var{}", user.home));
         }
     }
@@ -1563,7 +1587,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
          /bin/td-util chmod 0700 /sysroot/var/root\n"
     ));
     for user in sys.users {
-        if user.home != "/root" {
+        if gets_generic_persistent_home_setup(user) {
             init.push_str(&format!(
                 "/bin/td-util chmod 0700 /sysroot/var{}\n",
                 user.home
@@ -1686,9 +1710,10 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          /bin/chown 0:0 {SSHD_PRIVSEP_PATH} || ok=0\n\
          /bin/chmod 0755 {SSHD_PRIVSEP_PATH} || ok=0\n"
     ));
-    // Home ownership below the writable /var mount (skip root, which already owns it).
+    // Persistent home ownership below /var. The audio account's home is the
+    // volatile runtime that td-seatd creates after this check.
     for u in sys.users {
-        if u.uid != 0 {
+        if gets_generic_persistent_home_setup(u) {
             s.push_str(&format!(
                 "/bin/td-util chown {}:{} {} 2>/dev/null || ok=0\n",
                 u.uid, u.gid, u.home
@@ -1711,8 +1736,8 @@ fn build_rootcheck(sys: &SystemDef) -> String {
             // load-bearing: a stale root-owned `/var/.tdwr-su` makes the unprivileged
             // write fail with EACCES even where `/var` is world-writable, and that
             // failure would read as a pass. `home` sits inside DOUBLE quotes, so `$`
-            // and `"` would be live; `valid_home` admits only `/home/<alnum . _ ->`,
-            // which is what makes that safe.
+            // and `"` would be live. The image-wide source contract pins the
+            // autologin account to UI_HOME, a shell-safe direct child of /home.
             s.push_str(&format!(
                 "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su {home}/.tdwr-su || ok=0\n\
                  if /bin/su -s /bin/sh {name} -c \
@@ -1788,7 +1813,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     s.push_str(&build_mutable_etc_check(sys));
     let mut probe_paths = "/var /run /tmp /home /root".to_string();
     for user in sys.users {
-        if user.home != "/root" {
+        if gets_generic_persistent_home_setup(user) {
             probe_paths.push(' ');
             probe_paths.push_str(user.home);
         }
@@ -4474,6 +4499,30 @@ mod tests {
     }
 
     #[test]
+    fn audio_identity_is_locked_and_seat_prepares_its_runtime() {
+        let account = SYSTEM
+            .users
+            .iter()
+            .find(|user| user.name == AUDIO_USER)
+            .unwrap_or_else(|| unreachable!("no audio account"));
+        assert_eq!(
+            (account.uid, account.gid, account.passwordless),
+            (AUDIO_UID, AUDIO_GID, false)
+        );
+        assert!(build_passwd(&SYSTEM).contains(&format!(
+            "{AUDIO_USER}:x:{AUDIO_UID}:{AUDIO_GID}:System Audio:{AUDIO_RUNTIME}:/bin/false\n"
+        )));
+        assert!(build_group(&SYSTEM).contains(&format!(
+            "{AUDIO_USER}:x:{AUDIO_GID}:\n"
+        )));
+        assert!(build_shadow(&SYSTEM).contains(&format!("{AUDIO_USER}:!:")));
+        let init = build_deployment_init(&SYSTEM);
+        let rootcheck = build_rootcheck(&SYSTEM);
+        assert!(!init.contains("/sysroot/var/run/td-audio"));
+        assert!(!rootcheck.contains(AUDIO_RUNTIME));
+    }
+
+    #[test]
     fn profiler_is_static_indexed_persistent_and_privilege_separated() {
         let account = SYSTEM
             .users
@@ -6064,6 +6113,40 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
     /// never packed into /bin.
     #[test]
     fn system_def_is_self_consistent() {
+        let group_text = build_group(&SYSTEM);
+        let groups: Vec<(&str, u32)> = group_text
+            .lines()
+            .map(|line| {
+                let mut fields = line.split(':');
+                let name = fields
+                    .next()
+                    .unwrap_or_else(|| unreachable!("group without a name"));
+                let _password = fields
+                    .next()
+                    .unwrap_or_else(|| unreachable!("group without a password field"));
+                let gid = fields
+                    .next()
+                    .unwrap_or_else(|| unreachable!("group without a gid"))
+                    .parse::<u32>()
+                    .unwrap_or_else(|_| unreachable!("group with a non-numeric gid"));
+                (name, gid)
+            })
+            .collect();
+        for (name, gid) in &groups {
+            assert_eq!(
+                groups.iter().filter(|(candidate, _)| candidate == name).count(),
+                1,
+                "group name '{name}' must be unique"
+            );
+            assert_eq!(
+                groups
+                    .iter()
+                    .filter(|(_, candidate)| candidate == gid)
+                    .count(),
+                1,
+                "group gid {gid} must be unique"
+            );
+        }
         for user in SYSTEM.users {
             assert_eq!(
                 SYSTEM
@@ -6074,6 +6157,26 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 1,
                 "user name '{}' must be unique",
                 user.name
+            );
+            assert_eq!(
+                SYSTEM
+                    .users
+                    .iter()
+                    .filter(|candidate| candidate.uid == user.uid)
+                    .count(),
+                1,
+                "uid {} must belong to exactly one user",
+                user.uid
+            );
+            assert_eq!(
+                SYSTEM
+                    .users
+                    .iter()
+                    .filter(|candidate| candidate.gid == user.gid)
+                    .count(),
+                1,
+                "primary gid {} must belong to exactly one user",
+                user.gid
             );
         }
         assert!(
@@ -6114,9 +6217,10 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         assert_eq!(
             unit_key("seat", "exec"),
             Some(format!(
-                "/bin/td-seatd assign --uid {UI_UID} --gid {UI_GID}"
+                "/bin/td-seatd assign --uid {UI_UID} --gid {UI_GID} \
+                 --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID}"
             )),
-            "the seat service must create the application runtime for the compiled identity"
+            "the seat service must create both compiled runtime identities"
         );
         // td-login refuses `login -f` for a LOCKED account — stricter than busybox, whose
         // `-f` skips the account database entirely (td-login/THREAT-MODEL.md section 3). So a
@@ -8046,7 +8150,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         );
         assert!(
             init.contains("subvol=@var /dev/vda /sysroot/var")
-                && init.contains("tmpfs /sysroot/run")
+                && init.contains("mount -t tmpfs -o mode=0755 tmpfs /sysroot/run")
                 && init.contains("tmpfs /sysroot/tmp")
                 && init.contains("rm -rf /sysroot/var/run")
                 && init.contains("ln -s /run /sysroot/var/run"),
@@ -8074,15 +8178,20 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         );
         for user in SYSTEM.users {
             let path = format!("/sysroot/var{}", user.home);
-            assert!(
-                init.contains(&path),
-                "stage-1 init must create state directory {path} before switch_root"
-            );
-            if user.home != "/root" {
+            if gets_generic_persistent_home_setup(user) {
+                assert!(
+                    init.contains(&path),
+                    "stage-1 init must create state directory {path} before switch_root"
+                );
                 assert!(
                     init.contains(&format!("chmod 0700 {path}")),
                     "stage-1 init must make application home {path} private"
                 );
+            } else if user.uid == 0 {
+                assert!(init.contains("/sysroot/var/root"));
+            } else {
+                assert_eq!(user.name, AUDIO_USER);
+                assert!(!init.contains(&path));
             }
         }
         assert!(
@@ -8214,6 +8323,8 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         }
         assert!(valid_home(0, "/root"));
         assert!(valid_home(1000, "/home/test-user_1.0"));
+        assert!(valid_home(AUDIO_UID, AUDIO_RUNTIME));
+        assert!(!valid_home(AUDIO_UID, "/home/audio"));
     }
 
     /// The read-only-root self-check must emit both diagnostic markers the headless
@@ -8768,9 +8879,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             )),
             "the immutable root must pack td-boot and expose /bin/td-boot for transactions"
         );
-        // Home ownership is fixed for every non-root user below /var.
+        // Persistent home ownership is fixed for every applicable user below
+        // /var. Audio's home is the volatile runtime created by td-seatd.
         for u in SYSTEM.users {
-            if u.uid != 0 {
+            if gets_generic_persistent_home_setup(u) {
                 assert!(
                     rootcheck.contains(&format!("chown {}:{} {}", u.uid, u.gid, u.home)),
                     "rootcheck must chown {}'s /var-backed home",
