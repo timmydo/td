@@ -7629,6 +7629,19 @@ What to change now, while it is cheap — and nothing more:
 | `/dev/dri` simply absent | an explicit `devices=dri` policy branch, parsed and refused (§C) |
 | software env vars | keep them strictly per runtime-major and removable, never compiled in |
 
+**What has landed against that table**, kept here rather than by
+rewriting the rows, so the table stays the plan it was and this stays the
+state. Row 1: `td-compositor/src/buffer.rs` holds a `SurfaceBuffer` whose one
+variant is `ShmSnapshot`; linear CPU bytes and opacity are questions asked of
+the buffer rather than fields read off it, and `ShmSnapshot::new` holds the
+packing, non-zero-dimension and format invariants the renderer and that
+opacity rule rely on — the format one because a third `wl_shm` value would
+blend where the old renderer drew opaque, a changed appearance with no
+error anywhere. The reach of
+that is exact and smaller than it sounds — adding a variant is a compile
+error at each accessor, not at each caller — which is why row 4 remains the
+seam that makes a caller change.
+
 Three seams are already right and must stay: `Scene::render` is pure
 bytes-in-bytes-out and needs nothing; `framebuffer.rs` is already the
 only module that touches the device; and `server.rs::copy_buffer` is the

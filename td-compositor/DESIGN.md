@@ -1205,6 +1205,60 @@ positioned reads, so client mutation after commit cannot race the renderer.
 The compositor never maps client memory. ARGB8888 follows Wayland's
 premultiplied-alpha rule.
 
+What that copy becomes is a BUFFER rather than a pixel array. `buffer.rs`
+holds a `SurfaceBuffer` whose one variant today is `ShmSnapshot` — the copied
+bytes, their geometry, and the format the client declared — and the
+hardware-rendering landing `APPLICATIONS.md` §M plans adds `Dmabuf { planes,
+fourcc, modifier, fences }` beside it.
+
+What the enum buys while it has one variant, stated exactly, because the
+loose version of this claim is worth more than it is true. Every accessor
+answers by an exhaustive match, so adding a variant is a compile error inside
+`buffer.rs` at each accessor that must answer for it. It does NOT make every
+consumer revisit its assumptions: consumers see the answer, not the kind. The
+reach is therefore "the answers must be written", not "the callers must
+agree", and the one caller-visible question a new kind really does change —
+byte ceilings that cannot charge a card's memory in CPU bytes — is §M's
+fourth row and a separate increment. `resident_bytes` deliberately does not
+pre-commit what a second kind would answer, because answering zero there
+would make every ceiling that consumes it silently unbounded.
+
+Two questions are asked of the buffer rather than computed from its fields.
+Linear CPU bytes, which a dmabuf has only through a mapping, return an
+`Option`, and four production readers ask. None takes the empty path today,
+because the one variant always has bytes; what the split records is which of
+them WOULD once a second variant lands. Three would. `draw_surface` draws
+nothing, which is what §M's refusal to advertise dmabuf before a CPU
+composition fallback exists means in code. The application content scan says
+nothing AND drops any count it stored for the buffer that was replaced, since
+a retained count would be read as current. `drawn_cursor_image` reports no
+cursor, because published evidence must describe what was drawn. The fourth,
+`surface_rgb_at`, would still not be reached even then: its only caller is
+the diagnostic sampling below the content scan's own check, so a buffer that
+got that far is already known readable. Its own `?` is defensive against a
+caller that does not exist yet.
+
+Opacity is the second question. `pixel_is_opaque` answers per kind instead of
+each caller comparing a raw format number against a `wl_shm` enumerant, which
+a DRM fourcc would satisfy or fail by accident. `ShmSnapshot::new` admits
+only the two formats that rule is total over, so the predicate never meets a
+value it cannot answer for.
+
+`ShmSnapshot::new` re-checks that the bytes are exactly `width * 4 * height`,
+that neither dimension is zero, and that the format is one of the two. All
+three are invariants something else already relies on rather than
+descriptions of the data. `Scene::render` walks `chunks_exact(width * 4)` and
+takes `height` of them, so a disagreeing length draws a short or sheared
+image with nothing to say why. `chunks_exact(0)` panics, so a zero dimension
+is a panicking shape rather than an empty picture. And `pixel_is_opaque` is
+total only over the two admitted formats, so a third would BLEND where the
+old renderer drew opaque — a changed appearance with no error anywhere.
+`server.rs::copy_buffer` remains the single buffer-ingestion point. It is
+not the only place a `Surface` is constructed — the `selftest` subcommand
+builds a one-pixel one — and that is the point of moving the checks into the
+constructor: they hold at every construction site rather than at a privileged
+one.
+
 An XDG toplevel becomes eligible to map only after the client performs the
 required empty initial wl_surface commit and acknowledges the resulting
 xdg_surface configure serial. A buffer attached before that handshake is a

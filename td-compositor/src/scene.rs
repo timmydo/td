@@ -1,4 +1,5 @@
 use crate::bar::{self, BAR_HEIGHT};
+use crate::buffer::Surface;
 use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
 use crate::layout::{Axis, Command, DropKind, Layout, Placement, Presentation, Rect, ViewLayout};
@@ -7,8 +8,9 @@ use crate::MAX_UI_DIMENSION;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-pub const SHM_ARGB8888: u32 = 0;
-pub const SHM_XRGB8888: u32 = 1;
+// The buffer owns the format vocabulary; the scene re-exports it so the
+// renderer and the protocol keep spelling it the one way.
+pub use crate::buffer::{SHM_ARGB8888, SHM_XRGB8888};
 pub(crate) const GAP: usize = 24;
 const BORDER: usize = 4;
 /// One line of 2x glyphs with a little air, as the status bar is sized. The
@@ -53,13 +55,6 @@ pub(crate) const MAX_CURSOR_BYTES_PER_CLIENT: usize = 1024 * 1024;
 pub struct SurfaceKey {
     pub client: u64,
     pub object: u32,
-}
-
-pub struct Surface {
-    pub width: usize,
-    pub height: usize,
-    pub pixels: Vec<u8>,
-    pub format: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,8 +150,8 @@ impl Crop {
         Crop {
             x: 0,
             y: 0,
-            width: surface.width,
-            height: surface.height,
+            width: surface.width(),
+            height: surface.height(),
         }
     }
 }
@@ -931,14 +926,14 @@ impl Scene {
         // way, would freeze an animated cursor on a frame while the client
         // believed every one of them took. The cross says something is
         // wrong; a stale frame says nothing.
-        let refused = image.width > MAX_CURSOR_DIMENSION
-            || image.height > MAX_CURSOR_DIMENSION
-            || !self.cursor_fits(key, image.pixels.len());
+        let refused = image.width() > MAX_CURSOR_DIMENSION
+            || image.height() > MAX_CURSOR_DIMENSION
+            || !self.cursor_fits(key, image.resident_bytes());
         if refused {
             return self.forget_cursor_image(key) && drawn;
         }
         self.forget_cursor_image(key);
-        self.cursor_bytes = self.cursor_bytes.saturating_add(image.pixels.len());
+        self.cursor_bytes = self.cursor_bytes.saturating_add(image.resident_bytes());
         self.cursor_images.insert(key, image);
         drawn
     }
@@ -953,7 +948,7 @@ impl Scene {
             .iter()
             .filter(|(held, _)| held.client == key.client && **held != key)
             .fold(0usize, |total, (_, image)| {
-                total.saturating_add(image.pixels.len())
+                total.saturating_add(image.resident_bytes())
             });
         held.saturating_add(bytes) <= MAX_CURSOR_BYTES_PER_CLIENT
     }
@@ -1008,7 +1003,7 @@ impl Scene {
         let Some(held) = self.cursor_images.remove(&key) else {
             return false;
         };
-        self.cursor_bytes = self.cursor_bytes.saturating_sub(held.pixels.len());
+        self.cursor_bytes = self.cursor_bytes.saturating_sub(held.resident_bytes());
         true
     }
 
@@ -1032,7 +1027,16 @@ impl Scene {
     pub(crate) fn drawn_cursor_image(&self) -> Option<(SurfaceKey, usize, usize)> {
         let key = self.drawn_cursor_key()?;
         match self.drawn_cursor()? {
-            DrawnCursor::Image { image, .. } => Some((key, image.width, image.height)),
+            DrawnCursor::Image { image, .. } => {
+                // Evidence must describe what the renderer DREW. A buffer it
+                // cannot read draws nothing — `draw_surface` returns before
+                // its first row — so reporting the dimensions would publish a
+                // cursor that is not on the screen. This closes that one way
+                // of not being drawn, not every way: a cursor clipped off the
+                // output is still reported, as it was before.
+                image.linear_bytes()?;
+                Some((key, image.width(), image.height()))
+            }
             DrawnCursor::Nothing => None,
         }
     }
@@ -1092,7 +1096,7 @@ impl Scene {
                 image,
                 hotspot_x,
                 hotspot_y,
-            } => Some((hotspot_x, hotspot_y, image.width, image.height)),
+            } => Some((hotspot_x, hotspot_y, image.width(), image.height())),
             DrawnCursor::Nothing => None,
         }
     }
@@ -1306,7 +1310,7 @@ impl Scene {
         let Some(surface) = self.surfaces.remove(&key) else {
             return Ok(None);
         };
-        self.inactive_surface_bytes.insert(key, surface.pixels.len());
+        self.inactive_surface_bytes.insert(key, surface.resident_bytes());
         Ok(Some(surface))
     }
 
@@ -1350,7 +1354,7 @@ impl Scene {
         let Some(reserved) = self.inactive_surface_bytes.remove(&key) else {
             return Err("subsurface has no inactive byte reservation".to_string());
         };
-        if surface.pixels.len() != reserved {
+        if surface.resident_bytes() != reserved {
             self.inactive_surface_bytes.insert(key, reserved);
             return Err("subsurface inactive byte reservation does not match its image".to_string());
         }
@@ -1415,8 +1419,8 @@ impl Scene {
         let rect = root_rect.unwrap_or(ImageRect {
             x: origin.0,
             y: origin.1,
-            width: surface.width,
-            height: surface.height,
+            width: surface.width(),
+            height: surface.height(),
         });
         let layer = clip_surface_layer(SurfaceLayer { key, rect, crop }, root_clip);
         let default_stack = [None];
@@ -1735,14 +1739,14 @@ impl Scene {
         let prior = self
             .surfaces
             .get(&key)
-            .map(|current| current.pixels.len())
+            .map(Surface::resident_bytes)
             .unwrap_or(0);
         let retained = self
             .surface_bytes
             .checked_sub(prior)
             .ok_or_else(|| "scene byte accounting underflow".to_string())?;
         let next = retained
-            .checked_add(surface.pixels.len())
+            .checked_add(surface.resident_bytes())
             .ok_or_else(|| "scene byte accounting overflow".to_string())?;
         if next > MAX_SCENE_BYTES {
             return Err(format!(
@@ -1814,8 +1818,8 @@ impl Scene {
             return whole;
         };
         let (Some((x, width)), Some((y, height))) = (
-            clipped_span(geometry.x, width, surface.width),
-            clipped_span(geometry.y, height, surface.height),
+            clipped_span(geometry.x, width, surface.width()),
+            clipped_span(geometry.y, height, surface.height()),
         ) else {
             return whole;
         };
@@ -1890,7 +1894,7 @@ impl Scene {
     fn take_pixels(&mut self, key: SurfaceKey) -> Option<Surface> {
         self.input_regions.remove(&key);
         if let Some(surface) = self.surfaces.remove(&key) {
-            self.surface_bytes = self.surface_bytes.saturating_sub(surface.pixels.len());
+            self.surface_bytes = self.surface_bytes.saturating_sub(surface.resident_bytes());
             return Some(surface);
         }
         None
@@ -1963,7 +1967,7 @@ impl Scene {
             .iter()
             .filter(|(key, _)| key.client == client)
             .fold(0usize, |total, (_, surface)| {
-                total.saturating_add(surface.pixels.len())
+                total.saturating_add(surface.resident_bytes())
             });
         self.surfaces.retain(|key, _| key.client != client);
         self.inactive_surface_bytes.retain(|key, bytes| {
@@ -1997,7 +2001,7 @@ impl Scene {
         let mut cursors = 0usize;
         self.cursor_images.retain(|key, image| {
             if key.client == client {
-                cursors = cursors.saturating_add(image.pixels.len());
+                cursors = cursors.saturating_add(image.resident_bytes());
                 return false;
             }
             true
@@ -2192,7 +2196,7 @@ impl Scene {
     pub fn surface_size(&self, key: SurfaceKey) -> Option<(usize, usize)> {
         self.surfaces
             .get(&key)
-            .map(|surface| (surface.width, surface.height))
+            .map(|surface| (surface.width(), surface.height()))
     }
 
     /// Answers whether the pointer actually MOVED, which a nonzero delta does
@@ -3319,12 +3323,19 @@ fn draw_surface(
     let Some((source_y_start, visible_rows)) = visible_span(y, draw_height, height) else {
         return;
     };
+    // Where the renderer reads a buffer's BYTES. A kind that has none without
+    // a mapping draws nothing rather than being assumed readable: §M's dmabuf
+    // is not advertised in the software phase, so this cannot be reached
+    // today, and it is what keeps a later variant from painting a window's
+    // worth of whatever the frame already held.
+    let Some(pixels) = surface.linear_bytes() else {
+        return;
+    };
     // `skip` before `enumerate` in both walks: the index has to count from the
     // CROP's own origin, because that is the pixel the destination starts at.
-    for (source_y, row) in surface
-        .pixels
-        .chunks_exact(surface.width.saturating_mul(4))
-        .take(surface.height)
+    for (source_y, row) in pixels
+        .chunks_exact(surface.width().saturating_mul(4))
+        .take(surface.height())
         .skip(from.y)
         .enumerate()
         .skip(source_y_start)
@@ -3342,7 +3353,7 @@ fn draw_surface(
         {
             let target_x = x.saturating_add(i64::try_from(source_x).unwrap_or(i64::MAX));
             let [blue, green, red, alpha] = pixel;
-            if surface.format == SHM_ARGB8888 && *alpha < u8::MAX {
+            if !surface.pixel_is_opaque(*alpha) {
                 blend_pixel(
                     frame,
                     width,
@@ -3481,8 +3492,8 @@ fn draw_pointer(
                 // edge rather than off-screen where it belongs.
                 x: i64::from(x).saturating_sub(hotspot_x),
                 y: i64::from(y).saturating_sub(hotspot_y),
-                width: image.width,
-                height: image.height,
+                width: image.width(),
+                height: image.height(),
             },
             image,
             Crop::whole(image),
@@ -3639,12 +3650,7 @@ mod tests {
         for _ in 0..width.saturating_mul(height) {
             pixels.extend_from_slice(&color);
         }
-        Surface {
-            width,
-            height,
-            pixels,
-            format: SHM_XRGB8888,
-        }
+        Surface::from_shm_pixels(width, height, pixels, SHM_XRGB8888).unwrap()
     }
 
     /// A pixel of the TILING area, whose top is the status bar's bottom.
@@ -5397,12 +5403,7 @@ mod tests {
         }
         assert!(scene.commit_cursor(
             cursor_key(7, CURSOR_SURFACE),
-            Surface {
-                width: 2,
-                height: 2,
-                pixels,
-                format: SHM_ARGB8888,
-            }
+            Surface::from_shm_pixels(2, 2, pixels, SHM_ARGB8888).unwrap()
         ));
         scene.render(&mut frame, width, height, stride);
         assert_eq!(pixel(&frame, stride, 40, 60), INK);
@@ -6024,12 +6025,7 @@ mod tests {
         scene
             .commit(
                 key,
-                Surface {
-                    width: 10,
-                    height: 8,
-                    pixels: vec![0; 10 * 8 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(10, 8, vec![0; 10 * 8 * 4], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let view = scene
@@ -6256,11 +6252,12 @@ mod tests {
         let source_y = TITLE_HEIGHT;
         let mut child_surface = surface(red, 400, 200);
         let source_offset = source_y
-            .saturating_mul(child_surface.width)
+            .saturating_mul(child_surface.width())
             .saturating_add(source_x)
             .saturating_mul(4);
         child_surface
-            .pixels
+            .linear_bytes_mut()
+            .unwrap()
             .get_mut(source_offset..source_offset.saturating_add(4))
             .unwrap()
             .copy_from_slice(&clipped_edge);
@@ -7191,7 +7188,8 @@ mod tests {
             for x in MARGIN..MARGIN.saturating_add(INNER) {
                 let offset = y.saturating_mul(side).saturating_add(x).saturating_mul(4);
                 image
-                    .pixels
+                    .linear_bytes_mut()
+                    .unwrap()
                     .get_mut(offset..offset.saturating_add(4))
                     .unwrap()
                     .copy_from_slice(&WINDOW);
@@ -8548,7 +8546,8 @@ mod tests {
             for x in 4..14usize {
                 let offset = y.saturating_mul(side).saturating_add(x).saturating_mul(4);
                 image
-                    .pixels
+                    .linear_bytes_mut()
+                    .unwrap()
                     .get_mut(offset..offset.saturating_add(4))
                     .unwrap()
                     .copy_from_slice(&MENU);

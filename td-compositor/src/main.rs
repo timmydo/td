@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod bar;
+mod buffer;
 mod client;
 mod client_resources;
 mod configure;
@@ -376,12 +377,7 @@ fn selftest() -> Result<(), String> {
             client: 1,
             object: 2,
         },
-        scene::Surface {
-            width: 1,
-            height: 1,
-            pixels: vec![1, 2, 3, 0],
-            format: scene::SHM_XRGB8888,
-        },
+        buffer::Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], scene::SHM_XRGB8888)?,
     )?;
     // Tall enough to have a tiling area beneath the status bar AND a client
     // area beneath the tile's title band: a frame the size of either is all
@@ -658,6 +654,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const OTHER: &[(&str, &str)] = &[
         ("bar.rs", include_str!("bar.rs")),
+        ("buffer.rs", include_str!("buffer.rs")),
         ("client.rs", include_str!("client.rs")),
         ("client_resources.rs", include_str!("client_resources.rs")),
         ("configure.rs", include_str!("configure.rs")),

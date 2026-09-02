@@ -1,3 +1,4 @@
+use crate::buffer::Surface;
 use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::ConfigureTracker;
 use crate::framebuffer::Framebuffer;
@@ -13,8 +14,12 @@ use crate::pointer::{
 };
 use crate::scene::{
     BandPress, CursorRequest, Fraction, PopupConstraint, PopupPlacement, Scene, SharedInputRegion,
-    Surface, SurfaceKey, WindowGeometry, SHM_ARGB8888, SHM_XRGB8888,
+    SurfaceKey, WindowGeometry,
 };
+// Production code asks the buffer whether a pixel is opaque rather than
+// comparing format numbers, so the enumerants are now a fixture vocabulary.
+#[cfg(test)]
+use crate::scene::{SHM_ARGB8888, SHM_XRGB8888};
 use crate::server::TransferEndpoint;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1218,11 +1223,25 @@ impl Runtime {
             }
             return None;
         };
+        // A candidate whose buffer the compositor cannot read on the CPU takes
+        // the same path as one with no buffer at all, above: the scan says
+        // nothing, AND any count stored for an earlier buffer is dropped.
+        // Retaining it would leave a stale number describing a buffer that has
+        // already been replaced, which `application_stored_surface` reads as
+        // current — the opposite of saying nothing.
+        let Some(pixels) = surface.linear_bytes() else {
+            if let Some(ready) = self.application_ready.as_mut() {
+                ready.surface_content.remove(&key);
+            }
+            return None;
+        };
         let ready = self.application_ready.as_ref()?;
         let [[red_a, green_a, blue_a], [red_b, green_b, blue_b]] = ready.expected_content_rgbs;
         let root = self.scene.mapped_subsurface_root(key);
-        let content_pixels = surface
-            .pixels
+        // Geometry is the buffer's and does not change under the fold, so ask
+        // for it once rather than per pixel.
+        let scan_width = surface.width();
+        let content_pixels = pixels
             .as_chunks::<4>()
             .0
             .iter()
@@ -1230,22 +1249,23 @@ impl Runtime {
             .take(MAX_APPLICATION_PIXEL_SCAN)
             .fold([0usize; 2], |counts, (index, pixel)| {
                 let [mut count_a, mut count_b] = counts;
-                let x = if surface.width == 0 {
+                let x = if scan_width == 0 {
                     0
                 } else {
-                    index % surface.width
+                    index % scan_width
                 };
-                let opaque = surface.format == SHM_XRGB8888
-                    || (surface.format == SHM_ARGB8888 && pixel.get(3) == Some(&u8::MAX));
+                let opaque = pixel
+                    .get(3)
+                    .is_some_and(|alpha| surface.pixel_is_opaque(*alpha));
                 let color = pixel.get(..3);
                 if opaque
-                    && x.saturating_mul(2) < surface.width
+                    && x.saturating_mul(2) < scan_width
                     && color == Some(&[blue_a, green_a, red_a])
                 {
                     count_a = count_a.saturating_add(1);
                 }
                 if opaque
-                    && x.saturating_mul(2) >= surface.width
+                    && x.saturating_mul(2) >= scan_width
                     && color == Some(&[blue_b, green_b, red_b])
                 {
                     count_b = count_b.saturating_add(1);
@@ -1254,11 +1274,11 @@ impl Runtime {
             });
         let [content_pixels_a, content_pixels_b] = content_pixels;
         if self.application_diagnostic_slot() {
-            let sample_a = surface_rgb_at(surface, surface.width / 4, surface.height / 2);
+            let sample_a = surface_rgb_at(surface, surface.width() / 4, surface.height() / 2);
             let sample_b = surface_rgb_at(
                 surface,
-                surface.width.saturating_mul(3) / 4,
-                surface.height / 2,
+                surface.width().saturating_mul(3) / 4,
+                surface.height() / 2,
             );
             eprintln!(
                 "td-compositor: application observer scanned candidate \
@@ -1267,9 +1287,9 @@ impl Runtime {
                  sample-a={} sample-b={} root={root:?}",
                 key.client,
                 key.object,
-                surface.width,
-                surface.height,
-                surface.format,
+                surface.width(),
+                surface.height(),
+                surface.format(),
                 content_pixels_a,
                 content_pixels_b,
                 rgb_diagnostic(sample_a),
@@ -3423,14 +3443,16 @@ impl Runtime {
 }
 
 fn surface_rgb_at(surface: &Surface, x: usize, y: usize) -> Option<[u8; 3]> {
-    if x >= surface.width || y >= surface.height {
+    if x >= surface.width() || y >= surface.height() {
         return None;
     }
     let offset = y
-        .checked_mul(surface.width)?
+        .checked_mul(surface.width())?
         .checked_add(x)?
         .checked_mul(4)?;
-    let pixel = surface.pixels.get(offset..offset.checked_add(3)?)?;
+    let pixel = surface
+        .linear_bytes()?
+        .get(offset..offset.checked_add(3)?)?;
     let [blue, green, red] = <[u8; 3]>::try_from(pixel).ok()?;
     Some([red, green, blue])
 }
@@ -3466,12 +3488,7 @@ mod tests {
     }
 
     fn surface(color: [u8; 4]) -> Surface {
-        Surface {
-            width: 100,
-            height: 100,
-            pixels: color.repeat(10_000),
-            format: SHM_XRGB8888,
-        }
+        Surface::from_shm_pixels(100, 100, color.repeat(10_000), SHM_XRGB8888).unwrap()
     }
 
     fn application_content_surface() -> Surface {
@@ -3480,12 +3497,7 @@ mod tests {
             pixels.extend([0xff, 0x00, 0xff, 0].repeat(50));
             pixels.extend([0x00, 0xff, 0x00, 0].repeat(50));
         }
-        Surface {
-            width: 100,
-            height: 100,
-            pixels,
-            format: SHM_XRGB8888,
-        }
+        Surface::from_shm_pixels(100, 100, pixels, SHM_XRGB8888).unwrap()
     }
 
     fn reversed_application_content_surface() -> Surface {
@@ -3494,21 +3506,17 @@ mod tests {
             pixels.extend([0x00, 0xff, 0x00, 0].repeat(50));
             pixels.extend([0xff, 0x00, 0xff, 0].repeat(50));
         }
-        Surface {
-            width: 100,
-            height: 100,
-            pixels,
-            format: SHM_XRGB8888,
-        }
+        Surface::from_shm_pixels(100, 100, pixels, SHM_XRGB8888).unwrap()
     }
 
     fn transparent_application_content_surface() -> Surface {
-        let mut surface = application_content_surface();
-        surface.format = SHM_ARGB8888;
-        for alpha in surface.pixels.iter_mut().skip(3).step_by(4) {
+        let opaque = application_content_surface();
+        let mut pixels = opaque.linear_bytes().expect("shm test fixture").to_vec();
+        for alpha in pixels.iter_mut().skip(3).step_by(4) {
             *alpha = 0;
         }
-        surface
+        Surface::from_shm_pixels(opaque.width(), opaque.height(), pixels, SHM_ARGB8888)
+            .unwrap()
     }
 
     fn lend_application_resources(runtime: &mut Runtime, client: u64) {
@@ -3728,12 +3736,7 @@ mod tests {
                     client: 1,
                     object: 1,
                 },
-                Surface {
-                    width: 4,
-                    height: 4,
-                    pixels: vec![9; 4 * 4 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(4, 4, vec![9; 4 * 4 * 4], SHM_XRGB8888).unwrap(),
                 (0, 0),
             )
             .unwrap();
@@ -3787,12 +3790,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let image = || Surface {
-            width: 8,
-            height: 8,
-            pixels: vec![0x5a; 8 * 8 * 4],
-            format: SHM_XRGB8888,
-        };
+        let image = || Surface::from_shm_pixels(8, 8, vec![0x5a; 8 * 8 * 4], SHM_XRGB8888).unwrap();
         let _ = runtime.take_writes();
 
         runtime.commit_cursor(cursor, image(), (2, 3)).unwrap();
@@ -3866,12 +3864,7 @@ mod tests {
                     client: 1,
                     object: cursor_surface,
                 },
-                Surface {
-                    width: 8,
-                    height: 8,
-                    pixels: vec![0x5a; 8 * 8 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(8, 8, vec![0x5a; 8 * 8 * 4], SHM_XRGB8888).unwrap(),
                 (0, 0),
             )
             .unwrap();
@@ -7368,12 +7361,10 @@ mod tests {
         runtime
             .commit_popup(
                 menu,
-                Some(Surface {
-                    width: 10,
-                    height: 10,
-                    pixels: [7u8, 8, 9, 0].repeat(100),
-                    format: SHM_XRGB8888,
-                }),
+                Some(
+                    Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888)
+                        .unwrap(),
+                ),
                 PopupPlacement {
                     parent: window,
                     x: 5,
@@ -7488,11 +7479,8 @@ mod tests {
             object: 30,
         };
         runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
-        let small = || Surface {
-            width: 10,
-            height: 10,
-            pixels: [7u8, 8, 9, 0].repeat(100),
-            format: SHM_XRGB8888,
+        let small = || {
+            Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap()
         };
         let at = |parent, x, y| PopupPlacement {
             parent,
@@ -7593,11 +7581,8 @@ mod tests {
             width: 10,
             height: 10,
         };
-        let paint = || Surface {
-            width: 10,
-            height: 10,
-            pixels: [7u8, 8, 9, 0].repeat(100),
-            format: SHM_XRGB8888,
+        let paint = || {
+            Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap()
         };
         runtime
             .commit_popup(menu, Some(paint()), placement, None, None)
@@ -7707,12 +7692,10 @@ mod tests {
         runtime
             .commit_popup(
                 menu,
-                Some(Surface {
-                    width: 10,
-                    height: 10,
-                    pixels: [7u8, 8, 9, 0].repeat(100),
-                    format: SHM_XRGB8888,
-                }),
+                Some(
+                    Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888)
+                        .unwrap(),
+                ),
                 PopupPlacement {
                     parent: window,
                     x: 5,
@@ -7813,12 +7796,10 @@ mod tests {
         runtime
             .commit_popup(
                 menu,
-                Some(Surface {
-                    width: 10,
-                    height: 10,
-                    pixels: [7u8, 8, 9, 0].repeat(100),
-                    format: SHM_XRGB8888,
-                }),
+                Some(
+                    Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888)
+                        .unwrap(),
+                ),
                 PopupPlacement {
                     parent: window,
                     x: 5,
@@ -7923,12 +7904,10 @@ mod tests {
         runtime
             .commit_popup(
                 menu,
-                Some(Surface {
-                    width: 10,
-                    height: 10,
-                    pixels: [7u8, 8, 9, 0].repeat(100),
-                    format: SHM_XRGB8888,
-                }),
+                Some(
+                    Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888)
+                        .unwrap(),
+                ),
                 PopupPlacement {
                     parent: window,
                     x: 5,
@@ -8385,12 +8364,7 @@ mod tests {
         runtime
             .commit(
                 second,
-                Surface {
-                    width: 2,
-                    height: 2,
-                    pixels: [4, 5, 6, 0].repeat(4),
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(2, 2, [4, 5, 6, 0].repeat(4), SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let two = runtime.layout_snapshot().get(&second).unwrap().rect;
@@ -9200,12 +9174,7 @@ mod tests {
         runtime
             .commit_cursor(
                 cursor,
-                Surface {
-                    width: 4,
-                    height: 5,
-                    pixels: vec![9; 4 * 5 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(4, 5, vec![9; 4 * 5 * 4], SHM_XRGB8888).unwrap(),
                 (0, 0),
             )
             .unwrap();
@@ -9221,12 +9190,7 @@ mod tests {
         runtime
             .commit_cursor(
                 cursor,
-                Surface {
-                    width: 6,
-                    height: 7,
-                    pixels: vec![8; 6 * 7 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(6, 7, vec![8; 6 * 7 * 4], SHM_XRGB8888).unwrap(),
                 (0, 0),
             )
             .unwrap();

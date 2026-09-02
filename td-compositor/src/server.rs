@@ -1,3 +1,4 @@
+use crate::buffer::{ShmSnapshot, Surface};
 use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
 use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
@@ -12,7 +13,7 @@ use crate::runtime::{
     ToplevelParentError,
 };
 use crate::scene::{
-    CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, Surface, SurfaceKey,
+    CursorRequest, InputRegion, PopupPlacement, SharedInputRegion, SurfaceKey,
     WindowGeometry, MAX_CURSOR_DIMENSION, MAX_INPUT_REGION_OPERATIONS, MAX_SUBSURFACE_DEPTH,
     SHM_ARGB8888, SHM_XRGB8888,
 };
@@ -3978,12 +3979,16 @@ impl Client {
                 )
                 .map_err(|e| format!("read wl_shm row {source_y}: {e}"))?;
         }
-        Ok(Surface {
-            width: buffer.width,
-            height: buffer.height,
+        // The single buffer-INGESTION point. Not the only place a snapshot is
+        // built — `selftest` builds a one-pixel one — which is exactly why
+        // the constructor re-checks the packing this loop just produced
+        // rather than this site being trusted to have got it right.
+        Ok(Surface::shm(ShmSnapshot::new(
+            buffer.width,
+            buffer.height,
             pixels,
-            format: buffer.format,
-        })
+            buffer.format,
+        )?))
     }
 
     fn subsurface_parent(&self, surface: u32) -> Option<u32> {
@@ -8259,12 +8264,7 @@ mod tests {
             .unwrap()
             .commit(
                 focused,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         runtime
@@ -8654,12 +8654,7 @@ mod tests {
             .unwrap()
             .commit(
                 surface,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let focus = receive_messages(&mut peer, 2);
@@ -8878,12 +8873,7 @@ mod tests {
             .unwrap()
             .commit(
                 surface,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let revision = runtime.lock().unwrap().keyboard_snapshot().revision;
@@ -8989,12 +8979,7 @@ mod tests {
             .unwrap()
             .commit(
                 surface,
-                Surface {
-                    width: 32,
-                    height: 32,
-                    pixels: vec![1; 32 * 32 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(32, 32, vec![1; 32 * 32 * 4], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let rect = runtime
@@ -9115,12 +9100,7 @@ mod tests {
             .unwrap()
             .commit(
                 surface,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
 
@@ -9228,12 +9208,7 @@ mod tests {
         runtime
             .commit(
                 first,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let snapshot = runtime.keyboard_snapshot();
@@ -9309,12 +9284,7 @@ mod tests {
         runtime
             .commit(
                 second,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![4, 5, 6, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![4, 5, 6, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let focus = receive_messages(&mut peer, 6);
@@ -9380,12 +9350,7 @@ mod tests {
         runtime
             .commit(
                 surface,
-                Surface {
-                    width: 32,
-                    height: 32,
-                    pixels: vec![1; 32 * 32 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(32, 32, vec![1; 32 * 32 * 4], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let rect = runtime.layout_snapshot().get(&surface).unwrap().rect;
@@ -9859,12 +9824,7 @@ mod tests {
                     client: 99,
                     object: 7,
                 },
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         for time in 0..=crate::runtime::MAX_PENDING_KEYBOARD_DELIVERIES {
@@ -10361,12 +10321,7 @@ mod tests {
                     client: 88,
                     object: 1,
                 },
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         connected.wait_for((284, 332), false, false).unwrap();
@@ -10538,18 +10493,13 @@ mod tests {
         locked
             .apply_commit(
                 key,
-                Some(Surface {
-                    width: 100,
-                    height: 100,
-                    pixels: {
-                        let mut pixels = Vec::with_capacity(40_000);
-                        for _ in 0..100 {
-                            pixels.extend([0xff, 0x00, 0xff, 0].repeat(50));
-                            pixels.extend([0x00, 0xff, 0x00, 0].repeat(50));
-                        }
-                        pixels
-                    },
-                    format: SHM_XRGB8888,
+                Some({
+                    let mut pixels = Vec::with_capacity(40_000);
+                    for _ in 0..100 {
+                        pixels.extend([0xff, 0x00, 0xff, 0].repeat(50));
+                        pixels.extend([0x00, 0xff, 0x00, 0].repeat(50));
+                    }
+                    Surface::from_shm_pixels(100, 100, pixels, SHM_XRGB8888).unwrap()
                 }),
                 None,
                 None,
@@ -10867,23 +10817,13 @@ mod tests {
         runtime_state
             .commit(
                 parent,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         runtime_state
             .commit(
                 dialog,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![4, 5, 6, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![4, 5, 6, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         runtime_state
@@ -11238,12 +11178,7 @@ mod tests {
                         client: 1,
                         object: 5,
                     },
-                    Surface {
-                        width: 1,
-                        height: 1,
-                        pixels: vec![1, 2, 3, 0],
-                        format: SHM_XRGB8888,
-                    },
+                    Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
                 )
                 .unwrap();
             runtime
@@ -11252,12 +11187,7 @@ mod tests {
                         client: 2,
                         object: 5,
                     },
-                    Surface {
-                        width: 1,
-                        height: 1,
-                        pixels: vec![4, 5, 6, 0],
-                        format: SHM_XRGB8888,
-                    },
+                    Surface::from_shm_pixels(1, 1, vec![4, 5, 6, 0], SHM_XRGB8888).unwrap(),
                 )
                 .unwrap();
         }
@@ -11365,12 +11295,7 @@ mod tests {
                             client: 88,
                             object,
                         },
-                        Surface {
-                            width: 1,
-                            height: 1,
-                            pixels: color.to_vec(),
-                            format: SHM_XRGB8888,
-                        },
+                        Surface::from_shm_pixels(1, 1, color.to_vec(), SHM_XRGB8888).unwrap(),
                     )
                     .unwrap();
             }
@@ -11652,12 +11577,7 @@ mod tests {
                     client: source_client,
                     object: 90,
                 },
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
 
@@ -11728,12 +11648,7 @@ mod tests {
                     client: destination_client,
                     object: 91,
                 },
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![4, 5, 6, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![4, 5, 6, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let destination_offer = advertised_selection(
@@ -11832,12 +11747,7 @@ mod tests {
         runtime
             .commit(
                 first,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         runtime
@@ -11914,12 +11824,7 @@ mod tests {
         runtime
             .commit(
                 second,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![4, 5, 6, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![4, 5, 6, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let gained = receive_messages(&mut peer, 5);
@@ -11940,12 +11845,7 @@ mod tests {
                     client: 2,
                     object: 13,
                 },
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![7, 8, 9, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![7, 8, 9, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let within_client = receive_messages(&mut peer, 3);
@@ -12049,12 +11949,7 @@ mod tests {
                     client: 88,
                     object: 90,
                 },
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let (server, mut peer) = UnixStream::pair().unwrap();
@@ -12471,12 +12366,7 @@ mod tests {
                     client: 88,
                     object: 5,
                 },
-                Surface {
-                    width: 8,
-                    height: 8,
-                    pixels: [1u8, 2, 90, 0].repeat(64),
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(8, 8, [1u8, 2, 90, 0].repeat(64), SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         for (object, offset) in [(40, 0usize), (41, 4), (42, 8)] {
@@ -13447,12 +13337,7 @@ mod tests {
             .unwrap()
             .commit(
                 key,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         assert!(runtime.lock().unwrap().is_mapped(key));
@@ -14083,12 +13968,7 @@ mod tests {
             .unwrap()
             .commit(
                 key,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
 
@@ -14828,12 +14708,7 @@ mod tests {
             .unwrap()
             .commit(
                 key,
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![0, 0, 0, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![0, 0, 0, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
@@ -15100,12 +14975,7 @@ mod tests {
             .unwrap()
             .commit(
                 key,
-                Surface {
-                    width: 32,
-                    height: 32,
-                    pixels: vec![1; 32 * 32 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(32, 32, vec![1; 32 * 32 * 4], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let rect = runtime
@@ -15348,12 +15218,7 @@ mod tests {
             .unwrap()
             .commit(
                 focused,
-                Surface {
-                    width: 32,
-                    height: 32,
-                    pixels: vec![1; 32 * 32 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(32, 32, vec![1; 32 * 32 * 4], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let rect = runtime
@@ -15642,12 +15507,7 @@ mod tests {
             .unwrap()
             .commit(
                 focused,
-                Surface {
-                    width: 32,
-                    height: 32,
-                    pixels: vec![1; 32 * 32 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(32, 32, vec![1; 32 * 32 * 4], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let rect = runtime
@@ -15803,12 +15663,7 @@ mod tests {
             .unwrap()
             .commit(
                 focused,
-                Surface {
-                    width: 32,
-                    height: 32,
-                    pixels: vec![1; 32 * 32 * 4],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(32, 32, vec![1; 32 * 32 * 4], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let rect = runtime
@@ -16188,12 +16043,7 @@ mod tests {
             .unwrap()
             .commit(
                 POPUP_PARENT_KEY,
-                Surface {
-                    width: 10,
-                    height: 10,
-                    pixels: vec![0; 400],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(10, 10, vec![0; 400], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let initial_constraint = runtime
@@ -16249,12 +16099,7 @@ mod tests {
             .unwrap()
             .commit(
                 second,
-                Surface {
-                    width: 10,
-                    height: 10,
-                    pixels: vec![0; 400],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(10, 10, vec![0; 400], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         runtime
@@ -19655,12 +19500,7 @@ mod tests {
                     client: 77,
                     object: 5,
                 },
-                Surface {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![1, 2, 3, 0],
-                    format: SHM_XRGB8888,
-                },
+                Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
         let (server, mut peer) = UnixStream::pair().unwrap();
