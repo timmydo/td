@@ -73,7 +73,8 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
-use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1057,6 +1058,8 @@ struct PendingOpen {
     title: String,
     parent_handle: String,
     mode: file_chooser::Mode,
+    accept_label: Option<String>,
+    filter: Option<file_chooser::FileFilter>,
 }
 
 #[derive(Debug)]
@@ -1066,6 +1069,7 @@ struct ActiveDialog {
     cancel: Option<UnixStream>,
     presented: bool,
     cancelled: bool,
+    filter: Option<file_chooser::FileFilter>,
 }
 
 #[derive(Default)]
@@ -1074,6 +1078,7 @@ struct ServiceState {
     pending: BTreeMap<u32, PendingOpen>,
     pending_audits: BTreeMap<u32, String>,
     active: BTreeMap<String, ActiveDialog>,
+    connector: Arc<AtomicBool>,
 }
 
 fn consume_bus_frame(
@@ -1167,6 +1172,10 @@ fn begin_open_file(
     let parsed = match parse_open_file(call) {
         Ok(parsed) => parsed,
         Err(error) => {
+            eprintln!(
+                "td-portal: refused FileChooser OpenFile: {}: {}",
+                error.name, error.text
+            );
             if wants_reply {
                 let reply_serial = connection.next_serial()?;
                 let frame = method_error(
@@ -1212,6 +1221,8 @@ fn begin_open_file(
             title: parsed.title,
             parent_handle: parsed.parent_handle,
             mode: parsed.mode,
+            accept_label: parsed.accept_label,
+            filter: parsed.filter,
         },
     );
     connection.write_frame(&query)
@@ -1316,7 +1327,7 @@ fn consume_active_audit_reply(
         if let Some((endian, owner)) = response {
             let outcome = Err("FileChooser lost its authenticated owner".to_string());
             let serial = connection.next_serial()?;
-            let frame = file_chooser_response(endian, serial, &path, &owner, &outcome)?;
+            let frame = file_chooser_response(endian, serial, &path, &owner, &outcome, None)?;
             connection.write_frame(&frame)?;
         }
     }
@@ -1406,6 +1417,7 @@ fn consume_identity_reply(
             cancel: None,
             presented: false,
             cancelled: false,
+            filter: pending.filter.clone(),
         },
     );
     let config = wayland_dialog::DialogConfig {
@@ -1417,6 +1429,9 @@ fn consume_identity_reply(
         host_root: PathBuf::from(FIREFOX_HOST_DOWNLOADS),
         guest_root: PathBuf::from(FIREFOX_GUEST_DOWNLOADS),
         mode: pending.mode,
+        accept_label: pending.accept_label,
+        filter: pending.filter,
+        connector: state.connector.clone(),
     };
     let event_sender = events.clone();
     let event_path = path.clone();
@@ -1441,6 +1456,7 @@ fn consume_identity_reply(
             &path,
             &pending.owner,
             &Err(error),
+            None,
         )?)?;
     }
     Ok(true)
@@ -1488,6 +1504,7 @@ fn consume_dialog_notice(
             println!(
                 "TD-PORTAL-FILE-CHOOSER-PRESENTED path={path} size={width}x{height} checksum={checksum:016x}"
             );
+            io::stdout().flush()?;
         }
         wayland_dialog::Notice::Completed(outcome) => {
             let Some(active) = state.active.remove(path) else {
@@ -1506,9 +1523,17 @@ fn consume_dialog_notice(
                 ));
             }
             let serial = connection.next_serial()?;
-            let frame =
-                file_chooser_response(active.endian, serial, path, &active.owner, &outcome)?;
+            let (frame, record) = file_chooser_completion(
+                active.endian,
+                serial,
+                path,
+                &active.owner,
+                &outcome,
+                active.filter.as_ref(),
+            )?;
             connection.write_frame(&frame)?;
+            println!("{record}");
+            io::stdout().flush()?;
         }
     }
     Ok(())
@@ -1957,6 +1982,8 @@ struct ParsedOpen {
     title: String,
     parent_handle: String,
     mode: file_chooser::Mode,
+    accept_label: Option<String>,
+    filter: Option<file_chooser::FileFilter>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2017,9 +2044,9 @@ fn parse_open_file(call: &Message<'_>) -> Result<ParsedOpen, PortalCallError> {
     let mut multiple = None;
     let mut directory = None;
     let mut modal = None;
-    let mut accept_label = false;
-    let mut filters = false;
-    let mut current_filter = false;
+    let mut accept_label = None;
+    let mut filters = None;
+    let mut current_filter = None;
     let mut current_folder = false;
     for entry in entries {
         let pair = entry
@@ -2069,31 +2096,32 @@ fn parse_open_file(call: &Message<'_>) -> Result<ParsedOpen, PortalCallError> {
                 }
             }
             "accept_label" => {
-                if accept_label {
+                if accept_label.is_some() {
                     return Err(open_error(INVALID_OPEN, "accept_label appears twice"));
                 }
-                accept_label = true;
                 let label = variant_string(*value, "accept_label")?;
-                if label.is_empty() || label.len() > 64 || label.chars().any(char::is_control) {
+                if label.is_empty()
+                    || label.len() > file_chooser::MAX_ACCEPT_LABEL_BYTES
+                    || label.chars().any(char::is_control)
+                {
                     return Err(open_error(
                         INVALID_OPEN,
                         "accept_label is outside the 64-byte text bound",
                     ));
                 }
+                accept_label = Some(label.to_string());
             }
             "filters" => {
-                if filters {
+                if filters.is_some() {
                     return Err(open_error(INVALID_OPEN, "filters appears twice"));
                 }
-                filters = true;
-                validate_filters(*value)?;
+                filters = Some(parse_filters(*value)?);
             }
             "current_filter" => {
-                if current_filter {
+                if current_filter.is_some() {
                     return Err(open_error(INVALID_OPEN, "current_filter appears twice"));
                 }
-                current_filter = true;
-                validate_current_filter(*value)?;
+                current_filter = Some(parse_current_filter(*value)?);
             }
             "current_folder" => {
                 if current_folder {
@@ -2111,12 +2139,7 @@ fn parse_open_file(call: &Message<'_>) -> Result<ParsedOpen, PortalCallError> {
             _ => {}
         }
     }
-    if accept_label || filters || current_filter {
-        return Err(open_error(
-            UNSUPPORTED_OPEN,
-            "td FileChooser does not yet implement accept_label, filters, or current_filter",
-        ));
-    }
+    let filter = select_filter(filters, current_filter)?;
     if modal == Some(false) {
         return Err(open_error(
             UNSUPPORTED_OPEN,
@@ -2140,6 +2163,8 @@ fn parse_open_file(call: &Message<'_>) -> Result<ParsedOpen, PortalCallError> {
         } else {
             file_chooser::Mode::OpenFile { multiple }
         },
+        accept_label,
+        filter,
     })
 }
 
@@ -2178,7 +2203,7 @@ fn variant_bool(value: wire::Seq<'_>, option: &'static str) -> Result<bool, Port
     }
 }
 
-fn validate_filters(value: wire::Seq<'_>) -> Result<(), PortalCallError> {
+fn parse_filters(value: wire::Seq<'_>) -> Result<Vec<file_chooser::FileFilter>, PortalCallError> {
     if value.signature() != "a(sa(us))" {
         return Err(open_error(INVALID_OPEN, "filters has the wrong type"));
     }
@@ -2188,16 +2213,23 @@ fn validate_filters(value: wire::Seq<'_>) -> Result<(), PortalCallError> {
     let Some(Value::Array(filters)) = values.first() else {
         return Err(open_error(INVALID_OPEN, "filters has the wrong shape"));
     };
-    for filter in filters
+    let filters = filters
         .values(32)
-        .map_err(|_| open_error(INVALID_OPEN, "filters exceeds 32 entries"))?
-    {
-        validate_filter(filter)?;
+        .map_err(|_| open_error(INVALID_OPEN, "filters exceeds 32 entries"))?;
+    let mut parsed = Vec::with_capacity(filters.len());
+    for filter in filters {
+        parsed.push(parse_filter(filter)?);
     }
-    Ok(())
+    if parsed.len() > 1 {
+        return Err(open_error(
+            UNSUPPORTED_OPEN,
+            "td FileChooser supports only one all-files filter",
+        ));
+    }
+    Ok(parsed)
 }
 
-fn validate_current_filter(value: wire::Seq<'_>) -> Result<(), PortalCallError> {
+fn parse_current_filter(value: wire::Seq<'_>) -> Result<file_chooser::FileFilter, PortalCallError> {
     if value.signature() != "(sa(us))" {
         return Err(open_error(
             INVALID_OPEN,
@@ -2210,10 +2242,10 @@ fn validate_current_filter(value: wire::Seq<'_>) -> Result<(), PortalCallError> 
     let Some(filter) = values.first().copied() else {
         return Err(open_error(INVALID_OPEN, "current_filter is empty"));
     };
-    validate_filter(filter)
+    parse_filter(filter)
 }
 
-fn validate_filter(filter: Value<'_>) -> Result<(), PortalCallError> {
+fn parse_filter(filter: Value<'_>) -> Result<file_chooser::FileFilter, PortalCallError> {
     let fields = filter
         .as_seq()
         .ok_or_else(|| open_error(INVALID_OPEN, "a file filter is not a structure"))?
@@ -2231,10 +2263,12 @@ fn validate_filter(filter: Value<'_>) -> Result<(), PortalCallError> {
             "a file filter label is outside the 256-byte text bound",
         ));
     }
-    for rule in rules
+    let rules = rules
         .values(32)
-        .map_err(|_| open_error(INVALID_OPEN, "a file filter exceeds 32 rules"))?
-    {
+        .map_err(|_| open_error(INVALID_OPEN, "a file filter exceeds 32 rules"))?;
+    let mut supported_pattern = None;
+    let mut supported = true;
+    for rule in rules {
         let pair = rule
             .as_seq()
             .ok_or_else(|| open_error(INVALID_OPEN, "a file filter rule is not a structure"))?
@@ -2256,8 +2290,53 @@ fn validate_filter(filter: Value<'_>) -> Result<(), PortalCallError> {
                 "a file filter rule is outside its closed bound",
             ));
         }
+        if *kind == 0 && matches!(*pattern, "*" | "*.*") && supported_pattern.is_none() {
+            supported_pattern = Some(*pattern);
+        } else {
+            supported = false;
+        }
     }
-    Ok(())
+    if !supported {
+        return Err(open_error(
+            UNSUPPORTED_OPEN,
+            "td FileChooser supports only one all-files glob rule",
+        ));
+    }
+    let Some(pattern) = supported_pattern else {
+        return Err(open_error(
+            UNSUPPORTED_OPEN,
+            "td FileChooser supports only one all-files glob rule",
+        ));
+    };
+    file_chooser::FileFilter::all_files(label, pattern)
+        .map_err(|_| open_error(INVALID_OPEN, "the all-files filter is malformed"))
+}
+
+fn select_filter(
+    filters: Option<Vec<file_chooser::FileFilter>>,
+    current: Option<file_chooser::FileFilter>,
+) -> Result<Option<file_chooser::FileFilter>, PortalCallError> {
+    let mut filters = filters.unwrap_or_default();
+    if filters.is_empty() {
+        return if current.is_some() {
+            Err(open_error(
+                UNSUPPORTED_OPEN,
+                "current_filter requires a matching filters entry",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    let only = filters
+        .pop()
+        .ok_or_else(|| open_error(INVALID_OPEN, "the file filter list disappeared"))?;
+    if current.as_ref().is_some_and(|current| current != &only) {
+        return Err(open_error(
+            UNSUPPORTED_OPEN,
+            "current_filter does not select the supported all-files filter",
+        ));
+    }
+    Ok(Some(only))
 }
 
 fn validate_current_folder(value: wire::Seq<'_>) -> Result<(), PortalCallError> {
@@ -2567,42 +2646,89 @@ fn file_chooser_response(
     path: &str,
     destination: &str,
     outcome: &Result<file_chooser::Outcome, String>,
+    filter: Option<&file_chooser::FileFilter>,
 ) -> io::Result<Vec<u8>> {
     if let Err(error) = outcome {
         eprintln!("td-portal: FileChooser {path} failed: {error}");
     }
+    let response = file_chooser_response_code(outcome);
     message::Builder::signal(endian, path, handles::REQUEST_INTERFACE, "Response")
         .destination(destination)
         .serial(serial)
-        .body("ua{sv}", |writer| match outcome {
-            Ok(file_chooser::Outcome::Accepted(uris)) => {
-                writer.uint32(0);
-                writer.array("{sv}", |writer| {
-                    writer.dict_entry(|writer| {
-                        writer.string("uris")?;
-                        writer.variant("as", |writer| {
-                            writer.array("s", |writer| {
-                                for uri in uris {
-                                    writer.string(uri)?;
-                                }
-                                Ok(())
+        .body("ua{sv}", |writer| {
+            writer.uint32(response);
+            match outcome {
+                Ok(file_chooser::Outcome::Accepted(uris)) => {
+                    writer.array("{sv}", |writer| {
+                        writer.dict_entry(|writer| {
+                            writer.string("uris")?;
+                            writer.variant("as", |writer| {
+                                writer.array("s", |writer| {
+                                    for uri in uris {
+                                        writer.string(uri)?;
+                                    }
+                                    Ok(())
+                                })
                             })
-                        })
+                        })?;
+                        if let Some(filter) = filter {
+                            writer.dict_entry(|writer| {
+                                writer.string("current_filter")?;
+                                writer.variant("(sa(us))", |writer| {
+                                    writer.structure(|writer| {
+                                        writer.string(filter.label())?;
+                                        writer.array("(us)", |writer| {
+                                            writer.structure(|writer| {
+                                                writer.uint32(0);
+                                                writer.string(filter.pattern())
+                                            })
+                                        })
+                                    })
+                                })
+                            })?;
+                        }
+                        Ok(())
                     })
-                })
-            }
-            Ok(file_chooser::Outcome::Cancelled) => {
-                writer.uint32(1);
-                writer.array("{sv}", |_| Ok(()))
-            }
-            Ok(file_chooser::Outcome::Pending) | Err(_) => {
-                writer.uint32(2);
-                writer.array("{sv}", |_| Ok(()))
+                }
+                Ok(file_chooser::Outcome::Cancelled) => {
+                    writer.array("{sv}", |_| Ok(()))
+                }
+                Ok(file_chooser::Outcome::Pending) | Err(_) => {
+                    writer.array("{sv}", |_| Ok(()))
+                }
             }
         })
         .map_err(wire_error)?
         .encode()
         .map_err(message_error)
+}
+
+fn file_chooser_response_code(outcome: &Result<file_chooser::Outcome, String>) -> u32 {
+    match outcome {
+        Ok(file_chooser::Outcome::Accepted(_)) => 0,
+        Ok(file_chooser::Outcome::Cancelled) => 1,
+        Ok(file_chooser::Outcome::Pending) | Err(_) => 2,
+    }
+}
+
+fn file_chooser_completion(
+    endian: Endian,
+    serial: u32,
+    path: &str,
+    destination: &str,
+    outcome: &Result<file_chooser::Outcome, String>,
+    filter: Option<&file_chooser::FileFilter>,
+) -> io::Result<(Vec<u8>, String)> {
+    let response = file_chooser_response_code(outcome);
+    let frame = file_chooser_response(endian, serial, path, destination, outcome, filter)?;
+    Ok((
+        frame,
+        file_chooser_completion_record(path, response),
+    ))
+}
+
+fn file_chooser_completion_record(path: &str, response: u32) -> String {
+    format!("TD-PORTAL-FILE-CHOOSER-COMPLETED path={path} response={response}")
 }
 
 fn request_response(
@@ -3287,6 +3413,8 @@ mod tests {
             title: "Choose a file".into(),
             parent_handle: String::new(),
             mode: file_chooser::Mode::OpenFile { multiple: false },
+            accept_label: None,
+            filter: None,
         }
     }
 
@@ -3430,13 +3558,85 @@ mod tests {
     }
 
     #[test]
-    fn recognized_unimplemented_open_file_options_are_refused() {
+    fn accept_label_and_one_all_files_filter_match_firefox() {
         let accept_label = open_file_call(|writer| {
             writer.dict_entry(|writer| {
                 writer.string("accept_label")?;
                 writer.variant("s", |writer| writer.string("Select"))
             })
         });
+        let (accept_label, _) = message::decode(&accept_label, 0).unwrap();
+        assert_eq!(
+            parse_open_file(&accept_label)
+                .unwrap()
+                .accept_label
+                .as_deref(),
+            Some("Select")
+        );
+
+        let firefox = open_file_call(|writer| {
+            for key in ["filters", "current_filter"] {
+                writer.dict_entry(|writer| {
+                    writer.string(key)?;
+                    let signature = if key == "filters" {
+                        "a(sa(us))"
+                    } else {
+                        "(sa(us))"
+                    };
+                    writer.variant(signature, |writer| {
+                        let write_filter = |writer: &mut Writer| {
+                            writer.structure(|writer| {
+                                writer.string("All Files")?;
+                                writer.array("(us)", |writer| {
+                                    writer.structure(|writer| {
+                                        writer.uint32(0);
+                                        writer.string("*")
+                                    })
+                                })
+                            })
+                        };
+                        if key == "filters" {
+                            writer.array("(sa(us))", write_filter)
+                        } else {
+                            write_filter(writer)
+                        }
+                    })
+                })?;
+            }
+            Ok(())
+        });
+        let (firefox, _) = message::decode(&firefox, 0).unwrap();
+        let parsed = parse_open_file(&firefox).unwrap();
+        let filter = parsed.filter.unwrap();
+        assert_eq!(filter.label(), "All Files");
+        assert_eq!(filter.pattern(), "*");
+
+        let standalone_current = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("current_filter")?;
+                writer.variant("(sa(us))", |writer| {
+                    writer.structure(|writer| {
+                        writer.string("All Files")?;
+                        writer.array("(us)", |writer| {
+                            writer.structure(|writer| {
+                                writer.uint32(0);
+                                writer.string("*")
+                            })
+                        })
+                    })
+                })
+            })
+        });
+        let (standalone_current, _) =
+            message::decode(&standalone_current, 0).unwrap();
+        assert_eq!(
+            parse_open_file(&standalone_current).unwrap_err().name,
+            UNSUPPORTED_OPEN
+        );
+    }
+
+    #[test]
+    fn richer_file_filters_remain_explicitly_unsupported() {
         let filters = open_file_call(|writer| {
             writer.dict_entry(|writer| {
                 writer.string("filters")?;
@@ -3471,10 +3671,40 @@ mod tests {
                 })
             })
         });
-        for bytes in [accept_label, filters, current_filter] {
+        for bytes in [filters, current_filter] {
             let (call, _) = message::decode(&bytes, 0).unwrap();
             assert_eq!(parse_open_file(&call).unwrap_err().name, UNSUPPORTED_OPEN);
         }
+
+        let oversized = "x".repeat(257);
+        let invalid_after_mime = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("filters")?;
+                writer.variant("a(sa(us))", |writer| {
+                    writer.array("(sa(us))", |writer| {
+                        writer.structure(|writer| {
+                            writer.string("Mixed")?;
+                            writer.array("(us)", |writer| {
+                                writer.structure(|writer| {
+                                    writer.uint32(1);
+                                    writer.string("text/plain")
+                                })?;
+                                writer.structure(|writer| {
+                                    writer.uint32(2);
+                                    writer.string(&oversized)
+                                })
+                            })
+                        })
+                    })
+                })
+            })
+        });
+        let (invalid_after_mime, _) =
+            message::decode(&invalid_after_mime, 0).unwrap();
+        assert_eq!(
+            parse_open_file(&invalid_after_mime).unwrap_err().name,
+            INVALID_OPEN
+        );
     }
 
     #[test]
@@ -3619,6 +3849,7 @@ mod tests {
                     cancel: None,
                     presented: true,
                     cancelled: false,
+                    filter: None,
                 },
             );
             state.pending_audits.insert(1, path.into());
@@ -3673,6 +3904,7 @@ mod tests {
                     cancel: None,
                     presented: true,
                     cancelled: false,
+                    filter: None,
                 },
             );
             let count = if global {
@@ -3804,6 +4036,7 @@ mod tests {
                 cancel: None,
                 presented: true,
                 cancelled: false,
+                filter: None,
             },
         );
         cancel_dialog(&mut state, first).unwrap();
@@ -3841,6 +4074,7 @@ mod tests {
                 cancel: Some(service_stream),
                 presented: true,
                 cancelled: false,
+                filter: None,
             },
         );
         cancel_dialog(&mut state, path).unwrap();
@@ -3879,6 +4113,7 @@ mod tests {
                 cancel: Some(cancel_stream),
                 presented: true,
                 cancelled: false,
+                filter: None,
             },
         );
         begin_active_audit(&mut connection, &mut state).unwrap();
@@ -3919,6 +4154,39 @@ mod tests {
     #[test]
     fn accepted_file_chooser_response_is_directed_and_carries_guest_uris() {
         let path = "/org/freedesktop/portal/desktop/request/1_9/pick";
+        let filter = file_chooser::FileFilter::all_files("All Files", "*").unwrap();
+        assert_eq!(
+            file_chooser_response_code(&Ok(file_chooser::Outcome::Accepted(Vec::new()))),
+            0
+        );
+        assert_eq!(
+            file_chooser_response_code(&Ok(file_chooser::Outcome::Cancelled)),
+            1
+        );
+        assert_eq!(
+            file_chooser_completion_record(path, 1),
+            format!("TD-PORTAL-FILE-CHOOSER-COMPLETED path={path} response=1")
+        );
+        let (cancelled, cancelled_record) = file_chooser_completion(
+            Endian::Little,
+            70,
+            path,
+            ":1.9",
+            &Ok(file_chooser::Outcome::Cancelled),
+            None,
+        )
+        .unwrap();
+        let (cancelled, _) = message::decode(&cancelled, 0).unwrap();
+        assert_eq!(cancelled.args().first(), Some(&Value::Uint32(1)));
+        assert_eq!(
+            cancelled_record,
+            format!("TD-PORTAL-FILE-CHOOSER-COMPLETED path={path} response=1")
+        );
+        assert_eq!(
+            file_chooser_response_code(&Ok(file_chooser::Outcome::Pending)),
+            2
+        );
+        assert_eq!(file_chooser_response_code(&Err("failed".into())), 2);
         let bytes = file_chooser_response(
             Endian::Little,
             71,
@@ -3927,6 +4195,7 @@ mod tests {
             &Ok(file_chooser::Outcome::Accepted(vec![
                 "file:///home/td/Downloads/report.txt".into(),
             ])),
+            Some(&filter),
         )
         .unwrap();
         let (response, _) = message::decode(&bytes, 0).unwrap();
@@ -3936,7 +4205,7 @@ mod tests {
         let [Value::Uint32(0), Value::Array(results)] = response.args() else {
             panic!("accepted response has the wrong shape");
         };
-        let entries = results.values(1).unwrap();
+        let entries = results.values(2).unwrap();
         let pair = entries[0].as_seq().unwrap().values(2).unwrap();
         assert_eq!(pair[0], Value::Str("uris"));
         let Value::Variant(uris) = pair[1] else {
@@ -3950,6 +4219,17 @@ mod tests {
             uris.values(1).unwrap(),
             vec![Value::Str("file:///home/td/Downloads/report.txt")]
         );
+        let pair = entries[1].as_seq().unwrap().values(2).unwrap();
+        assert_eq!(pair[0], Value::Str("current_filter"));
+        let Value::Variant(current) = pair[1] else {
+            panic!("current_filter result is not a variant");
+        };
+        let values = current.values(1).unwrap();
+        let Value::Struct(current) = values[0] else {
+            panic!("current_filter result is not a structure");
+        };
+        let fields = current.values(2).unwrap();
+        assert_eq!(fields[0], Value::Str("All Files"));
     }
 
     #[test]

@@ -155,14 +155,24 @@ const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str =
 const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_CLIPBOARD_RETRY_MARKER;
 const TD_FIREFOX_CLIPBOARD_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CLIPBOARD_MARKER;
-const TD_FIREFOX_DOWNLOAD_ARMED_MARKER: &str =
-    td_recipe::ladder::TD_FIREFOX_DOWNLOAD_ARMED_MARKER;
+const TD_FIREFOX_DOWNLOAD_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_DOWNLOAD_ARMED_MARKER;
 const TD_FIREFOX_DOWNLOAD_MARKER: &str = td_recipe::ladder::TD_FIREFOX_DOWNLOAD_MARKER;
+const TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER;
+const TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER;
+const TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER;
+const TD_FIREFOX_FILE_CHOOSER_MARKER: &str = td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_MARKER;
+const TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX: &str =
+    "portal: TD-PORTAL-FILE-CHOOSER-PRESENTED ";
+#[cfg(test)]
+const TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER: &str =
+    "TD-PORTAL-FILE-CHOOSER-COMPLETED";
 const TD_APPLICATION_CURSOR_PREFIX: &str =
     "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
 const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_INPUT_CMDLINE_TOKEN;
-const TD_PROFILER_ATTRIBUTION_MARKER: &str =
-    td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
+const TD_PROFILER_ATTRIBUTION_MARKER: &str = td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
 const OPENSSH_ADMIN_PRIVATE_KEY_PATH: &str = "@var/lib/td-test/openssh-admin-selftest";
@@ -266,6 +276,16 @@ const MAX_QMP_RESPONSE_LINES: usize = 32;
 const QMP_ABSOLUTE_EXTENT: u32 = 32_768;
 const QMP_OUTPUT_WIDTH: u32 = 1_280;
 const QMP_OUTPUT_HEIGHT: u32 = 800;
+const PORTAL_CLIENT_X: usize = 160;
+const PORTAL_CLIENT_Y: usize = 141;
+const PORTAL_CLIENT_WIDTH: usize = 640;
+const PORTAL_CLIENT_HEIGHT: usize = 432;
+const PORTAL_BACKGROUND_RGB: [u8; 3] = [0x18, 0x20, 0x28];
+const PORTAL_PANEL_RGB: [u8; 3] = [0x28, 0x30, 0x3c];
+const PORTAL_HIGHLIGHT_RGB: [u8; 3] = [0x28, 0x48, 0x78];
+const MAX_SCREENSHOT_HEADER_BYTES: usize = 4096;
+const MAX_SCREENSHOT_BYTES: usize =
+    QMP_OUTPUT_WIDTH as usize * QMP_OUTPUT_HEIGHT as usize * 3 + MAX_SCREENSHOT_HEADER_BYTES;
 const TERMINAL_CONTENT_X: u32 = 24;
 const TERMINAL_CONTENT_Y: u32 = 68;
 const TERMINAL_CELL_WIDTH: u32 = 8;
@@ -375,6 +395,12 @@ struct ConsoleEvidence {
     td_firefox_clipboard: bool,
     td_firefox_download_armed: bool,
     td_firefox_download: bool,
+    td_firefox_file_chooser_refocus_armed: bool,
+    td_firefox_file_chooser_armed: bool,
+    td_firefox_file_chooser_focused: bool,
+    td_firefox_file_chooser_presented: Option<PortalPresentation>,
+    td_firefox_file_chooser_pixels: bool,
+    td_firefox_file_chooser: bool,
     td_application_cursor: bool,
     td_profiler_attribution: bool,
     td_wayland_runtime: bool,
@@ -392,6 +418,13 @@ struct ConsoleEvidence {
     git_https: bool,
     kexec_stage1: bool,
     kernel_panic: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PortalPresentation {
+    width: usize,
+    height: usize,
+    checksum: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -693,7 +726,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     // The reboot-crossing proof. The marker only says td-firstboot found an identity
     // already there; this says it is the SAME one, which is what a client pinning a
     // host key (or a fleet keyed by machine-id) actually depends on.
-    require_same_identity(&first, &healthy_candidate, "install", "healthy pending candidate")?;
+    require_same_identity(
+        &first,
+        &healthy_candidate,
+        "install",
+        "healthy pending candidate",
+    )?;
     if healthy_candidate.evidence.attempts_exhausted {
         return Err(format!(
             "the healthy pending candidate unexpectedly exhausted its boot budget. \
@@ -725,7 +763,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &fixture.alternate_id,
         "acknowledged candidate boot",
     )?;
-    require_same_identity(&first, &stable_candidate, "install", "acknowledged candidate")?;
+    require_same_identity(
+        &first,
+        &stable_candidate,
+        "install",
+        "acknowledged candidate",
+    )?;
     if stable_candidate.evidence.attempt_consumed || stable_candidate.evidence.attempts_exhausted {
         return Err(format!(
             "the acknowledged candidate retained boot-attempt state after success. \
@@ -788,7 +831,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     // different host key. Equality here would mean the key is coming from the image
     // rather than from this machine's entropy — i.e. every machine that boots the
     // image shares one host identity, exactly what moving the key to /var prevents.
-    require_distinct_identity(&first, &failure_install, "install", "failure-sequence install")?;
+    require_distinct_identity(
+        &first,
+        &failure_install,
+        "install",
+        "failure-sequence install",
+    )?;
     if failure_install.evidence.attempt_consumed || failure_install.evidence.attempts_exhausted {
         return Err(format!(
             "the failure-sequence install unexpectedly consumed or exhausted a boot-attempt budget. \
@@ -1018,6 +1066,14 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_FIREFOX_CLIPBOARD_MARKER}), focused the authenticated HTTPS download link \
          ({TD_FIREFOX_DOWNLOAD_ARMED_MARKER}), activated it through the emulated keyboard, \
          and validated the exact file outside the jail ({TD_FIREFOX_DOWNLOAD_MARKER}), \
+         then armed Firefox document refocus and its real file input \
+         ({TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER}), used one trusted physical click \
+         to focus the document ({TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER}), then focused the \
+         coordinate-bound native selector with a second trusted click \
+         ({TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER}) and opened it with physical Enter, \
+         matched the portal's announced frame to its centred QMP-captured pixels \
+         ({TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX}), physically selected the download, and \
+         validated its exact name, size and bytes in Firefox ({TD_FIREFOX_FILE_CHOOSER_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1214,6 +1270,36 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
             result.evidence.td_firefox_download,
             TD_FIREFOX_DOWNLOAD_MARKER,
             "Firefox did not write the exact download through its writable grant",
+        ),
+        (
+            result.evidence.td_firefox_file_chooser_refocus_armed,
+            TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER,
+            "Firefox did not arm physical document refocus before its real file input",
+        ),
+        (
+            result.evidence.td_firefox_file_chooser_armed,
+            TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER,
+            "Firefox did not arm its real file input before portal activation",
+        ),
+        (
+            result.evidence.td_firefox_file_chooser_focused,
+            TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER,
+            "Firefox did not prove trusted focus on its real file input",
+        ),
+        (
+            result.evidence.td_firefox_file_chooser_presented.is_some(),
+            TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX,
+            "td-portal did not present Firefox's FileChooser through the private manager",
+        ),
+        (
+            result.evidence.td_firefox_file_chooser_pixels,
+            "QMP centred FileChooser pixel proof",
+            "the QMP display did not contain the centred chooser palette and selection",
+        ),
+        (
+            result.evidence.td_firefox_file_chooser,
+            TD_FIREFOX_FILE_CHOOSER_MARKER,
+            "Firefox did not receive the exact selected file and its authenticated bytes",
         ),
     ] {
         if !seen {
@@ -2810,7 +2896,11 @@ pub(crate) fn append_trusted_key(initramfs: &Path, key: &[u8]) -> Result<(), Str
 
     let mut entries = Vec::new();
     for parent in key_path_parents() {
-        entries.push(Entry { name: parent, mode: 0o755, kind: Kind::Directory });
+        entries.push(Entry {
+            name: parent,
+            mode: 0o755,
+            kind: Kind::Directory,
+        });
     }
     entries.push(Entry {
         name: td_boot_protocol::TRUSTED_KEY_PATH,
@@ -2982,7 +3072,10 @@ fn stage_volume_trust_roots(seed: &Path, trust: &RunTrust) -> Result<(), String>
     fs::set_permissions(&idle, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod fixture idle channel {}: {e}", idle.display()))?;
     for (relative, line) in [
-        (td_boot_protocol::VOLUME_TRUSTED_KEY, trust.trusted_key_line()),
+        (
+            td_boot_protocol::VOLUME_TRUSTED_KEY,
+            trust.trusted_key_line(),
+        ),
         (
             td_recipe::ladder::DEPLOY_WRONG_KEY,
             decoy.trusted_key_line(),
@@ -3322,7 +3415,7 @@ fn boot(
             ));
         }
         if let Some(controller) = physical_input.as_mut() {
-            if let Err(error) = controller.progress(&evidence) {
+            if let Err(error) = controller.progress(&mut evidence) {
                 let _ = child.kill();
                 let _ = child.wait();
                 let console = String::from_utf8_lossy(&buf);
@@ -3611,6 +3704,15 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FIREFOX_CLIPBOARD_ARMED_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_RETRY_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_MARKER),
+        exact_line_window(TD_FIREFOX_DOWNLOAD_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_DOWNLOAD_MARKER),
+        exact_line_window(TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER),
+        TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX
+            .len()
+            .saturating_add(256),
+        exact_line_window(TD_FIREFOX_FILE_CHOOSER_MARKER),
         TD_APPLICATION_CURSOR_PREFIX.len().saturating_add(32),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
@@ -3918,6 +4020,35 @@ fn latch_console_evidence_from(
         TD_FIREFOX_DOWNLOAD_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
+    latch_line_marker(
+        &mut evidence.td_firefox_file_chooser_refocus_armed,
+        buf,
+        TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_file_chooser_armed,
+        buf,
+        TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_file_chooser_focused,
+        buf,
+        TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_portal_file_chooser_presentation(
+        &mut evidence.td_firefox_file_chooser_presented,
+        buf,
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_file_chooser,
+        buf,
+        TD_FIREFOX_FILE_CHOOSER_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
     latch_application_cursor(
         &mut evidence.td_application_cursor,
         buf,
@@ -4051,11 +4182,7 @@ fn latch_prefixed_line_marker(
     }
 }
 
-fn latch_application_cursor(
-    found: &mut bool,
-    haystack: &[u8],
-    starts_at_stream_boundary: bool,
-) {
+fn latch_application_cursor(found: &mut bool, haystack: &[u8], starts_at_stream_boundary: bool) {
     if *found {
         return;
     }
@@ -4102,6 +4229,110 @@ fn latch_application_cursor(
             return;
         }
     }
+}
+
+fn latch_portal_file_chooser_presentation(
+    found: &mut Option<PortalPresentation>,
+    haystack: &[u8],
+    starts_at_stream_boundary: bool,
+) {
+    if found.is_some() {
+        return;
+    }
+    let prefix = TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX.as_bytes();
+    for start in 0..haystack.len() {
+        if (start != 0 || !starts_at_stream_boundary)
+            && haystack.get(start.wrapping_sub(1)) != Some(&b'\n')
+        {
+            continue;
+        }
+        let Some(body_start) = start.checked_add(prefix.len()) else {
+            return;
+        };
+        if haystack.get(start..body_start) != Some(prefix) {
+            continue;
+        }
+        let Some(rest) = haystack.get(body_start..) else {
+            continue;
+        };
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let body = rest.get(..end).unwrap_or_default();
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let Ok(body) = std::str::from_utf8(body) else {
+            continue;
+        };
+        let fields = body.split(' ').collect::<Vec<_>>();
+        let [path, size, checksum] = fields.as_slice() else {
+            continue;
+        };
+        let Some(path) = path.strip_prefix("path=") else {
+            continue;
+        };
+        let Some(size) = size.strip_prefix("size=") else {
+            continue;
+        };
+        let Some(checksum) = checksum.strip_prefix("checksum=") else {
+            continue;
+        };
+        if !valid_portal_request_path(path) {
+            continue;
+        }
+        let Some((width, height)) = size.split_once('x') else {
+            continue;
+        };
+        let Some(width) = width.parse::<usize>().ok() else {
+            continue;
+        };
+        let Some(height) = height.parse::<usize>().ok() else {
+            continue;
+        };
+        if width != PORTAL_CLIENT_WIDTH || height != PORTAL_CLIENT_HEIGHT {
+            continue;
+        }
+        if checksum.len() != 16
+            || !checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            continue;
+        }
+        let Some(checksum) = u64::from_str_radix(checksum, 16)
+            .ok()
+            .filter(|checksum| *checksum != 0)
+        else {
+            continue;
+        };
+        *found = Some(PortalPresentation {
+            width,
+            height,
+            checksum,
+        });
+        return;
+    }
+}
+
+fn valid_portal_request_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("/org/freedesktop/portal/desktop/request/") else {
+        return false;
+    };
+    let Some((owner, token)) = relative.split_once('/') else {
+        return false;
+    };
+    if token.contains('/') || token.is_empty() || token.len() > 64 {
+        return false;
+    }
+    let Some(owner_number) = owner.strip_prefix("1_") else {
+        return false;
+    };
+    owner_number
+        .parse::<u32>()
+        .ok()
+        .is_some_and(|number| number != 0 && number.to_string() == owner_number)
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn latch_terminal_clipboard_focus(
@@ -4367,6 +4598,10 @@ enum PhysicalInputPhase {
     FirefoxPaste,
     FirefoxPasteRetried,
     FirefoxDownload,
+    FirefoxFileChooserFocus,
+    FirefoxFileChooserInputFocus,
+    FirefoxFileChooserOpen,
+    FirefoxFileChooserSelect,
 }
 
 fn qmp_absolute_pixel(pixel: u32, extent: u32) -> Result<u16, String> {
@@ -4427,7 +4662,7 @@ impl PhysicalInputController {
         }
     }
 
-    fn progress(&mut self, evidence: &ConsoleEvidence) -> Result<(), String> {
+    fn progress(&mut self, evidence: &mut ConsoleEvidence) -> Result<(), String> {
         if self.phase == PhysicalInputPhase::Arm && evidence.td_firefox_input_armed {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
             let mut qmp = Qmp::connect_until(&self.path, deadline)?;
@@ -4532,6 +4767,7 @@ impl PhysicalInputController {
         }
         if self.phase == PhysicalInputPhase::FirefoxPaste
             && evidence.td_firefox_clipboard_retry
+            && evidence.td_term_clipboard_sent
         {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
             let qmp = self
@@ -4549,6 +4785,53 @@ impl PhysicalInputController {
                 .ok_or_else(|| "QMP controller disappeared before Firefox download".to_string())?;
             qmp.download_activate_until(deadline)?;
             self.phase = PhysicalInputPhase::FirefoxDownload;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxDownload
+            && evidence.td_firefox_download
+            && evidence.td_firefox_file_chooser_refocus_armed
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self.qmp.as_mut().ok_or_else(|| {
+                "QMP controller disappeared before Firefox FileChooser refocus".to_string()
+            })?;
+            qmp.file_chooser_open_until(deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxFileChooserFocus;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxFileChooserFocus
+            && evidence.td_firefox_file_chooser_armed
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self.qmp.as_mut().ok_or_else(|| {
+                "QMP controller disappeared before Firefox FileChooser input focus".to_string()
+            })?;
+            qmp.file_chooser_focus_until(deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxFileChooserInputFocus;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxFileChooserInputFocus
+            && evidence.td_firefox_file_chooser_focused
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self.qmp.as_mut().ok_or_else(|| {
+                "QMP controller disappeared before Firefox FileChooser activation".to_string()
+            })?;
+            qmp.file_chooser_activate_until(deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxFileChooserOpen;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxFileChooserOpen
+            && evidence.td_firefox_file_chooser_presented.is_some()
+        {
+            let presentation = evidence
+                .td_firefox_file_chooser_presented
+                .ok_or_else(|| "FileChooser presentation disappeared".to_string())?;
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self.qmp.as_mut().ok_or_else(|| {
+                "QMP controller disappeared before FileChooser selection".to_string()
+            })?;
+            qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;
+            evidence.td_firefox_file_chooser_pixels = true;
+            let selection_deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            qmp.file_chooser_select_until(selection_deadline)?;
+            self.phase = PhysicalInputPhase::FirefoxFileChooserSelect;
         }
         Ok(())
     }
@@ -4623,27 +4906,58 @@ impl Qmp {
         self.key_chord_until(&["shift"], deadline)
     }
 
+    fn file_chooser_open_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.move_absolute_until(24_576, 16_384, deadline)?;
+        self.button_until("left", deadline)
+    }
+
+    fn file_chooser_focus_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.move_absolute_until(24_576, 16_384, deadline)?;
+        self.button_until("left", deadline)
+    }
+
+    fn file_chooser_activate_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.key_chord_until(&["ret"], deadline)
+    }
+
+    fn file_chooser_select_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.key_chord_until(&["ret"], deadline)
+    }
+
+    fn capture_portal_frame_until(
+        &mut self,
+        socket: &Path,
+        presentation: PortalPresentation,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let directory = socket
+            .parent()
+            .ok_or_else(|| "QMP socket has no screenshot directory".to_string())?
+            .to_path_buf();
+        let screenshot = directory.join("portal-file-chooser.ppm");
+        if screenshot.exists() {
+            return Err(format!(
+                "QMP portal screenshot already exists: {}",
+                screenshot.display()
+            ));
+        }
+        let filename = qmp_json_path(&screenshot)?;
+        self.exchange_until(
+            &format!("{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{filename}}}}}"),
+            deadline,
+        )?;
+        validate_portal_screenshot(&screenshot, presentation)
+    }
+
     fn key_chord_until(&mut self, keys: &[&str], deadline: Instant) -> Result<(), String> {
         if keys.is_empty()
             || keys.len() > 3
-            || keys
-                .iter()
-                .any(|key| {
-                    !matches!(
-                        *key,
-                        "ctrl"
-                            | "shift"
-                            | "c"
-                            | "e"
-                            | "l"
-                            | "m"
-                            | "o"
-                            | "ret"
-                            | "v"
-                            | "w"
-                            | "x"
-                    )
-                })
+            || keys.iter().any(|key| {
+                !matches!(
+                    *key,
+                    "ctrl" | "shift" | "c" | "e" | "l" | "m" | "o" | "ret" | "v" | "w" | "x"
+                )
+            })
         {
             return Err("QMP input chord is outside the closed set".to_string());
         }
@@ -4778,6 +5092,202 @@ impl Qmp {
     }
 }
 
+fn qmp_json_path(path: &Path) -> Result<String, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| format!("QMP screenshot path is not UTF-8: {}", path.display()))?;
+    let mut escaped = String::with_capacity(text.len().saturating_add(2));
+    escaped.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            value if (value as u32) < 0x20 => {
+                escaped.push_str(&format!("\\u{:04x}", value as u32));
+            }
+            value => escaped.push(value),
+        }
+    }
+    escaped.push('"');
+    Ok(escaped)
+}
+
+fn validate_portal_screenshot(path: &Path, presentation: PortalPresentation) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect QMP portal screenshot {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_SCREENSHOT_BYTES as u64 {
+        return Err("QMP portal screenshot is not a bounded regular file".to_string());
+    }
+    let file = File::open(path)
+        .map_err(|error| format!("open QMP portal screenshot {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_SCREENSHOT_BYTES)
+            .saturating_add(1),
+    );
+    file.take(MAX_SCREENSHOT_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read QMP portal screenshot {}: {error}", path.display()))?;
+    if bytes.len() > MAX_SCREENSHOT_BYTES {
+        return Err("QMP portal screenshot grew beyond its byte ceiling".to_string());
+    }
+    let (width, height, pixels) = parse_ppm(&bytes)?;
+    if width != QMP_OUTPUT_WIDTH as usize || height != QMP_OUTPUT_HEIGHT as usize {
+        return Err(format!(
+            "QMP portal screenshot has unexpected dimensions {width}x{height}"
+        ));
+    }
+    if presentation.width != PORTAL_CLIENT_WIDTH || presentation.height != PORTAL_CLIENT_HEIGHT {
+        return Err("portal presentation dimensions escaped the configured client".to_string());
+    }
+    let corner = ppm_pixel(pixels, width, PORTAL_CLIENT_X, PORTAL_CLIENT_Y)?;
+    let panel = ppm_pixel(pixels, width, 640, 173)?;
+    let highlight = ppm_pixel(pixels, width, 640, 269)?;
+    if corner != PORTAL_BACKGROUND_RGB
+        || panel != PORTAL_PANEL_RGB
+        || highlight != PORTAL_HIGHLIGHT_RGB
+    {
+        return Err(format!(
+            "QMP portal screenshot missed its centred palette: corner={corner:02x?} panel={panel:02x?} highlight={highlight:02x?}"
+        ));
+    }
+    let mut background = 0usize;
+    let mut panels = 0usize;
+    let mut highlights = 0usize;
+    let (pixel_rows, remainder) = pixels.as_chunks::<3>();
+    if !remainder.is_empty() {
+        return Err("QMP portal screenshot has a partial pixel".to_string());
+    }
+    for pixel in pixel_rows {
+        if *pixel == PORTAL_BACKGROUND_RGB {
+            background = background.saturating_add(1);
+        } else if *pixel == PORTAL_PANEL_RGB {
+            panels = panels.saturating_add(1);
+        } else if *pixel == PORTAL_HIGHLIGHT_RGB {
+            highlights = highlights.saturating_add(1);
+        }
+    }
+    if background < 20_000 || panels < 180_000 || highlights < 5_000 {
+        return Err(format!(
+            "QMP portal screenshot has too few chooser pixels: background={background} panel={panels} highlight={highlights}"
+        ));
+    }
+    let checksum = portal_client_checksum(pixels, width)?;
+    if checksum != presentation.checksum {
+        return Err(format!(
+            "QMP portal pixels have checksum {checksum:016x}, expected {:016x}",
+            presentation.checksum
+        ));
+    }
+    Ok(())
+}
+
+fn portal_client_checksum(pixels: &[u8], stride: usize) -> Result<u64, String> {
+    let mut checksum = 0xcbf2_9ce4_8422_2325u64;
+    for y in PORTAL_CLIENT_Y..PORTAL_CLIENT_Y.saturating_add(PORTAL_CLIENT_HEIGHT) {
+        for x in PORTAL_CLIENT_X..PORTAL_CLIENT_X.saturating_add(PORTAL_CLIENT_WIDTH) {
+            let [red, green, blue] = ppm_pixel(pixels, stride, x, y)?;
+            for byte in [blue, green, red, 0] {
+                checksum = (checksum ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+    }
+    Ok(checksum)
+}
+
+fn parse_ppm(bytes: &[u8]) -> Result<(usize, usize, &[u8]), String> {
+    let mut cursor = 0usize;
+    let magic = ppm_token(bytes, &mut cursor)?;
+    let width = ppm_number(ppm_token(bytes, &mut cursor)?, "width")?;
+    let height = ppm_number(ppm_token(bytes, &mut cursor)?, "height")?;
+    let maximum = ppm_number(ppm_token(bytes, &mut cursor)?, "maximum")?;
+    if magic != b"P6" || maximum != 255 {
+        return Err("QMP screenshot is not an eight-bit binary PPM".to_string());
+    }
+    let separator = bytes
+        .get(cursor)
+        .copied()
+        .ok_or_else(|| "QMP screenshot omits its pixel separator".to_string())?;
+    if !separator.is_ascii_whitespace() {
+        return Err("QMP screenshot has an invalid pixel separator".to_string());
+    }
+    cursor = cursor.saturating_add(1);
+    if separator == b'\r' && bytes.get(cursor) == Some(&b'\n') {
+        cursor = cursor.saturating_add(1);
+    }
+    let pixels = bytes
+        .get(cursor..)
+        .ok_or_else(|| "QMP screenshot pixel offset escaped its bytes".to_string())?;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|count| count.checked_mul(3))
+        .ok_or_else(|| "QMP screenshot dimensions overflow".to_string())?;
+    if pixels.len() != expected {
+        return Err(format!(
+            "QMP screenshot carries {} pixel bytes, expected {expected}",
+            pixels.len()
+        ));
+    }
+    Ok((width, height, pixels))
+}
+
+fn ppm_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
+    loop {
+        while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+            *cursor = cursor.saturating_add(1);
+        }
+        if bytes.get(*cursor) != Some(&b'#') {
+            break;
+        }
+        while bytes.get(*cursor).is_some_and(|byte| *byte != b'\n') {
+            *cursor = cursor.saturating_add(1);
+        }
+        if *cursor > MAX_SCREENSHOT_HEADER_BYTES {
+            return Err("QMP screenshot header exceeded its byte ceiling".to_string());
+        }
+    }
+    let start = *cursor;
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'#')
+    {
+        *cursor = cursor.saturating_add(1);
+    }
+    if *cursor == start || *cursor > MAX_SCREENSHOT_HEADER_BYTES {
+        return Err("QMP screenshot has a missing or oversized header token".to_string());
+    }
+    bytes
+        .get(start..*cursor)
+        .ok_or_else(|| "QMP screenshot header token escaped its bytes".to_string())
+}
+
+fn ppm_number(token: &[u8], name: &str) -> Result<usize, String> {
+    let text =
+        std::str::from_utf8(token).map_err(|_| format!("QMP screenshot {name} is not ASCII"))?;
+    let number = text
+        .parse::<usize>()
+        .map_err(|_| format!("QMP screenshot {name} is not decimal"))?;
+    if number.to_string() != text || number == 0 {
+        return Err(format!("QMP screenshot {name} is not canonical"));
+    }
+    Ok(number)
+}
+
+fn ppm_pixel(pixels: &[u8], width: usize, x: usize, y: usize) -> Result<[u8; 3], String> {
+    let offset = y
+        .checked_mul(width)
+        .and_then(|row| row.checked_add(x))
+        .and_then(|pixel| pixel.checked_mul(3))
+        .ok_or_else(|| "QMP screenshot pixel offset overflow".to_string())?;
+    let Some([red, green, blue]) = pixels.get(offset..offset.saturating_add(3)) else {
+        return Err("QMP screenshot sample escaped its pixels".to_string());
+    };
+    Ok([*red, *green, *blue])
+}
+
 fn qmp_deadline(timeout: Duration) -> Result<Instant, String> {
     Instant::now()
         .checked_add(timeout)
@@ -4892,6 +5402,53 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 
+    fn portal_test_ppm() -> Vec<u8> {
+        let width = QMP_OUTPUT_WIDTH as usize;
+        let height = QMP_OUTPUT_HEIGHT as usize;
+        let mut pixels = vec![0x11; width.saturating_mul(height).saturating_mul(3)];
+        let mut fill =
+            |left: usize, top: usize, fill_width: usize, fill_height: usize, color: [u8; 3]| {
+                for y in top..top.saturating_add(fill_height) {
+                    for x in left..left.saturating_add(fill_width) {
+                        let Some(offset) = y
+                            .checked_mul(width)
+                            .and_then(|row| row.checked_add(x))
+                            .and_then(|pixel| pixel.checked_mul(3))
+                        else {
+                            continue;
+                        };
+                        if let Some(pixel) = pixels.get_mut(offset..offset.saturating_add(3)) {
+                            pixel.copy_from_slice(&color);
+                        }
+                    }
+                }
+            };
+        fill(
+            PORTAL_CLIENT_X,
+            PORTAL_CLIENT_Y,
+            PORTAL_CLIENT_WIDTH,
+            PORTAL_CLIENT_HEIGHT,
+            PORTAL_BACKGROUND_RGB,
+        );
+        fill(
+            PORTAL_CLIENT_X.saturating_add(8),
+            PORTAL_CLIENT_Y.saturating_add(16),
+            PORTAL_CLIENT_WIDTH.saturating_sub(16),
+            PORTAL_CLIENT_HEIGHT.saturating_sub(32),
+            PORTAL_PANEL_RGB,
+        );
+        fill(
+            PORTAL_CLIENT_X.saturating_add(16),
+            PORTAL_CLIENT_Y.saturating_add(120),
+            PORTAL_CLIENT_WIDTH.saturating_sub(32),
+            16,
+            PORTAL_HIGHLIGHT_RGB,
+        );
+        let mut ppm = format!("P6\n# qmp fixture\n{width} {height}\n255\n").into_bytes();
+        ppm.extend_from_slice(&pixels);
+        ppm
+    }
+
     #[test]
     fn contains_matches_substrings_and_boundaries() {
         assert!(contains(
@@ -4904,6 +5461,46 @@ mod tests {
         assert!(!contains(b"abc", b"d")); // absent
         assert!(!contains(b"ab", b"abc")); // needle longer than haystack
         assert!(!contains(b"anything", b"")); // empty needle never matches
+    }
+
+    #[test]
+    fn qmp_screenshot_requires_the_centred_modal_chooser_pixels() {
+        let seq = AtomicU64::new(9_100);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let valid = dir.join("valid.ppm");
+        let valid_bytes = portal_test_ppm();
+        let (width, _, pixels) = parse_ppm(&valid_bytes).unwrap();
+        let presentation = PortalPresentation {
+            width: PORTAL_CLIENT_WIDTH,
+            height: PORTAL_CLIENT_HEIGHT,
+            checksum: portal_client_checksum(pixels, width).unwrap(),
+        };
+        fs::write(&valid, valid_bytes).unwrap();
+        validate_portal_screenshot(&valid, presentation).unwrap();
+
+        let wrong = dir.join("wrong.ppm");
+        let mut bytes = portal_test_ppm();
+        let (_, _, pixels) = parse_ppm(&bytes).unwrap();
+        let pixel_offset = pixels.as_ptr() as usize - bytes.as_ptr() as usize;
+        let sample = PORTAL_CLIENT_Y
+            .checked_mul(QMP_OUTPUT_WIDTH as usize)
+            .and_then(|row| row.checked_add(PORTAL_CLIENT_X))
+            .and_then(|pixel| pixel.checked_mul(3))
+            .and_then(|offset| pixel_offset.checked_add(offset))
+            .unwrap();
+        bytes
+            .get_mut(sample..sample.saturating_add(3))
+            .unwrap()
+            .copy_from_slice(&[0, 0, 0]);
+        fs::write(&wrong, bytes).unwrap();
+        assert!(validate_portal_screenshot(&wrong, presentation)
+            .unwrap_err()
+            .contains("missed its centred palette"));
+
+        assert!(parse_ppm(b"P6\n1280 800\n255\nshort")
+            .unwrap_err()
+            .contains("pixel bytes"));
     }
 
     #[test]
@@ -4979,18 +5576,20 @@ mod tests {
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
         let path = dir.join("qmp.sock");
+        let screenshot = dir.join("portal-file-chooser.ppm");
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .write_all(b"{\"QMP\":{\"version\":{}}}\r\n")
-                .unwrap();
+            stream.write_all(b"{\"QMP\":{\"version\":{}}}\r\n").unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut commands = Vec::new();
-            for _ in 0..30 {
+            for _ in 0..37 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 commands.push(line.trim_end().to_string());
+                if line.contains("\"execute\":\"screendump\"") {
+                    fs::write(&screenshot, portal_test_ppm()).unwrap();
+                }
                 stream.write_all(b"{\"event\":\"IGNORED\"}\r\n").unwrap();
                 stream.write_all(b"{\"return\": {}}\r\n").unwrap();
             }
@@ -4999,69 +5598,143 @@ mod tests {
 
         let mut controller = PhysicalInputController::new(path);
         let mut evidence = ConsoleEvidence::default();
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::Arm);
         evidence.td_firefox_input_armed = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::Menu);
         evidence.td_firefox_input_menu = true;
         evidence.td_term_clipboard_focus = Some(7);
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::Final);
         evidence.td_firefox_input = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::Final);
         evidence.td_term_clipboard_focus = Some(8);
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::TerminalPrepare);
         evidence.td_term_clipboard_target = Some(TerminalClipboardTarget { row: 0, column: 4 });
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::TerminalSelection);
         evidence.td_term_clipboard_selection = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::TerminalCopy);
         evidence.td_term_clipboard = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::TerminalCopy);
         evidence.td_firefox_clipboard_refocus_armed = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxFocus);
         evidence.td_firefox_clipboard_window_armed = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteArm);
         evidence.td_firefox_clipboard_armed = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPaste);
         evidence.td_firefox_clipboard_retry = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPaste);
+        evidence.td_term_clipboard_sent = true;
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteRetried);
         evidence.td_firefox_clipboard = true;
         evidence.td_firefox_download_armed = true;
-        controller.progress(&evidence).unwrap();
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxDownload);
+        evidence.td_firefox_download = true;
+        evidence.td_firefox_file_chooser_refocus_armed = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(
+            controller.phase,
+            PhysicalInputPhase::FirefoxFileChooserFocus
+        );
+        evidence.td_firefox_file_chooser_armed = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(
+            controller.phase,
+            PhysicalInputPhase::FirefoxFileChooserInputFocus
+        );
+        evidence.td_firefox_file_chooser_focused = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxFileChooserOpen);
+        evidence.td_firefox_file_chooser_presented = Some(PortalPresentation {
+            width: PORTAL_CLIENT_WIDTH,
+            height: PORTAL_CLIENT_HEIGHT,
+            checksum: {
+                let ppm = portal_test_ppm();
+                let (width, _, pixels) = parse_ppm(&ppm).unwrap();
+                portal_client_checksum(pixels, width).unwrap()
+            },
+        });
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(
+            controller.phase,
+            PhysicalInputPhase::FirefoxFileChooserSelect
+        );
+        assert!(evidence.td_firefox_file_chooser_pixels);
 
         let commands = server.join().unwrap();
-        assert_eq!(commands.first().unwrap(), r#"{"execute":"qmp_capabilities"}"#);
-        assert!(commands.get(1).unwrap().contains("\"axis\":\"x\",\"value\":24576"));
-        assert!(commands.get(2).unwrap().contains("\"axis\":\"x\",\"value\":25600"));
+        assert_eq!(
+            commands.first().unwrap(),
+            r#"{"execute":"qmp_capabilities"}"#
+        );
+        assert!(commands
+            .get(1)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":24576"));
+        assert!(commands
+            .get(2)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":25600"));
         assert!(commands.get(3).unwrap().contains("\"data\":\"x\""));
-        assert!(commands.get(4).unwrap().contains("\"button\":\"wheel-down\""));
+        assert!(commands
+            .get(4)
+            .unwrap()
+            .contains("\"button\":\"wheel-down\""));
         assert!(commands.get(5).unwrap().contains("\"button\":\"right\""));
-        assert!(commands.get(6).unwrap().contains("\"axis\":\"x\",\"value\":8192"));
+        assert!(commands
+            .get(6)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":8192"));
         assert!(commands.get(7).unwrap().contains("\"button\":\"left\""));
         assert!(commands.get(8).unwrap().contains("\"data\":\"l\""));
         assert!(commands.get(9).unwrap().contains("\"data\":\"shift\""));
         assert!(commands.get(9).unwrap().contains("\"data\":\"w\""));
-        for (index, key) in [(10, "e"), (11, "l"), (12, "c"), (13, "o"), (14, "m"), (15, "e")] {
-            assert!(commands.get(index).unwrap().contains(&format!("\"data\":\"{key}\"")));
+        for (index, key) in [
+            (10, "e"),
+            (11, "l"),
+            (12, "c"),
+            (13, "o"),
+            (14, "m"),
+            (15, "e"),
+        ] {
+            assert!(commands
+                .get(index)
+                .unwrap()
+                .contains(&format!("\"data\":\"{key}\"")));
         }
-        assert!(commands.get(16).unwrap().contains("\"axis\":\"x\",\"value\":1536"));
-        assert!(commands.get(17).unwrap().contains("\"down\":true,\"button\":\"left\""));
-        assert!(commands.get(18).unwrap().contains("\"axis\":\"x\",\"value\":2765"));
-        assert!(commands.get(19).unwrap().contains("\"down\":false,\"button\":\"left\""));
+        assert!(commands
+            .get(16)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":1536"));
+        assert!(commands
+            .get(17)
+            .unwrap()
+            .contains("\"down\":true,\"button\":\"left\""));
+        assert!(commands
+            .get(18)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":2765"));
+        assert!(commands
+            .get(19)
+            .unwrap()
+            .contains("\"down\":false,\"button\":\"left\""));
         assert!(commands.get(20).unwrap().contains("\"data\":\"shift\""));
         assert!(commands.get(20).unwrap().contains("\"data\":\"c\""));
-        assert!(commands.get(21).unwrap().contains("\"axis\":\"x\",\"value\":24576"));
+        assert!(commands
+            .get(21)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":24576"));
         assert!(commands.get(22).unwrap().contains("\"button\":\"left\""));
         assert!(commands.get(23).unwrap().contains("\"data\":\"l\""));
         assert!(commands.get(24).unwrap().contains("\"data\":\"v\""));
@@ -5070,6 +5743,42 @@ mod tests {
         assert!(commands.get(27).unwrap().contains("\"data\":\"shift\""));
         assert!(commands.get(28).unwrap().contains("\"data\":\"ret\""));
         assert!(commands.get(29).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands
+            .get(30)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":24576"));
+        assert!(commands
+            .get(30)
+            .unwrap()
+            .contains("\"axis\":\"y\",\"value\":16384"));
+        assert!(commands.get(31).unwrap().contains("\"button\":\"left\""));
+        assert!(commands
+            .get(32)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":24576"));
+        assert!(commands
+            .get(32)
+            .unwrap()
+            .contains("\"axis\":\"y\",\"value\":16384"));
+        assert!(commands.get(33).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(34).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands
+            .get(35)
+            .unwrap()
+            .contains("\"execute\":\"screendump\""));
+        assert!(commands
+            .get(35)
+            .unwrap()
+            .contains("portal-file-chooser.ppm"));
+        assert!(commands.get(36).unwrap().contains("\"data\":\"ret\""));
+        let source = include_str!("qemu_boot.rs");
+        assert!(source.contains(
+            "qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;"
+        ));
+        assert!(source.contains(concat!(
+            "let selection_deadline = qmp_deadline(QMP_IO_TIMEOUT)?;\n",
+            "            qmp.file_chooser_select_until(selection_deadline)?;"
+        )));
     }
 
     #[test]
@@ -5094,15 +5803,42 @@ mod tests {
     #[test]
     fn clipboard_coordinates_bind_the_fixed_first_workspace() {
         assert_eq!(
-            terminal_clipboard_coordinates(TerminalClipboardTarget { row: 0, column: 4 })
-                .unwrap(),
+            terminal_clipboard_coordinates(TerminalClipboardTarget { row: 0, column: 4 }).unwrap(),
             (1_536, 2_765, 3_113)
         );
         let scene = include_str!("../../../../../td-compositor/src/scene.rs");
         assert!(scene.contains("pub(crate) const GAP: usize = 24;"));
         assert!(scene.contains("pub(crate) const TITLE_HEIGHT: usize = 20;"));
+        assert!(scene.contains("let frame_width = width.saturating_mul(3) / 4;"));
+        assert!(scene.contains("let frame_height = usable_height.saturating_mul(3) / 4;"));
+        assert!(scene.contains("let frame_x = width.saturating_sub(frame_width) / 2;"));
+        assert!(scene.contains(
+            "let frame_y = BAR_HEIGHT.saturating_add(usable_height.saturating_sub(frame_height) / 2);"
+        ));
+        assert!(scene.contains(
+            "y: frame_y.saturating_add(band_height),\n                width: frame_width,\n                height: frame_height.saturating_sub(band_height),"
+        ));
         let bar = include_str!("../../../../../td-compositor/src/bar.rs");
         assert!(bar.contains("pub const BAR_HEIGHT: usize = 24;"));
+        let chooser = include_str!("../../../../../td-portal/src/file_chooser.rs");
+        assert!(chooser.contains(&format!(
+            "pub const WIDTH: usize = {PORTAL_CLIENT_WIDTH};"
+        )));
+        assert!(chooser.contains(&format!(
+            "pub const HEIGHT: usize = {PORTAL_CLIENT_HEIGHT};"
+        )));
+        assert!(chooser.contains("const BACKGROUND: [u8; 4] = [0x28, 0x20, 0x18, 0];"));
+        assert!(chooser.contains("const PANEL: [u8; 4] = [0x3c, 0x30, 0x28, 0];"));
+        assert!(chooser.contains("const HIGHLIGHT: [u8; 4] = [0x78, 0x48, 0x28, 0];"));
+        let firefox = include_str!("../../../../../td-jail/src/firefox.rs");
+        assert!(firefox.contains("input.style.width = \"200px\";"));
+        assert!(firefox.contains("input.style.height = \"100px\";"));
+        assert!(firefox.contains("refocus.x <= rect.left"));
+        assert!(firefox.contains("focus.style.width = \"100%\";"));
+        assert!(firefox.contains("focus.style.height = \"100%\";"));
+        assert!(firefox.contains("::file-selector-button"));
+        assert!(firefox.contains("width: 100%; height: 100%"));
+        assert!(firefox.contains("input.getBoundingClientRect()"));
         let font = include_str!("../../../../../td-compositor/src/font_data.rs");
         assert!(font.contains(
             "UNIFONT_HEX: &str = \"72b54a86000000002000000001000000c1500000100000001000000008000000"
@@ -5183,6 +5919,17 @@ mod tests {
                 "td-jail omitted {marker}"
             );
         }
+        for marker in [
+            TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER,
+            TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER,
+            TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER,
+            TD_FIREFOX_FILE_CHOOSER_MARKER,
+        ] {
+            assert!(
+                firefox.contains(&format!("\"{marker}\"")),
+                "td-jail omitted {marker}"
+            );
+        }
         assert!(firefox.contains(&format!(
             "const INPUT_CLIPBOARD_PUBLIC_ARMED: &str = \"{TD_FIREFOX_CLIPBOARD_ARMED_MARKER}\";"
         )));
@@ -5203,7 +5950,19 @@ mod tests {
             TD_FIREFOX_DOWNLOAD_MARKER,
             format!("TD-FIREFOX-DOWNLOAD-OK bytes={}", DOWNLOAD.len())
         );
+        assert_eq!(
+            TD_FIREFOX_FILE_CHOOSER_MARKER,
+            format!("TD-FIREFOX-FILE-CHOOSER-OK bytes={}", DOWNLOAD.len())
+        );
+        assert!(firefox.contains(&format!("file.size === {}", DOWNLOAD.len())));
+        let portal = include_str!("../../../../../td-portal/src/main.rs");
+        let presented = TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX
+            .strip_prefix("portal: ")
+            .unwrap();
+        assert!(portal.contains(presented));
+        assert!(portal.contains(TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER));
         let system = include_str!("../../../recipes/system-x86-64.rs");
+        assert!(system.contains(TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER));
         assert!(system.contains(
             "const FIREFOX_DOWNLOAD_FIXTURE: &str = \"TD-FIREFOX-DOWNLOAD-V1\";"
         ));
@@ -5835,7 +6594,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 62] {
+    fn all_console_markers() -> [&'static str; 69] {
         [
             MARKER,
             EROFS_MARKER,
@@ -5895,11 +6654,54 @@ mod tests {
             TD_FIREFOX_CLIPBOARD_ARMED_MARKER,
             TD_FIREFOX_CLIPBOARD_RETRY_MARKER,
             TD_FIREFOX_CLIPBOARD_MARKER,
+            TD_FIREFOX_DOWNLOAD_ARMED_MARKER,
+            TD_FIREFOX_DOWNLOAD_MARKER,
+            TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER,
+            TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER,
+            TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER,
+            TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX,
+            TD_FIREFOX_FILE_CHOOSER_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
         ]
+    }
+
+    #[test]
+    fn file_chooser_presentation_requires_one_exact_bounded_record() {
+        let valid = format!(
+            "\n{TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX}path=/org/freedesktop/portal/desktop/request/1_42/gtk_7 size={PORTAL_CLIENT_WIDTH}x{PORTAL_CLIENT_HEIGHT} checksum=0123456789abcdef\r\n"
+        );
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(&mut evidence, valid.as_bytes(), b"target");
+        assert_eq!(
+            evidence.td_firefox_file_chooser_presented,
+            Some(PortalPresentation {
+                width: PORTAL_CLIENT_WIDTH,
+                height: PORTAL_CLIENT_HEIGHT,
+                checksum: 0x0123_4567_89ab_cdef,
+            })
+        );
+
+        for invalid in [
+            format!("noise{}", valid.trim_start_matches('\n')),
+            valid.replace("1_42", "1_x"),
+            valid.replace("1_42", "1_042"),
+            valid.replace("1_42", "1_0"),
+            valid.replace("gtk_7", "gtk-7"),
+            valid.replace(
+                &format!("{PORTAL_CLIENT_WIDTH}x{PORTAL_CLIENT_HEIGHT}"),
+                "641x432",
+            ),
+            valid.replace("0123456789abcdef", "0123456789abcdeF"),
+            valid.replace("0123456789abcdef", "0000000000000000"),
+            valid.trim_end().to_string(),
+        ] {
+            let mut rejected = ConsoleEvidence::default();
+            latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");
+            assert_eq!(rejected.td_firefox_file_chooser_presented, None);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! One bounded private-Wayland FileChooser dialog.
 
-use crate::file_chooser::{self, Action, Chooser, Mode, Outcome};
+use crate::file_chooser::{self, Action, Chooser, FileFilter, Mode, Outcome};
 use crate::keyboard::{MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_SHIFT, XKB_KEYMAP};
 use crate::wayland_channel::EXPECTED_GLOBALS;
 use crate::{sys, wayland_wire as wire};
@@ -11,6 +11,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,6 +53,9 @@ pub struct DialogConfig {
     pub host_root: PathBuf,
     pub guest_root: PathBuf,
     pub mode: Mode,
+    pub accept_label: Option<String>,
+    pub filter: Option<FileFilter>,
+    pub connector: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -78,6 +83,23 @@ struct Globals {
     xdg_wm_base: Option<Global>,
     seat: Option<Global>,
     portal_manager: Option<Global>,
+}
+
+struct ConnectLease(Arc<AtomicBool>);
+
+impl ConnectLease {
+    fn acquire(active: Arc<AtomicBool>) -> Result<Self, String> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "the private Wayland connector is already occupied".to_string())?;
+        Ok(Self(active))
+    }
+}
+
+impl Drop for ConnectLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Globals {
@@ -171,52 +193,26 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    fn connect(path: &Path) -> Result<Self, String> {
+    fn connect(path: &Path, connector: Arc<AtomicBool>) -> Result<Self, String> {
         let deadline = Instant::now()
             .checked_add(HANDSHAKE_TIMEOUT)
             .ok_or_else(|| "private Wayland handshake deadline overflowed".to_string())?;
-        let mut last = None;
-        for attempt in 0..CONNECT_ATTEMPTS {
-            match UnixStream::connect(path) {
-                Ok(stream) => {
-                    return Ok(Self {
-                        stream,
-                        buffered: Vec::with_capacity(RECEIVE_BUFFER_BYTES),
-                        pending_fds: VecDeque::new(),
-                        incoming: [0; RECEIVE_BUFFER_BYTES],
-                        deadline: Some(deadline),
-                        last_write: Instant::now(),
-                        next_id: FIRST_DYNAMIC_ID,
-                        free_ids: BTreeSet::new(),
-                        keepalive_callbacks: BTreeSet::new(),
-                        retired_keepalive: None,
-                    });
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    last = Some(error);
-                    let remaining = remaining(deadline)?;
-                    if attempt + 1 < CONNECT_ATTEMPTS {
-                        thread::sleep(remaining.min(Duration::from_millis(100)));
-                    }
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "connect private portal Wayland socket {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        Err(format!(
-            "connect private portal Wayland socket {} after {CONNECT_ATTEMPTS} attempts: {}",
-            path.display(),
-            last.map_or_else(|| "unknown error".to_string(), |error| error.to_string())
-        ))
+        let path = path.to_path_buf();
+        let stream = bounded_connect(connector, deadline, move || {
+            connect_blocking_until(&path, deadline)
+        })?;
+        Ok(Self {
+            stream,
+            buffered: Vec::with_capacity(RECEIVE_BUFFER_BYTES),
+            pending_fds: VecDeque::new(),
+            incoming: [0; RECEIVE_BUFFER_BYTES],
+            deadline: Some(deadline),
+            last_write: Instant::now(),
+            next_id: FIRST_DYNAMIC_ID,
+            free_ids: BTreeSet::new(),
+            keepalive_callbacks: BTreeSet::new(),
+            retired_keepalive: None,
+        })
     }
 
     fn canceller(&self) -> Result<UnixStream, String> {
@@ -431,6 +427,72 @@ impl Connection {
     }
 }
 
+fn bounded_connect<F>(
+    connector: Arc<AtomicBool>,
+    deadline: Instant,
+    operation: F,
+) -> Result<UnixStream, String>
+where
+    F: FnOnce() -> Result<UnixStream, String> + Send + 'static,
+{
+    let lease = ConnectLease::acquire(connector)?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("td-portal-wayland-connect".into())
+        .spawn(move || {
+            let result = operation();
+            drop(lease);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("spawn the private Wayland connector: {error}"))?;
+    let wait = remaining(deadline)?;
+    receiver.recv_timeout(wait).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => {
+            "private portal Wayland connect exceeded its 20-second deadline".to_string()
+        }
+        mpsc::RecvTimeoutError::Disconnected => {
+            "private portal Wayland connector exited without a result".to_string()
+        }
+    })?
+}
+
+fn connect_blocking_until(path: &Path, deadline: Instant) -> Result<UnixStream, String> {
+    let mut last = None;
+    for attempt in 0..CONNECT_ATTEMPTS {
+        match UnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                last = Some(error);
+                if attempt + 1 < CONNECT_ATTEMPTS {
+                    let Some(wait) = deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|wait| !wait.is_zero())
+                    else {
+                        break;
+                    };
+                    thread::sleep(wait.min(Duration::from_millis(100)));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "connect private portal Wayland socket {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "connect private portal Wayland socket {} after {CONNECT_ATTEMPTS} attempts: {}",
+        path.display(),
+        last.map_or_else(|| "unknown error".to_string(), |error| error.to_string())
+    ))
+}
+
 #[derive(Debug)]
 struct Frame {
     buffer: u32,
@@ -470,11 +532,13 @@ impl Dialog {
         } else {
             format!("{} — {}", config.app_id, config.title)
         };
-        let chooser = Chooser::open(
+        let chooser = Chooser::open_with_options(
             &window_title,
             &config.host_root,
             &config.guest_root,
             config.mode,
+            config.accept_label,
+            config.filter,
         )?;
         Ok(Self {
             chooser,
@@ -861,7 +925,7 @@ impl Dialog {
                 return Ok(());
             }
             if !self.presented_once {
-                if !matches!(self.portal_state, Some(0 | 1)) {
+                if !matches!(self.portal_state, Some(0 | 1)) || !self.keyboard_focused {
                     return Ok(());
                 }
                 notice(Notice::Presented {
@@ -929,7 +993,7 @@ fn run(
     config: DialogConfig,
     notice: &impl Fn(Notice) -> Result<(), String>,
 ) -> Result<Outcome, String> {
-    let mut connection = Connection::connect(&config.socket)?;
+    let mut connection = Connection::connect(&config.socket, config.connector.clone())?;
     notice(Notice::Connected(connection.canceller()?))?;
     let mut dialog = Dialog::new(config)?;
     dialog.discover(&mut connection)?;
@@ -1414,11 +1478,15 @@ mod tests {
             host_root: root,
             guest_root: PathBuf::from("/home/td/Downloads"),
             mode: Mode::OpenFile { multiple: false },
+            accept_label: None,
+            filter: None,
+            connector: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
         assert_eq!(dialog.window_title, "firefox — Open file");
         dialog.dismissing = true;
         dialog.portal_state = Some(1);
+        dialog.keyboard_focused = true;
         dialog.frame = Some(Frame {
             buffer: 20,
             callback: 21,
@@ -1470,6 +1538,9 @@ mod tests {
             host_root: root,
             guest_root: PathBuf::from("/home/td/Downloads"),
             mode: Mode::OpenFile { multiple: false },
+            accept_label: None,
+            filter: None,
+            connector: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
         assert!(dialog.window_title.starts_with("firefox — "));
@@ -1478,7 +1549,47 @@ mod tests {
     }
 
     #[test]
-    fn presentation_waits_for_portal_admission() {
+    fn stalled_connect_has_one_bounded_worker_lane() {
+        let connector = Arc::new(AtomicBool::new(false));
+        let (release, blocked) = mpsc::sync_channel(1);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(50))
+            .unwrap();
+        let error = bounded_connect(connector.clone(), deadline, move || {
+            blocked.recv().unwrap();
+            Err("released stalled connector".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("20-second deadline"));
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_by_worker = invoked.clone();
+        let deadline = Instant::now().checked_add(Duration::from_secs(1)).unwrap();
+        let error = bounded_connect(connector.clone(), deadline, move || {
+            invoked_by_worker.store(true, Ordering::Release);
+            Ok(UnixStream::pair().unwrap().0)
+        })
+        .unwrap_err();
+        assert!(error.contains("connector is already occupied"));
+        assert!(!invoked.load(Ordering::Acquire));
+
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            if !connector.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!connector.load(Ordering::Acquire));
+        let deadline = Instant::now().checked_add(Duration::from_secs(1)).unwrap();
+        assert!(bounded_connect(connector, deadline, || {
+            Ok(UnixStream::pair().unwrap().0)
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn presentation_waits_for_portal_admission_and_keyboard_focus() {
         let temp = Temp::new("portal-admission");
         let root = temp.0.join("Downloads");
         fs::create_dir(&root).unwrap();
@@ -1491,6 +1602,9 @@ mod tests {
             host_root: root,
             guest_root: PathBuf::from("/home/td/Downloads"),
             mode: Mode::OpenFile { multiple: false },
+            accept_label: None,
+            filter: None,
+            connector: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
         dialog.frame = Some(Frame {
@@ -1527,6 +1641,12 @@ mod tests {
         assert_eq!(connection.deadline, Some(deadline));
 
         dialog.portal_state = Some(1);
+        dialog.settle(&mut connection, &record).unwrap();
+        assert!(notices.borrow().is_empty());
+        assert!(dialog.frame.is_some());
+        assert_eq!(connection.deadline, Some(deadline));
+
+        dialog.keyboard_focused = true;
         dialog.settle(&mut connection, &record).unwrap();
         assert!(matches!(
             notices.borrow().as_slice(),
@@ -1690,6 +1810,9 @@ mod tests {
                 host_root: root,
                 guest_root: PathBuf::from("/home/td/Downloads"),
                 mode: Mode::OpenFile { multiple: false },
+                accept_label: None,
+                filter: None,
+                connector: Arc::new(AtomicBool::new(false)),
             },
             move |notice| {
                 notice_tx

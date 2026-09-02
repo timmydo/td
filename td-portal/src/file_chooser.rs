@@ -21,6 +21,7 @@ pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_RESULT_URI_BYTES: usize = 512 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RENDERED_TITLE_BYTES: usize = 320;
+pub const MAX_ACCEPT_LABEL_BYTES: usize = 64;
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
 const HEADER_ROWS: usize = 6;
 const FOOTER_ROWS: usize = 2;
@@ -35,6 +36,35 @@ const O_DIRECTORY: i32 = 0x0001_0000;
 const O_NOFOLLOW: i32 = 0x0002_0000;
 
 static CHOOSER_FONT: OnceLock<Result<font::Font, String>> = OnceLock::new();
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileFilter {
+    label: String,
+    pattern: String,
+}
+
+impl FileFilter {
+    pub fn all_files(label: &str, pattern: &str) -> Result<Self, String> {
+        if label.is_empty() || label.len() > 256 || label.chars().any(char::is_control) {
+            return Err("file filter label is outside the 256-byte text bound".into());
+        }
+        if !matches!(pattern, "*" | "*.*") {
+            return Err("file filter is not the supported all-files glob".into());
+        }
+        Ok(Self {
+            label: label.to_string(),
+            pattern: pattern.to_string(),
+        })
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -84,6 +114,8 @@ pub struct Chooser {
     relative: PathBuf,
     directories: Vec<File>,
     mode: Mode,
+    accept_label: Option<String>,
+    filter: Option<FileFilter>,
     entries: Vec<Entry>,
     matches: Vec<usize>,
     selected: usize,
@@ -103,9 +135,29 @@ impl Chooser {
         guest_root: &Path,
         mode: Mode,
     ) -> Result<Self, String> {
+        Self::open_with_options(title, host_root, guest_root, mode, None, None)
+    }
+
+    pub fn open_with_options(
+        title: &str,
+        host_root: &Path,
+        guest_root: &Path,
+        mode: Mode,
+        accept_label: Option<String>,
+        filter: Option<FileFilter>,
+    ) -> Result<Self, String> {
         if title.len() > MAX_RENDERED_TITLE_BYTES || title.chars().any(char::is_control) {
             return Err(format!(
                 "file chooser title is outside the {MAX_RENDERED_TITLE_BYTES}-byte text bound"
+            ));
+        }
+        if accept_label.as_ref().is_some_and(|label| {
+            label.is_empty()
+                || label.len() > MAX_ACCEPT_LABEL_BYTES
+                || label.chars().any(char::is_control)
+        }) {
+            return Err(format!(
+                "file chooser accept label is outside the {MAX_ACCEPT_LABEL_BYTES}-byte text bound"
             ));
         }
         require_absolute_clean(guest_root, "file chooser guest root")?;
@@ -124,6 +176,8 @@ impl Chooser {
             relative: PathBuf::new(),
             directories: vec![root],
             mode,
+            accept_label,
+            filter,
             entries,
             matches: Vec::new(),
             selected: 0,
@@ -295,14 +349,8 @@ impl Chooser {
         }
         let help_row =
             (height / font.height().saturating_add(ROW_GAP).max(1)).saturating_sub(FOOTER_ROWS);
-        let help = match self.mode {
-            Mode::OpenFile { multiple: false } => "MOVE  FILTER  OPEN FILE  PARENT  CANCEL",
-            Mode::OpenFile { multiple: true } => {
-                "MOVE  FILTER  TOGGLE FILES  ACCEPT  PARENT  CANCEL"
-            }
-            Mode::OpenDirectory => "MOVE  FILTER  ENTER FOLDER  ACCEPT HERE  PARENT  CANCEL",
-        };
-        draw_text(&mut frame, dimensions, font, 3, help_row, help, MUTED);
+        let help = self.help_line();
+        draw_text(&mut frame, dimensions, font, 3, help_row, &help, MUTED);
         Ok(frame)
     }
 
@@ -325,6 +373,29 @@ impl Chooser {
         }
         if self.selection_limit_hit {
             line.push_str(&format!("  LIMIT {MAX_SELECTIONS}"));
+        }
+        if let Some(filter) = &self.filter {
+            line.push_str("  APP FILTER=");
+            line.push_str(&format!("{:?}", filter.label()));
+        }
+        line
+    }
+
+    fn help_line(&self) -> String {
+        let mut line = match self.mode {
+            Mode::OpenFile { multiple: false } => {
+                "MOVE  FILTER  OPEN FILE  PARENT  CANCEL".to_string()
+            }
+            Mode::OpenFile { multiple: true } => {
+                "MOVE  FILTER  TOGGLE FILES  ACCEPT  PARENT  CANCEL".to_string()
+            }
+            Mode::OpenDirectory => {
+                "MOVE  FILTER  ENTER FOLDER  ACCEPT HERE  PARENT  CANCEL".to_string()
+            }
+        };
+        if let Some(label) = &self.accept_label {
+            line.push_str("  APP ACTION=");
+            line.push_str(&format!("{label:?}"));
         }
         line
     }
@@ -880,6 +951,37 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn bounded_firefox_options_are_visible_and_richer_filters_are_refused() {
+        let root = Temp::new("firefox-options");
+        fs::write(root.0.join("report.txt"), b"x").unwrap();
+        let filter = FileFilter::all_files("All Files", "*").unwrap();
+        let chooser = Chooser::open_with_options(
+            "File Upload — firefox",
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+            Some("Select".into()),
+            Some(filter),
+        )
+        .unwrap();
+        assert!(chooser.status_line().contains("APP FILTER=\"All Files\""));
+        assert!(chooser
+            .help_line()
+            .starts_with("MOVE  FILTER  OPEN FILE  PARENT  CANCEL"));
+        assert!(chooser.help_line().contains("APP ACTION=\"Select\""));
+        assert!(FileFilter::all_files("Text", "*.txt").is_err());
+        assert!(Chooser::open_with_options(
+            "Open",
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+            Some("x".repeat(MAX_ACCEPT_LABEL_BYTES + 1)),
+            None,
+        )
+        .is_err());
     }
 
     #[test]

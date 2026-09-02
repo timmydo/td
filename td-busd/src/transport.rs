@@ -1405,6 +1405,31 @@ impl<'a> Connection<'a> {
                 }
                 self.answer(message, "as", |writer| writer.array("s", |_| Ok(())))
             }
+            // No activation is performed. GDBus nevertheless probes this
+            // method while constructing a proxy for an already-running
+            // service, and treats `UnknownMethod` as fatal before it can ask
+            // `GetNameOwner`. Report that a visible live service is already
+            // running and report every other name as unavailable, without
+            // starting a process or revealing a hidden owner.
+            "StartServiceByName" if here && on(BUS_NAME) => {
+                let Some(asked) = self.start_service_arguments(message)? else {
+                    return Ok(());
+                };
+                let running = self.may_see(&asked)
+                    && (asked == BUS_NAME || self.bus.owner_of(&asked).is_some());
+                if running {
+                    self.answer(message, "u", |writer| {
+                        writer.uint32(2);
+                        Ok(())
+                    })
+                } else {
+                    self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.ServiceUnknown",
+                        "the service is not available on this bus",
+                    )
+                }
+            }
             "NameHasOwner" if here && on(BUS_NAME) => {
                 let Some(asked) = self.bus_name_argument(message)? else {
                     return Ok(());
@@ -1873,6 +1898,37 @@ impl<'a> Connection<'a> {
                 Ok(None)
             }
         }
+    }
+
+    /// `StartServiceByName(s name, u flags)`, validated for td's no-activation
+    /// compatibility answer.
+    fn start_service_arguments(
+        &mut self,
+        message: &message::Message<'_>,
+    ) -> Result<Option<String>, Ended> {
+        if !self.takes(message, "su")? {
+            return Ok(None);
+        }
+        let args = message.args();
+        let name = args.first().and_then(crate::wire::Value::as_str);
+        let flags = args.get(1).and_then(crate::wire::Value::as_u32);
+        let (Some(name), Some(0)) = (name, flags) else {
+            self.refuse(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "StartServiceByName takes a name and zero flags",
+            )?;
+            return Ok(None);
+        };
+        if !crate::name::valid_well_known_name(name) {
+            self.refuse(
+                message,
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "that is not a well-known bus name",
+            )?;
+            return Ok(None);
+        }
+        Ok(Some(name.to_string()))
     }
 
     /// `AddMatch` and `RemoveMatch`, including the per-connection count and
@@ -4580,6 +4636,26 @@ mod tests {
             .expect("encode a RequestName")
     }
 
+    /// `StartServiceByName(name, flags)`.
+    fn start_service(name: &str, flags: u32, serial: u32) -> Vec<u8> {
+        message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            "StartServiceByName",
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .body("su", |writer| {
+            writer.string(name)?;
+            writer.uint32(flags);
+            Ok(())
+        })
+        .expect("body")
+        .encode()
+        .expect("encode StartServiceByName")
+    }
+
     /// `ReleaseName(name)`.
     fn release_name(name: &str, serial: u32) -> Vec<u8> {
         name_query("ReleaseName", name, serial)
@@ -5376,6 +5452,94 @@ mod tests {
             Some(GUID),
             "GetId answered with a different GUID than the handshake"
         );
+    }
+
+    /// `StartServiceByName` is a compatibility QUERY, not activation. A
+    /// visible name that is already owned earns the specified `2`; an absent
+    /// one gets `ServiceUnknown`, and neither call changes the directory.
+    #[test]
+    fn start_service_only_reports_visible_live_names() {
+        let (bus, mut clients) = bus_of(2);
+        let holder = clients.pop().expect("two clients");
+        let caller = clients.pop().expect("two clients");
+        let (mut caller, _) = Peer::arrive(caller);
+        let (mut holder, holder_name) = Peer::arrive(holder);
+
+        holder.send(&request_name("org.example.Service", 0, 2));
+        assert_eq!(name_code(&holder.answer()).0, 1);
+        let _acquired = holder.frame();
+
+        caller.send(&start_service("org.example.Service", 0, 2));
+        assert_eq!(name_code(&caller.answer()), (2, Some(2)));
+        assert!(bus.holds(&holder_name, "org.example.Service"));
+
+        caller.send(&start_service("org.example.Absent", 0, 3));
+        let frame = caller.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode ServiceUnknown");
+        assert_eq!(reply.kind, message::MessageType::Error);
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.ServiceUnknown")
+        );
+        assert!(!bus.holds(&holder_name, "org.example.Absent"));
+    }
+
+    /// A hidden live service is indistinguishable from an absent one on the
+    /// activation-compatibility path, just as it is for every name query.
+    #[test]
+    fn start_service_does_not_reveal_a_hidden_owner() {
+        if !pidfd_available() {
+            return;
+        }
+        let (_bus, free, jailed) = mixed_bus();
+        let (mut holder, _) = Peer::arrive(free);
+        let (mut app, _) = Peer::arrive(jailed);
+
+        holder.send(&request_name("org.example.Hidden", 0, 2));
+        assert_eq!(name_code(&holder.answer()).0, 1);
+        let _acquired = holder.frame();
+
+        app.send(&start_service("org.example.Hidden", 0, 2));
+        let frame = app.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode hidden refusal");
+        assert_eq!(
+            reply.fields.error_name,
+            Some("org.freedesktop.DBus.Error.ServiceUnknown")
+        );
+    }
+
+    /// The compatibility path is deliberately narrower than RequestName:
+    /// only a well-known name and the currently specified zero flags are
+    /// accepted, with exact signature checking.
+    #[test]
+    fn start_service_refuses_malformed_arguments() {
+        let (_bus, mut clients) = bus_of(1);
+        let only = clients.pop().expect("one client");
+        let (mut peer, _) = Peer::arrive(only);
+
+        for (serial, call) in [
+            (2, start_service(":1.2", 0, 2)),
+            (3, start_service("org.example.Service", 1, 3)),
+            (
+                4,
+                name_query("StartServiceByName", "org.example.Service", 4),
+            ),
+        ] {
+            peer.send(&call);
+            let frame = peer.answer();
+            let (reply, _) = message::decode(&frame, 0).expect("decode InvalidArgs");
+            assert_eq!(reply.kind, message::MessageType::Error);
+            assert_eq!(reply.fields.reply_serial, Some(serial));
+            assert_eq!(
+                reply.fields.error_name,
+                Some("org.freedesktop.DBus.Error.InvalidArgs")
+            );
+        }
+
+        peer.send(&bus_call("GetId", 5));
+        let frame = peer.answer();
+        let (reply, _) = message::decode(&frame, 0).expect("decode GetId");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
     }
 
     /// The broker answers who is behind a name from the KERNEL, not from
@@ -8027,9 +8191,15 @@ mod tests {
             owner.args().first().and_then(crate::wire::Value::as_str),
             Some(portal_unique.as_str())
         );
+        app.send(&start_service("org.freedesktop.portal.Desktop", 0, 6));
+        assert_eq!(
+            name_code(&app.answer()),
+            (2, Some(6)),
+            "the visible supervised portal was not reported already running"
+        );
         for (serial, target) in [
-            (6, "org.freedesktop.portal.Desktop"),
-            (7, portal_unique.as_str()),
+            (7, "org.freedesktop.portal.Desktop"),
+            (8, portal_unique.as_str()),
         ] {
             app.send(&name_query("GetConnectionCredentials", target, serial));
             let frame = app.answer();
@@ -8047,7 +8217,7 @@ mod tests {
             "OpenFile",
         )
         .destination(&portal_unique)
-        .serial(8)
+        .serial(9)
         .flags(message::FLAG_NO_REPLY_EXPECTED)
         .encode()
         .expect("encode a call to the portal's unique alias");

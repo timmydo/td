@@ -200,10 +200,13 @@ const FIREFOX_HTTPS_DOCUMENT: &str = concat!(
     ".a,.b{height:300vh}.a{background:#ff00ff}.b{background:#00ff00}",
     "#td-input{position:fixed;left:58%;top:24px;width:28%;z-index:1}",
     "#td-download{position:fixed;left:58%;top:64px;z-index:1}",
+    "#td-upload{position:fixed;left:58%;top:104px;z-index:1}",
+    "#td-upload::file-selector-button{width:100%;height:100%}",
     "</style><div class=a></div><div class=b></div>",
     "<input id=td-input aria-label=td-input>",
     "<a id=td-download href=download.txt ",
     "download=td-firefox-download.txt>Download</a>",
+    "<input id=td-upload type=file aria-label=td-upload>",
 );
 const FIREFOX_DOWNLOAD_FIXTURE: &str = "TD-FIREFOX-DOWNLOAD-V1";
 const FIREFOX_AUTOTEST_HOST_ROOT: &str = "/run/user/1000/td-app/firefox";
@@ -218,6 +221,9 @@ const FIREFOX_TLS_POLICY: &str = concat!(
 );
 const FIREFOX_WINDOW_READY_SOCKET: &str = "/run/user/1000/td-firefox-window-ready";
 const PORTAL_WAYLAND_SOCKET: &str = "/run/user/1000/td-portal-wayland-0";
+const PORTAL_SERVICE_LOG: &str = "/run/td-portal.log";
+const PORTAL_FILE_CHOOSER_COMPLETED: &str =
+    "TD-PORTAL-FILE-CHOOSER-COMPLETED";
 const FIREFOX_DOWNLOAD_SOURCE: &str = "/var/home/tester/Downloads";
 const FIREFOX_DOWNLOAD_PATH: &str =
     "/var/home/tester/Downloads/td-firefox-download.txt";
@@ -241,6 +247,8 @@ const FIREFOX_INPUT_TIMEOUT_SECS: u16 = 60;
 const FIREFOX_INPUT_ATTEMPTS: u16 = 3;
 const FIREFOX_RETRIED_INPUT_STAGES: u16 = 6;
 const FIREFOX_DOWNLOAD_TIMEOUT_SECS: u16 = 40;
+const FIREFOX_FILE_CHOOSER_TIMEOUT_SECS: u16 = 60;
+const FIREFOX_FILE_CHOOSER_STAGES: u16 = 4;
 const FIREFOX_DOWNLOAD_OBSERVE_ATTEMPTS: u16 = 20;
 const FIREFOX_INPUT_POLL_SLEEP_SECS: u16 =
     FIREFOX_RETRIED_INPUT_STAGES * FIREFOX_INPUT_ATTEMPTS.saturating_sub(1)
@@ -271,6 +279,7 @@ const FIREFOX_GREETER_WAIT_ITERATIONS: u16 =
             * FIREFOX_INPUT_ATTEMPTS
             * FIREFOX_RETRIED_INPUT_STAGES
         + FIREFOX_DOWNLOAD_TIMEOUT_SECS
+        + FIREFOX_FILE_CHOOSER_TIMEOUT_SECS * FIREFOX_FILE_CHOOSER_STAGES
         + FIREFOX_INPUT_POLL_SLEEP_SECS;
 
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
@@ -1214,6 +1223,8 @@ fn build_td_svc_conf() -> String {
          ready=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
          ready-timeout=30\n\
          restart=always\n\
+         log={portal_service_log}\n\
+         console=yes\n\
          \n\
          # Readiness output is discarded by td-svc. This separate client repeats\n\
          # the exact live Settings and Request exchanges with console output,\n\
@@ -1339,10 +1350,13 @@ fn build_td_svc_conf() -> String {
          # atomic completion so two Marionette sessions never race. Firefox then\n\
          # arms content and chrome listeners before the host advances through an\n\
          # open-menu, outside-dismiss, terminal-to-browser clipboard, and real\n\
-         # HTTPS download handshakes.\n\
+         # HTTPS download and real FileChooser handshakes. The FileChooser arm\n\
+         # and focus-confirmation sessions close before physical Enter; only the\n\
+         # portal's captured success line admits a fresh result session, so\n\
+         # Marionette cannot race the native default action.\n\
          [firefox-input]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/rm -f {firefox_download_path} {firefox_download_part_path} || exit 1; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input download || exit 1; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/rm -f {firefox_download_path} {firefox_download_part_path} || exit 1; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input download || exit 1; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && break; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_download_observe_wait} ] || exit 1; portal_done=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_done\" ] || portal_done=0; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser-focus || exit 1; n=0; while [ \"$n\" -lt {firefox_file_chooser_wait} ]; do portal_now=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_now\" ] || portal_now=0; [ \"$portal_now\" -gt \"$portal_done\" ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_file_chooser_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser-result || exit 1; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
          after=firefox-evidence\n\
          restart=never\n\
          \n\
@@ -1406,6 +1420,8 @@ fn build_td_svc_conf() -> String {
         portal_request_runtime_marker = TD_PORTAL_REQUEST_RUNTIME_MARKER,
         portal_channel_runtime_marker = TD_PORTAL_CHANNEL_RUNTIME_MARKER,
         portal_wayland_socket = PORTAL_WAYLAND_SOCKET,
+        portal_service_log = PORTAL_SERVICE_LOG,
+        portal_file_chooser_completed = PORTAL_FILE_CHOOSER_COMPLETED,
         ui_gid = UI_GID,
         profiler_uid = PROFILER_UID,
         profiler_read_gid = PROFILER_READ_GID,
@@ -1442,6 +1458,7 @@ fn build_td_svc_conf() -> String {
         firefox_download_path = FIREFOX_DOWNLOAD_PATH,
         firefox_download_part_path = FIREFOX_DOWNLOAD_PART_PATH,
         firefox_download_observe_wait = FIREFOX_DOWNLOAD_OBSERVE_ATTEMPTS,
+        firefox_file_chooser_wait = FIREFOX_FILE_CHOOSER_TIMEOUT_SECS,
         firefox_input_completion = FIREFOX_INPUT_COMPLETION,
         firefox_input_completion_path = FIREFOX_INPUT_COMPLETION_PATH,
         firefox_input_completion_tmp_path = FIREFOX_INPUT_COMPLETION_TMP_PATH,
@@ -4862,6 +4879,13 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         assert!(FIREFOX_HTTPS_DOCUMENT.contains("<div class=a></div>"));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains("width:100%;min-height:300vh"));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains("<input id=td-input"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains("<input id=td-upload type=file"));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains(
+            "#td-upload{position:fixed;left:58%;top:104px;z-index:1}"
+        ));
+        assert!(FIREFOX_HTTPS_DOCUMENT.contains(
+            "#td-upload::file-selector-button{width:100%;height:100%}"
+        ));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains(
             "<a id=td-download href=download.txt download=td-firefox-download.txt>"
         ));
@@ -4914,6 +4938,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                     * FIREFOX_INPUT_ATTEMPTS
                     * FIREFOX_RETRIED_INPUT_STAGES
                 + FIREFOX_DOWNLOAD_TIMEOUT_SECS
+                + FIREFOX_FILE_CHOOSER_TIMEOUT_SECS * FIREFOX_FILE_CHOOSER_STAGES
                 + FIREFOX_INPUT_POLL_SLEEP_SECS
         );
         assert_eq!(
@@ -5040,10 +5065,13 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             "clipboard-refocus &&",
             "clipboard &&",
             "download ||",
+            "file-chooser ||",
+            "file-chooser-focus ||",
+            "file-chooser-result ||",
         ];
         assert_eq!(
             stages.len(),
-            usize::from(FIREFOX_RETRIED_INPUT_STAGES.saturating_add(1))
+            usize::from(FIREFOX_RETRIED_INPUT_STAGES.saturating_add(4))
         );
         for stage in stages {
             assert_eq!(
@@ -5063,6 +5091,20 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         let clipboard = input.find("--probe-firefox-input clipboard &&").unwrap();
         let download = input.find("--probe-firefox-input download ||").unwrap();
         let file_probe = input.find("--probe-firefox-download").unwrap();
+        let file_chooser = input
+            .find("--probe-firefox-input file-chooser ||")
+            .unwrap();
+        let file_chooser_focus = input
+            .find("--probe-firefox-input file-chooser-focus ||")
+            .unwrap();
+        let portal_completions = input
+            .match_indices(PORTAL_FILE_CHOOSER_COMPLETED)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(portal_completions.len(), 2);
+        let file_chooser_result = input
+            .find("--probe-firefox-input file-chooser-result ||")
+            .unwrap();
         let completion = input.find(FIREFOX_INPUT_COMPLETION).unwrap();
         assert!(
             arm < menu
@@ -5072,13 +5114,23 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 && clipboard_refocus < clipboard
                 && clipboard < download
                 && download < file_probe
-                && file_probe < completion,
+                && file_probe < portal_completions[0]
+                && portal_completions[0] < file_chooser
+                && file_chooser < file_chooser_focus
+                && file_chooser_focus < portal_completions[1]
+                && portal_completions[1] < file_chooser_result
+                && file_chooser_result < completion,
             "input evidence and completion must retain their exact stage order"
         );
         assert!(input.contains("/bin/td-util printf \"%s\\n\" \"$download\""));
         assert!(input.contains(&format!(
             "while [ \"$n\" -lt {FIREFOX_DOWNLOAD_OBSERVE_ATTEMPTS} ]; do if download="
         )));
+        assert!(input.contains(&format!(
+            "while [ \"$n\" -lt {FIREFOX_FILE_CHOOSER_TIMEOUT_SECS} ]; do portal_now=$(/bin/rg -c \
+             \"^{PORTAL_FILE_CHOOSER_COMPLETED} .* response=0$\" {PORTAL_SERVICE_LOG}"
+        )));
+        assert!(input.contains("[ \"$portal_now\" -gt \"$portal_done\" ] && break"));
         assert!(input.contains(&format!(
             "{FIREFOX_INPUT_COMPLETION} > {FIREFOX_INPUT_COMPLETION_TMP_PATH}"
         )));
@@ -5524,6 +5576,11 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         assert_eq!(unit_key("portal", "requires").as_deref(), Some("busd"));
         assert_eq!(unit_key("portal", "restart").as_deref(), Some("always"));
         assert_eq!(unit_key("portal", "ready-timeout").as_deref(), Some("30"));
+        assert_eq!(
+            unit_key("portal", "log").as_deref(),
+            Some(PORTAL_SERVICE_LOG)
+        );
+        assert_eq!(unit_key("portal", "console").as_deref(), Some("yes"));
 
         assert_eq!(unit_key("portal-evidence", "exec"), Some(probe));
         assert_eq!(

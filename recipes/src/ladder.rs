@@ -176,9 +176,10 @@ pub fn target_rustc_at_roots(
         Vec::with_capacity(1 + td_engine::target_profile::DIRECT_RUSTC_ARGS.len() + args.len());
     argv.push(rustc.to_string());
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
-    argv.extend(
-        td_engine::target_profile::direct_rustc_args(build_root, source_root),
-    );
+    argv.extend(td_engine::target_profile::direct_rustc_args(
+        build_root,
+        source_root,
+    ));
     Step::Run {
         argv,
         env: Vec::new(),
@@ -590,9 +591,11 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// restores the former 70-second host margin at the value below.
 ///
 /// The Firefox download proof adds a 40-second one-shot browser boundary and a
-/// separate 20-second asynchronous file-observation window. Raising this by 45
-/// seconds keeps the host beyond both guest bounds and their diagnostic margin.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2055;
+/// separate 20-second asynchronous file-observation window. The real Firefox
+/// FileChooser proof adds four 60-second boundaries: arm, focus confirmation,
+/// portal completion and result. Raising the host ceiling by those bounds keeps
+/// it beyond the guest and diagnostic clocks.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2295;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// The source release identities and exact `--version` output shared by the
@@ -891,19 +894,22 @@ pub const TD_FIREFOX_INPUT_MENU_MARKER: &str = "TD-FIREFOX-INPUT-MENU";
 pub const TD_FIREFOX_INPUT_MARKER: &str = "TD-FIREFOX-INPUT-OK";
 pub const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = "TD-TERM-CLIPBOARD-FOCUS-READY serial=";
 pub const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = "TD-TERM-CLIPBOARD-TARGET-READY ";
-pub const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str =
-    "TD-TERM-CLIPBOARD-SELECTION-READY bytes=7";
+pub const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str = "TD-TERM-CLIPBOARD-SELECTION-READY bytes=7";
 pub const TD_TERM_CLIPBOARD_MARKER: &str = "TD-TERM-CLIPBOARD-READY bytes=7";
 pub const TD_TERM_CLIPBOARD_SENT_MARKER: &str = "TD-TERM-CLIPBOARD-SENT bytes=7";
-pub const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str =
-    "TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED";
-pub const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str =
-    "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED";
+pub const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED";
+pub const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str = "TD-FIREFOX-CLIPBOARD-RETRY-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_MARKER: &str = "TD-FIREFOX-CLIPBOARD-OK";
 pub const TD_FIREFOX_DOWNLOAD_ARMED_MARKER: &str = "TD-FIREFOX-DOWNLOAD-ARMED";
 pub const TD_FIREFOX_DOWNLOAD_MARKER: &str = "TD-FIREFOX-DOWNLOAD-OK bytes=23";
+pub const TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER: &str = "TD-FIREFOX-FILE-CHOOSER-ARMED";
+pub const TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER: &str =
+    "TD-FIREFOX-FILE-CHOOSER-REFOCUS-ARMED";
+pub const TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER: &str =
+    "TD-FIREFOX-FILE-CHOOSER-FOCUSED";
+pub const TD_FIREFOX_FILE_CHOOSER_MARKER: &str = "TD-FIREFOX-FILE-CHOOSER-OK bytes=23";
 /// Selects the physical-input oracle without changing an ordinary Firefox boot.
 pub const FIREFOX_INPUT_CMDLINE_TOKEN: &str = "td.firefox-input=1";
 /// Must match the compositor's independently pinned client-cursor dimension cap.
@@ -1853,15 +1859,17 @@ mod tests {
     /// reported even where a good one follows it: the farm is the recipe's
     /// declaration of what it wants, and fail-closed is the right direction
     /// for a duplicate nobody meant to write.
-    fn farm_invocation(recipe: &Recipe, links: &[(String, String)]) -> Option<(&'static str, String)> {
+    fn farm_invocation(
+        recipe: &Recipe,
+        links: &[(String, String)],
+    ) -> Option<(&'static str, String)> {
         let declared = recipe
             .native_inputs
             .as_ref()
             .is_some_and(|inputs| inputs.iter().any(|i| i == "busybox-x86-64"));
         for (name, target) in links {
-            let excused = declared
-                && !name.contains('/')
-                && target == "{in:busybox-x86-64}/bin/busybox";
+            let excused =
+                declared && !name.contains('/') && target == "{in:busybox-x86-64}/bin/busybox";
             for cmd in HOST_TOOLS {
                 if invokes(name, cmd) && !excused {
                     return Some((cmd, name.clone()));
@@ -2194,10 +2202,8 @@ mod tests {
     #[test]
     fn linux_boundary_exceptions_are_boot_artifacts_only() {
         let recipes = catalog::all();
-        for (stem, cpio_references, packed_kernel_references, copied_kernel_references) in [
-            ("kexec-spike-x86-64", 2, 1, 1),
-            ("system-x86-64", 2, 0, 1),
-        ]
+        for (stem, cpio_references, packed_kernel_references, copied_kernel_references) in
+            [("kexec-spike-x86-64", 2, 1, 1), ("system-x86-64", 2, 0, 1)]
         {
             let recipe = recipes
                 .iter()
@@ -2520,11 +2526,20 @@ mod tests {
             ("find".into(), BB.into()),
             ("find".into(), "{in:other}/bin/search".into()),
         ]);
-        assert_eq!(host_tool_invocation("probe", &shadowed), Some(("find", "find".into())));
+        assert_eq!(
+            host_tool_invocation("probe", &shadowed),
+            Some(("find", "find".into()))
+        );
 
         // A TARGET spelled as a sibling's link name is still a target.
-        let alias = farm(vec![("find".into(), BB.into()), ("scan".into(), "find".into())]);
-        assert_eq!(host_tool_invocation("probe", &alias), Some(("find", "find".into())));
+        let alias = farm(vec![
+            ("find".into(), BB.into()),
+            ("scan".into(), "find".into()),
+        ]);
+        assert_eq!(
+            host_tool_invocation("probe", &alias),
+            Some(("find", "find".into()))
+        );
 
         // `xargs` as well as `find`, because this branch carries its own copy
         // of the tool list: dropping one from it would leave every leg above
@@ -2802,7 +2817,10 @@ mod tests {
         const ROOT: &str = "#![forbid(unsafe_code)]\nfn main() {}\n";
         for (steps, want) in [
             (
-                vec![rs("{src}/main.rs", ROOT), rs("{src}/go.rs", "Command::new(x)")],
+                vec![
+                    rs("{src}/main.rs", ROOT),
+                    rs("{src}/go.rs", "Command::new(x)"),
+                ],
                 "names `Command'",
             ),
             (
@@ -2810,7 +2828,10 @@ mod tests {
                 "does not forbid unsafe",
             ),
             (
-                vec![rs("{src}/main.rs", "//! docs\n/*\n#![forbid(unsafe_code)]\n*/\n")],
+                vec![rs(
+                    "{src}/main.rs",
+                    "//! docs\n/*\n#![forbid(unsafe_code)]\n*/\n",
+                )],
                 "does not forbid unsafe",
             ),
             (
@@ -2820,7 +2841,10 @@ mod tests {
                 )],
                 "does not forbid unsafe",
             ),
-            (vec![rs("{src}/go.rs", "fn go() {}")], "writes no crate root"),
+            (
+                vec![rs("{src}/go.rs", "fn go() {}")],
+                "writes no crate root",
+            ),
             (
                 vec![
                     rs("{src}/main.rs", ROOT),
@@ -2907,7 +2931,10 @@ mod tests {
             (r#"Command::new("\u{78}args")"#, "xargs"),
             // A malformed `\u` must not swallow the text up to some later
             // brace: the escape is bounded, so the name after it still reads.
-            (r#"let s = "\u no brace"; Command::new("find"); let t = "}";"#, "find"),
+            (
+                r#"let s = "\u no brace"; Command::new("find"); let t = "}";"#,
+                "find",
+            ),
         ] {
             assert!(
                 step_invokes(&rust(spawning), spawning, cmd),
@@ -3016,20 +3043,17 @@ mod tests {
     /// build system also has the outer spec compiler as one typed consumer.
     fn payload_is_misplaced(recipe: &crate::types::Recipe) -> bool {
         let mesboot = matches!(recipe.build_system, crate::types::BuildSystem::Mesboot);
-        let application_payload_is_misplaced = match (
-            recipe.application.as_ref(),
-            recipe.payload_inputs.as_ref(),
-        ) {
-            (Some(application), Some(payloads)) if !mesboot => {
-                payloads.len() != 1
-                    || payloads.first().map(String::as_str) != Some(application.runtime())
-            }
-            (Some(_), None) if !mesboot => true,
-            (None, Some(_)) if !mesboot => true,
-            _ => false,
-        };
-        (recipe.is_foreign_source() && !mesboot)
-            || application_payload_is_misplaced
+        let application_payload_is_misplaced =
+            match (recipe.application.as_ref(), recipe.payload_inputs.as_ref()) {
+                (Some(application), Some(payloads)) if !mesboot => {
+                    payloads.len() != 1
+                        || payloads.first().map(String::as_str) != Some(application.runtime())
+                }
+                (Some(_), None) if !mesboot => true,
+                (None, Some(_)) if !mesboot => true,
+                _ => false,
+            };
+        (recipe.is_foreign_source() && !mesboot) || application_payload_is_misplaced
     }
 
     #[test]
@@ -3043,11 +3067,9 @@ mod tests {
         assert!(!payload_is_misplaced(
             &crate::types::Recipe::mesboot("x", "1").payload_inputs(&["y"])
         ));
-        let application = td_engine::application::ApplicationDeclaration::new(
-            "empty-runtime",
-            "/app/bin/x",
-        )
-        .unwrap();
+        let application =
+            td_engine::application::ApplicationDeclaration::new("empty-runtime", "/app/bin/x")
+                .unwrap();
         assert!(!payload_is_misplaced(
             &crate::types::Recipe::gnu("x", "1")
                 .payload_inputs(&["empty-runtime"])

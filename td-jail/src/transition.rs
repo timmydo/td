@@ -762,7 +762,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
     )
 }
 
@@ -4996,6 +4996,15 @@ mod tests {
             ),
             ("clipboard", firefox::InputStage::Clipboard),
             ("download", firefox::InputStage::Download),
+            ("file-chooser", firefox::InputStage::FileChooser),
+            (
+                "file-chooser-focus",
+                firefox::InputStage::FileChooserFocus,
+            ),
+            (
+                "file-chooser-result",
+                firefox::InputStage::FileChooserResult,
+            ),
         ] {
             assert_eq!(
                 parse_mode(args(&[FIREFOX_INPUT_PROBE_ARG, name])).unwrap(),

@@ -4305,6 +4305,37 @@ the application namespace, validates the exact regular file and bytes at the
 source of Firefox's writable Downloads grant. Ordinary boots retain neither
 the fixture link nor any of these listeners or markers.
 
+The Firefox package's reviewed `GTK_USE_PORTAL=1` environment forces the same
+portal backend in ordinary and autotest launches. The session first exposes a
+full-viewport focus control, then places the authenticated page's visible real
+file input in a bounded 200x100 rectangle containing that trusted click's exact
+content coordinates and makes its native selector button fill the control. One
+physical pointer click must focus the document and reach the one-shot refocus
+listeners. The armed marker waits for two
+animation frames after the native selector restyle, then the arming automation
+session closes before the host may click again. A second click must reach
+the input's one-shot physical listeners, remain uncancelled, and focus the
+input. A fresh bounded Marionette session confirms that trusted focus, closes,
+and emits the marker that admits physical Enter. That key makes Firefox's
+native default action issue its broker-authenticated FileChooser request. The
+portal admits Firefox's one `All Files` glob and matching current filter,
+renders their bounded label, and returns the selected filter; richer filter
+semantics remain a typed refusal rather than an ignored hint. The
+portal reports its first frame only after the private manager acknowledgement,
+keyboard enter, shm release and frame callback.
+At that boundary the host captures the virtio display through QMP, requires the
+centred portal client geometry and chooser background, panel and selected-row
+palette, and reconstructs the client XRGB bytes from that rectangle to match
+the portal's announced checksum. Only that pixel proof admits physical Enter.
+Firefox content must then observe one trusted change and one file with the
+download fixture's exact name, size and bytes. The root-owned input unit writes
+its atomic completion record only after the portal service's next captured
+exact success line in its volatile bounded log and a fresh result-only
+Marionette session. The native default action therefore has no concurrent
+automation command, and a hidden dialog, synthetic DOM assignment, stale
+portal line or response that never reached Firefox cannot pass. This machinery
+remains gated by the exact input-test boot token.
+
 ## 12. PTY and process lifecycle
 
 After mounting devtmpfs and before graphical services, the system creates

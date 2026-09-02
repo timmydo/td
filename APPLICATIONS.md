@@ -1654,9 +1654,11 @@ resource accounting remained within the compiled ceilings, and Firefox's own
 renderer and inner sandbox stayed active in its live process classes. The
 first full-system boot now separately proves physical keyboard, absolute
 pointer, wheel, Firefox client-cursor, native context-menu open, and
-outside-click dismissal without manual inspection. It does not yet prove
-portals, external networking policy, audio, or pixel-for-pixel correspondence
-between the accepted buffer and the complete decorated output. The same boot
+outside-click dismissal without manual inspection. That base gate does not by
+itself prove portals, external networking policy, audio, or pixel-for-pixel
+correspondence between the accepted buffer and the complete decorated output;
+the FileChooser extension below adds a bounded portal pixel and result proof.
+The same boot
 now focuses td-term, waits for its keyboard-focus acknowledgement, clears its
 prompt, physically types `Welcome`, and waits until td-term reports the exact
 rendered target cells in the live viewport. It selects those cells,
@@ -3469,7 +3471,8 @@ The test is a client that subscribes broadly and never reads.
 `Hello` (assigns `:1.N`; anything before it disconnects), `RequestName`/
 `ReleaseName` with `ALLOW_REPLACEMENT`/`REPLACE_EXISTING`/`DO_NOT_QUEUE`
 and a bounded owner queue, `ListNames`, `ListActivatableNames`,
-`NameHasOwner`, `GetNameOwner`, `GetConnectionUnixUser`,
+`StartServiceByName` as the no-activation compatibility query described
+below, `NameHasOwner`, `GetNameOwner`, `GetConnectionUnixUser`,
 `GetConnectionUnixProcessID`, `GetConnectionCredentials` (carrying the td
 extension `td.AppId` for sandboxed connections), `AddMatch`/`RemoveMatch`,
 `GetId`, `Peer.Ping`, `Peer.GetMachineId`, minimal
@@ -3478,8 +3481,9 @@ extension `td.AppId` for sandboxed connections), `AddMatch`/`RemoveMatch`,
 
 **Those methods are FILTERED PER CALLER, not answered globally**, which
 is the difference between a policy and a decoration. `ListNames`,
-`ListActivatableNames`, `NameHasOwner` and `GetNameOwner` answer only
-about names the caller may `see`; a name it may not is reported as
+`ListActivatableNames`, `StartServiceByName`, `NameHasOwner` and
+`GetNameOwner` answer only about names the caller may `see`; a name it may
+not is reported as
 absent, in the one consistent story rather than as an error that
 confirms it exists. `NameOwnerChanged` is filtered the same way, since a
 signal is a subscription-shaped version of the same question. And
@@ -3671,9 +3675,17 @@ confined process chooses.
 
 ### Activation
 
-`StartServiceByName` for *host* services is refused: there are no
-`.service` files on td and the portal is a supervised unit whose `ready=`
-proves it is up. But **app-local services (dconf, and whatever an app
+There is no host-service activation: there are no `.service` files on td
+and the portal is a supervised unit whose `ready=` proves it is up.
+`StartServiceByName(su)` is accepted only as a compatibility QUERY for an
+already-running service. Zero flags and a well-known name are mandatory; a
+visible live service returns `DBUS_START_REPLY_ALREADY_RUNNING`, and an
+absent or hidden one returns `ServiceUnknown`. It never starts a process.
+This narrow answer is load-bearing for GDBus, which probes the method while
+constructing a proxy for an existing service and treats `UnknownMethod` as
+fatal before asking `GetNameOwner`.
+
+But **app-local services (dconf, and whatever an app
 ships) must activate inside the app's namespaces**, so: the spec
 compiler parses the authenticated app/runtime `.service` files at build
 time, stage 2 opens a
@@ -3907,7 +3919,8 @@ pending-reply ownership, well-known name ownership, the permission file's
 `:1.N`, with anything before it disconnecting and a second one ending the
 connection, and announcing the assigned name like any other name gained),
 `RequestName` and `ReleaseName` with the owner queue, `ListNames`,
-`ListActivatableNames`, `NameHasOwner`,
+`ListActivatableNames`, the no-activation `StartServiceByName`
+compatibility query, `NameHasOwner`,
 `GetNameOwner`, `GetConnectionUnixUser`, `GetConnectionUnixProcessID`,
 `GetConnectionCredentials`, `AddMatch`, `RemoveMatch`, `GetId` and
 `Peer.Ping`, plus `NameAcquired`, `NameLost`, and filtered
@@ -3928,7 +3941,9 @@ there is no such method: the first waits, the second fails. So the bus
 answers every call it cannot serve rather than dropping it, and
 `ListActivatableNames` answers with an EMPTY array rather than an error
 because that is the true answer — td has no service activation, and
-nothing on this bus starts because it was called.
+nothing on this bus starts because it was called. `StartServiceByName`
+similarly says only that a caller-visible service is already running; it
+returns `ServiceUnknown` otherwise and never changes the bus.
 
 A method called with the wrong arguments is `InvalidArgs` and the
 connection continues. That is the same rule read the other way: a bad
@@ -5387,7 +5402,7 @@ not for a persistent Session lifecycle.
 | 1 | `.Settings` | nothing | **LANDED** as the version-1 synchronous service above: `org.freedesktop.appearance` `color-scheme`/`accent-color`/`contrast` plus the `org.gnome.desktop.interface` font/theme/cursor keys, from one immutable td session config file — never inferred from absent GNOME services. Removes GTK's startup portal probe as an unknown. |
 | 1a | `.Background` | nothing | **LANDED as an explicit denial**: version 1 `RequestBackground` exercises the real bounded Request lifecycle and returns response 2 with false `background`/`autostart`. Persistent background execution and version-2 `SetStatus` remain unsupported. |
 | 2 | `.Account` | a consent dialog | uid 1000's passwd entry, empty image URI. |
-| 3 | `.FileChooser` | a surface | **`OpenFile` v3 LANDED for the authenticated Firefox Downloads grant** with modal keyboard-driven open-file, multiple-file, and directory modes. Standard `SaveFile` and `SaveFiles` are advertised but explicitly `NotSupported`; `choices`, caller-defined labels and filters, and selection outside an existing grant are likewise refused. `current_folder` remains a bounded hint rather than an access control. |
+| 3 | `.FileChooser` | a surface | **`OpenFile` v3 LANDED for the authenticated Firefox Downloads grant** with modal keyboard-driven open-file, multiple-file, and directory modes. Standard `SaveFile` and `SaveFiles` are advertised but explicitly `NotSupported`; `choices`, richer filters, and selection outside an existing grant are likewise refused. A bounded accept label and Firefox's one all-files filter are rendered; `current_folder` remains a bounded hint rather than an access control. |
 | 4 | `.OpenURI` | nothing | scheme→handler registry generated from installed exports; `http`/`https` start the configured browser via its `/bin` entry. The fd-taking `OpenFile` member returns NotSupported in v1. **`file` is REFUSED in v1, not merely restricted to "a path visible to the caller"** — which an earlier draft said and which does not follow: the handler runs in a *different* sandbox, so a path the caller can see is one the handler generally cannot, and launching it would open a file that is not there. Honouring `file:` needs the path to reach the handler's namespace, which is a Documents-portal job (deferred, no FUSE) or an explicit grant to the handler at launch. Refusing is the honest answer until one of those exists; "opened" and then blank is worse. |
 | 5 | `.Inhibit` | compositor idle state | **idle flag only.** Suspend/logout/user-switch are refused, because td has no session manager and returning success without an observable inhibitor violates the readback principle. **The mechanism is the private `create_idle_inhibitor` and NOT public `zwp_idle_inhibit_v1`** — a review found both specified, and they cannot both hold: advertising the public global to every sandbox lets an app inhibit idle *directly*, with no portal record of who did it and no way for the user to see or revoke it, which is exactly the attribution the private call exists to provide. §F's `zwp_idle_inhibit_v1` row is therefore **not** required for `.Inhibit` to be honest, which is what it used to say; if it is ever implemented it is for unconfined clients, and it must not be advertised on a jailed connection. |
 | 6 | `.Notification` | private protocol | bounded toasts with title/body/priority/actions and a bounded icon; markup, sound and arbitrary icon paths refused. |
@@ -5480,11 +5495,18 @@ multiple-directory selection is refused. Requests must be modal.
 `current_folder` are structurally and numerically bounded. The caller title is
 at most 256 bytes; the internal authenticated title is at most 320 bytes and
 puts the authenticated application id first, with `Open file` substituted
-only for an empty caller title. `accept_label`, filters, and `current_filter`
-are explicitly `NotSupported` after structural validation instead of being
-silently ignored. `current_folder` is the one bounded ignored hint; it never
-changes access authority. Unknown options are ignored for version
-compatibility. `choices` is explicitly `NotSupported`.
+only for an empty caller title. The bounded caller `accept_label` is rendered
+in a quoted `APP ACTION` field after the fixed td-owned control legend, so it
+cannot relabel the actual cancel or navigation actions. The exact Firefox
+compatibility subset admits one `All Files`
+filter carrying one `*` or `*.*` glob, requires a supplied `current_filter` to
+select that same filter, shows its caller-provided label in a quoted
+`APP FILTER` field after fixed status, and returns it with a successful
+response. Richer glob lists and MIME filters remain explicitly
+`NotSupported` after structural validation instead of being silently ignored.
+`current_folder` is the one bounded ignored hint; it never changes access
+authority. Unknown options are ignored for version compatibility. `choices`
+is explicitly `NotSupported`.
 
 One service admits at most 16 pending broker identity replies in total across
 new calls and active-owner audits, four per caller across the same shared
@@ -5505,14 +5527,16 @@ occupied. A blocking local AF_UNIX connect therefore cannot be turned into
 detached-thread growth. Worker failures before presentation retain their exact
 diagnostic rather than being overwritten by the generic missing-frame error.
 No response 0 or 1 is emitted unless the compositor has acknowledged the
-portal manager's initial standalone/parented state, the first buffer release,
-and its frame callback. The worker's connect retry
-schedule and all registry, keymap, configure, first-buffer transfer, and
+portal manager's initial standalone/parented state, delivered keyboard focus,
+released the first buffer, and retired its frame callback. The worker's
+connect retry schedule and all registry, keymap, configure, first-buffer transfer, and
 first-presentation work after connection share one 20-second deadline. An
 initial `0x0` xdg-toplevel configure selects the client's bounded 640x432
 default; later nonzero compositor sizes replace it exactly. Rust's
-blocking AF_UNIX connect cannot itself be interrupted; the retained admission
-above bounds that residual to one worker. After that trusted local channel has
+blocking AF_UNIX connect cannot itself be interrupted. A dedicated connector
+worker is waited through the same deadline, and its one service-wide lane stays
+occupied until the underlying connect returns; later requests cannot accumulate
+connector threads while it is stalled. After that trusted local channel has
 presented, one outstanding `wl_display.sync` at a time pulses after ten
 seconds without a client write, regardless of incoming input traffic. The
 compositor's finite private-peer timeout therefore does not bound user
@@ -5543,9 +5567,11 @@ the directed response body. Recipe source contracts cross-check the portal's
 host/guest Downloads pair with the image source and Firefox guest preference.
 The target recipe stages all of those production modules and still runs
 `td-portal selftest`.
-What remains is the system-image oracle: it must make Firefox issue the real
-method, observe the modal pixels, drive a selection, and validate the exact
-directed response without a person inspecting the screen.
+The system-image oracle now makes Firefox activate a real HTML file input with
+physical pointer input, requires the broker-authenticated request's first
+modal frame, captures and validates its centred pixels through QMP, selects the
+already authenticated download, and makes Firefox validate the returned
+`File` name, size and contents. No person inspects the screen.
 
 ### Caller authentication
 
@@ -6214,7 +6240,10 @@ packaged selftest, boot oracle — with **network never in the gate**.
    body, and the pure dialog model's grant confinement. A live socket-pair
    compositor supplies the exact registry and keymap descriptor, consumes the
    real shared-memory frame, injects a physical key, and observes the selected
-   guest URI after the dismissal handshake.
+   guest URI after the dismissal handshake. The full-system QEMU oracle then
+   drives Firefox's real file input, matches the portal's presented-frame
+   dimensions and checksum to the captured modal pixels, accepts the selected
+   file physically, and validates the exact returned bytes in Firefox content.
    Session-producing and later UI interfaces still need socket-pair coverage
    for their own asynchronous cancellation and disconnect cleanup, positive
    unconfined identity, pid-reuse and start-time rejection,
@@ -6329,8 +6358,9 @@ HTTPS pixels, the declared guest-local NSS path, renderer selection, the
 global fallback sandbox facts, nested filters in every reported live required
 process role, and the staged physical-input subset of item 7. The complete
 browser claim also proves the fixed guest-local HTTPS download through its
-declared writable grant. It still requires the remaining items below, notably
-portal, isolation, soak and audio evidence.
+declared writable grant and FileChooser round-trip. It still requires the
+remaining items below, notably other portal classes, isolation, soak and audio
+evidence.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -6484,11 +6514,47 @@ and image commits — showing:
    fixture contents, unchanged path/descriptor identity, and no partial or
    duplicate proof name in a bounded directory scan. Only that probe emits
    `TD-FIREFOX-DOWNLOAD-OK bytes=23`, and the input completion record is written
-   afterwards. This proves Firefox's real HTTPS download path through the
-   authenticated read-write grant; it does not claim a public-network download
-   or a FileChooser portal;
-9. **the Settings portal and Request lifecycle succeeding — LANDED** through
-   the separate uid-1000 direct-reply/directed-signal oracle in item 6;
+   only after item 9. This proves Firefox's real HTTPS download path through
+   the authenticated read-write grant; it does not claim a public-network
+   download;
+9. **the Settings portal, Request lifecycle and FileChooser succeeding —
+   LANDED.** The separate uid-1000 direct-reply/directed-signal oracle in item
+   6 proves Settings and Request routing. In the input-enabled system boot,
+   Firefox's reviewed package environment forces GTK's portal backend with
+   `GTK_USE_PORTAL=1`; this is also the supported ordinary launch policy, not
+   an autotest-only preference. The portal accepts Firefox's one serialized
+   `All Files` filter and matching current filter rather than falling back to
+   a native GTK dialog.
+   Firefox content first exposes a full-viewport focus control, then places
+   the page's visible real file input in a bounded 200x100 rectangle containing
+   the first trusted click's exact content coordinates. Its native selector
+   button fills that control while one-shot refocus, focus and activation
+   listeners are armed. The activation marker follows
+   two animation frames after that restyle, and the arming Marionette session
+   closes before the host may send the second click. One trusted primary click
+   must focus the document and reach the refocus listener. A second trusted
+   primary click must reach the native input listeners and focus the input. A
+   fresh bounded Marionette session confirms that trusted focus, closes, and
+   emits the marker that admits physical Enter. That key invokes Firefox's
+   default action, rather than script or a synthetic assignment, to open the
+   picker. The oracle accepts only the exact broker-derived Request
+   path and the bounded
+   640x432 first-frame record. It captures the 1280x800 virtio display through
+   QMP, requires the compositor's centred client rectangle, the chooser's
+   background, panel and selected-row palette with bounded pixel counts, and
+   recomputes the portal's FNV checksum from that exact client rectangle.
+   Only then does it inject Enter. The root-owned input oracle waits for the
+   portal service's next captured exact successful-completion line in its
+   volatile bounded log before a fresh Marionette session polls the
+   already-delivered DOM result; no stale line or outstanding automation
+   command can race Firefox's native default action. Firefox must report one
+   trusted activation
+   and change, one selected `td-firefox-download.txt`, exact 23-byte size and
+   exact `TD-FIREFOX-DOWNLOAD-V1\n` contents before the final marker and atomic
+   input-completion record. The portal marker follows its private manager
+   acknowledgement, keyboard enter, shm release and frame callback, so neither
+   a D-Bus-only stub, a hidden/non-modal surface, synthetic DOM assignment nor
+   a directed response that Firefox never consumed can pass;
 10. five minutes of navigation with no compositor or bus disconnect;
 11. blocked syscall probes still blocked in the outer app process, and
     **zero seccomp denials for syscalls the application actually needs**
@@ -6556,7 +6622,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |
 | 20 | **clipboard producer and cross-client paste LANDED**: data-device v3 selection forwards a focus-scoped MIME offer and one bounded descriptor to its source. td-term adds visible pointer selection, bounded UTF-8 extraction, `Control+Shift+C`, three text MIME offers, exact endpoint ownership, eight-source/sync/offer ceilings and a four-entry nonblocking handoff whose five-second destination deadline restores prior status. The image oracle physically types `Welcome`, waits until its exact rendered cells are attested, selects them, waits for exact seven-byte source admission, then requires both td-term's exact-payload transfer record and Firefox's browser-chrome observation; client cursors landed separately (`1c4b7f88`) | a real terminal selection reaches Firefox through core Wayland clipboard without manual testing |
 | 21 | **xdg-foreign + private portal manager centred/modal presentation LANDED**; the dialog leaves tiling, retains its workspace home, stacks over application popups, captures keyboard/pointer input with owed-release preservation, and unwinds newest-first. A D-Bus dialog consumer remains | compositor-tested modal portal presentation without manual inspection |
-| 22 | **FileChooser `OpenFile` and modal surface LANDED**: the bounded directory, filter, selection, URI and PSF2 pixel core is joined to asynchronous broker-authenticated D-Bus Request routing and the private Wayland manager. A host peer reads the real shm pixels, supplies the exact keymap, drives a protocol-level selection and checks the directed guest URI. Save, Documents, OpenURI, Screenshot and Notification remain absent | a component-level real modal chooser with no manual inspection; the next acceptance gate drives the request from Firefox inside the system image |
+| 22 | **FileChooser `OpenFile`, modal surface and Firefox image oracle LANDED**: the bounded directory, filter, selection, URI and PSF2 pixel core is joined to asynchronous broker-authenticated D-Bus Request routing and the private Wayland manager. A host peer reads the real shm pixels, supplies the exact keymap, drives a protocol-level selection and checks the directed guest URI. The offline system boot additionally makes Firefox issue the call, hashes the captured centred modal pixels, selects physically, and validates the returned file bytes in content. Save, Documents, OpenURI, Screenshot and Notification remain absent | a real modal chooser completes from Firefox without manual inspection |
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 25 | **`td-audio` crate + surface #11**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients | **sound from the machine** |
@@ -6567,6 +6633,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 27c | **Firefox physical-input image proof — LANDED**; the first system boot uses a bounded private QMP controller, the already enumerated virtio tablet, and the PC machine's PS/2 keyboard, while staged Firefox content/chrome probes and a compositor-owned cursor marker independently attest the semantic results. The handshake proves typing, pointer motion, scrolling, native right-click menu opening, outside-click dismissal, and a painted Firefox cursor without sleeps or manual observation. The test page retains the authenticated magenta/lime framebuffer sentinel and adds only a fixed focused input, scroll extent, and cursor style | the supported Firefox path accepts real emulated input end to end; rung 27d extends the same handshake across clipboard paste |
 | 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and injects `Control+L`. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two commands plus eight total events are hard bounds. A separate Shift tap ends each command, and Firefox must observe its ordered keyup before classifying the batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |
 | 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input completion record now follows the download marker, so neither a synthetic DOM click nor a stale file can pass | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
+| 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content first exposes a full-viewport focus control, then places the authenticated page's visible real file input in a bounded 200x100 rectangle containing that trusted click's exact coordinates and fills it with the native selector button. A second uncancelled physical click at the same coordinates must focus that input; a fresh closed probe confirms the trusted focus before physical Enter invokes Firefox's default action. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter. Firefox then requires one trusted change and the exact selected file name, size and contents before input completion. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 
 **Two other reversals are still absent from this ladder, and that is a

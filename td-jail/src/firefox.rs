@@ -36,6 +36,14 @@ const INPUT_CLIPBOARD_OK: &str = "TD-FIREFOX-CLIPBOARD-OK";
 const INPUT_DOWNLOAD_ARMED: &str = "TD-FIREFOX-DOWNLOAD-CONTENT-ARMED";
 const INPUT_DOWNLOAD_PUBLIC_ARMED: &str = "TD-FIREFOX-DOWNLOAD-ARMED";
 const INPUT_DOWNLOAD_CLICKED: &str = "TD-FIREFOX-DOWNLOAD-CLICKED";
+const INPUT_FILE_CHOOSER_REFOCUS_ARMED: &str = "TD-FIREFOX-FILE-CHOOSER-REFOCUS-CONTENT-ARMED";
+const INPUT_FILE_CHOOSER_PUBLIC_REFOCUS_ARMED: &str = "TD-FIREFOX-FILE-CHOOSER-REFOCUS-ARMED";
+const INPUT_FILE_CHOOSER_ARMED: &str = "TD-FIREFOX-FILE-CHOOSER-CONTENT-ARMED";
+const INPUT_FILE_CHOOSER_PUBLIC_ARMED: &str = "TD-FIREFOX-FILE-CHOOSER-ARMED";
+const INPUT_FILE_CHOOSER_FOCUSED: &str = "TD-FIREFOX-FILE-CHOOSER-CONTENT-FOCUSED";
+const INPUT_FILE_CHOOSER_PUBLIC_FOCUSED: &str = "TD-FIREFOX-FILE-CHOOSER-FOCUSED";
+const INPUT_FILE_CHOOSER_OK: &str = "TD-FIREFOX-FILE-CHOOSER-CONTENT-OK";
+const INPUT_FILE_CHOOSER_PUBLIC_OK: &str = "TD-FIREFOX-FILE-CHOOSER-OK bytes=23";
 const DOWNLOAD_DIRECTORY: &str = "/var/home/tester/Downloads";
 const DOWNLOAD_NAME: &str = "td-firefox-download.txt";
 const DOWNLOAD_BYTES: &[u8] = b"TD-FIREFOX-DOWNLOAD-V1\n";
@@ -52,6 +60,9 @@ pub(crate) enum InputStage {
     ClipboardRefocus,
     Clipboard,
     Download,
+    FileChooser,
+    FileChooserFocus,
+    FileChooserResult,
 }
 
 impl InputStage {
@@ -64,6 +75,9 @@ impl InputStage {
             "clipboard-refocus" => Some(Self::ClipboardRefocus),
             "clipboard" => Some(Self::Clipboard),
             "download" => Some(Self::Download),
+            "file-chooser" => Some(Self::FileChooser),
+            "file-chooser-focus" => Some(Self::FileChooserFocus),
+            "file-chooser-result" => Some(Self::FileChooserResult),
             _ => None,
         }
     }
@@ -77,6 +91,9 @@ impl InputStage {
             Self::ClipboardRefocus => "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED",
             Self::Clipboard => "TD-FIREFOX-CLIPBOARD-OK",
             Self::Download => "TD-FIREFOX-DOWNLOAD-CLICKED",
+            Self::FileChooser => INPUT_FILE_CHOOSER_PUBLIC_ARMED,
+            Self::FileChooserFocus => INPUT_FILE_CHOOSER_PUBLIC_FOCUSED,
+            Self::FileChooserResult => INPUT_FILE_CHOOSER_PUBLIC_OK,
         }
     }
 }
@@ -353,6 +370,216 @@ const check = () => {
 check();
 "#;
 
+const CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const input = document.getElementById("td-upload");
+if (!input || input.type !== "file" || input.multiple) {
+  done("TD-FIREFOX-INPUT-ERROR:file-chooser-input");
+  return;
+}
+const focus = document.createElement("button");
+focus.id = "td-upload-focus";
+focus.type = "button";
+focus.textContent = "Activate file chooser";
+focus.tabIndex = 1;
+input.tabIndex = 2;
+input.parentNode.insertBefore(focus, input);
+focus.style.position = "fixed";
+focus.style.inset = "0";
+focus.style.width = "100%";
+focus.style.height = "100%";
+focus.style.zIndex = "2147483647";
+const state =
+  { downs: 0, clicks: 0, trusted: true, button: null, x: null, y: null };
+window.__tdFileChooserRefocus = state;
+window.__tdFileChooser =
+  { downs: 0, clicks: 0, pointerClicks: 0, keyboardClicks: 0,
+    unexpectedClicks: false, changes: 0, focuses: 0, trusted: true,
+    button: null, detail: null, keys: 0, key: null };
+focus.addEventListener("mousedown", event => {
+  state.downs++;
+  if (!event.isTrusted) state.trusted = false;
+}, { capture: true, once: true });
+focus.addEventListener("click", event => {
+  state.clicks++;
+  state.button = event.button;
+  state.x = event.clientX;
+  state.y = event.clientY;
+  if (!event.isTrusted) state.trusted = false;
+}, { capture: true, once: true });
+input.addEventListener("focus", event => {
+  window.__tdFileChooser.focuses++;
+  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
+}, { capture: true });
+input.addEventListener("mousedown", event => {
+  window.__tdFileChooser.downs++;
+  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
+}, { capture: true });
+input.addEventListener("click", event => {
+  window.__tdFileChooser.clicks++;
+  window.__tdFileChooser.button = event.button;
+  window.__tdFileChooser.detail = event.detail;
+  if (event.button === 0 && event.detail === 1) {
+    window.__tdFileChooser.pointerClicks++;
+  } else if (event.button === 0 && event.detail === 0) {
+    window.__tdFileChooser.keyboardClicks++;
+  } else {
+    window.__tdFileChooser.unexpectedClicks = true;
+  }
+  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
+}, { capture: true });
+input.addEventListener("change", event => {
+  window.__tdFileChooser.changes++;
+  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
+}, { capture: true });
+input.addEventListener("keydown", event => {
+  window.__tdFileChooser.keys++;
+  window.__tdFileChooser.key = event.key;
+  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
+}, { capture: true });
+input.value = "";
+const rect = focus.getBoundingClientRect();
+if (rect.left > 0 || rect.top > 0 || rect.right < innerWidth ||
+    rect.bottom < innerHeight) {
+  done("TD-FIREFOX-INPUT-ERROR:file-chooser-layout");
+  return;
+}
+done("TD-FIREFOX-FILE-CHOOSER-REFOCUS-CONTENT-ARMED");
+"#;
+
+const CONTENT_FILE_CHOOSER_ARM_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const refocus = window.__tdFileChooserRefocus;
+  const state = window.__tdFileChooser;
+  if ((!refocus || refocus.downs !== 1 || refocus.clicks !== 1 || !state) &&
+      Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  const input = document.getElementById("td-upload");
+  const focus = document.getElementById("td-upload-focus");
+  if (!refocus || refocus.downs !== 1 || refocus.clicks !== 1 ||
+      refocus.button !== 0 || !refocus.trusted || !state || !state.trusted ||
+      !Number.isFinite(refocus.x) || !Number.isFinite(refocus.y) ||
+      !input || !focus ||
+      input.type !== "file" || input.multiple || !document.hasFocus() ||
+      document.activeElement !== focus) {
+    done("TD-FIREFOX-INPUT-ERROR:file-chooser-input");
+    return;
+  }
+  focus.style.inset = "auto";
+  focus.style.left = "0";
+  focus.style.top = "0";
+  focus.style.width = "1px";
+  focus.style.height = "1px";
+  input.style.position = "fixed";
+  if (innerWidth < 200 || innerHeight < 100) {
+    done("TD-FIREFOX-INPUT-ERROR:file-chooser-layout");
+    return;
+  }
+  const left = Math.max(0, Math.min(innerWidth - 200, refocus.x - 100));
+  const top = Math.max(0, Math.min(innerHeight - 100, refocus.y - 50));
+  input.style.inset = "auto";
+  input.style.left = left + "px";
+  input.style.top = top + "px";
+  input.style.width = "200px";
+  input.style.height = "100px";
+  input.style.margin = "0";
+  input.style.padding = "0";
+  input.style.border = "0";
+  input.style.fontSize = "0";
+  input.style.zIndex = "2147483646";
+  const style = document.createElement("style");
+  style.id = "td-upload-native-button-style";
+  style.textContent =
+    "input[type=file]::file-selector-button { width: 100%; height: 100%; " +
+    "margin: 0; padding: 0; border: 0; font: 16px sans-serif; }";
+  document.head.appendChild(style);
+  const rect = input.getBoundingClientRect();
+  if (rect.width !== 200 || rect.height !== 100 ||
+      refocus.x <= rect.left || refocus.x >= rect.right ||
+      refocus.y <= rect.top || refocus.y >= rect.bottom) {
+    done("TD-FIREFOX-INPUT-ERROR:file-chooser-layout");
+    return;
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    done("TD-FIREFOX-FILE-CHOOSER-CONTENT-ARMED");
+  }));
+};
+check();
+"#;
+
+const CONTENT_FILE_CHOOSER_FOCUS_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = () => {
+  const state = window.__tdFileChooser;
+  const input = document.getElementById("td-upload");
+  const ok = state && input && state.downs === 1 && state.clicks === 1 &&
+    state.pointerClicks === 1 && state.keyboardClicks === 0 &&
+    !state.unexpectedClicks &&
+    state.focuses === 1 && state.trusted && state.button === 0 &&
+    state.detail === 1 && state.keys === 0 && document.hasFocus() &&
+    document.activeElement === input;
+  if (!ok && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  done(ok ? "TD-FIREFOX-FILE-CHOOSER-CONTENT-FOCUSED" :
+    "TD-FIREFOX-INPUT-ERROR:file-chooser-focus:" +
+    [state && state.downs, state && state.clicks, state && state.pointerClicks,
+      state && state.keyboardClicks, state && state.unexpectedClicks,
+      state && state.focuses,
+      state && state.trusted, state && state.button, state && state.detail,
+      state && state.keys, document.hasFocus(),
+      document.activeElement === input].map(String).join(":"));
+};
+check();
+"#;
+
+const CONTENT_FILE_CHOOSER_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 20000;
+const check = async () => {
+  const state = window.__tdFileChooser;
+  const input = document.getElementById("td-upload");
+  const file = input && input.files && input.files.length === 1 ?
+    input.files[0] : null;
+  let bytes = null;
+  if (file && file.name === "td-firefox-download.txt" && file.size === 23) {
+    try {
+      bytes = await file.text();
+    } catch (_) {}
+  }
+  const ok = state && input && state.downs === 1 &&
+    state.pointerClicks === 1 && state.keyboardClicks <= 1 &&
+    state.clicks === 1 + state.keyboardClicks && !state.unexpectedClicks &&
+    state.changes === 1 && state.focuses === 1 && state.trusted &&
+    state.button === 0 &&
+    state.detail === (state.keyboardClicks === 1 ? 0 : 1) &&
+    state.keys === 1 && state.key === "Enter" &&
+    file && file.name === "td-firefox-download.txt" &&
+    file.size === 23 && bytes === "TD-FIREFOX-DOWNLOAD-V1\n";
+  if (!ok && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  done(ok ? "TD-FIREFOX-FILE-CHOOSER-CONTENT-OK" :
+    "TD-FIREFOX-INPUT-ERROR:file-chooser:" +
+    [state && state.downs, state && state.clicks, state && state.pointerClicks,
+      state && state.keyboardClicks, state && state.unexpectedClicks,
+      state && state.changes,
+      state && state.focuses, state && state.trusted, state && state.button,
+      state && state.detail,
+      state && state.keys, state && state.key,
+      input && input.files && input.files.length,
+      file && file.name, file && file.size, bytes].map(String).join(":"));
+};
+check();
+"#;
+
 // This runs only after the exact QEMU autotest launch enabled Marionette and
 // opted into privileged script execution. It reads Firefox's own about:support
 // providers and reports Firefox's own child-role mapping. The Rust side binds
@@ -465,6 +692,10 @@ const done = arguments[arguments.length - 1];
     .sort()
     .map(name => `${clean(name)}:${remoteTypes[name]}`)
     .join(",");
+  const filePickerPortalPref = Services.prefs.getIntPref(
+    "widget.use-xdg-desktop-portal.file-picker", -1
+  );
+  const gtkUsePortal = Services.env.get("GTK_USE_PORTAL");
   done([
     "TD-FIREFOX-SUPPORT-V1",
     `protocol=${clean(graphics.windowProtocol)}`,
@@ -478,6 +709,8 @@ const done = arguments[arguments.length - 1];
     `media_sandbox=${clean(sandbox.canSandboxMedia)}`,
     `configured=${clean(sandbox.contentSandboxLevel)}`,
     `effective=${clean(sandbox.effectiveContentSandboxLevel)}`,
+    `file_picker_portal_pref=${clean(filePickerPortalPref)}`,
+    `gtk_use_portal=${clean(gtkUsePortal)}`,
     `roles=${roleReports.join(",")}`,
     `media=${Array.from(mediaUtilityPids).sort((a, b) => a - b).join(".") || "none"}`,
     `remote=${remote || "missing"}`,
@@ -507,6 +740,8 @@ pub(crate) struct SupportReport {
     media_sandbox: bool,
     configured: u32,
     effective: u32,
+    file_picker_portal_pref: u32,
+    gtk_use_portal: String,
     roles: Vec<RoleReport>,
     media_utility_pids: Vec<u32>,
     remote: String,
@@ -557,12 +792,7 @@ pub(crate) fn probe_download() -> io::Result<String> {
     ))
 }
 
-fn validate_download(
-    directory: &Path,
-    expected: &[u8],
-    uid: u32,
-    gid: u32,
-) -> io::Result<()> {
+fn validate_download(directory: &Path, expected: &[u8], uid: u32, gid: u32) -> io::Result<()> {
     let directory_before = fs::symlink_metadata(directory)
         .map_err(|error| contextual("inspect Firefox download directory", error))?;
     if !directory_before.file_type().is_dir()
@@ -814,6 +1044,41 @@ fn run_input_stage<S: Read + Write, W: Write>(
             progress.flush()?;
             require_script_value(stream, 4, CONTENT_DOWNLOAD_SCRIPT, INPUT_DOWNLOAD_CLICKED)
         }
+        InputStage::FileChooser => {
+            set_context(stream, 2, "content")?;
+            require_script_value(
+                stream,
+                3,
+                CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT,
+                INPUT_FILE_CHOOSER_REFOCUS_ARMED,
+            )?;
+            writeln!(progress, "{INPUT_FILE_CHOOSER_PUBLIC_REFOCUS_ARMED}")?;
+            progress.flush()?;
+            require_script_value(
+                stream,
+                4,
+                CONTENT_FILE_CHOOSER_ARM_SCRIPT,
+                INPUT_FILE_CHOOSER_ARMED,
+            )
+        }
+        InputStage::FileChooserFocus => {
+            set_context(stream, 2, "content")?;
+            require_script_value(
+                stream,
+                3,
+                CONTENT_FILE_CHOOSER_FOCUS_SCRIPT,
+                INPUT_FILE_CHOOSER_FOCUSED,
+            )
+        }
+        InputStage::FileChooserResult => {
+            set_context(stream, 2, "content")?;
+            require_script_value(
+                stream,
+                3,
+                CONTENT_FILE_CHOOSER_SCRIPT,
+                INPUT_FILE_CHOOSER_OK,
+            )
+        }
     }
 }
 
@@ -1011,6 +1276,11 @@ fn parse_report(value: &str) -> io::Result<SupportReport> {
     let media_sandbox = parse_bool("media_sandbox", &take_field(&mut fields, "media_sandbox")?)?;
     let configured = parse_u32("configured", &take_field(&mut fields, "configured")?)?;
     let effective = parse_u32("effective", &take_field(&mut fields, "effective")?)?;
+    let file_picker_portal_pref = parse_u32(
+        "file_picker_portal_pref",
+        &take_field(&mut fields, "file_picker_portal_pref")?,
+    )?;
+    let gtk_use_portal = take_field(&mut fields, "gtk_use_portal")?;
     let roles = parse_roles(&take_field(&mut fields, "roles")?)?;
     let media_utility_pids = parse_pid_list(&take_field(&mut fields, "media")?)?;
     let remote = take_field(&mut fields, "remote")?;
@@ -1031,6 +1301,8 @@ fn parse_report(value: &str) -> io::Result<SupportReport> {
         media_sandbox,
         configured,
         effective,
+        file_picker_portal_pref,
+        gtk_use_portal,
         roles,
         media_utility_pids,
         remote,
@@ -1205,6 +1477,13 @@ fn validate_report(report: &SupportReport, sandboxes: &[ProcessSandbox]) -> io::
             "about:support sandbox facts differ from the pinned fallback policy",
         ));
     }
+    if report.file_picker_portal_pref != 2 || report.gtk_use_portal != "1" {
+        return Err(report_error(
+            report,
+            sandboxes,
+            "Firefox's file-picker portal policy is not the pinned automatic policy",
+        ));
+    }
     for required in ["content", "socket"] {
         require_role(report, sandboxes, required)?;
     }
@@ -1281,7 +1560,7 @@ fn sandbox_is_nested(sandbox: &ProcessSandbox) -> bool {
 
 fn report_error(report: &SupportReport, sandboxes: &[ProcessSandbox], message: &str) -> io::Error {
     io::Error::other(format!(
-        "{message}: protocol={} compositor={} adapter={} sandbox={}/{}/{}/{}/{}/{}/{}:{} roles={} media={} remote={}",
+        "{message}: protocol={} compositor={} adapter={} sandbox={}/{}/{}/{}/{}/{}/{}:{} file-picker={}/{} roles={} media={} remote={}",
         report.protocol,
         report.compositor,
         report.adapter,
@@ -1293,6 +1572,8 @@ fn report_error(report: &SupportReport, sandboxes: &[ProcessSandbox], message: &
         report.media_sandbox,
         report.configured,
         report.effective,
+        report.file_picker_portal_pref,
+        report.gtk_use_portal,
         render_roles(&report.roles, sandboxes),
         render_pids(&report.media_utility_pids),
         report.remote
@@ -1422,7 +1703,7 @@ mod tests {
         }
     }
 
-    const GOOD_REPORT: &str = "TD-FIREFOX-SUPPORT-V1|protocol=wayland|compositor=WebRender (Software)|adapter=llvmpipe|seccomp_bpf=true|seccomp_tsync=true|privileged_userns=false|userns=false|content_sandbox=true|media_sandbox=true|configured=6|effective=6|roles=content:11.12,gpu:,socket:13,rdd:14,utility:15|media=none|remote=rdd:1,socket:1,utility_jSOracle:1,web:2";
+    const GOOD_REPORT: &str = "TD-FIREFOX-SUPPORT-V1|protocol=wayland|compositor=WebRender (Software)|adapter=llvmpipe|seccomp_bpf=true|seccomp_tsync=true|privileged_userns=false|userns=false|content_sandbox=true|media_sandbox=true|configured=6|effective=6|file_picker_portal_pref=2|gtk_use_portal=1|roles=content:11.12,gpu:,socket:13,rdd:14,utility:15|media=none|remote=rdd:1,socket:1,utility_jSOracle:1,web:2";
 
     fn good_sandboxes() -> Vec<ProcessSandbox> {
         [11, 12, 13, 14, 15]
@@ -1588,7 +1869,10 @@ mod tests {
                     responses.push(format!("[1,{id},null,{{\"value\":\"{value}\"}}]"));
                 }
             }
-            InputStage::Download => {
+            InputStage::Download
+            | InputStage::FileChooser
+            | InputStage::FileChooserFocus
+            | InputStage::FileChooserResult => {
                 responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
                 for (index, value) in values.iter().enumerate() {
                     let id = index + 3;
@@ -1699,6 +1983,90 @@ mod tests {
             r#"[0,6,"WebDriver:DeleteSession",{}]"#
         );
 
+        let mut chooser_io = input_transcript(
+            InputStage::FileChooser,
+            &[INPUT_FILE_CHOOSER_REFOCUS_ARMED, INPUT_FILE_CHOOSER_ARMED],
+        );
+        let mut chooser_progress = Vec::new();
+        probe_input_stream_with_progress(
+            &mut chooser_io,
+            InputStage::FileChooser,
+            &mut chooser_progress,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(chooser_progress).unwrap(),
+            format!("{INPUT_FILE_CHOOSER_PUBLIC_REFOCUS_ARMED}\n")
+        );
+        assert_eq!(
+            InputStage::FileChooser.marker(),
+            INPUT_FILE_CHOOSER_PUBLIC_ARMED
+        );
+        let mut commands = Cursor::new(chooser_io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(4, CONTENT_FILE_CHOOSER_ARM_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+
+        let mut chooser_focus_io =
+            input_transcript(InputStage::FileChooserFocus, &[INPUT_FILE_CHOOSER_FOCUSED]);
+        probe_input_stream_with_progress(
+            &mut chooser_focus_io,
+            InputStage::FileChooserFocus,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut commands = Cursor::new(chooser_focus_io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CONTENT_FILE_CHOOSER_FOCUS_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+
+        let mut chooser_result_io =
+            input_transcript(InputStage::FileChooserResult, &[INPUT_FILE_CHOOSER_OK]);
+        probe_input_stream_with_progress(
+            &mut chooser_result_io,
+            InputStage::FileChooserResult,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut commands = Cursor::new(chooser_result_io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CONTENT_FILE_CHOOSER_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+
         let mut retry_io = input_transcript(
             InputStage::Clipboard,
             &[
@@ -1708,12 +2076,8 @@ mod tests {
             ],
         );
         let mut retry_progress = Vec::new();
-        probe_input_stream_with_progress(
-            &mut retry_io,
-            InputStage::Clipboard,
-            &mut retry_progress,
-        )
-        .unwrap();
+        probe_input_stream_with_progress(&mut retry_io, InputStage::Clipboard, &mut retry_progress)
+            .unwrap();
         assert_eq!(
             String::from_utf8(retry_progress).unwrap(),
             format!("{INPUT_CLIPBOARD_PUBLIC_ARMED}\n{INPUT_CLIPBOARD_PUBLIC_RETRY}\n")
@@ -1810,12 +2174,8 @@ mod tests {
             &[INPUT_CLIPBOARD_ARMED, INPUT_CLIPBOARD_OK],
         );
         let mut progress = Vec::new();
-        probe_input_stream_with_progress(
-            &mut clipboard_io,
-            InputStage::Clipboard,
-            &mut progress,
-        )
-        .unwrap();
+        probe_input_stream_with_progress(&mut clipboard_io, InputStage::Clipboard, &mut progress)
+            .unwrap();
         assert_eq!(
             String::from_utf8(progress).unwrap(),
             format!("{INPUT_CLIPBOARD_PUBLIC_ARMED}\n")
@@ -1900,6 +2260,60 @@ mod tests {
         assert!(CONTENT_DOWNLOAD_SCRIPT.contains("state.keys <= 4"));
         assert!(CONTENT_DOWNLOAD_SCRIPT.contains("state.clicks === 1"));
         assert!(CONTENT_DOWNLOAD_SCRIPT.contains("state.commandEnds === 1"));
+        assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("mousedown"));
+        assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("once: true"));
+        assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("event.isTrusted"));
+        assert!(!CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("event.preventDefault()"));
+        assert!(!CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("input.showPicker()"));
+        assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("focus.style.inset = \"0\""));
+        assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("focus.style.width = \"100%\""));
+        assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("focus.style.height = \"100%\""));
+        assert!(!CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("input.style.opacity"));
+        assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("getBoundingClientRect()"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.clicks !== 1"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.button !== 0"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("document.hasFocus()"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("document.activeElement !== focus"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("Number.isFinite(refocus.x)"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.x - 100"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.y - 50"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("input.style.width = \"200px\""));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("input.style.height = \"100px\""));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.x <= rect.left"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.y >= rect.bottom"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("::file-selector-button"));
+        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("width: 100%; height: 100%"));
+        assert_eq!(
+            CONTENT_FILE_CHOOSER_ARM_SCRIPT
+                .matches("requestAnimationFrame(")
+                .count(),
+            2
+        );
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.downs === 1"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.clicks === 1"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.pointerClicks === 1"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.keyboardClicks === 0"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("!state.unexpectedClicks"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.focuses === 1"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.keys === 0"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("document.activeElement === input"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains(INPUT_FILE_CHOOSER_FOCUSED));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.downs === 1"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.clicks === 1 + state.keyboardClicks"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.pointerClicks === 1"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.keyboardClicks <= 1"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("!state.unexpectedClicks"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.changes === 1"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.focuses === 1"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.button === 0"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT
+            .contains("state.detail === (state.keyboardClicks === 1 ? 0 : 1)"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.keys === 1"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.key === \"Enter\""));
+        assert!(!CONTENT_FILE_CHOOSER_SCRIPT.contains("state.picker"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("file.size === 23"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("TD-FIREFOX-DOWNLOAD-V1\\n"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("Date.now() + 20000"));
         for script in [
             CONTENT_MENU_SCRIPT,
             CHROME_MENU_SCRIPT,
@@ -1908,6 +2322,9 @@ mod tests {
             CHROME_CLIPBOARD_ARM_SCRIPT,
             CHROME_CLIPBOARD_SCRIPT,
             CONTENT_DOWNLOAD_SCRIPT,
+            CONTENT_FILE_CHOOSER_ARM_SCRIPT,
+            CONTENT_FILE_CHOOSER_FOCUS_SCRIPT,
+            CONTENT_FILE_CHOOSER_SCRIPT,
         ] {
             assert!(script.contains("const expires = Date.now() + 20000"));
             assert!(script.contains("setTimeout(check, 50)"));
@@ -1924,6 +2341,10 @@ mod tests {
             CHROME_CLIPBOARD_SCRIPT,
             CONTENT_DOWNLOAD_ARM_SCRIPT,
             CONTENT_DOWNLOAD_SCRIPT,
+            CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT,
+            CONTENT_FILE_CHOOSER_ARM_SCRIPT,
+            CONTENT_FILE_CHOOSER_FOCUS_SCRIPT,
+            CONTENT_FILE_CHOOSER_SCRIPT,
         ] {
             assert!(execute_command_with_id(5, script).unwrap().len() < MAX_COMMAND_BYTES);
         }
@@ -1931,63 +2352,57 @@ mod tests {
 
     #[test]
     fn clipboard_result_waits_for_physical_command_boundaries() {
-        let classify =
-            |command_ends: usize,
-             retry_floor: usize,
-             shortcuts: usize,
-             pastes: usize,
-             empty: usize,
-             exact: usize,
-             value: &str| {
-                let first_bounded = command_ends == 1
-                    && retry_floor == 0
-                    && (1..=4).contains(&shortcuts);
-                let retry_events = shortcuts.saturating_sub(retry_floor);
-                let second_bounded = command_ends == 2
-                    && (1..=4).contains(&retry_floor)
-                    && (1..=4).contains(&retry_events);
-                let bounded = (first_bounded || second_bounded) && pastes == shortcuts;
-                let value_repeats = if !value.is_empty()
-                    && value.len().is_multiple_of("Welcome".len())
-                {
-                    let repeats = value.len() / "Welcome".len();
-                    if value == "Welcome".repeat(repeats) {
-                        repeats
-                    } else {
-                        0
-                    }
+        let classify = |command_ends: usize,
+                        retry_floor: usize,
+                        shortcuts: usize,
+                        pastes: usize,
+                        empty: usize,
+                        exact: usize,
+                        value: &str| {
+            let first_bounded =
+                command_ends == 1 && retry_floor == 0 && (1..=4).contains(&shortcuts);
+            let retry_events = shortcuts.saturating_sub(retry_floor);
+            let second_bounded = command_ends == 2
+                && (1..=4).contains(&retry_floor)
+                && (1..=4).contains(&retry_events);
+            let bounded = (first_bounded || second_bounded) && pastes == shortcuts;
+            let value_repeats = if !value.is_empty() && value.len().is_multiple_of("Welcome".len())
+            {
+                let repeats = value.len() / "Welcome".len();
+                if value == "Welcome".repeat(repeats) {
+                    repeats
                 } else {
                     0
-                };
-                let pasted = bounded
-                    && empty.saturating_add(exact) == pastes
-                    && value_repeats >= 1
-                    && value_repeats <= pastes
-                    && exact <= value_repeats;
-                let retry = command_ends == 1
-                    && retry_floor == 0
-                    && (1..=4).contains(&shortcuts)
-                    && pastes == shortcuts
-                    && empty == pastes
-                    && exact == 0
-                    && value == "old";
-                if pasted {
-                    "ok"
-                } else if retry {
-                    "retry"
-                } else {
-                    "pending-or-error"
                 }
+            } else {
+                0
             };
+            let pasted = bounded
+                && empty.saturating_add(exact) == pastes
+                && value_repeats >= 1
+                && value_repeats <= pastes
+                && exact <= value_repeats;
+            let retry = command_ends == 1
+                && retry_floor == 0
+                && (1..=4).contains(&shortcuts)
+                && pastes == shortcuts
+                && empty == pastes
+                && exact == 0
+                && value == "old";
+            if pasted {
+                "ok"
+            } else if retry {
+                "retry"
+            } else {
+                "pending-or-error"
+            }
+        };
 
         assert_eq!(classify(0, 0, 1, 1, 1, 0, "old"), "pending-or-error");
         assert_eq!(classify(1, 0, 1, 1, 1, 0, "old"), "retry");
         // An event arriving after the retry response is not a second command:
         // only the host's following Shift keyup may advance that boundary.
-        assert_eq!(
-            classify(1, 1, 2, 2, 1, 1, "Welcome"),
-            "pending-or-error"
-        );
+        assert_eq!(classify(1, 1, 2, 2, 1, 1, "Welcome"), "pending-or-error");
         assert_eq!(classify(2, 1, 3, 3, 1, 2, "WelcomeWelcome"), "ok");
         // Firefox may expose an empty DataTransfer while its default action
         // consumes the asynchronous Wayland transfer. The final URL accounts
@@ -2022,56 +2437,26 @@ mod tests {
         let path = directory.join(DOWNLOAD_NAME);
         fs::write(&path, DOWNLOAD_BYTES).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        validate_download(
-            &directory,
-            DOWNLOAD_BYTES,
-            owner.uid(),
-            owner.gid(),
-        )
-        .unwrap();
+        validate_download(&directory, DOWNLOAD_BYTES, owner.uid(), owner.gid()).unwrap();
 
         fs::write(&path, b"TD-FIREFOX-DOWNLOAD-V0\n").unwrap();
-        assert!(validate_download(
-            &directory,
-            DOWNLOAD_BYTES,
-            owner.uid(),
-            owner.gid(),
-        )
-        .is_err());
+        assert!(validate_download(&directory, DOWNLOAD_BYTES, owner.uid(), owner.gid(),).is_err());
         fs::write(&path, DOWNLOAD_BYTES).unwrap();
 
         let duplicate = directory.join("td-firefox-download.txt.part");
         fs::write(&duplicate, DOWNLOAD_BYTES).unwrap();
-        assert!(validate_download(
-            &directory,
-            DOWNLOAD_BYTES,
-            owner.uid(),
-            owner.gid(),
-        )
-        .is_err());
+        assert!(validate_download(&directory, DOWNLOAD_BYTES, owner.uid(), owner.gid(),).is_err());
         fs::remove_file(&duplicate).unwrap();
 
         let hardlink = directory.join("unrelated-hardlink");
         fs::hard_link(&path, &hardlink).unwrap();
-        assert!(validate_download(
-            &directory,
-            DOWNLOAD_BYTES,
-            owner.uid(),
-            owner.gid(),
-        )
-        .is_err());
+        assert!(validate_download(&directory, DOWNLOAD_BYTES, owner.uid(), owner.gid(),).is_err());
         fs::remove_file(&hardlink).unwrap();
 
         fs::remove_file(&path).unwrap();
         fs::write(directory.join("elsewhere"), DOWNLOAD_BYTES).unwrap();
         symlink("elsewhere", &path).unwrap();
-        assert!(validate_download(
-            &directory,
-            DOWNLOAD_BYTES,
-            owner.uid(),
-            owner.gid(),
-        )
-        .is_err());
+        assert!(validate_download(&directory, DOWNLOAD_BYTES, owner.uid(), owner.gid(),).is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 
