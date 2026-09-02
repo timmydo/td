@@ -8,6 +8,7 @@ use crate::keyboard::{
 };
 use crate::launcher::{LaunchRequest, LauncherAction};
 use crate::layout::{Command, ViewLayout};
+use crate::output::{Damage, OutputBackend, Submission};
 use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerScroll, PointerSnapshot, PointerState,
     PointerTarget, RoutedPointerFrame,
@@ -353,6 +354,16 @@ const POINTER_BUTTON_LEFT: u32 = 272;
 pub struct Runtime {
     scene: Scene,
     framebuffer: Framebuffer,
+    /// What the next paint will tell the backend about what changed. The
+    /// backend discovers ordinary damage itself, so this carries only the
+    /// case it cannot: pixels the compositor did not write and its shadow
+    /// copy therefore cannot see.
+    owed_damage: Damage,
+    /// What the last paint's submission answered, or `None` before one has
+    /// happened. `Option` rather than a `Presented` default so that observing
+    /// `Presented` proves a paint answered it, which a default would make
+    /// unfalsifiable — fbdev has no other answer to give.
+    last_submission: Option<Submission>,
     layout: Arc<BTreeMap<SurfaceKey, ViewLayout>>,
     subscribers: BTreeMap<u64, SyncSender<()>>,
     /// Each connected client's popup registrations, by client.
@@ -496,6 +507,8 @@ impl Runtime {
         Runtime {
             scene: Scene::new(),
             framebuffer,
+            owed_damage: Damage::Unknown,
+            last_submission: None,
             layout: Arc::new(BTreeMap::new()),
             subscribers: BTreeMap::new(),
             popup_registrations: BTreeMap::new(),
@@ -588,24 +601,42 @@ impl Runtime {
     }
 
     pub fn width(&self) -> usize {
-        self.framebuffer.width
+        self.framebuffer.dimensions().width
     }
 
     pub fn height(&self) -> usize {
-        self.framebuffer.height
+        self.framebuffer.dimensions().height
     }
 
     /// Pessimistic across the paint, as the framebuffer's shadow copy is across
     /// its write: a paint that failed leaves the screen owed, not settled.
+    ///
+    /// `paint` SUBMITS. The debt this clears is that the current scene has
+    /// been handed to the backend, which is a claim it can make; whether the
+    /// pixels are on glass is `last_submission`'s to answer, and against a
+    /// KMS backend the answer would be "not yet".
     pub fn repaint(&mut self) -> Result<(), String> {
         if let Some(compound) = self.compound_settle.as_mut() {
             compound.paint = true;
             return Ok(());
         }
         self.pending_paint = true;
-        self.framebuffer.paint(&self.scene)?;
+        // The damage is cleared only on success, so a failed paint still owes
+        // the whole output — which is what the backend's own shadow-copy
+        // distrust did before this was the caller's to say.
+        self.last_submission = Some(self.framebuffer.paint(&self.scene, self.owed_damage)?);
+        self.owed_damage = Damage::Unknown;
         self.pending_paint = false;
         Ok(())
+    }
+
+    /// What the last submission answered, or `None` before the first paint.
+    /// Test-only until a backend that can answer `Queued` exists; the field is
+    /// not test-only, because dropping the value on the floor is what
+    /// `paint`-means-submit exists to prevent.
+    #[cfg(test)]
+    pub(crate) fn last_submission(&self) -> Option<Submission> {
+        self.last_submission
     }
 
     /// Owe a paint instead of taking one. The scene is already current, so any
@@ -947,8 +978,9 @@ impl Runtime {
     }
 
     pub fn popup_constraint(&self, parent: SurfaceKey) -> Option<PopupConstraint> {
+        let size = self.framebuffer.dimensions();
         self.scene
-            .popup_constraint(parent, self.framebuffer.width, self.framebuffer.height)
+            .popup_constraint(parent, size.width, size.height)
     }
 
     #[cfg(test)]
@@ -1592,8 +1624,11 @@ impl Runtime {
         self.scene.command(command);
         // A tiling command is what a user reaches for when the screen looks
         // wrong, so make it the immediate repair for pixels the compositor did
-        // not write and its shadow copy therefore cannot see.
-        self.framebuffer.resend();
+        // not write and its shadow copy therefore cannot see. Said as damage
+        // the caller knows about rather than by reaching into one backend's
+        // shadow copy: a KMS backend has no shadow copy and the same request
+        // still means the same thing to it.
+        self.owed_damage = Damage::Whole;
         self.settle(true)
     }
 
@@ -1754,9 +1789,8 @@ impl Runtime {
         // outward one at the edge of the output is clamped away, and a report
         // that changed no coordinate owes no paint, re-answers no focus and
         // re-derives no drop.
-        let moved =
-            self.scene
-                .move_pointer(dx, dy, self.framebuffer.width, self.framebuffer.height);
+        let size = self.framebuffer.dimensions();
+        let moved = self.scene.move_pointer(dx, dy, size.width, size.height);
         self.pointer_report(time, moved, buttons, scroll)
     }
 
@@ -1777,9 +1811,8 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
-        let moved = self
-            .scene
-            .place_pointer(x, y, self.framebuffer.width, self.framebuffer.height);
+        let size = self.framebuffer.dimensions();
+        let moved = self.scene.place_pointer(x, y, size.width, size.height);
         self.pointer_report(time, moved, buttons, scroll)
     }
 
@@ -1790,6 +1823,7 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
+        let size = self.framebuffer.dimensions();
         let overlay_modal = self.scene.modal();
         let portal_modal = self.scene.portal_modal().is_some();
         let input_modal = overlay_modal || portal_modal;
@@ -1836,7 +1870,7 @@ impl Runtime {
             Vec::new()
         } else {
             self.scene
-                .grabs_dismissed_by_pointer(self.framebuffer.width, self.framebuffer.height)
+                .grabs_dismissed_by_pointer(size.width, size.height)
         };
         // OWNER EVENTS. The protocol gives the grab-owning client its pointer
         // events for all of its surfaces as normal, so the press is only td's
@@ -1875,7 +1909,7 @@ impl Runtime {
         let alt = self.keyboard.held().depressed & MOD_ALT != 0
             && self
                 .scene
-                .draggable_at_pointer(self.framebuffer.width, self.framebuffer.height)
+                .draggable_at_pointer(size.width, size.height)
                 .is_some();
         let result = self
             .pointer
@@ -1924,11 +1958,11 @@ impl Runtime {
             && !grabbed
             && self
                 .scene
-                .topmost_grab(self.framebuffer.width, self.framebuffer.height)
+                .topmost_grab(size.width, size.height)
                 .is_none()
         {
             self.scene
-                .window_at_pointer(self.framebuffer.width, self.framebuffer.height)
+                .window_at_pointer(size.width, size.height)
         } else {
             None
         };
@@ -1999,7 +2033,8 @@ impl Runtime {
         if modal {
             return self.cancel_drag();
         }
-        let (width, height) = (self.framebuffer.width, self.framebuffer.height);
+        let size = self.framebuffer.dimensions();
+        let (width, height) = (size.width, size.height);
         // One pass, in the order the transitions happened. A frame can carry
         // several — evdev keeps every transition up to its SYN_REPORT — and a
         // release followed by a press is a window dropped and the next one
@@ -2039,11 +2074,12 @@ impl Runtime {
                                 // an unfocused band would present another one.
                                 self.focus_surface(key)?;
                                 self.scene.command(Command::SetPresentation(wanted));
-                                // `Runtime::command`'s `framebuffer.resend()` is
-                                // deliberately NOT taken: that is the repair for
-                                // pixels the compositor did not write, reached
-                                // for when the screen looks wrong, and a click is
-                                // not. Same reason `focus_surface` declines it.
+                                // `Runtime::command`'s whole-output damage is
+                                // deliberately NOT owed here: that is the repair
+                                // for pixels the compositor did not write,
+                                // reached for when the screen looks wrong, and a
+                                // click is not. Same reason `focus_surface`
+                                // declines it.
                                 self.settle(true)?;
                                 continue;
                             }
@@ -2129,7 +2165,7 @@ impl Runtime {
         if !self.scene.focus_key(key) {
             return Ok(());
         }
-        // No `framebuffer.resend()` here, unlike a tiling command: that one is
+        // No whole-output damage here, unlike a tiling command: that one is
         // the repair gesture for pixels the compositor did not write, and a
         // click is not reached for when the screen looks wrong.
         self.settle(true)
@@ -3246,7 +3282,7 @@ impl Runtime {
     fn refresh_layout(&mut self) -> bool {
         let next: BTreeMap<SurfaceKey, ViewLayout> = self
             .scene
-            .views(self.framebuffer.width, self.framebuffer.height)
+            .views(self.framebuffer.dimensions().width, self.framebuffer.dimensions().height)
             .into_iter()
             .map(|view| (view.key, view))
             .collect();
@@ -3373,14 +3409,15 @@ impl Runtime {
     /// than moving this target. The portal dialog differs because it is a
     /// client surface owed keyboard enter/leave while it enforces modality.
     fn keyboard_target(&self) -> Option<SurfaceKey> {
+        let size = self.framebuffer.dimensions();
         if let Some(dialog) = self.scene.portal_modal() {
             return self
                 .scene
-                .topmost_grab(self.framebuffer.width, self.framebuffer.height)
+                .topmost_grab(size.width, size.height)
                 .or(Some(dialog));
         }
         self.scene
-            .topmost_grab(self.framebuffer.width, self.framebuffer.height)
+            .topmost_grab(size.width, size.height)
             .or_else(|| self.scene.focused().map(|key| self.topmost_parented(key)))
     }
 
@@ -3411,8 +3448,8 @@ impl Runtime {
     fn pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
         let (hover, grab) = self.scene.pointer_targets(
             self.pointer.grab_surface(),
-            self.framebuffer.width,
-            self.framebuffer.height,
+            self.framebuffer.dimensions().width,
+            self.framebuffer.dimensions().height,
         );
         (
             hover.map(|point| PointerTarget {
@@ -3983,6 +4020,63 @@ mod tests {
 
         // The repair a user can reach for when foreign pixels are on screen.
         runtime.command(Command::Focus(Direction::Left)).unwrap();
+        assert_eq!(runtime.take_writes(), vec![(0, 120 * 4 * 80)]);
+    }
+
+    #[test]
+    fn a_paint_reports_that_fbdev_completed_rather_than_queued() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-submission-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        // `None` first, so `Presented` below is an answer a paint gave rather
+        // than the value the field happened to start at. An earlier version of
+        // this test defaulted the field to `Presented` and passed even when
+        // the assignment was deleted.
+        assert_eq!(runtime.last_submission(), None);
+
+        runtime.repaint().unwrap();
+        // fbdev's submit IS its completion: `write` returns when the bytes are
+        // the device's and there is no later event. A KMS backend answers
+        // `Queued` here and completes at the page flip, which is the whole
+        // reason `paint` returns a value rather than `()`.
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+
+        runtime
+            .pointer_frame(1, 30, 30, &[], PointerScroll::default())
+            .unwrap();
+        runtime.flush_paint().unwrap();
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+    }
+
+    #[test]
+    fn a_failed_paint_keeps_the_whole_output_owed_for_the_next_one() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-owed-damage-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.repaint().unwrap();
+        runtime.take_writes();
+
+        // The repair gesture, with the paint it asks for failing. The debt is
+        // the runtime's now rather than the backend's shadow copy, so this is
+        // what pins that it is cleared only on success: hoisting the clear
+        // above the paint leaves the next frame a band instead of the whole
+        // image, and nothing else in the suite notices.
+        runtime.fail_next_repaint();
+        assert!(runtime.command(Command::Focus(Direction::Left)).is_err());
+        runtime.clear_repaint_failure();
+        assert_eq!(runtime.take_writes(), vec![]);
+
+        runtime.repaint().unwrap();
         assert_eq!(runtime.take_writes(), vec![(0, 120 * 4 * 80)]);
     }
 

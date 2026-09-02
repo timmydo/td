@@ -577,6 +577,88 @@ splits once rather than once per repeat interval. Ordinary keys omit XKB's
 by default. Clients combine that per-key property with
 `wl_keyboard.repeat_info`.
 
+Scanout sits behind `output.rs`'s `OutputBackend`, and `Framebuffer` is its
+one implementation. The trait is `dimensions`, `supported_formats`,
+`begin_frame(damage)`, `present` and `poll_events`, with one provided method,
+`paint`, that renders a scene into the target and submits it. That split is
+`APPLICATIONS.md` §M's third row, and it exists so the fbdev assumptions the
+renderer had absorbed become one backend's answers rather than the shape of
+the code.
+
+**`paint` is defined as SUBMIT, and that is the load-bearing part.** It
+returns a `Submission`: `Presented` means the pixels are on glass, `Queued`
+means submitted and not yet visible. fbdev always answers `Presented` because
+its `write` returns when the bytes are the device's and there is no later
+event to wait for; a KMS backend answers `Queued` and completes at the page
+flip. Nothing today can produce `Queued`, which is exactly why it is named
+now: a caller written against a `paint` that returned `()` would have encoded
+"the frame is visible" as an assumption no type could correct, and widening
+the contract afterwards means auditing every caller instead of none.
+`Runtime` therefore keeps the answer in `last_submission` rather than
+discarding it, and `repaint`'s cleared debt is "the scene has been submitted",
+which is a claim it can make.
+
+`Damage` travels the other way. `Unknown` means the caller does not know what
+changed and a backend may discover it — fbdev compares its own shadow copy —
+while `Whole` means what the device holds cannot be trusted. A tiling command
+is the one caller that says `Whole`, and it now says it as damage rather than
+by reaching into fbdev's shadow copy, because a KMS backend has no shadow copy
+and the same request still means the same thing to it. Damage is cleared only
+on a successful paint, so a failed one still owes the whole output —
+`a_failed_paint_keeps_the_whole_output_owed_for_the_next_one` is what holds
+that, and it fails if the clear is hoisted above the paint.
+`poll_events` is on the trait and NOTHING CALLS IT. That is deliberate and is
+the more useful half of this section. A draft of this landing drained it at the
+end of every repaint and answered both events there; three reviewers
+independently showed that response is wrong, and the reasons are the ones a
+KMS author must not rediscover:
+
+- a page flip arrives on the card descriptor asynchronously, so draining only
+  from a repaint means an idle screen never observes one. The client waits for
+  a frame callback, which waits for a completion, which waits for a repaint,
+  which waits for the client. The descriptor has to join the input event loop.
+- neither `Submission` nor `OutputEvent` carries a frame identity, so a
+  completion drained after submitting frame N cannot be distinguished from
+  N-1's. The draft marked the just-queued frame as on glass.
+- `Changed` invalidates every size derived from `dimensions`, not only the
+  damage: the shadow copy, the frame storage, and the layout the views were
+  configured against.
+- presentation-dependent evidence must move with it. Application readiness and
+  cursor evidence are published today after a successful submit, which is
+  correct while submit means presented; under a backend that answers `Queued`
+  they would announce a frame that is not yet on screen, and they have to be
+  retained until the completion arrives.
+
+Naming those is what §M asks for. Guessing at the response is what it calls
+painting into the corner.
+
+`supported_formats` answers in `Fourcc`, a NEWTYPE and not an alias for
+`u32`. That matters because `wl_shm`'s two enumerants are `u32` as well, and
+an alias would let the compiler accept one wherever the other belongs — the
+exact mix-up the separate namespace exists to prevent. Those two say what a
+client may hand td to copy; a fourcc says what hardware may scan out. fbdev
+advertises `XR24` alone, since `open` refuses anything but 32 bits per pixel.
+§M's rule that nothing here may be advertised to a CLIENT until a linear CPU
+composition fallback exists is untouched: what a backend can put on glass and
+what td will accept from a client are separate questions, and this answers
+only the first.
+
+**What the split does NOT yet do**, so the seam is not read as wider than it
+is: `Runtime` still holds a concrete `Framebuffer` and its constructor still
+names one. Every OUTPUT-GEOMETRY read goes through `dimensions()`, and the
+width, height and stride fields are private, so no caller reads the output's
+shape out of this backend. Three things stay inherent to it, and each is a
+caller a second backend would break: the row pitch, which `main.rs`'s startup
+diagnostic reads through `stride()` — a dumb buffer's pitch is the kernel's
+to choose and is a property of this backend's memory rather than of the
+output, which is why it is not on the trait; the pixel-attribution the
+application observer needs (`surface_rgb_pixel_counts`); and the
+`#[cfg(test)]` hooks. Substituting a second backend therefore still needs
+`Runtime` to become generic over one or to hold a boxed trait object, and
+that is the KMS landing's work rather than something this split can claim.
+What it claims is the interface, the submit semantics, and that fbdev's
+output geometry is no longer readable outside its own module.
+
 The framebuffer is single-buffered from userspace's perspective. The renderer
 allocates its frame storage once and composes a full frame after scene changes.
 It then writes only the rows that changed, keeping a second allocation holding

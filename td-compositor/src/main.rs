@@ -16,6 +16,7 @@ mod keyboard;
 mod keys;
 mod launcher;
 mod layout;
+mod output;
 mod pointer;
 mod positioner;
 mod pty;
@@ -33,6 +34,7 @@ mod ui;
 mod wire;
 
 use framebuffer::Framebuffer;
+use output::OutputBackend;
 use runtime::Runtime;
 use std::env;
 use std::io::Write;
@@ -302,7 +304,25 @@ fn resolve_socket_endpoint(path: &Path, label: &str) -> Result<PathBuf, String> 
 
 fn run_compositor(options: RunOptions) -> Result<(), String> {
     let framebuffer = Framebuffer::open(&options.framebuffer)?;
-    let geometry = (framebuffer.width, framebuffer.height, framebuffer.stride);
+    let size = framebuffer.dimensions();
+    let geometry = (size.width, size.height, framebuffer.stride());
+    // What this backend can put on glass, as DRM fourccs. Reported at start
+    // because the answer is a property of the BACKEND rather than of td: a
+    // KMS backend on the same machine would print a different list, and that
+    // list is the first thing to look at when a format is refused.
+    let scanout: Vec<String> = framebuffer
+        .supported_formats()
+        .iter()
+        .map(|format| {
+            let code = format.code();
+            // A fourcc that is not four printable characters is still a
+            // number worth reading, and hex is the form every DRM header
+            // writes it in.
+            std::str::from_utf8(&code)
+                .map(String::from)
+                .unwrap_or_else(|_| format!("{:#010x}", u32::from_le_bytes(code)))
+        })
+        .collect();
     let mut runtime = Runtime::new(framebuffer);
     runtime.set_launcher_application(options.launcher_application.as_deref());
     if let Some((((path, app_id), content_rgb_a), content_rgb_b)) = options
@@ -347,8 +367,11 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         eprintln!("td-compositor: {error}");
     }
     eprintln!(
-        "td-compositor: software output {}x{} stride={} inputs={inputs}",
-        geometry.0, geometry.1, geometry.2
+        "td-compositor: software output {}x{} stride={} scanout={} inputs={inputs}",
+        geometry.0,
+        geometry.1,
+        geometry.2,
+        scanout.join(",")
     );
     server::serve(&options.socket, &options.portal_socket, runtime)
 }
@@ -669,6 +692,7 @@ mod confinement {
         ("keys.rs", include_str!("keys.rs")),
         ("launcher.rs", include_str!("launcher.rs")),
         ("layout.rs", include_str!("layout.rs")),
+        ("output.rs", include_str!("output.rs")),
         ("pointer.rs", include_str!("pointer.rs")),
         ("positioner.rs", include_str!("positioner.rs")),
         ("pty.rs", include_str!("pty.rs")),

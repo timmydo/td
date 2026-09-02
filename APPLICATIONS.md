@@ -7642,6 +7642,26 @@ that is exact and smaller than it sounds — adding a variant is a compile
 error at each accessor, not at each caller — which is why row 4 remains the
 seam that makes a caller change.
 
+Row 3: `td-compositor/src/output.rs` holds `OutputBackend` —
+`dimensions`/`supported_formats`/`begin_frame(damage)`/`present`/`poll_events`
+— with `Framebuffer` as its one implementation, and `paint` defined as submit.
+It returns a `Submission`, so no caller can read a return as pixels on glass;
+fbdev answers `Presented` and a KMS backend will answer `Queued`. The
+whole-output repair a tiling command reaches for is now `Damage::Whole` passed
+in rather than a reach into fbdev's shadow copy, which is the same request
+stated in terms a backend without a shadow copy can honour. Formats are
+answered as a `Fourcc` newtype, which is what actually keeps the DRM namespace
+apart from `wl_shm`'s — an alias would have left both as `u32` and prevented
+nothing.
+
+Two things that row does NOT get, recorded because assuming otherwise is the
+expensive mistake: `Runtime` still holds a concrete `Framebuffer`, so
+substituting a backend remains the KMS landing's work; and `poll_events` has
+no caller, because the delivery path is asynchronous, a completion cannot be
+matched to its frame without an identity neither type carries, and the
+presentation-dependent evidence published on submit today would announce a
+frame that is not yet on glass. `td-compositor/DESIGN.md` carries the list.
+
 Three seams are already right and must stay: `Scene::render` is pure
 bytes-in-bytes-out and needs nothing; `framebuffer.rs` is already the
 only module that touches the device; and `server.rs::copy_buffer` is the
