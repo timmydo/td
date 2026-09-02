@@ -1,3 +1,4 @@
+use crate::buffer::BufferCharge;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9,7 +10,16 @@ pub(crate) struct ClientResourceSnapshot {
     pub cached_commits: usize,
     pub deferred_events: usize,
     pub deferred_bytes: usize,
-    pub copied_bytes: usize,
+    /// High-water of td's OWN memory holding copied client pixels. Named for
+    /// the kind because it counts one: a buffer whose bytes are a card's does
+    /// not belong in this number, and a reader comparing it against a host
+    /// ceiling has to be able to tell.
+    pub copied_shm_bytes: usize,
+    /// High-water of how many client buffers were held at once, which the
+    /// bytes do not say. `APPLICATIONS.md` §M's fourth row counts per
+    /// outstanding lifetime as well as per kind, and a kind that costs td no
+    /// bytes still costs it a holding.
+    pub copied_buffers: usize,
 }
 
 #[derive(Default)]
@@ -21,7 +31,8 @@ pub(crate) struct ClientResourceHighWater {
     cached_commits: AtomicUsize,
     deferred_events: AtomicUsize,
     deferred_bytes: AtomicUsize,
-    copied_bytes: AtomicUsize,
+    copied_shm_bytes: AtomicUsize,
+    copied_buffers: AtomicUsize,
 }
 
 impl ClientResourceHighWater {
@@ -47,8 +58,15 @@ impl ClientResourceHighWater {
         self.deferred_bytes.fetch_max(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn observe_copied_bytes(&self, value: usize) {
-        self.copied_bytes.fetch_max(value, Ordering::Relaxed);
+    /// Each quantity keeps its own high-water. They are deliberately not
+    /// required to come from the same instant: the largest total this client
+    /// ever held and the most buffers it ever held are separate facts, and a
+    /// pair taken together would report neither.
+    pub(crate) fn observe_copied(&self, charge: BufferCharge) {
+        self.copied_shm_bytes
+            .fetch_max(charge.host_bytes(), Ordering::Relaxed);
+        self.copied_buffers
+            .fetch_max(charge.held(), Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(&self) -> ClientResourceSnapshot {
@@ -60,7 +78,8 @@ impl ClientResourceHighWater {
             cached_commits: self.cached_commits.load(Ordering::Relaxed),
             deferred_events: self.deferred_events.load(Ordering::Relaxed),
             deferred_bytes: self.deferred_bytes.load(Ordering::Relaxed),
-            copied_bytes: self.copied_bytes.load(Ordering::Relaxed),
+            copied_shm_bytes: self.copied_shm_bytes.load(Ordering::Relaxed),
+            copied_buffers: self.copied_buffers.load(Ordering::Relaxed),
         }
     }
 }
@@ -82,8 +101,8 @@ mod tests {
         metrics.observe_cached_commits(2);
         metrics.observe_deferred(12, 900);
         metrics.observe_deferred(8, 1_000);
-        metrics.observe_copied_bytes(4_096);
-        metrics.observe_copied_bytes(4);
+        metrics.observe_copied(BufferCharge::shm(4_096));
+        metrics.observe_copied(BufferCharge::shm(4));
 
         assert_eq!(
             metrics.snapshot(),
@@ -95,7 +114,8 @@ mod tests {
                 cached_commits: 6,
                 deferred_events: 12,
                 deferred_bytes: 1_000,
-                copied_bytes: 4_096,
+                copied_shm_bytes: 4_096,
+                copied_buffers: 1,
             }
         );
     }

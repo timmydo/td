@@ -1,4 +1,4 @@
-use crate::buffer::{ShmSnapshot, Surface};
+use crate::buffer::{BufferCeiling, BufferCharge, ShmSnapshot, Surface};
 use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
 use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
@@ -246,6 +246,24 @@ struct Buffer {
     height: usize,
     stride: usize,
     format: u32,
+}
+
+impl Buffer {
+    /// What holding a copy of this buffer would cost, from the geometry the
+    /// client declared and BEFORE the copy exists — the reservation has to be
+    /// refusable without first allocating what it would refuse.
+    ///
+    /// `wl_shm` is the only kind td accepts, so this names `shm` outright. A
+    /// second kind arrives with its own path to a charge rather than borrowing
+    /// this one's arithmetic, which is the point of charging by kind.
+    fn declared_charge(&self) -> Result<BufferCharge, String> {
+        let bytes = self
+            .width
+            .checked_mul(self.height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "client surface byte count overflow".to_string())?;
+        Ok(BufferCharge::shm(bytes))
+    }
 }
 
 /// An `attach` that no commit has applied yet. The OFFSET rides in here rather
@@ -576,12 +594,12 @@ enum Object {
         /// Whether this popup has EVER had pixels up.
         ///
         /// `invalid_grab` is "tried to grab after being mapped", which is a
-        /// fact about the popup's life rather than its state now: the byte
-        /// ledger is cleared on unmap, so a popup that mapped, took itself
-        /// down with a null attach, and then grabbed would slip past a check
-        /// on that. A real menu does not: a toolkit destroys the popup and
-        /// makes another rather than re-mapping one, and a fresh object
-        /// starts false.
+        /// fact about the popup's life rather than its state now: the
+        /// charge ledger is cleared on unmap, so a popup that mapped, took
+        /// itself down with a null attach, and then grabbed would slip past
+        /// a check on that. A real menu does not: a toolkit destroys the
+        /// popup and makes another rather than re-mapping one, and a fresh
+        /// object starts false.
         mapped_once: bool,
     },
     XdgToplevel {
@@ -736,8 +754,8 @@ struct Client {
     /// a different fault on a different object. Cleared per dispatch beside the
     /// code, so it can only ever describe the request that set it.
     protocol_error_object: Option<u32>,
-    mapped_bytes: BTreeMap<u32, usize>,
-    mapped_total: usize,
+    mapped_charges: BTreeMap<u32, BufferCharge>,
+    mapped_total: BufferCharge,
     resources: Arc<ClientResourceHighWater>,
 }
 
@@ -1287,8 +1305,8 @@ fn send_reserved_delete_id(
 /// event, which cannot be sent there because addressing it needs this client's
 /// own registrations.
 ///
-/// What no thread here can do is REFUND the client's byte ceiling:
-/// `mapped_bytes` is the dispatch thread's own field, and the refund arrives
+/// What no thread here can do is REFUND the client's ceiling:
+/// `mapped_charges` is the dispatch thread's own field, and the refund arrives
 /// when the client destroys the menu it has just been told about. A client that
 /// never destroys keeps its own quota spent, which is its ceiling and nobody
 /// else's.
@@ -1823,16 +1841,30 @@ fn supervise_seat_worker(
     result
 }
 
-fn client_surface_total(current: usize, prior: usize, proposed: usize) -> Result<usize, String> {
+/// This client's copied-buffer total after replacing one surface's charge,
+/// refused if it would exceed the ceiling.
+///
+/// The ceiling names its limit PER KIND rather than passing a number, so a
+/// kind whose bytes are a card's cannot be admitted or refused by a bound on
+/// this process's address space. Adding one stops this function compiling
+/// until this ceiling's own limit for it is named.
+fn client_surface_total(
+    current: BufferCharge,
+    prior: BufferCharge,
+    proposed: BufferCharge,
+) -> Result<BufferCharge, String> {
     let retained = current
         .checked_sub(prior)
-        .ok_or_else(|| "client surface byte accounting underflow".to_string())?;
+        .ok_or_else(|| "client surface charge accounting underflow".to_string())?;
     let next = retained
         .checked_add(proposed)
-        .ok_or_else(|| "client surface byte accounting overflow".to_string())?;
-    if next > MAX_UI_FRAME_BYTES {
+        .ok_or_else(|| "client surface charge accounting overflow".to_string())?;
+    if !next.fits(BufferCeiling {
+        host_bytes: MAX_UI_FRAME_BYTES,
+    }) {
         return Err(format!(
-            "client surfaces need {next} bytes, exceeding {MAX_UI_FRAME_BYTES}"
+            "client surfaces need {} bytes, exceeding {MAX_UI_FRAME_BYTES}",
+            next.host_bytes()
         ));
     }
     Ok(next)
@@ -2026,15 +2058,15 @@ impl Client {
             keymap,
             protocol_error_code: WL_DISPLAY_ERROR_IMPLEMENTATION,
             protocol_error_object: None,
-            mapped_bytes: BTreeMap::new(),
-            mapped_total: 0,
+            mapped_charges: BTreeMap::new(),
+            mapped_total: BufferCharge::none(),
             resources,
         })
     }
 
-    fn clear_surface_bytes(&mut self, surface: u32) {
-        if let Some(bytes) = self.mapped_bytes.remove(&surface) {
-            self.mapped_total = self.mapped_total.saturating_sub(bytes);
+    fn clear_surface_charge(&mut self, surface: u32) {
+        if let Some(charge) = self.mapped_charges.remove(&surface) {
+            self.mapped_total = self.mapped_total.saturating_sub(charge);
         }
     }
 
@@ -2102,7 +2134,7 @@ impl Client {
         surface: u32,
         runtime: &mut Runtime,
     ) -> Result<(), String> {
-        self.clear_surface_bytes(surface);
+        self.clear_surface_charge(surface);
         let dropped = runtime.unmap(SurfaceKey {
             client: self.id,
             object: surface,
@@ -2116,7 +2148,7 @@ impl Client {
         surface: u32,
         runtime: &mut Runtime,
     ) -> Result<(), String> {
-        self.clear_surface_bytes(surface);
+        self.clear_surface_charge(surface);
         let dropped = runtime.remove(SurfaceKey {
             client: self.id,
             object: surface,
@@ -2149,7 +2181,7 @@ impl Client {
     fn release_dropped(&mut self, dropped: &[SurfaceKey]) -> Result<(), String> {
         for key in dropped {
             if key.client == self.id {
-                self.clear_surface_bytes(key.object);
+                self.clear_surface_charge(key.object);
             }
         }
         // BACKWARDS, which is the whole of the ordering requirement: the
@@ -3071,7 +3103,7 @@ impl Client {
         surface: u32,
         runtime: &mut Runtime,
     ) -> Result<(), String> {
-        self.clear_surface_bytes(surface);
+        self.clear_surface_charge(surface);
         let dropped = runtime.unmap_popup(SurfaceKey {
             client: self.id,
             object: surface,
@@ -4326,7 +4358,7 @@ impl Client {
                     object: surface,
                 })?;
             if retained.is_none() {
-                self.clear_surface_bytes(surface);
+                self.clear_surface_charge(surface);
             }
             if let Some(Object::Surface(state)) = self.objects.get_mut(&surface) {
                 state.role = Some(SurfaceRole::SubsurfaceRetired);
@@ -4341,7 +4373,7 @@ impl Client {
                             object: surface,
                         });
                 }
-                self.clear_surface_bytes(surface);
+                self.clear_surface_charge(surface);
                 return Err(format!("missing subsurface wl_surface {surface}"));
             }
         }
@@ -4369,7 +4401,7 @@ impl Client {
                 cached = std::mem::take(current);
             }
             self.release_cached_commit(&mut cached)?;
-            self.clear_surface_bytes(surface);
+            self.clear_surface_charge(surface);
             runtime.remove_subsurface(SurfaceKey {
                 client: self.id,
                 object: surface,
@@ -4401,7 +4433,7 @@ impl Client {
         if let Some(stack) = parent.and_then(|parent| self.subsurface_stacks.get_mut(&parent)) {
             stack.retain(|entry| *entry != Some(surface));
         }
-        self.clear_surface_bytes(surface);
+        self.clear_surface_charge(surface);
         runtime.remove_subsurface(SurfaceKey {
             client: self.id,
             object: surface,
@@ -4652,7 +4684,7 @@ impl Client {
         };
         let input_region = state.input_region.clone();
         let attaching_buffer = matches!(state.pending_buffer, Some(PendingBuffer::Buffer { .. }));
-        let was_mapped = self.mapped_bytes.contains_key(&id);
+        let was_mapped = self.mapped_charges.contains_key(&id);
         let cursor = state.role == Some(SurfaceRole::Cursor);
         let subsurface = matches!(state.role, Some(SurfaceRole::Subsurface(_)));
         let inactive_subsurface = state.role == Some(SurfaceRole::SubsurfaceRetired);
@@ -4891,22 +4923,22 @@ impl Client {
                 match pending {
                     PendingBuffer::Detach { .. } => {
                         runtime.detach_inactive_subsurface(key);
-                        self.clear_surface_bytes(id);
+                        self.clear_surface_charge(id);
                         state.inactive_subsurface = None;
                     }
                     PendingBuffer::Buffer { object, buffer, .. } => {
-                        let surface_bytes = buffer
-                            .width
-                            .checked_mul(buffer.height)
-                            .and_then(|pixels| pixels.checked_mul(4))
-                            .ok_or_else(|| "client surface byte count overflow".to_string())?;
-                        let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
-                        let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
+                        let charge = buffer.declared_charge()?;
+                        let prior = self
+                            .mapped_charges
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(BufferCharge::none);
+                        let next = client_surface_total(self.mapped_total, prior, charge)?;
                         let surface = Self::copy_buffer(&buffer)?;
-                        runtime.replace_inactive_subsurface(key, surface_bytes)?;
-                        self.resources.observe_copied_bytes(next);
+                        runtime.replace_inactive_subsurface(key, charge)?;
+                        self.resources.observe_copied(next);
                         state.inactive_subsurface = Some(Arc::new(surface));
-                        self.mapped_bytes.insert(id, surface_bytes);
+                        self.mapped_charges.insert(id, charge);
                         self.mapped_total = next;
                         if matches!(
                             self.objects.get(&object),
@@ -4960,25 +4992,25 @@ impl Client {
             } else if subsurface {
                 match pending {
                     PendingBuffer::Detach { .. } => {
-                        self.clear_surface_bytes(id);
+                        self.clear_surface_charge(id);
                         runtime.detach_subsurface(key)?;
                     }
                     PendingBuffer::Buffer { object, buffer, .. } => {
-                        let surface_bytes = buffer
-                            .width
-                            .checked_mul(buffer.height)
-                            .and_then(|pixels| pixels.checked_mul(4))
-                            .ok_or_else(|| "client surface byte count overflow".to_string())?;
-                        let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
-                        let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
+                        let charge = buffer.declared_charge()?;
+                        let prior = self
+                            .mapped_charges
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(BufferCharge::none);
+                        let next = client_surface_total(self.mapped_total, prior, charge)?;
                         let surface = Self::copy_buffer(&buffer)?;
-                        self.resources.observe_copied_bytes(next);
+                        self.resources.observe_copied(next);
                         runtime.commit_subsurface(
                             key,
                             Some(surface),
                             Some(input_region.clone()),
                         )?;
-                        self.mapped_bytes.insert(id, surface_bytes);
+                        self.mapped_charges.insert(id, charge);
                         self.mapped_total = next;
                         if matches!(
                             self.objects.get(&object),
@@ -5039,15 +5071,15 @@ impl Client {
                         }
                     }
                     (PendingBuffer::Buffer { object, buffer, .. }, Some(placement)) => {
-                        let surface_bytes = buffer
-                            .width
-                            .checked_mul(buffer.height)
-                            .and_then(|pixels| pixels.checked_mul(4))
-                            .ok_or_else(|| "client surface byte count overflow".to_string())?;
-                        let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
-                        let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
+                        let charge = buffer.declared_charge()?;
+                        let prior = self
+                            .mapped_charges
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(BufferCharge::none);
+                        let next = client_surface_total(self.mapped_total, prior, charge)?;
                         let surface = Self::copy_buffer(&buffer)?;
-                        self.resources.observe_copied_bytes(next);
+                        self.resources.observe_copied(next);
                         runtime.commit_popup(
                             key,
                             Some(surface),
@@ -5055,11 +5087,11 @@ impl Client {
                             Some(input_region.clone()),
                             geometry,
                         )?;
-                        self.mapped_bytes.insert(id, surface_bytes);
+                        self.mapped_charges.insert(id, charge);
                         self.mapped_total = next;
                         // Pixels are up, which is what `invalid_grab` dates
                         // from. Recorded on the popup OBJECT rather than read
-                        // back off the byte ledger, which an unmap clears.
+                        // back off the charge ledger, which an unmap clears.
                         if let Some(Object::XdgPopup { mapped_once, .. }) =
                             popup_object_id.and_then(|popup| self.objects.get_mut(&popup))
                         {
@@ -5100,22 +5132,22 @@ impl Client {
                         }
                     }
                     PendingBuffer::Buffer { object, buffer, .. } => {
-                        let surface_bytes = buffer
-                            .width
-                            .checked_mul(buffer.height)
-                            .and_then(|pixels| pixels.checked_mul(4))
-                            .ok_or_else(|| "client surface byte count overflow".to_string())?;
-                        let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
-                        let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
+                        let charge = buffer.declared_charge()?;
+                        let prior = self
+                            .mapped_charges
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(BufferCharge::none);
+                        let next = client_surface_total(self.mapped_total, prior, charge)?;
                         let surface = Self::copy_buffer(&buffer)?;
-                        self.resources.observe_copied_bytes(next);
+                        self.resources.observe_copied(next);
                         runtime.apply_commit(
                             key,
                             Some(surface),
                             Some(input_region.clone()),
                             geometry,
                         )?;
-                        self.mapped_bytes.insert(id, surface_bytes);
+                        self.mapped_charges.insert(id, charge);
                         self.mapped_total = next;
                         if matches!(
                             self.objects.get(&object),
@@ -7097,7 +7129,7 @@ fn application_evidence_line(evidence: &ApplicationEvidence) -> Result<String, S
     let [content_pixels_a, content_pixels_b] = evidence.content_pixels;
     let resources = evidence.resources;
     Ok(format!(
-        "TD-APPLICATION-CONTENT-READY app-id={} content-rgb-a={} content-rgb-b={} content-pixels-a={} content-pixels-b={} objects={} shm-pools={} shm-bytes={} callbacks={} cached-commits={} deferred-events={} deferred-bytes={} copied-bytes={}\n",
+        "TD-APPLICATION-CONTENT-READY app-id={} content-rgb-a={} content-rgb-b={} content-pixels-a={} content-pixels-b={} objects={} shm-pools={} shm-bytes={} callbacks={} cached-commits={} deferred-events={} deferred-bytes={} copied-shm-bytes={} copied-buffers={}\n",
         evidence.app_id,
         content_rgb_text(content_rgb_a),
         content_rgb_text(content_rgb_b),
@@ -7110,7 +7142,8 @@ fn application_evidence_line(evidence: &ApplicationEvidence) -> Result<String, S
         resources.cached_commits,
         resources.deferred_events,
         resources.deferred_bytes,
-        resources.copied_bytes,
+        resources.copied_shm_bytes,
+        resources.copied_buffers,
     ))
 }
 
@@ -7187,7 +7220,8 @@ fn parse_application_evidence(
         cached_commits: parse_evidence_usize(&mut fields, "cached-commits=")?,
         deferred_events: parse_evidence_usize(&mut fields, "deferred-events=")?,
         deferred_bytes: parse_evidence_usize(&mut fields, "deferred-bytes=")?,
-        copied_bytes: parse_evidence_usize(&mut fields, "copied-bytes=")?,
+        copied_shm_bytes: parse_evidence_usize(&mut fields, "copied-shm-bytes=")?,
+        copied_buffers: parse_evidence_usize(&mut fields, "copied-buffers=")?,
     };
     if fields.next().is_some() {
         return Err("application evidence contains trailing fields".to_string());
@@ -7205,8 +7239,10 @@ fn parse_application_evidence(
         || resources.cached_commits > MAX_CACHED_SUBSURFACE_COMMITS
         || resources.deferred_events > MAX_DEFERRED_EVENTS
         || resources.deferred_bytes > MAX_DEFERRED_EVENT_BYTES
-        || resources.copied_bytes == 0
-        || resources.copied_bytes > MAX_UI_FRAME_BYTES
+        || resources.copied_shm_bytes == 0
+        || resources.copied_shm_bytes > MAX_UI_FRAME_BYTES
+        || resources.copied_buffers == 0
+        || resources.copied_buffers > MAX_OBJECTS
     {
         return Err("application evidence resource high-water exceeds its bound".to_string());
     }
@@ -7676,7 +7712,8 @@ mod tests {
                 cached_commits: 3,
                 deferred_events: 9,
                 deferred_bytes: 512,
-                copied_bytes: 4 * 1024 * 1024,
+                copied_shm_bytes: 4 * 1024 * 1024,
+                copied_buffers: 3,
             },
         }
     }
@@ -7885,12 +7922,24 @@ mod tests {
                 deferred_bytes: MAX_DEFERRED_EVENT_BYTES + 1,
                 ..evidence.resources
             },
+            // Every row leaves each field it is not testing VALID, so the
+            // clause under test is the only one that can reject it. The
+            // clauses are one `||` chain and short-circuit left to right, so
+            // a row that trips two pins only the earlier one.
             ClientResourceSnapshot {
-                copied_bytes: 0,
+                copied_shm_bytes: 0,
                 ..evidence.resources
             },
             ClientResourceSnapshot {
-                copied_bytes: MAX_UI_FRAME_BYTES + 1,
+                copied_shm_bytes: MAX_UI_FRAME_BYTES + 1,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                copied_buffers: 0,
+                ..evidence.resources
+            },
+            ClientResourceSnapshot {
+                copied_buffers: MAX_OBJECTS + 1,
                 ..evidence.resources
             },
         ] {
@@ -12444,7 +12493,7 @@ mod tests {
             .dispatch(request(6, 3, next_frame).unwrap(), &mut VecDeque::new())
             .unwrap();
 
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
         assert!(!fs::read(&framebuffer_path)
             .unwrap()
             .as_chunks::<4>()
@@ -12468,8 +12517,8 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 4);
-        assert_eq!(client.resources.snapshot().copied_bytes, 4);
+        assert_eq!(client.mapped_total.host_bytes(), 4);
+        assert_eq!(client.resources.snapshot().copied_shm_bytes, 4);
         assert!(fs::read(&framebuffer_path)
             .unwrap()
             .as_chunks::<4>()
@@ -12594,7 +12643,7 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
         client
             .dispatch(
                 request(30, 0, wire::Builder::new()).unwrap(),
@@ -12671,7 +12720,7 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 4);
+        assert_eq!(client.mapped_total.host_bytes(), 4);
         assert!(!fs::read(&framebuffer_path)
             .unwrap()
             .as_chunks::<4>()
@@ -12693,7 +12742,7 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 4);
+        assert_eq!(client.mapped_total.host_bytes(), 4);
         assert!(!fs::read(&framebuffer_path)
             .unwrap()
             .as_chunks::<4>()
@@ -12770,7 +12819,7 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
 
         let _ = fs::remove_file(framebuffer_path);
         let _ = fs::remove_file(pool_path);
@@ -12796,14 +12845,14 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
         client
             .dispatch(
                 request(5, 6, wire::Builder::new()).unwrap(),
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 4);
+        assert_eq!(client.mapped_total.host_bytes(), 4);
         assert!(matches!(
             client.objects.get(&31),
             Some(Object::Subsurface {
@@ -12878,7 +12927,7 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 8);
+        assert_eq!(client.mapped_total.host_bytes(), 8);
         runtime.lock().unwrap().take_writes();
 
         client
@@ -12887,7 +12936,7 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
         assert_eq!(runtime.lock().unwrap().take_writes().len(), 1);
         assert!(matches!(
             client.objects.get(&30),
@@ -12960,7 +13009,7 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_total, 4);
+        assert_eq!(client.mapped_total.host_bytes(), 4);
         assert!(!client.objects.contains_key(&50));
         assert!(matches!(
             client.objects.get(&30),
@@ -15429,7 +15478,7 @@ mod tests {
             }),
             None
         );
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
         // The hotspot reached the scene rather than being parsed and dropped,
         // and the pixels came with it. Both halves matter and arrive by
         // different routes — the hotspot with the request, the image with the
@@ -16270,19 +16319,31 @@ mod tests {
     /// already been sent — so the next role on that xdg_surface never gets
     /// one, and a client waiting on it hangs with no window.
     #[test]
-    fn a_destroyed_popup_gives_back_its_bytes_and_its_configure() {
+    fn a_destroyed_popup_gives_back_its_charge_and_its_configure() {
         let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
             mapped_popup("popup-bytes");
-        assert_eq!(client.mapped_bytes.get(&6).copied(), Some(4));
+        assert_eq!(
+            client
+                .mapped_charges
+                .get(&6)
+                .copied()
+                .map(BufferCharge::host_bytes),
+            Some(4)
+        );
         let held = client.mapped_total;
+        assert_eq!(held.held(), 1);
         client
             .dispatch(
                 request(14, 0, wire::Builder::new()).unwrap(),
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert_eq!(client.mapped_bytes.get(&6), None);
-        assert_eq!(client.mapped_total, held.saturating_sub(4));
+        assert_eq!(client.mapped_charges.get(&6), None);
+        assert_eq!(
+            client.mapped_total,
+            held.saturating_sub(BufferCharge::shm(4))
+        );
+        assert_eq!(client.mapped_total.held(), 0);
         let Some(Object::XdgSurface { configure, .. }) = client.objects.get(&13) else {
             panic!("the xdg_surface went with its role object");
         };
@@ -16302,6 +16363,7 @@ mod tests {
         let (mut client, _peer, runtime, framebuffer_path, pool_path) =
             mapped_popup("popup-detach");
         let held = client.mapped_total;
+        assert_eq!(held.held(), 1);
         let mut attach = wire::Builder::new();
         attach.u32(0);
         attach.i32(0);
@@ -16316,8 +16378,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runtime.lock().unwrap().popup_placement(POPUP_KEY), None);
-        assert_eq!(client.mapped_bytes.get(&6), None);
-        assert_eq!(client.mapped_total, held.saturating_sub(4));
+        assert_eq!(client.mapped_charges.get(&6), None);
+        assert_eq!(
+            client.mapped_total,
+            held.saturating_sub(BufferCharge::shm(4))
+        );
+        assert_eq!(client.mapped_total.held(), 0);
         let Some(Object::XdgSurface { configure, .. }) = client.objects.get(&13) else {
             panic!("the xdg_surface went with its buffer");
         };
@@ -16756,7 +16822,7 @@ mod tests {
             !snapshot.contains_key(&POPUP_KEY),
             "an orphaned menu joined the layout"
         );
-        assert_eq!(client.mapped_bytes.get(&6), None);
+        assert_eq!(client.mapped_charges.get(&6), None);
 
         // Again, because once is not the interesting case: a client that has
         // not noticed its window is gone repaints on a timer, and a menu that
@@ -17050,7 +17116,7 @@ mod tests {
             map_popup_surface(client, peer, surface, xdg_surface, buffer, pool_path);
         }
         assert_eq!(
-            client.mapped_bytes.keys().copied().collect::<Vec<u32>>(),
+            client.mapped_charges.keys().copied().collect::<Vec<u32>>(),
             vec![6, 20, 40],
             "the menu tree is not charged the way this test needs it"
         );
@@ -17082,11 +17148,11 @@ mod tests {
             .unwrap();
         commit(&mut client).unwrap();
         assert!(
-            client.mapped_bytes.is_empty(),
+            client.mapped_charges.is_empty(),
             "a menu that went down with its window is still charged: {:?}",
-            client.mapped_bytes
+            client.mapped_charges
         );
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
 
         let _ = fs::remove_file(&framebuffer_path);
         let _ = fs::remove_file(&pool_path);
@@ -17116,11 +17182,11 @@ mod tests {
             )
             .unwrap();
         assert!(
-            client.mapped_bytes.is_empty(),
+            client.mapped_charges.is_empty(),
             "a submenu that went down with its menu is still charged: {:?}",
-            client.mapped_bytes
+            client.mapped_charges
         );
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
 
         let _ = fs::remove_file(&framebuffer_path);
         let _ = fs::remove_file(&pool_path);
@@ -17145,7 +17211,11 @@ mod tests {
         let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
             mapped_popup("popup-recommit");
         assert_eq!(
-            client.mapped_bytes.get(&6).copied(),
+            client
+                .mapped_charges
+                .get(&6)
+                .copied()
+                .map(BufferCharge::host_bytes),
             Some(4),
             "the menu is not charged to begin with"
         );
@@ -17159,9 +17229,9 @@ mod tests {
             )
             .unwrap();
         assert!(
-            client.mapped_bytes.is_empty(),
+            client.mapped_charges.is_empty(),
             "the toplevel's own take-down left the menu charged: {:?}",
-            client.mapped_bytes
+            client.mapped_charges
         );
 
         // The menu's own objects are all still alive, so the client may
@@ -17204,7 +17274,11 @@ mod tests {
         // and the test would stop covering `remove_surface` with nothing to
         // say so.
         assert_eq!(
-            client.mapped_bytes.get(&6).copied(),
+            client
+                .mapped_charges
+                .get(&6)
+                .copied()
+                .map(BufferCharge::host_bytes),
             Some(4),
             "the repaint did not put the menu back"
         );
@@ -17225,11 +17299,11 @@ mod tests {
             )
             .unwrap();
         assert!(
-            client.mapped_bytes.is_empty(),
+            client.mapped_charges.is_empty(),
             "remove_surface reached a live popup tree and did not refund it: {:?}",
-            client.mapped_bytes
+            client.mapped_charges
         );
-        assert_eq!(client.mapped_total, 0);
+        assert_eq!(client.mapped_total.host_bytes(), 0);
 
         let _ = fs::remove_file(&framebuffer_path);
         let _ = fs::remove_file(&pool_path);
@@ -17758,7 +17832,14 @@ mod tests {
 
         // The client puts the submenu back up, and only the submenu.
         map_popup_surface(&mut client, &mut peer, 20, 21, 28, &pool_path);
-        assert_eq!(client.mapped_bytes.get(&20).copied(), Some(4));
+        assert_eq!(
+            client
+                .mapped_charges
+                .get(&20)
+                .copied()
+                .map(BufferCharge::host_bytes),
+            Some(4)
+        );
         drain_messages(&mut peer);
 
         // The menu's own initial commit. It can never be placed, so it is
@@ -17780,7 +17861,7 @@ mod tests {
             "the submenu was not dismissed ahead of the menu it hangs off"
         );
         assert_eq!(
-            client.mapped_bytes.get(&20),
+            client.mapped_charges.get(&20),
             None,
             "the submenu went down still charged for its pixels"
         );
@@ -17919,7 +18000,11 @@ mod tests {
                 .unwrap_or_else(|error| panic!("round {round} map refused: {error}"));
         }
         assert_eq!(
-            client.mapped_bytes.get(&6).copied(),
+            client
+                .mapped_charges
+                .get(&6)
+                .copied()
+                .map(BufferCharge::host_bytes),
             Some(4),
             "the last round did not leave the menu mapped"
         );
@@ -18414,7 +18499,14 @@ mod tests {
         ));
         fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
         map_popup_surface(&mut client, &mut peer, 6, 13, 7, &pool_path);
-        assert_eq!(client.mapped_bytes.get(&6).copied(), Some(4));
+        assert_eq!(
+            client
+                .mapped_charges
+                .get(&6)
+                .copied()
+                .map(BufferCharge::host_bytes),
+            Some(4)
+        );
 
         assert_eq!(
             grab(&mut client, 14, 70).unwrap_err(),
@@ -18431,7 +18523,7 @@ mod tests {
     /// A popup that mapped, took itself down, and then grabs is still
     /// grabbing AFTER BEING MAPPED, which is what `invalid_grab` names.
     ///
-    /// The byte ledger cannot answer this: an unmap clears it, so a check on
+    /// The charge ledger cannot answer this: an unmap clears it, so a check on
     /// what is mapped NOW lets the sequence through. The popup object keeps
     /// the fact instead. No real menu is refused by the difference — a
     /// toolkit destroys the popup and makes another rather than re-mapping
@@ -18448,7 +18540,7 @@ mod tests {
         fs::write(&pool_path, [0x21u8, 0x43, 0x65, 0]).unwrap();
         map_popup_surface(&mut client, &mut peer, 6, 13, 7, &pool_path);
 
-        // The client's own null attach, which clears the byte ledger.
+        // The client's own null attach, which clears the charge ledger.
         let mut detach = wire::Builder::new();
         detach.u32(0);
         detach.i32(0);
@@ -18463,7 +18555,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            client.mapped_bytes.get(&6),
+            client.mapped_charges.get(&6),
             None,
             "the fixture stayed mapped"
         );
@@ -19521,10 +19613,32 @@ mod tests {
     #[test]
     fn client_memory_and_connection_limits_fail_closed() {
         assert_eq!(
-            client_surface_total(MAX_UI_FRAME_BYTES, 4096, 4096).unwrap(),
-            MAX_UI_FRAME_BYTES
+            client_surface_total(
+                BufferCharge::shm(MAX_UI_FRAME_BYTES),
+                BufferCharge::shm(4096),
+                BufferCharge::shm(4096),
+            )
+            .unwrap(),
+            BufferCharge::shm(MAX_UI_FRAME_BYTES)
         );
-        assert!(client_surface_total(MAX_UI_FRAME_BYTES, 0, 1).is_err());
+        assert!(client_surface_total(
+            BufferCharge::shm(MAX_UI_FRAME_BYTES),
+            BufferCharge::none(),
+            BufferCharge::shm(1),
+        )
+        .is_err());
+        // Replacing a surface's buffer leaves ONE holding, not two. The four
+        // commit paths all subtract the prior charge before adding the new
+        // one, and a holding double-counted there would never be given back.
+        assert_eq!(
+            client_surface_total(
+                BufferCharge::shm(4_096),
+                BufferCharge::shm(4_096),
+                BufferCharge::shm(8_192),
+            )
+            .unwrap(),
+            BufferCharge::shm(8_192)
+        );
         let mut public = Vec::new();
         for _ in 0..MAX_PUBLIC_CLIENTS {
             public.push(ClientPermit::acquire(ClientAccess::Public).unwrap());

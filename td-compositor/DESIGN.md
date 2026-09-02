@@ -1030,7 +1030,7 @@ child of another surface. The role KIND remains permanent: destroying the
 but only a new `wl_subsurface` may make that wl_surface play a role again. A
 commit while the role object is absent remains legal and replaces the current
 buffer and input state without mapping it. That copied current buffer stays
-inside both the same per-client surface-byte charge and an explicit reservation
+inside both the same per-client surface charge and an explicit reservation
 against the scene-wide byte ceiling. A new `wl_subsurface` moves, rather than
 copies, it back into the active scene, where it remains invisible until the
 new association is applied by its parent's commit. A destroyed child
@@ -1299,14 +1299,14 @@ answers by an exhaustive match, so adding a variant is a compile error inside
 `buffer.rs` at each accessor that must answer for it. It does NOT make every
 consumer revisit its assumptions: consumers see the answer, not the kind. The
 reach is therefore "the answers must be written", not "the callers must
-agree", and the one caller-visible question a new kind really does change —
-byte ceilings that cannot charge a card's memory in CPU bytes — is §M's
-fourth row and a separate increment. `resident_bytes` deliberately does not
-pre-commit what a second kind would answer, because answering zero there
-would make every ceiling that consumes it silently unbounded.
+agree" — with one exception, the accounting at the end of this section,
+where a new kind owes an answer to each CEILING as well. The error chain
+still STARTS inside `buffer.rs`; what the accounting adds is that answering
+it there is not the end, because the answer changes a type the ceilings
+construct.
 
-Two questions are asked of the buffer rather than computed from its fields.
-Linear CPU bytes, which a dmabuf has only through a mapping, return an
+Three questions are asked of the buffer rather than computed from its
+fields. Linear CPU bytes, which a dmabuf has only through a mapping, return an
 `Option`, and four production readers ask. None takes the empty path today,
 because the one variant always has bytes; what the split records is which of
 them WOULD once a second variant lands. Three would. `draw_surface` draws
@@ -1324,7 +1324,8 @@ Opacity is the second question. `pixel_is_opaque` answers per kind instead of
 each caller comparing a raw format number against a `wl_shm` enumerant, which
 a DRM fourcc would satisfy or fail by accident. `ShmSnapshot::new` admits
 only the two formats that rule is total over, so the predicate never meets a
-value it cannot answer for.
+value it cannot answer for. Cost is the third, and it has a part of its own
+below.
 
 `ShmSnapshot::new` re-checks that the bytes are exactly `width * 4 * height`,
 that neither dimension is zero, and that the format is one of the two. All
@@ -1340,6 +1341,79 @@ not the only place a `Surface` is constructed — the `selftest` subcommand
 builds a one-pixel one — and that is the point of moving the checks into the
 constructor: they hold at every construction site rather than at a privileged
 one.
+
+**What buffers cost, per kind.** Nothing counts a surface's bytes any more.
+`Surface::charge` answers a `BufferCharge`, every BUFFER ledger holds one, and
+every buffer ceiling is fed one: the scene's surface total and its
+inactive-subsurface reservations, the per-client cursor allowance, the
+per-client copied-buffer ceiling `client_surface_total` enforces. What a
+ceiling BOUNDS is still a byte count named per kind — `BufferCeiling` carries
+`host_bytes` — so `MAX_SCENE_BYTES` and its neighbours keep their names, and
+prose naming the LIMIT stays right to call them byte ceilings. Prose about the
+MEASURED side drops the word, because that side is a charge: `fits` takes one,
+which is what stops a second kind being admitted by a limit that never named
+it. Both readings appear below and neither is stale. The
+application-readiness evidence is fed FROM a charge rather than denominated
+in one: `observe_copied` takes a `BufferCharge` and splits it into two
+independent high-waters, because the largest total a client ever held and the
+most buffers it ever held are separate facts and a pair taken together would
+report neither. Ledgers over things that are not buffers stay in bytes
+and should: the `wl_shm` pool total against `MAX_CLIENT_SHM_BYTES`, the
+deferred-event byte ledger, the fbdev device's own size at open, and a demo
+client sizing its own buffer all count one resource with no kind.
+`Surface::resident_bytes` is deleted rather than kept beside the charge: a
+number that meant "bytes" is the thing being replaced, not a caller to
+preserve.
+
+A charge carries TWO quantities per kind, which is `APPLICATIONS.md` §M's
+fourth row read literally — per buffer type and per outstanding lifetime.
+`host_bytes` is how much of td's own address space is held; `held` is how
+many buffers are held. The second is not derivable from the first, and it is
+what a lease-based release will be counted in when §M's second row lands: a
+thousand one-pixel cursors and one window can weigh the same and are not the
+same problem.
+
+Ceilings do not compare a total. Each names its limit PER KIND, as a
+`BufferCeiling` struct literal, and `BufferCharge::fits` destructures both
+sides without `..`. That is what carries this row out to the callers, in two
+steps that were checked on a scratch copy rather than argued. Adding
+`dmabuf_bytes` and `dmabuf_held` to the charge breaks eight places, all
+inside `buffer.rs`. Answering them there means giving `BufferCeiling` a
+`device_bytes` of its own — and that breaks all four ceiling sites, three in
+`scene.rs` and one in `server.rs`, each until its author says what that
+ceiling allows of the new resource.
+
+That is the decision no accessor can make on a ceiling's behalf. A dmabuf
+occupies no compositor memory and some quantity of device memory: a ceiling
+that summed the two would add different things, and one that kept counting
+only compositor bytes would be unbounded in the resource that actually ran
+out. A single `host_bytes()` total compared against a number would have
+compiled through both, and quietly bounded a card's memory in CPU bytes at
+every ceiling at once.
+
+One path to a charge per kind, used from both sides of a copy.
+`BufferCharge::shm` is what `server.rs`'s `Buffer::declared_charge` returns
+for the reservation a commit takes BEFORE copying — a client's buffer must be
+refusable without first allocating what would be refused — and the same
+constructor is what `Surface::charge` returns for the copy that resulted.
+That single-sources the HOLDING. The byte counts agree for a separate reason
+worth knowing: `ShmSnapshot::new` refuses a buffer whose length is not
+exactly the geometry the reservation was computed from, so the copy cannot
+weigh anything else. Every replacement subtracts the prior charge before
+adding the new one, so redrawing a surface at its current size is not a
+second holding.
+
+**What this does NOT do.** Holdings are counted and reported; nothing bounds
+them. `fits` discards `shm_held` and `BufferCeiling` carries no holding
+limit, deliberately: every copy is released at commit, so a client's holdings
+track its live surfaces and `MAX_OBJECTS` already bounds those. A cap loose
+enough to change no behaviour today could never be driven red by a test, and
+one tight enough to fire would be new policy refusing clients that work now —
+which an accounting change must not smuggle in. The quantity that needs its
+own bound is an outstanding LEASE, and §M's second row is where it arrives.
+What keeps that from being forgotten is the same `..`-free pattern: a kind
+with a lifetime cost adds a field `fits` must mention, so discarding it is a
+written decision rather than a default.
 
 An XDG toplevel becomes eligible to map only after the client performs the
 required empty initial wl_surface commit and acknowledges the resulting
@@ -1411,9 +1485,9 @@ its parent", and each was a defect before it was a rule.
 A popup dies with its own unmap, with its parent, and with its client, and its
 SUBMENUS die with it in each case: pixels included, since a chain nothing can
 reach would otherwise hold the scene's byte ceiling, and one left behind comes
-back the moment anything remaps its parent. Its bytes are given back to the
-CLIENT's accounting too, on the destroy as well as the null attach — a menu that
-returned its pixels to the scene and not to the ledger would have an
+back the moment anything remaps its parent. Its charge is given back to the
+CLIENT's accounting too, on the destroy as well as the null attach — a menu
+that returned its pixels to the scene and not to the ledger would have an
 application that opens and dismisses menus disconnected for buffers td is not
 holding. A destroyed popup also leaves a FRESH configure tracker behind, as a
 destroyed toplevel does: one left initialised says the first configure has been
@@ -1668,8 +1742,8 @@ runtime lock, and every other client's input, commits and repaints behind that
 of td's first two fixes taken together. The registrations are a leaf: nothing
 is acquired while they are held.
 
-One consequence is recorded rather than fixed: the client's byte ceiling is not
-refunded until it DESTROYS the popup, because `mapped_bytes` is the dispatch
+One consequence is recorded rather than fixed: the client's ceiling is not
+refunded until it DESTROYS the popup, because `mapped_charges` is the dispatch
 thread's own. A client that never destroys keeps its own quota spent, which is
 its ceiling and nobody else's.
 
@@ -1698,8 +1772,8 @@ queued everything rather than one menu.
 
 `invalid_grab` is the popup's own and only error, and is exactly "tried to
 grab after being mapped". That is a fact about the popup's LIFE, not its state
-now: the byte ledger is cleared on unmap, so a popup that mapped, took itself
-down and then grabbed would slip past a check on what is mapped, and the
+now: the charge ledger is cleared on unmap, so a popup that mapped, took
+itself down and then grabbed would slip past a check on what is mapped, and the
 object keeps the fact instead. It is not the configure being answered, though
 — a toolkit asks for the grab on the button press that opens the menu, long
 before it has painted, and dating the refusal from the acknowledgement would
@@ -2185,17 +2259,18 @@ The readiness answer is one newline-terminated structured line carrying the
 app id, both RGB values, both bounded matching-pixel counts and that
 connection's monotonic high-water counts for objects, retained shm pools and
 bytes, frame callbacks, synchronized commit caches, deferred events and bytes,
-and copied surface bytes. `probe-application` requires the expected app id and
-colors, exact
-field order, no trailing data, the minimum and maximum sentinel-pixel counts,
-at least one object/pool/shm byte/copied byte, and every compiled resource
-ceiling before it reproduces the line. Matching surface keys remain after the
-one-shot publication so launcher activation can reuse the service-owned
-window; role, surface and client teardown remove them and their telemetry
-registration. `probe-application SOCKET ID RGB-A RGB-B` connects to that
-distinct socket and reproduces the structured line; its `--quiet` form applies
-the same validation for supervisor readiness without putting a second evidence
-record on the console.
+and copied surface bytes AND buffers, which are separate high-waters because a
+charge is two quantities and a pair taken together would report neither.
+`probe-application` requires the expected app id and colors, exact field
+order, no trailing data, the minimum and maximum sentinel-pixel counts, at
+least one object/pool/shm byte/copied byte/copied buffer, and every compiled
+resource ceiling before it reproduces the line. Matching surface keys remain
+after the one-shot publication so launcher activation can reuse the
+service-owned window; role, surface and client teardown remove them and their
+telemetry registration. `probe-application SOCKET ID RGB-A RGB-B` connects to
+that distinct socket and reproduces the structured line; its `--quiet` form
+applies the same validation for supervisor readiness without putting a second
+evidence record on the console.
 
 The same configured observer has a second one-shot output for client-cursor
 evidence. It remains gated on successful content publication, then accepts
@@ -3266,9 +3341,9 @@ admission constants part of the QEMU
 answer, while the saturation regressions separately pin every instrumentation
 site at its exact limit. The snapshot is intentionally an early fixed-page
 trace, not authority to tune limits below a later mixed browsing workload.
-The copied-surface byte ledger is independent and
-covers toplevels, popups and subsurfaces rather than mistaking shared pool
-address space for memory copied into the compositor.
+The copied-surface charge ledger is independent and covers toplevels, popups
+and subsurfaces rather than mistaking shared pool address space for memory
+copied into the compositor.
 One compound commit may defer at most 2,048 events and 256 KiB of encoded
 event bytes while the runtime lock is held, including at most 512 buffer
 releases and 256 frame-callback completions. The cap is checked before each

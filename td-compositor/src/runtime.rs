@@ -1,4 +1,4 @@
-use crate::buffer::Surface;
+use crate::buffer::{BufferCharge, Surface};
 use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::ConfigureTracker;
 use crate::framebuffer::Framebuffer;
@@ -822,9 +822,9 @@ impl Runtime {
     pub fn replace_inactive_subsurface(
         &mut self,
         key: SurfaceKey,
-        bytes: usize,
+        charge: BufferCharge,
     ) -> Result<(), String> {
-        self.scene.replace_inactive_subsurface(key, bytes)
+        self.scene.replace_inactive_subsurface(key, charge)
     }
 
     pub fn detach_inactive_subsurface(&mut self, key: SurfaceKey) {
@@ -3563,7 +3563,7 @@ mod tests {
         resources.observe_frame_callbacks(4);
         resources.observe_cached_commits(2);
         resources.observe_deferred(7, 320);
-        resources.observe_copied_bytes(40_000);
+        resources.observe_copied(BufferCharge::shm(40_000));
         runtime
             .register_client_resources(client, resources)
             .unwrap();

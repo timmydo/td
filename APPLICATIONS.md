@@ -1602,8 +1602,8 @@ comparison render with only that surface omitted attributes at least 4,096
 final-output pixels of each exact color to it. The socket returns the app id,
 both expected colors and observed
 bounded pixel counts, and that client's bounded object, shm-pool, shm-byte,
-callback, synchronized-commit, deferred-event, deferred-byte and copied-byte
-high-water marks. Its probe rejects a malformed, over-limit or
+callback, synchronized-commit, deferred-event, deferred-byte, copied-byte and
+copied-buffer high-water marks. Its probe rejects a malformed, over-limit or
 identity-mismatched record.
 The comparison uses one fallibly allocated, reusable output-sized frame under
 the compositor's 64 MiB stride-padded framebuffer ceiling; allocation failure
@@ -6065,15 +6065,16 @@ lock before the transaction flush. A malformed or greedy client is
 disconnected without taking the compositor down.
 
 The deterministic offline-document lifecycle records Firefox's object, pool,
-declared-shm, callback, synchronized-commit, queued-event, queued-byte and
-copied-byte high-water marks on every QEMU boot and rejects the record if any
-compiled ceiling is crossed. It also retains the earlier observation that
-startup requests a fifth simultaneous pool resource. The staged physical-input
-trace added a native Firefox cursor and context menu and reached nine retained
-pools, so the count ceiling rose from eight to sixteen while the independent
-256 MiB byte ceiling stayed fixed. This is a real navigation/content trace,
-but it is one small fixed page rather than the five-minute mixed workload in
-§H. A later cap change therefore still needs evidence from that broader run.
+declared-shm, callback, synchronized-commit, queued-event, queued-byte,
+copied-byte and copied-buffer high-water marks on every QEMU boot and rejects
+the record if any compiled ceiling is crossed. It also retains the earlier
+observation that startup requests a fifth simultaneous pool resource. The
+staged physical-input trace added a native Firefox cursor and context menu and
+reached nine retained pools, so the count ceiling rose from eight to sixteen
+while the independent 256 MiB byte ceiling stayed fixed. This is a real
+navigation/content trace, but it is one small fixed page rather than the
+five-minute mixed workload in §H. A later cap change therefore still needs
+evidence from that broader run.
 
 And a performance caveat that belongs in the claim rather than in a
 surprise: the renderer copies client pixels and software-composites the
@@ -7638,9 +7639,41 @@ packing, non-zero-dimension and format invariants the renderer and that
 opacity rule rely on — the format one because a third `wl_shm` value would
 blend where the old renderer drew opaque, a changed appearance with no
 error anywhere. The reach of
-that is exact and smaller than it sounds — adding a variant is a compile
-error at each accessor, not at each caller — which is why row 4 remains the
-seam that makes a caller change.
+that is exact and smaller than it sounds: adding a variant is a compile
+error at each accessor, not at each caller. Row 4 is the seam that makes a
+CALLER change, and it has landed too.
+
+Row 4, in its UNIT half. Nothing counts a surface's bytes. `Surface::charge`
+answers a `BufferCharge`, and the scene's surface total, its
+inactive-subsurface reservations, the per-client cursor allowance and the
+per-client copied-buffer ceiling each hold one and are each checked against a
+ceiling fed one — the four sites a second kind breaks. The readiness
+evidence's resource high-waters are split out of a charge rather than
+denominated in one. It carries two quantities per kind — `host_bytes` held and
+`held` buffers — per buffer type AND per outstanding lifetime, and the second
+is not derivable from the first.
+
+The row's other half, a CAP per outstanding lifetime, has not landed and is
+row 2's. Holdings are counted and reported; no ceiling bounds them. Today
+every copy is released at commit, so holdings track live surfaces and
+`MAX_OBJECTS` already bounds those: a cap loose enough to change nothing
+could not be tested, and one tight enough to fire would be new policy
+refusing clients that work now. The resource that will need bounding is an
+outstanding lease, which row 2 introduces — and a kind carrying a lifetime
+cost adds a field `fits` must name, so row 2 cannot skip the decision
+silently.
+
+The property that makes it a caller change: no ceiling compares a total.
+Each names its limit per kind as a `BufferCeiling` literal, and `fits`
+destructures both sides without `..`. Adding a `Dmabuf`'s fields breaks eight
+places inside `buffer.rs`; answering them there requires a `device_bytes`
+limit, which then breaks all four ceiling sites until each says what it
+allows of the new resource. Checked on a scratch copy, not asserted. A
+ceiling that summed host and device bytes would add different things; one
+that kept counting only host bytes would be unbounded in the resource that
+ran out, and neither is a decision an accessor can make for it.
+`Surface::resident_bytes` is deleted rather than left beside the charge,
+since a number meaning "bytes" is what this row replaces.
 
 Row 3: `td-compositor/src/output.rs` holds `OutputBackend` —
 `dimensions`/`supported_formats`/`begin_frame(damage)`/`present`/`poll_events`

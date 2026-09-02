@@ -1,5 +1,5 @@
 use crate::bar::{self, BAR_HEIGHT};
-use crate::buffer::Surface;
+use crate::buffer::{BufferCeiling, BufferCharge, Surface};
 use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
 use crate::layout::{Axis, Command, DropKind, Layout, Placement, Presentation, Rect, ViewLayout};
@@ -816,12 +816,12 @@ pub struct Scene {
     layout: Layout,
     pointer_x: i32,
     pointer_y: i32,
-    surface_bytes: usize,
+    surface_charge: BufferCharge,
     /// Copied current buffers whose permanent subsurface role temporarily has
     /// no role object. The server owns the pixels, but this reservation keeps
-    /// them inside the one scene-wide byte ceiling until they are restored or
+    /// them inside the one scene-wide ceiling until they are restored or
     /// discarded.
-    inactive_surface_bytes: BTreeMap<SurfaceKey, usize>,
+    inactive_surface_charges: BTreeMap<SurfaceKey, BufferCharge>,
     /// What a drag is drawing INSTEAD of `layout`. Not a second source of
     /// truth: it is derived from `layout` on every pointer frame and dropped
     /// by every mutation of it, so nothing here can outlive what it was
@@ -838,7 +838,7 @@ pub struct Scene {
     /// Emptied of a surface by its destroy or a null attach, and of a
     /// client by its departure.
     cursor_images: BTreeMap<SurfaceKey, Surface>,
-    cursor_bytes: usize,
+    cursor_charge: BufferCharge,
     launcher: Launcher,
     help: Help,
     status: String,
@@ -861,12 +861,12 @@ impl Scene {
             layout: Layout::new(),
             pointer_x: 0,
             pointer_y: 0,
-            surface_bytes: 0,
-            inactive_surface_bytes: BTreeMap::new(),
+            surface_charge: BufferCharge::none(),
+            inactive_surface_charges: BTreeMap::new(),
             hint: None,
             cursor: None,
             cursor_images: BTreeMap::new(),
-            cursor_bytes: 0,
+            cursor_charge: BufferCharge::none(),
             launcher: Launcher::new(),
             help: Help::default(),
             status: String::new(),
@@ -928,29 +928,31 @@ impl Scene {
         // wrong; a stale frame says nothing.
         let refused = image.width() > MAX_CURSOR_DIMENSION
             || image.height() > MAX_CURSOR_DIMENSION
-            || !self.cursor_fits(key, image.resident_bytes());
+            || !self.cursor_fits(key, image.charge());
         if refused {
             return self.forget_cursor_image(key) && drawn;
         }
         self.forget_cursor_image(key);
-        self.cursor_bytes = self.cursor_bytes.saturating_add(image.resident_bytes());
+        self.cursor_charge = self.cursor_charge.saturating_add(image.charge());
         self.cursor_images.insert(key, image);
         drawn
     }
 
-    /// Whether `client` may hold `bytes` more of cursor pixels, counting what
-    /// the same surface already holds as returned first: a client replacing
-    /// one frame with another the same size must not walk into its own
-    /// ceiling.
-    fn cursor_fits(&self, key: SurfaceKey, bytes: usize) -> bool {
+    /// Whether `key`'s client may take on `charge` more of cursor pixels,
+    /// counting what the same surface already holds as returned first: a
+    /// client replacing one frame with another the same size must not walk
+    /// into its own ceiling.
+    fn cursor_fits(&self, key: SurfaceKey, charge: BufferCharge) -> bool {
         let held = self
             .cursor_images
             .iter()
             .filter(|(held, _)| held.client == key.client && **held != key)
-            .fold(0usize, |total, (_, image)| {
-                total.saturating_add(image.resident_bytes())
+            .fold(BufferCharge::none(), |total, (_, image)| {
+                total.saturating_add(image.charge())
             });
-        held.saturating_add(bytes) <= MAX_CURSOR_BYTES_PER_CLIENT
+        held.saturating_add(charge).fits(BufferCeiling {
+            host_bytes: MAX_CURSOR_BYTES_PER_CLIENT,
+        })
     }
 
     /// An attach carried an offset, so a cursor drawn WITH this surface moves
@@ -1003,7 +1005,7 @@ impl Scene {
         let Some(held) = self.cursor_images.remove(&key) else {
             return false;
         };
-        self.cursor_bytes = self.cursor_bytes.saturating_sub(held.resident_bytes());
+        self.cursor_charge = self.cursor_charge.saturating_sub(held.charge());
         true
     }
 
@@ -1108,7 +1110,14 @@ impl Scene {
 
     #[cfg(test)]
     pub(crate) fn cursor_bytes(&self) -> usize {
-        self.cursor_bytes
+        self.cursor_charge.host_bytes()
+    }
+
+    /// How many cursor buffers are held, which the bytes do not say: a
+    /// thousand one-pixel cursors and one large one can weigh the same.
+    #[cfg(test)]
+    pub(crate) fn cursor_buffers(&self) -> usize {
+        self.cursor_charge.held()
     }
 
     /// Which client the pointer is focused on, as the pointer model answers
@@ -1228,7 +1237,7 @@ impl Scene {
     }
 
     /// A popup's pixels and where they go. It shares `surfaces` with the tiles
-    /// — the byte ceiling is the whole scene's, and a client cannot be allowed
+    /// — the ceiling is the whole scene's, and a client cannot be allowed
     /// to spend it through menus instead of windows — but it never enters the
     /// LAYOUT, which is the whole difference between a popup and a window.
     pub fn commit_popup(
@@ -1302,44 +1311,51 @@ impl Scene {
     }
 
     pub fn take_subsurface(&mut self, key: SurfaceKey) -> Result<Option<Surface>, String> {
-        if self.inactive_surface_bytes.contains_key(&key) {
-            return Err("subsurface already has an inactive byte reservation".to_string());
+        if self.inactive_surface_charges.contains_key(&key) {
+            return Err("subsurface already has an inactive charge reservation".to_string());
         }
         self.remove_subsurface_association(key);
         self.input_regions.remove(&key);
         let Some(surface) = self.surfaces.remove(&key) else {
             return Ok(None);
         };
-        self.inactive_surface_bytes.insert(key, surface.resident_bytes());
+        self.inactive_surface_charges.insert(key, surface.charge());
         Ok(Some(surface))
     }
 
     pub fn replace_inactive_subsurface(
         &mut self,
         key: SurfaceKey,
-        bytes: usize,
+        charge: BufferCharge,
     ) -> Result<(), String> {
-        let prior = self.inactive_surface_bytes.get(&key).copied().unwrap_or(0);
+        let prior = self
+            .inactive_surface_charges
+            .get(&key)
+            .copied()
+            .unwrap_or_else(BufferCharge::none);
         let retained = self
-            .surface_bytes
+            .surface_charge
             .checked_sub(prior)
-            .ok_or_else(|| "scene inactive byte accounting underflow".to_string())?;
+            .ok_or_else(|| "scene inactive charge accounting underflow".to_string())?;
         let next = retained
-            .checked_add(bytes)
-            .ok_or_else(|| "scene inactive byte accounting overflow".to_string())?;
-        if next > MAX_SCENE_BYTES {
+            .checked_add(charge)
+            .ok_or_else(|| "scene inactive charge accounting overflow".to_string())?;
+        if !next.fits(BufferCeiling {
+            host_bytes: MAX_SCENE_BYTES,
+        }) {
             return Err(format!(
-                "scene surfaces need {next} bytes, exceeding {MAX_SCENE_BYTES}"
+                "scene surfaces need {} bytes, exceeding {MAX_SCENE_BYTES}",
+                next.host_bytes()
             ));
         }
-        self.inactive_surface_bytes.insert(key, bytes);
-        self.surface_bytes = next;
+        self.inactive_surface_charges.insert(key, charge);
+        self.surface_charge = next;
         Ok(())
     }
 
     pub fn detach_inactive_subsurface(&mut self, key: SurfaceKey) {
-        if let Some(bytes) = self.inactive_surface_bytes.remove(&key) {
-            self.surface_bytes = self.surface_bytes.saturating_sub(bytes);
+        if let Some(charge) = self.inactive_surface_charges.remove(&key) {
+            self.surface_charge = self.surface_charge.saturating_sub(charge);
         }
     }
 
@@ -1351,12 +1367,14 @@ impl Scene {
         if self.surfaces.contains_key(&key) {
             return Err("subsurface is already mapped while restoring inactive pixels".to_string());
         }
-        let Some(reserved) = self.inactive_surface_bytes.remove(&key) else {
-            return Err("subsurface has no inactive byte reservation".to_string());
+        let Some(reserved) = self.inactive_surface_charges.remove(&key) else {
+            return Err("subsurface has no inactive charge reservation".to_string());
         };
-        if surface.resident_bytes() != reserved {
-            self.inactive_surface_bytes.insert(key, reserved);
-            return Err("subsurface inactive byte reservation does not match its image".to_string());
+        if surface.charge() != reserved {
+            self.inactive_surface_charges.insert(key, reserved);
+            return Err(
+                "subsurface inactive charge reservation does not match its image".to_string(),
+            );
         }
         self.surfaces.insert(key, surface);
         Ok(())
@@ -1732,29 +1750,32 @@ impl Scene {
         self.popups_stacked()
     }
 
-    /// The pixels alone, byte-accounted, without saying what they are FOR.
+    /// The pixels alone, charged by kind, without saying what they are FOR.
     /// Answers whether the surface is one td had not seen before.
     fn store_surface(&mut self, key: SurfaceKey, surface: Surface) -> Result<bool, String> {
         let is_new = !self.surfaces.contains_key(&key);
         let prior = self
             .surfaces
             .get(&key)
-            .map(Surface::resident_bytes)
-            .unwrap_or(0);
+            .map(Surface::charge)
+            .unwrap_or_else(BufferCharge::none);
         let retained = self
-            .surface_bytes
+            .surface_charge
             .checked_sub(prior)
-            .ok_or_else(|| "scene byte accounting underflow".to_string())?;
+            .ok_or_else(|| "scene charge accounting underflow".to_string())?;
         let next = retained
-            .checked_add(surface.resident_bytes())
-            .ok_or_else(|| "scene byte accounting overflow".to_string())?;
-        if next > MAX_SCENE_BYTES {
+            .checked_add(surface.charge())
+            .ok_or_else(|| "scene charge accounting overflow".to_string())?;
+        if !next.fits(BufferCeiling {
+            host_bytes: MAX_SCENE_BYTES,
+        }) {
             return Err(format!(
-                "scene surfaces need {next} bytes, exceeding {MAX_SCENE_BYTES}"
+                "scene surfaces need {} bytes, exceeding {MAX_SCENE_BYTES}",
+                next.host_bytes()
             ));
         }
         self.surfaces.insert(key, surface);
-        self.surface_bytes = next;
+        self.surface_charge = next;
         Ok(is_new)
     }
 
@@ -1894,7 +1915,7 @@ impl Scene {
     fn take_pixels(&mut self, key: SurfaceKey) -> Option<Surface> {
         self.input_regions.remove(&key);
         if let Some(surface) = self.surfaces.remove(&key) {
-            self.surface_bytes = self.surface_bytes.saturating_sub(surface.resident_bytes());
+            self.surface_charge = self.surface_charge.saturating_sub(surface.charge());
             return Some(surface);
         }
         None
@@ -1966,13 +1987,13 @@ impl Scene {
             .surfaces
             .iter()
             .filter(|(key, _)| key.client == client)
-            .fold(0usize, |total, (_, surface)| {
-                total.saturating_add(surface.resident_bytes())
+            .fold(BufferCharge::none(), |total, (_, surface)| {
+                total.saturating_add(surface.charge())
             });
         self.surfaces.retain(|key, _| key.client != client);
-        self.inactive_surface_bytes.retain(|key, bytes| {
+        self.inactive_surface_charges.retain(|key, charge| {
             if key.client == client {
-                removed = removed.saturating_add(*bytes);
+                removed = removed.saturating_add(*charge);
                 return false;
             }
             true
@@ -1994,19 +2015,19 @@ impl Scene {
         self.portal_dialog_order
             .retain(|key| key.client != client);
         self.titles.retain(|key, _| key.client != client);
-        self.surface_bytes = self.surface_bytes.saturating_sub(removed);
+        self.surface_charge = self.surface_charge.saturating_sub(removed);
         // Cursor surfaces are not in `surfaces`, so the sweep above misses
         // them: a departing client's retained cursor pixels would be held
         // for the life of the compositor with nothing left to name them.
-        let mut cursors = 0usize;
+        let mut cursors = BufferCharge::none();
         self.cursor_images.retain(|key, image| {
             if key.client == client {
-                cursors = cursors.saturating_add(image.resident_bytes());
+                cursors = cursors.saturating_add(image.charge());
                 return false;
             }
             true
         });
-        self.cursor_bytes = self.cursor_bytes.saturating_sub(cursors);
+        self.cursor_charge = self.cursor_charge.saturating_sub(cursors);
         if self
             .cursor
             .as_ref()
@@ -5577,12 +5598,17 @@ mod tests {
         assert_eq!(pixel(&frame, stride, 40, 60), INK);
     }
 
-    /// The byte ledger is per CLIENT, and it is a ledger rather than a
+    /// The ledger is per CLIENT, and it is a ledger rather than a
     /// high-water mark: everything that drops a retained image has to give
-    /// its bytes back, or the ceiling leaks until no cursor is admitted at
+    /// its charge back, or the ceiling leaks until no cursor is admitted at
     /// all and nothing says why.
+    ///
+    /// Bytes and HOLDINGS are checked at every step, because they are the two
+    /// halves of `APPLICATIONS.md` §M's fourth row and they fail differently:
+    /// a leaked holding is invisible to a byte ceiling, and would still be
+    /// wrong under a kind whose cost is a card's rather than td's.
     #[test]
-    fn the_cursor_ledger_is_per_client_and_gives_its_bytes_back() {
+    fn the_cursor_ledger_is_per_client_and_gives_its_charge_back() {
         let mut scene = Scene::new();
         // A full-size cursor is a quarter of one client's allowance, so four
         // fit and the fifth does not.
@@ -5593,8 +5619,10 @@ mod tests {
             assert!(!scene.commit_cursor(cursor_key(7, object), surface(INK, side, side)));
         }
         assert_eq!(scene.cursor_bytes(), MAX_CURSOR_BYTES_PER_CLIENT);
+        assert_eq!(scene.cursor_buffers(), 4);
         assert!(!scene.commit_cursor(cursor_key(7, 4), surface(INK, side, side)));
         assert_eq!(scene.cursor_bytes(), MAX_CURSOR_BYTES_PER_CLIENT);
+        assert_eq!(scene.cursor_buffers(), 4);
 
         // ANOTHER client is unaffected, which one shared ledger would not
         // manage: a first-come total would let the client above deny every
@@ -5604,15 +5632,19 @@ mod tests {
             scene.cursor_bytes(),
             MAX_CURSOR_BYTES_PER_CLIENT.saturating_add(each)
         );
+        assert_eq!(scene.cursor_buffers(), 5);
 
         // Replacing a frame with one the same size is not a fifth cursor:
         // what the surface already holds is returned before the new image is
-        // weighed, or a client at its ceiling could never redraw.
+        // weighed, or a client at its ceiling could never redraw. The HOLDING
+        // is returned with it — a replacement that added one without
+        // subtracting would be invisible here in bytes and never given back.
         assert!(!scene.commit_cursor(cursor_key(7, 0), surface(OTHER_INK, side, side)));
         assert_eq!(
             scene.cursor_bytes(),
             MAX_CURSOR_BYTES_PER_CLIENT.saturating_add(each)
         );
+        assert_eq!(scene.cursor_buffers(), 5);
 
         // Every route out gives the bytes back: a null attach, a destroy,
         // and a departure.
@@ -5621,12 +5653,16 @@ mod tests {
             scene.cursor_bytes(),
             MAX_CURSOR_BYTES_PER_CLIENT.saturating_add(each) - each
         );
+        assert_eq!(scene.cursor_buffers(), 4);
         scene.remove(cursor_key(7, 1));
         assert_eq!(scene.cursor_bytes(), each.saturating_mul(3));
+        assert_eq!(scene.cursor_buffers(), 3);
         scene.remove_client(7);
         assert_eq!(scene.cursor_bytes(), each);
+        assert_eq!(scene.cursor_buffers(), 1);
         scene.remove_client(9);
         assert_eq!(scene.cursor_bytes(), 0);
+        assert_eq!(scene.cursor_buffers(), 0);
         assert!(scene.cursor_images.is_empty());
     }
 
@@ -5880,7 +5916,7 @@ mod tests {
         scene.commit(key, surface([4, 5, 6, 0], 2, 2)).unwrap();
         assert_eq!(scene.surfaces.len(), 1);
         assert_eq!(scene.layout.placements(100, 100, 0, 0).len(), 1);
-        assert_eq!(scene.surface_bytes, 16);
+        assert_eq!(scene.surface_charge.host_bytes(), 16);
         assert!(scene.layout.check_invariants().is_ok());
     }
 
@@ -6157,29 +6193,51 @@ mod tests {
             .commit_subsurface(child, surface([4, 5, 6, 0], 4, 4))
             .unwrap();
         scene.associate_subsurface(child, parent, 0, 0);
-        let active_bytes = scene.surface_bytes;
+        let active_bytes = scene.surface_charge.host_bytes();
         let held = scene.take_subsurface(child).unwrap().unwrap();
-        assert_eq!(scene.surface_bytes, active_bytes);
-        assert_eq!(scene.inactive_surface_bytes.get(&child), Some(&64));
+        assert_eq!(scene.surface_charge.host_bytes(), active_bytes);
+        assert_eq!(
+            scene
+                .inactive_surface_charges
+                .get(&child)
+                .copied()
+                .map(BufferCharge::host_bytes),
+            Some(64)
+        );
         assert!(!scene.surfaces.contains_key(&child));
         drop(held);
 
-        scene.replace_inactive_subsurface(child, 16).unwrap();
-        assert_eq!(scene.surface_bytes, active_bytes.saturating_sub(48));
+        scene
+            .replace_inactive_subsurface(child, BufferCharge::shm(16))
+            .unwrap();
+        assert_eq!(
+            scene.surface_charge.host_bytes(),
+            active_bytes.saturating_sub(48)
+        );
         assert!(scene
-            .replace_inactive_subsurface(child, MAX_SCENE_BYTES)
+            .replace_inactive_subsurface(child, BufferCharge::shm(MAX_SCENE_BYTES))
             .is_err());
-        assert_eq!(scene.inactive_surface_bytes.get(&child), Some(&16));
+        assert_eq!(
+            scene
+                .inactive_surface_charges
+                .get(&child)
+                .copied()
+                .map(BufferCharge::host_bytes),
+            Some(16)
+        );
         scene
             .restore_inactive_subsurface(child, surface([7, 8, 9, 0], 2, 2))
             .unwrap();
-        assert_eq!(scene.surface_bytes, active_bytes.saturating_sub(48));
-        assert!(!scene.inactive_surface_bytes.contains_key(&child));
+        assert_eq!(
+            scene.surface_charge.host_bytes(),
+            active_bytes.saturating_sub(48)
+        );
+        assert!(!scene.inactive_surface_charges.contains_key(&child));
         assert!(scene.surfaces.contains_key(&child));
 
         let held = scene.take_subsurface(child).unwrap().unwrap();
         assert!(!scene.remove_subsurface(child));
-        assert_eq!(scene.surface_bytes, 4);
+        assert_eq!(scene.surface_charge.host_bytes(), 4);
         drop(held);
     }
 
@@ -6200,12 +6258,19 @@ mod tests {
             .unwrap();
         scene.associate_subsurface(child, parent, 0, 0);
         let held = scene.take_subsurface(child).unwrap().unwrap();
-        assert_eq!(scene.surface_bytes, 68);
-        assert_eq!(scene.inactive_surface_bytes.get(&child), Some(&64));
+        assert_eq!(scene.surface_charge.host_bytes(), 68);
+        assert_eq!(
+            scene
+                .inactive_surface_charges
+                .get(&child)
+                .copied()
+                .map(BufferCharge::host_bytes),
+            Some(64)
+        );
 
         assert!(scene.remove_client(4));
-        assert_eq!(scene.surface_bytes, 0);
-        assert!(!scene.inactive_surface_bytes.contains_key(&child));
+        assert_eq!(scene.surface_charge.host_bytes(), 0);
+        assert!(!scene.inactive_surface_charges.contains_key(&child));
         drop(held);
     }
 
@@ -7963,13 +8028,16 @@ mod tests {
             .commit_popup(menu, surface(MENU, 10, 10), place)
             .unwrap();
         assert_eq!(scene.popup_placement(menu), Some(place));
-        let held = scene.surface_bytes;
+        let held = scene.surface_charge.host_bytes();
         assert!(scene.unmap_popup(menu).0);
         assert_eq!(scene.popup_placement(menu), None);
         // Its PIXELS go with it, which nothing on screen would show: a menu
         // that kept them would spend the scene's byte ceiling on every popup a
         // client ever opened.
-        assert_eq!(scene.surface_bytes, held.saturating_sub(10 * 10 * 4));
+        assert_eq!(
+            scene.surface_charge.host_bytes(),
+            held.saturating_sub(10 * 10 * 4)
+        );
         // Nothing left to draw either: an unmapped popup is a dismissed menu
         // rather than a window that might come back to the same tile.
         scene.render(&mut frame, width, height, stride);
@@ -8683,12 +8751,12 @@ mod tests {
         scene
             .commit_popup(submenu, surface(SUBMENU, 6, 6), placed(menu, 10, 2, 6))
             .unwrap();
-        let held = scene.surface_bytes;
+        let held = scene.surface_charge.host_bytes();
         assert!(scene.unmap_popup(menu).0);
         assert_eq!(scene.popup_placement(menu), None);
         assert_eq!(scene.popup_placement(submenu), None);
         assert_eq!(
-            scene.surface_bytes,
+            scene.surface_charge.host_bytes(),
             held.saturating_sub(10 * 10 * 4 + 6 * 6 * 4)
         );
 
@@ -8701,11 +8769,11 @@ mod tests {
         scene
             .commit_popup(submenu, surface(SUBMENU, 6, 6), placed(menu, 10, 2, 6))
             .unwrap();
-        let held = scene.surface_bytes;
+        let held = scene.surface_charge.host_bytes();
         scene.unmap(key);
         assert_eq!(scene.popup_placement(submenu), None);
         assert_eq!(
-            scene.surface_bytes,
+            scene.surface_charge.host_bytes(),
             held.saturating_sub(10 * 10 * 4 + 6 * 6 * 4 + 240 * 100 * 4)
         );
     }

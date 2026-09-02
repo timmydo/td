@@ -11,10 +11,14 @@
 //! exhaustive `match`, so adding a variant is a compile error in THIS module
 //! at each accessor that has to answer for it. Be exact about the reach of
 //! that: consumers see the answer rather than the kind, so it forces the
-//! answers to be written, not the callers to be revisited. Where a caller
-//! genuinely must change — the byte ceilings, which cannot charge a card's
-//! memory in CPU bytes — the seam is the per-buffer-type accounting §M asks
-//! for next, and it is not this module's to claim.
+//! answers to be written, not the callers to be revisited.
+//!
+//! The callers that genuinely must change are the CEILINGS, which cannot
+//! charge a card's memory in CPU bytes, and that seam is here too:
+//! `BufferCharge` is what every buffer ledger counts, and `BufferCeiling` is
+//! how each ceiling names its limit per kind. A ceiling is where the compile
+//! error for a second kind finally lands, after this module has been made to
+//! answer for it first.
 //!
 //! The one question a dmabuf cannot answer without a mapping — give me linear
 //! CPU bytes — says so in its return type rather than by convention.
@@ -104,6 +108,148 @@ impl ShmSnapshot {
     }
 }
 
+/// What a set of buffers costs, kept PER KIND rather than as one number.
+///
+/// `APPLICATIONS.md` §M's fourth row: counting CPU bytes is the wrong unit the
+/// moment a buffer lives on a card. A dmabuf occupies no compositor memory and
+/// some quantity of device memory, so a ceiling that added the two would be
+/// adding different things, and one that kept counting only compositor bytes
+/// would be unbounded in the resource that actually ran out.
+///
+/// Two quantities per kind, which is the row's "per buffer type and per
+/// outstanding lifetime": how much is held, and how many holdings there are.
+/// The second is not derivable from the first — a thousand one-pixel cursors
+/// and one window can cost the same bytes and are not the same problem — and
+/// it is what a lease-based release will be counted in when §M's second row
+/// lands.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BufferCharge {
+    shm_bytes: usize,
+    shm_held: usize,
+}
+
+impl BufferCharge {
+    pub fn none() -> BufferCharge {
+        BufferCharge::default()
+    }
+
+    /// One `wl_shm` holding of a known size, for the reservation a commit
+    /// takes BEFORE the copy exists. Naming the kind at the call site is the
+    /// point: a caller reserving for a kind whose cost is not host bytes has
+    /// to say so rather than passing a number that looks like any other.
+    pub fn shm(bytes: usize) -> BufferCharge {
+        BufferCharge {
+            shm_bytes: bytes,
+            shm_held: 1,
+        }
+    }
+
+    /// Bytes of td's OWN address space. Named for the resource rather than
+    /// for the kind, because that is what a ceiling on it bounds, and a kind
+    /// whose bytes are not td's contributes nothing here BY DESIGN — it needs
+    /// a ceiling of its own rather than a share of this one.
+    pub fn host_bytes(self) -> usize {
+        let BufferCharge {
+            shm_bytes,
+            shm_held: _,
+        } = self;
+        shm_bytes
+    }
+
+    /// How many buffers this charge is holding, across every kind.
+    pub fn held(self) -> usize {
+        let BufferCharge {
+            shm_bytes: _,
+            shm_held,
+        } = self;
+        shm_held
+    }
+
+    pub fn checked_add(self, other: BufferCharge) -> Option<BufferCharge> {
+        Some(BufferCharge {
+            shm_bytes: self.shm_bytes.checked_add(other.shm_bytes)?,
+            shm_held: self.shm_held.checked_add(other.shm_held)?,
+        })
+    }
+
+    pub fn checked_sub(self, other: BufferCharge) -> Option<BufferCharge> {
+        Some(BufferCharge {
+            shm_bytes: self.shm_bytes.checked_sub(other.shm_bytes)?,
+            shm_held: self.shm_held.checked_sub(other.shm_held)?,
+        })
+    }
+
+    /// Never past the maximum. For the running totals that have no caller to
+    /// fail to, where an add that silently kept its previous value would
+    /// UNDER-count, which is the direction that admits.
+    ///
+    /// Saturating is the safe direction only where the total is then
+    /// compared against a ceiling — `cursor_fits`, which over-estimates and
+    /// so refuses. The refund sweeps in `remove_client` accumulate with this
+    /// too, and there saturation would over-refund; that is fail-open, and it
+    /// is unreachable rather than guarded, because a refund is bounded by the
+    /// total it was admitted under and every ceiling is far below `usize`.
+    /// `commit_cursor`'s add is neither: it maintains a total nothing admits
+    /// on, so saturation there costs a report rather than a decision.
+    pub fn saturating_add(self, other: BufferCharge) -> BufferCharge {
+        BufferCharge {
+            shm_bytes: self.shm_bytes.saturating_add(other.shm_bytes),
+            shm_held: self.shm_held.saturating_add(other.shm_held),
+        }
+    }
+
+    /// Never below zero. For the teardown sweeps, which must not fail.
+    pub fn saturating_sub(self, other: BufferCharge) -> BufferCharge {
+        BufferCharge {
+            shm_bytes: self.shm_bytes.saturating_sub(other.shm_bytes),
+            shm_held: self.shm_held.saturating_sub(other.shm_held),
+        }
+    }
+
+    /// Whether this charge fits under `ceiling`, every kind at once.
+    ///
+    /// Both sides are destructured without `..` deliberately, and that is
+    /// what carries §M's fourth row out to the callers. A second kind adds a
+    /// field to the charge, which stops THIS function compiling; answering
+    /// for it means giving `BufferCeiling` a limit of its own, which stops
+    /// every BUFFER ceiling compiling until its author says what that ceiling
+    /// allows of the new resource. Ceilings over things that are not buffers
+    /// — a `wl_shm` pool's bytes, a deferred-event queue's — are unaffected,
+    /// and should be: they bound one resource that has no kind.
+    ///
+    /// An accessor returning one total could not do that: summing the fields
+    /// would compile, and would quietly bound a card's memory in CPU bytes at
+    /// every ceiling at once.
+    /// `shm_held` is discarded HERE and nowhere silently: no ceiling bounds
+    /// holdings today, because every copy is released at commit, so a
+    /// client's holdings track its live surfaces and `MAX_OBJECTS` already
+    /// bounds those. The quantity that needs a bound of its own is an
+    /// outstanding LEASE, which §M's second row introduces. A kind that
+    /// carries a lifetime cost adds a field the pattern below must mention,
+    /// so discarding it stays a written decision rather than a default.
+    pub fn fits(self, ceiling: BufferCeiling) -> bool {
+        let BufferCharge {
+            shm_bytes,
+            shm_held: _,
+        } = self;
+        let BufferCeiling { host_bytes } = ceiling;
+        shm_bytes <= host_bytes
+    }
+}
+
+/// What one ceiling allows, per kind.
+///
+/// Written as a struct literal at each ceiling rather than passed as a number,
+/// so that adding a kind is a question each ceiling has to answer separately.
+/// No `BufferCharge` can answer it on a ceiling's behalf: a limit on device
+/// memory has nothing to do with how much of td's own address space the same
+/// ceiling was protecting, and the two are not exchangeable at any rate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferCeiling {
+    /// Bytes of td's own address space this ceiling allows.
+    pub host_bytes: usize,
+}
+
 /// One committed client image, by kind. See the module comment for why this
 /// is an enum with a single variant.
 pub enum SurfaceBuffer {
@@ -153,6 +299,20 @@ impl Surface {
         }
     }
 
+    /// What this surface costs, by kind.
+    ///
+    /// The match is the cost table: a second variant does not compile until
+    /// it says what holding one costs. It reaches `BufferCharge` through the
+    /// same constructor a pre-copy reservation does, which single-sources the
+    /// HOLDING; the byte counts agree for a different reason, because
+    /// `ShmSnapshot::new` refuses a buffer whose length is not exactly the
+    /// geometry the reservation was computed from.
+    pub fn charge(&self) -> BufferCharge {
+        match &self.buffer {
+            SurfaceBuffer::Shm(shm) => BufferCharge::shm(shm.pixels.len()),
+        }
+    }
+
     /// The format the client declared, as the number the client named. It is
     /// for diagnostics and for the protocol, which speaks in exactly these
     /// numbers. It is NOT the thing to compare when the question is really
@@ -186,22 +346,6 @@ impl Surface {
         }
     }
 
-    /// Bytes of td's OWN memory this surface occupies — what the scene and
-    /// the per-client ceilings charge today.
-    ///
-    /// A single number is the wrong shape the moment a buffer lives on a
-    /// card, which is exactly §M's fourth row, and this accessor deliberately
-    /// does NOT pre-commit what a second kind would answer here. Answering
-    /// zero would make every ceiling that consumes it silently unbounded;
-    /// answering the card's bytes would make it a different unit under one
-    /// name. The per-buffer-type accounting is where that is decided, and
-    /// until it lands this counts one kind because there is one kind.
-    pub fn resident_bytes(&self) -> usize {
-        match &self.buffer {
-            SurfaceBuffer::Shm(shm) => shm.pixels.len(),
-        }
-    }
-
     /// The pixels, tightly packed, if this kind of buffer has any without a
     /// mapping. `None` is not an error: it is a dmabuf saying that reading it
     /// on the CPU costs an `mmap` plus `DMA_BUF_IOCTL_SYNC`, so a caller that
@@ -226,6 +370,75 @@ impl Surface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_charge_counts_bytes_and_holdings_separately() {
+        let big = Surface::from_shm_pixels(4, 4, vec![0; 64], SHM_XRGB8888).unwrap();
+        let small = Surface::from_shm_pixels(1, 1, vec![0; 4], SHM_XRGB8888).unwrap();
+
+        let charge = BufferCharge::none()
+            .checked_add(big.charge())
+            .and_then(|charge| charge.checked_add(small.charge()))
+            .unwrap();
+        assert_eq!(charge.host_bytes(), 68);
+        assert_eq!(charge.held(), 2);
+
+        // Holdings are not derivable from bytes: the same total, twice the
+        // buffers, is a different fact about the same client.
+        let many = (0..16).fold(BufferCharge::none(), |charge, _| {
+            charge.checked_add(small.charge()).unwrap()
+        });
+        assert_eq!(many.host_bytes(), 64);
+        assert_eq!(many.held(), 16);
+        assert_eq!(big.charge().host_bytes(), 64);
+        assert_eq!(big.charge().held(), 1);
+    }
+
+    #[test]
+    fn a_charge_returns_to_nothing_when_its_buffers_go() {
+        let surface = Surface::from_shm_pixels(2, 2, vec![0; 16], SHM_ARGB8888).unwrap();
+        let charge = BufferCharge::none().checked_add(surface.charge()).unwrap();
+        assert_ne!(charge, BufferCharge::none());
+        assert_eq!(
+            charge.checked_sub(surface.charge()),
+            Some(BufferCharge::none())
+        );
+        // And a subtraction that would go negative is refused rather than
+        // wrapping into an enormous charge.
+        assert_eq!(BufferCharge::none().checked_sub(surface.charge()), None);
+        assert_eq!(
+            BufferCharge::none().saturating_sub(surface.charge()),
+            BufferCharge::none()
+        );
+    }
+
+    #[test]
+    fn a_ledger_that_cannot_add_saturates_rather_than_forgetting() {
+        let surface = Surface::from_shm_pixels(1, 1, vec![0; 4], SHM_XRGB8888).unwrap();
+        let brim = BufferCharge::shm(usize::MAX);
+        // A sweep that cannot represent its own total holds the maximum, so
+        // the next ceiling check REFUSES. Keeping the previous total instead
+        // would under-count and admit one more — the ledger failing open.
+        let over = brim.saturating_add(surface.charge());
+        assert_eq!(over.host_bytes(), usize::MAX);
+        // The HOLDING still went up: an add that answered the previous total
+        // would leave this at one, and that is the fail-open shape.
+        assert_eq!(over.held(), 2);
+        assert!(!over.fits(BufferCeiling {
+            host_bytes: 32 * 1024 * 1024
+        }));
+        // Where a caller can answer an error, it gets one instead.
+        assert_eq!(brim.checked_add(surface.charge()), None);
+    }
+
+    #[test]
+    fn a_ceiling_bounds_host_memory_rather_than_a_total() {
+        let surface = Surface::from_shm_pixels(2, 2, vec![0; 16], SHM_XRGB8888).unwrap();
+        let charge = surface.charge();
+        assert!(charge.fits(BufferCeiling { host_bytes: 16 }));
+        assert!(!charge.fits(BufferCeiling { host_bytes: 15 }));
+        assert!(BufferCharge::none().fits(BufferCeiling { host_bytes: 0 }));
+    }
 
     #[test]
     fn a_snapshot_must_carry_exactly_its_own_geometry() {
@@ -284,11 +497,11 @@ mod tests {
         assert_eq!(surface.width(), 2);
         assert_eq!(surface.height(), 1);
         assert_eq!(surface.format(), SHM_ARGB8888);
-        assert_eq!(surface.resident_bytes(), 8);
+        assert_eq!(surface.charge().host_bytes(), 8);
         if let Some(byte) = surface.linear_bytes_mut().and_then(<[u8]>::first_mut) {
             *byte = 1;
         }
         assert_eq!(surface.linear_bytes().and_then(<[u8]>::first), Some(&1));
-        assert_eq!(surface.resident_bytes(), 8);
+        assert_eq!(surface.charge().host_bytes(), 8);
     }
 }
