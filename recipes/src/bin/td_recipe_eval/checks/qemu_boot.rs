@@ -483,6 +483,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: true,
             extra_append: "",
             user_net: false,
+            audio: false,
             physical_input: false,
         },
         runner.scratch_dir(),
@@ -537,6 +538,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: true,
             extra_append: "",
             user_net: false,
+            audio: false,
             physical_input: false,
         },
         runner.scratch_dir(),
@@ -666,6 +668,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: true,
             extra_append: "",
             user_net: false,
+            audio: false,
             physical_input: false,
         },
         runner.scratch_dir(),
@@ -1112,6 +1115,7 @@ fn boot_system_once(
             kill_on_marker: false,
             extra_append: tokens,
             user_net: false,
+            audio: true,
             physical_input: tokens
                 .split_ascii_whitespace()
                 .any(|token| token == FIREFOX_INPUT_CMDLINE_TOKEN),
@@ -1148,6 +1152,7 @@ fn boot_failed_target_once(
             kill_on_marker: false,
             extra_append: tokens,
             user_net: false,
+            audio: true,
             physical_input: false,
         },
         scratch,
@@ -2061,6 +2066,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: false,
             extra_append: &tokens,
             user_net: true,
+            audio: true,
             physical_input: false,
         },
         runner.scratch_dir(),
@@ -2201,6 +2207,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: true,
             extra_append: "",
             user_net: false,
+            audio: false,
             physical_input: false,
         },
         runner.scratch_dir(),
@@ -3278,6 +3285,8 @@ struct BootPlan<'a> {
     /// none`, so the guest's td-netd can DHCP, resolve, and reach a host — the
     /// `qemu-boot-net` mode. `false` (every other mode): no network, hermetic and offline.
     user_net: bool,
+    /// Attach the exact HDA playback device the system audio service owns.
+    audio: bool,
     /// Ask the bounded QMP controller to inject the first boot's staged
     /// Firefox keyboard, tablet, wheel, and outside-click sequence.
     physical_input: bool,
@@ -3390,6 +3399,9 @@ fn boot(
     } else {
         // -nic none: hermetic, offline; qemu's default is a user-mode NIC, so disable it.
         cmd.args(["-nic", "none"]);
+    }
+    if plan.audio {
+        attach_system_audio(&mut cmd);
     }
     // Optional raw disk: if=none defines the backing store and a separate
     // virtio-blk-pci device attaches it as /dev/vda.
@@ -3548,6 +3560,13 @@ fn boot(
         console,
         elapsed: start.elapsed(),
     })
+}
+
+fn attach_system_audio(command: &mut Command) {
+    command
+        .args(["-audiodev", "none,id=audio0"])
+        .args(["-device", "intel-hda"])
+        .args(["-device", "hda-output,audiodev=audio0"]);
 }
 
 fn validate_boot_plan_tokens(extra_append: &str) -> Result<(), String> {
@@ -5440,6 +5459,27 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn system_audio_uses_one_explicit_silent_backend_and_hda_codec() {
+        let mut command = Command::new("qemu-system-x86_64");
+        attach_system_audio(&mut command);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "-audiodev",
+                "none,id=audio0",
+                "-device",
+                "intel-hda",
+                "-device",
+                "hda-output,audiodev=audio0",
+            ]
+        );
+    }
 
     fn portal_test_ppm() -> Vec<u8> {
         let width = QMP_OUTPUT_WIDTH as usize;

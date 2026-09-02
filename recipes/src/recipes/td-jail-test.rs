@@ -145,6 +145,7 @@ pub fn recipe() -> Recipe {
         "/home/td-jail-host/etc",
         "/home/td-jail-host",
         "/home/td-jail-host/runtime",
+        "/home/td-jail-host/runtime/pulse",
     ] {
         steps.push(Step::MkDir { path: path.into() });
     }
@@ -195,7 +196,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "/home/td-jail-host/packages/00000000000000000000000000000000-firefox-154.0/files/bin/firefox".into(),
         content: format!(
-            "#!/bin/sh\nset -eu\nTMPDIR=$XDG_CACHE_HOME/tmp\nexport TMPDIR\n[ \"$LD_LIBRARY_PATH\" = /app/lib:/app/lib/firefox ] || exit 81\nfor path in /bin /lib /lib64 /sbin; do [ -L \"$path\" ] || exit 82; done\n[ -x /bin/sh ] || exit 83\n[ -d \"$TMPDIR\" ] || exit 84\n[ -w \"$TMPDIR\" ] || exit 85\nprintf '%s\\n' '{HOST_FIREFOX_MARKER}' >\"$XDG_RUNTIME_DIR/td-app/dynamic-ready\" || exit 86\n"
+            "#!/bin/sh\nset -eu\nTMPDIR=$XDG_CACHE_HOME/tmp\nexport TMPDIR\n[ \"$LD_LIBRARY_PATH\" = /app/lib:/app/lib/firefox ] || exit 81\nfor path in /bin /lib /lib64 /sbin; do [ -L \"$path\" ] || exit 82; done\n[ -x /bin/sh ] || exit 83\n[ -d \"$TMPDIR\" ] || exit 84\n[ -w \"$TMPDIR\" ] || exit 85\nif /bin/busybox mv /run/flatpak /run/flatpak-replaced 2>/dev/null; then exit 86; fi\nif /bin/busybox mv /run/flatpak/pulse /run/flatpak/pulse-replaced 2>/dev/null; then exit 87; fi\nprintf '%s\\n' '{HOST_FIREFOX_MARKER}' >\"$XDG_RUNTIME_DIR/td-app/dynamic-ready\" || exit 88\n"
         ),
         exec: true,
     });
@@ -226,17 +227,22 @@ pub fn recipe() -> Recipe {
                      printf '%s\\n' td-jail-file-grant-v1 >/var/td-jail-fixture-file || exit 1; \
                      '{busd}' run --socket /home/td-jail-host/runtime/bus >/home/td-jail-host/bus.log 2>&1 & b=$!; \
                      '{busd}' run --socket /home/td-jail-host/runtime/wayland-test >/home/td-jail-host/wayland.log 2>&1 & w=$!; \
-                     n=0; while {{ [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ]; }} && [ \"$n\" -lt 10 ]; do n=$((n+1)); sleep 1; done; \
-                     if [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ]; then kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; echo 'td-jail host authorities did not become ready' >&2; exit 1; fi; \
+                     '{busd}' run --socket /home/td-jail-host/runtime/pulse/native >/home/td-jail-host/pulse.log 2>&1 & a=$!; \
+                     n=0; while {{ [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ] || [ ! -S /home/td-jail-host/runtime/pulse/native ]; }} && [ \"$n\" -lt 10 ]; do n=$((n+1)); sleep 1; done; \
+                     if [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ] || [ ! -S /home/td-jail-host/runtime/pulse/native ]; then kill \"$b\" \"$w\" \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; echo 'td-jail host authorities did not become ready' >&2; exit 1; fi; \
                      o=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest 2>&1); s=$?; \
                      c=0; cp /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/shared-spec /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/spec || c=$?; \
                      p=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest --shared-network 2>&1); t=$?; \
                      f=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf firefox 2>&1); u=$?; \
+                     kill \"$a\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; \
+                     XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf firefox >/home/td-jail-host/stale-pulse.log 2>&1 && v=0 || v=$?; \
                      kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; \
                      [ \"$s\" -eq 0 ] || {{ echo \"td-jail host fixture failed: $o\" >&2; exit 1; }}; \
                      [ \"$c\" -eq 0 ] || {{ echo 'td-jail host shared spec could not replace the isolated spec' >&2; exit 1; }}; \
                      [ \"$t\" -eq 0 ] || {{ echo \"td-jail host shared-network fixture failed: $p\" >&2; exit 1; }}; \
                      [ \"$u\" -eq 0 ] || {{ echo \"td-jail host Firefox-spec smoke failed with status $u: $f\" >&2; exit 1; }}; \
+                     [ \"$v\" -ne 0 ] || {{ echo 'td-jail host Firefox-spec accepted a stale Pulse socket' >&2; exit 1; }}; \
+                     grep -q 'host PulseAudio authority' /home/td-jail-host/stale-pulse.log || {{ echo 'td-jail stale Pulse refusal was not named' >&2; exit 1; }}; \
                      e='{}\n{}'; \
                      [ \"$o\" = \"$e\" ] || {{ echo \"td-jail host isolated degradation report changed: $o\" >&2; exit 1; }}; \
                      [ \"$p\" = \"$e\" ] || {{ echo \"td-jail host shared-network degradation report changed: $p\" >&2; exit 1; }}; \
@@ -291,7 +297,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
         content: format!(
-            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, the application bootstrap executes its parent-death and terminal-containment setup before authority resolution, stage 1 closes inherited descriptors, preserves a policy-declared shared network or brings up and reads back isolated loopback, builds a selective immutable /etc with per-application identity, pinned CA trust, and nonempty file/directory runtime configuration binds, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, derives the exact /etc roster from /usr/etc, verifies its runtime nested mounts and conditional resolver bind, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, naturally reaps filtered descendants as PID 1, and exercises bounded namespace-wide TERM and KILL survivor cleanup; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; explicit host mode launches the ordinary fixture identity with both its isolated spec and a fixture-derived shared-network spec plus a source-built surrogate under the real Firefox spec from a materialized prefix through the real td-busd registration path, binds caller-owned host session sockets, verifies the ordinary writable and read-only grants except for a nested source mount, checks Firefox's exact loader path, immutable runtime aliases and private cache tmp, and emits the exact cgroup and Wayland-filter degradation report for all three; the host smoke leg may skip behavior under an inherited filter. system-x86-64's QEMU oracle supplies the authoritative target-kernel generic transition through {TD_JAIL_TRANSITION_MARKER} and the installed shared-network Firefox launch, Wayland-frame, and cgroup-cap evidence through {TD_FIREFOX_BOOT_MARKER}; recursive read-only handling remains pinned by lower-level mountinfo and flag regressions because the build sandbox cannot construct a nested source mount\n"
+            "PASS: td-jail is a static ELF64 x86-64 executable; the build-host policy permits the complete namespace transition, the application bootstrap executes its parent-death and terminal-containment setup before authority resolution, stage 1 closes inherited descriptors, preserves a policy-declared shared network or brings up and reads back isolated loopback, builds a selective immutable /etc with per-application identity, pinned CA trust, and nonempty file/directory runtime configuration binds, and installs an exact CAP_SYS_ADMIN exec bridge with an empty bounding set; stage 2 enters a read-back immutable tmpfs root with fresh proc/dev/devpts/shm/tmp/var-tmp and no old root, derives the exact /etc roster from /usr/etc, verifies its runtime nested mounts and conditional resolver bind, clears every capability, sets and reads back no-new-privileges, installs and reads back the compiled seccomp filter, naturally reaps filtered descendants as PID 1, and exercises bounded namespace-wide TERM and KILL survivor cleanup; the td-GCC-built non-shipped probe checks real filter errno and kill behavior, and a bare td-jail invocation cannot enter its internal interface; explicit host mode launches the ordinary fixture identity with both its isolated spec and a fixture-derived shared-network spec plus a source-built surrogate under the real Firefox spec from a materialized prefix through the real td-busd registration path, binds caller-owned host session sockets, proves a live Pulse listener is required, refuses its stale socket after daemon death, verifies the Pulse policy's fixed ancestors remain immutable from the running surrogate, verifies the ordinary writable and read-only grants except for a nested source mount, checks Firefox's exact loader path, immutable runtime aliases and private cache tmp, and emits the exact cgroup and Wayland-filter degradation report for all three; the host smoke leg may skip behavior under an inherited filter. system-x86-64's QEMU oracle supplies the authoritative target-kernel generic transition through {TD_JAIL_TRANSITION_MARKER} and the installed shared-network Firefox launch, Wayland-frame, and cgroup-cap evidence through {TD_FIREFOX_BOOT_MARKER}; recursive read-only handling remains pinned by lower-level mountinfo and flag regressions because the build sandbox cannot construct a nested source mount\n"
         ),
         exec: false,
     });
@@ -312,7 +318,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, launches the ordinary fixture with isolated and shared network policy plus a source-built surrogate under the exact Firefox spec through the parent-death and terminal-containment bootstrap from a host prefix with exact degradation diagnostics and fixture-owned CA/resolver inputs, verifies the Firefox loader path, runtime aliases and cache tmp, smoke-tests selective immutable /etc plus namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping plus bounded TERM/KILL survivor cleanup, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
+echo ">> recipe-check td-jail-test: build-plan --auto builds the static target td-jail and a non-shipped td-GCC seccomp probe, launches the ordinary fixture with isolated and shared network policy plus a source-built surrogate under the exact Firefox spec through the parent-death and terminal-containment bootstrap from a host prefix with exact degradation diagnostics and fixture-owned CA/resolver inputs, proves Pulse authority liveness plus post-release policy immutability and stale-socket refusal, verifies the Firefox loader path, runtime aliases and cache tmp, smoke-tests selective immutable /etc plus namespace/mount/capability transition, installs and reads back no-new-privileges plus the compiled filter, attempts real errno/kill behavior only when the host has no inherited seccomp filter, verifies filtered PID-1 orphan reaping plus bounded TERM/KILL survivor cleanup, and refuses bare internal invocation; the system QEMU oracle proves installed launch on the target kernel"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-jail-test 1
 "#,
@@ -359,12 +365,20 @@ mod tests {
                 if path.ends_with("firefox-154.0/files/bin/firefox")
                     && content.starts_with("#!/bin/sh\n")
                     && content.contains("[ \"$LD_LIBRARY_PATH\" = /app/lib:/app/lib/firefox ]")
+                    && content.contains("mv /run/flatpak /run/flatpak-replaced")
+                    && content.contains("mv /run/flatpak/pulse /run/flatpak/pulse-replaced")
                     && content.contains(HOST_FIREFOX_MARKER)
         )));
         assert!(recipe.steps.iter().flatten().any(|step| matches!(
             step,
             crate::types::Step::Symlink { target, link }
                 if target == "busybox" && link.ends_with("/files/bin/sh")
+        )));
+        assert!(recipe.steps.iter().flatten().any(|step| matches!(
+            step,
+            crate::types::Step::Run { argv, .. }
+                if argv.iter().any(|arg| arg.contains("runtime/pulse/native"))
+                    && argv.iter().any(|arg| arg.contains("accepted a stale Pulse socket"))
         )));
     }
 

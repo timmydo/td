@@ -231,20 +231,17 @@ Consequences worth stating separately:
 - **Overlayfs is refused on purpose**, so `/app`+`/usr` composition is
   bind mounts. That is what bubblewrap does anyway; it just forecloses an
   alternative someone would otherwise reach for.
-- **Sound is built as of rung 25, and nothing plays it yet.** Until that
-  rung the kernel had no ALSA and no `/dev/snd` at all, which was a
-  statement about the shipped kernel rather than a non-goal: §K designs
-  the audio path and the pin block below turns the hardware on for it.
-  The pins are now in the kernel recipe, so the nodes exist; what does
-  not exist is a running daemon, `/dev/snd/*` ownership, or a unit —
-  see rung 26 and §K.5. An earlier draft said "audio is a non-goal" ten
-  lines above its own `CONFIG_SND*` pins, which was left over from
-  before §K existed.
+- **Before rungs 25–26 there was no sound of any kind** — not "no
+  PipeWire", no ALSA and no `/dev/snd`. That was a statement about the
+  shipped kernel, not a non-goal. The audio pins below and `td-audio` are
+  now landed; §K specifies the path from those devices to a jailed app.
+  An earlier draft said "audio is a non-goal" ten lines above its own
+  `CONFIG_SND*` pins, which was left over from before §K existed.
 
 The pins, with `MEMFD_CREATE`/`EPOLL`/`FUTEX`-class symbols included
 defensively in the recipe's existing style even though they are
-EXPERT-gated and already on. All of it has landed, the audio block with
-td-audio at rung 25:
+EXPERT-gated and already on. The namespace, resource and audio blocks
+have all landed:
 
 ```
 CONFIG_USER_NS=y  CONFIG_PID_NS=y  CONFIG_NET_NS=y  CONFIG_UTS_NS=y
@@ -287,7 +284,7 @@ application launch with a named diagnostic; it never silently selects a weaker
 sandbox.
 
 **LANDED, in staged halves, and the split is worth reading before relying on
-it.** The pins above (minus audio, which waits for td-audio) are in
+it.** The pins above are in
 `linux-x86-64.rs`, each guarded against the RESOLVED `.config` rather
 than against the pin list; and the greeter carries a kernel-capability
 farm that prints `TD-SANDBOX-KERNEL-OK` once the RUNNING kernel has been
@@ -6221,13 +6218,17 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   create an undeclared compatibility ABI. The bootstrap's interpreter
   rewriting exists for binaries that must run against *td's* glibc; a
   runtime is a sealed world that brings its own.
-- **Audio: `td-audio`'s socket, and nothing else.** This entry said
+- **Audio: `td-audio`'s runtime, and no device.** This entry said
   "Audio: none. Firefox starts and plays video silently" before §K
   existed, and §K supersedes it: `sockets=pulseaudio` binds td-audio's
-  Pulse-protocol socket at the fixed path upstream uses, the kernel gains
-  the `CONFIG_SND*` pins §0 lists, and `/dev/snd` is still **not** exposed
-  — direct ALSA would bypass per-app mediation, which is the reason it
-  was refused when there was no sound at all and remains the reason now.
+  read-only service runtime behind `/run/flatpak/pulse/native`, supplies
+  the exact `PULSE_SERVER` and no-autospawn/no-shm client configuration,
+  and never exposes `/dev/snd`. Mounting the directory rather than one
+  socket inode lets a later connection from the same jail resolve the
+  replacement after a daemon restart. The daemon alone receives playback
+  nodes — direct ALSA would
+  bypass per-app mediation, which is the reason it was refused when there
+  was no sound at all and remains the reason now.
 - **Accessibility: the a11y bus, per §S.** `GTK_A11Y=none` is the v1
   setting and a stated gap rather than a permanent one; §S designs the
   bus and registry that lets it come off, and it is not silently
@@ -6715,8 +6716,9 @@ Each row is one landing or a small family, leaving the tree green.
 | 23 | **a pinned small GTK application as a seed package** | **first foreign-toolkit window** |
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 24a | **dedicated audio service identity — LANDED**: the immutable account table carries locked, non-login `audio` uid/gid 994, and the seat assignment receives both the distinct graphical and audio identities. It creates and reads back `/run/td-audio` as audio-owned mode 0755 while retaining `/run/user/1000` as tester-owned mode 0700. Sound-device ownership and the service-only `td-login` credential class wait for the first ALSA backend, because no daemon starts in this precursor and the current kernel intentionally creates no `/dev/snd` nodes | the privilege and socket-directory boundary exists before an adversarial audio parser does |
-| 25 | **`td-audio` crate + surface #13**: the ALSA PCM back end alone, driven by a fixture that writes a tone — no protocol, no clients. The surface number was written as `#11` when the audio reversal reached this ladder; `#11` was already `td-profiler` then and `td-portal` has since taken `#12` | **sound from the machine** |
-| 26 | `td-audio`'s PulseAudio protocol: frames, tagstruct codec, the captured command table, the session state machine, and the daemon that serves them on `/run/td-audio/native` — `getsockopt(2)`/`SO_PEERCRED` joins surface #13 with it. Rung 24a landed the `audio` account and `/run/td-audio` before this, so what remains between here and a jailed client is the wiring, not the identity: this rung adds the kernel's `CONFIG_SND` nodes but assigns no `/dev/snd/*` ownership, adds no `td-svc` unit and no service-only `td-login` credential class, and so selects no daemon into an image. `sockets=pulseaudio` waits on those | a client plays audio through the daemon |
+| 25 | **`td-audio` crate + surface #13 — LANDED**: the direct ALSA PCM back end is driven by a deterministic tone fixture. The surface number was written as `#11` when the audio reversal reached this ladder; `#11` was already `td-profiler` then and `td-portal` has since taken `#12` | the hardware-facing PCM path and its headless signal oracle exist without a browser or jail |
+| 26 | **`td-audio` PulseAudio protocol and daemon — LANDED**: frames, tagstruct codec, the captured command table, session state machine and daemon serve `/run/td-audio/native`; `getsockopt(2)`/`SO_PEERCRED` joins surface #13. Permanent fixtures replay the captured schemas, mix two socket clients, and prove exact PCM through the session state machine. A one-time libpulse 16.1 run established compatibility; rung 26a selects the daemon into the image and the final Firefox-to-WAV proof remains rung 28 | captured Pulse traffic plays through the bounded daemon and mixer without making the one-time host libpulse run a permanent gate |
+| 26a | **system and jail audio integration — LANDED**: `td-login` has an exact service-only credential path for the locked audio account; `td-seatd` assigns only ALSA playback PCMs to it; and td-svc starts the daemon after seat setup, probes its live socket as that identity, and orders Firefox behind that result. Every daemon start repeats the bounded playback-node assignment before dropping privilege, so a device that appeared after the seat oneshot is covered. Firefox's compiled `sockets=pulseaudio` policy derives the exact server/config environment. td-jail validates the owned server runtime and endpoint, then bind-mounts the stable directory read-only behind the private `/run/flatpak/pulse/native` alias. Replacement of a stale socket after a supervised daemon restart is therefore visible to existing clients instead of leaving their jail pinned to the dead inode; a missing mandatory runtime or endpoint still refuses launch rather than silently dropping the grant. Normal-system and interactive QEMU plans attach one explicit HDA codec to a host-silent backend; the full WAV capture remains rung 28 evidence rather than a claim of this wiring increment | the system image can start Firefox against its mediated audio server without exposing ALSA devices to the browser |
 | 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The initial proof selected a fresh volatile automation profile and fixed local document, then accepted only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributed both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. Rung 27a retains that authority and replaces the local-file transport with verified HTTPS. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints deterministic content without manual inspection |
 | 27a | **Firefox HTTPS/NSS image proof — LANDED**; the source-built LibreSSL command supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The all-interface LibreSSL test listener is supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
 | 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
@@ -6929,12 +6931,21 @@ than a vote against PipeWire.
 ### K.2 What the sandbox expects to find
 
 Verified against upstream `common/flatpak-run-pulseaudio.c`: flatpak
-discovers the host socket, bind-mounts it read-only at the fixed path
+discovers the host socket and presents it read-only at the fixed path
 **`/run/flatpak/pulse/native`** — *not* at `$XDG_RUNTIME_DIR/pulse/native`
 — and sets `PULSE_SERVER=unix:/run/flatpak/pulse/native` plus
 `PULSE_CLIENTCONFIG=/run/flatpak/pulse/config`, whose generated content
-includes **`enable-shm=no`**. td spells all of it byte-for-byte the same,
-adds `autospawn=no`, and mounts its own socket there.
+includes **`enable-shm=no`**. td keeps those exact client-visible paths
+and bytes, adds `autospawn=no`, and makes `native` a fixed alias into a
+read-only bind of the service runtime. The directory bind is deliberate:
+unlike a bind of today's socket inode, it exposes the replacement pathname
+after td-svc restarts the daemon. The highest private ancestor is a read-only
+mountpoint, making the generated configuration and both private directories
+immutable: the application cannot rename an ancestor, recreate the fixed
+path and replace the policy.
+Before creating the jail, td-jail also completes a bounded connection to the
+resolved socket. A dead daemon's leftover socket inode is therefore not
+authority and cannot admit a permanently silent application.
 
 `enable-shm=no` is a gift: upstream already forces sandboxed clients onto
 plain socket data, so a server that declines both the SHM and memfd
@@ -7160,9 +7171,10 @@ pattern td has now built four times is not a cost worth that.
 already; `td-portal` has since taken `#12`):
 `ioctl(2)` with the pinned PCM roster, `poll(2)`, and `getsockopt(2)`
 restricted to `SOL_SOCKET`/`SO_PEERCRED` with a pinned 12-byte
-`[i32; 3]`. A multicall in the house style — `td-audio serve`, `status`,
-`volume` — where the CLI personalities are ordinary Pulse *clients* of
-the daemon's own socket, so policy tooling costs no second protocol.
+`[i32; 3]`. The landed multicall provides the server, deterministic ALSA
+and WAV tone paths, WAV verification, device enumeration and a live-socket
+probe. `status` and `volume` remain future ordinary Pulse clients of the
+daemon's own socket, so policy tooling will cost no second protocol.
 
 **It runs as a dedicated `audio` uid, not as uid 1000 — CONFIRMED by the
 maintainer**, which §O listed as the one privilege question the two
@@ -7185,26 +7197,31 @@ exists — and not the user's files, sockets or session.
 reviews found all three. They are the cost side of the decision, not
 arguments against it.**
 
-*The dedicated account and runtime-directory prerequisite is landed.*
+*The dedicated account, devices and service are landed.*
 `system-x86-64.rs` now declares locked `audio` uid/gid 994 beside the
 existing system identities, and the seat unit passes that exact identity
 to `td-seatd`. The assigner creates `/run/td-audio` as mode 0755 owned by
 `audio`, reads the result back, and keeps the uid/gid distinct from the
-graphical account. The account has a non-login `/bin/false` shell. Its
-home is the same volatile `/run/td-audio` directory; image generation does
-not create, chown, or probe a persistent `/var`-backed audio home.
-`/dev/snd/*` ownership and the daemon unit remained with the
-hardware/backend landing, because claiming a device before the kernel
-built one would have made a missing device indistinguishable from a
-supported machine. Rungs 25 and 26 built the device and stopped there. The
-kernel pin now carries `CONFIG_SND`, so the nodes exist and that ambiguity
-is gone; the ownership assignment, the unit, and the credential class
-below are still owed, and until they land the daemon runs only from a
-shell and `td-audio serve` is in no image. A locked account is also
-correctly refused by today's `td-login exec-as`; the daemon landing must
-add the service-only credential class specified by
-`td-login/THREAT-MODEL.md`, then use that typed path rather than `su` or a
-passwordless account. `td-svc` still has no `User=` directive.
+graphical account. The account has a non-login `/bin/false` shell.
+Its home is the same volatile `/run/td-audio` directory; image generation
+does not create, chown, or probe a persistent `/var`-backed audio home.
+It recognizes only `/dev/snd/pcmC<card>D<device>p`, caps the scan at 64
+entries, and assigns those playback nodes mode 0600 to `audio`; capture,
+control and unknown nodes retain their existing ownership. The locked
+account remains refused by `td-login exec-as`. A separate exact
+`exec-service-as` path admits only the service-only shadow marker and is
+the daemon unit's credential transition, rather than `su`, a passwordless
+account, or a general `User=` directive in td-svc. The unit requires seat
+setup. On every start, `td-seatd exec-audio` repeats the bounded playback
+scan and assignment before literally executing the service credential
+transition and `td-audio serve`; this covers sound nodes that enumerate
+after the seat oneshot without giving the daemon root. Its readiness probe
+connects to that running instance's socket under the same service identity.
+With no non-loopback playback PCM, device selection fails and the service
+remains in supervised restart rather than exposing a silent fake sink;
+because Firefox's audio grant is mandatory, its launch then fails closed
+until usable hardware appears. Supporting a physical machine still requires
+the explicit device and firmware matrix below.
 
 *The socket's permissions have to be stated, because the obvious two
 choices are each wrong.* If `/run/td-audio` is private to `audio` (0700),
@@ -7264,7 +7281,7 @@ itself: map `SO_PEERCRED` to the registered jail lineage and app id, ask
 record a session or persistent decision, show a compositor-owned
 recording indicator, and support revocation by corking the stream.
 
-Kernel and QEMU: `intel-hda` with `hda-duplex` as the first target
+Kernel and QEMU: `intel-hda` with playback-only `hda-output` as the first target
 (mature, and it resembles real x86 hardware, where `virtio-sound` tests
 only a virtual transport), with the `CONFIG_SND*` pins in §0. Real
 machines need an explicit device matrix — USB audio, and SOF/SoundWire
@@ -7296,7 +7313,7 @@ sound server. Budget the middle.
 | component | uid | why |
 |---|---|---|
 | `td-svc` | root | the supervisor |
-| `td-seatd` | root, oneshot | assigns `/dev/fb0` and `/dev/input/*`; makes `/run/user/1000` and the audio-owned `/run/td-audio`; the ALSA landing extends its device duty to `/dev/snd/*` |
+| `td-seatd` | root, oneshot | assigns `/dev/fb0` and `/dev/input/*`; makes `/run/user/1000` and the audio-owned `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
 | `td-compositor` | 1000 | owns the session |
 | `td-busd` | 1000 | **required**, see below |
 | `td-portal` | 1000 | reads the user's files in order to show them |
@@ -8434,12 +8451,12 @@ as fixture data; td-jail never borrows the host's ambient `/etc`.
 ### X.2 What is missing on a host, and what answers it
 
 None of td's session components exist on a foreign host, and the answer
-in every case is flatpak's: **bind the host's socket into the jail.**
+in every case is flatpak's: **bind the host's authority into the jail.**
 
 | td component | on a host |
 |---|---|
 | `td-compositor` | absent. Bind the host's `$WAYLAND_DISPLAY` socket. §F's protocol gap is irrelevant here — but see the grant below |
-| `td-audio` | absent. Bind the host's **PulseAudio-protocol** socket — `pipewire-pulse`'s where the host runs PipeWire, which is what §K.2's layout and `PULSE_SERVER` already target. Not `pipewire-0`: §K.1 keeps those apart and they are different protocols |
+| `td-audio` | absent. Bind the host's read-only **PulseAudio-protocol runtime** — `pipewire-pulse`'s where the host runs PipeWire — behind §K.2's fixed `native` alias. Not `pipewire-0`: §K.1 keeps those apart and they are different protocols |
 | `td-portal` | not integrated. The landed Settings binary needs only td-busd and an immutable settings file, but the host harness does not supervise it. Future dialog portals need td's private compositor socket; alternatively td-busd would have to **forward** to the host session bus where `xdg-desktop-portal` answers |
 | `td-seatd` | absent and unneeded; the host owns its own devices |
 | `td-authd` | absent, and nothing replaces it. There is no elevated operation here, so host mode has no privileged path at all — and it must not grow one by reaching for the host's `sudo`, which would be a password prompt from td's own code (principle 7) and a shell (directive 3) |

@@ -37,6 +37,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -61,6 +62,7 @@ usage: td-audio devices [--proc PATH]
        td-audio verify-tone [--wav PATH] [--hz HZ] [--voices N] [--ms MS]
        td-audio serve [--socket PATH] [--card N] [--device N] [--proc PATH]
                       [--passes N]
+       td-audio probe [--socket PATH]
 
   devices      list the playback PCMs /proc/asound/pcm reports
   tone         play a deterministic tone through the ALSA back end, or render
@@ -69,6 +71,7 @@ usage: td-audio devices [--proc PATH]
                rate, duration, non-silence, and correlation with the waveform
   serve        run the PulseAudio-protocol daemon: bind the socket, mix every
                client, and play the sum through the ALSA back end
+  probe        connect to the supervised daemon's socket
 ";
 
 fn run(arguments: &[OsString]) -> io::Result<()> {
@@ -80,6 +83,7 @@ fn run(arguments: &[OsString]) -> io::Result<()> {
         Some("tone") => tone(rest),
         Some("verify-tone") => verify_tone(rest),
         Some("serve") => serve_daemon(rest),
+        Some("probe") => probe(rest),
         Some("--help" | "-h" | "help") => {
             print!("{USAGE}");
             Ok(())
@@ -91,13 +95,32 @@ fn run(arguments: &[OsString]) -> io::Result<()> {
     }
 }
 
+fn probe(arguments: &[OsString]) -> io::Result<()> {
+    let socket = parse_probe(arguments)?;
+    drop(UnixStream::connect(&socket).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("connect {}: {error}", socket.display()),
+        )
+    })?);
+    Ok(())
+}
+
+fn parse_probe(arguments: &[OsString]) -> io::Result<PathBuf> {
+    Ok(match arguments {
+        [] => PathBuf::from(serve::SOCKET_PATH),
+        [flag, path] if flag == "--socket" && !path.is_empty() => PathBuf::from(path),
+        _ => return Err(bad("probe accepts only [--socket PATH]".into())),
+    })
+}
+
 /// Run the daemon.
 ///
 /// §K.5 puts the socket at `/run/td-audio/native` in a directory `td-seatd`
 /// creates, and authorizes on `SO_PEERCRED` rather than on mode bits. The
-/// account that owns it is a rung of its own and is not built yet, so the uid
-/// this admits is whichever it happens to run as, plus the seat user — which is
-/// the policy §K.5 states, resolved at run time rather than compiled in.
+/// image runs it as the dedicated `audio` account; the daemon resolves that
+/// identity at run time and admits its own uid plus the seat user rather than
+/// compiling an account number into this protocol boundary.
 fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
     let options = parse(arguments)?;
     let found = device::read(&options.proc_pcm)?;
@@ -626,6 +649,28 @@ fn play(options: &Options) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn probe_accepts_only_its_fixed_socket_option() {
+        assert_eq!(
+            parse_probe(&[]).unwrap(),
+            PathBuf::from(serve::SOCKET_PATH)
+        );
+        assert_eq!(
+            parse_probe(&[OsString::from("--socket"), OsString::from("/tmp/audio")])
+                .unwrap(),
+            PathBuf::from("/tmp/audio")
+        );
+        for bad in [
+            vec![OsString::from("--socket")],
+            vec![OsString::from("--socket"), OsString::new()],
+            vec![OsString::from("--hz"), OsString::from("440")],
+        ] {
+            assert!(parse_probe(&bad).is_err());
+        }
+    }
 
     /// Every source file of this crate, by name. Read at COMPILE time, so the
     /// assertions below do not depend on the working directory a test runs in.

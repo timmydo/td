@@ -175,10 +175,32 @@ pub(crate) fn authorize(name: &str, forced: bool) -> Result<Account, String> {
     let secret = db::secret(name)?;
     db::may_start_session(secret, forced).map_err(|denial| match denial {
         Denied::Locked => format!("account {name:?} is locked"),
+        Denied::ServiceOnly => format!("account {name:?} is service-only"),
         Denied::NeedsPassword => format!(
             "account {name:?} has a password and this build verifies no hash scheme \
              (see td-login/THREAT-MODEL.md section 3)"
         ),
+        Denied::NotService => format!("account {name:?} is not a service account"),
+    })?;
+    Ok(account)
+}
+
+/// Resolve the service-specific account class for `exec-service-as`.
+///
+/// Kept beside `authorize` so every front end still reaches one account and
+/// secret lookup boundary. The separate policy call is load-bearing: ordinary
+/// forced sessions continue to reject this account class.
+pub(crate) fn authorize_service(name: &str) -> Result<Account, String> {
+    if !plausible_name(name) {
+        return Err(format!("{name:?} is not a plausible user name"));
+    }
+    let account = db::account(name)?;
+    let secret = db::secret(name)?;
+    db::may_start_service(secret).map_err(|denial| match denial {
+        Denied::NotService => format!("account {name:?} is not a service account"),
+        Denied::Locked => format!("account {name:?} is locked"),
+        Denied::ServiceOnly => format!("account {name:?} is service-only"),
+        Denied::NeedsPassword => format!("account {name:?} needs a password"),
     })?;
     Ok(account)
 }
@@ -304,6 +326,11 @@ mod tests {
             assert!(
                 err.contains("not a plausible user name"),
                 "{bad:?} must be refused before the lookup, got: {err}"
+            );
+            let err = authorize_service(bad).unwrap_err();
+            assert!(
+                err.contains("not a plausible user name"),
+                "service path must refuse {bad:?} before the lookup, got: {err}"
             );
         }
     }

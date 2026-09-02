@@ -30,6 +30,7 @@ pub fn recipe() -> Recipe {
     let Ok(permissions) = PermissionPolicy::new()
         .with_network()
         .and_then(|value| value.with_socket(PermissionSocket::Wayland))
+        .and_then(|value| value.with_socket(PermissionSocket::PulseAudio))
         .and_then(|value| value.with_filesystem("xdg-download", FilesystemAccess::ReadWrite, true))
         .and_then(|value| value.with_session_bus("org.mozilla.firefox", BusAccess::Own))
     else {
@@ -115,14 +116,14 @@ mod tests {
     }
 
     #[test]
-    fn first_policy_is_wayland_network_download_and_one_bus_name() {
+    fn first_policy_is_wayland_pulse_network_download_and_one_bus_name() {
         let policy = recipe()
             .application_permissions
             .expect("permission policy")
             .to_keyfile();
         assert_eq!(
             policy,
-            "format=1\n\n[Context]\nshared=network\nsockets=wayland\n\n[Filesystem]\nxdg-download=rw:create\n\n[Session Bus Policy]\norg.mozilla.firefox=own\n"
+            "format=1\n\n[Context]\nshared=network\nsockets=wayland;pulseaudio\n\n[Filesystem]\nxdg-download=rw:create\n\n[Session Bus Policy]\norg.mozilla.firefox=own\n"
         );
     }
 }

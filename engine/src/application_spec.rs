@@ -67,15 +67,17 @@ pub fn dynamic_application_policy(
 /// This is the same rule as the `LD_*` refusal below for a different reason,
 /// and `TD_*` is refused a layer down by the name grammar.
 ///
-/// "Pins" is not all one thing: `authority.rs` holds four of these to an exact
-/// VALUE and requires `FLATPAK_ID` to be present and non-empty, its value being
-/// per-application. Both are refusals a manifest cannot talk its way past, which
-/// is what puts them on one list; adding a name to either check there means
-/// adding it here.
+/// "Pins" is not all one thing: `authority.rs` holds the session values to an
+/// exact VALUE, conditionally holds the Pulse pair to its socket permission,
+/// and requires `FLATPAK_ID` to be present and non-empty, its value being
+/// per-application. All are refusals a manifest cannot talk its way past;
+/// adding a name to either check there means adding it here.
 const PINNED_ENVIRONMENT: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "FLATPAK_ID",
     "HOME",
+    "PULSE_CLIENTCONFIG",
+    "PULSE_SERVER",
     "WAYLAND_DISPLAY",
     "XDG_RUNTIME_DIR",
 ];
@@ -134,6 +136,19 @@ impl ApplicationSpec {
             "FLATPAK_ID".into(),
             manifest.alias().unwrap_or(manifest.name()).to_string(),
         );
+        if permissions
+            .sockets()
+            .any(|socket| socket == crate::permissions::PermissionSocket::PulseAudio)
+        {
+            environment.insert(
+                "PULSE_CLIENTCONFIG".into(),
+                crate::permissions::APPLICATION_PULSE_CONFIG_PATH.into(),
+            );
+            environment.insert(
+                "PULSE_SERVER".into(),
+                crate::permissions::APPLICATION_PULSE_SERVER.into(),
+            );
+        }
         for (name, value) in manifest.environment() {
             if name.starts_with("LD_") {
                 return Err(format!(
@@ -379,6 +394,24 @@ impl ApplicationSpec {
                 ));
             }
         }
+        let pulse_requested = self
+            .permissions
+            .sockets()
+            .any(|socket| socket == crate::permissions::PermissionSocket::PulseAudio);
+        let expected_server = pulse_requested.then_some(crate::permissions::APPLICATION_PULSE_SERVER);
+        let expected_config =
+            pulse_requested.then_some(crate::permissions::APPLICATION_PULSE_CONFIG_PATH);
+        if self.environment.get("PULSE_SERVER").map(String::as_str) != expected_server
+            || self
+                .environment
+                .get("PULSE_CLIENTCONFIG")
+                .map(String::as_str)
+                != expected_config
+        {
+            return Err(
+                "application Pulse environment does not match its pulseaudio socket grant".into(),
+            );
+        }
         let loader_policy = runtime_recipe_name(&self.runtime)
             .and_then(|runtime| dynamic_application_policy(&self.name, runtime));
         match (
@@ -614,6 +647,8 @@ mod tests {
             "DBUS_SESSION_BUS_ADDRESS",
             "FLATPAK_ID",
             "HOME",
+            "PULSE_CLIENTCONFIG",
+            "PULSE_SERVER",
             "WAYLAND_DISPLAY",
             "XDG_RUNTIME_DIR",
         ] {
@@ -694,6 +729,58 @@ mod tests {
         let error =
             ApplicationSpec::compile(&overridden, runtime, PermissionPolicy::new()).unwrap_err();
         assert!(error.contains("Freedesktop 25.08 runtime policy"), "{error}");
+    }
+
+    #[test]
+    fn pulse_environment_is_derived_from_the_socket_grant() {
+        let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1";
+        let permissions = PermissionPolicy::new()
+            .with_socket(PermissionSocket::Wayland)
+            .unwrap()
+            .with_socket(PermissionSocket::PulseAudio)
+            .unwrap();
+        let spec = ApplicationSpec::compile(&manifest(), runtime, permissions).unwrap();
+        assert_eq!(
+            spec.environment().find(|(name, _)| *name == "PULSE_SERVER"),
+            Some(("PULSE_SERVER", crate::permissions::APPLICATION_PULSE_SERVER))
+        );
+        assert_eq!(
+            spec.environment()
+                .find(|(name, _)| *name == "PULSE_CLIENTCONFIG"),
+            Some((
+                "PULSE_CLIENTCONFIG",
+                crate::permissions::APPLICATION_PULSE_CONFIG_PATH
+            ))
+        );
+        let without = spec
+            .to_keyfile()
+            .replace(
+                &format!(
+                    "PULSE_SERVER={}\n",
+                    crate::permissions::APPLICATION_PULSE_SERVER
+                ),
+                "",
+            );
+        assert!(ApplicationSpec::parse(&without).is_err());
+        let without_config = spec.to_keyfile().replace(
+            &format!(
+                "PULSE_CLIENTCONFIG={}\n",
+                crate::permissions::APPLICATION_PULSE_CONFIG_PATH
+            ),
+            "",
+        );
+        assert!(ApplicationSpec::parse(&without_config).is_err());
+        let no_grant = ApplicationSpec::compile(&manifest(), runtime, PermissionPolicy::new())
+            .unwrap()
+            .to_keyfile();
+        let injected = no_grant.replace(
+            "WAYLAND_DISPLAY=wayland-0\n",
+            &format!(
+                "PULSE_SERVER={}\nWAYLAND_DISPLAY=wayland-0\n",
+                crate::permissions::APPLICATION_PULSE_SERVER
+            ),
+        );
+        assert!(ApplicationSpec::parse(&injected).is_err());
     }
 
     #[test]

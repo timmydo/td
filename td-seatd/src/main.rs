@@ -3,11 +3,14 @@
 use std::env;
 use std::fs::{self, FileType, Metadata, Permissions};
 use std::os::unix::fs::{self as unix_fs, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
 
 const FRAMEBUFFER: &str = "/dev/fb0";
 const INPUT_DIR: &str = "/dev/input";
+const SOUND_DIR: &str = "/dev/snd";
+const MAX_PLAYBACK_DEVICES: usize = 64;
 const RUNTIME_BASE: &str = "/run/user";
 const AUDIO_RUNTIME: &str = "/run/td-audio";
 const READY_MARKER: &str = "TD-SEAT-READY";
@@ -15,6 +18,8 @@ const READY_MARKER: &str = "TD-SEAT-READY";
 fn usage() -> String {
     "usage: td-seatd assign --uid UID --gid GID --audio-uid UID --audio-gid GID | \
      td-seatd probe --uid UID --gid GID --audio-uid UID --audio-gid GID | \
+     td-seatd exec-audio --uid UID --gid GID --audio-uid UID --audio-gid GID \
+     -- PROGRAM [ARG...] | \
      td-seatd selftest"
         .into()
 }
@@ -29,6 +34,12 @@ struct Account {
 struct Assignment {
     seat: Account,
     audio: Account,
+}
+
+struct AudioExec<'a> {
+    assignment: Assignment,
+    program: &'a str,
+    arguments: &'a [String],
 }
 
 fn parse_assignment(args: &[String]) -> Result<Assignment, String> {
@@ -99,6 +110,28 @@ fn parse_assignment(args: &[String]) -> Result<Assignment, String> {
     })
 }
 
+fn parse_audio_exec(args: &[String]) -> Result<AudioExec<'_>, String> {
+    let separator = args
+        .iter()
+        .position(|argument| argument == "--")
+        .ok_or_else(|| "exec-audio requires `--` before the program".to_string())?;
+    let assignment = parse_assignment(args.get(..separator).ok_or_else(usage)?)?;
+    let command = args
+        .get(separator + 1..)
+        .ok_or_else(|| "exec-audio requires a program after `--`".to_string())?;
+    let (program, arguments) = command
+        .split_first()
+        .ok_or_else(|| "exec-audio requires a program after `--`".to_string())?;
+    if !program.starts_with('/') || program.ends_with('/') {
+        return Err("exec-audio requires an absolute program path with a basename".into());
+    }
+    Ok(AudioExec {
+        assignment,
+        program,
+        arguments,
+    })
+}
+
 fn event_name(name: &str) -> bool {
     name.strip_prefix("event")
         .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
@@ -125,6 +158,57 @@ fn input_paths(input_dir: &Path) -> Result<Vec<PathBuf>, String> {
             input_dir.display()
         ));
     }
+    Ok(paths)
+}
+
+fn decimal_component(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The playback PCM nodes `td-audio` is allowed to open.
+///
+/// Control, sequencer, timer and capture nodes stay root-owned. The daemon
+/// implements volume in its mixer and v1 exposes no capture protocol, so
+/// granting those devices would be authority with no supported use.
+fn playback_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("pcmC") else {
+        return false;
+    };
+    let Some((card, rest)) = rest.split_once('D') else {
+        return false;
+    };
+    let Some(device) = rest.strip_suffix('p') else {
+        return false;
+    };
+    decimal_component(card) && decimal_component(device)
+}
+
+fn playback_paths(sound_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = match fs::read_dir(sound_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "read sound directory {}: {error}",
+                sound_dir.display()
+            ));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read sound directory entry: {error}"))?;
+        let name = entry.file_name();
+        if name.to_str().is_some_and(playback_name) {
+            if paths.len() >= MAX_PLAYBACK_DEVICES {
+                return Err(format!(
+                    "{} has more than {MAX_PLAYBACK_DEVICES} playback devices",
+                    sound_dir.display()
+                ));
+            }
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
     Ok(paths)
 }
 
@@ -243,14 +327,21 @@ fn prepare_audio_runtime(
     prepare_owned_runtime(path, account, 0o755)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Counts {
+    inputs: usize,
+    playback: usize,
+}
+
 fn assign(
     framebuffer: &Path,
     input_dir: &Path,
+    sound_dir: &Path,
     runtime: &Path,
     audio_runtime: &Path,
     assignment: Assignment,
     require_char: bool,
-) -> Result<usize, String> {
+) -> Result<Counts, String> {
     prepare_runtime(runtime, assignment.seat, require_char)?;
     prepare_audio_runtime(audio_runtime, assignment.audio, require_char)?;
     assign_path(framebuffer, assignment.seat, require_char)?;
@@ -258,17 +349,41 @@ fn assign(
     for path in &inputs {
         assign_path(path, assignment.seat, require_char)?;
     }
-    Ok(inputs.len())
+    let playback = assign_playback(sound_dir, assignment.audio, require_char)?;
+    Ok(Counts {
+        inputs: inputs.len(),
+        playback: playback.len(),
+    })
+}
+
+fn assign_playback(
+    sound_dir: &Path,
+    account: Account,
+    require_char: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let playback = playback_paths(sound_dir)?;
+    for path in &playback {
+        assign_path(path, account, require_char)?;
+    }
+    Ok(playback)
+}
+
+fn exec_audio(args: &[String]) -> Result<(), String> {
+    let options = parse_audio_exec(args)?;
+    let _assigned = assign_playback(Path::new(SOUND_DIR), options.assignment.audio, true)?;
+    let error = Command::new(options.program).args(options.arguments).exec();
+    Err(format!("exec {}: {error}", options.program))
 }
 
 fn probe(
     framebuffer: &Path,
     input_dir: &Path,
+    sound_dir: &Path,
     runtime: &Path,
     audio_runtime: &Path,
     assignment: Assignment,
     require_char: bool,
-) -> Result<usize, String> {
+) -> Result<Counts, String> {
     verify_owner_mode(runtime, assignment.seat, 0o700)?;
     verify_owner_mode(audio_runtime, assignment.audio, 0o755)?;
     checked_metadata(framebuffer, require_char)?;
@@ -278,7 +393,15 @@ fn probe(
         checked_metadata(path, require_char)?;
         verify_owner_mode(path, assignment.seat, 0o600)?;
     }
-    Ok(inputs.len())
+    let playback = playback_paths(sound_dir)?;
+    for path in &playback {
+        checked_metadata(path, require_char)?;
+        verify_owner_mode(path, assignment.audio, 0o600)?;
+    }
+    Ok(Counts {
+        inputs: inputs.len(),
+        playback: playback.len(),
+    })
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -338,12 +461,16 @@ fn run(args: &[String]) -> Result<(), String> {
         println!("TD-SEAT-SELFTEST-OK");
         return Ok(());
     }
+    if command == "exec-audio" {
+        return exec_audio(args.get(1..).ok_or_else(usage)?);
+    }
     let assignment = parse_assignment(args.get(1..).ok_or_else(usage)?)?;
     let runtime = PathBuf::from(RUNTIME_BASE).join(assignment.seat.uid.to_string());
-    let inputs = match command.as_str() {
+    let counts = match command.as_str() {
         "assign" => assign(
             Path::new(FRAMEBUFFER),
             Path::new(INPUT_DIR),
+            Path::new(SOUND_DIR),
             &runtime,
             Path::new(AUDIO_RUNTIME),
             assignment,
@@ -352,6 +479,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "probe" => probe(
             Path::new(FRAMEBUFFER),
             Path::new(INPUT_DIR),
+            Path::new(SOUND_DIR),
             &runtime,
             Path::new(AUDIO_RUNTIME),
             assignment,
@@ -360,14 +488,16 @@ fn run(args: &[String]) -> Result<(), String> {
         _ => return Err(usage()),
     };
     println!(
-        "{READY_MARKER} uid={} gid={} framebuffer={} inputs={inputs} runtime={} \
-         audio-uid={} audio-gid={} audio-runtime={AUDIO_RUNTIME}",
+        "{READY_MARKER} uid={} gid={} framebuffer={} inputs={} runtime={} \
+         audio-uid={} audio-gid={} audio-runtime={AUDIO_RUNTIME} audio-pcms={}",
         assignment.seat.uid,
         assignment.seat.gid,
         FRAMEBUFFER,
+        counts.inputs,
         runtime.display(),
         assignment.audio.uid,
         assignment.audio.gid,
+        counts.playback,
     );
     Ok(())
 }
@@ -417,6 +547,41 @@ mod tests {
         for bad in ["event", "event-1", "mouse0", "event0.bak"] {
             assert!(!event_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn playback_names_exclude_capture_and_control_devices() {
+        for good in ["pcmC0D0p", "pcmC12D34p"] {
+            assert!(playback_name(good), "{good}");
+        }
+        for bad in [
+            "pcmC0D0c",
+            "pcmC0D0",
+            "pcmCD0p",
+            "pcmC0Dp",
+            "pcmC0D0p.bak",
+            "controlC0",
+            "seq",
+            "timer",
+        ] {
+            assert!(!playback_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn playback_scan_accepts_no_sound_hardware_and_caps_named_devices() {
+        let scratch = Scratch::new();
+        let absent = scratch.path.join("absent");
+        assert!(playback_paths(&absent).unwrap().is_empty());
+
+        let sound = scratch.path.join("snd");
+        fs::create_dir(&sound).unwrap();
+        for device in 0..MAX_PLAYBACK_DEVICES {
+            fs::write(sound.join(format!("pcmC0D{device}p")), b"").unwrap();
+        }
+        assert_eq!(playback_paths(&sound).unwrap().len(), MAX_PLAYBACK_DEVICES);
+        fs::write(sound.join(format!("pcmC0D{MAX_PLAYBACK_DEVICES}p")), b"").unwrap();
+        assert!(playback_paths(&sound).is_err());
     }
 
     #[test]
@@ -478,20 +643,67 @@ mod tests {
     }
 
     #[test]
+    fn audio_exec_parser_preserves_the_literal_service_command() {
+        let args = [
+            "--uid",
+            "1000",
+            "--gid",
+            "1000",
+            "--audio-uid",
+            "994",
+            "--audio-gid",
+            "994",
+            "--",
+            "/bin/td-login",
+            "exec-service-as",
+            "audio",
+            "--",
+            "/bin/td-audio",
+            "serve",
+        ]
+        .map(String::from);
+        let parsed = parse_audio_exec(&args).unwrap();
+        assert_eq!(parsed.assignment.seat.uid, 1000);
+        assert_eq!(parsed.assignment.seat.gid, 1000);
+        assert_eq!(parsed.assignment.audio.uid, 994);
+        assert_eq!(parsed.assignment.audio.gid, 994);
+        assert_eq!(parsed.program, "/bin/td-login");
+        assert_eq!(
+            parsed.arguments,
+            ["exec-service-as", "audio", "--", "/bin/td-audio", "serve"]
+        );
+
+        let missing_separator = args[..8].to_vec();
+        assert!(parse_audio_exec(&missing_separator).is_err());
+        let missing_program = args[..9].to_vec();
+        assert!(parse_audio_exec(&missing_program).is_err());
+        for program in ["td-login", "/"] {
+            let mut invalid = args[..9].to_vec();
+            invalid.push(program.into());
+            assert!(parse_audio_exec(&invalid).is_err(), "{program}");
+        }
+    }
+
+    #[test]
     fn assignment_is_bounded_to_framebuffer_events_and_runtime() {
         let scratch = Scratch::new();
         let dev = scratch.path.join("dev");
         let input = dev.join("input");
         let run = scratch.path.join("run");
+        let sound = dev.join("snd");
         let runtime = run.join("user/1000");
         let audio_runtime = run.join("td-audio");
         fs::create_dir_all(&input).unwrap();
+        fs::create_dir(&sound).unwrap();
         fs::create_dir(&run).unwrap();
         fs::set_permissions(&run, Permissions::from_mode(0o755)).unwrap();
         fs::write(dev.join("fb0"), b"").unwrap();
         fs::write(input.join("event0"), b"").unwrap();
         fs::write(input.join("event12"), b"").unwrap();
         fs::write(input.join("mouse0"), b"untouched").unwrap();
+        fs::write(sound.join("pcmC0D0p"), b"").unwrap();
+        fs::write(sound.join("pcmC0D0c"), b"capture").unwrap();
+        fs::write(sound.join("controlC0"), b"control").unwrap();
         let metadata = fs::metadata(&scratch.path).unwrap();
         let assignment = Assignment {
             seat: Account {
@@ -506,28 +718,41 @@ mod tests {
         let count = assign(
             &dev.join("fb0"),
             &input,
+            &sound,
             &runtime,
             &audio_runtime,
             assignment,
             false,
         )
         .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(
+            count,
+            Counts {
+                inputs: 2,
+                playback: 1,
+            }
+        );
         assert_eq!(
             fs::read(input.join("mouse0")).unwrap(),
             b"untouched".to_vec()
         );
+        assert_eq!(fs::read(sound.join("pcmC0D0c")).unwrap(), b"capture");
+        assert_eq!(fs::read(sound.join("controlC0")).unwrap(), b"control");
         assert_eq!(
             probe(
                 &dev.join("fb0"),
                 &input,
+                &sound,
                 &runtime,
                 &audio_runtime,
                 assignment,
                 false,
             )
             .unwrap(),
-            2
+            Counts {
+                inputs: 2,
+                playback: 1,
+            }
         );
         assert_eq!(
             fs::symlink_metadata(&audio_runtime)

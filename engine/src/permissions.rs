@@ -60,6 +60,18 @@ pub const DEFAULT_MEMORY_MAX_BYTES: u64 = 1280 * 1024 * 1024;
 pub const DEFAULT_PIDS_MAX: u32 = 1024;
 pub const DEFAULT_CPU_QUOTA_USEC: u64 = 100_000;
 pub const DEFAULT_CPU_PERIOD_USEC: u64 = 100_000;
+/// Fixed target-side audio service and the path presented to applications.
+/// td-jail includes this module directly, while the image recipe links the
+/// engine crate, so the two sides cannot drift onto different sockets.
+pub const TD_AUDIO_UID: u32 = 994;
+pub const TD_AUDIO_GID: u32 = 994;
+pub const TD_AUDIO_RUNTIME_PATH: &str = "/run/td-audio";
+pub const TD_AUDIO_SOCKET_PATH: &str = "/run/td-audio/native";
+pub const TD_AUDIO_SOCKET_MODE: u32 = 0o666;
+pub const APPLICATION_PULSE_SOCKET_PATH: &str = "/run/flatpak/pulse/native";
+pub const APPLICATION_PULSE_SERVER: &str = "unix:/run/flatpak/pulse/native";
+pub const APPLICATION_PULSE_CONFIG_PATH: &str = "/run/flatpak/pulse/config";
+pub const APPLICATION_PULSE_CONFIG: &str = "autospawn = no\nenable-shm = no\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionSocket {
@@ -506,8 +518,8 @@ impl PermissionPolicy {
     /// operator holding a permission file and "policy not implemented" does
     /// not say which line to change.
     ///
-    /// What is honoured is shared network, the wayland socket, filesystem
-    /// entries, resource limits, and `[Session Bus Policy]` `own` entries —
+    /// What is honoured is shared network, Wayland, the td-audio Pulse socket,
+    /// filesystem entries, resource limits, and `[Session Bus Policy]` `own` entries —
     /// the last of which the broker consults when the application asks for
     /// the name. `see` and `talk` parse and are refused here: widening what a
     /// sandbox may ADDRESS is a decision about the imported services §B.3.2
@@ -531,11 +543,13 @@ impl PermissionPolicy {
         if !sockets.contains(&PermissionSocket::Wayland) {
             return Some("a launch with no wayland socket".to_string());
         }
-        if let Some(socket) = sockets
-            .iter()
-            .find(|socket| **socket != PermissionSocket::Wayland)
-        {
-            return Some(format!("the {} socket", socket.as_str()));
+        // An added enum variant must make this policy decision fail to
+        // compile until the new authority is explicitly implemented or
+        // refused here.
+        for socket in sockets {
+            match socket {
+                PermissionSocket::Wayland | PermissionSocket::PulseAudio => {}
+            }
         }
         if *allow_devel {
             return Some("features=allow-devel".to_string());
@@ -1285,9 +1299,8 @@ mod tests {
                 .clone()
                 .with_socket(PermissionSocket::PulseAudio)
                 .unwrap()
-                .unhonoured_request()
-                .as_deref(),
-            Some("the pulseaudio socket")
+                .unhonoured_request(),
+            None
         );
         assert_eq!(
             admitted

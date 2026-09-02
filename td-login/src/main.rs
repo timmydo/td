@@ -71,6 +71,9 @@ const VERIFY: &str = "verify-credentials";
 /// name a person could mistake for a general-purpose "run this as anyone" tool,
 /// which is worth not hanging in `/bin` beside `su`.
 const EXEC_AS: &str = "exec-as";
+/// A service identity is marked separately in `/etc/shadow`; this exact
+/// subcommand is the only front end that admits that class.
+const EXEC_SERVICE_AS: &str = "exec-service-as";
 
 /// A plain loop rather than an iterator search: this file is embedded verbatim
 /// into the recipe, and the ladder guard scans step content for host-tool names
@@ -122,7 +125,8 @@ fn usage() -> String {
         "td-login: static multicall; applets: {}\n\
          usage: td-login <applet> [args]  (or invoke through a /bin/<applet> symlink)\n\
          usage: td-login {VERIFY} --uid U --gid G [--groups G[,G…]]\n\
-         usage: td-login {EXEC_AS} USER -- PROGRAM [ARG…]",
+         usage: td-login {EXEC_AS} USER -- PROGRAM [ARG…]\n\
+         usage: td-login {EXEC_SERVICE_AS} USER -- PROGRAM [ARG…]",
         names().join(" ")
     )
 }
@@ -136,6 +140,8 @@ enum Route<'a> {
     Verify { args_from: usize },
     /// Run a literal argv as another user.
     ExecAs { args_from: usize },
+    /// Run a literal argv as an explicitly marked service account.
+    ExecServiceAs { args_from: usize },
     /// Print the applet roster.
     List,
     /// Print usage and exit 2.
@@ -166,6 +172,7 @@ fn route(argv: &[String]) -> Route<'_> {
         },
         Some(v) if v == VERIFY => Route::Verify { args_from: 2 },
         Some(v) if v == EXEC_AS => Route::ExecAs { args_from: 2 },
+        Some(v) if v == EXEC_SERVICE_AS => Route::ExecServiceAs { args_from: 2 },
         Some("--list") => Route::List,
         _ => Route::Usage,
     }
@@ -275,6 +282,10 @@ fn main() -> ExitCode {
             EXEC_AS,
             exec_as::run(argv.get(args_from..).unwrap_or(&[])),
         ),
+        Route::ExecServiceAs { args_from } => (
+            EXEC_SERVICE_AS,
+            exec_as::run_service(argv.get(args_from..).unwrap_or(&[])),
+        ),
         Route::Applet { name, args_from } => {
             let args = argv.get(args_from..).unwrap_or(&[]);
             let run = match lookup(name) {
@@ -374,6 +385,16 @@ mod tests {
             route(&argv(&["td-login", EXEC_AS, "tester", "--", "/bin/td-busd"])),
             Route::ExecAs { args_from: 2 }
         );
+        assert_eq!(
+            route(&argv(&[
+                "td-login",
+                EXEC_SERVICE_AS,
+                "audio",
+                "--",
+                "/bin/td-audio",
+            ])),
+            Route::ExecServiceAs { args_from: 2 }
+        );
         assert_eq!(route(&argv(&["td-login", "--list"])), Route::List);
         assert_eq!(route(&argv(&["td-login"])), Route::Usage);
         assert_eq!(route(&argv(&["td-login", "nosuch"])), Route::Usage);
@@ -385,13 +406,17 @@ mod tests {
         // caller can reach without spelling `td-login` at all.
         assert_eq!(route(&argv(&[&format!("/bin/{VERIFY}")])), Route::Usage);
         assert_eq!(route(&argv(&[&format!("/bin/{EXEC_AS}")])), Route::Usage);
+        assert_eq!(
+            route(&argv(&[&format!("/bin/{EXEC_SERVICE_AS}")])),
+            Route::Usage
+        );
     }
 
     /// The subcommands are not applets, so they must be absent from the roster
     /// `--list` prints and the shipped `/bin` symlink farm is built from.
     #[test]
     fn the_subcommands_are_not_in_the_applet_roster() {
-        for name in [VERIFY, EXEC_AS] {
+        for name in [VERIFY, EXEC_AS, EXEC_SERVICE_AS] {
             assert!(
                 !names().contains(&name),
                 "{name} is a subcommand, so a /bin/{name} symlink would be an \
@@ -885,8 +910,10 @@ mod confinement {
     /// `may_start_session`, so every other scan in this file stays green while
     /// the crate grows a switch nobody authorized.
     ///
-    /// Two halves, and the second is the point: exactly the three front ends
-    /// call it, AND each of them reaches `authorize`.
+    /// Two halves, and the second is the point: exactly the three front-end
+    /// modules call it, AND each reaches an authorization boundary. The
+    /// service-only function shares `exec_as.rs` with the ordinary one, so the
+    /// next test pins that distinct chain inside the function bodies.
     #[test]
     fn every_credential_switch_is_a_front_end_that_authorized_first() {
         let enter = concat!("session::", "enter(");
@@ -935,6 +962,45 @@ mod confinement {
             ["db.rs", "login.rs"],
             "the session policy must be reached through login::authorize alone"
         );
+    }
+
+    #[test]
+    fn the_service_switch_uses_only_the_service_policy_chain() {
+        let source = |name: &str| {
+            sources()
+                .into_iter()
+                .find_map(|(path, text)| (path == name).then_some(text))
+                .unwrap()
+        };
+        let exec = source("exec_as.rs");
+        let service = exec
+            .split_once("pub fn run_service(")
+            .and_then(|(_, rest)| rest.split_once("#[cfg(test)]"))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert_eq!(service.matches("login::authorize_service(").count(), 1);
+        let enter = concat!("session::", "enter(");
+        assert_eq!(service.matches(enter).count(), 1);
+        assert!(!service.contains("login::authorize("));
+
+        let login = source("login.rs");
+        let authorize = login
+            .split_once("pub(crate) fn authorize_service(")
+            .and_then(|(_, rest)| rest.split_once("#[cfg(test)]"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let service_call = concat!("db::may_start_", "service(");
+        assert_eq!(authorize.matches(service_call).count(), 1);
+        let session_call = concat!("db::may_start_", "session(");
+        assert!(!authorize.contains(session_call));
+
+        let decision = concat!("may_start_", "service");
+        let namers = sources()
+            .into_iter()
+            .filter(|(_, text)| text.contains(decision))
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        assert_eq!(namers, ["db.rs", "login.rs"]);
     }
 
     #[test]

@@ -80,6 +80,7 @@ const REAPER_POLL: Duration = Duration::from_millis(5);
 const SURVIVOR_TERM_TIMEOUT: Duration = Duration::from_secs(2);
 const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const SURVIVOR_PROBE_LIFETIME: Duration = Duration::from_secs(30);
+const PULSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STAGE2_OUTPUT_LIMIT: usize = 4096;
 const WRITE_PROBE_PREFIX: &str = ".td-jail-write-probe-";
 const ETC_SIZE_BYTES: usize = 8 * 1024 * 1024;
@@ -581,6 +582,11 @@ where
             &environment,
             uid,
             loader_library_path.as_deref(),
+            // Stage 1 emitted this authenticated environment from the
+            // permission-bearing ApplicationSpec. Here the environment is
+            // the stage-2 wire format, so this proves only that its Pulse
+            // pair remains internally complete and exact.
+            environment.iter().any(|(key, _)| key == "PULSE_SERVER"),
         )?;
         if args.next().as_deref() != Some(STAGE2_FILESYSTEMS_ARG.as_ref()) {
             return Err(usage_error());
@@ -1892,6 +1898,28 @@ fn prepare_mount_plan(
         let listener = UnixListener::bind(&bus)
             .map_err(|e| io::Error::other(format!("create session bus bind target: {e}")))?;
         drop(listener);
+        let pulse = pulse_mount_plan(application.pulse_runtime.as_deref());
+        if let Some(pulse) = &pulse {
+            create_dir(&format!("{run}/flatpak"), 0o755)?;
+            create_dir(&format!("{run}/flatpak/pulse"), 0o755)?;
+            create_dir(&pulse.runtime_target, 0o755)?;
+            symlink("server/native", format!("{run}/flatpak/pulse/native"))?;
+            fs::write(
+                &pulse.config_target,
+                crate::permissions::APPLICATION_PULSE_CONFIG,
+            )?;
+            fs::set_permissions(
+                &pulse.config_target,
+                fs::Permissions::from_mode(0o444),
+            )?;
+            // The tmpfs is made by the mapped application identity, so 0444
+            // alone is not immutable. Make the highest private ancestor a
+            // read-only mountpoint before adding the server child mount. That
+            // prevents replacing either `flatpak` or `pulse`; binding after
+            // the child mount would need a recursive bind to preserve it.
+            let flatpak_directory = format!("{run}/flatpak");
+            mount_private_bind(Path::new(&flatpak_directory), &flatpak_directory, true)?;
+        }
 
         create_dir(&format!("{NEW_ROOT}/home/td"), 0o700)?;
         mount_application_tree(&application.package_files, &format!("{NEW_ROOT}/app"))?;
@@ -1935,50 +1963,81 @@ fn prepare_mount_plan(
         // (`is_local_mountpoint` -> `EBUSY`) and the app has no `CAP_SYS_ADMIN`
         // to unmount it.
         mount_private_bind(&application.bus_socket, &bus, true)?;
+        if let Some(pulse) = &pulse {
+            mount_private_bind(pulse.source, &pulse.runtime_target, true)?;
+        }
         for filesystem in &application.filesystems {
             mount_filesystem_grant(filesystem)?;
         }
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-        for (source, target) in [
+        let mut mounted = vec![
             (
-                application.package_files.as_path(),
+                application.package_files.clone(),
                 format!("{NEW_ROOT}/app"),
             ),
             (
-                application.runtime_files.as_path(),
+                application.runtime_files.clone(),
                 format!("{NEW_ROOT}/usr"),
             ),
             (
-                application.state.home.as_path(),
+                application.state.home.clone(),
                 format!("{NEW_ROOT}/home/td"),
             ),
             (
-                application.state.config.as_path(),
+                application.state.config.clone(),
                 format!("{NEW_ROOT}/home/td/.config"),
             ),
             (
-                application.state.cache.as_path(),
+                application.state.cache.clone(),
                 format!("{NEW_ROOT}/home/td/.cache"),
             ),
             (
-                application.state.data.as_path(),
+                application.state.data.clone(),
                 format!("{NEW_ROOT}/home/td/.local/share"),
             ),
             (
-                application.state.local_state.as_path(),
+                application.state.local_state.clone(),
                 format!("{NEW_ROOT}/home/td/.local/state"),
             ),
-            (application.state.runtime.as_path(), application_runtime),
-            (application.wayland_socket.as_path(), wayland),
-            (application.bus_socket.as_path(), bus),
-        ] {
-            require_bind_source(&mountinfo, source, Path::new(&target))?;
+            (application.state.runtime.clone(), application_runtime),
+            (application.wayland_socket.clone(), wayland),
+            (application.bus_socket.clone(), bus),
+        ];
+        if let Some(pulse) = pulse {
+            mounted.push((pulse.source.to_path_buf(), pulse.runtime_target));
+            let path = format!("{NEW_ROOT}/run/flatpak");
+            mounted.push((PathBuf::from(&path), path));
+        }
+        for (source, target) in mounted {
+            require_bind_source(&mountinfo, &source, Path::new(&target))?;
         }
     }
     if application.is_none() {
         mount_reaper_probe(executable)?;
     }
     remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PulseMountPlan<'a> {
+    source: &'a Path,
+    runtime_target: String,
+    config_target: String,
+}
+
+fn pulse_mount_plan(source: Option<&Path>) -> Option<PulseMountPlan<'_>> {
+    source.map(|source| PulseMountPlan {
+        source,
+        runtime_target: format!("{NEW_ROOT}/run/flatpak/pulse/server"),
+        config_target: format!(
+            "{NEW_ROOT}{}",
+            crate::permissions::APPLICATION_PULSE_CONFIG_PATH
+        ),
+    })
+}
+
+fn pulse_socket_mode(pulse: bool, host_mode: bool) -> Option<u32> {
+    (pulse && !host_mode).then_some(crate::permissions::TD_AUDIO_SOCKET_MODE)
 }
 
 fn install_runtime_aliases() -> io::Result<()> {
@@ -2231,6 +2290,14 @@ fn require_names(path: &str, expected: &[&str]) -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+fn required_run_names(pulse: bool) -> &'static [&'static str] {
+    if pulse {
+        &["flatpak", "user"]
+    } else {
+        &["user"]
+    }
 }
 
 fn require_mode(path: &str, expected: u32) -> io::Result<()> {
@@ -2852,13 +2919,26 @@ fn require_etc_plan(
     require_read_only_mount("/etc", token)
 }
 
-fn require_mount_plan(
-    filesystems: Option<&[Stage2Filesystem]>,
-    etc: EtcBinding<'_>,
+struct Stage2MountExpectation<'a> {
+    filesystems: Option<&'a [Stage2Filesystem]>,
+    etc: EtcBinding<'a>,
     runtime_aliases: bool,
+    pulse: bool,
+    pulse_socket_mode: Option<u32>,
+}
+
+fn require_mount_plan(
+    expected: Stage2MountExpectation<'_>,
     token: &[u8; TOKEN_LEN],
     identity: Identity,
 ) -> io::Result<()> {
+    let Stage2MountExpectation {
+        filesystems,
+        etc,
+        runtime_aliases,
+        pulse,
+        pulse_socket_mode,
+    } = expected;
     let application = filesystems.is_some();
     if fs::symlink_metadata(OLD_ROOT).is_ok()
         || (!application && fs::symlink_metadata("/etc").is_ok())
@@ -2966,7 +3046,7 @@ fn require_mount_plan(
             require_runtime_aliases()?;
         }
         require_etc_plan(&mountinfo, token, etc, identity)?;
-        require_names("/run", &["user"])?;
+        require_names("/run", required_run_names(pulse))?;
         let runtime = format!("/run/user/{}", identity.uid);
         require_mode(&runtime, 0o700)?;
         require_names("/run/user", &[&identity.uid.to_string()])?;
@@ -3028,6 +3108,52 @@ fn require_mount_plan(
             &["ro", "nosuid", "nodev", "noexec"],
             &["rw"],
         )?;
+        if pulse {
+            require_names("/run/flatpak", &["pulse"])?;
+            require_names("/run/flatpak/pulse", &["config", "native", "server"])?;
+            require_mode("/run/flatpak", 0o755)?;
+            require_mode("/run/flatpak/pulse", 0o755)?;
+            require_mode(crate::permissions::APPLICATION_PULSE_CONFIG_PATH, 0o444)?;
+            if fs::read_to_string(crate::permissions::APPLICATION_PULSE_CONFIG_PATH)?
+                != crate::permissions::APPLICATION_PULSE_CONFIG
+            {
+                return Err(io::Error::other(
+                    "private PulseAudio client configuration changed after mounting",
+                ));
+            }
+            if fs::read_link(crate::permissions::APPLICATION_PULSE_SOCKET_PATH)?
+                != Path::new("server/native")
+            {
+                return Err(io::Error::other(
+                    "private PulseAudio endpoint alias changed after mounting",
+                ));
+            }
+            let socket = fs::metadata(crate::permissions::APPLICATION_PULSE_SOCKET_PATH)?;
+            if !socket.file_type().is_socket() {
+                return Err(io::Error::other(
+                    "private PulseAudio endpoint is not a socket",
+                ));
+            }
+            if let Some(mode) = pulse_socket_mode {
+                require_mode(crate::permissions::APPLICATION_PULSE_SOCKET_PATH, mode)?;
+            }
+            require_mount(
+                &mountinfo,
+                "/run/flatpak/pulse/server",
+                None,
+                &["ro", "nosuid", "nodev", "noexec"],
+                &["rw"],
+            )?;
+            require_mount(
+                &mountinfo,
+                "/run/flatpak",
+                None,
+                &["ro", "nosuid", "nodev", "noexec"],
+                &["rw"],
+            )?;
+            require_read_only_mount("/run/flatpak", token)?;
+            require_read_only_mount("/run/flatpak/pulse", token)?;
+        }
         let application_runtime = format!("{runtime}/{}", crate::authority::RUNTIME_ROOT_NAME);
         require_mode(&application_runtime, 0o700)?;
         require_mode("/home/td", 0o700)?;
@@ -3803,7 +3929,16 @@ pub fn run_stage2(
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     let mount_probe_token = random_token()?;
-    let (filesystems, etc, runtime_aliases) = match &action {
+    let host_mode = matches!(
+        &action,
+        Stage2Action::Launch(launch) if launch.cgroup_membership == NO_CGROUP_MEMBERSHIP
+    );
+    let (
+        filesystems,
+        etc,
+        runtime_aliases,
+        pulse,
+    ) = match &action {
         Stage2Action::Probe => (
             None,
             EtcBinding {
@@ -3812,6 +3947,7 @@ pub fn run_stage2(
                 firefox_autotest_policy: false,
                 machine_id: None,
             },
+            false,
             false,
         ),
         Stage2Action::Launch(launch) => (
@@ -3823,20 +3959,27 @@ pub fn run_stage2(
                 machine_id: Some(launch.machine_id.as_str()),
             },
             launch.runtime_aliases,
+            // Stage 1 already authenticated the permission-to-environment
+            // derivation. This bit checks only that the corresponding private
+            // mount survived the stage-2 transition.
+            launch
+                .environment
+                .iter()
+                .any(|(key, _)| key == "PULSE_SERVER"),
         ),
     };
     require_mount_plan(
-        filesystems,
-        etc,
-        runtime_aliases,
+        Stage2MountExpectation {
+            filesystems,
+            etc,
+            runtime_aliases,
+            pulse,
+            pulse_socket_mode: pulse_socket_mode(pulse, host_mode),
+        },
         &mount_probe_token,
         identity,
     )?;
     clear_and_require_empty_capabilities()?;
-    let host_mode = matches!(
-        &action,
-        Stage2Action::Launch(launch) if launch.cgroup_membership == NO_CGROUP_MEMBERSHIP
-    );
     install_standard_seccomp_filter().map_err(|error| {
         if host_mode {
             io::Error::new(
@@ -4217,6 +4360,14 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             "td-jail launch identity changed after authority resolution",
         ));
     }
+    if let Some(socket) = &application.pulse_socket {
+        let what = if application.host_mode {
+            "host PulseAudio authority"
+        } else {
+            "td-audio authority"
+        };
+        crate::bus::require_accepting_endpoint(socket, PULSE_CONNECT_TIMEOUT, what)?;
+    }
     let inside_identity = Identity {
         uid: application.inside_uid,
         gid: application.inside_gid,
@@ -4578,6 +4729,35 @@ mod tests {
                 .require_application_change(&before, true)
                 .is_err());
         }
+    }
+
+    #[test]
+    fn pulse_mount_plan_is_absent_or_uses_the_compiled_private_paths() {
+        assert_eq!(required_run_names(false), ["user"]);
+        assert_eq!(required_run_names(true), ["flatpak", "user"]);
+        assert_eq!(pulse_mount_plan(None), None);
+        let source = Path::new("/run/td-audio");
+        assert_eq!(
+            pulse_mount_plan(Some(source)),
+            Some(PulseMountPlan {
+                source,
+                runtime_target: format!("{NEW_ROOT}/run/flatpak/pulse/server"),
+                config_target: format!(
+                    "{NEW_ROOT}{}",
+                    crate::permissions::APPLICATION_PULSE_CONFIG_PATH
+                ),
+            })
+        );
+        assert_eq!(
+            crate::permissions::APPLICATION_PULSE_CONFIG,
+            "autospawn = no\nenable-shm = no\n"
+        );
+        assert_eq!(pulse_socket_mode(false, false), None);
+        assert_eq!(pulse_socket_mode(true, true), None);
+        assert_eq!(
+            pulse_socket_mode(true, false),
+            Some(crate::permissions::TD_AUDIO_SOCKET_MODE)
+        );
     }
 
     /// The ceiling `td-busd` declares for one of the two names this module

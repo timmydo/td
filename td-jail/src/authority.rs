@@ -1,6 +1,6 @@
 use crate::permissions::{
-    BusAccess, FilesystemAccess, PermissionPolicy, ResourceLimits, MAX_FILESYSTEM_ENTRIES,
-    RESERVED_FILESYSTEM_TREES,
+    BusAccess, FilesystemAccess, PermissionPolicy, PermissionSocket, ResourceLimits,
+    MAX_FILESYSTEM_ENTRIES, RESERVED_FILESYSTEM_TREES,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -94,6 +94,13 @@ pub(crate) struct LaunchPlan {
     pub(crate) state: StatePlan,
     pub(crate) wayland_socket: PathBuf,
     pub(crate) bus_socket: PathBuf,
+    /// Present only when the authenticated permission file requests Pulse.
+    /// Mounting the stable directory, rather than today's socket inode, lets
+    /// a client reconnect after the supervised daemon replaces a stale socket.
+    pub(crate) pulse_runtime: Option<PathBuf>,
+    /// The exact socket resolved under `pulse_runtime`, retained so stage 1
+    /// can prove a listener is alive before it creates any namespaces.
+    pub(crate) pulse_socket: Option<PathBuf>,
     pub(crate) filesystems: Vec<FilesystemGrant>,
     /// The `[Session Bus Policy]` `own` entries, in the permission file's own
     /// order, which is the canonical one its parser imposes.
@@ -366,10 +373,15 @@ where
         .iter()
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect::<Vec<_>>();
+    let pulse_requested = spec
+        .permissions
+        .sockets()
+        .any(|socket| socket == PermissionSocket::PulseAudio);
     validate_environment_list(
         &environment,
         inside_identity.0,
         spec.loader_library_path.as_deref(),
+        pulse_requested,
     )?;
     let (wayland_socket, bus_socket, runtime_root) = if config.host_mode {
         host_session_sockets(outside_identity, config.runtime_root.as_deref())?
@@ -380,6 +392,59 @@ where
             session_socket("bus", "session bus", outside_identity.0)?,
             runtime_root,
         )
+    };
+    let pulse = if pulse_requested {
+        let (runtime, socket, identity, what) = if config.host_mode {
+            (
+                runtime_root.join("pulse"),
+                runtime_root.join("pulse/native"),
+                outside_identity,
+                "host PulseAudio authority",
+            )
+        } else {
+            (
+                PathBuf::from(crate::permissions::TD_AUDIO_RUNTIME_PATH),
+                PathBuf::from(crate::permissions::TD_AUDIO_SOCKET_PATH),
+                (
+                    crate::permissions::TD_AUDIO_UID,
+                    crate::permissions::TD_AUDIO_GID,
+                ),
+                "td-audio authority",
+            )
+        };
+        require_owned_directory(&runtime, identity, false)?;
+        let runtime = fs::canonicalize(&runtime).map_err(|error| {
+            invalid(format!("{what} runtime {}: {error}", runtime.display()))
+        })?;
+        require_owned_directory(&runtime, identity, false)?;
+        if !config.host_mode {
+            require_exact_mode(&runtime, 0o755, "td-audio runtime")?;
+        }
+        let socket = resolved_socket(&socket, identity.0, what)?;
+        if !config.host_mode {
+            require_exact_mode(
+                &socket,
+                crate::permissions::TD_AUDIO_SOCKET_MODE,
+                what,
+            )?;
+        }
+        if socket.parent() != Some(runtime.as_path()) {
+            return Err(invalid(format!(
+                "{what} socket does not belong to its validated runtime directory"
+            )));
+        }
+        if socket == wayland_socket || socket == bus_socket {
+            return Err(invalid(format!(
+                "{what} resolves to another session authority socket"
+            )));
+        }
+        Some((runtime, socket))
+    } else {
+        None
+    };
+    let (pulse_runtime, pulse_socket) = match pulse {
+        Some((runtime, socket)) => (Some(runtime), Some(socket)),
+        None => (None, None),
     };
     // Unconditional, like the mount it feeds: APPLICATIONS.md §C's mount plan,
     // step 12, binds the bus ALWAYS, because the BROKER is the policy. A jail
@@ -433,6 +498,8 @@ where
         state,
         wayland_socket,
         bus_socket,
+        pulse_runtime,
+        pulse_socket,
         filesystems,
         // Built HERE rather than bound above it. A reviewer defeated the
         // source pin on this rule by shadowing the binding — compute the
@@ -717,6 +784,7 @@ pub(crate) fn validate_environment_list(
     environment: &[(OsString, OsString)],
     uid: u32,
     loader_library_path: Option<&str>,
+    pulse_requested: bool,
 ) -> io::Result<()> {
     validate_stage2_loader_library_path(loader_library_path)?;
     if environment.len() > MAX_ENVIRONMENT_ENTRIES {
@@ -788,6 +856,20 @@ pub(crate) fn validate_environment_list(
     if actual_loader_library_path.as_deref() != loader_library_path {
         return Err(invalid(format!(
             "application environment LD_LIBRARY_PATH is {actual_loader_library_path:?}, expected {loader_library_path:?}"
+        )));
+    }
+    let pulse_server = environment.iter().find_map(|(key, value)| {
+        (key == "PULSE_SERVER").then(|| value.to_string_lossy().into_owned())
+    });
+    let pulse_config = environment.iter().find_map(|(key, value)| {
+        (key == "PULSE_CLIENTCONFIG").then(|| value.to_string_lossy().into_owned())
+    });
+    let expected_pulse = pulse_requested.then_some(crate::permissions::APPLICATION_PULSE_SERVER);
+    let expected_config =
+        pulse_requested.then_some(crate::permissions::APPLICATION_PULSE_CONFIG_PATH);
+    if pulse_server.as_deref() != expected_pulse || pulse_config.as_deref() != expected_config {
+        return Err(invalid(format!(
+            "application Pulse environment is server {pulse_server:?}, config {pulse_config:?}; expected {expected_pulse:?}, {expected_config:?}"
         )));
     }
     Ok(())
@@ -2486,14 +2568,18 @@ fn canonical_child_directory(parent: &Path, name: &str, label: &str) -> io::Resu
 /// and owned by the login user — the principal the session belongs to.
 fn session_socket(name: &str, what: &str, uid: u32) -> io::Result<PathBuf> {
     let path = PathBuf::from(format!("/run/user/{uid}/{name}"));
-    require_session_socket(&path, uid, what)?;
+    resolved_socket(&path, uid, what)
+}
+
+fn resolved_socket(path: &Path, uid: u32, what: &str) -> io::Result<PathBuf> {
+    require_session_socket(path, uid, what)?;
     // Labelled rather than propagated bare. The likeliest failure on this path
     // is now "the broker has not bound yet", and `main` prints `td-jail: {e}` —
     // so a bare `ENOENT` would reach an operator as `No such file or directory`
     // with no path and no noun, ambiguous between two sockets since there are
     // two. `require_regular` and `require_directory` in this file already say
     // which thing they were looking at; this is that habit applied here.
-    let path = fs::canonicalize(&path).map_err(|error| {
+    let path = fs::canonicalize(path).map_err(|error| {
         invalid(format!("{what} {}: {error}", path.display()))
     })?;
     require_session_socket(&path, uid, what)?;
@@ -2555,6 +2641,19 @@ fn require_session_socket(path: &Path, uid: u32, what: &str) -> io::Result<()> {
     if !metadata.file_type().is_socket() || metadata.uid() != uid {
         return Err(invalid(format!(
             "{what} {} is not a socket owned by uid {uid}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_exact_mode(path: &Path, expected: u32, what: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| invalid(format!("{what} {}: {error}", path.display())))?;
+    let actual = metadata.mode() & 0o7777;
+    if actual != expected {
+        return Err(invalid(format!(
+            "{what} {} has mode {actual:04o}, expected {expected:04o}",
             path.display()
         )));
     }
@@ -2972,10 +3071,15 @@ pub(crate) fn test_validate_spec_environment(text: &str, uid: u32) -> io::Result
         .iter()
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect::<Vec<_>>();
+    let pulse_requested = spec
+        .permissions
+        .sockets()
+        .any(|socket| socket == PermissionSocket::PulseAudio);
     validate_environment_list(
         &environment,
         uid,
         spec.loader_library_path.as_deref(),
+        pulse_requested,
     )
 }
 
@@ -4013,12 +4117,12 @@ mod tests {
                 OsString::from("/run/user/1000"),
             ),
         ];
-        assert!(validate_environment_list(&environment, 1000, None).is_ok());
+        assert!(validate_environment_list(&environment, 1000, None, false).is_ok());
         // A DIFFERENT uid fails on every uid-derived value at once, the bus
         // address among them: an app told to reach /run/user/1000/bus while
         // running as 1001 would find a socket it cannot use, or somebody
         // else's.
-        assert!(validate_environment_list(&environment, 1001, None).is_err());
+        assert!(validate_environment_list(&environment, 1001, None, false).is_err());
         // Each required name is required ON ITS OWN. A draft sliced the front
         // of the array instead, which drops one name and then two, so the
         // second assertion passed for the first one's reason and no name after
@@ -4037,7 +4141,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(without.len(), environment.len() - 1, "{dropped} was not there");
             assert!(
-                validate_environment_list(&without, 1000, None).is_err(),
+                validate_environment_list(&without, 1000, None, false).is_err(),
                 "a spec missing {dropped} was accepted"
             );
         }
@@ -4060,7 +4164,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            validate_environment_list(&elsewhere, 1000, None).is_err(),
+            validate_environment_list(&elsewhere, 1000, None, false).is_err(),
             "a spec may not point the app at a bus this jail does not mount"
         );
 
@@ -4071,7 +4175,54 @@ mod tests {
             ),
             (OsString::from("HOME"), OsString::from("/home/td")),
         ];
-        assert!(validate_environment_list(&unsorted, 1000, None).is_err());
+        assert!(validate_environment_list(&unsorted, 1000, None, false).is_err());
+    }
+
+    #[test]
+    fn pulse_environment_is_exactly_bound_to_the_permission() {
+        let mut environment = vec![
+            (
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from("unix:path=/run/user/1000/bus"),
+            ),
+            (
+                OsString::from("FLATPAK_ID"),
+                OsString::from("org.td.Fixture"),
+            ),
+            (OsString::from("HOME"), OsString::from("/home/td")),
+            (
+                OsString::from("PULSE_CLIENTCONFIG"),
+                OsString::from(crate::permissions::APPLICATION_PULSE_CONFIG_PATH),
+            ),
+            (
+                OsString::from("PULSE_SERVER"),
+                OsString::from(crate::permissions::APPLICATION_PULSE_SERVER),
+            ),
+            (
+                OsString::from("WAYLAND_DISPLAY"),
+                OsString::from("wayland-0"),
+            ),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/1000"),
+            ),
+        ];
+        assert!(validate_environment_list(&environment, 1000, None, true).is_ok());
+        assert!(validate_environment_list(&environment, 1000, None, false).is_err());
+        environment.retain(|(key, _)| key != "PULSE_SERVER");
+        assert!(validate_environment_list(&environment, 1000, None, true).is_err());
+    }
+
+    #[test]
+    fn target_audio_socket_mode_is_exact() {
+        let scratch = TestDirectory::new("audio-socket-mode").unwrap();
+        let path = scratch.join("native");
+        let listener = UnixListener::bind(&path).unwrap();
+        drop(listener);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(require_exact_mode(&path, 0o666, "audio").is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(require_exact_mode(&path, 0o666, "audio").is_err());
     }
 
     /// The shim the td-jail recipe check reaches across the crate boundary

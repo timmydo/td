@@ -1,8 +1,9 @@
 # td-login threat model
 
 td-login is the credential-switching half of td's login chain: the
-`login` and `su` applets, replacing busybox's, plus the `exec-as`
-subcommand that runs a supervised daemon as another user. It is the only
+`login` and `su` applets, replacing busybox's, plus the `exec-as` and
+`exec-service-as` subcommands that run supervised daemons as another user.
+It is the only
 td-owned general-purpose program on a td image whose job is to *change* a
 process's Unix credentials, so a
 bug here is not a malfunction — it is privilege escalation. This
@@ -34,10 +35,10 @@ Adversaries considered:
   entries. On a td image `/etc` is immutable EROFS, so this is
   primarily a *build-time* adversary — a tailoring mistake in the
   `SYSTEM` const — but the parser must not trust the file either way.
-- **A3 — a hostile caller of td-login**: whatever execs
-  `login`/`su`/`exec-as` chooses argv, the environment, the current
-  directory, and the open file descriptors, including which file is on
-  fd 0.
+- **A3 — a hostile caller of td-login**: whatever execs `login`, `su`,
+  `exec-as`, or `exec-service-as` chooses argv, the environment, the
+  current directory, and the open file descriptors, including which file
+  is on fd 0.
 
 Explicitly **not** in the model: an attacker who already has uid 0
 (nothing here can constrain them), physical DMA, and the kernel itself.
@@ -200,21 +201,24 @@ return instead — `su tester` as tester, or `exec-as tester` as tester —
 and starts a program with no privilege that caller lacked. The forced
 path skips a password; it does not hand one out.
 
-`exec-as` shares `su`'s column exactly, and by construction rather than
-by coincidence: all three front ends reach ONE decision,
+Ordinary `exec-as` shares `su`'s column exactly, and by construction rather
+than by coincidence: all three human-session front ends reach ONE decision,
 `login::authorize`, which `the_session_policy_is_decided_in_one_place`
 holds them to by refusing any module but `db` and `login` to name
-`may_start_session` at all. So a locked account is refused on every one
-of them. That matters most for `exec-as`, because a unit naming a locked
-account must fail loudly at boot rather than quietly running a daemon as
-it.
+`may_start_session` at all. So a locked or service-only account is refused on
+every one of them. `exec-service-as` reaches the same account lookup and the
+same credential switch, but a disjoint policy decision accepts only the exact
+`!td-service` shadow marker. It rejects an empty field, a hash and an ordinary
+lock, so a unit cannot turn the service path into a second way to enter a
+human account.
 
-| `/etc/shadow` field | class        | interactive `login` | `login -f` | `su`, `exec-as` (forced) |
-| ------------------- | ------------ | ------------------- | ---------- | ------------------------ |
-| empty               | `NoPassword` | allowed             | allowed    | allowed                  |
-| `!`, `!!`, `*`      | `Locked`     | denied              | **denied** | **denied**               |
-| anything else       | `Hashed`     | **denied**          | allowed    | allowed                  |
-| no entry / no file  | —            | denied              | denied     | denied                   |
+| `/etc/shadow` field | class        | interactive `login` | `login -f` | `su`, `exec-as` (forced) | `exec-service-as` |
+| ------------------- | ------------ | ------------------- | ---------- | ------------------------ | ----------------- |
+| empty               | `NoPassword` | allowed             | allowed    | allowed                  | denied            |
+| `!td-service`       | `Service`    | denied              | denied     | denied                   | **allowed**       |
+| `!`, `!!`, `*`      | `Locked`     | denied              | **denied** | **denied**               | denied            |
+| anything else       | `Hashed`     | **denied**          | allowed    | allowed                  | denied            |
+| no entry / no file  | —            | denied              | denied     | denied                   | denied            |
 
 Consequences worth stating plainly:
 
@@ -230,36 +234,24 @@ Consequences worth stating plainly:
   that no session may run as it; the cheap way to honour that is to make
   `/etc/autologin` naming a locked account fail loudly instead of
   quietly working. Nothing on a td image needs the other behaviour.
-- **A service account launched through `exec-as` cannot be `Locked`, and
-  that is a live
-  constraint rather than a footnote.** `exec-as` shares this table, so a
-  daemon's identity is governed by a policy written for humans logging
-  in. `system-x86-64` writes `!` for any user with `passwordless:
-  false`, which is `Locked`, which `exec-as` refuses — so the first unit
-  that runs as a service uid (APPLICATIONS.md rung 24a's landed `audio`)
-  would fail on every boot unless that account were `passwordless: true`,
-  and an empty
-  shadow field is one `login` and `su` will start an interactive session
-  for with no authentication at all. Hardening a daemon identity the
-  ordinary way breaks the unit; the spelling that works makes the
-  account world-loginable, which is the opposite of what AGENTS.md
-  principle 7 wants.
+- **A service account is a distinct credential class, not an ordinary lock
+  with a special caller.** `system-x86-64` writes the exact
+  `!td-service` marker only for identities a unit starts through
+  `exec-service-as`. The marker still begins with `!`, so software that does
+  not know td's extension sees a conventional lock. td-login distinguishes it
+  before the general `!` rule, refuses it through every human-session path,
+  and refuses every other class through the service path. Making the audio
+  account passwordless to satisfy ordinary `exec-as` would therefore red both
+  the image contract and the credential policy.
 
   The shipped image has three locked service identities. OpenSSH's `sshd`
   privilege-separation account and `td-profiler`'s `profiler` account are not
   td-svc `exec-as` targets; each daemon performs its own fixed-purpose drop.
   The `sshd` account has a `/bin/false` shell and an empty root-owned
   `/run/sshd-empty` chroot recreated before the daemon starts. The `audio`
-  account likewise has a `/bin/false` shell and a volatile `/run/td-audio`
-  home, but no process runs as it before the planned backend landing. None of
-  the three can be entered through td-login's forced modes or an interactive
-  login.
-
-  What closes the remaining `exec-as` constraint is a THIRD `Secret` class —
-  locked for login, permitted for `exec-as` — and that is a policy amendment to
-  this section, landing with the audio backend's first td-svc service account
-  rather than speculatively before it exists. It is written down here so that
-  account is not made world-loginable by accident.
+  account has a `/bin/false` shell and a volatile `/run/td-audio` home and is
+  the sole current `exec-service-as` target. None of the three can be entered
+  through td-login's human forced modes or an interactive login.
 - `system-x86-64`'s `system_def_is_self_consistent` test refuses to ship
   a `SYSTEM` definition whose auto-login user is not passwordless, so the
   image cannot be tailored into a machine that will not let anyone in.
@@ -340,16 +332,17 @@ makes `su -c` usable from a script), but `HOME`, `SHELL`, `USER`,
 `LOGNAME` and `PATH` are still overwritten so they describe the target
 account rather than the caller's.
 
-For **`exec-as`** the environment is discarded ENTIRELY — the only front
-end where nothing at all of the caller's survives, `TERM` included. What
-it starts is a SUPERVISED DAEMON, whose environment ought to be a
-property of its unit; td-svc has no `env=` key to make it one, so
-preserving would hand a long-lived unprivileged service whatever the
-supervisor happened to inherit from the boot path — undeclared, and not
-necessarily the same on a restart as on the first boot. Discarding is
-also the direction A3 argues for: `exec-as` is the one front end whose
-caller is a root supervisor and whose target runs indefinitely, so
-anything carried across is carried into every restart too.
+For **`exec-as` and `exec-service-as`** the environment is discarded
+ENTIRELY — these are the only front ends where nothing at all of the
+caller's survives, `TERM` included. What they start is a SUPERVISED
+DAEMON, whose environment ought to be a property of its unit; td-svc has
+no `env=` key to make it one, so preserving would hand a long-lived
+unprivileged service whatever the supervisor happened to inherit from the
+boot path — undeclared, and not necessarily the same on a restart as on
+the first boot. Discarding is also the direction A3 argues for: these are
+the front ends whose caller is a root supervisor and whose target runs
+indefinitely, so anything carried across is carried into every restart
+too.
 
 `TERM` is the exception to the exception and is worth stating, because
 the login rule above justifies keeping it. There it is right: the

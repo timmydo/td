@@ -231,6 +231,20 @@ without a new td-svc primitive. The one-shot evidence client emits separate
 exact lines only after its synchronous Settings reply and its pre-subscribed
 Background method-reply/directed-`Request.Response` denial both complete.
 
+Application audio uses both edges deliberately. `audio requires=seat`
+because its private identity and runtime directory do not exist before seat
+setup succeeds. Each daemon start first re-runs td-seatd's bounded playback
+node assignment, so a node that appeared after the initial seat oneshot is
+owned before td-login drops to the service identity. Its readiness command
+runs the daemon's live-socket probe through that same service-only identity.
+Firefox has only `after=audio`, as it does for the restartable
+broker: if audio is in a temporary failed/backoff phase, a strict dependency
+would strand Firefox permanently. Ordering releases a launch attempt, and
+td-jail refuses a missing required runtime or endpoint. A launched jail binds
+the stable runtime directory rather than one socket inode, so a supervised
+restart's replacement endpoint remains visible to libpulse; the declared
+authority is never silently omitted or pinned permanently to the stale inode.
+
 Note what `requires=` does NOT change, since the difference is easy to read
 backwards: `after=` is already enough to keep a dependent behind its
 dependency, because a unit does not start until every dependency has settled.

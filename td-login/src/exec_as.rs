@@ -115,6 +115,20 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     session::enter(&session)
 }
 
+/// The service-only sibling of `run`.
+///
+/// The argv grammar and credential application are identical. Only the
+/// account authorization differs: this path accepts the exact service marker
+/// and rejects every interactive, hashed, or ordinarily locked account.
+pub fn run_service(args: &[String]) -> Result<u8, String> {
+    let opts = parse(args)
+        .map_err(|e| format!("{e}\nusage: exec-service-as USER -- PROGRAM [ARG…]"))?;
+    let account = login::authorize_service(&opts.user)?;
+    let groups = db::supplementary(&opts.user)?;
+    let session = session_for(&account, &groups, opts, &session::inherited());
+    session::enter(&session)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]

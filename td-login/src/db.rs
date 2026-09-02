@@ -33,6 +33,9 @@ pub enum Secret {
     NoPassword,
     /// `!`, `!!`, `*`, or any `!`-prefixed hash — administratively locked.
     Locked,
+    /// Exact td image marker: locked for every human session and available
+    /// only to the service-specific credential path.
+    Service,
     /// A hash this build cannot verify. Denied, never treated as absent.
     Hashed,
 }
@@ -45,6 +48,11 @@ pub enum Denied {
     Locked,
     /// The account has a password and this build verifies no hash scheme.
     NeedsPassword,
+    /// The account is a service identity, not a human session.
+    ServiceOnly,
+    /// The service path was pointed at an interactive or ordinarily locked
+    /// account rather than an explicitly marked service identity.
+    NotService,
 }
 
 /// The whole authentication decision, in one place.
@@ -55,15 +63,31 @@ pub enum Denied {
 pub fn may_start_session(secret: Secret, forced: bool) -> Result<(), Denied> {
     match secret {
         Secret::Locked => Err(Denied::Locked),
+        Secret::Service => Err(Denied::ServiceOnly),
         Secret::NoPassword => Ok(()),
         Secret::Hashed if forced => Ok(()),
         Secret::Hashed => Err(Denied::NeedsPassword),
     }
 }
 
+/// Admit only the exact service-account class.
+///
+/// This is intentionally not a `forced` branch above. `login -f`, `su`, and
+/// ordinary `exec-as` must keep refusing a service account, while a unit must
+/// not use the service path to enter an interactive account.
+pub fn may_start_service(secret: Secret) -> Result<(), Denied> {
+    match secret {
+        Secret::Service => Ok(()),
+        Secret::Locked | Secret::NoPassword | Secret::Hashed => Err(Denied::NotService),
+    }
+}
+
 pub fn classify(field: &str) -> Secret {
     if field.is_empty() {
         return Secret::NoPassword;
+    }
+    if field == "!td-service" {
+        return Secret::Service;
     }
     // `*` and anything `!`-prefixed are the two spellings shadow-utils, busybox
     // and util-linux all agree mean "cannot authenticate". `!` in front of an
@@ -344,6 +368,7 @@ mod tests {
         assert_eq!(classify("!"), Secret::Locked);
         assert_eq!(classify("!!"), Secret::Locked);
         assert_eq!(classify("!$6$salt$hash"), Secret::Locked);
+        assert_eq!(classify("!td-service"), Secret::Service);
         assert_eq!(classify("$6$salt$hash"), Secret::Hashed);
         assert_eq!(classify("x"), Secret::Hashed);
     }
@@ -363,5 +388,17 @@ mod tests {
         assert_eq!(may_start_session(Secret::Hashed, true), Ok(()));
         assert_eq!(may_start_session(Secret::Locked, false), Err(Denied::Locked));
         assert_eq!(may_start_session(Secret::Locked, true), Err(Denied::Locked));
+        assert_eq!(
+            may_start_session(Secret::Service, false),
+            Err(Denied::ServiceOnly)
+        );
+        assert_eq!(
+            may_start_session(Secret::Service, true),
+            Err(Denied::ServiceOnly)
+        );
+        assert_eq!(may_start_service(Secret::Service), Ok(()));
+        for secret in [Secret::NoPassword, Secret::Locked, Secret::Hashed] {
+            assert_eq!(may_start_service(secret), Err(Denied::NotService));
+        }
     }
 }

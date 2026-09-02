@@ -350,6 +350,11 @@ mod confinement {
             "`owned` is named somewhere else on the launch path, so the field \
              this test pins is not necessarily what reaches the broker"
         );
+        assert!(
+            at("bus::require_accepting_endpoint(") < at("ManagedCgroup::create("),
+            "Pulse authority liveness is no longer proved before launch-side \
+             resources and namespaces are created"
+        );
         assert!(at("ManagedCgroup::create(") < at("bus::register("));
         assert!(at("bus::register(") < at("sys::unshare_namespaces("));
         assert!(at("bus::register(") < at("close_inherited_descriptors("));

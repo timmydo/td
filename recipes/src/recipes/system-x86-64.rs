@@ -124,8 +124,9 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 
 /// One account materialised into `/etc/passwd`, `/etc/group`, `/etc/shadow`, and a
 /// home directory. `passwordless` writes an EMPTY shadow password — convenient for
-/// a throwaway VM (the auto-login path bypasses auth anyway); set it false for a
-/// locked account.
+/// a throwaway VM (the auto-login path bypasses auth anyway). With both account
+/// class flags false the password is ordinarily locked; `service_only` selects
+/// td-login's distinct non-human service marker instead.
 struct User {
     name: &'static str,
     uid: u32,
@@ -140,6 +141,10 @@ struct User {
     /// `build_group` first, then it may be named here.
     groups: &'static [&'static str],
     passwordless: bool,
+    /// Mark this account with td-login's exact service-only shadow class.
+    /// Such an account is refused by login, login -f, su, and ordinary
+    /// exec-as; only exec-service-as may enter it.
+    service_only: bool,
 }
 
 /// One application selected into this immutable deployment. The package is a
@@ -187,9 +192,9 @@ const SSHD_PRIVSEP_UID: u32 = 995;
 const SSHD_PRIVSEP_GID: u32 = 995;
 const SSHD_PRIVSEP_PATH: &str = "/run/sshd-empty";
 const AUDIO_USER: &str = "audio";
-const AUDIO_UID: u32 = 994;
-const AUDIO_GID: u32 = 994;
-pub(super) const AUDIO_RUNTIME: &str = "/run/td-audio";
+const AUDIO_UID: u32 = td_engine::permissions::TD_AUDIO_UID;
+const AUDIO_GID: u32 = td_engine::permissions::TD_AUDIO_GID;
+pub(super) const AUDIO_RUNTIME: &str = td_engine::permissions::TD_AUDIO_RUNTIME_PATH;
 const PROFILER_CAPTURE_SECS: u16 = 60;
 const PROFILER_EVIDENCE_TIMEOUT_SECS: u16 = 300;
 const PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS: u16 = 315;
@@ -360,6 +365,7 @@ const SYSTEM: SystemDef = SystemDef {
             shell: "/bin/sh",
             groups: &[],
             passwordless: true,
+            service_only: false,
         },
         User {
             name: PROFILER_USER,
@@ -370,6 +376,7 @@ const SYSTEM: SystemDef = SystemDef {
             shell: "/bin/sh",
             groups: &[],
             passwordless: false,
+            service_only: false,
         },
         User {
             name: AUDIO_USER,
@@ -380,6 +387,7 @@ const SYSTEM: SystemDef = SystemDef {
             shell: "/bin/false",
             groups: &[],
             passwordless: false,
+            service_only: true,
         },
         User {
             name: "tester",
@@ -390,6 +398,7 @@ const SYSTEM: SystemDef = SystemDef {
             shell: "/bin/sh",
             groups: &["wheel"],
             passwordless: true,
+            service_only: false,
         },
     ],
     applications: SHIPPED_APPLICATIONS,
@@ -937,11 +946,16 @@ fn gets_generic_persistent_home_setup(user: &User) -> bool {
 fn build_shadow(sys: &SystemDef) -> String {
     let mut s = String::new();
     for u in sys.users {
-        // Empty password field => no password (login -f bypasses auth regardless;
-        // an empty field also lets `su` reach the account on a throwaway VM). A
-        // non-passwordless account is locked (`!`). A fixed last-change day (19000)
-        // keeps the file reproducible (no wall-clock date).
-        let pw = if u.passwordless { "" } else { "!" };
+        // Empty password field => no password. `!` is an ordinary lock, while
+        // the exact td marker is denied by every human path and admitted only
+        // by exec-service-as. A fixed last-change day keeps this reproducible.
+        let pw = if u.service_only {
+            "!td-service"
+        } else if u.passwordless {
+            ""
+        } else {
+            "!"
+        };
         s.push_str(&format!("{}:{}:19000:0:99999:7:::\n", u.name, pw));
     }
     s.push_str(&format!(
@@ -1024,13 +1038,14 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 23] = [
+const TD_SVC_UNITS: [&str; 24] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
     "profiler",
     "profiler-evidence",
     "seat",
+    "audio",
     "netup",
     "busd",
     "portal",
@@ -1207,6 +1222,19 @@ fn build_td_svc_conf() -> String {
          after=rootcheck\n\
          timeout={seat}\n\
          \n\
+         # The service-only audio identity owns the playback PCMs and daemon\n\
+         # socket. A live connect is required before applications may launch.\n\
+         [audio]\n\
+         type=daemon\n\
+         exec=/bin/td-seatd exec-audio --uid {ui_uid} --gid {ui_gid} --audio-uid {audio_uid} --audio-gid {audio_gid} -- /bin/td-login exec-service-as {audio_user} -- /bin/td-audio serve --socket {audio_socket}\n\
+         after=seat\n\
+         requires=seat\n\
+         ready=/bin/td-login exec-service-as {audio_user} -- /bin/td-audio probe --socket {audio_socket}\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         log=/var/log/svc/td-audio.log\n\
+         console=yes\n\
+         \n\
          # Networking after the read-only-root self-check.\n\
          [netup]\n\
          type=oneshot\n\
@@ -1349,7 +1377,7 @@ fn build_td_svc_conf() -> String {
          [firefox]\n\
          type=daemon\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name} --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name};; esac'\n\
-         after=busd,portal,wayland,firefox-autotest,firefox-tls-origin\n\
+         after=audio,busd,portal,wayland,firefox-autotest,firefox-tls-origin\n\
          requires=wayland,firefox-autotest,firefox-tls-origin\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
@@ -1444,6 +1472,8 @@ fn build_td_svc_conf() -> String {
         ui_uid = UI_UID,
         audio_uid = AUDIO_UID,
         audio_gid = AUDIO_GID,
+        audio_user = AUDIO_USER,
+        audio_socket = td_engine::permissions::TD_AUDIO_SOCKET_PATH,
         portal_settings = TD_PORTAL_SETTINGS_PATH,
         portal_runtime_marker = TD_PORTAL_RUNTIME_MARKER,
         portal_request_runtime_marker = TD_PORTAL_REQUEST_RUNTIME_MARKER,
@@ -3496,6 +3526,10 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         dest: "{root}/real-root{in:td-seatd}".into(),
     });
     steps.push(Step::CopyTree {
+        from: "{in:td-audio}".into(),
+        dest: "{root}/real-root{in:td-audio}".into(),
+    });
+    steps.push(Step::CopyTree {
         from: "{in:td-compositor}".into(),
         dest: "{root}/real-root{in:td-compositor}".into(),
     });
@@ -3664,6 +3698,10 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::Symlink {
         target: "{in:td-seatd}/bin/td-seatd".into(),
         link: "{root}/real-root/bin/td-seatd".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-audio}/bin/td-audio".into(),
+        link: "{root}/real-root/bin/td-audio".into(),
     });
     steps.push(Step::Symlink {
         target: "{in:td-compositor}/bin/td-compositor".into(),
@@ -3954,7 +3992,9 @@ fn shape_check() -> String {
      done; \
      [ -e \"$root/bin/verify-credentials\" ] && { echo 'root tree: verify-credentials is a readback PROBE, not an applet; a /bin symlink for it is a name no farm list accounts for' >&2; exit 1; }; \
      [ -e \"$root/bin/exec-as\" ] && { echo 'root tree: exec-as is a SUBCOMMAND, not an applet; a /bin/exec-as symlink would be a name no farm list in system-x86-64.rs accounts for, and one a reader could mistake for a general-purpose run-as-anyone tool beside su. It is not a privilege boundary - creds::may_switch is - so this refuses an unaccounted NAME, not a reachable capability' >&2; exit 1; }; \
+     [ -e \"$root/bin/exec-service-as\" ] && { echo 'root tree: exec-service-as is a SUBCOMMAND, not an applet' >&2; exit 1; }; \
      \"$tdl\" exec-as 2>/dev/null && { echo 'td-login exec-as ACCEPTED an argv with no user and no program - its parser is what keeps a supervisor unit from starting something nobody named' >&2; exit 1; }; \
+     \"$tdl\" exec-service-as 2>/dev/null && { echo 'td-login exec-service-as ACCEPTED an argv with no service account and no program' >&2; exit 1; }; \
      \"$tdl\" verify-credentials --uid 4294967294 --gid 4294967294 >/dev/null 2>&1 && { echo 'td-login verify-credentials ACCEPTED credentials this build process cannot have - the readback the TD-LOGIN-RUN-OK marker gates on proves nothing' >&2; exit 1; }; \
      set -- $(ls -l \"$tdl\"); case \"$1\" in *[sS]*) echo \"root tree: the packed td-login carries a setuid/setgid bit (mode $1). td-login is NEVER installed setuid-root (td-login/THREAT-MODEL.md section 4): with one, an unprivileged caller starts with euid 0 and 'su root' becomes root without authenticating\" >&2; exit 1;; esac; \
      tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
@@ -3971,6 +4011,8 @@ fn shape_check() -> String {
      tdj=\"{root}/real-root{in:td-jail}/bin/td-jail\"; { [ -f \"$tdj\" ] && [ -x \"$tdj\" ]; } || { echo 'root tree: td-jail is not packed and executable, so the running-kernel transition oracle cannot run' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
      seat=\"{root}/real-root{in:td-seatd}/bin/td-seatd\"; { [ -f \"$seat\" ] && [ -x \"$seat\" ]; } || { echo 'root tree: td-seatd is not packed and executable' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-audio\" 2>/dev/null)\" = \"{in:td-audio}/bin/td-audio\" ] || { echo 'root tree: /bin/td-audio is not a symlink to the staged audio daemon' >&2; exit 1; }; \
+     audio=\"{root}/real-root{in:td-audio}/bin/td-audio\"; { [ -f \"$audio\" ] && [ -x \"$audio\" ]; } || { echo 'root tree: td-audio is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-compositor\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-compositor\" ] || { echo 'root tree: /bin/td-compositor is not a symlink to the staged software Wayland compositor' >&2; exit 1; }; \
      compositor=\"{root}/real-root{in:td-compositor}/bin/td-compositor\"; { [ -f \"$compositor\" ] && [ -x \"$compositor\" ]; } || { echo 'root tree: td-compositor is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-term\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-term\" ] || { echo 'root tree: /bin/td-term is not a symlink to the staged terminal' >&2; exit 1; }; \
@@ -3992,7 +4034,7 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); ts=$(svcpos firefox-tls-setup); pc=$(svcpos portal-channel-evidence); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); po=$(svcpos portal); pv=$(svcpos portal-evidence); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); au=$(svcpos audio); nu=$(svcpos netup); wl=$(svcpos wayland); ts=$(svcpos firefox-tls-setup); pc=$(svcpos portal-channel-evidence); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); po=$(svcpos portal); pv=$(svcpos portal-evidence); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$pf\" ] && [ \"$pf\" -lt \"$pe\" ] || { echo 'td-svc would not serialize rootcheck -> profiler -> profiler evidence' >&2; exit 1; }; \
@@ -4001,6 +4043,7 @@ fn shape_check() -> String {
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$pc\" ] && [ \"$ts\" -lt \"$pc\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$ff\" ] && [ \"$ff\" -lt \"$fe\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland plus TLS setup -> private portal-channel evidence, wayland -> terminal + Firefox evidence, and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
+     [ \"$st\" -lt \"$au\" ] && [ \"$au\" -lt \"$ff\" ] || { echo 'td-svc would not serialize seat -> audio -> Firefox' >&2; exit 1; }; \
      [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds inside the runtime directory td-seatd makes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
      [ \"$bd\" -lt \"$po\" ] && [ \"$po\" -lt \"$pv\" ] && [ \"$po\" -lt \"$ff\" ] || { echo 'td-svc would not serialize busd -> portal -> live portal evidence and Firefox' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
@@ -4342,6 +4385,7 @@ pub fn recipe() -> Recipe {
         // td-jail: the static application boundary; its target-kernel transition probe
         //   and the Firefox launch both run on every boot.
         // td-seatd/td-compositor: the static single-user UI substrate and terminal.
+        // td-audio: the static ALSA/Pulse daemon for the service-only audio account.
         // td-busd: the static session D-Bus broker used by every Firefox launch.
         // td-portal: the static Settings service, activation supervisor, and
         //   unprivileged live client probe.
@@ -4371,6 +4415,7 @@ pub fn recipe() -> Recipe {
             "td-profiler",
             "td-jail",
             "td-seatd",
+            "td-audio",
             "td-compositor",
             "td-busd",
             "td-portal",
@@ -4506,8 +4551,13 @@ mod tests {
             .find(|user| user.name == AUDIO_USER)
             .unwrap_or_else(|| unreachable!("no audio account"));
         assert_eq!(
-            (account.uid, account.gid, account.passwordless),
-            (AUDIO_UID, AUDIO_GID, false)
+            (
+                account.uid,
+                account.gid,
+                account.passwordless,
+                account.service_only,
+            ),
+            (AUDIO_UID, AUDIO_GID, false, true)
         );
         assert!(build_passwd(&SYSTEM).contains(&format!(
             "{AUDIO_USER}:x:{AUDIO_UID}:{AUDIO_GID}:System Audio:{AUDIO_RUNTIME}:/bin/false\n"
@@ -4515,11 +4565,52 @@ mod tests {
         assert!(build_group(&SYSTEM).contains(&format!(
             "{AUDIO_USER}:x:{AUDIO_GID}:\n"
         )));
-        assert!(build_shadow(&SYSTEM).contains(&format!("{AUDIO_USER}:!:")));
+        assert!(
+            build_shadow(&SYSTEM).contains(&format!("{AUDIO_USER}:!td-service:"))
+        );
         let init = build_deployment_init(&SYSTEM);
         let rootcheck = build_rootcheck(&SYSTEM);
         assert!(!init.contains("/sysroot/var/run/td-audio"));
         assert!(!rootcheck.contains(AUDIO_RUNTIME));
+    }
+
+    #[test]
+    fn audio_daemon_is_packed_supervised_and_ready_before_firefox() {
+        let steps = recipe().steps.unwrap_or_default();
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::CopyTree { from, dest }
+                if from == "{in:td-audio}" && dest == "{root}/real-root{in:td-audio}"
+        )));
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::Symlink { target, link }
+                if target == "{in:td-audio}/bin/td-audio"
+                    && link == "{root}/real-root/bin/td-audio"
+        )));
+        let native_inputs = recipe().native_inputs.unwrap_or_default();
+        assert!(native_inputs.iter().any(|input| input == "td-audio"));
+        assert_eq!(
+            unit_key("audio", "exec"),
+            Some(format!(
+                "/bin/td-seatd exec-audio --uid {UI_UID} --gid {UI_GID} \
+                 --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID} -- \
+                 /bin/td-login exec-service-as {AUDIO_USER} -- /bin/td-audio \
+                 serve --socket {}",
+                td_engine::permissions::TD_AUDIO_SOCKET_PATH
+            ))
+        );
+        assert_eq!(
+            unit_key("audio", "ready"),
+            Some(format!(
+                "/bin/td-login exec-service-as {AUDIO_USER} -- /bin/td-audio \
+                 probe --socket {}",
+                td_engine::permissions::TD_AUDIO_SOCKET_PATH
+            ))
+        );
+        assert_eq!(unit_key("audio", "requires").as_deref(), Some("seat"));
+        assert_eq!(unit_key("audio", "restart").as_deref(), Some("always"));
+        assert!(ordered_before("audio", "firefox"));
     }
 
     #[test]
@@ -5514,6 +5605,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             ("td-firstboot", vec!["hostname"]),
             ("rootcheck", vec!["td-firstboot"]),
             ("seat", vec!["rootcheck"]),
+            ("audio", vec!["seat"]),
             ("netup", vec!["rootcheck"]),
             ("busd", vec!["seat"]),
             ("portal", vec!["busd"]),
@@ -5530,6 +5622,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             (
                 "firefox",
                 vec![
+                    "audio",
                     "busd",
                     "portal",
                     "wayland",
@@ -6238,6 +6331,18 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             SYSTEM.autologin
         );
         for u in SYSTEM.users {
+            assert!(
+                !(u.passwordless && u.service_only),
+                "user '{}' cannot be both passwordless and service-only",
+                u.name
+            );
+            if u.service_only {
+                assert_eq!(
+                    u.shell, "/bin/false",
+                    "service-only user '{}' must have the non-login shell",
+                    u.name
+                );
+            }
             assert_ne!(
                 u.uid, SSHD_PRIVSEP_UID,
                 "user '{}' collides with the reserved OpenSSH privilege-separation uid {}",
@@ -10241,11 +10346,11 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 "/bin/{applet} must resolve to the staged td-login multicall"
             );
         }
-        // Neither SUBCOMMAND gets a /bin name: neither is an applet, and a farm-less /bin
+        // No subcommand gets a /bin name: none is an applet, and a farm-less /bin
         // entry is one no list in this file accounts for and no shape check verifies.
         // Roster hygiene rather than a boundary — `/bin/td-login` is a shipped symlink,
         // so the subcommand is reachable either way; `creds::may_switch` is the gate.
-        for subcommand in ["verify-credentials", "exec-as"] {
+        for subcommand in ["verify-credentials", "exec-as", "exec-service-as"] {
             assert!(
                 !packed_bin_names().iter().any(|n| n == subcommand),
                 "{subcommand} is a subcommand, not an applet; it must not be packed into /bin"
@@ -10297,6 +10402,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             shell: "/bin/sh",
             groups: &[],
             passwordless: true,
+            service_only: false,
         }];
         let lone = SystemDef {
             autologin: "solo",

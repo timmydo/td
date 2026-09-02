@@ -450,6 +450,9 @@ fn interactive_command(
         .args(["-netdev", QEMU_USER_NETDEV])
         .args(["-device", QEMU_USER_NET_DEVICE])
         .args(["-device", "virtio-vga"])
+        .args(["-audiodev", "none,id=audio0"])
+        .args(["-device", "intel-hda"])
+        .args(["-device", "hda-output,audiodev=audio0"])
         // An ABSOLUTE pointer, and here it is the point rather than a proof: an
         // operator sitting in front of this one has a host cursor, and QEMU's
         // PS/2 mouse gives the guest deltas it accumulates — which leaves the
@@ -498,7 +501,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     #[test]
-    fn interactive_network_is_explicit_guest_initiated_user_nat() {
+    fn interactive_network_and_audio_devices_are_explicit() {
         let accel = AccelPlan {
             names: &["tcg"],
             label: "TCG",
@@ -542,6 +545,13 @@ mod tests {
         }));
         assert!(!arguments.iter().any(|argument| argument.contains("hostfwd")));
         assert!(!arguments.iter().any(|argument| argument == "-nic"));
+        for expected in [
+            "none,id=audio0",
+            "intel-hda",
+            "hda-output,audiodev=audio0",
+        ] {
+            assert_eq!(count(expected), 1, "missing exact audio argument {expected}");
+        }
     }
 
     #[test]

@@ -216,15 +216,47 @@ impl Write for Timed<'_> {
 /// returns, the thread is left holding it and the process exits out from
 /// under it, which is exactly what should happen to a launch that failed.
 fn connect_within(socket: &Path, budget: Duration) -> io::Result<UnixStream> {
+    connect_endpoint_within(socket, budget, "the session bus")
+}
+
+/// Prove that an authority socket has a live listener before its directory is
+/// exposed to an application. Metadata alone cannot distinguish a listener
+/// from the socket inode left behind by an abruptly terminated daemon.
+pub(crate) fn require_accepting_endpoint(
+    socket: &Path,
+    budget: Duration,
+    what: &str,
+) -> io::Result<()> {
+    let path = socket.to_path_buf();
+    match within_required(budget, move || UnixStream::connect(&path))? {
+        Some(Ok(stream)) => {
+            drop(stream);
+            Ok(())
+        }
+        Some(Err(error)) => Err(io::Error::other(format!(
+            "connect to {what} at {socket:?}: {error}"
+        ))),
+        None => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("connect to {what} at {socket:?}: it never accepted"),
+        )),
+    }
+}
+
+fn connect_endpoint_within(
+    socket: &Path,
+    budget: Duration,
+    what: &str,
+) -> io::Result<UnixStream> {
     let path = socket.to_path_buf();
     match within(budget, move || UnixStream::connect(&path)) {
         Some(Ok(stream)) => Ok(stream),
         Some(Err(error)) => Err(io::Error::other(format!(
-            "connect to the session bus at {socket:?}: {error}"
+            "connect to {what} at {socket:?}: {error}"
         ))),
         None => Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("connect to the session bus at {socket:?}: it never accepted"),
+            format!("connect to {what} at {socket:?}: it never accepted"),
         )),
     }
 }
@@ -332,6 +364,43 @@ fn within<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
     within_spawning(budget, true, work)
+}
+
+/// Run bounded work only when its deadline helper can be created.
+///
+/// The authority liveness probe runs before namespaces and has no reason to
+/// inherit phase two's unbounded inline fallback. If resource exhaustion
+/// prevents the helper, refusing the application preserves the advertised
+/// deadline and leaves no launch resources behind.
+fn within_required<T: Send + 'static>(
+    budget: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<Option<T>> {
+    within_required_spawning(budget, true, work)
+}
+
+fn within_required_spawning<T: Send + 'static>(
+    budget: Duration,
+    may_spawn: bool,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<Option<T>> {
+    let (done, waiting) = std::sync::mpsc::channel();
+    let spawned = match may_spawn {
+        true => std::thread::Builder::new().spawn(move || {
+            let _ = done.send(work());
+        }),
+        false => Err(io::Error::other("the spawn is suppressed for a test")),
+    };
+    let helper = spawned.map_err(|error| {
+        io::Error::other(format!(
+            "cannot start the bounded authority-connect helper: {error}"
+        ))
+    })?;
+    let answer = waiting.recv_timeout(budget).ok();
+    if answer.is_some() {
+        let _ = helper.join();
+    }
+    Ok(answer)
 }
 
 /// `within`, with the spawn suppressible.
@@ -1277,6 +1346,53 @@ mod tests {
             .to_string();
         assert!(error.contains("connect to the session bus"), "{error}");
     }
+
+    /// A socket inode is not proof of a listening authority. Abrupt service
+    /// death leaves the pathname behind, and admitting it would give a newly
+    /// launched application a permanently dead endpoint.
+    #[test]
+    fn an_authority_probe_requires_a_live_listener() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = scratch();
+        let socket = dir.join("native");
+        let listener = UnixListener::bind(&socket).unwrap();
+        require_accepting_endpoint(
+            &socket,
+            Duration::from_secs(1),
+            "test audio authority",
+        )
+        .unwrap();
+        drop(listener);
+
+        let error = require_accepting_endpoint(
+            &socket,
+            Duration::from_secs(1),
+            "test audio authority",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("test audio authority"), "{error}");
+        assert!(error.contains("refused"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Resource exhaustion may prevent a helper thread before the namespace
+    /// transition. The authority probe must refuse at that point rather than
+    /// run a potentially blocking connect inline and lose its deadline.
+    #[test]
+    fn an_authority_probe_requires_its_deadline_helper() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        let error = within_required_spawning(Duration::from_secs(1), false, move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("bounded authority-connect helper"), "{error}");
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     /// A broker that accepts and then says nothing does not hang the launch.
     ///
     /// This is the claim the module doc makes at its head — a launch that
@@ -1665,6 +1781,10 @@ mod tests {
             shipped.contains("within_spawning(budget, true, work)"),
             "`within` no longer attempts a helper on the shipped path"
         );
+        assert!(
+            shipped.contains("within_required(budget, move || UnixStream::connect(&path))"),
+            "the authority liveness probe no longer requires its bounded helper"
+        );
         // The work is parked where the refusal can hand it back, rather than
         // moved into a closure that a refusal drops.
         assert!(
@@ -1689,12 +1809,16 @@ mod tests {
             "connect_within no longer runs the connect under a deadline, so a \
              listener that never accepts holds the launch for ever"
         );
-        // And nothing else reaches the raw connect: the one inside `within`
-        // above is the only mention in the shipped half of this file.
+        assert!(
+            shipped.contains("within_required(budget, move || UnixStream::connect("),
+            "the authority connect no longer runs under its required helper"
+        );
+        // Nothing else reaches the raw connect: the bus exchange and the
+        // authority liveness probe are the two bounded production sites.
         assert_eq!(
             shipped.matches("UnixStream::connect(").count(),
-            1,
-            "a second, unbounded connect appeared"
+            2,
+            "an unbounded connect appeared or a bounded connect disappeared"
         );
     }
 

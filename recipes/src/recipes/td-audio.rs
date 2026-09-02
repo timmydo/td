@@ -10,9 +10,8 @@ use crate::types::{Recipe, Step};
 //
 // This is APPLICATIONS.md §I rungs 25 and 26 — the ALSA PCM back end and its
 // mixer, driven by a tone fixture, plus the PulseAudio protocol and the socket
-// the daemon serves it on. The dedicated `audio` account §K.5 specifies is a
-// rung of its own and precedes the unit that runs this; nothing here is
-// selected into an image yet.
+// the daemon serves it on. The system image supplies §K.5's dedicated `audio`
+// account before its unit selects and starts this output.
 const MAIN_RS: &str = include_str!("../../../td-audio/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     ("alsa", include_str!("../../../td-audio/src/alsa.rs")),
@@ -212,6 +211,22 @@ mod tests {
             step,
             Step::SplitDebugTree { root, .. } if root == "{out}"
         )));
+    }
+
+    #[test]
+    fn daemon_socket_mode_matches_the_jail_contract() {
+        let serve = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "serve").then_some(*source))
+            .expect("serve module");
+        let expected = format!(
+            "pub const SOCKET_MODE: u32 = {:#o};",
+            td_engine::permissions::TD_AUDIO_SOCKET_MODE
+        );
+        assert!(
+            serve.contains(&expected),
+            "td-audio must publish the mode td-jail validates: {expected}"
+        );
     }
 
     /// The shipped text carries the surface `UNSAFE.md` §13 records, and nothing
