@@ -3321,6 +3321,21 @@ the smaller of that size field and the struct's own size, so an oversized
 number is harmless while a buffer shortened without the number is an
 out-of-bounds write.
 
+This crate maps no memory: wl_shm pixels are copied out of client pools with
+`FileExt::read_exact_at` and the device is written with `seek`+`write_all`.
+The DRM/KMS output backend `APPLICATIONS.md` §M plans cannot keep that
+property, because a dumb buffer has no `write(2)` path. `UNSAFE.md` §6's
+mapping-class subsection therefore records what that landing must look like
+before it is written — `mmap`/`munmap` pinned to one owned card descriptor, a
+region type holding the length the mapping was created with, a `Drop` that
+unmaps, a lent slice rather than an escaping pointer, and confinement tests
+in the same guard style as the descriptor types above. It is an anticipation
+rather than an allowance: no source in the crate names `mmap`, the
+confinement tests still pin the absence of `unsafe` outside `sys.rs`, and the
+landing that adds a mapping amends both documents together. Naming
+the class now is the point, since it is the one shape the roster's
+syscall-instruction phrasing does not describe.
+
 ## 5. Boot and recovery
 
 This section records the boot profile. The td-term cutover of sections 12 and

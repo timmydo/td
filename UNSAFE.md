@@ -404,7 +404,8 @@ a `File`; the one thing that does not is the POSITION a resync reads, since
 publishes it, which is a cursor move that came through this surface rather
 than through a file), Unix socket setup and
 byte I/O (`std`), mmap (wl_shm
-pixels are copied with `FileExt`), device ownership (safe `td-seatd`), or
+pixels are copied with `FileExt`; the mapping hardware rendering will need is
+anticipated below rather than present), device ownership (safe `td-seatd`), or
 anything else the PTY needs — no termios call (the slave's kernel defaults
 ARE the canonical-input policy), no `setsid(2)` or `TIOCSCTTY` (the child
 gets its session from the declared `td-init` input's `cttyhack --stdin`),
@@ -468,6 +469,65 @@ rule is the TYPE's: a `Reader` is not clonable, exposes no descriptor, and a
 `Connection` refuses both to read and to detach again once it has given one
 up. Detaching also requires the handshake to be over, because the socket
 read timeout a deadline sets outlives the deadline itself.
+
+### The anticipated mapping class
+
+Nothing in this crate maps memory, and the surface above is complete as
+written. This subsection is an ANTICIPATION, recorded before the code exists
+because `APPLICATIONS.md` §M asks for it: the DRM/KMS output backend that
+replaces `/dev/fb0` cannot keep the no-mmap property — a dumb buffer has no
+`write(2)` path, so pixels enter through a mapping of the card descriptor —
+and the roster's current phrasing does not describe what that needs. Writing
+the shape down now is what lets the author of that landing amend a plan
+instead of bending around a rule.
+
+It is a new CLASS rather than a thirteenth syscall on an existing one. Every
+surface in this file is a syscall-instruction one-shot: the unsafe begins at
+the instruction and ends when it returns, and what returns is a number that
+safe code then owns. §11's perf ring is the one mapping already rostered and
+it is not this shape either — `Ring` copies bytes out before they leave the
+module, so no pointer and no borrowed region escapes `sys.rs`, which is
+exactly why "owns the pointer accesses into the perf ring mapping" was
+enough to describe it. A scanout target inverts that. The mapping IS the
+destination: the renderer writes pixels INTO it, so a slice over
+kernel-owned memory must cross a module boundary and stay valid while the
+frame is drawn. Neither "one instruction" nor "nothing escapes the module"
+covers a lifetime-carrying mapping, and a class nobody named is a class
+somebody adds quietly.
+
+What the amendment must budget when it lands:
+
+- `mmap(2)` and `munmap(2)` join surface #6. `mmap` is pinned to a shared
+  read/write mapping of one owned card descriptor at the kernel-reported
+  offset and length of a dumb buffer this crate created; `munmap` receives
+  only the owned pair. That is §11's pinning, for §11's reason.
+- One region type owns the pair. Its length is the length the mapping was
+  created with, held in the type rather than recomputed at each use. A length
+  that can drift from its mapping is an out-of-bounds write the compiler
+  reads as safe — the `EVIOCGABS` buffer's failure mode, one layer up, and
+  the reason that request number and `ABSINFO_WORDS` are pinned together.
+- `Drop` unmaps, nothing else does, and the type is not clonable: the
+  region's lifetime is the value's, which is the property its name claims.
+- The borrowed slice is the only way out. No raw pointer reaches the
+  renderer, and the borrow cannot outlive the guard — the `ReceivedFd` and
+  `BorrowedFd` guard style this section already uses for descriptors,
+  applied to bytes instead.
+- Confinement tests pin the allow count, both syscall numbers, the single
+  owning module, the single construction site, and the length, exactly as
+  the descriptor guards are pinned today.
+- A dmabuf that must be CPU-read needs `DMA_BUF_IOCTL_SYNC` bracketing the
+  access. That is a seventh value-pinned `ioctl` request, not a widening of
+  the entry point to caller-supplied requests, and it is named here so the
+  count is right when it arrives rather than discovered in a diff.
+
+None of this is authorization, and none of it is in the code: the
+confinement tests still pin the absence of `unsafe` from every module but
+`sys.rs`, `sys.rs` carries neither mapping syscall, and no source in the
+crate names `mmap` at all. What the landing gains is that its shape was reviewed before it was written; what it
+still owes is the ordinary amendment to this file, to the roster table, and
+to `td-compositor/DESIGN.md` §4 in the same commit. What this subsection
+settles is only that the answer is not "refuse `mmap` forever", which is the
+one way td could paint itself out of hardware rendering.
 
 ## 7. `td-util` — the diagnostics multicall
 

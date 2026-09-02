@@ -7608,12 +7608,13 @@ fd, and any dmabuf that must be CPU-read is `mmap` plus
 `DMA_BUF_IOCTL_SYNC`. So the GPU path's first landing carries an
 `UNSAFE.md` amendment of a genuinely **new class**: not another
 syscall-instruction one-shot but a *lifetime-carrying mapping*, which the
-roster's current phrasing does not cover. Write that anticipation into
-`UNSAFE.md` **now**, so the future author amends a plan instead of
-bending around a rule — budget a mapped-region abstraction with a pinned
-length, a `Drop`-based unmap, and confinement tests in the `BorrowedFd`
-guard style. Refusing `mmap` forever is the one way td could actually
-paint itself into this corner.
+roster's current phrasing does not cover. That anticipation is now
+written down: `UNSAFE.md` §6's mapping-class subsection budgets a
+mapped-region abstraction with a pinned length, a `Drop`-based unmap, a
+lent slice rather than an escaping pointer, and confinement tests in the
+`BorrowedFd` guard style, so the future author amends a plan instead of
+bending around a rule. Refusing `mmap` forever is the one way td could
+actually paint itself into this corner.
 
 What to change now, while it is cheap — and nothing more:
 
