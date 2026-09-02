@@ -594,8 +594,9 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// separate 20-second asynchronous file-observation window. The real Firefox
 /// FileChooser proof adds four 60-second boundaries: arm, focus confirmation,
 /// portal completion and result. Raising the host ceiling by those bounds keeps
-/// it beyond the guest and diagnostic clocks.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2295;
+/// it beyond the guest and diagnostic clocks. The public Firefox navigation adds
+/// one further 60-second boundary to the network oracle's evidence transaction.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2355;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// The source release identities and exact `--version` output shared by the
@@ -987,9 +988,15 @@ pub const SYSTEM_NET_REACH_MARKER: &str = "TD-NET-REACH-OK";
 /// the remote HEAD. Like the other network markers, this is operator-only evidence.
 pub const GIT_HTTPS_RUNTIME_MARKER: &str = "TD-GIT-HTTPS-OK";
 
+/// Printed by the Firefox evidence transaction after the jailed browser navigates
+/// to the public test origin, completes the HTTPS document load, and validates the
+/// resulting content context. Like the other network markers, this is operator-only
+/// evidence under `NETTEST_CMDLINE_TOKEN`.
+pub const FIREFOX_NETWORK_RUNTIME_MARKER: &str = "TD-FIREFOX-NETWORK-HTTPS-OK";
+
 /// Kernel-cmdline token the headless `qemu-boot-net` oracle appends so `/etc/netup`
-/// runs the resolve+reach and Git HTTPS self-tests (and prints the four markers
-/// above). Absent it
+/// runs the resolve+reach and Git HTTPS self-tests and prints the four non-Firefox
+/// markers. The later Firefox evidence transaction prints the fifth marker. Absent it
 /// (normal boot, or the `-nic none` `qemu-boot-system` oracle), td-netd still brings
 /// the link up but the self-test and its markers are skipped.
 pub const NETTEST_CMDLINE_TOKEN: &str = "td.nettest=1";
@@ -1001,6 +1008,7 @@ pub const NETTEST_CMDLINE_TOKEN: &str = "td.nettest=1";
 pub const NETTEST_DEFAULT_HOST: &str = "git.kernel.org";
 pub const NETTEST_DEFAULT_PORT: &str = "443";
 pub const GIT_HTTPS_TEST_URL: &str = "https://git.kernel.org/pub/scm/git/git.git";
+pub const FIREFOX_NETWORK_TEST_URL: &str = "https://git.kernel.org/";
 
 // ── kexec-spike-x86-64 two-kernel boot markers (Phase-0 kexec spike) ─────────────
 // The spike proves the source-built kernel can kexec_file_load(2) + reboot(KEXEC) a

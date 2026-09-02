@@ -58,6 +58,7 @@ fn run() -> std::io::Result<()> {
             transition::probe_process_token(&application, &token)
         }
         transition::Mode::FirefoxSupportProbe => transition::probe_firefox_support(),
+        transition::Mode::FirefoxNetworkProbe => transition::probe_firefox_network(),
         transition::Mode::FirefoxInputProbe { stage } => {
             transition::probe_firefox_input(stage)
         }

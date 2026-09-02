@@ -234,19 +234,22 @@ const PERSIST_READ_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_READ_CMDLINE
 const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = td_recipe::ladder::DEPLOY_INSTALL_CMDLINE_TOKEN;
 const BOOT_FAIL_TARGET_CMDLINE_TOKEN: &str = td_recipe::ladder::BOOT_FAIL_TARGET_CMDLINE_TOKEN;
 
-/// The four networking markers `/etc/netup` prints under the nettest token: the link
-/// came up + DHCP applied, td-netd resolved and reached the test host, then Git read an
-/// upstream HEAD over verified HTTPS. `qemu-boot-net` asserts all four. Shared with the
-/// recipe via `td_recipe::ladder` so they can never desync.
+/// The networking markers trusted target units print under the nettest token: the
+/// link came up + DHCP applied, td-netd resolved and reached the test host, Git read
+/// an upstream HEAD over verified HTTPS, and Firefox loaded a public HTTPS document.
+/// `qemu-boot-net` asserts all five. Shared with the recipe via `td_recipe::ladder`.
 const SYSTEM_NET_UP_MARKER: &str = td_recipe::ladder::SYSTEM_NET_UP_MARKER;
 const SYSTEM_NET_RESOLVE_MARKER: &str = td_recipe::ladder::SYSTEM_NET_RESOLVE_MARKER;
 const SYSTEM_NET_REACH_MARKER: &str = td_recipe::ladder::SYSTEM_NET_REACH_MARKER;
 const GIT_HTTPS_RUNTIME_MARKER: &str = td_recipe::ladder::GIT_HTTPS_RUNTIME_MARKER;
+const FIREFOX_NETWORK_RUNTIME_MARKER: &str =
+    td_recipe::ladder::FIREFOX_NETWORK_RUNTIME_MARKER;
 const GIT_HTTPS_TEST_URL: &str = td_recipe::ladder::GIT_HTTPS_TEST_URL;
+const FIREFOX_NETWORK_TEST_URL: &str = td_recipe::ladder::FIREFOX_NETWORK_TEST_URL;
 
-/// The kernel-cmdline token `qemu-boot-net` appends so `/etc/netup` runs the
-/// resolve+reach+Git HTTPS self-test (and prints the four markers above). Shared via
-/// `td_recipe::ladder` with the recipe's netup gate.
+/// The kernel-cmdline token `qemu-boot-net` appends so `/etc/netup` runs its
+/// four-marker resolve+reach+Git HTTPS self-test and Firefox evidence adds the
+/// fifth marker. Shared via `td_recipe::ladder` with both recipe gates.
 const NETTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::NETTEST_CMDLINE_TOKEN;
 
 /// The OUTER /init prints this on ttyS0 before it execs td-kexec — stage-1 reached
@@ -266,9 +269,9 @@ const GUEST_WAIT_MARGIN_SECS: u64 = td_recipe::ladder::QEMU_GUEST_WAIT_MARGIN_SE
 // The dynamic Firefox jail may use 1.25 GiB while the compositor, terminal and
 // next kexec kernel remain live. Keep the guest above that enforced application
 // ceiling rather than making host memory pressure look like a browser failure.
-const SYSTEM_GUEST_MEMORY_MIB: &str = "2048";
-const QEMU_USER_NETDEV: &str = "user,id=net0";
-const QEMU_USER_NET_DEVICE: &str = "virtio-net-pci,netdev=net0";
+pub(crate) const SYSTEM_GUEST_MEMORY_MIB: &str = "2048";
+pub(crate) const QEMU_USER_NETDEV: &str = "user,id=net0";
+pub(crate) const QEMU_USER_NET_DEVICE: &str = "virtio-net-pci,netdev=net0";
 const POLL: Duration = Duration::from_millis(200);
 const QMP_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_QMP_LINE_BYTES: usize = 64 * 1024;
@@ -416,6 +419,7 @@ struct ConsoleEvidence {
     net_resolve: bool,
     net_reach: bool,
     git_https: bool,
+    firefox_network: bool,
     kexec_stage1: bool,
     kernel_panic: bool,
 }
@@ -2016,9 +2020,10 @@ fn validate_persistent_shutdown(result: &BootResult, context: &str) -> Result<()
 /// user-mode NIC on virtio-net-pci and BOTH the nettest and autotest tokens on the
 /// cmdline: at sysinit `/etc/netup` DHCP-configures the link (SLIRP hands out
 /// 10.0.2.15), then td-netd's own DNS client resolves the test host via the DHCP
-/// nameserver (10.0.2.3), TCP-connects it, and completes an unprivileged Git HTTPS
-/// query with the installed CA trust — printing the four net markers — before
-/// the greeter self-exits (autotest) and the VM powers off. Host-side (never a gated
+/// nameserver (10.0.2.3), TCP-connects it, completes an unprivileged Git HTTPS
+/// query with the installed CA trust, and makes the jailed Firefox navigate to and
+/// validate a public HTTPS document — printing five net markers — before the greeter
+/// self-exits (autotest) and the VM powers off. Host-side (never a gated
 /// check) like the other qemu oracles: it needs host qemu AND outbound DNS/TCP from
 /// the operator host (SLIRP forwards the guest's DNS and NATs its TCP), which the
 /// gate's host-free sandbox has neither of.
@@ -2027,20 +2032,19 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, init_cpio, disk, btrfs) = build_persistent_system(runner)?;
 
     println!(
-        "   [qemu-boot-net] {qemu} boots the recipe-built deployment under TCG with a user-mode NIC; /etc/netup DHCP-configures the link, td-netd resolves + reaches {}:{}, then Git reads HEAD from {} over verified HTTPS\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
+        "   [qemu-boot-net] {qemu} boots the recipe-built deployment under TCG with a user-mode NIC; /etc/netup DHCP-configures the link, td-netd resolves + reaches {}:{}, Git reads HEAD from {} over verified HTTPS, and Firefox loads {}\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
         td_recipe::ladder::NETTEST_DEFAULT_HOST,
         td_recipe::ladder::NETTEST_DEFAULT_PORT,
         GIT_HTTPS_TEST_URL,
+        FIREFOX_NETWORK_TEST_URL,
         bzimage.display(),
         init_cpio.display(),
         disk.display()
     );
 
-    // Nettest drives netup's resolve+reach+Git HTTPS self-test (the four net markers); autotest
-    // and its host-derived wait bound make the greeter self-exit after health completion
-    // so the VM powers off cleanly. Key on the greeter (reached AFTER netup) with
-    // kill_on_marker=false so the net markers, which print earlier at sysinit, are all
-    // captured before the guest powers off.
+    // Nettest drives netup's resolve+reach+Git HTTPS self-test and Firefox's public
+    // navigation proof (five markers total); autotest and its host-derived wait bound
+    // make the greeter self-exit only after Firefox publishes its evidence completion.
     let wait_token = autotest_wait_token(boot_timeout());
     let tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {wait_token} {NETTEST_CMDLINE_TOKEN}");
     let result = boot(
@@ -2069,9 +2073,9 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
     if !result.evidence.target {
         return Err(format!(
             "the selector/kexec boot did not reach the greeter {GREETER_MARKER:?} on ttyS0 — {} \
-             (the network self-test runs at sysinit BEFORE the greeter, so a boot that never \
-             reached the greeter likely failed earlier — unrelated to networking). Last serial \
-             output:\n{}",
+             (netup's DHCP/DNS/TCP/Git checks run at sysinit before the greeter, while the \
+             Firefox navigation runs later; a boot that never reached the greeter therefore \
+             failed before the browser proof). Last serial output:\n{}",
             result.reason,
             tail(&result.console, 80)
         ));
@@ -2122,6 +2126,16 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
+    if !result.evidence.firefox_network {
+        return Err(format!(
+            "Git HTTPS succeeded but the jailed Firefox did not load and validate the public \
+             document ({FIREFOX_NETWORK_RUNTIME_MARKER:?} absent) — Firefox could not resolve \
+             the host through the jailed libc configuration, connect through shared networking, \
+             verify the public certificate with NSS, complete navigation, or inspect the loaded \
+             content context. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
     if result.evidence.kernel_panic {
         return Err(format!(
             "the net markers were printed but the kernel PANICKED rather than powering off cleanly — \
@@ -2144,7 +2158,9 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
         "PASS: system-x86-64 brings the network up under qemu user-net — td-netd DHCP-configures the \
          virtio-net link ({SYSTEM_NET_UP_MARKER}), resolves the test host with its own DNS client \
          ({SYSTEM_NET_RESOLVE_MARKER}), TCP-reaches it ({SYSTEM_NET_REACH_MARKER}), and completes \
-         a verified Git HTTPS query ({GIT_HTTPS_RUNTIME_MARKER}) before the VM powers off cleanly"
+         a verified Git HTTPS query ({GIT_HTTPS_RUNTIME_MARKER}); the jailed Firefox also loads \
+         and validates a public HTTPS document ({FIREFOX_NETWORK_RUNTIME_MARKER}) before the VM \
+         powers off cleanly"
     );
     Ok(())
 }
@@ -3279,6 +3295,7 @@ fn boot(
     plan: BootPlan<'_>,
     scratch_base: &Path,
 ) -> Result<BootResult, String> {
+    validate_boot_plan_tokens(plan.extra_append)?;
     // Per-invocation console/diag dir created EXCLUSIVELY (mkdir, not mkdir -p)
     // with 0700 under the runner's private scratch base — NOT world-writable
     // `/tmp`. Exclusive creation means this process is the sole creator (a stale or
@@ -3533,6 +3550,21 @@ fn boot(
     })
 }
 
+fn validate_boot_plan_tokens(extra_append: &str) -> Result<(), String> {
+    let has = |token| {
+        extra_append
+            .split_ascii_whitespace()
+            .any(|candidate| candidate == token)
+    };
+    if has(NETTEST_CMDLINE_TOKEN) && has(FIREFOX_INPUT_CMDLINE_TOKEN) {
+        return Err(format!(
+            "the {NETTEST_CMDLINE_TOKEN} public-navigation plan and \
+             {FIREFOX_INPUT_CMDLINE_TOKEN} local-fixture input plan are mutually exclusive"
+        ));
+    }
+    Ok(())
+}
+
 fn format_end_reason(end: EndReason, target_seen: bool) -> String {
     match end {
         EndReason::MarkerSeen => "the marker was seen".to_string(),
@@ -3730,6 +3762,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SYSTEM_NET_RESOLVE_MARKER.len(),
         SYSTEM_NET_REACH_MARKER.len(),
         GIT_HTTPS_RUNTIME_MARKER.len(),
+        exact_line_window(FIREFOX_NETWORK_RUNTIME_MARKER),
         KEXEC_STAGE1_MARKER.len(),
         "Kernel panic".len(),
     ]
@@ -4121,6 +4154,12 @@ fn latch_console_evidence_from(
         &mut evidence.git_https,
         buf,
         GIT_HTTPS_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.firefox_network,
+        buf,
+        FIREFOX_NETWORK_RUNTIME_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_marker(
         &mut evidence.kexec_stage1,
@@ -6594,7 +6633,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 69] {
+    fn all_console_markers() -> [&'static str; 70] {
         [
             MARKER,
             EROFS_MARKER,
@@ -6626,6 +6665,7 @@ mod tests {
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
             GIT_HTTPS_RUNTIME_MARKER,
+            FIREFOX_NETWORK_RUNTIME_MARKER,
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
@@ -6702,6 +6742,23 @@ mod tests {
             latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");
             assert_eq!(rejected.td_firefox_file_chooser_presented, None);
         }
+    }
+
+    #[test]
+    fn firefox_network_evidence_requires_one_exact_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {FIREFOX_NETWORK_RUNTIME_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.firefox_network);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{FIREFOX_NETWORK_RUNTIME_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.firefox_network);
     }
 
     #[test]
@@ -7069,12 +7126,23 @@ mod tests {
     }
 
     #[test]
-    fn autotest_user_network_has_no_inbound_forward() {
+    fn shared_user_network_has_no_inbound_forward() {
         assert_eq!(QEMU_USER_NETDEV, "user,id=net0");
         assert_eq!(QEMU_USER_NET_DEVICE, "virtio-net-pci,netdev=net0");
         assert!(!QEMU_USER_NETDEV.contains("hostfwd"));
         let enabled = ["user_net:", " true"].concat();
         assert_eq!(include_str!("qemu_boot.rs").matches(&enabled).count(), 1);
+    }
+
+    #[test]
+    fn public_navigation_and_local_input_plans_are_mutually_exclusive() {
+        assert!(validate_boot_plan_tokens(NETTEST_CMDLINE_TOKEN).is_ok());
+        assert!(validate_boot_plan_tokens(FIREFOX_INPUT_CMDLINE_TOKEN).is_ok());
+        assert!(validate_boot_plan_tokens(&format!(
+            "{AUTOTEST_CMDLINE_TOKEN} {NETTEST_CMDLINE_TOKEN} \
+             {FIREFOX_INPUT_CMDLINE_TOKEN}"
+        ))
+        .is_err());
     }
 
     #[test]
@@ -7298,6 +7366,7 @@ mod tests {
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
             GIT_HTTPS_RUNTIME_MARKER,
+            FIREFOX_NETWORK_RUNTIME_MARKER,
             KEXEC_STAGE1_MARKER,
             "Kernel panic",
         ]
@@ -7362,6 +7431,7 @@ mod tests {
         assert!(evidence.net_resolve);
         assert!(evidence.net_reach);
         assert!(evidence.git_https);
+        assert!(evidence.firefox_network);
         assert!(evidence.kexec_stage1);
         assert!(evidence.kernel_panic);
         assert!(!contains(

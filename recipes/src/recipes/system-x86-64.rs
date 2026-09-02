@@ -2,7 +2,7 @@ use crate::ladder::{
     post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, CODEX_BWRAP_VERSION_OUTPUT, CODEX_RUNTIME_MARKER,
     CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN, FIREFOX_INPUT_CMDLINE_TOKEN,
-    GIT_HTTPS_RUNTIME_MARKER,
+    FIREFOX_NETWORK_RUNTIME_MARKER, GIT_HTTPS_RUNTIME_MARKER,
     GIT_HTTPS_TEST_URL, GIT_RUNTIME_MARKER, GREETER_MARKER,
     NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
@@ -258,6 +258,7 @@ const FIREFOX_READY_ATTEMPTS: u16 = 2;
 const FIREFOX_RETRY_MARGIN_SECS: u16 = 60;
 const FIREFOX_SUPPORT_TIMEOUT_SECS: u16 = 60;
 const FIREFOX_SUPPORT_ATTEMPTS: u16 = 3;
+const FIREFOX_NETWORK_TIMEOUT_SECS: u16 = 60;
 // The evidence unit polls itself so its deadline is not widened by td-svc's
 // exponential restart backoff. Autotest allows two cold starts plus margin.
 const FIREFOX_EVIDENCE_WAIT_ITERATIONS: u16 =
@@ -268,7 +269,8 @@ const FIREFOX_EVIDENCE_WAIT_ITERATIONS: u16 =
 // session that can legally extend one of those iterations.
 const FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS: u16 =
     FIREFOX_EVIDENCE_WAIT_ITERATIONS
-        + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS;
+        + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS
+        + FIREFOX_NETWORK_TIMEOUT_SECS;
 // The greeter may observe deployment health before Firefox's first ready
 // timeout starts the evidence unit. Its allowance includes that offset and
 // each separately bounded Firefox support and staged-input attempt.
@@ -1337,12 +1339,15 @@ fn build_td_svc_conf() -> String {
          # block bootsuccess.\n\
          # A failed cold start is covered by bounded cheap polling, not td-svc's\n\
          # exponential restart backoff. Once those probes pass, at most three\n\
-         # separately deadline-bounded support sessions may run. No unit consumes\n\
-         # this unit's spawn-ready state; atomic marker publication is the authority.\n\
+         # separately deadline-bounded support sessions may run. The network oracle\n\
+         # adds one bounded public Firefox navigation before publication. Any later\n\
+         # publication error is terminal, so the navigation cannot be repeated. No\n\
+         # unit consumes this unit's spawn-ready state; atomic marker publication is\n\
+         # the authority.\n\
          [firefox-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {firefox_evidence_wait} ]; do if application=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} 2>/dev/null) && content=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} -contentproc 2>/dev/null) && /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-resource-caps {firefox_name}; then if support=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-support); then /bin/rm -f {firefox_evidence_tmp_path} {firefox_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_evidence} > {firefox_evidence_tmp_path} && /bin/td-util chmod 0644 {firefox_evidence_tmp_path} && /bin/mv {firefox_evidence_tmp_path} {firefox_evidence_path} && /bin/td-util printf \"%s\\n\" \"$application\" && /bin/td-util printf \"%s\\n\" \"$content\" && /bin/td-util printf \"%s\\n\" \"$support\" && /bin/echo {firefox_marker} && /bin/echo {firefox_content_marker} && /bin/echo {firefox_support_marker} && /bin/td-util printf \"%s\\n\" {firefox_completion} > {firefox_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_completion_tmp_path} && /bin/mv {firefox_completion_tmp_path} {firefox_completion_path} && exit 0; fi; s=$((s+1)); [ \"$s\" -lt {firefox_support_attempts} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
-         after=firefox\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {firefox_evidence_wait} ]; do if application=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} 2>/dev/null) && content=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} -contentproc 2>/dev/null) && /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-resource-caps {firefox_name}; then if support=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-support); then network=; case \" $(/bin/cat /proc/cmdline) \" in *\" {nettest_cmdline_token} \"*) network=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-network) || exit 1; [ \"$network\" = {firefox_network_marker} ] || exit 1;; esac; /bin/rm -f {firefox_evidence_tmp_path} {firefox_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_evidence} > {firefox_evidence_tmp_path} && /bin/td-util chmod 0644 {firefox_evidence_tmp_path} && /bin/mv {firefox_evidence_tmp_path} {firefox_evidence_path} && /bin/td-util printf \"%s\\n\" \"$application\" && /bin/td-util printf \"%s\\n\" \"$content\" && /bin/td-util printf \"%s\\n\" \"$support\" && /bin/td-util printf \"%s\\n\" \"$network\" && /bin/echo {firefox_marker} && /bin/echo {firefox_content_marker} && /bin/echo {firefox_support_marker} && /bin/td-util printf \"%s\\n\" {firefox_completion} > {firefox_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_completion_tmp_path} && /bin/mv {firefox_completion_tmp_path} {firefox_completion_path} && exit 0; exit 1; fi; s=$((s+1)); [ \"$s\" -lt {firefox_support_attempts} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         after=firefox,netup\n\
          restart=never\n\
          \n\
          # The first full-system QEMU boot alone asks this root-owned oracle to\n\
@@ -1431,6 +1436,7 @@ fn build_td_svc_conf() -> String {
         profiler_evidence_service_timeout_secs = PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
         profiler_attribution_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
         autotest_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
+        nettest_cmdline_token = NETTEST_CMDLINE_TOKEN,
         firefox_tls_setup_timeout = svc_timeouts::FIREFOX_TLS_SETUP,
         firefox_name = FIREFOX_NAME,
         firefox_app_id = FIREFOX_APP_ID,
@@ -1443,6 +1449,7 @@ fn build_td_svc_conf() -> String {
         firefox_marker = TD_FIREFOX_BOOT_MARKER,
         firefox_content_marker = TD_FIREFOX_CONTENT_MARKER,
         firefox_support_marker = TD_FIREFOX_SUPPORT_MARKER,
+        firefox_network_marker = FIREFOX_NETWORK_RUNTIME_MARKER,
         firefox_evidence = FIREFOX_EVIDENCE,
         firefox_evidence_path = FIREFOX_EVIDENCE_PATH,
         firefox_evidence_tmp_path = FIREFOX_EVIDENCE_TMP_PATH,
@@ -4945,6 +4952,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
             FIREFOX_EVIDENCE_WAIT_ITERATIONS
                 + FIREFOX_SUPPORT_TIMEOUT_SECS * FIREFOX_SUPPORT_ATTEMPTS
+                + FIREFOX_NETWORK_TIMEOUT_SECS
         );
         assert!(
             u64::from(FIREFOX_GREETER_WAIT_ITERATIONS)
@@ -4959,6 +4967,34 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         )));
         assert!(evidence.contains(&format!(
             "s=$((s+1)); [ \"$s\" -lt {FIREFOX_SUPPORT_ATTEMPTS} ] || exit 1"
+        )));
+        let network_probe = evidence
+            .find(&format!(
+                "*\" {NETTEST_CMDLINE_TOKEN} \"*) network=$(/bin/td-login exec-as \
+                 tester -- /bin/td-jail --probe-firefox-network) || exit 1; \
+                 [ \"$network\" = {FIREFOX_NETWORK_RUNTIME_MARKER} ] || exit 1"
+            ))
+            .expect("Firefox public-network probe gate missing");
+        assert_eq!(
+            evidence.matches("--probe-firefox-network").count(),
+            1,
+            "the evidence program must contain one public-navigation command"
+        );
+        assert!(evidence.contains(&format!(
+            "/bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH} \
+             && exit 0; exit 1; fi; s=$((s+1))"
+        )));
+        let firefox_probe = include_str!("../../../td-jail/src/firefox.rs");
+        assert!(firefox_probe.contains(
+            "const NETWORK_PROBE_DEADLINE: Duration = Duration::from_secs(60);"
+        ));
+        assert!(firefox_probe.contains(&format!(
+            "const FIREFOX_NETWORK_TEST_URL: &str = \
+             \"{}\";",
+            crate::ladder::FIREFOX_NETWORK_TEST_URL
+        )));
+        assert!(firefox_probe.contains(&format!(
+            "\"{FIREFOX_NETWORK_RUNTIME_MARKER}\""
         )));
         assert!(evidence.contains(&format!(
             "/bin/rm -f {FIREFOX_EVIDENCE_TMP_PATH} {FIREFOX_COMPLETION_TMP_PATH}"
@@ -4988,6 +5024,9 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         let support_report = evidence
             .find("/bin/td-util printf \"%s\\n\" \"$support\"")
             .expect("Firefox support report missing");
+        let network_report = evidence
+            .find("/bin/td-util printf \"%s\\n\" \"$network\"")
+            .expect("Firefox network report missing");
         let support_marker = evidence
             .find(&format!("/bin/echo {TD_FIREFOX_SUPPORT_MARKER}"))
             .expect("Firefox support marker missing");
@@ -5013,11 +5052,13 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             .expect("Firefox completion publication missing");
         assert!(
             evidence_write < evidence_chmod
+                && network_probe < evidence_write
                 && evidence_chmod < evidence_publish
                 && evidence_publish < application_report
                 && application_report < content_report
                 && content_report < support_report
-                && support_report < evidence_marker
+                && support_report < network_report
+                && network_report < evidence_marker
                 && evidence_marker < content_marker
                 && content_marker < support_marker
                 && support_marker < completion_write
@@ -5026,7 +5067,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             "evidence, marker and completion must have one exact order"
         );
         assert!(evidence.ends_with(&format!(
-            "&& /bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH} && exit 0; fi; s=$((s+1)); [ \"$s\" -lt {FIREFOX_SUPPORT_ATTEMPTS} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
+            "&& /bin/mv {FIREFOX_COMPLETION_TMP_PATH} {FIREFOX_COMPLETION_PATH} && exit 0; exit 1; fi; s=$((s+1)); [ \"$s\" -lt {FIREFOX_SUPPORT_ATTEMPTS} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'"
         )));
         assert_eq!(
             unit_key("firefox-evidence", "type").as_deref(),
@@ -5038,6 +5079,9 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         );
         assert!(
             unit_after("firefox-evidence").contains(&"firefox".to_string())
+        );
+        assert!(
+            unit_after("firefox-evidence").contains(&"netup".to_string())
         );
         assert!(unit_key("firefox-evidence", "requires").is_none());
 
@@ -5444,7 +5488,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                     "firefox-tls-origin",
                 ],
             ),
-            ("firefox-evidence", vec!["firefox"]),
+            ("firefox-evidence", vec!["firefox", "netup"]),
             ("firefox-input", vec!["firefox-evidence"]),
             (
                 "bootsuccess",

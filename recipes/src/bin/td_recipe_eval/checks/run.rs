@@ -34,7 +34,8 @@ use std::process::Command;
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::qemu_boot::{
     build_btrfs_tools, create_persistent_volume, drive_arg, find_qemu, provision_selector,
-    verify_deployment, verify_selector, RunTrust,
+    verify_deployment, verify_selector, RunTrust, QEMU_USER_NETDEV, QEMU_USER_NET_DEVICE,
+    SYSTEM_GUEST_MEMORY_MIB,
 };
 
 /// The distro image recipe this runner boots; its recipe closure pulls in the
@@ -341,7 +342,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
          The initramfs verifies + kexecs current, loop-mounts its EROFS root, mounts @var,\n         \
          and switch_roots into the deployment. This private test volume lasts for the\n         \
          interactive session and is discarded when qemu exits;\n         \
-         auto-login as the test user is enabled.\n         \
+         auto-login as the test user is enabled. The explicit user-mode NIC provides\n         \
+         guest-initiated DNS/TCP through NAT, including the operator host at 10.0.2.2\n         \
+         and reachable LAN services, but has no inbound host forwarding.\n         \
          To power off: type `exit` (or Ctrl-D) at the shell - the session wrapper tears\n         \
          state down and reboots as root, and qemu (-no-reboot) exits. To force-quit qemu at any time: Ctrl-A then X.\n",
         accel.label,
@@ -365,8 +368,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 /// It selects and kexecs current; the deployment initramfs mounts root.erofs and @var. No
 /// marker scan, no timeout, no kill — the guest owns the terminal until the operator
 /// types `exit`/Ctrl-D at the greeter (the `tty-session` wrapper then tears state down and
-/// reboots as root) or force-quits with Ctrl-A X. `-nic none` + `-no-user-config` keep the run
-/// offline and hermetic; `-no-reboot` makes the guest reset exit qemu. `accel` is
+/// reboots as root) or force-quits with Ctrl-A X. The explicit QEMU user-mode NIC
+/// provides guest-initiated SLIRP DNS and NAT, including access to the operator host
+/// at 10.0.2.2 and reachable LAN services, but no host-to-guest forwarding;
+/// `-no-user-config` prevents any ambient QEMU defaults. `-no-reboot` makes the guest
+/// reset exit qemu. `accel` is
 /// `accel_plan`'s preference order — unlike the headless qemu_boot oracle, which pins TCG so a
 /// gated check boots identically everywhere, an operator sitting in front of this one wants
 /// whatever the host can actually go fast with.
@@ -382,40 +388,15 @@ fn boot_interactive(
     // to read, then quits with Ctrl-A X — an auto-reboot would scroll it away. No autotest
     // token either, so the greeter is a normal interactive shell (it powers off on `exit`,
     // not immediately).
-    let append = "console=ttyS0 rdinit=/init";
-    let mut command = Command::new(qemu);
-    command.arg("-M").arg("pc");
-    // No `-cpu host`: the guest CPU MODEL stays qemu's default, the one the gate's TCG
-    // boots also see. Not the same as "only the speed changes" — KVM additionally exposes
-    // its paravirt CPUID leaves (kvmclock, PV EOI) and masks features against the host,
-    // so a boot difference between this runner and the TCG-pinned oracle can be real.
-    for name in accel.names {
-        command.args(["-accel", name]);
-    }
-    command
-        .args(["-m", "512", "-no-reboot"])
-        .args(["-no-user-config", "-nic", "none", "-vga", "none"])
-        .args(["-device", "virtio-vga"])
-        // An ABSOLUTE pointer, and here it is the point rather than a proof: an
-        // operator sitting in front of this one has a host cursor, and QEMU's
-        // PS/2 mouse gives the guest deltas it accumulates — which leaves the
-        // right and bottom edges of the screen unreachable no matter how far
-        // the mouse is pushed. The tablet reports where the cursor IS.
-        .args(["-device", "virtio-tablet-pci"]);
-    if !host_display_available() {
-        command.args(["-display", "none"]);
-    }
+    let mut command = interactive_command(
+        qemu,
+        accel,
+        bzimage,
+        init_cpio,
+        disk,
+        host_display_available(),
+    );
     let status = command
-        .args(["-serial", "mon:stdio"])
-        .arg("-kernel")
-        .arg(bzimage)
-        .arg("-initrd")
-        .arg(init_cpio)
-        .args(["-append", append])
-        // The writable persistent Btrfs volume over virtio-blk (/dev/vda).
-        .arg("-drive")
-        .arg(drive_arg(disk, false))
-        .args(["-device", "virtio-blk-pci,drive=disk0"])
         .status()
         .map_err(|e| format!("spawn {qemu}: {e}"))?;
     // The legitimate interactive exits all return 0: a guest `poweroff`/`reboot` under
@@ -445,6 +426,53 @@ fn boot_interactive(
     Ok(())
 }
 
+fn interactive_command(
+    qemu: &str,
+    accel: &AccelPlan,
+    bzimage: &Path,
+    init_cpio: &Path,
+    disk: &Path,
+    display_available: bool,
+) -> Command {
+    let append = "console=ttyS0 rdinit=/init";
+    let mut command = Command::new(qemu);
+    command.arg("-M").arg("pc");
+    // No `-cpu host`: the guest CPU MODEL stays qemu's default, the one the gate's TCG
+    // boots also see. Not the same as "only the speed changes" — KVM additionally exposes
+    // its paravirt CPUID leaves (kvmclock, PV EOI) and masks features against the host,
+    // so a boot difference between this runner and the TCG-pinned oracle can be real.
+    for name in accel.names {
+        command.args(["-accel", name]);
+    }
+    command
+        .args(["-m", SYSTEM_GUEST_MEMORY_MIB, "-no-reboot"])
+        .args(["-no-user-config", "-vga", "none"])
+        .args(["-netdev", QEMU_USER_NETDEV])
+        .args(["-device", QEMU_USER_NET_DEVICE])
+        .args(["-device", "virtio-vga"])
+        // An ABSOLUTE pointer, and here it is the point rather than a proof: an
+        // operator sitting in front of this one has a host cursor, and QEMU's
+        // PS/2 mouse gives the guest deltas it accumulates — which leaves the
+        // right and bottom edges of the screen unreachable no matter how far
+        // the mouse is pushed. The tablet reports where the cursor IS.
+        .args(["-device", "virtio-tablet-pci"]);
+    if !display_available {
+        command.args(["-display", "none"]);
+    }
+    command
+        .args(["-serial", "mon:stdio"])
+        .arg("-kernel")
+        .arg(bzimage)
+        .arg("-initrd")
+        .arg(init_cpio)
+        .args(["-append", append])
+        // The writable persistent Btrfs volume over virtio-blk (/dev/vda).
+        .arg("-drive")
+        .arg(drive_arg(disk, false))
+        .args(["-device", "virtio-blk-pci,drive=disk0"]);
+    command
+}
+
 fn host_display_available() -> bool {
     let nonempty = |name| {
         std::env::var_os(name)
@@ -468,6 +496,53 @@ mod tests {
 
     use std::cell::Cell;
     use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn interactive_network_is_explicit_guest_initiated_user_nat() {
+        let accel = AccelPlan {
+            names: &["tcg"],
+            label: "TCG",
+            hint: None,
+            forced: false,
+        };
+        let command = interactive_command(
+            "qemu-system-x86_64",
+            &accel,
+            Path::new("bzImage"),
+            Path::new("init.cpio"),
+            Path::new("system.btrfs"),
+            false,
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let count = |expected: &str| {
+            arguments
+                .iter()
+                .filter(|argument| argument.as_str() == expected)
+                .count()
+        };
+        assert_eq!(count("-netdev"), 1);
+        assert_eq!(count(QEMU_USER_NETDEV), 1);
+        assert_eq!(count(QEMU_USER_NET_DEVICE), 1);
+        assert!(arguments.windows(4).any(|window| {
+            window.iter().map(String::as_str).eq([
+                "-netdev",
+                QEMU_USER_NETDEV,
+                "-device",
+                QEMU_USER_NET_DEVICE,
+            ])
+        }));
+        assert!(arguments.windows(2).any(|window| {
+            window
+                .iter()
+                .map(String::as_str)
+                .eq(["-m", SYSTEM_GUEST_MEMORY_MIB])
+        }));
+        assert!(!arguments.iter().any(|argument| argument.contains("hostfwd")));
+        assert!(!arguments.iter().any(|argument| argument == "-nic"));
+    }
 
     #[test]
     fn probed_kvm_keeps_tcg_behind_it() {

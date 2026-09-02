@@ -6278,6 +6278,22 @@ packaged selftest, boot oracle — with **network never in the gate**.
    `TD-FIREFOX-SUPPORT-READY`, then publishes a completion record that lets the
    autotest greeter exit. QEMU requires all three exact markers on every system
    boot.
+   The separate operator-run network oracle attaches one explicit QEMU
+   user-mode NIC with no `hostfwd`. Guest-initiated SLIRP traffic can reach the
+   operator host through `10.0.2.2`, reachable LAN services, and the public
+   network; there is no host-to-guest forwarding. After td-netd's DHCP, DNS and
+   TCP checks and Git's verified HTTPS query, the same evidence transaction
+   opens one bounded Marionette session in the jailed Firefox, navigates to
+   `https://git.kernel.org/`, and requires a complete HTTPS document on that
+   exact origin with status 200 and a nonempty body. Only the exact standalone
+   `TD-FIREFOX-NETWORK-HTTPS-OK` line, printed before the evidence completion,
+   satisfies the host oracle. The session and every protocol byte share a
+   60-second deadline; a navigation error, certificate error, non-200 response,
+   wrong final origin, error-document URI, empty document, malformed reply or
+   failed session cleanup drops the marker. This test remains operator-run
+   because upstream reachability is not a reproducible build input. The
+   ordinary headless system oracle remains
+   NIC-less and deterministic.
    The evidence unit is not a dependency of `bootsuccess`, so user-owned state
    cannot decrement the deployment attempt counter. The application has no
    terminal or console descriptor with which to forge that evidence or alter
@@ -6439,7 +6455,15 @@ and image commits — showing:
    `hostfwd`. Tests pin that it is the sole autotest plan with a NIC and that
    its netdev string has no inbound forwarding. The network oracle therefore
    retains outbound DHCP, DNS and HTTPS without making the fixture reachable
-   from the host or an external network;
+   from the host or an external network. It now also makes the already-painted
+   jailed Firefox leave the local origin, complete a public HTTPS navigation,
+   and validate the resulting content document. This complements rather than
+   replaces the local origin: the local page is deterministic framebuffer and
+   private-NSS evidence, while the public page proves the shared-network jail,
+   resolver and public NSS trust path. The interactive `td-recipe-eval run`
+   path uses the same explicit QEMU user-network backend, so a normal Firefox
+   session can browse. Its guest-initiated reach includes the operator host and
+   LAN; it adds no host-to-guest forwarding surface;
 7. **keyboard, pointer, cursor, wheel, and a right-click menu opening and
    dismissing are LANDED** in the first full-system boot. A bounded QMP client
    connects only after Firefox's privileged test session has installed fixed
@@ -6634,6 +6658,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and injects `Control+L`. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two commands plus eight total events are hard bounds. A separate Shift tap ends each command, and Firefox must observe its ordered keyup before classifying the batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |
 | 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input completion record now follows the download marker, so neither a synthetic DOM click nor a stale file can pass | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
 | 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content first exposes a full-viewport focus control, then places the authenticated page's visible real file input in a bounded 200x100 rectangle containing that trusted click's exact coordinates and fills it with the native selector button. A second uncancelled physical click at the same coordinates must focus that input; a fresh closed probe confirms the trusted focus before physical Enter invokes Firefox's default action. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter. Firefox then requires one trusted change and the exact selected file name, size and contents before input completion. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
+| 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The deterministic system oracle remains NIC-less; public reachability is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 
 **Two other reversals are still absent from this ladder, and that is a

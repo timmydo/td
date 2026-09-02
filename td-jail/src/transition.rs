@@ -22,6 +22,7 @@ pub const PROBE_ARG: &str = "--probe-transition";
 pub const RESOURCE_PROBE_ARG: &str = "--probe-resource-caps";
 pub const PROCESS_TOKEN_PROBE_ARG: &str = "--probe-process-token";
 pub const FIREFOX_SUPPORT_PROBE_ARG: &str = "--probe-firefox-support";
+pub const FIREFOX_NETWORK_PROBE_ARG: &str = "--probe-firefox-network";
 pub const FIREFOX_INPUT_PROBE_ARG: &str = "--probe-firefox-input";
 pub const FIREFOX_DOWNLOAD_PROBE_ARG: &str = "--probe-firefox-download";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
@@ -219,6 +220,7 @@ pub enum Mode {
         token: String,
     },
     FirefoxSupportProbe,
+    FirefoxNetworkProbe,
     FirefoxInputProbe {
         stage: firefox::InputStage,
     },
@@ -353,6 +355,12 @@ where
             return Err(usage_error());
         }
         return Ok(Mode::FirefoxSupportProbe);
+    }
+    if mode == FIREFOX_NETWORK_PROBE_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::FirefoxNetworkProbe);
     }
     if mode == FIREFOX_INPUT_PROBE_ARG {
         let stage = args
@@ -762,7 +770,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-network, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
     )
 }
 
@@ -3378,6 +3386,17 @@ pub fn probe_firefox_support() -> io::Result<()> {
     writeln!(io::stdout(), "{diagnostic}")
 }
 
+pub fn probe_firefox_network() -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the Firefox network probe requires the nonzero application identity",
+        ));
+    }
+    writeln!(io::stdout(), "{}", firefox::probe_network()?)
+}
+
 pub fn probe_firefox_input(stage: firefox::InputStage) -> io::Result<()> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
@@ -4982,6 +5001,11 @@ mod tests {
             Mode::FirefoxSupportProbe
         );
         assert!(parse_mode(args(&[FIREFOX_SUPPORT_PROBE_ARG, "extra"])).is_err());
+        assert_eq!(
+            parse_mode(args(&[FIREFOX_NETWORK_PROBE_ARG])).unwrap(),
+            Mode::FirefoxNetworkProbe
+        );
+        assert!(parse_mode(args(&[FIREFOX_NETWORK_PROBE_ARG, "extra"])).is_err());
         for (name, stage) in [
             ("arm", firefox::InputStage::Arm),
             ("menu", firefox::InputStage::Menu),

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 const MARIONETTE_PORT: u16 = 2828;
 const PROBE_DEADLINE: Duration = Duration::from_secs(60);
+const NETWORK_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 const DOWNLOAD_PROBE_DEADLINE: Duration = Duration::from_secs(40);
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -44,12 +45,49 @@ const INPUT_FILE_CHOOSER_FOCUSED: &str = "TD-FIREFOX-FILE-CHOOSER-CONTENT-FOCUSE
 const INPUT_FILE_CHOOSER_PUBLIC_FOCUSED: &str = "TD-FIREFOX-FILE-CHOOSER-FOCUSED";
 const INPUT_FILE_CHOOSER_OK: &str = "TD-FIREFOX-FILE-CHOOSER-CONTENT-OK";
 const INPUT_FILE_CHOOSER_PUBLIC_OK: &str = "TD-FIREFOX-FILE-CHOOSER-OK bytes=23";
+const FIREFOX_NETWORK_TEST_URL: &str = "https://git.kernel.org/";
+const FIREFOX_NETWORK_CONTENT_OK: &str = "TD-FIREFOX-NETWORK-CONTENT-OK";
+pub(crate) const FIREFOX_NETWORK_RUNTIME_MARKER: &str =
+    "TD-FIREFOX-NETWORK-HTTPS-OK";
 const DOWNLOAD_DIRECTORY: &str = "/var/home/tester/Downloads";
 const DOWNLOAD_NAME: &str = "td-firefox-download.txt";
 const DOWNLOAD_BYTES: &[u8] = b"TD-FIREFOX-DOWNLOAD-V1\n";
 const DOWNLOAD_UID: u32 = 1000;
 const DOWNLOAD_GID: u32 = 1000;
 const MAX_DOWNLOAD_DIRECTORY_ENTRIES: usize = 64;
+
+const NETWORK_DOCUMENT_SCRIPT_TEMPLATE: &str = r#"
+const done = arguments[arguments.length - 1];
+try {
+  const expected = new URL(__TD_EXPECTED_URL__);
+  const url = new URL(document.location.href);
+  const documentUrl = new URL(document.documentURI);
+  const navigation = performance.getEntriesByType("navigation")[0];
+  const body = document.body;
+  const text = body ? String(body.innerText || body.textContent || "").slice(0, 4097) : "";
+  if (document.readyState !== "complete") {
+    done("TD-FIREFOX-NETWORK-ERROR:not-complete");
+  } else if (url.origin !== expected.origin || documentUrl.origin !== expected.origin) {
+    done("TD-FIREFOX-NETWORK-ERROR:wrong-origin");
+  } else if (!navigation || Number(navigation.responseStatus) !== 200) {
+    done("TD-FIREFOX-NETWORK-ERROR:http-status");
+  } else if (!body || !text.trim()) {
+    done("TD-FIREFOX-NETWORK-ERROR:empty-document");
+  } else {
+    done("TD-FIREFOX-NETWORK-CONTENT-OK");
+  }
+} catch (error) {
+  done("TD-FIREFOX-NETWORK-ERROR:" +
+    String(error).replace(/[|,"\\\r\n]/g, "_").slice(0, 256));
+}
+"#;
+
+fn network_document_script() -> String {
+    NETWORK_DOCUMENT_SCRIPT_TEMPLATE.replace(
+        "__TD_EXPECTED_URL__",
+        &json_string(FIREFOX_NETWORK_TEST_URL),
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputStage {
@@ -759,6 +797,18 @@ pub(crate) fn probe_support() -> io::Result<SupportReport> {
     probe_stream(&mut stream)
 }
 
+pub(crate) fn probe_network() -> io::Result<&'static str> {
+    let address = SocketAddr::from(([127, 0, 0, 1], MARIONETTE_PORT));
+    let deadline = Instant::now()
+        .checked_add(NETWORK_PROBE_DEADLINE)
+        .ok_or_else(|| io::Error::other("Firefox network probe deadline overflow"))?;
+    let stream = TcpStream::connect_timeout(&address, remaining(deadline)?)
+        .map_err(|error| contextual("connect to Firefox Marionette on loopback", error))?;
+    let mut stream = DeadlineStream { stream, deadline };
+    probe_network_stream(&mut stream)?;
+    Ok(FIREFOX_NETWORK_RUNTIME_MARKER)
+}
+
 pub(crate) fn probe_input<W: Write>(
     stage: InputStage,
     progress: &mut W,
@@ -940,6 +990,19 @@ fn probe_stream<S: Read + Write>(stream: &mut S) -> io::Result<SupportReport> {
     }
 }
 
+fn probe_network_stream<S: Read + Write>(stream: &mut S) -> io::Result<()> {
+    start_session(stream)?;
+    let result = run_network_probe(stream);
+    let cleanup = delete_session_with_id(stream, 5);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe), Err(cleanup)) => Err(io::Error::other(format!(
+            "Firefox network probe failed: {probe}; session cleanup also failed: {cleanup}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 fn probe_input_stream<S: Read + Write>(stream: &mut S, stage: InputStage) -> io::Result<()> {
     probe_input_stream_with_progress(stream, stage, &mut io::sink())
@@ -1090,6 +1153,37 @@ fn set_context<S: Read + Write>(stream: &mut S, id: u8, value: &str) -> io::Resu
         .map_err(|error| contextual("read Firefox set-context response", error))?;
     require_exact(
         "set-context response",
+        &response,
+        &format!(r#"[1,{id},null,{{"value":null}}]"#),
+    )
+}
+
+fn run_network_probe<S: Read + Write>(stream: &mut S) -> io::Result<()> {
+    set_context(stream, 2, "content")?;
+    navigate(stream, 3, FIREFOX_NETWORK_TEST_URL)?;
+    let script = network_document_script();
+    require_script_value(
+        stream,
+        4,
+        &script,
+        FIREFOX_NETWORK_CONTENT_OK,
+    )
+}
+
+fn navigate<S: Read + Write>(stream: &mut S, id: u8, url: &str) -> io::Result<()> {
+    let encoded = json_string(url);
+    let command = format!(r#"[0,{id},"WebDriver:Navigate",{{"url":{encoded}}}]"#);
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(io::Error::other(
+            "Firefox navigation command exceeded its 64 KiB bound",
+        ));
+    }
+    write_frame(stream, &command)
+        .map_err(|error| contextual("write Firefox navigation command", error))?;
+    let response = read_frame(stream)
+        .map_err(|error| contextual("read Firefox navigation response", error))?;
+    require_exact(
+        "navigation response",
         &response,
         &format!(r#"[1,{id},null,{{"value":null}}]"#),
     )
@@ -1742,6 +1836,7 @@ mod tests {
     #[test]
     fn production_probe_has_one_end_to_end_deadline() {
         assert_eq!(PROBE_DEADLINE, Duration::from_secs(60));
+        assert_eq!(NETWORK_PROBE_DEADLINE, Duration::from_secs(60));
         assert_eq!(DOWNLOAD_PROBE_DEADLINE, Duration::from_secs(40));
         assert_eq!(
             remaining(Instant::now()).unwrap_err().kind(),
@@ -1833,6 +1928,110 @@ mod tests {
             r#"[0,4,"WebDriver:DeleteSession",{}]"#
         );
         assert!(read_frame(&mut commands).is_err());
+    }
+
+    fn network_transcript(value: &str) -> ScriptedIo {
+        let responses = [
+            HELLO.to_string(),
+            r#"[1,1,null,{"sessionId":"td","capabilities":{}}]"#.to_string(),
+            r#"[1,2,null,{"value":null}]"#.to_string(),
+            r#"[1,3,null,{"value":null}]"#.to_string(),
+            format!(r#"[1,4,null,{{"value":"{value}"}}]"#),
+            r#"[1,5,null,{"value":null}]"#.to_string(),
+        ];
+        let mut input = Vec::new();
+        for response in responses {
+            write_frame(&mut input, &response).unwrap();
+        }
+        ScriptedIo {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn network_protocol_navigates_and_validates_the_public_document() {
+        assert_eq!(FIREFOX_NETWORK_TEST_URL, "https://git.kernel.org/");
+        assert_eq!(
+            FIREFOX_NETWORK_RUNTIME_MARKER,
+            "TD-FIREFOX-NETWORK-HTTPS-OK"
+        );
+        let script = network_document_script();
+        assert!(script.contains("document.readyState"));
+        assert!(script.contains("url.origin !== expected.origin"));
+        assert!(script.contains("documentUrl.origin !== expected.origin"));
+        assert!(script.contains("Number(navigation.responseStatus) !== 200"));
+        assert!(script.contains(".slice(0, 4097)"));
+        assert_eq!(script.matches(FIREFOX_NETWORK_TEST_URL).count(), 1);
+        assert!(!script.contains("url.hostname"));
+
+        let mut io = network_transcript(FIREFOX_NETWORK_CONTENT_OK);
+        probe_network_stream(&mut io).unwrap();
+        let mut commands = Cursor::new(io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,3,"WebDriver:Navigate",{"url":"https://git.kernel.org/"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(4, &script).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,5,"WebDriver:DeleteSession",{}]"#
+        );
+        assert!(read_frame(&mut commands).is_err());
+    }
+
+    #[test]
+    fn network_protocol_rejects_the_wrong_document_and_still_cleans_up() {
+        let mut io = network_transcript("TD-FIREFOX-NETWORK-ERROR:wrong-origin");
+        assert!(probe_network_stream(&mut io).is_err());
+        let mut commands = Cursor::new(io.output);
+        let mut last = String::new();
+        while let Ok(command) = read_frame(&mut commands) {
+            last = command;
+        }
+        assert_eq!(last, r#"[0,5,"WebDriver:DeleteSession",{}]"#);
+    }
+
+    #[test]
+    fn network_protocol_rejects_a_navigation_error_and_still_cleans_up() {
+        let responses = [
+            HELLO,
+            r#"[1,1,null,{"sessionId":"td","capabilities":{}}]"#,
+            r#"[1,2,null,{"value":null}]"#,
+            r#"[1,3,{"error":"unknown error","message":"Reached error page: about:neterror"},null]"#,
+            r#"[1,5,null,{"value":null}]"#,
+        ];
+        let mut input = Vec::new();
+        for response in responses {
+            write_frame(&mut input, response).unwrap();
+        }
+        let mut io = ScriptedIo {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        };
+        assert!(probe_network_stream(&mut io).is_err());
+        let mut commands = Cursor::new(io.output);
+        let mut observed = Vec::new();
+        while let Ok(command) = read_frame(&mut commands) {
+            observed.push(command);
+        }
+        assert_eq!(
+            observed,
+            [
+                NEW_SESSION,
+                r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#,
+                r#"[0,3,"WebDriver:Navigate",{"url":"https://git.kernel.org/"}]"#,
+                r#"[0,5,"WebDriver:DeleteSession",{}]"#,
+            ]
+        );
     }
 
     fn input_transcript(stage: InputStage, values: &[&str]) -> ScriptedIo {
