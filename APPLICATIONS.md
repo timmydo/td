@@ -7801,6 +7801,24 @@ needs a renderer that scales and rotates. Naming the two apart is what this
 row buys; moving callers to the logical one is the KMS landing's.
 `td-compositor/DESIGN.md` carries why each caller reads what it reads.
 
+Row 2 has NOT landed: there are no leases and no completion, and td still
+gives a buffer back the moment it stops needing the bytes — because it copied
+them, because it declined to keep them, because a newer commit replaced them,
+or because the surface or subsurface went away. td does already hold one
+uncopied: a synchronized subsurface's buffer waits from its own commit until
+td applies, replaces or discards it, so a client's buffer already crosses that
+gap without anything calling it a lease. `td-compositor/DESIGN.md`'s
+subsurface section is the one place the ends of that hold are listed. What has
+landed is the half of row 2 that can be done while td still decides the moment
+itself — one function, `give_back_buffer`, in place of eight sites that each
+decided separately, so the dmabuf answer has somewhere to go instead of eight
+somewheres. Closing it also closed two paths that WOULD have dropped a
+client's buffer without giving it back — neither was reachable, and they were
+worth closing now because after dmabuf a dropped buffer stops being a protocol
+discourtesy and becomes retained GPU memory. `td-compositor/DESIGN.md` carries
+the serial check those sites shared, the three paths that deliberately release
+nothing, and why one of the two closed paths is testable and the other is not.
+
 Three seams are already right and must stay: `Scene::render` is pure
 bytes-in-bytes-out and needs nothing; `framebuffer.rs` is already the
 only module that touches the device; and `server.rs::copy_buffer` is the

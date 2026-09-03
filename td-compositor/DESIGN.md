@@ -1102,23 +1102,31 @@ so paint and surface-local pointer coordinates agree at negative edges and no
 child can paint or receive input over compositor chrome or another tile.
 
 A child starts synchronized. Its buffer, input region, and frame callbacks are
-cached until its parent's state applies; a synchronized ancestor makes every
-descendant effectively synchronized, even after a descendant asks for
-desynchronized mode. `set_sync` and `set_desync` themselves take effect
-immediately, and leaving the last effective synchronized mode applies any
-cache at once. Application walks through clean intermediate children, because
-a grandchild's cache and pending placement still belong to the root commit;
-state authored after a child's own cached commit remains the child's next
-uncommitted state. The applying parent and every synchronized descendant mutate
-under one runtime lock and incur one paint/focus/layout settlement, so neither
-input nor the framebuffer can observe a half-applied compound frame. Buffer
-releases, frame callbacks, configures, and popup dismissals generated along
-that path are queued until after the runtime lock is released; a client that
-stops reading therefore cannot freeze the compositor through this atomicity
-boundary. Parent destruction uses the same transaction for every direct child
-and the root. Every teardown releases a cached buffer and retires cached frame
-callback ids; an orphan becomes desynchronized and inert rather than retaining
-callbacks for a parent boundary that can no longer arrive.
+cached until one of the ends below arrives, most often its parent's state
+applying; a synchronized ancestor makes every descendant effectively
+synchronized, even after a descendant asks for desynchronized mode. `set_sync`
+and `set_desync` themselves take effect immediately, and leaving the last
+effective synchronized mode applies any cache at once. A second child commit
+that CARRIES a buffer replaces the cached one and releases it, a null attach
+included, since that carries a detach; a commit carrying no buffer leaves the
+cache where it is, and its frame callbacks are appended to the cache rather
+than replacing it. This paragraph is the ONE place the ends of a cached hold
+are enumerated — a parent commit, a replacing child commit, `set_desync`, or
+teardown; `give_back_buffer` points here rather than restating them, because
+restating them is how the list went stale twice. Application walks through
+clean intermediate children, because a grandchild's cache and pending
+placement still belong to the root commit; state authored after a child's own
+cached commit remains the child's next uncommitted state. The applying parent
+and every synchronized descendant mutate under one runtime lock and incur one
+paint/focus/layout settlement, so neither input nor the framebuffer can
+observe a half-applied compound frame. Buffer releases, frame callbacks,
+configures, and popup dismissals generated along that path are queued until
+after the runtime lock is released; a client that stops reading therefore
+cannot freeze the compositor through this atomicity boundary. Parent
+destruction uses the same transaction for every direct child and the root.
+Every teardown releases a cached buffer and retires cached frame callback ids;
+an orphan becomes desynchronized and inert rather than retaining callbacks for
+a parent boundary that can no longer arrive.
 
 Rendering and hit testing walk the same bounded 32-level tree and the same
 active stack. Children below the parent draw first, children above it draw
@@ -1466,6 +1474,92 @@ own bound is an outstanding LEASE, and §M's second row is where it arrives.
 What keeps that from being forgotten is the same `..`-free pattern: a kind
 with a lifetime cost adds a field `fits` must mention, so discarding it is a
 written decision rather than a default.
+
+**One place decides that a buffer's lifetime is over.** `give_back_buffer`
+sends `wl_buffer.release`, and eight call sites that each carried their own
+copy of the same serial check now call it. That check is what makes the
+release address the right object: a client may destroy its `wl_buffer` while
+td still holds the copy it took, and the id it frees is immediately reusable,
+so releasing on the id alone would tell some later object its pixels are free
+while the real owner is never told.
+`a_buffer_is_given_back_only_while_that_id_still_names_it` drives all three
+branches — still the same buffer, the id reused for another, the id gone —
+and deleting the check reds it.
+
+It is `give_back` rather than `release` because `server.rs` already has four
+`release_*` methods and three of them mean something else: `release_dropped`
+refunds a charge, `release_popup_grab` ends a grab, and
+`release_frame_callbacks` deletes callback objects. The fourth,
+`release_cached_commit`, is a buffer-lifetime function that calls this one. A
+fifth would leave the single place that decides a buffer's lifetime
+indistinguishable by grep from the three that have nothing to do with buffers.
+
+Three paths deliberately give nothing back, and are recorded at that function
+rather than left to be rediscovered as omissions: a second `wl_surface.attach`
+before a commit overwrites the pending buffer, which never reached a commit; a
+`wl_surface` destroyed while holding an attached, uncommitted buffer drops it
+for the same reason, which is why `destroy_surface` releases frame callbacks
+and the cached commit beside it but not that; and a `wl_buffer` whose object
+the client already destroyed.
+
+The commit is the line, not whether td drew with the buffer.
+`cache_subsurface_commit` releases a replaced cached buffer it never drew
+either, because a commit is what put it there; stating the rule as "a buffer
+the compositor used" would make these two look inconsistent when they are not.
+
+Two paths gave nothing back and should have.
+`apply_cached_subsurface_with_runtime` took the cached commit out of its
+subsurface and then returned early if it
+turned out not to be committed, dropping any buffer inside it; it was safe
+only because the one writer sets `committed` in the same block that installs
+the buffer, an invariant nothing enforced. It no longer takes what it will not
+use. Past that check the surface lookup could still fail with the cache
+already taken and a buffer plausibly in it, so that path releases the cache
+instead of dropping it.
+
+Neither LEAK was reachable, but they are unreachable for different reasons and
+only one of them is testable. The uncommitted arm is live code — every parent
+commit over a synchronized child that has not cached one runs it — and what
+cannot occur is an uncommitted cache with a buffer in it; a test can construct
+that state directly, and
+`an_uncommitted_cache_keeps_its_buffer_instead_of_being_taken_and_dropped`
+does. Restoring the shape it replaced — an unconditional take followed by
+`if !cached.committed { return }` — reds it on the buffer being gone from the
+cache; dropping the condition instead of moving it reds it on the cache being
+applied rather than left. The second path cannot be entered at all: nothing
+removes the surface between the role lookup and the lookup that fails, so no
+test can reach it and none is claimed. Both were
+worth closing while the release path was being made one thing, because after
+dmabuf a dropped buffer stops being a protocol discourtesy and becomes
+retained GPU memory.
+
+This is NOT §M's second row. Leases and completion have not landed, and td
+still gives a client's buffer back the moment it stops needing the bytes. The
+eight callers are four ways of reaching that moment: it copied them, so the
+pixels are td's; it looked and declined to keep them, which is an oversized
+cursor refused or a popup taken down because its parent has gone; a newer
+commit replaced a cached one before it applied; or the surface or subsurface
+went away, which is every caller of `release_cached_commit` — the
+`wl_subsurface.destroy` and `destroy_surface` paths, and the unreachable
+missing-surface arm this commit added. The cursor site is both of
+the first two — `copy_buffer` sits inside the size check and the release sits
+outside it — which is why counting sites per case gets it wrong.
+
+"Released at commit" was therefore never quite the rule: a teardown releases a
+cached buffer too, which the subsurface section above already stated. What
+holds across all four is that td decides at the moment it acts, and nothing
+waits on an answer from outside. td does hold a buffer in one place — a
+synchronized subsurface's waits in `cached.pending_buffer` from its own commit
+until td applies, replaces or discards it, bounded at 128 per client by
+`MAX_CACHED_SUBSURFACE_COMMITS` — and every end of that hold is td deciding.
+The subsurface section above enumerates them and is the only place that does;
+`set_desync_ends_the_hold_and_gives_the_cached_buffer_back` pins the one that
+is easiest to forget. What dmabuf adds is the first hold that ends on someone
+else's answer.
+
+What has changed is that there is one function to ask, which is where the
+dmabuf answer — release at flip, or when the GPU work finishes — will have to
+go.
 
 An XDG toplevel becomes eligible to map only after the client performs the
 required empty initial wl_surface commit and acknowledges the resulting

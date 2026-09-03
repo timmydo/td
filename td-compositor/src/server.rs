@@ -4173,12 +4173,7 @@ impl Client {
         self.resources
             .observe_cached_commits(cached_commits.saturating_add(usize::from(!was_committed)));
         if let Some(PendingBuffer::Buffer { object, buffer, .. }) = previous {
-            if matches!(
-                self.objects.get(&object),
-                Some(Object::Buffer(current)) if current.serial == buffer.serial
-            ) {
-                self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
-            }
+            self.give_back_buffer(object, &buffer)?;
         }
         self.objects.insert(surface, Object::Surface(state));
         Ok(())
@@ -4196,14 +4191,21 @@ impl Client {
             })) => *object,
             _ => return Ok(false),
         };
-        let cached = match self.objects.get_mut(&object) {
-            Some(Object::Subsurface { cached, .. }) => std::mem::take(cached),
+        let mut cached = match self.objects.get_mut(&object) {
+            // Taking it is what makes this function responsible for the
+            // buffer inside it, so an uncommitted cache is left where it is
+            // rather than taken and dropped. Not a dead branch: every parent
+            // commit over a synchronized child that has not cached one lands
+            // here. What is unreachable is an uncommitted cache HOLDING a
+            // buffer, and that is an invariant of the one writer, not of this.
+            Some(Object::Subsurface { cached, .. }) if cached.committed => std::mem::take(cached),
             _ => return Ok(false),
         };
-        if !cached.committed {
-            return Ok(false);
-        }
         let Some(Object::Surface(mut state)) = self.objects.get(&surface).cloned() else {
+            // Past the check above, so this cache may hold a buffer, and it
+            // is out of the subsurface: dropping it here would keep a
+            // client's buffer without ever giving it back.
+            self.release_cached_commit(&mut cached)?;
             return Ok(false);
         };
         let next_pending_buffer = state.pending_buffer.take();
@@ -4341,14 +4343,96 @@ impl Client {
         Ok(())
     }
 
+    /// Give a client's buffer back — `wl_buffer.release`, and the ONE place
+    /// td decides that a buffer's lifetime is over.
+    ///
+    /// `give_back` rather than `release` because `server.rs` already has four
+    /// `release_*` methods and three of them mean something else:
+    /// `release_dropped` refunds a charge, `release_popup_grab` ends a grab,
+    /// `release_frame_callbacks` deletes callback objects. The fourth,
+    /// `release_cached_commit`, IS a buffer-lifetime function — and it calls
+    /// this one. A fifth would leave the single place that decides a buffer's
+    /// lifetime indistinguishable by grep from the three that have nothing to
+    /// do with buffers.
+    ///
+    /// The serial check is why this is a function and not eight copies of a
+    /// `matches!`. A client may destroy its `wl_buffer` while td still holds
+    /// the copy it took, and may then be handed that object id again for
+    /// something else; releasing on the id alone would address a stranger.
+    /// `a_buffer_is_given_back_only_while_that_id_still_names_it` pins that
+    /// and reds if the check goes.
+    /// `attached_buffer_survives_client_side_object_destruction` walks the
+    /// same destroyed-object path but asserts only that the pixels still
+    /// reached the screen, so it holds nothing about the release.
+    ///
+    /// td gives a client's buffer back the moment it stops needing the
+    /// bytes. The eight callers are four ways of reaching that moment:
+    ///
+    /// - it copied them, so the pixels are td's and the client's are free —
+    ///   the ordinary commit path, and most of the eight;
+    /// - it looked and declined to keep them. An oversized cursor is refused
+    ///   and released in the same breath, and a popup whose parent has gone
+    ///   is taken down rather than drawn; the client is told instead of left
+    ///   waiting on a buffer td will never use;
+    /// - a newer commit replaced a cached one before it applied;
+    /// - the surface or the subsurface went away, which is every caller of
+    ///   `release_cached_commit` — the `wl_subsurface.destroy` and
+    ///   `destroy_surface` paths, and the unreachable missing-surface arm
+    ///   this commit added.
+    ///
+    /// The cursor site is BOTH of the first two, which is why counting sites
+    /// per case gets it wrong: `copy_buffer` sits inside the size check and
+    /// the release sits outside it.
+    ///
+    /// The last case is why "released at commit" was never quite the rule —
+    /// a teardown releases a cached buffer too, which the subsurface section
+    /// of `DESIGN.md` already said. What holds across all four is that td
+    /// decides at the moment it acts: nothing waits on an answer from
+    /// outside.
+    ///
+    /// td does hold a buffer in one place. A synchronized subsurface's waits
+    /// in `cached.pending_buffer` from its own commit until td applies,
+    /// replaces or discards it, bounded at 128 per client by
+    /// `MAX_CACHED_SUBSURFACE_COMMITS`. The subsurface section of
+    /// `DESIGN.md` owns the list of what does that and is the only place it
+    /// is written; do not restate it here. It is longer than it looks —
+    /// `wl_subsurface.set_desync` ends the hold as surely as a parent commit
+    /// does, which
+    /// `set_desync_ends_the_hold_and_gives_the_cached_buffer_back` pins.
+    /// Every entry on that list is td deciding.
+    ///
+    /// `APPLICATIONS.md` §M's second row is where that stops being true. A
+    /// dmabuf is never copied, so nothing is freed by copying it, and its
+    /// release waits on the GPU or the flip — an answer td does not have at
+    /// the moment the protocol event arrives. When a lease exists, this is
+    /// the function that chooses — which is the whole reason for making it
+    /// one function while the choice is still this narrow.
+    ///
+    /// Three paths deliberately give nothing back, recorded here rather than
+    /// left scattered, because "no release" is a decision too:
+    ///
+    /// - a second `wl_surface.attach` before a commit overwrites the pending
+    ///   buffer. A release is owed for a buffer that reached a COMMIT, and
+    ///   this one did not. The commit is the line, not whether td drew with
+    ///   it: `cache_subsurface_commit` releases a replaced cached buffer it
+    ///   never drew either, because a commit is exactly what put it there.
+    /// - destroying a `wl_surface` that holds an attached, uncommitted buffer
+    ///   drops it for that same reason. It is why `destroy_surface` releases
+    ///   the frame callbacks and the cached commit beside it but not this.
+    /// - a `wl_buffer` whose object the client already destroyed, above.
+    fn give_back_buffer(&mut self, object: u32, buffer: &Buffer) -> Result<(), String> {
+        if matches!(
+            self.objects.get(&object),
+            Some(Object::Buffer(current)) if current.serial == buffer.serial
+        ) {
+            self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
+        }
+        Ok(())
+    }
+
     fn release_cached_commit(&mut self, cached: &mut CachedSurfaceCommit) -> Result<(), String> {
         if let Some(PendingBuffer::Buffer { object, buffer, .. }) = cached.pending_buffer.take() {
-            if matches!(
-                self.objects.get(&object),
-                Some(Object::Buffer(current)) if current.serial == buffer.serial
-            ) {
-                self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
-            }
+            self.give_back_buffer(object, &buffer)?;
         }
         self.release_frame_callbacks(&mut cached.frame_callbacks)
     }
@@ -4970,12 +5054,7 @@ impl Client {
                         state.inactive_subsurface = Some(Arc::new(surface));
                         self.mapped_charges.insert(id, charge);
                         self.mapped_total = next;
-                        if matches!(
-                            self.objects.get(&object),
-                            Some(Object::Buffer(current)) if current.serial == buffer.serial
-                        ) {
-                            self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
-                        }
+                        self.give_back_buffer(object, &buffer)?;
                     }
                 }
             } else if cursor {
@@ -5011,12 +5090,7 @@ impl Client {
                         // client left waiting on the buffer it would have
                         // reused is a client that stops drawing — a worse
                         // failure than the cursor it asked for not appearing.
-                        if matches!(
-                            self.objects.get(&object),
-                            Some(Object::Buffer(current)) if current.serial == buffer.serial
-                        ) {
-                            self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
-                        }
+                        self.give_back_buffer(object, &buffer)?;
                     }
                 }
             } else if subsurface {
@@ -5042,12 +5116,7 @@ impl Client {
                         )?;
                         self.mapped_charges.insert(id, charge);
                         self.mapped_total = next;
-                        if matches!(
-                            self.objects.get(&object),
-                            Some(Object::Buffer(current)) if current.serial == buffer.serial
-                        ) {
-                            self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
-                        }
+                        self.give_back_buffer(object, &buffer)?;
                     }
                 }
             } else if is_popup {
@@ -5093,12 +5162,7 @@ impl Client {
                         // which hang above this one: the protocol's order is
                         // topmost first whichever call the popups came from.
                         self.dismiss_popup(id)?;
-                        if matches!(
-                            self.objects.get(&object),
-                            Some(Object::Buffer(current)) if current.serial == buffer.serial
-                        ) {
-                            self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
-                        }
+                        self.give_back_buffer(object, &buffer)?;
                     }
                     (PendingBuffer::Buffer { object, buffer, .. }, Some(placement)) => {
                         let charge = buffer.declared_charge()?;
@@ -5127,12 +5191,7 @@ impl Client {
                         {
                             *mapped_once = true;
                         }
-                        if matches!(
-                            self.objects.get(&object),
-                            Some(Object::Buffer(current)) if current.serial == buffer.serial
-                        ) {
-                            self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
-                        }
+                        self.give_back_buffer(object, &buffer)?;
                     }
                 }
             } else {
@@ -5179,12 +5238,7 @@ impl Client {
                         )?;
                         self.mapped_charges.insert(id, charge);
                         self.mapped_total = next;
-                        if matches!(
-                            self.objects.get(&object),
-                            Some(Object::Buffer(current)) if current.serial == buffer.serial
-                        ) {
-                            self.send(object, WL_BUFFER_RELEASE, wire::Builder::new())?;
-                        }
+                        self.give_back_buffer(object, &buffer)?;
                     }
                 }
             }
@@ -12845,6 +12899,53 @@ mod tests {
         let _ = fs::remove_file(pool_path);
     }
 
+    /// A synchronized child's cached buffer comes back on `set_desync`. The
+    /// ends of that hold are listed once, in `DESIGN.md`'s subsurface
+    /// section; this drives the one that is easiest to forget, and the setup
+    /// below reaches none of the others — no parent commit, no replacing
+    /// commit, no teardown.
+    ///
+    /// This is the end of the hold that had no test, and its absence is why
+    /// `give_back_buffer`'s doc first enumerated the ends and got the list
+    /// wrong. `DESIGN.md`'s subsurface section always said it — "leaving the
+    /// last effective synchronized mode applies any cache at once" — so the
+    /// behaviour was specified, specified correctly, and unpinned.
+    #[test]
+    fn set_desync_ends_the_hold_and_gives_the_cached_buffer_back() {
+        let (mut client, mut peer, _runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("desync-release");
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+        attach_surface(&mut client, 6, 40).unwrap();
+        client
+            .dispatch(
+                request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        // Still held: a synchronized child's own commit only caches.
+        assert!(drain_messages(&mut peer).is_empty());
+        assert!(matches!(
+            client.objects.get(&30),
+            Some(Object::Subsurface { cached, .. }) if cached.committed
+        ));
+
+        // wl_subsurface.set_desync, and nothing else.
+        client
+            .dispatch(
+                request(30, 5, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+
+        assert!(drain_messages(&mut peer)
+            .iter()
+            .any(|message| (message.object, message.opcode) == (40, WL_BUFFER_RELEASE)));
+
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
     #[test]
     fn retired_subsurface_accepts_commits_and_restores_current_content() {
         let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
@@ -15832,6 +15933,171 @@ mod tests {
         runtime.lock().unwrap().unsubscribe_keyboard(2);
         fs::remove_file(framebuffer_path).unwrap();
         fs::remove_file(pool_path).unwrap();
+    }
+
+    /// The serial guard, which eight release sites used to carry a copy of
+    /// each and which `give_back_buffer` now holds once.
+    ///
+    /// Deleting it would make every one of those sites address whatever the
+    /// id names NOW. A client may destroy a `wl_buffer` while td still holds
+    /// the copy it took, and the id it frees is immediately reusable, so the
+    /// wrong `wl_buffer` would be told its pixels are free while its real
+    /// owner is never told.
+    #[test]
+    fn a_buffer_is_given_back_only_while_that_id_still_names_it() {
+        let stem = format!(
+            "td-wayland-give-back-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(&pool_path, [1, 2, 3, 0]).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(11, server, runtime, test_keymap()).unwrap();
+
+        let taken = Buffer {
+            serial: 1,
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            pool_charge: Arc::new(AtomicUsize::new(4)),
+            offset: 0,
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: SHM_XRGB8888,
+        };
+        client.insert(7, Object::Buffer(taken.clone())).unwrap();
+
+        // Still the buffer td took: told.
+        client.give_back_buffer(7, &taken).unwrap();
+        let sent = drain_messages(&mut peer);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            (sent.first().unwrap().object, sent.first().unwrap().opcode),
+            (7, WL_BUFFER_RELEASE)
+        );
+
+        // The id now names a DIFFERENT buffer, which is what a destroy plus a
+        // reuse looks like from here. Telling it would address a stranger.
+        let reused = Buffer {
+            serial: 2,
+            ..taken.clone()
+        };
+        client.objects.insert(7, Object::Buffer(reused));
+        client.give_back_buffer(7, &taken).unwrap();
+        assert!(drain_messages(&mut peer).is_empty());
+
+        // The id names nothing at all.
+        client.objects.remove(&7);
+        client.give_back_buffer(7, &taken).unwrap();
+        assert!(drain_messages(&mut peer).is_empty());
+
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    /// The `committed` guard on the take in
+    /// `apply_cached_subsurface_with_runtime`. An uncommitted cache is left
+    /// in its subsurface instead of taken and dropped, so a buffer inside
+    /// one waits for whatever ends the hold, listed once in `DESIGN.md`'s
+    /// subsurface section, rather than vanishing.
+    ///
+    /// This state cannot be reached over the wire — the one writer sets
+    /// `committed` in the same block that installs the buffer, which is
+    /// exactly the invariant at issue — so it is built directly.
+    ///
+    /// Restoring the shape this replaced, an unconditional take followed by
+    /// `if !cached.committed { return }`, reds "the uncommitted cache lost
+    /// the buffer it was holding". Dropping the condition instead of moving
+    /// it reds `!applied`, because the cache is then applied rather than
+    /// left. The message assertion catches neither in the order they fire:
+    /// the take dropped the buffer in silence, and that silence was the
+    /// defect. It is here to pin that this path owes no release either.
+    #[test]
+    fn an_uncommitted_cache_keeps_its_buffer_instead_of_being_taken_and_dropped() {
+        let stem = format!(
+            "td-wayland-uncommitted-cache-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(&pool_path, [1, 2, 3, 0]).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(12, server, Arc::clone(&runtime), test_keymap()).unwrap();
+
+        let buffer = Buffer {
+            serial: 1,
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            pool_charge: Arc::new(AtomicUsize::new(4)),
+            offset: 0,
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: SHM_XRGB8888,
+        };
+        client.insert(7, Object::Buffer(buffer.clone())).unwrap();
+        client
+            .insert(
+                5,
+                Object::Surface(SurfaceState {
+                    role: Some(SurfaceRole::Subsurface(30)),
+                    ..SurfaceState::default()
+                }),
+            )
+            .unwrap();
+        client
+            .insert(
+                30,
+                Object::Subsurface {
+                    surface: Some(5),
+                    parent: Some(4),
+                    position: (0, 0),
+                    pending_position: None,
+                    synchronized: true,
+                    cached: CachedSurfaceCommit {
+                        committed: false,
+                        pending_buffer: Some(PendingBuffer::Buffer {
+                            object: 7,
+                            buffer: buffer.clone(),
+                            offset: (0, 0),
+                        }),
+                        ..CachedSurfaceCommit::default()
+                    },
+                },
+            )
+            .unwrap();
+
+        let shared = Arc::clone(&runtime);
+        let mut locked = shared.lock().unwrap();
+        let applied = client
+            .apply_cached_subsurface_with_runtime(5, &mut locked)
+            .unwrap();
+        drop(locked);
+        assert!(!applied);
+
+        assert!(
+            matches!(
+                client.objects.get(&30),
+                Some(Object::Subsurface { cached, .. })
+                    if matches!(
+                        &cached.pending_buffer,
+                        Some(PendingBuffer::Buffer { object: 7, buffer, .. })
+                            if buffer.serial == 1
+                    )
+            ),
+            "the uncommitted cache lost the buffer it was holding"
+        );
+        assert!(drain_messages(&mut peer).is_empty());
+
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
     }
 
     /// The two `i32`s an attach carries are the surface offset at the version
