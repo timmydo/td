@@ -1485,12 +1485,23 @@ fn copy_crates(from: &Path, to: &Path) -> usize {
 ///
 /// Write it ATOMICALLY (temp + rename): a bare `fs::write` truncates the target to 0 bytes
 /// first, so a failed write (ENOSPC — likely the same reason the copy above failed) would
-/// leave a 0-byte `.warm-complete` that `is_warm_complete`'s `is_file()` reads as done,
+/// leave a 0-byte `.warm-complete`; that no longer reads as done (an empty first line
+/// matches no digest), but a torn WRITE could still leave a plausible-looking one,
 /// re-introducing the fail-open the marker exists to close. rename is atomic on the vendor
 /// dir's filesystem, so the marker either does not exist or is a complete record.
-fn mark_warm_complete(vendor: &Path, n: usize) {
+/// The marker records WHICH Cargo.lock the set was published from, because a
+/// vendor set is only complete FOR one lock. Before this it recorded a count
+/// alone, so a dependency bump left the old set marked done: the next warm
+/// reported "already warm" and skipped, and the build's set-equality gate then
+/// rejected the closure the lock no longer describes — a failure whose message
+/// points at the vendor dir rather than at the bump that invalidated it.
+///
+/// A marker written by the old scheme carries a count where the digest belongs,
+/// never matches, and so reads as cold exactly once, re-warms, and is replaced.
+/// That is the whole migration; there is no marker to convert.
+fn mark_warm_complete(vendor: &Path, n: usize, lock_digest: &str) {
     let tmp = vendor.join(".warm-complete.tmp");
-    if std::fs::write(&tmp, format!("{n}\n")).is_ok()
+    if std::fs::write(&tmp, format!("{lock_digest}\n{n}\n")).is_ok()
         && std::fs::rename(&tmp, vendor.join(".warm-complete")).is_ok()
     {
         return;
@@ -1498,8 +1509,43 @@ fn mark_warm_complete(vendor: &Path, n: usize) {
     let _ = std::fs::remove_file(&tmp);
 }
 
-fn is_warm_complete(vendor: &Path) -> bool {
-    vendor.join(".warm-complete").is_file()
+/// Complete AND for this lock. An unreadable marker, an unreadable lock, and a
+/// digest that does not match are all "not warm": every one of them means this
+/// cache cannot be shown to describe the lock in hand, and re-warming is
+/// cheaper than the set-equality failure that follows from guessing.
+fn is_warm_complete(vendor: &Path, lock: &Path) -> bool {
+    let Some(marked) = read_marker(&vendor.join(".warm-complete")) else {
+        return false;
+    };
+    let Some(want) = lock_digest(lock) else {
+        return false;
+    };
+    marked.lines().next().map(str::trim) == Some(want.as_str())
+}
+
+/// The digest the marker carries: sha256 over the lock's BYTES, so any bump to
+/// a pin, a version or a checksum changes it.
+///
+/// Bounded by the same `MAX_CARGO_LOCK_BYTES` the fetch enforces, and refuses a
+/// non-regular file: a marker or lock replaced by a symlink to something huge
+/// must read as "not warm", not exhaust memory deciding.
+fn lock_digest(lock: &Path) -> Option<String> {
+    let meta = std::fs::metadata(lock).ok()?;
+    if !meta.is_file() || meta.len() > MAX_CARGO_LOCK_BYTES {
+        return None;
+    }
+    std::fs::read(lock).ok().map(|bytes| hex_sha256(&bytes))
+}
+
+/// The marker is one digest line and one count line. Read it under a small
+/// ceiling and only as a regular file, for the reason above.
+fn read_marker(path: &Path) -> Option<String> {
+    const MAX_MARKER_BYTES: u64 = 4096;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_MARKER_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
 }
 
 /// Run `cmd` with stdio discarded; true on a zero exit (best-effort, never panics).
@@ -1695,10 +1741,16 @@ fn account_locked_cargo_source(
 /// Fetch only the registry members of the committed lock through td's
 /// verifying sparse-index/static-crate egress. Git members are represented by
 /// separately pinned source archives and are intentionally never contacted.
+/// Returns the locked sources AND the sha256 of the bytes they were parsed
+/// from. The digest travels with the parse deliberately: the completion marker
+/// records which lock a vendor set was published from, and re-reading the path
+/// afterwards would let a lock edited mid-fetch stamp the NEW digest onto the
+/// set selected by the OLD one — sealing a mismatch as complete (review
+/// finding).
 fn fetch_locked_registry(
     lock_path: &Path,
     store: &Path,
-) -> Result<LockedCargoSources, String> {
+) -> Result<(LockedCargoSources, String), String> {
     let metadata = std::fs::metadata(lock_path)
         .map_err(|e| format!("stat Cargo.lock {}: {e}", lock_path.display()))?;
     if !metadata.is_file() || metadata.len() > MAX_CARGO_LOCK_BYTES {
@@ -1709,6 +1761,7 @@ fn fetch_locked_registry(
     }
     let text = std::fs::read_to_string(lock_path)
         .map_err(|e| format!("read Cargo.lock {}: {e}", lock_path.display()))?;
+    let digest = hex_sha256(text.as_bytes());
     let sources = parse_locked_cargo_sources(&text)?;
     for package in &sources.registry {
         let guard = ResponseGuard {
@@ -1726,7 +1779,7 @@ fn fetch_locked_registry(
             ));
         }
     }
-    Ok(sources)
+    Ok((sources, digest))
 }
 
 /// The cargo `config.toml` body that routes crates.io through the proxy at `addr` (sparse
@@ -1832,7 +1885,10 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     let work = cv.join("work");
     let srccrate = work.join(format!("{krate}-{ver}.crate"));
 
-    if srcdir.join("Cargo.toml").is_file() && srccrate.is_file() && is_warm_complete(&vendor) {
+    if srcdir.join("Cargo.toml").is_file()
+        && srccrate.is_file()
+        && is_warm_complete(&vendor, &srcdir.join("Cargo.lock"))
+    {
         eprintln!(
             "td-feed warm crate: {krate}-{ver} already warm ({} crates) in {}",
             count_crates(&vendor),
@@ -1907,7 +1963,7 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     //    their separately pinned archives are warmed by `warm sources`.
     let _ = std::fs::remove_dir_all(proxy_store.join("crates"));
     let _ = std::fs::remove_dir_all(proxy_store.join("index"));
-    let sources = match fetch_locked_registry(&srcdir.join("Cargo.lock"), &proxy_store) {
+    let (sources, digest) = match fetch_locked_registry(&srcdir.join("Cargo.lock"), &proxy_store) {
         Ok(sources) => sources,
         Err(error) => {
             eprintln!(
@@ -1939,7 +1995,17 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
         eprintln!("td-feed warm crate: copied only {n}/{want} crates for {krate}-{ver} - a copy failed; NOT marking complete so the next warm re-does it");
         return;
     }
-    mark_warm_complete(&vendor, n);
+    // What the DESTINATION holds, not only what this run copied into it. The
+    // wipe above ignores its error, so a partial removal can leave stale
+    // `.crate` files from an older lock beside the new ones: `n == want` still
+    // holds, and the digest would seal a set the build then rejects for extras
+    // it can never repair (review finding).
+    let have = count_crates(&vendor);
+    if have != want {
+        eprintln!("td-feed warm crate: {krate}-{ver} vendor holds {have} crates, expected {want} - stale entries survived the wipe; NOT marking complete");
+        return;
+    }
+    mark_warm_complete(&vendor, n, &digest);
     eprintln!(
         "td-feed warm crate: {krate}-{ver} — source + {n} registry crates and {} Git package pin(s) provisioned guix-free \
          (Cargo.lock-pinned, registry sha==index cksum; no Git transport) in {}",
@@ -2048,7 +2114,7 @@ fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
         .join(".td-build-cache/crate-vendor")
         .join(dest)
         .join("vendor");
-    if is_warm_complete(&vendor) {
+    if is_warm_complete(&vendor, lock) {
         eprintln!(
             "td-feed warm {action}: {dest} already warm ({} crates) in {}",
             count_crates(&vendor),
@@ -2061,7 +2127,7 @@ fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
         .join(format!("{dest}.work"));
     let _ = std::fs::remove_dir_all(&work);
     let proxy_store = work.join("proxy-store");
-    let sources = match fetch_locked_registry(lock, &proxy_store) {
+    let (sources, digest) = match fetch_locked_registry(lock, &proxy_store) {
         Ok(sources) => sources,
         Err(error) => {
             eprintln!(
@@ -2090,7 +2156,13 @@ fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
         eprintln!("td-feed warm {action}: copied only {n}/{want} crates for {dest} - a copy failed; NOT marking complete so the next warm re-does it");
         return;
     }
-    mark_warm_complete(&vendor, n);
+    // The destination set, for the reason given in `warm_crate`.
+    let have = count_crates(&vendor);
+    if have != want {
+        eprintln!("td-feed warm {action}: {dest} vendor holds {have} crates, expected {want} - stale entries survived the wipe; NOT marking complete");
+        return;
+    }
+    mark_warm_complete(&vendor, n, &digest);
     eprintln!(
         "td-feed warm {action}: {dest} — {n} registry crates and {} Git package pin(s) provisioned guix-free \
          (lock {}, registry sha==index cksum; no Git transport) in {}",
@@ -2822,7 +2894,7 @@ fn warm_selftest() {
     );
     std::fs::write(&lock, lock_text)
         .unwrap_or_else(|e| die(format!("warm-selftest: write Cargo.lock: {e}")));
-    let locked = fetch_locked_registry(&lock, &store)
+    let (locked, _) = fetch_locked_registry(&lock, &store)
         .unwrap_or_else(|e| die(format!("warm-selftest: lock-driven registry fetch: {e}")));
     if locked.registry.len() != 1 || locked.git_packages != 1 {
         die("warm-selftest: lock-driven fetch did not separate registry and Git packages".into());
@@ -3169,6 +3241,7 @@ pub fn run(a: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
+        is_warm_complete, mark_warm_complete,
         cargo_route, detach_from_workspace, download_verified, ensure_serve_daemon,
         feed_daemon_policy, file_sha256_before, index_path, mount_is_memory_backed,
         parse_locked_cargo_sources, parse_serve_addr, read_digest_sidecar, real_relative_file,
@@ -3178,6 +3251,67 @@ mod tests {
     };
     use std::io::Read;
     use std::path::PathBuf;
+
+    /// The marker answers for the lock it was published from, and only that one.
+    ///
+    /// A vendor set is complete FOR a lock. Before the marker carried a digest
+    /// it recorded a count alone, so bumping a dependency left the old set
+    /// marked done: the next warm said "already warm" and skipped, and the
+    /// build's set-equality gate then rejected a closure the lock no longer
+    /// describes.
+    #[test]
+    fn a_warm_marker_does_not_survive_the_lock_that_produced_it() {
+        let dir = unique_tmp_dir("warm-marker");
+        let vendor = dir.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let lock = dir.join("Cargo.lock");
+        std::fs::write(&lock, "[[package]]\nname = \"a\"\n").unwrap();
+
+        assert!(
+            !is_warm_complete(&vendor, &lock),
+            "no marker at all is not warm"
+        );
+
+        let digest = super::lock_digest(&lock).expect("digest");
+        mark_warm_complete(&vendor, 3, &digest);
+        assert!(is_warm_complete(&vendor, &lock), "its own lock is warm");
+
+        // The bump.
+        std::fs::write(&lock, "[[package]]\nname = \"a\"\nversion = \"2\"\n").unwrap();
+        assert!(
+            !is_warm_complete(&vendor, &lock),
+            "a superseded lock must re-warm, not report already warm"
+        );
+
+        // An unreadable lock cannot be shown to match, so it is not warm.
+        std::fs::remove_file(&lock).unwrap();
+        assert!(!is_warm_complete(&vendor, &lock), "no lock is not warm");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A marker written by the pre-digest scheme carries a count where the
+    /// digest belongs. It never matches, so it reads as cold exactly once and is
+    /// replaced — which is the whole migration.
+    #[test]
+    fn a_pre_digest_marker_reads_as_cold_and_is_replaced() {
+        let dir = unique_tmp_dir("warm-marker-old");
+        let vendor = dir.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let lock = dir.join("Cargo.lock");
+        std::fs::write(&lock, "[[package]]\nname = \"a\"\n").unwrap();
+        // Exactly what the old mark_warm_complete wrote.
+        std::fs::write(vendor.join(".warm-complete"), "1189\n").unwrap();
+
+        assert!(
+            !is_warm_complete(&vendor, &lock),
+            "an old count-only marker must not read as warm"
+        );
+
+        let digest = super::lock_digest(&lock).expect("digest");
+        mark_warm_complete(&vendor, 1189, &digest);
+        assert!(is_warm_complete(&vendor, &lock), "and is replaced in place");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A per-invocation-unique temp dir under $TMPDIR. `cargo test` runs tests
     /// concurrently in ONE process, so `std::process::id()` alone is shared across

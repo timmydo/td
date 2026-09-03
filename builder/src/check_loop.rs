@@ -1468,10 +1468,14 @@ fn warm_vendor_closures(
         root,
         envs,
     );
+    // Each line is the warm argv with the LOCK appended: `warm ... <dest> <lock>`.
+    // The lock is what td-feed stamps into the completion marker, so taking it
+    // from the same line is what keeps this reader's verdict and td-feed's the
+    // same verdict.
     let jobs: Vec<Vec<String>> = listing
         .lines()
         .map(|line| line.split('\t').map(s).collect::<Vec<String>>())
-        .filter(|argv| argv.len() >= 3)
+        .filter(|fields| fields.len() >= 4)
         .collect();
     if jobs.is_empty() {
         // warm_capture returns "" for a failed spawn, a non-zero exit and an
@@ -1529,10 +1533,16 @@ fn run_vendor_warms(
     warm_jobs: usize,
 ) -> Vec<ColdVendor> {
     let mut codes: Vec<(String, Option<i32>)> = Vec::new();
-    let mut running: Vec<(std::process::Child, Vec<String>)> = Vec::new();
-    let drain = |running: &mut Vec<(std::process::Child, Vec<String>)>,
+    // The dest travels WITH the child, rather than being read back off the
+    // spawned argv: that argv has had the trailing lock stripped for td-feed, so
+    // `vendor_dest`'s "field before the lock" would name the field before the
+    // dest instead. Keying the exit statuses under that would leave every code
+    // unfindable, and the retry below — the reason the statuses are collected —
+    // permanently empty (review finding).
+    let mut running: Vec<(std::process::Child, Vec<String>, String)> = Vec::new();
+    let drain = |running: &mut Vec<(std::process::Child, Vec<String>, String)>,
                  codes: &mut Vec<(String, Option<i32>)>| {
-        for (mut child, argv) in running.drain(..) {
+        for (mut child, argv, dest) in running.drain(..) {
             let status = child.wait().ok();
             let code = status.and_then(|st| st.code());
             if !status.is_some_and(|st| st.success()) {
@@ -1542,15 +1552,15 @@ fn run_vendor_warms(
                     argv.join(" ")
                 );
             }
-            codes.push((vendor_dest(&argv).to_string(), code));
+            codes.push((dest, code));
         }
     };
     for job in jobs {
         let mut argv = vec![tdfeed.to_string()];
-        argv.extend(job.iter().cloned());
+        argv.extend(vendor_argv(job).iter().cloned());
         let wrapped = warm_argv(&argv);
         if let Some(child) = spawn_argv(&wrapped, root, envs) {
-            running.push((child, argv));
+            running.push((child, argv, vendor_dest(job).to_string()));
         } else {
             eprintln!(
                 "td-builder check: vendor warm (best-effort) could not spawn: {}",
@@ -1564,7 +1574,7 @@ fn run_vendor_warms(
     }
     drain(&mut running, &mut codes);
     jobs.iter()
-        .filter(|job| !vendor_is_complete(root, vendor_dest(job)))
+        .filter(|job| !vendor_is_complete(root, vendor_dest(job), vendor_lock(job)))
         .map(|job| ColdVendor {
             code: codes
                 .iter()
@@ -1592,21 +1602,60 @@ fn report_cold_vendors(cold: &[ColdVendor], suffix: &str) {
     }
 }
 
-/// The recipe stem a vendor warm targets: the last field of every
-/// `warm crate`/`crate-local`/`crate-source` argv the catalog derives.
+/// The recipe stem a vendor warm targets: the field before the trailing lock.
 fn vendor_dest(job: &[String]) -> &str {
-    job.last().map(String::as_str).unwrap_or("?")
+    job.len()
+        .checked_sub(2)
+        .and_then(|i| job.get(i))
+        .map(String::as_str)
+        .unwrap_or("?")
+}
+
+/// The lock td-feed pins this rung's closure with, and stamps into the marker.
+fn vendor_lock(job: &[String]) -> Option<&str> {
+    job.last().map(String::as_str)
+}
+
+/// The argv itself, without the trailing lock this side reads.
+fn vendor_argv(job: &[String]) -> &[String] {
+    job.split_last().map(|(_, rest)| rest).unwrap_or(&[])
 }
 
 /// td-feed's own completion predicate -- the marker it renames in only once the
-/// whole locked closure is published. Anything weaker reads an interrupted warm
-/// as done, which is what `provision_auto_vendor` then rejects.
-fn vendor_is_complete(root: &Path, dest: &str) -> bool {
-    root.join(".td-build-cache/crate-vendor")
+/// whole locked closure is published, AND the lock digest that marker carries.
+///
+/// Presence alone reads both an interrupted warm and a SUPERSEDED one as done.
+/// The second is the one that bites quietly: after a dependency bump the marker
+/// still sits there, this reader would report the vendor complete, the retry
+/// and the report are both suppressed, and the build then fails the vendor
+/// gate's set-equality check every run with nothing here saying why.
+fn vendor_is_complete(root: &Path, dest: &str, lock: Option<&str>) -> bool {
+    let marker = root
+        .join(".td-build-cache/crate-vendor")
         .join(dest)
         .join("vendor")
-        .join(".warm-complete")
-        .is_file()
+        .join(".warm-complete");
+    // Bounded and regular-file only, as td-feed's own reader is: a marker
+    // replaced by a symlink to something huge must read as "not warm", not
+    // decide the question by exhausting memory.
+    let Ok(meta) = std::fs::metadata(&marker) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > 4096 {
+        return false;
+    }
+    let Ok(marked) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    // No lock named means nothing can vouch for the marker; treat it as cold
+    // rather than trust a bare file, which is the fail-open being closed here.
+    let Some(lock) = lock else {
+        return false;
+    };
+    let Ok(want) = crate::sha256::sha256_file(&root.join(lock)) else {
+        return false;
+    };
+    marked.lines().next().map(str::trim) == Some(want.as_str())
 }
 
 /// An already-built `td-recipe-eval`, WITHOUT building one: the operator
@@ -1946,6 +1995,55 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The catalog line's fields, and the argv actually spawned from it.
+    ///
+    /// These three read the SAME line differently — dest is the field before
+    /// the lock, the lock is last, and td-feed is handed everything but the
+    /// lock — and the exit statuses collected from the spawned argv are keyed
+    /// by dest. Reading the dest back off the SPAWNED argv (which no longer has
+    /// the lock) silently names the wrong field, leaves every status
+    /// unfindable, and quietly disables the source-built-td-feed retry that
+    /// exists for exactly the rung this whole area is about.
+    #[test]
+    fn a_vendor_line_splits_into_an_argv_a_dest_and_a_lock() {
+        let line: Vec<String> = [
+            "warm",
+            "crate-source",
+            "codex-rust-v0.148.0.tar.gz",
+            "abc123",
+            "recipes/locks/codex/Cargo.lock",
+            "codex",
+            "recipes/locks/codex/Cargo.lock",
+        ]
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+
+        assert_eq!(super::vendor_dest(&line), "codex");
+        assert_eq!(
+            super::vendor_lock(&line),
+            Some("recipes/locks/codex/Cargo.lock")
+        );
+        let argv = super::vendor_argv(&line);
+        assert_eq!(argv.len(), line.len() - 1, "the lock is not passed to td-feed");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("codex"),
+            "the spawned argv ends at the dest"
+        );
+
+        // The `warm crate` form, whose dest is not the last field of the line
+        // either. Short and malformed lines must not panic.
+        let crate_line: Vec<String> = ["warm", "crate", "coreutils", "0.9.0", "uutils", "L"]
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        assert_eq!(super::vendor_dest(&crate_line), "uutils");
+        assert_eq!(super::vendor_dest(&[]), "?");
+        assert_eq!(super::vendor_lock(&[]), None);
+        assert!(super::vendor_argv(&[]).is_empty());
+    }
+
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {

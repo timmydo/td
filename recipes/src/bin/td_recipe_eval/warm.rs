@@ -290,14 +290,25 @@ fn header_seed_is_warm(sources_dir: &Path, arch: &str) -> Result<bool, String> {
 fn cold_vendor_jobs(root: &Path, graph: &[RecipeNode]) -> Vec<VendorJob> {
     let mut jobs = Vec::new();
     for node in graph {
-        if node.recipe.cargo_lock.is_none() || vendor_is_warm(root, &node.stem) {
+        // A rung with no committed lock declares no crate closure at all. Every
+        // non-Rust rung in the graph is one, so without this the survey asks
+        // `vendor_warm_plan` about zlib and gcc and reports ~55 "no warm
+        // command" lines per run — and a `.crate`-pinned rung without a
+        // cargoLock would yield a real job that can never be satisfied.
+        if node.recipe.cargo_lock.is_none() {
             continue;
         }
-        match vendor_warm_args(&node.recipe, &node.stem) {
-            Ok(args) => jobs.push(VendorJob {
-                dest: node.stem.clone(),
-                args,
-            }),
+        match vendor_warm_plan(&node.recipe, &node.stem) {
+            Ok((args, rel)) => {
+                let lock = root.join(rel);
+                if vendor_is_warm(root, &node.stem, &lock) {
+                    continue;
+                }
+                jobs.push(VendorJob {
+                    dest: node.stem.clone(),
+                    args,
+                });
+            }
             Err(e) => eprintln!(
                 "   [warm] no warm command for {}'s crate closure ({e}) — skipping it",
                 node.stem
@@ -351,8 +362,15 @@ fn vendor_warm_lines(graph: &[RecipeNode]) -> Vec<String> {
         if node.recipe.cargo_lock.is_none() {
             continue;
         }
-        match vendor_warm_args(&node.recipe, &node.stem) {
-            Ok(args) => lines.push(args.join("\t")),
+        match vendor_warm_plan(&node.recipe, &node.stem) {
+            // The lock LAST, after the stem, so a reader that wants only the
+            // argv drops one field and one that must judge completeness has the
+            // file td-feed will stamp — rather than deriving a second opinion.
+            Ok((args, lock)) => lines.push(format!(
+                "{}\t{}",
+                args.join("\t"),
+                lock.display()
+            )),
             Err(e) => eprintln!(
                 "   [warm] no warm command for {}'s crate closure ({e}) -- skipping it",
                 node.stem
@@ -364,28 +382,52 @@ fn vendor_warm_lines(graph: &[RecipeNode]) -> Vec<String> {
 
 /// td-feed's OWN completion predicate: the `.warm-complete` marker it renames
 /// into `crate-vendor/<dest>/vendor` only once the whole locked closure is
-/// published. Anything weaker (say, "some `.crate` is here") would read an
-/// interrupted warm as done and skip the repair, leaving the build to fail the
-/// vendor gate's set-equality check — the outcome this preflight exists to avoid.
-fn vendor_is_warm(root: &Path, dest: &str) -> bool {
-    root.join(".td-build-cache/crate-vendor")
-        .join(dest)
-        .join("vendor")
-        .join(".warm-complete")
-        .is_file()
+/// published, AND the lock digest that marker carries. Anything weaker (say,
+/// "some `.crate` is here", or the marker's mere presence) would read an
+/// interrupted or SUPERSEDED warm as done and skip the repair, leaving the
+/// build to fail the vendor gate's set-equality check — the outcome this
+/// preflight exists to avoid.
+///
+/// The digest half is why this must move with td-feed: the marker is only
+/// meaningful for the lock it was published from, and a preflight that skipped
+/// on presence alone would decline to repair exactly the bumped rung td-feed
+/// would have re-warmed.
+fn vendor_is_warm(root: &Path, dest: &str, lock: &Path) -> bool {
+    let Ok(marked) = std::fs::read_to_string(
+        root.join(".td-build-cache/crate-vendor")
+            .join(dest)
+            .join("vendor")
+            .join(".warm-complete"),
+    ) else {
+        return false;
+    };
+    let Ok(want) = td_engine::sha256::sha256_file(lock) else {
+        return false;
+    };
+    marked.lines().next().map(str::trim) == Some(want.as_str())
 }
 
 /// The `td-feed` argv that vendors one rust rung's dep closure into
 /// `crate-vendor/<dest>`: an in-tree crate vendors from its own directory, a
 /// crates.io one from the package the recipe pins.
-fn vendor_warm_args(recipe: &Recipe, dest: &str) -> Result<Vec<String>, String> {
+/// The argv AND the lock td-feed will hash into the completion marker for it.
+///
+/// Derived together, deliberately. Each `warm` form pins its closure with a
+/// DIFFERENT lock — `crate-local` with the in-tree directory's, `crate-source`
+/// with the committed one the recipe names, and `crate` with the lock SHIPPED
+/// inside the fetched package — and a preflight that guessed differently would
+/// compute a digest td-feed never wrote. It would then ask for a repair on
+/// every run while td-feed reported `already warm` and skipped: a standoff that
+/// resolves only when someone deletes the vendor dir by hand. Today all three
+/// crates.io rungs happen to ship a lock byte-identical to their committed
+/// copy, which is exactly the sort of coincidence that stops being true
+/// quietly (review finding).
+fn vendor_warm_plan(recipe: &Recipe, dest: &str) -> Result<(Vec<String>, PathBuf), String> {
     if let Some(rel) = &recipe.local_source {
-        return Ok(vec![
-            s("warm"),
-            s("crate-local"),
-            rel.clone(),
-            dest.to_string(),
-        ]);
+        return Ok((
+            vec![s("warm"), s("crate-local"), rel.clone(), dest.to_string()],
+            PathBuf::from(rel).join("Cargo.lock"),
+        ));
     }
     let key = recipe
         .source_input
@@ -394,13 +436,23 @@ fn vendor_warm_args(recipe: &Recipe, dest: &str) -> Result<Vec<String>, String> 
     let pin = source_pin_for_key(key)?;
     if pin.file.ends_with(".crate") {
         let name = crate_name_from_pin(&pin.file, &recipe.version)?;
-        return Ok(vec![
-            s("warm"),
-            s("crate"),
-            name,
-            recipe.version.clone(),
-            dest.to_string(),
-        ]);
+        // `warm crate` fetches the package and pins the closure with the lock
+        // that package SHIPS, so that is the file whose digest it stamps.
+        let shipped = PathBuf::from(".td-build-cache/crate-vendor")
+            .join(dest)
+            .join("src")
+            .join(format!("{name}-{}", recipe.version))
+            .join("Cargo.lock");
+        return Ok((
+            vec![
+                s("warm"),
+                s("crate"),
+                name,
+                recipe.version.clone(),
+                dest.to_string(),
+            ],
+            shipped,
+        ));
     }
     // Fixed-output archives are materialized from their top-level source root;
     // fail during warming if the later build has not selected its Cargo workspace.
@@ -414,14 +466,17 @@ fn vendor_warm_args(recipe: &Recipe, dest: &str) -> Result<Vec<String>, String> 
         .cargo_lock
         .as_deref()
         .ok_or_else(|| format!("`{dest}' declares no committed Cargo.lock"))?;
-    Ok(vec![
-        s("warm"),
-        s("crate-source"),
-        pin.file,
-        pin.sha256,
-        lock.to_string(),
-        dest.to_string(),
-    ])
+    Ok((
+        vec![
+            s("warm"),
+            s("crate-source"),
+            pin.file,
+            pin.sha256,
+            lock.to_string(),
+            dest.to_string(),
+        ],
+        PathBuf::from(lock),
+    ))
 }
 
 /// The crates.io package name behind a pinned `<name>-<version>.crate`. Taken by
@@ -761,7 +816,20 @@ mod tests {
                 .join(".td-build-cache/crate-vendor")
                 .join(&job.dest)
                 .join("vendor");
-            fs::write(vendor.join(".warm-complete"), b"").unwrap();
+            // As td-feed publishes it: the digest of the lock this set is for.
+            // An empty or count-only marker is what the pre-digest scheme wrote
+            // and is deliberately no longer enough.
+            // Ask the derivation which lock td-feed would stamp for this rung,
+            // rather than writing one the preflight would never look at.
+            let recipe = td_recipe::catalog::lookup(&job.dest).unwrap();
+            let (_, rel) = vendor_warm_plan(&recipe, &job.dest).unwrap();
+            let lock = root.join(rel);
+            if let Some(parent) = lock.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&lock, format!("[[package]]\nname = \"{}\"\n", job.dest)).unwrap();
+            let digest = td_engine::sha256::sha256_file(&lock).unwrap();
+            fs::write(vendor.join(".warm-complete"), format!("{digest}\n1\n")).unwrap();
         }
         let after = survey(
             &root,
@@ -818,7 +886,7 @@ mod tests {
     fn malformed_crate_pin_is_not_reinterpreted_as_a_workspace_archive() {
         let mut recipe = td_recipe::catalog::lookup("uutils").unwrap();
         recipe.version = "wrong-version".into();
-        let error = vendor_warm_args(&recipe, "uutils").unwrap_err();
+        let error = vendor_warm_plan(&recipe, "uutils").unwrap_err();
         assert!(error.contains("is not `<name>-wrong-version.crate'"), "{error}");
     }
 
@@ -865,7 +933,11 @@ mod tests {
         let lines = vendor_warm_lines(&graph);
         for stem in &locked {
             assert!(
-                lines.iter().any(|line| line.ends_with(&format!("\t{stem}"))),
+                lines.iter().any(|line| {
+                    let mut fields = line.split('\t').rev();
+                    let _lock = fields.next();
+                    fields.next() == Some(stem)
+                }),
                 "no vendor warm derived for `{stem}': {lines:?}"
             );
         }
@@ -888,7 +960,7 @@ mod tests {
             if node.recipe.cargo_lock.is_none() {
                 continue;
             }
-            let args = vendor_warm_args(&node.recipe, &node.stem).unwrap();
+            let (args, _) = vendor_warm_plan(&node.recipe, &node.stem).unwrap();
             for field in &args {
                 assert!(
                     !field.contains('\t') && !field.contains('\n'),
@@ -906,7 +978,9 @@ mod tests {
     fn the_vendor_warm_args_verb_checks_its_arguments_and_derives_lines() {
         let lines = vendor_warm_args_for("system-x86-64").unwrap();
         assert!(
-            lines.iter().any(|line| line.ends_with("\tcodex")),
+            lines
+                .iter()
+                .any(|line| line.contains("\tcodex\t") && line.ends_with("Cargo.lock")),
             "the default target derives no codex warm: {lines:?}"
         );
         assert!(vendor_warm_args_for("no-such-recipe-stem").is_err());
@@ -914,19 +988,25 @@ mod tests {
         assert!(vendor_warm_args_cli(&two).is_err(), "arity is unchecked");
     }
 
-    /// The line format the prelude parses: TAB-joined, `warm` first, stem last.
+    /// The line format the prelude parses: TAB-joined, `warm` first, then the
+    /// recipe stem, then the lock td-feed pins that rung with. The lock is last
+    /// so a reader that wants only the argv drops one field.
     #[test]
-    fn a_derived_vendor_warm_line_is_tab_joined_with_the_stem_last() {
+    fn a_derived_vendor_warm_line_is_tab_joined_with_the_stem_then_the_lock() {
         let graph = recipe_closure(&["system-x86-64"]).unwrap();
         let lines = vendor_warm_lines(&graph);
         assert!(!lines.is_empty(), "the default graph derives no vendor warm");
         for line in &lines {
             let fields: Vec<&str> = line.split('\t').collect();
             assert!(
-                fields.len() >= 3,
-                "`{line}' is too short to name a warm and a dest"
+                fields.len() >= 4,
+                "`{line}' is too short to name a warm, a dest and a lock"
             );
             assert_eq!(fields.first(), Some(&"warm"), "`{line}' is not a warm argv");
+            assert!(
+                fields.last().is_some_and(|f| f.ends_with("Cargo.lock")),
+                "`{line}' does not end in the lock it is judged against"
+            );
             assert!(
                 !line.contains('\n'),
                 "`{line}' would not survive line-based parsing"
@@ -937,11 +1017,80 @@ mod tests {
         }
     }
 
+    /// The preflight's skip must agree with td-feed's own predicate, or it
+    /// declines to repair exactly the rung td-feed would have re-warmed.
+    ///
+    /// Both read the digest the marker carries. A marker for a superseded lock
+    /// — or one written by the pre-digest scheme, which carries a count where
+    /// the digest belongs — is not warm on either side.
+    #[test]
+    fn a_vendor_marked_for_another_lock_is_not_warm() {
+        let root = scratch("vendor-marker");
+        let vendor = root.join(".td-build-cache/crate-vendor/x/vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        let lock = root.join("Cargo.lock");
+        fs::write(&lock, "[[package]]\nname = \"a\"\n").unwrap();
+
+        assert!(!vendor_is_warm(&root, "x", &lock), "no marker is not warm");
+
+        let digest = td_engine::sha256::sha256_file(&lock).unwrap();
+        fs::write(vendor.join(".warm-complete"), format!("{digest}\n7\n")).unwrap();
+        assert!(vendor_is_warm(&root, "x", &lock), "its own lock is warm");
+
+        fs::write(&lock, "[[package]]\nname = \"a\"\nversion = \"2\"\n").unwrap();
+        assert!(
+            !vendor_is_warm(&root, "x", &lock),
+            "a bumped lock must be repaired, not skipped"
+        );
+
+        fs::write(vendor.join(".warm-complete"), "1189\n").unwrap();
+        assert!(
+            !vendor_is_warm(&root, "x", &lock),
+            "a pre-digest marker must be repaired, not skipped"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Each warm form is judged against the lock td-feed actually pins it with.
+    ///
+    /// This is the derivation, not the comparison: handing a predicate a lock
+    /// proves nothing about which lock it would have chosen. `warm crate`
+    /// fetches a package and uses the lock that package SHIPS, so a preflight
+    /// that reached for the committed copy instead would compute a digest
+    /// td-feed never wrote — asking for a repair every run while td-feed
+    /// reported `already warm`. The two files are byte-identical for every
+    /// crates.io rung today, which is exactly why nothing would notice.
+    #[test]
+    fn each_warm_form_is_judged_against_the_lock_td_feed_pins_it_with() {
+        let uutils = td_recipe::catalog::lookup("uutils").unwrap();
+        let (args, lock) = vendor_warm_plan(&uutils, "uutils").unwrap();
+        assert_eq!(args.get(1).map(String::as_str), Some("crate"));
+        assert_eq!(
+            lock,
+            PathBuf::from(".td-build-cache/crate-vendor/uutils/src")
+                .join(format!("coreutils-{}", uutils.version))
+                .join("Cargo.lock"),
+            "a crates.io rung is pinned by the lock its package ships"
+        );
+
+        let codex = td_recipe::catalog::lookup("codex").unwrap();
+        let (args, lock) = vendor_warm_plan(&codex, "codex").unwrap();
+        assert_eq!(args.get(1).map(String::as_str), Some("crate-source"));
+        assert_eq!(
+            lock,
+            PathBuf::from("recipes/locks/codex/Cargo.lock"),
+            "an archive rung is pinned by its committed lock"
+        );
+        // The argv td-feed receives names that same lock, so the two cannot be
+        // about different files.
+        assert_eq!(args.get(4).map(String::as_str), lock.to_str());
+    }
+
     #[test]
     fn fixed_output_workspace_archives_warm_from_the_committed_lock() {
         let codex = td_recipe::catalog::lookup("codex").unwrap();
         assert_eq!(
-            vendor_warm_args(&codex, "codex").unwrap(),
+            vendor_warm_plan(&codex, "codex").unwrap().0,
             vec![
                 "warm",
                 "crate-source",
