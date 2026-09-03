@@ -120,6 +120,16 @@ const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str =
     td_recipe::ladder::TD_PORTAL_REQUEST_RUNTIME_MARKER;
 const TD_PORTAL_REQUEST_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-REQUEST-READY response=2";
+/// Printed by that same probe once every portal §H item 14 names unsupported
+/// has been proved unavailable. `ladder::TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER`
+/// defines what "proved" takes; nothing in this file restates it, because six
+/// paraphrases of it drifted apart before that rule was adopted. The operator
+/// diagnostic below lists CAUSES for a missing marker, which is a different
+/// thing and is what a red boot needs to read.
+const TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER: &str =
+    td_recipe::ladder::TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER;
+const TD_PORTAL_UNSUPPORTED_CONSOLE_MARKER: &str =
+    "portal-evidence: TD-PORTAL-UNSUPPORTED-REFUSED portals=4";
 const TD_PORTAL_CHANNEL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_CHANNEL_RUNTIME_MARKER;
 const TD_PORTAL_CHANNEL_CONSOLE_MARKER: &str =
     "portal-channel-evidence: TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2";
@@ -376,6 +386,7 @@ struct ConsoleEvidence {
     td_busd_runtime: bool,
     td_portal_runtime: bool,
     td_portal_request_runtime: bool,
+    td_portal_unsupported_runtime: bool,
     td_portal_channel_runtime: bool,
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
@@ -1042,6 +1053,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          version and immutable policy ({TD_PORTAL_RUNTIME_MARKER}), then pre-subscribed to a \
          caller-derived handle and received both its Background method reply and directed \
          policy-denial Request.Response ({TD_PORTAL_REQUEST_RUNTIME_MARKER}), \
+         proved unavailable every portal §H names unsupported \
+         ({TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER}), \
          connected to the compositor's private portal socket, received its exact registry, \
          bound the privileged manager, and completed standalone and dismissal acknowledgements \
          ({TD_PORTAL_CHANNEL_RUNTIME_MARKER}), \
@@ -1663,6 +1676,28 @@ fn validate_system_boot(
              Request.Response with code 2. The denial is intentional: td has no persistent \
              background-service policy. The missing marker instead means handle export, \
              reply ordering, directed signal routing, or exact result decoding failed. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_portal_unsupported_runtime {
+        return Err(format!(
+            "the live portal proofs passed, but the unsupported-portal marker \
+             ({TD_PORTAL_UNSUPPORTED_CONSOLE_MARKER:?}) was absent — ScreenCast, \
+             RemoteDesktop, Camera and Secret were not all proved unavailable. \
+             Each portal faces two checks and the marker needs every one. \
+             Five check outcomes withhold it, and they mean different things: \
+             a portal PUBLISHED an interface version, or ANSWERED a method td \
+             does not implement — either tells a client td has a capability it \
+             does not have; the unpublished-interface refusal or the method \
+             refusal arrived under a different error name, which means that \
+             dispatcher arm moved and the probe is no longer testing what it \
+             names; or a reply came from a sender other than the portal, which \
+             means the evidence was never the portal's to give. A transport \
+             failure inside the probe — a deadline, a malformed frame, an \
+             unauthenticated reply — also leaves the marker absent without \
+             being any of those, so read the probe's own error below before \
+             concluding a portal misbehaved. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -3735,6 +3770,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_BUSD_RUNTIME_MARKER.len(),
         exact_line_window(TD_PORTAL_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_REQUEST_CONSOLE_MARKER),
+        exact_line_window(TD_PORTAL_UNSUPPORTED_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_CHANNEL_CONSOLE_MARKER),
         TD_SANDBOX_KERNEL_MARKER.len(),
         TD_JAIL_TRANSITION_MARKER.len(),
@@ -3942,6 +3978,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_portal_request_runtime,
         buf,
         TD_PORTAL_REQUEST_CONSOLE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_portal_unsupported_runtime,
+        buf,
+        TD_PORTAL_UNSUPPORTED_CONSOLE_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -6675,7 +6717,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 70] {
+    fn all_console_markers() -> [&'static str; 71] {
         [
             MARKER,
             EROFS_MARKER,
@@ -6716,6 +6758,7 @@ mod tests {
             TD_BUSD_RUNTIME_MARKER,
             TD_PORTAL_CONSOLE_MARKER,
             TD_PORTAL_REQUEST_CONSOLE_MARKER,
+            TD_PORTAL_UNSUPPORTED_CONSOLE_MARKER,
             TD_PORTAL_CHANNEL_CONSOLE_MARKER,
             TD_SANDBOX_KERNEL_MARKER,
             TD_JAIL_TRANSITION_MARKER,
@@ -6893,6 +6936,10 @@ mod tests {
             Some(TD_PORTAL_REQUEST_RUNTIME_MARKER)
         );
         assert_eq!(
+            TD_PORTAL_UNSUPPORTED_CONSOLE_MARKER.strip_prefix("portal-evidence: "),
+            Some(TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER)
+        );
+        assert_eq!(
             TD_PORTAL_CHANNEL_CONSOLE_MARKER.strip_prefix("portal-channel-evidence: "),
             Some(TD_PORTAL_CHANNEL_RUNTIME_MARKER)
         );
@@ -6922,6 +6969,25 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_portal_request_runtime);
+        assert!(!evidence.td_portal_unsupported_runtime);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER}\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_portal_unsupported_runtime);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\nportal: {TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER}\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_portal_unsupported_runtime);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_PORTAL_UNSUPPORTED_CONSOLE_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_portal_unsupported_runtime);
         assert!(!evidence.td_portal_channel_runtime);
         latch_console_evidence(
             &mut evidence,
@@ -7392,6 +7458,7 @@ mod tests {
             TD_BUSD_RUNTIME_MARKER,
             TD_PORTAL_CONSOLE_MARKER,
             TD_PORTAL_REQUEST_CONSOLE_MARKER,
+            TD_PORTAL_UNSUPPORTED_CONSOLE_MARKER,
             TD_PORTAL_CHANNEL_CONSOLE_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
@@ -7457,6 +7524,7 @@ mod tests {
         assert!(evidence.td_busd_runtime);
         assert!(evidence.td_portal_runtime);
         assert!(evidence.td_portal_request_runtime);
+        assert!(evidence.td_portal_unsupported_runtime);
         assert!(evidence.td_portal_channel_runtime);
         assert!(evidence.td_jail_transition);
         assert!(evidence.td_jail_seccomp);

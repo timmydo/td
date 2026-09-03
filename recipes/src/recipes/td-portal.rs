@@ -194,7 +194,7 @@ mod tests {
     use super::*;
     use crate::ladder::{
         TD_PORTAL_CHANNEL_RUNTIME_MARKER, TD_PORTAL_REQUEST_RUNTIME_MARKER,
-        TD_PORTAL_RUNTIME_MARKER,
+        TD_PORTAL_RUNTIME_MARKER, TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER,
     };
 
     #[test]
@@ -293,6 +293,9 @@ mod tests {
         assert!(MAIN_RS.contains(&format!(
             "pub const REQUEST_READY_MARKER: &str = \"{TD_PORTAL_REQUEST_RUNTIME_MARKER}\";"
         )));
+        assert!(MAIN_RS.contains(&format!(
+            "pub const UNSUPPORTED_READY_MARKER: &str = \"{TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER}\";"
+        )));
         assert!(WAYLAND_CHANNEL_RS.contains("EXPECTED_GLOBALS.len()"));
         assert!(
             WAYLAND_CHANNEL_RS.contains("TD-PORTAL-CHANNEL-READY globals={} privileged=1 dialog=2")
@@ -303,6 +306,7 @@ mod tests {
         );
         assert!(MAIN_RS.contains("println!(\"{READY_MARKER}\");"));
         assert!(MAIN_RS.contains("println!(\"{REQUEST_READY_MARKER}\");"));
+        assert!(MAIN_RS.contains("println!(\"{UNSUPPORTED_READY_MARKER}\");"));
         assert!(MAIN_RS.contains("println!(\"{}\", wayland_channel::ready_marker());"));
     }
 

@@ -127,6 +127,38 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const OWNER_MATCH: &str = "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged'";
 pub const READY_MARKER: &str = "TD-PORTAL-READY namespaces=2 settings=10 version=1";
 pub const REQUEST_READY_MARKER: &str = "TD-PORTAL-REQUEST-READY response=2";
+/// §H item 14. The count is pinned in the line because the host greps for an
+/// exact string; `the_unsupported_marker_counts_the_portals_it_names` holds
+/// it to `UNSUPPORTED_PORTALS`, which is the list itself.
+pub const UNSUPPORTED_READY_MARKER: &str = "TD-PORTAL-UNSUPPORTED-REFUSED portals=4";
+
+/// §H item 14's unsupported portals, each with a member a real client calls
+/// first. The four are NAMED in several places — §H itself, the marker's
+/// definition, the operator diagnostic — but this array is the only one
+/// anything WALKS: the live probe and both dispatcher tests read it, so a
+/// fifth cannot be proved in one place and forgotten in the other. Adding one
+/// reds the count pins, which is what forces the prose copies to be revisited.
+///
+/// `probe` is also the `[portal]` unit's `ready=` command, so implementing one
+/// of these must drop it from here in the same change or the daemon never
+/// comes ready.
+///
+/// None of the four is in `known_property_interface`, which is what makes
+/// `Properties.Get` report them unpublished.
+///
+/// Each entry costs two round trips against the ONE `EXCHANGE_TIMEOUT`
+/// deadline `Connection::open` sets for the whole probe — the budget does not
+/// grow with this list. These are the cheapest calls in the exchange (both
+/// are refused at a dispatcher match arm, with no I/O and no handle
+/// allocation, unlike the Background request that waits on a directed
+/// signal), but a much longer roster would need that deadline revisited
+/// rather than assumed.
+const UNSUPPORTED_PORTALS: [(&str, &str); 4] = [
+    ("org.freedesktop.portal.ScreenCast", "CreateSession"),
+    ("org.freedesktop.portal.RemoteDesktop", "CreateSession"),
+    ("org.freedesktop.portal.Camera", "AccessCamera"),
+    ("org.freedesktop.portal.Secret", "RetrieveSecret"),
+];
 const BACKGROUND_DENIAL_BODY: &[u8] = &[
     2, 0, 0, 0, 48, 0, 0, 0, 10, 0, 0, 0, 98, 97, 99, 107, 103, 114, 111, 117, 110, 100, 0, 1, 98,
     0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 97, 117, 116, 111, 115, 116, 97, 114, 116, 0, 1, 98, 0, 0, 0,
@@ -352,11 +384,19 @@ struct Reply {
     sender: String,
     signature: String,
     body: Vec<u8>,
+    /// `Some` only when the call asked for a refusal and got one. Every other
+    /// reply — including every error a caller did not ask to see — is `None`,
+    /// so a caller cannot mistake a refusal for an answer by forgetting to
+    /// look.
+    refusal: Option<String>,
 }
 
 struct CallGuard<'a> {
     signature: &'a str,
     early_response_path: Option<&'a str>,
+    /// Treat a D-Bus error reply as the result instead of a failure. Off for
+    /// every ordinary call, so an unexpected refusal still fails loudly.
+    expect_refusal: bool,
 }
 
 enum IncomingFrame {
@@ -528,9 +568,88 @@ impl Connection {
             CallGuard {
                 signature,
                 early_response_path: None,
+                expect_refusal: false,
             },
             fill,
         )
+    }
+
+    /// Require `Properties.Get(interface, "version")` to report the interface
+    /// unpublished.
+    ///
+    /// This is the availability question §H item 14 actually asks, and unlike
+    /// a bare method call it is protocol-valid for every roster entry:
+    /// `Properties.Get` takes `ss` whatever the portal's own methods take. A
+    /// portal that begins serving one of these has to publish a version to be
+    /// conformant, so this reddens even when the new implementation's real
+    /// signature differs from the one `require_refusal` can send — which is
+    /// exactly Secret's case.
+    fn require_unpublished_interface(&mut self, interface: &str, from: &str) -> io::Result<()> {
+        let reply = self.call_guarded(
+            PORTAL_NAME,
+            PORTAL_PATH,
+            PROPERTIES_INTERFACE,
+            "Get",
+            CallGuard {
+                signature: "ss",
+                early_response_path: None,
+                expect_refusal: true,
+            },
+            |writer| {
+                writer.string(interface)?;
+                writer.string("version")
+            },
+        )?;
+        require_portal_sender(&reply, from, &format!("Properties.Get({interface}, version)"))?;
+        match reply.refusal.as_deref() {
+            Some(UNPUBLISHED_INTERFACE_ERROR) => Ok(()),
+            Some(other) => Err(io::Error::other(format!(
+                "Properties.Get({interface}, version) was refused as {other}, \
+                 not {UNPUBLISHED_INTERFACE_ERROR}"
+            ))),
+            None => Err(io::Error::other(format!(
+                "{interface} PUBLISHES a version, so td advertises it as available"
+            ))),
+        }
+    }
+
+    /// Call a portal td does not serve and require it to REFUSE.
+    ///
+    /// A method return fails this, and so does any error name other than the
+    /// dispatcher's catch-all: §H's point is that an unimplemented portal
+    /// answering a call is worse than one refusing, because the caller
+    /// records a capability td does not have.
+    ///
+    /// The body is an options-only `a{sv}`. That IS the real signature for
+    /// ScreenCast and RemoteDesktop `CreateSession` and for Camera
+    /// `AccessCamera`, so for those three this is a well-formed call refused
+    /// on its merits. `Secret.RetrieveSecret` really takes `ha{sv}` with an
+    /// attached descriptor, which this client has no way to send, so for
+    /// Secret this shows only that a malformed call is refused.
+    /// `require_unpublished_interface` is what carries Secret's proof.
+    fn require_refusal(&mut self, interface: &str, member: &str, from: &str) -> io::Result<()> {
+        let reply = self.call_guarded(
+            PORTAL_NAME,
+            PORTAL_PATH,
+            interface,
+            member,
+            CallGuard {
+                signature: "a{sv}",
+                early_response_path: None,
+                expect_refusal: true,
+            },
+            |writer| writer.array("{sv}", |_| Ok(())),
+        )?;
+        require_portal_sender(&reply, from, &format!("{interface}.{member}"))?;
+        match reply.refusal.as_deref() {
+            Some(UNSUPPORTED_PORTAL_ERROR) => Ok(()),
+            Some(other) => Err(io::Error::other(format!(
+                "{interface}.{member} was refused as {other}, not {UNSUPPORTED_PORTAL_ERROR}"
+            ))),
+            None => Err(io::Error::other(format!(
+                "{interface}.{member} was ANSWERED, but td does not implement it"
+            ))),
+        }
     }
 
     fn call_guarded<F>(
@@ -590,6 +709,18 @@ impl Connection {
                 }
             }
             if reply.kind == MessageType::Error {
+                if guard.expect_refusal {
+                    let name = reply.fields.error_name.ok_or_else(|| {
+                        io::Error::other("a D-Bus error reply carried no error name")
+                    })?;
+                    return Ok(Reply {
+                        endian: reply.endian,
+                        sender: sender.to_string(),
+                        signature: reply.fields.signature.unwrap_or("").to_string(),
+                        body: reply.body_bytes().to_vec(),
+                        refusal: Some(name.to_string()),
+                    });
+                }
                 let text = reply.args().first().and_then(Value::as_str).unwrap_or("");
                 return Err(io::Error::other(format!(
                     "{member} was refused as {}{}",
@@ -609,6 +740,7 @@ impl Connection {
                 sender: sender.to_string(),
                 signature: reply.fields.signature.unwrap_or("").to_string(),
                 body: reply.body_bytes().to_vec(),
+                refusal: None,
             });
         }
         Err(io::Error::other(format!(
@@ -652,6 +784,7 @@ impl Connection {
                 sender: portal_sender.to_string(),
                 signature: signal.fields.signature.unwrap_or("").to_string(),
                 body: signal.body_bytes().to_vec(),
+                refusal: None,
             });
         }
         Err(io::Error::other(format!(
@@ -1698,7 +1831,7 @@ fn dispatch(
             serial,
             call.serial,
             sender,
-            "org.freedesktop.DBus.Error.UnknownMethod",
+            UNSUPPORTED_PORTAL_ERROR,
             "td-portal does not serve that method",
         ),
     }?;
@@ -1992,6 +2125,32 @@ struct PortalCallError {
     text: &'static str,
 }
 
+/// The dispatcher's catch-all refusal for any (interface, member) pair
+/// td-portal does not serve. §H item 14's unsupported portals — `ScreenCast`,
+/// `RemoteDesktop`, `Camera`, `Secret` — all arrive here.
+const UNSUPPORTED_PORTAL_ERROR: &str = "org.freedesktop.DBus.Error.UnknownMethod";
+/// What `Properties.Get` answers for an interface td does not publish. The
+/// live probe requires this for every §H item 14 portal.
+const UNPUBLISHED_INTERFACE_ERROR: &str = "org.freedesktop.DBus.Error.UnknownInterface";
+
+/// Require a refusal to have come FROM the portal, named by the unique sender
+/// an earlier reply in the same exchange carried.
+///
+/// Without this the §H item 14 marker would attest only that SOMETHING
+/// refused with the expected name. td-busd makes another answer hard — a
+/// directed call to a name nobody owns is refused `NameHasNoOwner`, and the
+/// broker emits `UnknownMethod` only for calls addressed to its own name —
+/// but the claim should be exact rather than rest on that, as the directed
+/// `Request.Response` check already does.
+fn require_portal_sender(reply: &Reply, expected: &str, what: &str) -> io::Result<()> {
+    if reply.sender == expected {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "{what} was answered by {}, not the portal at {expected}",
+        reply.sender
+    )))
+}
 const INVALID_OPEN: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 const UNSUPPORTED_OPEN: &str = "org.freedesktop.portal.Error.NotSupported";
 
@@ -3141,6 +3300,7 @@ fn probe(paths: &Paths) -> Result<(), String> {
             CallGuard {
                 signature: "sa{sv}",
                 early_response_path: Some(&request_path),
+                expect_refusal: false,
             },
             |writer| {
                 writer.string("")?;
@@ -3169,8 +3329,20 @@ fn probe(paths: &Paths) -> Result<(), String> {
     {
         return Err("the live Background denial response is not exact".into());
     }
+    // Printed before the §H item 14 checks run, not after: these two attest
+    // proofs that have already passed, and a failure below must not also
+    // erase their evidence and be reported as three failures with one cause.
     println!("{READY_MARKER}");
     println!("{REQUEST_READY_MARKER}");
+    for (interface, member) in UNSUPPORTED_PORTALS {
+        connection
+            .require_unpublished_interface(interface, &request.sender)
+            .map_err(|error| format!("an unsupported-portal check failed: {error}"))?;
+        connection
+            .require_refusal(interface, member, &request.sender)
+            .map_err(|error| format!("an unsupported-portal check failed: {error}"))?;
+    }
+    println!("{UNSUPPORTED_READY_MARKER}");
     Ok(())
 }
 
@@ -4467,6 +4639,143 @@ mod tests {
         assert_eq!(version.values(1).unwrap(), vec![Value::Uint32(3)]);
     }
 
+    /// §H item 14: a portal td does not implement must REFUSE, not answer.
+    ///
+    /// A portal that replies to a call it has not implemented is worse than
+    /// one that refuses: the caller records a capability td does not have.
+    ///
+    /// The body is an options-only `a{sv}`, which is the REAL signature for
+    /// ScreenCast and RemoteDesktop `CreateSession` and for Camera
+    /// `AccessCamera`. `Secret.RetrieveSecret` takes `ha{sv}` with an
+    /// attached descriptor, so for Secret this asserts only that a malformed
+    /// call is refused; `the_unsupported_portals_are_not_published` is what
+    /// keeps Secret honest, because a real implementation would have to
+    /// publish a version.
+    ///
+    /// The name here is `UnknownMethod`: the dispatcher's catch-all for any
+    /// (interface, member) pair it does not serve. It is asserted rather than
+    /// corrected. Making a bare call to an unpublished interface answer
+    /// `UnknownInterface` instead would be a protocol change, not a proof, so
+    /// the availability question is asked where the protocol already answers
+    /// it — `Properties.Get`, in the companion test.
+    #[test]
+    fn the_unsupported_portals_are_refused_rather_than_answered() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        for (interface, member) in UNSUPPORTED_PORTALS {
+            let request = call(interface, member, "a{sv}", |writer| {
+                writer.array("{sv}", |_| Ok(()))
+            });
+            let (request, _) = message::decode(&request, 0).unwrap();
+            let reply = dispatch_one(&request, &settings, 40);
+            let (reply, _) = message::decode(&reply, 0).unwrap();
+            assert_eq!(
+                reply.kind,
+                MessageType::Error,
+                "{interface}.{member} was ANSWERED"
+            );
+            // The wire name is spelled out rather than compared to
+            // `UNSUPPORTED_PORTAL_ERROR`: the dispatcher builds its reply from
+            // that same const, so naming it here would let the two move
+            // together and assert nothing. This is what a client sees.
+            assert_eq!(
+                reply.fields.error_name,
+                Some("org.freedesktop.DBus.Error.UnknownMethod"),
+                "{interface}.{member} was refused under a different name"
+            );
+            assert_eq!(
+                reply.args().first().and_then(Value::as_str),
+                Some("td-portal does not serve that method"),
+                "{interface}.{member} was refused with unexpected text"
+            );
+        }
+    }
+
+    /// §H item 14 asks that these portals be reported UNAVAILABLE. A method
+    /// call proves no method arm serves one; this proves td does not
+    /// advertise the interface at all, which is the question a client asks
+    /// first and the one a bare call cannot answer for `Secret` — its real
+    /// signature carries a descriptor this probe cannot send, so a
+    /// signature-aware implementation could serve valid requests while the
+    /// malformed one still reached the catch-all.
+    #[test]
+    fn the_unsupported_portals_are_not_published() {
+        let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
+        for (interface, _) in UNSUPPORTED_PORTALS {
+            let request = call(PROPERTIES_INTERFACE, "Get", "ss", |writer| {
+                writer.string(interface)?;
+                writer.string("version")
+            });
+            let (request, _) = message::decode(&request, 0).unwrap();
+            let reply = dispatch_one(&request, &settings, 40);
+            let (reply, _) = message::decode(&reply, 0).unwrap();
+            assert_eq!(
+                reply.kind,
+                MessageType::Error,
+                "{interface} published a version"
+            );
+            assert_eq!(
+                reply.fields.error_name,
+                Some("org.freedesktop.DBus.Error.UnknownInterface"),
+                "{interface} was refused under a different name"
+            );
+        }
+    }
+
+    /// Introspection is the other way a client discovers a portal. An
+    /// interface listed in any of these would read as available however the
+    /// dispatcher answers a call to it, so none of them may name one. All
+    /// THREE documents td serves are checked: an earlier version of this test
+    /// checked only the root and session documents, and a mutation that added
+    /// ScreenCast to the request document passed it.
+    #[test]
+    fn introspection_does_not_advertise_an_unsupported_portal() {
+        let documents = [
+            ("root", INTROSPECTION_XML),
+            ("request", REQUEST_INTROSPECTION_XML),
+            ("session", SESSION_INTROSPECTION_XML),
+        ];
+        for (interface, _) in UNSUPPORTED_PORTALS {
+            for (name, document) in documents {
+                assert!(
+                    !document.contains(interface),
+                    "the {name} introspection document advertises {interface}"
+                );
+            }
+        }
+    }
+
+    /// A refusal is only evidence if the PORTAL produced it. This pins the
+    /// equality rather than resting on td-busd refusing to route a portal call
+    /// anywhere else.
+    #[test]
+    fn a_refusal_from_another_sender_is_not_the_portals_refusal() {
+        let reply = Reply {
+            endian: Endian::Little,
+            sender: ":1.99".to_string(),
+            signature: String::new(),
+            body: Vec::new(),
+            refusal: Some(UNSUPPORTED_PORTAL_ERROR.to_string()),
+        };
+        let error = require_portal_sender(&reply, ":1.7", "iface.CreateSession")
+            .expect_err("a reply from another sender was accepted");
+        assert!(error.to_string().contains(":1.99"));
+        assert!(require_portal_sender(&reply, ":1.99", "iface.CreateSession").is_ok());
+    }
+
+    /// The marker the host greps for states a count, so it can go stale
+    /// against the list it summarises. It cannot silently: this holds the
+    /// rendered line to the array.
+    #[test]
+    fn the_unsupported_marker_counts_the_portals_it_names() {
+        assert_eq!(
+            UNSUPPORTED_READY_MARKER,
+            format!(
+                "TD-PORTAL-UNSUPPORTED-REFUSED portals={}",
+                UNSUPPORTED_PORTALS.len()
+            )
+        );
+    }
+
     #[test]
     fn properties_refuse_an_ambiguous_empty_interface_and_are_read_only() {
         let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
@@ -5054,6 +5363,7 @@ mod tests {
                 CallGuard {
                     signature: "sa{sv}",
                     early_response_path: Some(path),
+                    expect_refusal: false,
                 },
                 |writer| {
                     writer.string("")?;

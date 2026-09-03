@@ -14,7 +14,8 @@ use crate::ladder::{
     TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
     TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
     TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_CHANNEL_RUNTIME_MARKER,
-    TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
+    TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
     TD_TXT_RUNTIME_MARKER,
     TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
@@ -1280,15 +1281,16 @@ fn build_td_svc_conf() -> String {
          console=yes\n\
          \n\
          # Readiness output is discarded by td-svc. This separate client repeats\n\
-         # the exact live Settings and Request exchanges with console output,\n\
-         # making routing, reply and directed-signal QEMU evidence rather than\n\
-         # a startup assertion.\n\
+         # the exact live Settings, Request and unsupported-portal exchanges\n\
+         # with console output, making routing, reply, directed-signal and\n\
+         # refusal QEMU evidence rather than a startup assertion.\n\
          # Wait for TLS setup because its key generator writes raw progress to\n\
          # the console without line framing; once it settles, td-svc's one-write\n\
          # service prefix is an attributable exact line. This is ordering only:\n\
          # TLS setup is deliberately not required by portal evidence.\n\
-         # td-recipe-eval requires exact {portal_runtime_marker} and\n\
-         # {portal_request_runtime_marker} lines.\n\
+         # td-recipe-eval requires exact {portal_runtime_marker},\n\
+         # {portal_request_runtime_marker} and\n\
+         # {portal_unsupported_runtime_marker} lines.\n\
          [portal-evidence]\n\
          type=oneshot\n\
          cgroup=session\n\
@@ -1487,6 +1489,7 @@ fn build_td_svc_conf() -> String {
         portal_settings = TD_PORTAL_SETTINGS_PATH,
         portal_runtime_marker = TD_PORTAL_RUNTIME_MARKER,
         portal_request_runtime_marker = TD_PORTAL_REQUEST_RUNTIME_MARKER,
+        portal_unsupported_runtime_marker = TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER,
         portal_channel_runtime_marker = TD_PORTAL_CHANNEL_RUNTIME_MARKER,
         portal_wayland_socket = PORTAL_WAYLAND_SOCKET,
         portal_service_log = PORTAL_SERVICE_LOG,

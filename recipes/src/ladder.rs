@@ -775,6 +775,26 @@ pub const TD_PORTAL_RUNTIME_MARKER: &str =
 pub const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str =
     "TD-PORTAL-REQUEST-READY response=2";
 
+/// Printed by that same live client once every portal §H item 14 names as
+/// unsupported — `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret` — has been
+/// proved unavailable over the routed bus. Each faces two checks: its
+/// interface must report unpublished to `Properties.Get`, and a call to one of
+/// its members must be refused rather than answered. Both replies must come
+/// from the portal's own unique sender, so the line attests that the PORTAL
+/// answered this way rather than that something did. A portal that answers a
+/// method it does not implement is worse than one that refuses, because the
+/// caller records a capability td does not have.
+///
+/// Two checks because one does not cover `Secret`: its real signature carries
+/// a descriptor the probe cannot send, so only the unpublished-interface half
+/// would notice a signature-aware implementation serving valid requests.
+///
+/// DUPLICATED as `UNSUPPORTED_READY_MARKER` in td-portal/src/main.rs and
+/// pinned by the td-portal recipe. The count is part of the line, and
+/// td-portal holds it to the list it walks.
+pub const TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER: &str =
+    "TD-PORTAL-UNSUPPORTED-REFUSED portals=4";
+
 /// Printed by a separate unprivileged client only after the compositor's
 /// private portal socket returns its exact registry, binds the privileged
 /// manager, and completes standalone-association and dismissal requests.

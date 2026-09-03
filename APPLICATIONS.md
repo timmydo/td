@@ -549,10 +549,14 @@ literal `td-login exec-as tester -- /bin/td-portal run ...` direct child while
 retaining its own bus connection. The child activates that capability before
 claiming `org.freedesktop.portal.Desktop`. Readiness is a separate uid-1000
 client performing live `Properties.Get(version)`, synchronous
-`Settings.ReadAll`, and a pre-subscribed `Background.RequestBackground` whose
-caller-derived handle receives a directed denial `Request.Response`; td-svc
-discards readiness output, so `portal-evidence` repeats the same bounded
-exchanges through its captured service log and `console=yes` for QEMU.
+`Settings.ReadAll`, a pre-subscribed `Background.RequestBackground` whose
+caller-derived handle receives a directed denial `Request.Response`, and the
+§H item 14 checks that each unsupported portal is unpublished and refuses;
+td-svc discards readiness output, so `portal-evidence` repeats the same
+bounded exchanges through its captured service log and `console=yes` for
+QEMU. Readiness therefore depends on those four portals staying
+unimplemented: whoever implements one must drop it from the probe's roster
+in the same change, or the daemon never comes ready.
 Firefox is ordered after `portal` but does not
 `require` it, and neither portal unit is a dependency of `bootsuccess`: a
 user-service failure is evidence failure, not authority to reject an otherwise
@@ -5337,8 +5341,50 @@ to the compiled file. It then pre-subscribes to its exact caller-derived
 Request path, calls the Background interface described below, checks that the
 method reply carries that path, and byte-compares the directed `Response`.
 Only then does it emit `TD-PORTAL-READY namespaces=2 settings=10 version=1`
-and `TD-PORTAL-REQUEST-READY response=2`. QEMU requires both as exact
-td-svc-prefixed `portal-evidence:` lines on every validated boot. The evidence
+and `TD-PORTAL-REQUEST-READY response=2`.
+
+The same client then puts each portal §H item 14 names unsupported —
+`ScreenCast`, `RemoteDesktop`, `Camera` and `Secret` — through two routed
+checks, and emits `TD-PORTAL-UNSUPPORTED-REFUSED portals=4` only if all four
+pass both. The two markers above are printed before these checks run, so a
+regression here cannot also erase the evidence for proofs that already
+passed and be reported as three failures with one cause.
+
+The first check is `Properties.Get(<interface>, "version")`, which must
+answer `org.freedesktop.DBus.Error.UnknownInterface`. That is the
+availability question §H actually asks, and it is protocol-valid for every
+entry whatever that portal's own methods take, because `Properties.Get`
+takes `ss`. The second is a bare call to a member a real client would reach
+for, which must be refused with the dispatcher's
+`org.freedesktop.DBus.Error.UnknownMethod` catch-all. Both exact names are
+required, so the check fails if either arm later moves and the probe quietly
+stops testing what it names.
+
+The method call carries an options-only `a{sv}` body. That IS the real
+signature for ScreenCast and RemoteDesktop `CreateSession` and for Camera
+`AccessCamera`, so for those three it is a well-formed call refused on its
+merits. `Secret.RetrieveSecret` really takes `ha{sv}` with an attached
+descriptor this probe cannot send, so for Secret the method call shows only
+that a malformed request is refused. That is exactly why the
+`Properties.Get` check exists: a signature-aware Secret implementation could
+serve valid requests while the malformed one still reached the catch-all,
+and only the unpublished-interface check would notice.
+
+Both checks additionally require the reply to come FROM the portal, matched
+against the unique name the `Background` method return carried earlier in the
+same exchange. Without that the marker would attest only that something
+refused with the expected name. td-busd already makes another answer hard —
+a directed call to a name nobody owns is refused `NameHasNoOwner`, and the
+broker emits `UnknownMethod` only for calls addressed to its own name — but
+the evidence pins the sender rather than resting on that, exactly as the
+directed `Request.Response` check does.
+
+Unit tests additionally hold all three introspection documents — root,
+request and session — to naming none of the four, since an advertised
+interface reads as available however a call to it is answered.
+
+QEMU requires all three markers as exact td-svc-prefixed
+`portal-evidence:` lines on every validated boot. The evidence
 unit is not a dependency of `bootsuccess`, so absence makes application
 evidence red without granting mutable user service state authority over
 deployment acknowledgement.
@@ -6392,8 +6438,11 @@ packaged selftest, boot oracle — with **network never in the gate**.
    version-1 `Background.RequestBackground`, requires the method reply before
    the directed denial signal, byte-compares response 2 and its false results,
    and emits exact
-   `portal-evidence: TD-PORTAL-REQUEST-READY response=2`. These prove live
-   routed portal exchanges, not that Firefox made them.
+   `portal-evidence: TD-PORTAL-REQUEST-READY response=2`. It then requires
+   each portal §H item 14 names unsupported to report its interface
+   unpublished and to refuse a call to it, and emits exact
+   `portal-evidence: TD-PORTAL-UNSUPPORTED-REFUSED portals=4`. These prove
+   live routed portal exchanges, not that Firefox made them.
 7. **Recipe tests**: every new crate — `td-jail`, `td-busd`, `td-portal`,
    `td-audio` —
    stays a one-package dependency-free crate and is picked up by
