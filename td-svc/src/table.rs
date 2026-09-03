@@ -44,6 +44,79 @@ pub struct Unit {
     pub ready: Vec<String>,
     pub ready_timeout: Duration,
     pub stop_timeout: Duration,
+    /// Which cgroup this unit's processes are accounted in.
+    pub cgroup: Cgroup,
+    /// What this unit's own leaf bounds. Refused unless `cgroup=service`, so a
+    /// limit is never written where the unit's processes will not be.
+    pub limits: Limits,
+}
+
+/// Where a unit's processes are accounted.
+///
+/// A unit that hands its process to another cgroup cannot be bounded by one of
+/// its own, and the table is where a reader looks to find out which is which —
+/// so it is declared rather than guessed from the `exec=` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cgroup {
+    /// Its own leaf under `/sys/fs/cgroup/system`, created before it starts.
+    #[default]
+    Service,
+    /// The uid-1000 session leaf. `td-login` joins it before dropping
+    /// privilege, so the process leaves any leaf td-svc might have made — which
+    /// is why declaring this refuses limits rather than writing inert ones.
+    Session,
+}
+
+/// The controls written into a unit's leaf before it starts.
+///
+/// `None` is "unbounded", not "default": cgroup v2's own default is `max`, and
+/// writing a number nobody chose is how a service acquires a limit its author
+/// never reasoned about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Limits {
+    /// `memory.max`, in bytes.
+    pub memory_max: Option<u64>,
+    /// `pids.max`.
+    pub pids_max: Option<u64>,
+    /// `cpu.weight`, 1..=10000. A share under contention, never a ceiling.
+    pub cpu_weight: Option<u32>,
+}
+
+impl Limits {
+    pub fn is_empty(&self) -> bool {
+        self.memory_max.is_none() && self.pids_max.is_none() && self.cpu_weight.is_none()
+    }
+}
+
+impl Unit {
+    /// The path component this unit's leaf is named by, or `None` when it has
+    /// no leaf of its own.
+    ///
+    /// The name is already `[A-Za-z0-9_-]` with no leading `-` and no `.`, so
+    /// what this returns is a single path component that cannot collide with a
+    /// cgroup interface file. It is re-checked here anyway: this is the value
+    /// that becomes a directory under `/sys/fs/cgroup`, and the check that
+    /// matters is the one next to the use.
+    pub fn cgroup_leaf_name(&self) -> Option<&str> {
+        if self.cgroup != Cgroup::Service
+            || !is_safe_component(&self.name)
+            || self.name.contains('.')
+            || self.name.len() > MAX_LEAF_NAME
+        {
+            return None;
+        }
+        Some(&self.name)
+    }
+}
+
+/// The longest name cgroupfs will accept as a directory, so the longest a unit
+/// may be named. Exceeding it fails with `ENAMETOOLONG` at boot; refused at
+/// `check` time instead.
+const MAX_LEAF_NAME: usize = 255;
+
+/// One path component: not empty, not `.` or `..`, and no separator.
+fn is_safe_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -73,6 +146,8 @@ impl Default for Unit {
             ready: Vec::new(),
             ready_timeout: DEFAULT_READY_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
+            cgroup: Cgroup::Service,
+            limits: Limits::default(),
         }
     }
 }
@@ -223,10 +298,31 @@ pub fn parse(text: &str) -> (Vec<Unit>, Vec<String>) {
             }
             if !name
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             {
                 problems.push(format!(
-                    "line {number}: unit name '{name}' must be [A-Za-z0-9._-]"
+                    "line {number}: unit name '{name}' must be [A-Za-z0-9_-]"
+                ));
+                continue;
+            }
+            // `.` is not in that class, and dropping it is what makes a unit
+            // name safe as a cgroup directory. Every cgroup interface file is
+            // spelled `<controller>.<attribute>` — `cgroup.procs`, `memory.max`
+            // — and a child directory shares that namespace, so a unit named
+            // for one collides with a file the kernel put there first and the
+            // leaf silently cannot be made. `.` and `..` are the same rule
+            // rather than a second one. A blocklist of controller prefixes
+            // would rot as the kernel adds controllers; refusing the separator
+            // cannot.
+            // The character class above is what refuses `.`, `..` and every
+            // `<controller>.<attribute>`; by here only the length can still
+            // fire. `is_safe_component` is kept as the check that travels with
+            // the path, so narrowing the class later cannot silently un-refuse
+            // a traversal.
+            if !is_safe_component(name) || name.len() > MAX_LEAF_NAME {
+                problems.push(format!(
+                    "line {number}: unit name '{name}' cannot name a cgroup \
+                     directory, and a unit's leaf is named after it"
                 ));
                 continue;
             }
@@ -377,6 +473,18 @@ fn apply(unit: &mut Unit, key: &str, value: &str, stanza: &mut Stanza) -> Result
             }
             unit.log = Some(value.to_string());
         }
+        "cgroup" => {
+            unit.cgroup = match value {
+                "service" => Cgroup::Service,
+                "session" => Cgroup::Session,
+                other => {
+                    return Err(format!("unknown cgroup '{other}' (service, session)"));
+                }
+            };
+        }
+        "memory-max" => unit.limits.memory_max = Some(parse_bytes(value)?),
+        "pids-max" => unit.limits.pids_max = Some(parse_count(value)?),
+        "cpu-weight" => unit.limits.cpu_weight = Some(parse_weight(value)?),
         "console" => unit.console = parse_bool(value)?,
         "timeout" => unit.timeout = Some(parse_duration(value)?),
         "ready-timeout" => unit.ready_timeout = parse_duration(value)?,
@@ -384,6 +492,65 @@ fn apply(unit: &mut Unit, key: &str, value: &str, stanza: &mut Stanza) -> Result
         other => return Err(format!("unknown key '{other}'")),
     }
     Ok(())
+}
+
+/// A byte count with an optional `K`, `M` or `G` suffix, all binary.
+///
+/// No `max`: leaving the key out is how a unit says unbounded, and a second
+/// spelling for it would be a value that reads as a limit and is not one. No
+/// bare `0` either — `memory.max=0` kills the service on its first page, which
+/// is never what a table meant to say.
+fn parse_bytes(value: &str) -> Result<u64, String> {
+    // `strip_suffix` rather than `&value[..value.len() - 1]`: the slice is
+    // provably in bounds and on a char boundary here, but it is still the
+    // panicking construct AGENTS.md refuses, and this says the same thing.
+    let (digits, scale) = match value.strip_suffix('K') {
+        Some(digits) => (digits, 1024u64),
+        None => match value.strip_suffix('M') {
+            Some(digits) => (digits, 1024 * 1024),
+            None => match value.strip_suffix('G') {
+                Some(digits) => (digits, 1024 * 1024 * 1024),
+                None => (value, 1),
+            },
+        },
+    };
+    let number: u64 = digits
+        .parse()
+        .map_err(|_| format!("expected a byte count like 64M, got '{value}'"))?;
+    if number == 0 {
+        return Err(format!(
+            "'{value}' is zero; omit the key for unbounded rather than writing a \
+             limit no process can start under"
+        ));
+    }
+    number
+        .checked_mul(scale)
+        .ok_or_else(|| format!("'{value}' overflows a byte count"))
+}
+
+/// A positive count. Zero is refused for the same reason a zero byte limit is.
+fn parse_count(value: &str) -> Result<u64, String> {
+    let number: u64 = value
+        .parse()
+        .map_err(|_| format!("expected a count, got '{value}'"))?;
+    if number == 0 {
+        return Err(format!(
+            "'{value}' is zero; a unit that may hold no process cannot start"
+        ));
+    }
+    Ok(number)
+}
+
+/// `cpu.weight` takes 1..=10000 and the kernel refuses anything else, so this
+/// refuses it here, where the diagnostic can name the unit and the table line.
+fn parse_weight(value: &str) -> Result<u32, String> {
+    let number: u32 = value
+        .parse()
+        .map_err(|_| format!("expected a cpu weight, got '{value}'"))?;
+    if !(1..=10_000).contains(&number) {
+        return Err(format!("cpu weight '{value}' is outside 1..=10000"));
+    }
+    Ok(number)
 }
 
 /// `yes`/`no`, and nothing else.
@@ -415,6 +582,17 @@ fn finish(unit: Unit, stanza: Stanza, units: &mut Vec<Unit>, problems: &mut Vec<
     if unit.is_console() && !unit.requires.is_empty() {
         problems.push(format!(
             "{name}: a console unit (tty=) may not declare requires= — the console is never skippable"
+        ));
+        ok = false;
+    }
+    // DESIGN.md §3: nothing is accepted-and-ignored. A `cgroup=session` unit's
+    // process is moved into the session leaf by td-login before it execs, so a
+    // limit written into a leaf td-svc made would bound nothing at all. The
+    // pair is refused rather than the limit silently dropped.
+    if unit.cgroup == Cgroup::Session && !unit.limits.is_empty() {
+        problems.push(format!(
+            "{name}: cgroup=session and a limit are mutually exclusive — this unit's \
+             processes are accounted in the session leaf, which this unit does not own"
         ));
         ok = false;
     }
@@ -584,6 +762,122 @@ mod tests {
             problems.iter().any(|p| p.contains("absolute")),
             "{problems:?}"
         );
+    }
+
+    /// The limit keys, and the units they produce.
+    #[test]
+    fn a_unit_declares_its_own_bounds() {
+        let (units, problems) = parse(
+            "[g]\ntype=daemon\nexec=/x\nmemory-max=64M\npids-max=32\ncpu-weight=200\n",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let g = units.first().expect("one unit");
+        assert_eq!(g.limits.memory_max, Some(64 * 1024 * 1024));
+        assert_eq!(g.limits.pids_max, Some(32));
+        assert_eq!(g.limits.cpu_weight, Some(200));
+        assert_eq!(g.cgroup, Cgroup::Service);
+        assert_eq!(g.cgroup_leaf_name(), Some("g"));
+    }
+
+    /// A unit with nothing to say about its bounds says nothing, and gets the
+    /// kernel's own default rather than a number this table invented.
+    #[test]
+    fn an_undeclared_limit_is_unbounded_not_defaulted() {
+        let (units, problems) = parse("[g]\ntype=daemon\nexec=/x\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        let g = units.first().expect("one unit");
+        assert!(g.limits.is_empty());
+        assert_eq!(g.limits.memory_max, None);
+    }
+
+    /// Sizes take a binary suffix, and refuse what cannot be honoured. Zero is
+    /// the one that matters: `memory.max=0` kills the service on its first page.
+    #[test]
+    fn a_size_is_binary_and_never_zero() {
+        for (text, want) in [("512", 512u64), ("1K", 1024), ("2M", 2 << 20), ("1G", 1 << 30)] {
+            assert_eq!(parse_bytes(text), Ok(want), "{text}");
+        }
+        for bad in ["0", "0M", "", "M", "-1", "64MB", "1.5M", "99999999999999999999G"] {
+            assert!(parse_bytes(bad).is_err(), "{bad} was accepted");
+        }
+        assert!(parse_count("0").is_err(), "a unit may not hold zero processes");
+        assert_eq!(parse_count("32"), Ok(32));
+        for bad in ["0", "10001", "-1", "x"] {
+            assert!(parse_weight(bad).is_err(), "cpu weight {bad} was accepted");
+        }
+        assert_eq!(parse_weight("1"), Ok(1));
+        assert_eq!(parse_weight("10000"), Ok(10_000));
+    }
+
+    /// `cgroup=` takes the two placements and no third spelling.
+    #[test]
+    fn cgroup_takes_only_service_or_session() {
+        let (units, problems) = parse("[g]\ntype=daemon\nexec=/x\ncgroup=session\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        let g = units.first().expect("one unit");
+        assert_eq!(g.cgroup, Cgroup::Session);
+        assert_eq!(
+            g.cgroup_leaf_name(),
+            None,
+            "a session unit owns no leaf, so it names none"
+        );
+        for value in ["yes", "own", "system", ""] {
+            let (units, problems) =
+                parse(&format!("[g]\ntype=daemon\nexec=/x\ncgroup={value}\n"));
+            assert!(units.is_empty(), "cgroup={value} was admitted");
+            assert!(problems.iter().any(|p| p.contains("unknown cgroup")), "{problems:?}");
+        }
+    }
+
+    /// A limit on a unit whose processes are accounted elsewhere would bound
+    /// nothing. Refused as a pair, the way `tty=` with `log=` is.
+    #[test]
+    fn a_session_unit_may_not_declare_a_limit_it_cannot_hold() {
+        let (units, problems) = parse(
+            "[g]\ntype=daemon\nexec=/x\ncgroup=session\nmemory-max=64M\n",
+        );
+        assert!(units.is_empty(), "a limit was admitted on a session unit");
+        assert!(
+            problems.iter().any(|p| p.contains("mutually exclusive")),
+            "{problems:?}"
+        );
+        // The same unit without the limit is fine: the placement is not the
+        // problem, the unenforceable promise is.
+        let (units, problems) = parse("[g]\ntype=daemon\nexec=/x\ncgroup=session\n");
+        assert_eq!(units.len(), 1, "{problems:?}");
+    }
+
+    /// A unit name becomes a directory under `/sys/fs/cgroup`, and a cgroup
+    /// directory shares its namespace with the kernel's own interface files.
+    /// Every one of those is `<controller>.<attribute>`, so refusing the
+    /// separator refuses the whole class at once — `.` and `..` included, and
+    /// controllers the kernel has not added yet.
+    #[test]
+    fn a_unit_may_not_be_named_for_a_cgroup_file() {
+        // `.` and `..` traverse; the rest are real interface files that exist
+        // in every cgroup directory before td-svc creates anything.
+        for name in [".", "..", "cgroup.procs", "memory.max", "pids.max", "cpu.weight"] {
+            let (units, problems) = parse(&format!("[{name}]\ntype=daemon\nexec=/x\n"));
+            assert!(units.is_empty(), "a unit named '{name}' was admitted");
+            assert!(
+                problems.iter().any(|p| p.contains(name)),
+                "{name}: {problems:?}"
+            );
+        }
+        // Length is the other way a legal name stops being a legal directory.
+        let long = "a".repeat(MAX_LEAF_NAME + 1);
+        let (units, problems) = parse(&format!("[{long}]\ntype=daemon\nexec=/x\n"));
+        assert!(units.is_empty(), "a {}-byte name was admitted", long.len());
+        assert!(
+            problems.iter().any(|p| p.contains("cannot name a cgroup")),
+            "{problems:?}"
+        );
+        // The longest name that still fits is not refused.
+        let longest = "a".repeat(MAX_LEAF_NAME);
+        let (units, problems) = parse(&format!("[{longest}]\ntype=daemon\nexec=/x\n"));
+        assert_eq!(units.len(), 1, "{problems:?}");
+        assert!(!is_safe_component("a/b"));
+        assert!(!is_safe_component(""));
     }
 
     /// `console=` takes yes or no, and says so when it does not get one.

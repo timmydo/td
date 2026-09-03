@@ -247,6 +247,15 @@ fn main() -> ExitCode {
                     "td-svc: application cgroup delegation failed: {error}\n"
                 ));
             }
+            // Reported and survived, exactly as the delegation above is: a
+            // machine that cannot account its services still owes I5 a console.
+            // Each unit reports its own leaf failure at start, so this line is
+            // the parent's and not a prediction about any service.
+            if let Err(error) = cgroup::prepare_system() {
+                emit_err(&format!(
+                    "td-svc: service cgroup parent unavailable: {error}\n"
+                ));
+            }
             let (units, problems) = load(&path);
             for problem in &problems {
                 emit_err(&format!("td-svc: {problem}\n"));

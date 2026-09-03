@@ -225,7 +225,25 @@ mod tests {
             "const SESSION: &str = {:?};",
             crate::ladder::TD_APPLICATION_CGROUP_SESSION
         )));
-        assert!(cgroup.contains("\"+cpu +memory +pids\""));
-        assert!(cgroup.contains("&[\"cpu\", \"memory\", \"pids\"]"));
+        assert!(cgroup.contains(&format!(
+            "const SYSTEM: &str = {:?};",
+            crate::ladder::TD_SERVICE_CGROUP_ROOT
+        )));
+        // One roster, and a subtree write built FROM it. The literal
+        // "+cpu +memory +pids" this used to pin was a second copy of the same
+        // three names, so the two could disagree while both tests passed.
+        let roster = format!(
+            "const CONTROLLERS: &[&str] = &[{}];",
+            crate::ladder::TD_CGROUP_CONTROLLERS
+                .iter()
+                .map(|c| format!("{c:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(cgroup.contains(&roster), "the controller roster is not {roster}");
+        assert!(
+            cgroup.contains("write!(request, \"+{controller} \")"),
+            "the subtree write no longer derives from the roster"
+        );
     }
 }

@@ -1255,6 +1255,7 @@ fn build_td_svc_conf() -> String {
          # environment is the unit's rather than the boot path's.\n\
          [busd]\n\
          type=daemon\n\
+         cgroup=session\n\
          exec=/bin/td-login exec-as {ui_user} -- /bin/td-busd run --socket /run/user/{ui_uid}/bus\n\
          after=seat\n\
          requires=seat\n\
@@ -1290,6 +1291,7 @@ fn build_td_svc_conf() -> String {
          # {portal_request_runtime_marker} lines.\n\
          [portal-evidence]\n\
          type=oneshot\n\
+         cgroup=session\n\
          exec=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
          after=portal,firefox-tls-setup\n\
          requires=portal\n\
@@ -1301,6 +1303,7 @@ fn build_td_svc_conf() -> String {
          # credentials, and the compositor opens only those fixed paths.\n\
          [wayland]\n\
          type=daemon\n\
+         cgroup=session\n\
          exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --portal-socket {portal_wayland_socket} --launcher-application {firefox_name} --terminal-client /bin/td-term --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}'\n\
          after=seat\n\
          requires=seat\n\
@@ -1316,6 +1319,7 @@ fn build_td_svc_conf() -> String {
          # td-recipe-eval requires the exact {portal_channel_runtime_marker} line.\n\
          [portal-channel-evidence]\n\
          type=oneshot\n\
+         cgroup=session\n\
          exec=/bin/td-login exec-as {ui_user} -- /bin/td-portal channel-probe --wayland {portal_wayland_socket}\n\
          after=wayland,firefox-tls-setup\n\
          requires=wayland\n\
@@ -1331,6 +1335,7 @@ fn build_td_svc_conf() -> String {
          # a seat advertising a POINTER and this needs only a keyboard.\n\
          [terminal]\n\
          type=daemon\n\
+         cgroup=session\n\
          exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-term-ready'\n\
          after=wayland\n\
          requires=wayland\n\
@@ -1351,6 +1356,7 @@ fn build_td_svc_conf() -> String {
          \n\
          [firefox-tls-origin]\n\
          type=daemon\n\
+         cgroup=session\n\
          exec=/bin/td-login exec-as {ui_user} -- /etc/firefox-tls-origin\n\
          after=firefox-tls-setup\n\
          requires=firefox-tls-setup\n\
@@ -1364,6 +1370,7 @@ fn build_td_svc_conf() -> String {
          # command line. Trust comes from the exact root-owned policy above.\n\
          [firefox-autotest]\n\
          type=oneshot\n\
+         cgroup=session\n\
          exec=/bin/td-login exec-as {ui_user} -- /bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) root={firefox_autotest_host_root}; /bin/mkdir -p \"$root/profile\" && /bin/td-util chmod 0700 \"$root\" \"$root/profile\" && /bin/rm -f \"$root/.user.js.tmp\" && /bin/td-util printf \"%s\\n\" \"user_pref(\\\"browser.preonboarding.enabled\\\", false);\" \"user_pref(\\\"termsofuse.bypassNotification\\\", true);\" \"user_pref(\\\"browser.download.useDownloadDir\\\", true);\" \"user_pref(\\\"browser.download.folderList\\\", 2);\" \"user_pref(\\\"browser.download.dir\\\", \\\"/home/td/Downloads\\\");\" > \"$root/.user.js.tmp\" && /bin/td-util chmod 0600 \"$root/.user.js.tmp\" && /bin/mv \"$root/.user.js.tmp\" \"$root/profile/user.js\";; *) :;; esac'\n\
          after=seat\n\
          requires=seat\n\
@@ -1376,6 +1383,7 @@ fn build_td_svc_conf() -> String {
          # ordinary boots retain Firefox's own first-run and default-profile flow.\n\
          [firefox]\n\
          type=daemon\n\
+         cgroup=session\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name} --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name};; esac'\n\
          after=audio,busd,portal,wayland,firefox-autotest,firefox-tls-origin\n\
          requires=wayland,firefox-autotest,firefox-tls-origin\n\
@@ -4435,6 +4443,65 @@ pub fn recipe() -> Recipe {
 mod tests {
     use super::*;
 
+
+    /// Every unit whose leader is td-login declares `cgroup=session`, and no
+    /// other unit does.
+    ///
+    /// td-login joins the uid-1000 session leaf before it drops privilege, so
+    /// such a unit's processes leave any leaf td-svc made for it. Declaring it
+    /// is what makes td-svc refuse a limit there instead of writing one into a
+    /// cgroup the service does not occupy. The realistic regression is not a
+    /// wrong declaration but a MISSING one on a unit added later, so this is
+    /// derived from the `exec=` line rather than compared against a list — a
+    /// list would have to be updated by the same person who forgot.
+    #[test]
+    fn a_unit_that_hands_its_process_to_td_login_says_so() {
+        let handoff_leaders = [
+            format!("/bin/td-login exec-as {UI_USER} "),
+            format!("/bin/su -s /bin/sh {UI_USER} "),
+        ];
+        let mut session = Vec::new();
+        let mut service = Vec::new();
+        for (name, keys) in parse_td_svc_conf() {
+            let exec = keys
+                .iter()
+                .find(|(key, _)| key == "exec")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            let declared = keys.iter().any(|(k, v)| k == "cgroup" && v == "session");
+            // Two ways a unit's LEADER becomes td-login: it is the leader, or a
+            // shell leader `exec`s it and is replaced. The second is what the
+            // first version of this test missed — `firefox` reaches td-login
+            // through `sh -c '… exec …'`, so a prefix match called it a service
+            // and would have let a limit be written into a leaf its processes
+            // had already left. Without `exec` the shell STAYS, which is why
+            // `firefox-evidence` and `firefox-input` — which run td-login in
+            // loops and command substitutions — are not handoffs.
+            let hands_off = handoff_leaders
+                .iter()
+                .any(|p| exec.starts_with(p.as_str()) || exec.contains(&format!("exec {p}")));
+            if hands_off {
+                session.push(name.clone());
+                assert!(
+                    declared,
+                    "{name} execs td-login as {UI_USER}, so its processes are moved \
+                     into the session leaf — it must declare cgroup=session, or a \
+                     limit on it would be written where they are not"
+                );
+            } else {
+                service.push(name.clone());
+                assert!(
+                    !declared,
+                    "{name} declares cgroup=session but its leader is not td-login \
+                     as {UI_USER}, so it does own a leaf and can be bounded"
+                );
+            }
+        }
+        // Both sides are non-empty, so neither arm can be vacuous: a parse that
+        // silently returned nothing would otherwise pass this test.
+        assert!(!session.is_empty(), "no session units parsed");
+        assert!(!service.is_empty(), "no service units parsed");
+    }
 
     /// Parse the generated unit table into `(name, [(key, value)])`.
     ///

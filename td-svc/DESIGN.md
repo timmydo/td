@@ -110,7 +110,8 @@ td-svc unconditionally, so a td-svc that dies mid-teardown must not come
 back and start services while an orphaned `/etc/shutdown` is unmounting
 filesystems.
 
-**I7. The application cgroup delegation root is empty and controller-complete.**
+**I7. Every cgroup td-svc creates carries the controllers its children need,
+and the ones that hold processes are leaves.**
 PID 1 mounts cgroup2 before it starts td-svc. At the beginning of `run`, before
 td-svc spawns a control thread or service, it enables `cpu`, `memory`, and
 `pids` at the hierarchy root, creates `/sys/fs/cgroup/td-user-1000`, enables
@@ -119,7 +120,8 @@ the same controllers there, and delegates the directory plus `cgroup.procs`,
 itself stays empty: ordinary user processes live in the root-owned `session`
 leaf and jailed stage-2 processes live in direct per-instance leaves.
 The populated hierarchy root is explicitly exempt from the no-internal-process
-rule; PID 1 and system services stay there. The order below it is load-bearing:
+rule, which is why PID 1 may stay there. System services no longer do: each
+gets its own leaf, described below. The order below it is load-bearing:
 delegating before enabling controllers leaves child limit files absent. A
 failure is diagnosed and supervision continues so I5 still provides a console;
 td-login reports but does not make application-session placement credential
@@ -128,6 +130,103 @@ the delegation.
 The 1000:1000 ownership is authority shared by every unconfined process with
 that uid, not a same-uid security boundary. Confined applications cannot reach
 cgroupfs; other uid-1000 session components are trusted by this design.
+
+System services get leaves of their own, under `/sys/fs/cgroup/system`. That
+parent is a sibling of the delegated application root rather than a child of
+it — these are the system's services and uid 1000 owns no part of them — and,
+unlike the hierarchy root, it is NOT exempt from the no-internal-process rule,
+so it carries controllers for its children and never a process.
+
+A unit's leaf is named after the unit, so the name has to be a legal directory
+in a cgroup. That is why `.` is not in the name character class: a cgroup
+directory shares its namespace with the kernel's own interface files, every
+one of which is spelled `<controller>.<attribute>`, so a unit named
+`memory.max` or `cgroup.procs` would collide with a file the kernel put there
+first and silently get no leaf. Refusing the separator refuses that whole
+class, `.` and `..` included, and — unlike a blocklist of controller
+prefixes — does not rot as the kernel adds controllers. Length is refused for
+the same reason, at cgroupfs's own 255-byte limit. Both are refused at parse
+time, so `td-svc check` reds the build rather than the boot.
+
+Every control is written on every start, including the ones the unit did not
+declare. A leaf outlives the process in it and is reused across a restart, so
+writing only the declared limits would leave a bound the table no longer
+carries still in force. **An absent limit is unbounded, not defaulted** is a
+claim about the kernel's state, not about the table, so the unset controls are
+written back to the kernel's own defaults rather than skipped.
+
+Placement is a write to the leaf's `cgroup.procs` in the parent, immediately
+after `spawn` returns, and the placed process's own membership is read back
+from `/proc/<pid>/cgroup`: a write that succeeds while the membership does not
+change is exactly the failure an unverified limit hides. The read is of the
+process rather than of the leaf's `cgroup.procs` because it answers the
+question directly and is one line whatever the cgroup holds — reading the
+roster of a busy service would overrun the control-file bound and turn a
+successful placement into a reported failure.
+
+**`spawn` does not return until the child's `execve` has completed**, so the
+service program is already running when the parent places it, and nothing
+bounds how far it gets first. Two consequences follow, and they are stated
+because an earlier version of this document claimed the opposite. The exec
+image was charged outside the leaf because the exec happened BEFORE the window
+opened, not during it. And a service that forks before it is placed leaves
+those descendants in td-svc's cgroup permanently, because the write moves one
+pid and not a tree — so the trigger below is a live race, not a theoretical
+one. A process that exits before it can be placed is not a failure: nothing was
+accounted and nothing is left to bound, and reporting it would put a line in
+the log for every fast oneshot. Whether it exited is asked of the PROCESS and
+never inferred from the errno of the failed write. td-svc holds the `Child`
+until `watch` takes it, so such a service is an unreaped ZOMBIE, not an absent
+pid: it still passes the kernel's pid lookup, so the write does not answer
+ESRCH for it. Reading that errno would also have called `ENOENT` — which on
+that open means the LEAF is missing — a success, and logged nothing.
+
+Closing the window needs the child placed at creation, or placing itself
+before it execs. `clone3(CLONE_INTO_CGROUP)` does the first; it is unreachable
+from `Command`, so adopting it means hand-rolling fork and exec — stdio,
+process group, cwd and all — as async-signal-safe code in a multithreaded
+supervisor, which is the hazard I2 exists to abolish, permanently and by hand.
+The second is cheaper and does not touch I1 or I2: a td-svc trampoline verb
+that writes its own pid into the leaf and then `exec`s the real program, the
+way td-login already joins the session leaf before it drops privilege. **The
+triggers that would change the answer, recorded so the decision is not
+rediscovered: a service that forks descendants before it is placed; or a
+measured accounting gap that matters.** Readiness probes are a known part of
+that gap — `ready=` runs as a separate child of td-svc and is not placed in
+the unit's leaf, so `memory.peak` and `pids.peak` exclude it.
+
+A unit whose leader hands its processes to another cgroup declares
+`cgroup=session` and gets no leaf. Its limits are refused rather than written
+into a leaf its processes have already left — §3's accepted-and-ignored rule,
+applied to a promise the kernel would keep against the wrong cgroup. A leader
+is handed off when it IS `td-login`/`su`, and equally when a shell leader
+`exec`s one and is replaced; without the `exec` the shell stays and the unit
+keeps its leaf.
+
+There is a third case the model does not carry: a unit whose leader stays but
+whose real work moves on. `firefox-evidence`, `firefox-input` and `greeter`
+are that case — their shell leaders stay in the unit's leaf while the work
+they drive runs as td-login children elsewhere — so they are accounted for
+what they supervise, not for what they launched, and declare no limits rather
+than a misleading one. Modelling it properly means teaching td-svc about jail
+semantics, which no increment has done.
+
+A unit that wants a leaf but cannot name one is reported, not folded into the
+handoff case: nothing was refused on its behalf, so a limit on it really would
+be lost. The name rule above makes it unreachable through the table, which is
+why it is stated here rather than trusted.
+
+A cgroup failure never fails a start. A machine whose cgroupfs is missing or
+unwritable would otherwise start nothing at all, the console included, and a
+machine that will not boot cannot be repaired from itself: I5 outranks
+accounting, exactly as it does for the delegation above. What §3 does demand
+is that the loss is never silent, so a unit that ends up outside its leaf says
+so by name, and says UNBOUNDED when the table declared a limit that is now not
+in force. The one case reported collectively rather than per unit is the
+parent's absence, below. The parent's absence is reported once, at startup,
+rather than by every unit in turn — except by a unit that declared a limit,
+which is that unit's own fact and is said rather than inferred.
+
 Every operation here is safe filesystem I/O; I1 remains exactly one syscall.
 
 ## 3. The table
@@ -163,7 +262,16 @@ restart=always
 
 Keys: `type` (`oneshot` | `daemon`), `exec`, `after`, `requires`, `restart`
 (`always` | `on-failure` | `never`), `tty`, `log`, `console` (`yes` | `no`),
-`timeout`, `ready`, `ready-timeout`, `stop-timeout`.
+`timeout`, `ready`, `ready-timeout`, `stop-timeout`, `cgroup`
+(`service` | `session`), `memory-max`, `pids-max`, `cpu-weight`.
+
+`memory-max` takes a byte count with an optional binary `K`, `M` or `G`;
+`pids-max` a count; `cpu-weight` 1..=10000, which is a share under contention
+and never a ceiling. **An absent limit is unbounded, not defaulted.** cgroup
+v2's own default is `max`, and a number nobody chose is how a service acquires
+a bound its author never reasoned about. Zero is refused for both counts:
+`memory.max=0` kills the service on its first page, and a unit that may hold
+no process cannot start, so neither spelling can be what a table meant.
 
 **Nothing is accepted-and-ignored.** A key the supervisor would silently
 drop reads in the table as a guarantee it does not make, so each is

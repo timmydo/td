@@ -24,6 +24,12 @@ pub const TD_APPLICATION_CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";
 pub const TD_APPLICATION_CGROUP_SESSION: &str =
     "/sys/fs/cgroup/td-user-1000/session";
 pub const TD_APPLICATION_CGROUP_MEMBERSHIP_ROOT: &str = "/td-user-1000";
+/// Parent of td-svc's per-service leaves. A sibling of the delegated
+/// application root rather than a child of it: these are the SYSTEM services,
+/// and uid 1000 owns no part of them.
+pub const TD_SERVICE_CGROUP_ROOT: &str = "/sys/fs/cgroup/system";
+/// The controllers td-svc enables at every level it creates.
+pub const TD_CGROUP_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 pub const TD_JAIL_FIXTURE_NAME: &str = "td-jail-fixture";
 pub const TD_JAIL_FIXTURE_ENTRY: &str = "/app/bin/td-compositor";
 pub const TD_JAIL_FIXTURE_ALIAS: &str = "org.td.JailFixture";

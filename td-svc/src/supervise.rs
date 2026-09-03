@@ -11,6 +11,7 @@
 //! otherwise have its replacement marked ready by the dead instance's probe.
 
 use crate::backoff;
+use crate::cgroup;
 use crate::order;
 use crate::procfs::{self, Containment};
 use crate::table::{Kind, Restart, Unit};
@@ -20,6 +21,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// What to append to a "this unit is outside its leaf" line.
+///
+/// A unit with no limits loses accounting, which is worth a line. A unit that
+/// DECLARED one loses the limit too, and I7 requires that case named rather
+/// than left for a reader to infer from the table.
+fn unbounded_suffix(limits: &crate::table::Limits) -> &'static str {
+    if limits.is_empty() {
+        ""
+    } else {
+        " and UNBOUNDED"
+    }
+}
 
 /// How often the loop wakes when something is pending (a retry, a deadline).
 /// With nothing pending it blocks on the channel instead.
@@ -1228,9 +1242,83 @@ impl Runtime {
             log(said);
         }
 
+        // Before the spawn, because a limit written after a process is placed
+        // never applied while that process started — which is the window a
+        // memory bound most needs to cover.
+        //
+        // A cgroup failure does NOT fail the start. The first draft failed it,
+        // on the reasoning that a declared limit which does not apply is the
+        // accepted-and-ignored §3 forbids. That is the wrong trade and I7
+        // already says so: "A failure is diagnosed and supervision continues so
+        // I5 still provides a console." A machine whose cgroupfs is missing or
+        // unwritable would otherwise start NOTHING — the console included — and
+        // a machine that will not boot cannot be repaired from itself.
+        //
+        // What §3 does demand is that the loss is never silent. Every way a
+        // unit can end up outside its leaf reports itself, and says UNBOUNDED
+        // when the table declared a limit that is now not in force.
+        let leaf = match cgroup::leaf_for(&unit) {
+            cgroup::Leaf::Own(leaf) => match cgroup::create_service(&leaf, &unit.limits) {
+                Ok(()) => Some(leaf),
+                Err(error) => {
+                    log(&format!(
+                        "{}: no cgroup of its own ({error}); it starts unaccounted{}",
+                        unit.name,
+                        unbounded_suffix(&unit.limits)
+                    ));
+                    None
+                }
+            },
+            // Declared `cgroup=session`. Its limits were refused at parse time,
+            // so there is no promise to break and nothing to report.
+            cgroup::Leaf::Elsewhere => None,
+            // Wants a leaf, cannot name one. `parse` refuses such a name, so
+            // reaching this means the table and the cgroup layer disagree about
+            // what a name may be — report it rather than lose a limit quietly.
+            cgroup::Leaf::Unnamable => {
+                log(&format!(
+                    "{}: cannot name a cgroup directory; it starts unaccounted{}",
+                    unit.name,
+                    unbounded_suffix(&unit.limits)
+                ));
+                None
+            }
+            cgroup::Leaf::Unavailable => {
+                // The parent's absence was already reported once, by name, at
+                // startup; repeating it per unit would bury the per-unit
+                // failures that are actually about that unit. A unit that
+                // DECLARED a limit is the exception — that is this unit's own
+                // fact, and I7 requires it said rather than inferred.
+                if !unit.limits.is_empty() {
+                    log(&format!(
+                        "{}: no service cgroup on this machine; it starts UNBOUNDED",
+                        unit.name
+                    ));
+                }
+                None
+            }
+        };
+
         match cmd.spawn() {
             Ok(mut child) => {
                 let pid = child.id() as i32;
+                // Placed first, so the window in which the child is outside its
+                // leaf is the shortest this design can make it. A failure is
+                // reported and the service is left running: it is already
+                // alive, and killing a started service to enforce accounting
+                // would trade a live machine for a tidy one.
+                if let Some(leaf) = &leaf {
+                    match cgroup::place(leaf, pid) {
+                        // Already exited. Nothing was accounted and nothing is
+                        // left to bound, so there is no loss to report.
+                        Ok(cgroup::Placed::Yes | cgroup::Placed::ProcessGone) => {}
+                        Err(error) => log(&format!(
+                            "{}: not placed in its cgroup ({error}); it runs unaccounted{}",
+                            unit.name,
+                            unbounded_suffix(&unit.limits)
+                        )),
+                    }
+                }
                 let cancel = Arc::new(AtomicBool::new(false));
                 // Read before anything else: field 22 is set at fork, so it is
                 // valid the instant `spawn` returns — unlike pgrp/session,

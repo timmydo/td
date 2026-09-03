@@ -76,7 +76,7 @@ pub struct Entry {
 }
 
 /// Render the record. `name` last and unquoted: the table refuses any name
-/// outside `[A-Za-z0-9._-]`, so it can hold neither a space nor a newline.
+/// outside `[A-Za-z0-9_-]`, so it can hold neither a space nor a newline.
 pub fn render(entries: &[Entry]) -> String {
     let mut out = String::new();
     for e in entries {

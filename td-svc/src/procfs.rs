@@ -11,6 +11,15 @@ use std::io;
 
 const PROC: &str = "/proc";
 
+/// Is `/proc` mounted at all?
+///
+/// `stat_of` answers `Ok(None)` for "that process is gone", and an ABSENT
+/// `/proc` produces the same ENOENT as a reaped pid. Callers that must not
+/// mistake "cannot ask" for "the answer is no" check this first.
+pub(crate) fn is_mounted() -> bool {
+    std::path::Path::new(PROC).is_dir()
+}
+
 /// `ESRCH`. `/proc/<pid>/stat` is a seq_file: if the process exits between the
 /// `open` and the `read`, the READ fails with ESRCH rather than the open
 /// failing with ENOENT. std maps errno 3 to no named `ErrorKind`, so it arrives
