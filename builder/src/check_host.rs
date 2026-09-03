@@ -3,6 +3,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::check_memory::{self, HostBudget, TokenPool};
 
@@ -20,6 +21,34 @@ const SOCKET_NAME: &str = "check-host-v2.sock";
 const START_LOCK_NAME: &str = "check-host-v2.start.lock";
 const HOST_LOCK_NAME: &str = "check-host-v2.host.lock";
 const LOG_NAME: &str = "check-host-v2.log";
+const PREV_LOG_NAME: &str = "check-host-v2.log.prev";
+/// Past this, a log whose rotation keeps failing is discarded rather than
+/// grown: the runtime dir is usually a tmpfs.
+const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+/// How long `accept` may fail CONTINUOUSLY before the host gives up and says
+/// so, rather than reporting the same failure into its log forever.
+///
+/// A duration rather than a count: the thing being detected is a failure that
+/// never clears, and a count cannot tell that apart from one that clears in a
+/// few seconds. Under the two-concurrent-gate load this host exists for, a
+/// transient EMFILE tearing the host down would start a restart storm that
+/// burns both log generations.
+const MAX_ACCEPT_FAILURE: Duration = Duration::from_secs(60);
+/// How long a hand-off to the worker pool waits between attempts.
+const HANDOFF_POLL: Duration = Duration::from_millis(100);
+/// How long `check-host-stop` waits for its answer before reporting that it
+/// did not get one. A stop needs a free worker to dequeue it, so a wedged pool
+/// would otherwise hang the command with nothing said anywhere.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one connection may wait for a worker before it is dropped.
+///
+/// `stop` is set only by a worker that has DEQUEUED a stop request, so a pool
+/// with no worker able to dequeue anything can never be asked to stop. Waiting
+/// on that flag would be waiting on something the wedged case cannot produce,
+/// so the wait is bounded by the clock instead and the loop goes back to
+/// accepting. The client whose connection is dropped reads an ending and is
+/// pointed at this log, which says what happened to it.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 const MAGIC: &[u8; 8] = b"TDCHV2\0\n";
 const REQUEST_RUN: u8 = 1;
 const REQUEST_PING: u8 = 2;
@@ -41,6 +70,13 @@ const OUTPUT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const FEED_NO_DAEMON_ENV: &str = "TD_FEED_NO_DAEMON";
+/// What a client sees when the host stops mid-request.
+///
+/// A short read at a frame boundary is not a protocol error: the host
+/// closed the connection having never sent an exit frame. Naming that is
+/// the difference between a diagnosable death and `failed to fill whole
+/// buffer`.
+const HOST_CLOSED: &str = "the connection ended without an exit frame";
 
 // The socket name is the coordinator ABI. Bump it with any incompatible token
 // or wire-policy change; hosted requests always execute their own exact binary,
@@ -85,12 +121,30 @@ impl FrameWriter {
             .stream
             .lock()
             .map_err(|_| io::Error::other("check-host output lock poisoned"))?;
+        // Checked under the lock, not before it: `write_all` can fail having
+        // already committed part of a frame (the 5s SO_SNDTIMEO turns a full
+        // socket buffer into a short write), which leaves no boundary to
+        // resume from. A second pump writing its header after that splices it
+        // into the first one's body, and the client reports a framing bug that
+        // never happened — a manufactured sibling of the very message this
+        // file exists to make trustworthy. One writer giving up ends the
+        // stream for all of them.
+        if self.disconnected.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "check-host response stream already gave up",
+            ));
+        }
         let result = stream
             .write_all(&[kind])
             .and_then(|()| stream.write_all(&len.to_be_bytes()))
             .and_then(|()| stream.write_all(bytes));
         if result.is_err() {
             self.disconnected.store(true, Ordering::Relaxed);
+            // Give the client a clean EOF to report rather than half a frame
+            // to misparse. That is the `Closed` case, which says the host may
+            // be gone — which, for this request, it is.
+            let _ = stream.shutdown(Shutdown::Write);
         }
         result
     }
@@ -170,10 +224,40 @@ fn forward_inner(args: &[String]) -> Result<u8, String> {
         args: args.iter().map(OsString::from).collect(),
         env: std::env::vars_os().collect(),
     };
-    write_run_request(&mut stream, &request)?;
+    if let Err(e) = write_run_request(&mut stream, &request) {
+        // Submitting fails the same way reading does — the host can die
+        // between the connect and the request, and a gate-run issues many
+        // requests down fresh connections — but this path used to surface a
+        // bare errno with no log named and nothing to read. Ask the socket
+        // which it was, with a bound so a live host cannot park us here.
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+        let failure = if peer_gone(&mut stream) {
+            ResponseError::Closed
+        } else {
+            // A live peer means the request never landed: a field or count
+            // over this client's own bound, or a write that failed for a
+            // reason the host's log cannot explain. Sending the reader to that
+            // log would be the same misattribution this file refuses in the
+            // other direction for an oversized RECEIVED frame.
+            //
+            // Note this splits on peer LIVENESS, not on the nature of the
+            // error, so a bound violation that races a real host death is
+            // still reported as an ending. Splitting on cause would mean
+            // checking this client's own bounds before connecting.
+            ResponseError::Local(format!("send check-host request: {e}"))
+        };
+        return Err(describe_response_error(failure, &runtime));
+    }
     let result = read_run_frames(&mut stream);
     drop(pinned_exe);
-    result
+    // A host-side failure is worth a trip to the host's log, and a local one
+    // is not. Only generations with something in them are named, and the
+    // current one is named as movable: nothing has rotated it yet at the
+    // moment this prints, but this death is what makes the next client start
+    // the replacement that will.
+    // "Dropped" rather than "died": a panicking worker drops the stream with
+    // the host still serving, and that is one of the things this can mean.
+    result.map_err(|e| describe_response_error(e, &runtime))
 }
 
 pub fn serve_cli(args: &[String]) -> ExitCode {
@@ -195,7 +279,13 @@ pub fn serve_cli(args: &[String]) -> ExitCode {
 }
 
 pub fn stop_cli() -> ExitCode {
-    match runtime_dir().and_then(|runtime| stop(&runtime.join(SOCKET_NAME))) {
+    // Annotated like a run failure. A stop that reports a bare ending is the
+    // symptom this commit's own record says to expect a recurrence of, and
+    // sending the reader to the host's log is the entire remedy on offer.
+    let outcome = runtime_dir().and_then(|runtime| {
+        stop(&runtime.join(SOCKET_NAME)).map_err(|e| describe_response_error(e, &runtime))
+    });
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("td-builder: check-host-stop: {e}");
@@ -304,11 +394,31 @@ fn ensure_server(runtime: &Path, socket: &Path) -> Result<(), String> {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            return Err(format!(
-                "live check host did not publish {} within {}s",
-                socket.display(),
-                START_TIMEOUT.as_secs()
-            ));
+            // Two shapes reach here and they read very differently. One is a
+            // host still starting. The other is a host SHUTTING DOWN: it
+            // withdraws the socket name as soon as its accept loop ends but
+            // holds the lifetime lock until its last worker finishes, so this
+            // window is as long as the longest check still in flight. Calling
+            // that a failure to publish sends the reader hunting a startup
+            // fault that is really an orderly exit, so name both and point at
+            // the log that tells them apart.
+            return Err(match host_logs(runtime) {
+                Some(logs) => format!(
+                    "a host holds the lifetime lock but has not published {} \
+                     within {}s: it is starting, or shutting down and still \
+                     finishing a check. Its log is {logs}",
+                    socket.display(),
+                    START_TIMEOUT.as_secs()
+                ),
+                None => format!(
+                    "a host holds the lifetime lock but has not published {} \
+                     within {}s, and nothing under {} says whether it is \
+                     starting or shutting down",
+                    socket.display(),
+                    START_TIMEOUT.as_secs(),
+                    runtime.display()
+                ),
+            });
         }
         Ok(true) => drop(host_probe),
         Err(e) => {
@@ -319,14 +429,8 @@ fn ensure_server(runtime: &Path, socket: &Path) -> Result<(), String> {
         }
     }
 
-    let log_path = runtime.join(LOG_NAME);
-    let log = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&log_path)
-        .map_err(|e| format!("open check-host log {}: {e}", log_path.display()))?;
+    let (log_path, _) = log_paths(runtime);
+    let log = open_fresh_log(runtime)?;
     let log_err = log
         .try_clone()
         .map_err(|e| format!("clone check-host log: {e}"))?;
@@ -359,6 +463,34 @@ fn ensure_server(runtime: &Path, socket: &Path) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Killing it here leaves a banner and no exit line, which is the
+    // signature of a host that died unaccountably. Write into its own log
+    // that td did this, so the next reader is not chasing a ghost.
+    //
+    // Only into a log that already says something, though. A host killed
+    // before it could write its banner leaves an empty one, and the empty-log
+    // rule is what stops the next start from spending its single generation
+    // on it. Appending here would defeat that rule using the one case it was
+    // written for, and push a real account out of reach to make room for a
+    // line about a host that never spoke. That case goes to the starter's own
+    // stderr, which is where its `Err` is about to say the same thing.
+    let host_spoke = has_content(&log_path);
+    let notice = format!(
+        "td-builder: check host {} killed by its starter at {}s: \
+         not ready within {}s",
+        child.id(),
+        epoch_seconds(),
+        START_TIMEOUT.as_secs()
+    );
+    let logged = host_spoke
+        && OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .map(|mut log| writeln!(log, "{notice}").is_ok())
+            .unwrap_or(false);
+    if !logged {
+        eprintln!("{notice}");
+    }
     terminate_tree(child.id());
     let _ = child.wait();
     Err(format!(
@@ -366,6 +498,157 @@ fn ensure_server(runtime: &Path, socket: &Path) -> Result<(), String> {
         START_TIMEOUT.as_secs(),
         log_path.display()
     ))
+}
+
+/// This host's log, and the one it displaced.
+fn log_paths(runtime: &Path) -> (PathBuf, PathBuf) {
+    (runtime.join(LOG_NAME), runtime.join(PREV_LOG_NAME))
+}
+
+/// The host logs with something in them, for pointing a reader at.
+///
+/// Existence is not the test: this rotation deliberately leaves 0-byte logs
+/// behind a host that was killed before it could speak, and naming one first
+/// would send the reader to an empty file while the account it wants sits in
+/// the other. They are listed rather than related, because after that case the
+/// older one is not the host this one replaced.
+fn host_logs(runtime: &Path) -> Option<String> {
+    let (log_path, previous) = log_paths(runtime);
+    match (has_content(&log_path), has_content(&previous)) {
+        (false, false) => None,
+        (false, true) => Some(previous.display().to_string()),
+        // The current generation is not a stable address. The death being
+        // reported is exactly what makes the next client start a replacement,
+        // and that replacement rotates this file into `.prev` — usually before
+        // a human reads the CI output naming it. Say where it is and where it
+        // will have gone, or the pointer is stale on arrival.
+        (true, false) => Some(format!(
+            "{} (or {}, if a replacement host has since rotated it)",
+            log_path.display(),
+            previous.display()
+        )),
+        // Same reasoning as above, and here rotation also DESTROYS: the
+        // replacement's rename overwrites `.prev`, so by the time this is
+        // read the older account may be gone rather than merely moved.
+        (true, true) => Some(format!(
+            "{} and {} (a replacement host rotating the first would displace \
+             the second)",
+            log_path.display(),
+            previous.display()
+        )),
+    }
+}
+
+/// Whether a log says anything at all.
+///
+/// One definition, three callers: which generation is worth naming, whether a
+/// generation is worth keeping, and whether the starter may append its kill
+/// notice. They have to agree — a log that is "empty" for rotation but "has
+/// content" for the notice would rotate away a real account to keep a line
+/// about a host that never spoke.
+fn has_content(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Open a fresh log without destroying the outgoing host's.
+///
+/// A host that dies is replaced by the very next client, so truncating here
+/// would make the recovery erase the only record of the death — the client is
+/// left with an unexplained EOF and the reason is already gone. Exactly one
+/// generation is retained, which is exactly the restart that follows a death.
+/// Rotation is best effort: a first start has nothing to move, and a rename
+/// that fails must not keep a host from starting.
+fn open_fresh_log(runtime: &Path) -> Result<std::fs::File, String> {
+    let (log_path, previous) = log_paths(runtime);
+    let len = std::fs::metadata(&log_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    // Only a log that says something is worth a generation. A host killed
+    // before it could write its banner leaves an empty one, and rotating that
+    // would push an earlier host's account of its death out of reach — which
+    // is the case this rotation exists for, and the case a loaded machine
+    // produces twice in a row.
+    let mut keep = len > 0;
+    let mut rotate_failure = None;
+    if keep {
+        match std::fs::rename(&log_path, &previous) {
+            // Discarding here would destroy exactly the record this function
+            // exists to keep, so it is kept and appended to. A rotation that
+            // cannot happen is an environment fault, not a detail.
+            Err(e) => rotate_failure = Some(e),
+            Ok(()) => keep = false,
+        }
+    }
+    // Rotation has been failing long enough to matter. The runtime dir is
+    // usually a tmpfs, so an unbounded log is a worse failure than a lost one.
+    let over_cap = keep && len > MAX_LOG_BYTES;
+    if over_cap {
+        keep = false;
+    }
+    // Reported once, and only after the cap has had its say: announcing
+    // "appending rather than discarding" and then discarding two lines later
+    // would make the first sentence false in the one run that most needs to be
+    // believed.
+    if let Some(e) = rotate_failure {
+        eprintln!(
+            "td-builder: could not rotate {} ({e}); {}",
+            log_path.display(),
+            if over_cap {
+                "and it is past the size cap"
+            } else {
+                "appending to it rather than discarding the previous host's log"
+            }
+        );
+    }
+    // O_APPEND, always. The starter writes into this file too (when it kills a
+    // host for missing its deadline), through a different file description
+    // with its own offset — without O_APPEND the host's next write lands at
+    // its stale offset and overwrites what the starter just said.
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+        .map_err(|e| format!("open check-host log {}: {e}", log_path.display()))?;
+    if !keep {
+        // TRUNCATED IN PLACE, never unlinked. The start flock is held across
+        // spawn and the readiness wait, so on the ordinary path no second
+        // client reaches here while a host runs. The window is narrower than
+        // that: a starter that dies mid-startup releases the flock before its
+        // host has taken the lifetime lock, and a host between `serve`
+        // returning and the process exiting still writes to this log with the
+        // lock already released. In either, unlinking leaves a live writer
+        // holding an inode with no name, so its account exists nowhere a
+        // reader can reach — the disappearance this function exists to
+        // prevent, caused by the function itself. `ftruncate` on an O_APPEND
+        // descriptor keeps the file, and any writer resumes at the new end.
+        //
+        // Reported after the fact, never before: whatever stopped the rename
+        // usually stops this too. Announcing the discard first would claim a
+        // cap that is not being enforced.
+        match log.set_len(0) {
+            Ok(()) if over_cap => eprintln!(
+                "td-builder: discarded {} ({len} bytes, over the \
+                 {MAX_LOG_BYTES}-byte cap and unrotatable)",
+                log_path.display()
+            ),
+            Ok(()) => {}
+            Err(e) => eprintln!(
+                "td-builder: could not clear {} ({e}); appending to it instead",
+                log_path.display()
+            ),
+        }
+    }
+    Ok(log)
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 fn path_is_socket(path: &Path) -> bool {
@@ -380,7 +663,7 @@ fn ping(socket: &Path) -> Result<(), String> {
         .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(|e| e.to_string())?;
     write_control_request(&mut stream, REQUEST_PING)?;
-    let (kind, bytes) = read_frame(&mut stream)?;
+    let (kind, bytes) = read_frame(&mut stream).map_err(FrameError::message)?;
     if kind == FRAME_PONG && bytes.is_empty() {
         Ok(())
     } else {
@@ -388,15 +671,36 @@ fn ping(socket: &Path) -> Result<(), String> {
     }
 }
 
-fn stop(socket: &Path) -> Result<(), String> {
-    let mut stream =
-        UnixStream::connect(socket).map_err(|e| format!("connect to {}: {e}", socket.display()))?;
-    write_control_request(&mut stream, REQUEST_STOP)?;
-    let (kind, bytes) = read_frame(&mut stream)?;
+fn stop(socket: &Path) -> Result<(), ResponseError> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|e| ResponseError::Local(format!("connect to {}: {e}", socket.display())))?;
+    // Bounded, like `ping`. A stop queued behind 32 busy workers is never
+    // dequeued, and without this the CLI simply hangs with no output and
+    // nothing in the log to explain the silence.
+    stream
+        .set_read_timeout(Some(STOP_TIMEOUT))
+        .map_err(|e| ResponseError::Local(format!("set check-host stop timeout: {e}")))?;
+    write_control_request(&mut stream, REQUEST_STOP).map_err(ResponseError::Local)?;
+    let (kind, bytes) = read_frame(&mut stream).map_err(|e| match e {
+        FrameError::Closed => ResponseError::Closed,
+        // Local, not Host: the host's log cannot explain a request no worker
+        // ever dequeued, and a bare EAGAIN here would be indistinguishable
+        // from the failure this commit exists to make legible. Say what the
+        // silence means and what to do about it instead.
+        FrameError::TimedOut => ResponseError::Local(format!(
+            "the check host did not answer a stop request within {}s; a stop \
+             needs a free worker to dequeue it, so a pool whose workers are \
+             all wedged cannot be stopped this way — kill the host instead",
+            STOP_TIMEOUT.as_secs()
+        )),
+        FrameError::Other(message) => ResponseError::Host(message),
+    })?;
     if kind == FRAME_EXIT && bytes == 0u32.to_be_bytes() {
         Ok(())
     } else {
-        Err("check host returned an invalid stop response".to_string())
+        Err(ResponseError::Host(
+            "check host returned an invalid stop response".to_string(),
+        ))
     }
 }
 
@@ -427,8 +731,11 @@ fn serve(runtime: &Path) -> Result<(), String> {
         .set_nonblocking(true)
         .map_err(|e| format!("make check-host listener nonblocking: {e}"))?;
     eprintln!(
-        "td-builder: per-user check host listening on {} ({} GiB work, {} GiB reserve, {} tokens)",
+        "td-builder: per-user check host {} listening on {} at {}s \
+         ({} GiB work, {} GiB reserve, {} tokens)",
+        std::process::id(),
         socket.display(),
+        epoch_seconds(),
         budget.work_bytes / check_memory::GIB,
         budget.reserve_bytes / check_memory::GIB,
         budget.token_count
@@ -454,31 +761,132 @@ fn serve(runtime: &Path) -> Result<(), String> {
             .map_err(|e| format!("spawn check-host worker {index}: {e}"))?;
         workers.push(worker);
     }
+    // The workers are now the only owners. Holding a receiver here too would
+    // make the `send` below unable to ever fail, so a pool emptied by panics
+    // would fill the channel and block this loop forever, socket still bound
+    // and lock still held — a host that answers nothing and says nothing.
+    drop(recv);
 
     let mut idle_since = Instant::now();
-    while !stop.load(Ordering::Relaxed) {
+    // An ORDERLY exit has to be distinguishable from a death. Without this the
+    // log of a host that is gone looks the same either way, and a client's EOF
+    // cannot be attributed.
+    let mut reason = "stop request";
+    // An accept error that never clears (EMFILE, ENOBUFS) would otherwise be
+    // reported forever into the one file that is supposed to be the record,
+    // never reaching the idle check, holding the lock and the socket.
+    let mut failing_since: Option<Instant> = None;
+    'accept: while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                failing_since = None;
                 idle_since = Instant::now();
-                if send.send(stream).is_err() {
-                    break;
+                // Workers that are alive but wedged — parked on a memory token
+                // that never frees, or polling a child that never exits for a
+                // client that never leaves — fill the channel without ever
+                // dropping their receivers. A blocking `send` would then park
+                // here for good: `stop` never rechecked, lifetime lock held,
+                // socket still bound, which is the same mute hang the receiver
+                // fix removed, reached from the other side.
+                let mut pending = stream;
+                let waiting_since = Instant::now();
+                loop {
+                    match send.try_send(pending) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                            if stop.load(Ordering::Relaxed) {
+                                break 'accept;
+                            }
+                            if waiting_since.elapsed() >= HANDOFF_TIMEOUT {
+                                // Dropped, and said so. Every worker is busy
+                                // and none has freed in 30s, so holding this
+                                // connection only adds a second mute client to
+                                // a host that already cannot explain itself.
+                                // What is known is that nobody dequeued for
+                                // 30s and the queue is full. How many workers
+                                // are alive to be busy is NOT known, because a
+                                // panicking worker shrinks the pool, so this
+                                // says the evidence and not the inference.
+                                eprintln!(
+                                    "td-builder: check host dropped a connection after {}s: \
+                                     no worker took it and the {WORKER_THREADS}-slot queue \
+                                     is full at {}s",
+                                    HANDOFF_TIMEOUT.as_secs(),
+                                    epoch_seconds()
+                                );
+                                drop(returned);
+                                break;
+                            }
+                            pending = returned;
+                            std::thread::sleep(HANDOFF_POLL);
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            reason = "no worker left to accept requests";
+                            break 'accept;
+                        }
+                    }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // EAGAIN with nothing pending is the benign case, not a run.
+                failing_since = None;
                 if active.load(Ordering::Relaxed) == 0 && idle_since.elapsed() >= IDLE_TIMEOUT {
-                    break;
+                    reason = "idle timeout";
+                    break 'accept;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => eprintln!("td-builder: check host accept error: {e}"),
+            Err(e) => {
+                eprintln!("td-builder: check host accept error: {e}");
+                let started = *failing_since.get_or_insert_with(Instant::now);
+                if started.elapsed() >= MAX_ACCEPT_FAILURE {
+                    reason = "accept kept failing";
+                    break 'accept;
+                }
+                // The same pause the WouldBlock arm takes, so a transient
+                // error does not spin between here and the cap.
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
+    // Unlinked FIRST, before the joins. The listener is bound until `serve`
+    // returns, so between the loop ending and the process exiting a client can
+    // still connect, land in a backlog nobody will ever accept, and read an
+    // ending from a host that is doing exactly what it was asked to do — a
+    // phantom death reported by the very command that caused the shutdown.
+    // ENOENT is the honest answer in that window: there is nothing to talk to.
+    // Established connections are unaffected; only the name goes.
+    let _ = std::fs::remove_file(&socket);
     drop(send);
     for worker in workers {
         let _ = worker.join();
     }
-    let _ = std::fs::remove_file(&socket);
+    eprintln!(
+        "td-builder: check host {} exiting on {reason} at {}s",
+        std::process::id(),
+        epoch_seconds()
+    );
     Ok(())
+}
+
+/// Holds the active-request count for as long as a request is in flight.
+///
+/// The count is what stops the accept loop idling out under a live request, so
+/// a request that unwinds past a bare decrement would leak one forever and the
+/// host could never exit again. A guard cannot be skipped by an unwind.
+struct ActiveGuard(Arc<AtomicUsize>);
+
+impl ActiveGuard {
+    fn new(active: &Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::Relaxed);
+        Self(active.clone())
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn worker_loop(
@@ -504,30 +912,67 @@ fn worker_loop(
             .unwrap_or_else(Instant::now);
         match read_request(&mut stream, deadline) {
             Ok(Request::Ping) => {
-                if let Ok(writer) = FrameWriter::new(stream) {
-                    let _ = writer.frame(FRAME_PONG, &[]);
+                // Same reasoning as the stop arm: a ping that goes
+                // unanswered reads at the client as a host that vanished.
+                match FrameWriter::new(stream).and_then(|writer| writer.frame(FRAME_PONG, &[])) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("td-builder: check host could not answer a ping: {e}")
+                    }
                 }
             }
             Ok(Request::Stop) => {
-                stop.store(true, Ordering::Relaxed);
-                if let Ok(writer) = FrameWriter::new(stream) {
-                    let _ = writer.frame(FRAME_EXIT, &0u32.to_be_bytes());
+                // Answer first, then arm the shutdown. `serve` joins its
+                // workers, so this ordering is not what keeps the reply alive
+                // today; it is what stops a future teardown that does not join
+                // from turning an orderly exit into the EOF a dead host makes.
+                // A reply that cannot be sent still stops the host.
+                //
+                // Reported, never dropped: an unanswered stop leaves the
+                // stopper reading that same EOF and reporting a host that may
+                // have died, while this one exits perfectly normally. That is
+                // the exact confusion this commit exists to remove, so the
+                // one path that can cause it silently is made to speak.
+                match FrameWriter::new(stream)
+                    .and_then(|writer| writer.frame(FRAME_EXIT, &0u32.to_be_bytes()))
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("td-builder: check host could not answer the stop request: {e}")
+                    }
                 }
+                stop.store(true, Ordering::Relaxed);
             }
             Ok(Request::Run(request)) => {
-                active.fetch_add(1, Ordering::Relaxed);
-                let error_stream = stream.try_clone().ok();
-                if let Err(e) = run_request(stream, request, &pool, &budget, &runtime, &token_dir) {
-                    eprintln!("td-builder: check host request failed: {e}");
-                    if let Some(error_stream) = error_stream {
-                        if let Ok(writer) = FrameWriter::new(error_stream) {
+                let _active = ActiveGuard::new(&active);
+                // ONE writer for this connection, built here and shared with
+                // the error path. A second `FrameWriter` over a clone carries
+                // its own `disconnected` flag and its own mutex, so a stream
+                // one of them had given up on would still be written to by the
+                // other — which is the splice `frame` refuses to make, put
+                // back by the error path that reports it.
+                let bound = stream
+                    .try_clone()
+                    .map_err(|e| format!("clone check-host client socket: {e}"))
+                    .and_then(|clone| {
+                        FrameWriter::new(clone)
+                            .map_err(|e| format!("bound check-host client output: {e}"))
+                    });
+                match bound {
+                    Ok(writer) => {
+                        if let Err(e) = run_request(
+                            stream, request, &pool, &budget, &runtime, &token_dir, &writer,
+                        ) {
+                            eprintln!("td-builder: check host request failed: {e}");
                             let line = format!("td-builder: check host: {e}\n");
                             let _ = writer.frame(FRAME_STDERR, line.as_bytes());
                             let _ = writer.frame(FRAME_EXIT, &1u32.to_be_bytes());
                         }
                     }
+                    Err(e) => {
+                        eprintln!("td-builder: check host could not bind a client's output: {e}")
+                    }
                 }
-                active.fetch_sub(1, Ordering::Relaxed);
             }
             Err(e) => eprintln!("td-builder: check host dropped malformed request: {e}"),
         }
@@ -541,6 +986,7 @@ fn run_request(
     budget: &HostBudget,
     runtime: &Path,
     token_dir: &Path,
+    writer: &Arc<FrameWriter>,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_millis(20)))
@@ -567,12 +1013,6 @@ fn run_request(
     stream
         .set_read_timeout(Some(Duration::from_millis(20)))
         .map_err(|e| format!("reset check-host client poll timeout: {e}"))?;
-    let writer_stream = stream
-        .try_clone()
-        .map_err(|e| format!("clone check-host client socket: {e}"))?;
-    let writer = FrameWriter::new(writer_stream)
-        .map_err(|e| format!("bound check-host client output: {e}"))?;
-
     // Each request supplies a procfs descriptor to its pinned executable.
     // Use it for the supervisor, then have that exact process re-exec itself
     // after installing the PID namespace. A client that disconnects closes
@@ -676,15 +1116,43 @@ fn run_request(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => {
+                // Joined before returning: the pumps are still draining this
+                // child, and the caller is about to write its own frames down
+                // the same stream. Leaving them running splices one into the
+                // other and manufactures a framing error.
                 terminate_tree(pid);
+                let _ = out_thread.join();
+                let _ = err_thread.join();
                 return Err(format!("wait for hosted command {pid}: {e}"));
             }
         }
         let pressure = check_memory::emergency_memory_available(emergency)
             .map(|available| !available)
             .unwrap_or(true);
-        if writer.disconnected.load(Ordering::Relaxed) || peer_gone(&mut stream) || pressure {
+        let disconnected = writer.disconnected.load(Ordering::Relaxed);
+        let peer_left = peer_gone(&mut stream);
+        if disconnected || peer_left || pressure {
             cancelled = true;
+            // Cancelling drops the client with no exit frame, which is
+            // indistinguishable at the client from the host having died, so
+            // the host is the only place that can say which it was. Every
+            // cause that held is named: they overlap, and picking one would
+            // mean picking a precedence the condition above does not have.
+            let mut causes = Vec::new();
+            if disconnected {
+                causes.push("response writes stopped being accepted");
+            }
+            if peer_left {
+                causes.push("client went away");
+            }
+            if pressure {
+                causes.push("emergency memory reserve crossed");
+            }
+            eprintln!(
+                "td-builder: check host cancelling request {pid} ({}) at {}s",
+                causes.join(", "),
+                epoch_seconds()
+            );
             if pressure {
                 let _ = writer.frame(
                     FRAME_STDERR,
@@ -692,9 +1160,15 @@ fn run_request(
                 );
             }
             terminate_tree(pid);
-            break child
-                .wait()
-                .map_err(|e| format!("wait after cancelling hosted command {pid}: {e}"))?;
+            match child.wait() {
+                Ok(status) => break status,
+                Err(e) => {
+                    // Same reason as above: never return past a live pump.
+                    let _ = out_thread.join();
+                    let _ = err_thread.join();
+                    return Err(format!("wait after cancelling hosted command {pid}: {e}"));
+                }
+            }
         }
         std::thread::sleep(POLL_INTERVAL);
     };
@@ -708,7 +1182,11 @@ fn run_request(
     if cancelled && code == 0 {
         code = 1;
     }
-    let _ = writer.frame(FRAME_EXIT, &code.to_be_bytes());
+    if let Err(e) = writer.frame(FRAME_EXIT, &code.to_be_bytes()) {
+        // The client is about to read EOF and report a host that vanished.
+        // This is the only record of what actually happened to its exit code.
+        eprintln!("td-builder: check host could not send exit {code} for {pid}: {e}");
+    }
     Ok(())
 }
 
@@ -983,51 +1461,738 @@ fn read_exact(
     Ok(())
 }
 
-fn read_run_frames(stream: &mut UnixStream) -> Result<u8, String> {
+/// Say what a response failure was, and where to read about it.
+fn describe_response_error(error: ResponseError, runtime: &Path) -> String {
+    match error {
+        ResponseError::Local(message) => message,
+        // Never "said which in no host log under ...": a sentence asserting
+        // the host explained itself, in a file it states does not exist.
+        ResponseError::Host(message) => match host_logs(runtime) {
+            Some(logs) => format!("{message}; the host's side of this is in {logs}"),
+            None => format!(
+                "{message}; nothing survived under {} to say more",
+                runtime.display()
+            ),
+        },
+        ResponseError::Closed => match host_logs(runtime) {
+            Some(logs) => format!(
+                "{HOST_CLOSED}; the host exited, was killed, or dropped this \
+                 request, and said which in {logs}"
+            ),
+            None => format!(
+                "{HOST_CLOSED}; the host exited, was killed, or dropped this \
+                 request, and nothing survived under {} to say which",
+                runtime.display()
+            ),
+        },
+    }
+}
+
+/// Which side a response failure belongs to, and how much it implies.
+///
+/// Only the first two are a reason to read the host's log, and only `Closed`
+/// says the host may be gone. Annotating a broken local stdout with the
+/// host's log would send the reader to a file with nothing to say about it,
+/// and telling them a live host died because it sent an oversized frame would
+/// send them to one with nothing to say about that either.
+#[derive(Debug)]
+enum ResponseError {
+    Closed,
+    Host(String),
+    Local(String),
+}
+
+fn read_run_frames(stream: &mut UnixStream) -> Result<u8, ResponseError> {
+    read_run_frames_into(stream, &mut std::io::stdout(), &mut std::io::stderr())
+}
+
+/// The response loop, with its two sinks named so a test can fail one.
+fn read_run_frames_into(
+    stream: &mut UnixStream,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<u8, ResponseError> {
     loop {
-        let (kind, bytes) = read_frame(stream)?;
+        let (kind, bytes) = read_frame(stream).map_err(|e| match e {
+            FrameError::Closed => ResponseError::Closed,
+            // This client sets no read deadline on the response, so the host
+            // going silent without closing is a host-side condition and the
+            // log is the right place to send the reader.
+            FrameError::TimedOut => ResponseError::Host(
+                "the host went silent without closing the connection".to_string(),
+            ),
+            FrameError::Other(message) => ResponseError::Host(message),
+        })?;
         match kind {
-            FRAME_STDOUT => std::io::stdout()
+            FRAME_STDOUT => out
                 .write_all(&bytes)
-                .map_err(|e| format!("write hosted stdout: {e}"))?,
-            FRAME_STDERR => std::io::stderr()
+                .map_err(|e| ResponseError::Local(format!("write hosted stdout: {e}")))?,
+            FRAME_STDERR => err
                 .write_all(&bytes)
-                .map_err(|e| format!("write hosted stderr: {e}"))?,
+                .map_err(|e| ResponseError::Local(format!("write hosted stderr: {e}")))?,
             FRAME_EXIT if bytes.len() == 4 => {
-                let raw: [u8; 4] = bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| "invalid check-host exit frame".to_string())?;
+                let raw: [u8; 4] = bytes.as_slice().try_into().map_err(|_| {
+                    ResponseError::Host("invalid check-host exit frame".to_string())
+                })?;
                 return Ok(u32::from_be_bytes(raw).min(255) as u8);
             }
-            _ => return Err(format!("invalid check-host response frame {kind}")),
+            _ => {
+                return Err(ResponseError::Host(format!(
+                    "invalid check-host response frame {kind}"
+                )))
+            }
         }
     }
 }
 
-fn read_frame(stream: &mut UnixStream) -> Result<(u8, Vec<u8>), String> {
+/// A frame that could not be read, and what kind of silence it was.
+enum FrameError {
+    Closed,
+    /// The read deadline expired: nothing arrived, and the connection is still
+    /// open. Distinct from `Other` because the bare `EAGAIN` this produces is
+    /// the same shape as the message this whole file exists to abolish.
+    TimedOut,
+    Other(String),
+}
+
+impl FrameError {
+    fn message(self) -> String {
+        match self {
+            FrameError::Closed => HOST_CLOSED.to_string(),
+            FrameError::TimedOut => "the check host did not answer in time".to_string(),
+            FrameError::Other(message) => message,
+        }
+    }
+}
+
+/// Whether a failure to read a frame TYPE means the connection simply ended.
+///
+/// Kept separate because it cannot be provoked from a socket pair: RST arrives
+/// only from a real peer killed with output still queued, which is exactly the
+/// case a unit test cannot stage but a `kill -9` produces routinely.
+fn ended_at_boundary(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+    )
+}
+
+fn read_frame(stream: &mut UnixStream) -> Result<(u8, Vec<u8>), FrameError> {
     let mut kind = [0u8; 1];
-    stream
-        .read_exact(&mut kind)
-        .map_err(|e| format!("read check-host frame type: {e}"))?;
+    if let Err(e) = stream.read_exact(&mut kind) {
+        // At a frame BOUNDARY these two mean one thing: no more frames are
+        // coming and no exit frame arrived. A clean shutdown gives EOF; a host
+        // SIGKILLed with output still queued gives RST instead, which is the
+        // same event and deserves the same explanation rather than a bare
+        // errno. Mid-frame (length, body) they stay `Other`: that is
+        // truncation, which is a different diagnosis.
+        if ended_at_boundary(e.kind()) {
+            return Err(FrameError::Closed);
+        }
+        if matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            return Err(FrameError::TimedOut);
+        }
+        return Err(FrameError::Other(format!(
+            "read check-host frame type: {e}"
+        )));
+    }
     let mut raw = [0u8; 4];
     stream
         .read_exact(&mut raw)
-        .map_err(|e| format!("read check-host frame length: {e}"))?;
+        .map_err(|e| FrameError::Other(format!("read check-host frame length: {e}")))?;
     let len = usize::try_from(u32::from_be_bytes(raw)).unwrap_or(usize::MAX);
     if len > IO_CHUNK_BYTES {
-        return Err(format!("check-host frame exceeds {IO_CHUNK_BYTES} bytes"));
+        return Err(FrameError::Other(format!(
+            "check-host frame exceeds {IO_CHUNK_BYTES} bytes"
+        )));
     }
     let mut bytes = vec![0u8; len];
     stream
         .read_exact(&mut bytes)
-        .map_err(|e| format!("read check-host frame body: {e}"))?;
+        .map_err(|e| FrameError::Other(format!("read check-host frame body: {e}")))?;
     Ok((kind[0], bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A private directory for one test, named so two cannot collide.
+    fn scratch_runtime(name: &str) -> PathBuf {
+        let runtime = std::env::temp_dir().join(format!(
+            "td-check-host-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&runtime);
+        std::fs::create_dir_all(&runtime).unwrap();
+        runtime
+    }
+
+    /// The replacement must not erase the record of what it replaced.
+    ///
+    /// A dead host is replaced by the next client within milliseconds, so a
+    /// truncating start would make recovery destroy the only account of the
+    /// death. One generation back is exactly the restart that follows one.
+    #[test]
+    fn a_replacement_host_keeps_the_dead_hosts_log() {
+        let runtime = scratch_runtime("rotate");
+        let (log_path, previous) = log_paths(&runtime);
+
+        let mut first = open_fresh_log(&runtime).unwrap();
+        first.write_all(b"first host died here\n").unwrap();
+        drop(first);
+
+        let second = open_fresh_log(&runtime).unwrap();
+        drop(second);
+        assert_eq!(
+            std::fs::read_to_string(&previous).unwrap(),
+            "first host died here\n",
+            "the dead host's log must survive the restart that replaces it"
+        );
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
+
+        // Only one generation is kept, so the record cannot grow without bound.
+        let mut second = OpenOptions::new().append(true).open(&log_path).unwrap();
+        second.write_all(b"second\n").unwrap();
+        drop(second);
+        drop(open_fresh_log(&runtime).unwrap());
+        assert_eq!(std::fs::read_to_string(&previous).unwrap(), "second\n");
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// A failure is annotated with the host's log only when it is the host's.
+    ///
+    /// The reader's time is the thing being spent here: a broken local stdout
+    /// sent to the host's log is a wasted trip to a file with nothing to say,
+    /// and a `.prev` named on a first start is a trip to a file that does not
+    /// exist at all.
+    #[test]
+    fn only_a_host_side_failure_is_worth_the_host_log() {
+        let runtime = scratch_runtime("attribute");
+        let (log_path, previous) = log_paths(&runtime);
+
+        let local = describe_response_error(
+            ResponseError::Local("write hosted stdout: Broken pipe".to_string()),
+            &runtime,
+        );
+        assert_eq!(local, "write hosted stdout: Broken pipe");
+
+        // Only a closed connection may claim the host might be gone. A frame
+        // this client refused says nothing about the host's health.
+        let refused = describe_response_error(
+            ResponseError::Host("check-host frame exceeds 65536 bytes".to_string()),
+            &runtime,
+        );
+        assert!(
+            !refused.contains("exited, was killed"),
+            "a refused frame is not a dead host: {refused}"
+        );
+
+        // No log yet: say so rather than name a file nobody can read.
+        let closed = describe_response_error(ResponseError::Closed, &runtime);
+        assert!(closed.starts_with(HOST_CLOSED), "{closed}");
+        assert!(closed.contains("exited, was killed"), "{closed}");
+        assert!(closed.contains("nothing survived under"), "{closed}");
+
+        // An empty log is not worth a trip: this rotation leaves them behind a
+        // host that was killed before it could speak.
+        std::fs::write(&log_path, b"").unwrap();
+        assert_eq!(host_logs(&runtime), None);
+        let closed = describe_response_error(ResponseError::Closed, &runtime);
+        assert!(closed.contains("nothing survived under"), "{closed}");
+
+        std::fs::write(&log_path, b"banner\n").unwrap();
+        assert_eq!(
+            host_logs(&runtime),
+            Some(format!(
+                "{} (or {}, if a replacement host has since rotated it)",
+                log_path.display(),
+                previous.display()
+            ))
+        );
+        let closed = describe_response_error(ResponseError::Closed, &runtime);
+        assert!(closed.contains(&log_path.display().to_string()), "{closed}");
+        // The empty generation is named only as where this file is about to
+        // go — the replacement this death provokes rotates it — and never as
+        // an account to go and read now.
+        assert!(
+            closed.contains("if a replacement host has since rotated it"),
+            "the current log must be given as movable: {closed}"
+        );
+
+        std::fs::write(&previous, b"older banner\n").unwrap();
+        assert_eq!(
+            host_logs(&runtime),
+            Some(format!(
+                "{} and {} (a replacement host rotating the first would \
+                 displace the second)",
+                log_path.display(),
+                previous.display()
+            ))
+        );
+        let closed = describe_response_error(ResponseError::Closed, &runtime);
+        assert!(closed.contains(&previous.display().to_string()), "{closed}");
+        assert!(
+            closed.contains("would displace"),
+            "two live generations are just as movable as one: {closed}"
+        );
+
+        // The shape a killed host actually leaves once its replacement has
+        // started: an empty current generation, the account in the previous
+        // one. Naming the empty file here would send the reader nowhere, and
+        // hedging about a rotation that already happened would be noise.
+        std::fs::write(&log_path, b"").unwrap();
+        // Compared exactly, not by `contains`: `...log.prev` has `...log` as a
+        // prefix, so a substring test here can never fail and would pin
+        // nothing at all.
+        assert_eq!(
+            host_logs(&runtime),
+            Some(previous.display().to_string()),
+            "an empty current generation must not be named at all"
+        );
+        let closed = describe_response_error(ResponseError::Closed, &runtime);
+        assert!(closed.contains(&previous.display().to_string()), "{closed}");
+        assert!(
+            !closed.contains("if a replacement host has since rotated it"),
+            "the rotation already happened; do not hedge about it: {closed}"
+        );
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// A sink that refuses everything, standing in for a broken local stdout.
+    struct Refuses;
+
+    impl Write for Refuses {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The response loop must decide whose failure it was, not just report it.
+    ///
+    /// `describe_response_error` can only be as right as the classification it
+    /// is handed, so the classification is pinned where it is made: a local
+    /// write that fails is the client's problem, and must not be dressed up as
+    /// a host that stopped.
+    #[test]
+    fn a_broken_local_sink_is_not_the_hosts_failure() {
+        let (mut client, mut host) = UnixStream::pair().unwrap();
+        let payload = b"hosted output";
+        host.write_all(&[FRAME_STDOUT]).unwrap();
+        host.write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
+        host.write_all(payload).unwrap();
+
+        let failure = read_run_frames_into(&mut client, &mut Refuses, &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(&failure, ResponseError::Local(message)
+                if message.starts_with("write hosted stdout:")),
+            "a local sink that refuses is a local failure"
+        );
+
+        // And the same frame with a sink that accepts it runs on to the exit.
+        host.write_all(&[FRAME_EXIT]).unwrap();
+        host.write_all(&4u32.to_be_bytes()).unwrap();
+        host.write_all(&7u32.to_be_bytes()).unwrap();
+        drop(host);
+        let mut client = client;
+        let code = read_run_frames_into(&mut client, &mut Vec::new(), &mut Vec::new()).unwrap();
+        assert_eq!(code, 7);
+    }
+
+    /// A stream that failed mid-frame is finished, for every writer on it.
+    ///
+    /// `write_all` can fail with bytes already committed, and there is no way
+    /// to find the next frame boundary after that. The stdout and stderr pumps
+    /// share one `FrameWriter`, so nothing but this refusal stops the second
+    /// from writing its header into the first one's body and handing the
+    /// client a framing error that describes nothing that happened.
+    #[test]
+    fn a_writer_that_failed_does_not_let_the_next_one_resume() {
+        let (client, host) = UnixStream::pair().unwrap();
+        let writer = FrameWriter::new(host).unwrap();
+        assert!(writer.frame(FRAME_STDOUT, b"delivered").is_ok());
+
+        // The client is gone: the next write cannot land.
+        drop(client);
+        assert!(
+            writer.frame(FRAME_STDOUT, b"lost").is_err(),
+            "a write to a departed client must fail"
+        );
+        assert!(writer.disconnected.load(Ordering::Relaxed));
+
+        // The other pump now tries to use the same stream.
+        let after = writer.frame(FRAME_STDERR, b"would be spliced").unwrap_err();
+        assert_eq!(after.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            after.to_string().contains("already gave up"),
+            "the refusal must name itself, not look like a fresh write failure: {after}"
+        );
+    }
+
+    /// A killed host and a closed one end the same way, and read the same.
+    ///
+    /// A host SIGKILLed with output still queued resets the connection instead
+    /// of closing it. Reporting that as a bare `Connection reset by peer` says
+    /// nothing about which of the three things happened, which is the whole
+    /// complaint this commit answers.
+    #[test]
+    fn a_reset_at_a_frame_boundary_is_a_connection_that_ended() {
+        assert!(ended_at_boundary(io::ErrorKind::UnexpectedEof));
+        assert!(ended_at_boundary(io::ErrorKind::ConnectionReset));
+        // Not everything is: these are real read failures on a live host, and
+        // calling them "ended" would assert a death that did not happen.
+        assert!(!ended_at_boundary(io::ErrorKind::TimedOut));
+        assert!(!ended_at_boundary(io::ErrorKind::Interrupted));
+        assert!(!ended_at_boundary(io::ErrorKind::InvalidData));
+    }
+
+    /// A failed frame shuts the write half for EVERY handle on the socket.
+    ///
+    /// `frame`'s refusal only covers writers sharing one `FrameWriter`, and a
+    /// clone of the socket carries no flag at all — `run_request` hands the
+    /// pumps one handle while its caller holds another. The `shutdown` is the
+    /// part that reaches those, so it is pinned rather than assumed.
+    ///
+    /// Staged with a live peer and a full buffer, which is the case that
+    /// matters: a dead peer would fail the clone's write anyway and prove
+    /// nothing about whether the shutdown happened.
+    #[test]
+    fn a_failed_frame_shuts_the_write_half_for_every_handle() {
+        let (mut client, host) = UnixStream::pair().unwrap();
+        let mut clone = host.try_clone().unwrap();
+        let writer = FrameWriter::new(host).unwrap();
+        // SO_SNDTIMEO is a socket option, so this reaches the writer's handle
+        // too, and turns the 5s production timeout into a testable one.
+        clone
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        // Fill the buffer against a client that is not reading, until a write
+        // times out with the peer still very much alive.
+        let payload = vec![b'x'; 64 * 1024];
+        let mut timed_out = false;
+        for _ in 0..64 {
+            if writer.frame(FRAME_STDOUT, &payload).is_err() {
+                timed_out = true;
+                break;
+            }
+        }
+        assert!(
+            timed_out,
+            "the socket buffer must fill for this to test anything"
+        );
+        // The crux, and the reason this matters beyond framing: the peer is
+        // ALIVE and merely slow, and the host has just marked it gone. The
+        // cancel loop reads exactly this flag and SIGKILLs the whole hosted
+        // check, after which the client reads an ending at a frame boundary —
+        // the reported flake's shape, produced by a healthy host and a client
+        // that stopped draining for five seconds.
+        assert!(
+            writer.disconnected.load(Ordering::Relaxed),
+            "a write timeout marks a live client disconnected"
+        );
+
+        // Drain it, so a write would succeed again if nothing had shut the
+        // half down. Without the shutdown this clone would append to a stream
+        // that is stranded mid-frame.
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut sink = vec![0u8; 256 * 1024];
+        while client.read(&mut sink).map(|n| n > 0).unwrap_or(false) {}
+
+        assert!(
+            clone.write_all(b"would be spliced").is_err(),
+            "a failed frame must shut the write half for every handle on it"
+        );
+    }
+
+    /// A stop that cannot be answered is classified, not just printed.
+    ///
+    /// `stop_cli` annotates whatever this returns with the host's log, so the
+    /// operator chasing the recurrence this commit predicts is sent somewhere.
+    /// A bare string could not be annotated at all.
+    #[test]
+    fn a_stop_whose_host_vanishes_is_a_closed_connection() {
+        let runtime = scratch_runtime("stopclosed");
+        let socket = runtime.join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let accepted = std::thread::spawn(move || {
+            // Accept, take the whole request, and leave without answering:
+            // the host that died between reading and replying. Reading first
+            // is what makes this deterministic — dropping the stream the
+            // instant it is accepted races the client's write, and a write
+            // that loses gets EPIPE and a Local error instead of the Closed
+            // this is pinning. A commit about a CI flake must not add one.
+            if let Ok((mut accepted, _)) = listener.accept() {
+                let mut request = vec![0u8; MAGIC.len() + 1];
+                let _ = accepted.read_exact(&mut request);
+            }
+        });
+
+        let failure = stop(&socket).unwrap_err();
+        assert!(
+            matches!(&failure, ResponseError::Closed),
+            "an unanswered stop is a connection that ended: {failure:?}"
+        );
+
+        // And it acquires the log pointer on the way out.
+        let (log_path, _) = log_paths(&runtime);
+        std::fs::write(&log_path, b"banner\n").unwrap();
+        let described = describe_response_error(ResponseError::Closed, &runtime);
+        assert!(
+            described.contains(&log_path.display().to_string()),
+            "{described}"
+        );
+
+        let _ = accepted.join();
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// The other half of that split, pinned where it is DECIDED.
+    ///
+    /// A frame this client refuses is the host's doing and not a closed
+    /// connection, and the difference is made in the `FrameError` mapping, not
+    /// in the formatter. Handing `describe_response_error` a `Host` built by
+    /// the test would pin nothing: mapping `Other` to `Closed` has to red
+    /// here, or the classification is only asserted where it is printed.
+    #[test]
+    fn a_frame_this_client_refuses_is_not_a_closed_connection() {
+        let (mut client, mut host) = UnixStream::pair().unwrap();
+        let oversized = u32::try_from(IO_CHUNK_BYTES).unwrap().saturating_add(1);
+        host.write_all(&[FRAME_STDOUT]).unwrap();
+        host.write_all(&oversized.to_be_bytes()).unwrap();
+
+        let refused =
+            read_run_frames_into(&mut client, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(&refused, ResponseError::Host(message) if message.contains("exceeds")),
+            "an oversized frame is the host's doing, not a connection that closed: {refused:?}"
+        );
+
+        // A connection that simply ends is the other classification, from the
+        // same reader, so neither can stand in for the other.
+        let (mut client, host) = UnixStream::pair().unwrap();
+        drop(host);
+        let ended =
+            read_run_frames_into(&mut client, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(&ended, ResponseError::Closed),
+            "an ended connection is Closed: {ended:?}"
+        );
+    }
+
+    /// Past the cap and unrotatable, the log is discarded — in place.
+    ///
+    /// This is the only path where the truncate does any work: an empty log is
+    /// a no-op and a successful rename leaves nothing behind. The runtime dir
+    /// is usually a tmpfs, so a log that can never be rotated has to stop
+    /// growing, and it has to stop growing without unlinking the file a
+    /// running host is writing to.
+    #[test]
+    fn a_log_past_the_cap_that_cannot_rotate_is_discarded() {
+        let runtime = scratch_runtime("cap");
+        let (log_path, previous) = log_paths(&runtime);
+
+        let mut log = open_fresh_log(&runtime).unwrap();
+        let oversized = usize::try_from(MAX_LOG_BYTES).unwrap().saturating_add(1);
+        log.write_all(&vec![b'x'; oversized]).unwrap();
+        drop(log);
+
+        // A `.prev` that cannot be replaced, so rotation keeps failing and the
+        // cap is the only thing bounding the file.
+        std::fs::create_dir(&previous).unwrap();
+        std::fs::write(previous.join("occupied"), b"x").unwrap();
+
+        let before = std::fs::metadata(&log_path).unwrap().ino();
+        drop(open_fresh_log(&runtime).unwrap());
+
+        let after = std::fs::metadata(&log_path).unwrap();
+        assert_eq!(
+            after.len(),
+            0,
+            "a log past the cap that cannot rotate must stop growing"
+        );
+        assert_eq!(
+            after.ino(),
+            before,
+            "even discarding clears in place; unlinking loses a live host's stderr"
+        );
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// Clearing the log must not unlink the file a live host is writing to.
+    ///
+    /// A host's stderr IS this file, held open for its whole life, and the
+    /// start flock does not cover every moment a host is writing to it: a
+    /// starter that dies mid-startup releases the flock before its host takes
+    /// the lifetime lock, and an exiting host writes its last lines after
+    /// releasing it. Unlinking in those windows leaves a live writer holding
+    /// an inode with no name, so its account survives where no reader can
+    /// reach it: the exact disappearance this function exists to prevent,
+    /// caused by the function itself.
+    #[test]
+    fn clearing_the_log_keeps_the_file_a_host_holds_open() {
+        let runtime = scratch_runtime("inode");
+        let (log_path, _) = log_paths(&runtime);
+
+        let held = open_fresh_log(&runtime).unwrap();
+        let before = std::fs::metadata(&log_path).unwrap().ino();
+
+        // Empty, so no generation is spent and the log is cleared in place.
+        let replacement = open_fresh_log(&runtime).unwrap();
+        let after = std::fs::metadata(&log_path).unwrap().ino();
+        assert_eq!(
+            before, after,
+            "the log was replaced rather than cleared; a host holding the old \
+             one now writes where nobody can read"
+        );
+
+        // And the descriptor the "running host" holds still reaches the file
+        // a reader would open by name.
+        let mut held = held;
+        held.write_all(b"still reachable\n").unwrap();
+        drop(held);
+        drop(replacement);
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            "still reachable\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// A rotation that cannot happen must not cost the record either.
+    ///
+    /// This is the branch where `rename` fails for a real reason rather than
+    /// for want of a first generation. Discarding the log there would destroy
+    /// exactly what this function exists to keep, so it is appended to.
+    #[test]
+    fn a_log_that_cannot_rotate_is_appended_to_rather_than_lost() {
+        let runtime = scratch_runtime("norotate");
+        let (log_path, previous) = log_paths(&runtime);
+
+        let mut first = open_fresh_log(&runtime).unwrap();
+        first.write_all(b"the account\n").unwrap();
+        drop(first);
+
+        // A `.prev` that cannot be replaced by a rename.
+        std::fs::create_dir(&previous).unwrap();
+        std::fs::write(previous.join("occupied"), b"x").unwrap();
+
+        let mut second = open_fresh_log(&runtime).unwrap();
+        second.write_all(b"the next host\n").unwrap();
+        drop(second);
+
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            "the account\nthe next host\n",
+            "a rotation that cannot happen must not cost the record"
+        );
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// A host killed before it could speak must not cost a generation.
+    ///
+    /// Under the load that kills hosts, a replacement can fail to come up too.
+    /// If its empty log rotated, the second failure would push the first
+    /// host's account of its death out of reach — losing exactly the record
+    /// this rotation exists to keep, in exactly the conditions that need it.
+    #[test]
+    fn an_empty_log_does_not_spend_a_generation() {
+        let runtime = scratch_runtime("empty");
+        let (log_path, previous) = log_paths(&runtime);
+
+        let mut first = open_fresh_log(&runtime).unwrap();
+        first.write_all(b"the death that matters\n").unwrap();
+        drop(first);
+
+        // A replacement starts, rotating the account above out to `.prev`, and
+        // is killed before it writes its banner.
+        drop(open_fresh_log(&runtime).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&previous).unwrap(),
+            "the death that matters\n"
+        );
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
+
+        // Its successor must not rotate that silence over the account.
+        drop(open_fresh_log(&runtime).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&previous).unwrap(),
+            "the death that matters\n",
+            "an empty log must not displace a host's account of its death"
+        );
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// A host that stops mid-request is named as such, not as a short read.
+    #[test]
+    fn a_response_that_stops_early_names_the_host_not_the_buffer() {
+        let (client, host) = UnixStream::pair().unwrap();
+        drop(host);
+        let mut client = client;
+        let closed = read_frame(&mut client).unwrap_err();
+        assert!(
+            matches!(closed, FrameError::Closed),
+            "a connection that ended at a frame boundary is a gone host"
+        );
+        assert_eq!(closed.message(), HOST_CLOSED);
+
+        // A frame that starts and then stops is still a truncated frame: only
+        // the boundary case means "the host is gone".
+        let (mut client, mut host) = UnixStream::pair().unwrap();
+        host.write_all(&[FRAME_STDOUT]).unwrap();
+        drop(host);
+        let truncated = read_frame(&mut client).unwrap_err();
+        assert!(
+            matches!(truncated, FrameError::Other(_)),
+            "a frame that starts and stops is a truncated frame, not a gone host"
+        );
+        let truncated = truncated.message();
+        assert!(
+            truncated.starts_with("read check-host frame length:"),
+            "{truncated}"
+        );
+    }
+
+    /// The idle exit is gated on this count, so an unwind must not leak one.
+    #[test]
+    fn an_active_request_is_uncounted_however_it_leaves() {
+        let active = Arc::new(AtomicUsize::new(0));
+        {
+            let _guard = ActiveGuard::new(&active);
+            assert_eq!(active.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+
+        let unwound = std::panic::catch_unwind({
+            let active = active.clone();
+            move || {
+                let _guard = ActiveGuard::new(&active);
+                panic!("a hosted request failed mid-flight");
+            }
+        });
+        assert!(unwound.is_err());
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            0,
+            "a request that unwinds must not leave the host permanently busy"
+        );
+    }
 
     #[test]
     fn routing_only_wraps_work_executing_entry_points() {
