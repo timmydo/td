@@ -2203,7 +2203,32 @@ fn variant_bool(value: wire::Seq<'_>, option: &'static str) -> Result<bool, Port
     }
 }
 
-fn parse_filters(value: wire::Seq<'_>) -> Result<Vec<file_chooser::FileFilter>, PortalCallError> {
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedFileFilter {
+    label: String,
+    rules: Vec<(u32, String)>,
+}
+
+impl ParsedFileFilter {
+    fn selected_all_files(&self) -> Result<file_chooser::FileFilter, PortalCallError> {
+        let [(kind, pattern)] = self.rules.as_slice() else {
+            return Err(open_error(
+                UNSUPPORTED_OPEN,
+                "td FileChooser supports an all-files current filter",
+            ));
+        };
+        if *kind != 0 || !matches!(pattern.as_str(), "*" | "*.*") {
+            return Err(open_error(
+                UNSUPPORTED_OPEN,
+                "td FileChooser supports an all-files current filter",
+            ));
+        }
+        file_chooser::FileFilter::all_files(&self.label, pattern)
+            .map_err(|_| open_error(INVALID_OPEN, "the all-files filter is malformed"))
+    }
+}
+
+fn parse_filters(value: wire::Seq<'_>) -> Result<Vec<ParsedFileFilter>, PortalCallError> {
     if value.signature() != "a(sa(us))" {
         return Err(open_error(INVALID_OPEN, "filters has the wrong type"));
     }
@@ -2220,16 +2245,10 @@ fn parse_filters(value: wire::Seq<'_>) -> Result<Vec<file_chooser::FileFilter>, 
     for filter in filters {
         parsed.push(parse_filter(filter)?);
     }
-    if parsed.len() > 1 {
-        return Err(open_error(
-            UNSUPPORTED_OPEN,
-            "td FileChooser supports only one all-files filter",
-        ));
-    }
     Ok(parsed)
 }
 
-fn parse_current_filter(value: wire::Seq<'_>) -> Result<file_chooser::FileFilter, PortalCallError> {
+fn parse_current_filter(value: wire::Seq<'_>) -> Result<ParsedFileFilter, PortalCallError> {
     if value.signature() != "(sa(us))" {
         return Err(open_error(
             INVALID_OPEN,
@@ -2245,7 +2264,7 @@ fn parse_current_filter(value: wire::Seq<'_>) -> Result<file_chooser::FileFilter
     parse_filter(filter)
 }
 
-fn parse_filter(filter: Value<'_>) -> Result<file_chooser::FileFilter, PortalCallError> {
+fn parse_filter(filter: Value<'_>) -> Result<ParsedFileFilter, PortalCallError> {
     let fields = filter
         .as_seq()
         .ok_or_else(|| open_error(INVALID_OPEN, "a file filter is not a structure"))?
@@ -2266,8 +2285,7 @@ fn parse_filter(filter: Value<'_>) -> Result<file_chooser::FileFilter, PortalCal
     let rules = rules
         .values(32)
         .map_err(|_| open_error(INVALID_OPEN, "a file filter exceeds 32 rules"))?;
-    let mut supported_pattern = None;
-    let mut supported = true;
+    let mut parsed_rules = Vec::with_capacity(rules.len());
     for rule in rules {
         let pair = rule
             .as_seq()
@@ -2290,33 +2308,19 @@ fn parse_filter(filter: Value<'_>) -> Result<file_chooser::FileFilter, PortalCal
                 "a file filter rule is outside its closed bound",
             ));
         }
-        if *kind == 0 && matches!(*pattern, "*" | "*.*") && supported_pattern.is_none() {
-            supported_pattern = Some(*pattern);
-        } else {
-            supported = false;
-        }
+        parsed_rules.push((*kind, (*pattern).to_string()));
     }
-    if !supported {
-        return Err(open_error(
-            UNSUPPORTED_OPEN,
-            "td FileChooser supports only one all-files glob rule",
-        ));
-    }
-    let Some(pattern) = supported_pattern else {
-        return Err(open_error(
-            UNSUPPORTED_OPEN,
-            "td FileChooser supports only one all-files glob rule",
-        ));
-    };
-    file_chooser::FileFilter::all_files(label, pattern)
-        .map_err(|_| open_error(INVALID_OPEN, "the all-files filter is malformed"))
+    Ok(ParsedFileFilter {
+        label: (*label).to_string(),
+        rules: parsed_rules,
+    })
 }
 
 fn select_filter(
-    filters: Option<Vec<file_chooser::FileFilter>>,
-    current: Option<file_chooser::FileFilter>,
+    filters: Option<Vec<ParsedFileFilter>>,
+    current: Option<ParsedFileFilter>,
 ) -> Result<Option<file_chooser::FileFilter>, PortalCallError> {
-    let mut filters = filters.unwrap_or_default();
+    let filters = filters.unwrap_or_default();
     if filters.is_empty() {
         return if current.is_some() {
             Err(open_error(
@@ -2327,16 +2331,28 @@ fn select_filter(
             Ok(None)
         };
     }
-    let only = filters
-        .pop()
-        .ok_or_else(|| open_error(INVALID_OPEN, "the file filter list disappeared"))?;
-    if current.as_ref().is_some_and(|current| current != &only) {
-        return Err(open_error(
-            UNSUPPORTED_OPEN,
-            "current_filter does not select the supported all-files filter",
-        ));
-    }
-    Ok(Some(only))
+    let selected = match current {
+        Some(current) => {
+            if !filters.iter().any(|filter| filter == &current) {
+                return Err(open_error(
+                    UNSUPPORTED_OPEN,
+                    "current_filter does not select an advertised filter",
+                ));
+            }
+            current
+        }
+        None if filters.len() == 1 => filters
+            .into_iter()
+            .next()
+            .ok_or_else(|| open_error(INVALID_OPEN, "the file filter list disappeared"))?,
+        None => {
+            return Err(open_error(
+                UNSUPPORTED_OPEN,
+                "multiple filters require an explicit current_filter",
+            ));
+        }
+    };
+    selected.selected_all_files().map(Some)
 }
 
 fn validate_current_folder(value: wire::Seq<'_>) -> Result<(), PortalCallError> {
@@ -3364,6 +3380,25 @@ mod tests {
         })
     }
 
+    fn write_file_filter(
+        writer: &mut Writer,
+        label: &str,
+        rules: &[(u32, &str)],
+    ) -> Result<(), WireError> {
+        writer.structure(|writer| {
+            writer.string(label)?;
+            writer.array("(us)", |writer| {
+                for (kind, pattern) in rules {
+                    writer.structure(|writer| {
+                        writer.uint32(*kind);
+                        writer.string(pattern)
+                    })?;
+                }
+                Ok(())
+            })
+        })
+    }
+
     fn credentials_reply(reply_serial: u32, uid: u32, app_id: Option<&str>) -> Vec<u8> {
         message::Builder::method_return(Endian::Little, reply_serial)
             .sender(BUS_NAME)
@@ -3558,7 +3593,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_label_and_one_all_files_filter_match_firefox() {
+    fn accept_label_and_firefox_filter_list_select_all_files() {
         let accept_label = open_file_call(|writer| {
             writer.dict_entry(|writer| {
                 writer.string("accept_label")?;
@@ -3575,35 +3610,30 @@ mod tests {
         );
 
         let firefox = open_file_call(|writer| {
-            for key in ["filters", "current_filter"] {
-                writer.dict_entry(|writer| {
-                    writer.string(key)?;
-                    let signature = if key == "filters" {
-                        "a(sa(us))"
-                    } else {
-                        "(sa(us))"
-                    };
-                    writer.variant(signature, |writer| {
-                        let write_filter = |writer: &mut Writer| {
-                            writer.structure(|writer| {
-                                writer.string("All Files")?;
-                                writer.array("(us)", |writer| {
-                                    writer.structure(|writer| {
-                                        writer.uint32(0);
-                                        writer.string("*")
-                                    })
-                                })
-                            })
-                        };
-                        if key == "filters" {
-                            writer.array("(sa(us))", write_filter)
-                        } else {
-                            write_filter(writer)
+            writer.dict_entry(|writer| {
+                writer.string("filters")?;
+                writer.variant("a(sa(us))", |writer| {
+                    writer.array("(sa(us))", |writer| {
+                        for (label, rules) in [
+                            ("All Files", &[(0, "*")][..]),
+                            ("HTML Files", &[(0, "*.html"), (1, "text/html")][..]),
+                            ("Text Files", &[(1, "text/plain")][..]),
+                            ("Image Files", &[(1, "image/png"), (1, "image/jpeg")][..]),
+                            ("XML Files", &[(0, "*.xml")][..]),
+                            ("PDF Files", &[(1, "application/pdf")][..]),
+                        ] {
+                            write_file_filter(writer, label, rules)?;
                         }
+                        Ok(())
                     })
-                })?;
-            }
-            Ok(())
+                })
+            })?;
+            writer.dict_entry(|writer| {
+                writer.string("current_filter")?;
+                writer.variant("(sa(us))", |writer| {
+                    write_file_filter(writer, "All Files", &[(0, "*")])
+                })
+            })
         });
         let (firefox, _) = message::decode(&firefox, 0).unwrap();
         let parsed = parse_open_file(&firefox).unwrap();
@@ -3636,45 +3666,49 @@ mod tests {
     }
 
     #[test]
-    fn richer_file_filters_remain_explicitly_unsupported() {
-        let filters = open_file_call(|writer| {
+    fn a_non_all_files_current_filter_remains_explicitly_unsupported() {
+        let selected_text = open_file_call(|writer| {
             writer.dict_entry(|writer| {
                 writer.string("filters")?;
                 writer.variant("a(sa(us))", |writer| {
                     writer.array("(sa(us))", |writer| {
-                        writer.structure(|writer| {
-                            writer.string("Text")?;
-                            writer.array("(us)", |writer| {
-                                writer.structure(|writer| {
-                                    writer.uint32(0);
-                                    writer.string("*.txt")
-                                })
-                            })
-                        })
+                        write_file_filter(writer, "All Files", &[(0, "*")])?;
+                        write_file_filter(writer, "Text", &[(0, "*.txt")])
                     })
                 })
-            })
-        });
-        let current_filter = open_file_call(|writer| {
+            })?;
             writer.dict_entry(|writer| {
                 writer.string("current_filter")?;
                 writer.variant("(sa(us))", |writer| {
-                    writer.structure(|writer| {
-                        writer.string("Text")?;
-                        writer.array("(us)", |writer| {
-                            writer.structure(|writer| {
-                                writer.uint32(0);
-                                writer.string("*.txt")
-                            })
-                        })
+                    write_file_filter(writer, "Text", &[(0, "*.txt")])
+                })
+            })
+        });
+        let (selected_text, _) = message::decode(&selected_text, 0).unwrap();
+        assert_eq!(
+            parse_open_file(&selected_text).unwrap_err().name,
+            UNSUPPORTED_OPEN
+        );
+
+        let multiple_without_current = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("filters")?;
+                writer.variant("a(sa(us))", |writer| {
+                    writer.array("(sa(us))", |writer| {
+                        write_file_filter(writer, "All Files", &[(0, "*")])?;
+                        write_file_filter(writer, "Text", &[(0, "*.txt")])
                     })
                 })
             })
         });
-        for bytes in [filters, current_filter] {
-            let (call, _) = message::decode(&bytes, 0).unwrap();
-            assert_eq!(parse_open_file(&call).unwrap_err().name, UNSUPPORTED_OPEN);
-        }
+        let (multiple_without_current, _) =
+            message::decode(&multiple_without_current, 0).unwrap();
+        assert_eq!(
+            parse_open_file(&multiple_without_current)
+                .unwrap_err()
+                .name,
+            UNSUPPORTED_OPEN
+        );
 
         let oversized = "x".repeat(257);
         let invalid_after_mime = open_file_call(|writer| {
@@ -3705,6 +3739,101 @@ mod tests {
             parse_open_file(&invalid_after_mime).unwrap_err().name,
             INVALID_OPEN
         );
+    }
+
+    #[test]
+    fn file_filter_and_rule_counts_have_exact_closed_bounds() {
+        let filters_at_limit = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("filters")?;
+                writer.variant("a(sa(us))", |writer| {
+                    writer.array("(sa(us))", |writer| {
+                        for index in 0..32 {
+                            write_file_filter(
+                                writer,
+                                &format!("All Files {index}"),
+                                &[(0, "*")],
+                            )?;
+                        }
+                        Ok(())
+                    })
+                })
+            })?;
+            writer.dict_entry(|writer| {
+                writer.string("current_filter")?;
+                writer.variant("(sa(us))", |writer| {
+                    write_file_filter(writer, "All Files 31", &[(0, "*")])
+                })
+            })
+        });
+        let (filters_at_limit, _) =
+            message::decode(&filters_at_limit, 0).unwrap();
+        assert_eq!(
+            parse_open_file(&filters_at_limit)
+                .unwrap()
+                .filter
+                .unwrap()
+                .label(),
+            "All Files 31"
+        );
+
+        let filters_over_limit = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("filters")?;
+                writer.variant("a(sa(us))", |writer| {
+                    writer.array("(sa(us))", |writer| {
+                        for index in 0..33 {
+                            write_file_filter(
+                                writer,
+                                &format!("All Files {index}"),
+                                &[(0, "*")],
+                            )?;
+                        }
+                        Ok(())
+                    })
+                })
+            })
+        });
+        let (filters_over_limit, _) =
+            message::decode(&filters_over_limit, 0).unwrap();
+        let error = parse_open_file(&filters_over_limit).unwrap_err();
+        assert_eq!(error.name, INVALID_OPEN);
+        assert_eq!(error.text, "filters exceeds 32 entries");
+
+        let rules_at_limit = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("filters")?;
+                writer.variant("a(sa(us))", |writer| {
+                    writer.array("(sa(us))", |writer| {
+                        let rules = vec![(0, "*"); 32];
+                        write_file_filter(writer, "Many Rules", &rules)
+                    })
+                })
+            })
+        });
+        let (rules_at_limit, _) =
+            message::decode(&rules_at_limit, 0).unwrap();
+        assert_eq!(
+            parse_open_file(&rules_at_limit).unwrap_err().name,
+            UNSUPPORTED_OPEN
+        );
+
+        let rules_over_limit = open_file_call(|writer| {
+            writer.dict_entry(|writer| {
+                writer.string("filters")?;
+                writer.variant("a(sa(us))", |writer| {
+                    writer.array("(sa(us))", |writer| {
+                        let rules = vec![(0, "*"); 33];
+                        write_file_filter(writer, "Too Many Rules", &rules)
+                    })
+                })
+            })
+        });
+        let (rules_over_limit, _) =
+            message::decode(&rules_over_limit, 0).unwrap();
+        let error = parse_open_file(&rules_over_limit).unwrap_err();
+        assert_eq!(error.name, INVALID_OPEN);
+        assert_eq!(error.text, "a file filter exceeds 32 rules");
     }
 
     #[test]
@@ -4230,6 +4359,17 @@ mod tests {
         };
         let fields = current.values(2).unwrap();
         assert_eq!(fields[0], Value::Str("All Files"));
+        let Value::Array(rules) = fields[1] else {
+            panic!("current_filter rules are not an array");
+        };
+        let rules = rules.values(1).unwrap();
+        let Value::Struct(rule) = rules[0] else {
+            panic!("current_filter rule is not a structure");
+        };
+        assert_eq!(
+            rule.values(2).unwrap(),
+            vec![Value::Uint32(0), Value::Str("*")]
+        );
     }
 
     #[test]

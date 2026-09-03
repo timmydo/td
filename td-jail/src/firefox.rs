@@ -410,18 +410,11 @@ check();
 
 const CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT: &str = r#"
 const done = arguments[arguments.length - 1];
-const input = document.getElementById("td-upload");
-if (!input || input.type !== "file" || input.multiple) {
-  done("TD-FIREFOX-INPUT-ERROR:file-chooser-input");
-  return;
-}
 const focus = document.createElement("button");
 focus.id = "td-upload-focus";
 focus.type = "button";
-focus.textContent = "Activate file chooser";
-focus.tabIndex = 1;
-input.tabIndex = 2;
-input.parentNode.insertBefore(focus, input);
+focus.textContent = "Focus Firefox for its native Open File command";
+document.body.appendChild(focus);
 focus.style.position = "fixed";
 focus.style.inset = "0";
 focus.style.width = "100%";
@@ -430,10 +423,6 @@ focus.style.zIndex = "2147483647";
 const state =
   { downs: 0, clicks: 0, trusted: true, button: null, x: null, y: null };
 window.__tdFileChooserRefocus = state;
-window.__tdFileChooser =
-  { downs: 0, clicks: 0, pointerClicks: 0, keyboardClicks: 0,
-    unexpectedClicks: false, changes: 0, focuses: 0, trusted: true,
-    button: null, detail: null, keys: 0, key: null };
 focus.addEventListener("mousedown", event => {
   state.downs++;
   if (!event.isTrusted) state.trusted = false;
@@ -445,37 +434,6 @@ focus.addEventListener("click", event => {
   state.y = event.clientY;
   if (!event.isTrusted) state.trusted = false;
 }, { capture: true, once: true });
-input.addEventListener("focus", event => {
-  window.__tdFileChooser.focuses++;
-  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
-}, { capture: true });
-input.addEventListener("mousedown", event => {
-  window.__tdFileChooser.downs++;
-  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
-}, { capture: true });
-input.addEventListener("click", event => {
-  window.__tdFileChooser.clicks++;
-  window.__tdFileChooser.button = event.button;
-  window.__tdFileChooser.detail = event.detail;
-  if (event.button === 0 && event.detail === 1) {
-    window.__tdFileChooser.pointerClicks++;
-  } else if (event.button === 0 && event.detail === 0) {
-    window.__tdFileChooser.keyboardClicks++;
-  } else {
-    window.__tdFileChooser.unexpectedClicks = true;
-  }
-  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
-}, { capture: true });
-input.addEventListener("change", event => {
-  window.__tdFileChooser.changes++;
-  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
-}, { capture: true });
-input.addEventListener("keydown", event => {
-  window.__tdFileChooser.keys++;
-  window.__tdFileChooser.key = event.key;
-  if (!event.isTrusted) window.__tdFileChooser.trusted = false;
-}, { capture: true });
-input.value = "";
 const rect = focus.getBoundingClientRect();
 if (rect.left > 0 || rect.top > 0 || rect.right < innerWidth ||
     rect.bottom < innerHeight) {
@@ -490,19 +448,16 @@ const done = arguments[arguments.length - 1];
 const expires = Date.now() + 20000;
 const check = () => {
   const refocus = window.__tdFileChooserRefocus;
-  const state = window.__tdFileChooser;
-  if ((!refocus || refocus.downs !== 1 || refocus.clicks !== 1 || !state) &&
+  if ((!refocus || refocus.downs !== 1 || refocus.clicks !== 1) &&
       Date.now() < expires) {
     setTimeout(check, 50);
     return;
   }
-  const input = document.getElementById("td-upload");
   const focus = document.getElementById("td-upload-focus");
   if (!refocus || refocus.downs !== 1 || refocus.clicks !== 1 ||
-      refocus.button !== 0 || !refocus.trusted || !state || !state.trusted ||
+      refocus.button !== 0 || !refocus.trusted ||
       !Number.isFinite(refocus.x) || !Number.isFinite(refocus.y) ||
-      !input || !focus ||
-      input.type !== "file" || input.multiple || !document.hasFocus() ||
+      !focus || !document.hasFocus() ||
       document.activeElement !== focus) {
     done("TD-FIREFOX-INPUT-ERROR:file-chooser-input");
     return;
@@ -512,36 +467,6 @@ const check = () => {
   focus.style.top = "0";
   focus.style.width = "1px";
   focus.style.height = "1px";
-  input.style.position = "fixed";
-  if (innerWidth < 200 || innerHeight < 100) {
-    done("TD-FIREFOX-INPUT-ERROR:file-chooser-layout");
-    return;
-  }
-  const left = Math.max(0, Math.min(innerWidth - 200, refocus.x - 100));
-  const top = Math.max(0, Math.min(innerHeight - 100, refocus.y - 50));
-  input.style.inset = "auto";
-  input.style.left = left + "px";
-  input.style.top = top + "px";
-  input.style.width = "200px";
-  input.style.height = "100px";
-  input.style.margin = "0";
-  input.style.padding = "0";
-  input.style.border = "0";
-  input.style.fontSize = "0";
-  input.style.zIndex = "2147483646";
-  const style = document.createElement("style");
-  style.id = "td-upload-native-button-style";
-  style.textContent =
-    "input[type=file]::file-selector-button { width: 100%; height: 100%; " +
-    "margin: 0; padding: 0; border: 0; font: 16px sans-serif; }";
-  document.head.appendChild(style);
-  const rect = input.getBoundingClientRect();
-  if (rect.width !== 200 || rect.height !== 100 ||
-      refocus.x <= rect.left || refocus.x >= rect.right ||
-      refocus.y <= rect.top || refocus.y >= rect.bottom) {
-    done("TD-FIREFOX-INPUT-ERROR:file-chooser-layout");
-    return;
-  }
   requestAnimationFrame(() => requestAnimationFrame(() => {
     done("TD-FIREFOX-FILE-CHOOSER-CONTENT-ARMED");
   }));
@@ -553,26 +478,19 @@ const CONTENT_FILE_CHOOSER_FOCUS_SCRIPT: &str = r#"
 const done = arguments[arguments.length - 1];
 const expires = Date.now() + 20000;
 const check = () => {
-  const state = window.__tdFileChooser;
-  const input = document.getElementById("td-upload");
-  const ok = state && input && state.downs === 1 && state.clicks === 1 &&
-    state.pointerClicks === 1 && state.keyboardClicks === 0 &&
-    !state.unexpectedClicks &&
-    state.focuses === 1 && state.trusted && state.button === 0 &&
-    state.detail === 1 && state.keys === 0 && document.hasFocus() &&
-    document.activeElement === input;
+  const state = window.__tdFileChooserRefocus;
+  const ok = state && state.downs === 1 && state.clicks === 1 &&
+    state.button === 0 && state.trusted && Number.isFinite(state.x) &&
+    Number.isFinite(state.y) && document.hasFocus();
   if (!ok && Date.now() < expires) {
     setTimeout(check, 50);
     return;
   }
   done(ok ? "TD-FIREFOX-FILE-CHOOSER-CONTENT-FOCUSED" :
     "TD-FIREFOX-INPUT-ERROR:file-chooser-focus:" +
-    [state && state.downs, state && state.clicks, state && state.pointerClicks,
-      state && state.keyboardClicks, state && state.unexpectedClicks,
-      state && state.focuses,
-      state && state.trusted, state && state.button, state && state.detail,
-      state && state.keys, document.hasFocus(),
-      document.activeElement === input].map(String).join(":"));
+    [state && state.downs, state && state.clicks, state && state.button,
+      state && state.trusted, state && state.x, state && state.y,
+      document.hasFocus()].map(String).join(":"));
 };
 check();
 "#;
@@ -581,39 +499,18 @@ const CONTENT_FILE_CHOOSER_SCRIPT: &str = r#"
 const done = arguments[arguments.length - 1];
 const expires = Date.now() + 20000;
 const check = async () => {
-  const state = window.__tdFileChooser;
-  const input = document.getElementById("td-upload");
-  const file = input && input.files && input.files.length === 1 ?
-    input.files[0] : null;
-  let bytes = null;
-  if (file && file.name === "td-firefox-download.txt" && file.size === 23) {
-    try {
-      bytes = await file.text();
-    } catch (_) {}
-  }
-  const ok = state && input && state.downs === 1 &&
-    state.pointerClicks === 1 && state.keyboardClicks <= 1 &&
-    state.clicks === 1 + state.keyboardClicks && !state.unexpectedClicks &&
-    state.changes === 1 && state.focuses === 1 && state.trusted &&
-    state.button === 0 &&
-    state.detail === (state.keyboardClicks === 1 ? 0 : 1) &&
-    state.keys === 1 && state.key === "Enter" &&
-    file && file.name === "td-firefox-download.txt" &&
-    file.size === 23 && bytes === "TD-FIREFOX-DOWNLOAD-V1\n";
+  const text = document.body && document.body.textContent;
+  const ok = location.href ===
+      "file:///home/td/Downloads/td-firefox-download.txt" &&
+    document.contentType === "text/plain" &&
+    text === "TD-FIREFOX-DOWNLOAD-V1\n";
   if (!ok && Date.now() < expires) {
     setTimeout(check, 50);
     return;
   }
   done(ok ? "TD-FIREFOX-FILE-CHOOSER-CONTENT-OK" :
     "TD-FIREFOX-INPUT-ERROR:file-chooser:" +
-    [state && state.downs, state && state.clicks, state && state.pointerClicks,
-      state && state.keyboardClicks, state && state.unexpectedClicks,
-      state && state.changes,
-      state && state.focuses, state && state.trusted, state && state.button,
-      state && state.detail,
-      state && state.keys, state && state.key,
-      input && input.files && input.files.length,
-      file && file.name, file && file.size, bytes].map(String).join(":"));
+    [location.href, document.contentType, text].map(String).join(":"));
 };
 check();
 "#;
@@ -2070,13 +1967,19 @@ mod tests {
             }
             InputStage::Download
             | InputStage::FileChooser
-            | InputStage::FileChooserFocus
             | InputStage::FileChooserResult => {
                 responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
                 for (index, value) in values.iter().enumerate() {
                     let id = index + 3;
                     responses.push(format!("[1,{id},null,{{\"value\":\"{value}\"}}]"));
                 }
+            }
+            InputStage::FileChooserFocus => {
+                responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
+                responses.push(format!(
+                    "[1,3,null,{{\"value\":\"{}\"}}]",
+                    values.first().copied().unwrap_or_default()
+                ));
             }
         }
         responses.push(r#"[1,6,null,{"value":null}]"#.to_string());
@@ -2462,26 +2365,17 @@ mod tests {
         assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("mousedown"));
         assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("once: true"));
         assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("event.isTrusted"));
-        assert!(!CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("event.preventDefault()"));
-        assert!(!CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("input.showPicker()"));
+        assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT
+            .contains("Focus Firefox for its native Open File command"));
         assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("focus.style.inset = \"0\""));
         assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("focus.style.width = \"100%\""));
         assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("focus.style.height = \"100%\""));
-        assert!(!CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("input.style.opacity"));
         assert!(CONTENT_FILE_CHOOSER_REFOCUS_ARM_SCRIPT.contains("getBoundingClientRect()"));
         assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.clicks !== 1"));
         assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.button !== 0"));
         assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("document.hasFocus()"));
         assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("document.activeElement !== focus"));
         assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("Number.isFinite(refocus.x)"));
-        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.x - 100"));
-        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.y - 50"));
-        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("input.style.width = \"200px\""));
-        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("input.style.height = \"100px\""));
-        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.x <= rect.left"));
-        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("refocus.y >= rect.bottom"));
-        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("::file-selector-button"));
-        assert!(CONTENT_FILE_CHOOSER_ARM_SCRIPT.contains("width: 100%; height: 100%"));
         assert_eq!(
             CONTENT_FILE_CHOOSER_ARM_SCRIPT
                 .matches("requestAnimationFrame(")
@@ -2490,27 +2384,15 @@ mod tests {
         );
         assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.downs === 1"));
         assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.clicks === 1"));
-        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.pointerClicks === 1"));
-        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.keyboardClicks === 0"));
-        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("!state.unexpectedClicks"));
-        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.focuses === 1"));
-        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.keys === 0"));
-        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("document.activeElement === input"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.trusted"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("state.button === 0"));
+        assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains("document.hasFocus()"));
         assert!(CONTENT_FILE_CHOOSER_FOCUS_SCRIPT.contains(INPUT_FILE_CHOOSER_FOCUSED));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.downs === 1"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.clicks === 1 + state.keyboardClicks"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.pointerClicks === 1"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.keyboardClicks <= 1"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("!state.unexpectedClicks"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.changes === 1"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.focuses === 1"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.button === 0"));
         assert!(CONTENT_FILE_CHOOSER_SCRIPT
-            .contains("state.detail === (state.keyboardClicks === 1 ? 0 : 1)"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.keys === 1"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("state.key === \"Enter\""));
-        assert!(!CONTENT_FILE_CHOOSER_SCRIPT.contains("state.picker"));
-        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("file.size === 23"));
+            .contains("file:///home/td/Downloads/td-firefox-download.txt"));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT
+            .contains("document.contentType === \"text/plain\""));
+        assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("document.body.textContent"));
         assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("TD-FIREFOX-DOWNLOAD-V1\\n"));
         assert!(CONTENT_FILE_CHOOSER_SCRIPT.contains("Date.now() + 20000"));
         for script in [

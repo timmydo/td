@@ -1073,11 +1073,11 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_FIREFOX_CLIPBOARD_MARKER}), focused the authenticated HTTPS download link \
          ({TD_FIREFOX_DOWNLOAD_ARMED_MARKER}), activated it through the emulated keyboard, \
          and validated the exact file outside the jail ({TD_FIREFOX_DOWNLOAD_MARKER}), \
-         then armed Firefox document refocus and its real file input \
+         then armed Firefox document refocus for its native Open File command \
          ({TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER}), used one trusted physical click \
-         to focus the document ({TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER}), then focused the \
-         coordinate-bound native selector with a second trusted click \
-         ({TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER}) and opened it with physical Enter, \
+         to focus the document ({TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER}), closed a fresh \
+         read-only focus probe ({TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER}), and opened \
+         Firefox's native picker with physical Control+O, \
          matched the portal's announced frame to its centred QMP-captured pixels \
          ({TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX}), physically selected the download, and \
          validated its exact name, size and bytes in Firefox ({TD_FIREFOX_FILE_CHOOSER_MARKER}), \
@@ -1283,17 +1283,17 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
         (
             result.evidence.td_firefox_file_chooser_refocus_armed,
             TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER,
-            "Firefox did not arm physical document refocus before its real file input",
+            "Firefox did not arm physical document refocus before native Open File",
         ),
         (
             result.evidence.td_firefox_file_chooser_armed,
             TD_FIREFOX_FILE_CHOOSER_ARMED_MARKER,
-            "Firefox did not arm its real file input before portal activation",
+            "Firefox did not validate physical focus before portal activation",
         ),
         (
             result.evidence.td_firefox_file_chooser_focused,
             TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER,
-            "Firefox did not prove trusted focus on its real file input",
+            "Firefox did not prove trusted browser focus before native Open File",
         ),
         (
             result.evidence.td_firefox_file_chooser_presented.is_some(),
@@ -4858,11 +4858,6 @@ impl PhysicalInputController {
         if self.phase == PhysicalInputPhase::FirefoxFileChooserFocus
             && evidence.td_firefox_file_chooser_armed
         {
-            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
-            let qmp = self.qmp.as_mut().ok_or_else(|| {
-                "QMP controller disappeared before Firefox FileChooser input focus".to_string()
-            })?;
-            qmp.file_chooser_focus_until(deadline)?;
             self.phase = PhysicalInputPhase::FirefoxFileChooserInputFocus;
         }
         if self.phase == PhysicalInputPhase::FirefoxFileChooserInputFocus
@@ -4870,9 +4865,9 @@ impl PhysicalInputController {
         {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
             let qmp = self.qmp.as_mut().ok_or_else(|| {
-                "QMP controller disappeared before Firefox FileChooser activation".to_string()
+                "QMP controller disappeared before Firefox Open File command".to_string()
             })?;
-            qmp.file_chooser_activate_until(deadline)?;
+            qmp.file_chooser_command_until(deadline)?;
             self.phase = PhysicalInputPhase::FirefoxFileChooserOpen;
         }
         if self.phase == PhysicalInputPhase::FirefoxFileChooserOpen
@@ -4969,13 +4964,8 @@ impl Qmp {
         self.button_until("left", deadline)
     }
 
-    fn file_chooser_focus_until(&mut self, deadline: Instant) -> Result<(), String> {
-        self.move_absolute_until(24_576, 16_384, deadline)?;
-        self.button_until("left", deadline)
-    }
-
-    fn file_chooser_activate_until(&mut self, deadline: Instant) -> Result<(), String> {
-        self.key_chord_until(&["ret"], deadline)
+    fn file_chooser_command_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.key_chord_until(&["ctrl", "o"], deadline)
     }
 
     fn file_chooser_select_until(&mut self, deadline: Instant) -> Result<(), String> {
@@ -5013,7 +5003,17 @@ impl Qmp {
             || keys.iter().any(|key| {
                 !matches!(
                     *key,
-                    "ctrl" | "shift" | "c" | "e" | "l" | "m" | "o" | "ret" | "v" | "w" | "x"
+                    "ctrl"
+                        | "shift"
+                        | "c"
+                        | "e"
+                        | "l"
+                        | "m"
+                        | "o"
+                        | "ret"
+                        | "v"
+                        | "w"
+                        | "x"
                 )
             })
         {
@@ -5662,7 +5662,7 @@ mod tests {
             stream.write_all(b"{\"QMP\":{\"version\":{}}}\r\n").unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut commands = Vec::new();
-            for _ in 0..37 {
+            for _ in 0..35 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 commands.push(line.trim_end().to_string());
@@ -5831,25 +5831,26 @@ mod tests {
             .unwrap()
             .contains("\"axis\":\"y\",\"value\":16384"));
         assert!(commands.get(31).unwrap().contains("\"button\":\"left\""));
+        assert_eq!(
+            commands.get(32).map(String::as_str),
+            Some(concat!(
+                r#"{"execute":"input-send-event","arguments":{"events":["#,
+                r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"ctrl"}}},"#,
+                r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"o"}}},"#,
+                r#"{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"o"}}},"#,
+                r#"{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"ctrl"}}}"#,
+                "]}}"
+            ))
+        );
         assert!(commands
-            .get(32)
-            .unwrap()
-            .contains("\"axis\":\"x\",\"value\":24576"));
-        assert!(commands
-            .get(32)
-            .unwrap()
-            .contains("\"axis\":\"y\",\"value\":16384"));
-        assert!(commands.get(33).unwrap().contains("\"button\":\"left\""));
-        assert!(commands.get(34).unwrap().contains("\"data\":\"ret\""));
-        assert!(commands
-            .get(35)
+            .get(33)
             .unwrap()
             .contains("\"execute\":\"screendump\""));
         assert!(commands
-            .get(35)
+            .get(33)
             .unwrap()
             .contains("portal-file-chooser.ppm"));
-        assert!(commands.get(36).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(34).unwrap().contains("\"data\":\"ret\""));
         let source = include_str!("qemu_boot.rs");
         assert!(source.contains(
             "qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;"
@@ -5910,14 +5911,11 @@ mod tests {
         assert!(chooser.contains("const PANEL: [u8; 4] = [0x3c, 0x30, 0x28, 0];"));
         assert!(chooser.contains("const HIGHLIGHT: [u8; 4] = [0x78, 0x48, 0x28, 0];"));
         let firefox = include_str!("../../../../../td-jail/src/firefox.rs");
-        assert!(firefox.contains("input.style.width = \"200px\";"));
-        assert!(firefox.contains("input.style.height = \"100px\";"));
-        assert!(firefox.contains("refocus.x <= rect.left"));
+        assert!(firefox.contains("Focus Firefox for its native Open File command"));
         assert!(firefox.contains("focus.style.width = \"100%\";"));
         assert!(firefox.contains("focus.style.height = \"100%\";"));
-        assert!(firefox.contains("::file-selector-button"));
-        assert!(firefox.contains("width: 100%; height: 100%"));
-        assert!(firefox.contains("input.getBoundingClientRect()"));
+        assert!(!firefox.contains("input.showPicker()"));
+        assert!(!firefox.contains("input.style.width = \"200px\";"));
         let font = include_str!("../../../../../td-compositor/src/font_data.rs");
         assert!(font.contains(
             "UNIFONT_HEX: &str = \"72b54a86000000002000000001000000c1500000100000001000000008000000"
@@ -6033,7 +6031,11 @@ mod tests {
             TD_FIREFOX_FILE_CHOOSER_MARKER,
             format!("TD-FIREFOX-FILE-CHOOSER-OK bytes={}", DOWNLOAD.len())
         );
-        assert!(firefox.contains(&format!("file.size === {}", DOWNLOAD.len())));
+        assert!(firefox.contains(
+            "file:///home/td/Downloads/td-firefox-download.txt"
+        ));
+        assert!(firefox.contains("document.contentType === \"text/plain\""));
+        assert!(firefox.contains("document.body.textContent"));
         let portal = include_str!("../../../../../td-portal/src/main.rs");
         let presented = TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX
             .strip_prefix("portal: ")
