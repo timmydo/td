@@ -3,6 +3,7 @@ use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
 use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
 use crate::layout::ViewLayout;
+use crate::output::{Output, OutputDimensions};
 use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::positioner::{Anchor, Gravity, Positioner, Rect as PositionerRect};
 use crate::runtime::{
@@ -3818,16 +3819,45 @@ impl Client {
         }
     }
 
+    /// Describe the output on a client's newly bound `wl_output`.
+    ///
+    /// `id` is that CLIENT's object id; `output.id` is td's own identity for
+    /// the screen, and the two are different numbers in different namespaces
+    /// — which is why `OutputId` is a type rather than a `u32`.
     fn send_output(&mut self, id: u32, version: u32) -> Result<(), String> {
-        let (width, height) = {
+        let output = {
             let runtime = self
                 .runtime
                 .lock()
                 .map_err(|_| "runtime lock poisoned".to_string())?;
-            (runtime.width(), runtime.height())
+            runtime.output()
         };
+        self.send_described_output(id, version, &output)
+    }
+
+    /// The encoding half, taking the descriptor rather than fetching it.
+    ///
+    /// Separate from `send_output` for one reason: `Runtime` holds a concrete
+    /// `Framebuffer` whose descriptor is fixed at `FIRST`/`Normal`/scale 1, so
+    /// a test driving the whole path can only ever see the values the literals
+    /// this commit replaced already had. Given the descriptor directly, a test
+    /// can encode one no backend can currently report.
+    fn send_described_output(
+        &mut self,
+        id: u32,
+        version: u32,
+        output: &Output,
+    ) -> Result<(), String> {
+        // `wl_output.mode` carries SCANOUT pixels, not the logical size the
+        // layout works in: a client divides by the scale itself, and sending
+        // an already-divided size would have it divide twice.
+        let OutputDimensions { width, height } = output.dimensions;
         let width = i32::try_from(width).map_err(|_| "output width exceeds i32".to_string())?;
         let height = i32::try_from(height).map_err(|_| "output height exceeds i32".to_string())?;
+        let transform = i32::try_from(output.transform.to_wl())
+            .map_err(|_| "output transform exceeds i32".to_string())?;
+        let scale_factor = i32::try_from(output.scale.factor())
+            .map_err(|_| "output scale exceeds i32".to_string())?;
 
         let mut geometry = wire::Builder::new();
         geometry.i32(0);
@@ -3837,7 +3867,7 @@ impl Client {
         geometry.i32(0);
         geometry.string("td")?;
         geometry.string("software framebuffer")?;
-        geometry.i32(0);
+        geometry.i32(transform);
         self.send(id, 0, geometry)?;
 
         let mut mode = wire::Builder::new();
@@ -3849,12 +3879,12 @@ impl Client {
 
         if version >= 2 {
             let mut scale = wire::Builder::new();
-            scale.i32(1);
+            scale.i32(scale_factor);
             self.send(id, 3, scale)?;
         }
         if version >= 4 {
             let mut name = wire::Builder::new();
-            name.string("TD-1")?;
+            name.string(&format!("TD-{}", output.id.get()))?;
             self.send(id, 4, name)?;
             let mut description = wire::Builder::new();
             description.string("td software framebuffer")?;
@@ -10690,6 +10720,131 @@ mod tests {
         let mode = payload.u32().unwrap();
         payload.finish().unwrap();
         mode
+    }
+
+    /// The other half of the pair below: this one drives the real bind arm and
+    /// the descriptor LOOKUP, which the encoding test bypasses.
+    ///
+    /// It can only ever see `FIRST`/`Normal`/scale 1, so it cannot tell the
+    /// descriptor from the literals it replaced — that is the encoding test's
+    /// job. What it holds is that `send_output` asks the RUNTIME: the mode
+    /// carries 120x(80+BAR_HEIGHT), which is the test backend's size and
+    /// appears in no literal, so a `send_output` that built a fixed descriptor
+    /// of its own would fail here.
+    #[test]
+    fn binding_wl_output_reports_the_runtimes_own_output() {
+        let stem = format!(
+            "td-wayland-output-bind-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let described = runtime.lock().unwrap().output();
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(90, server, runtime, test_keymap()).unwrap();
+
+        client
+            .bind_global(GLOBAL_OUTPUT, "wl_output", 4, 7)
+            .unwrap();
+
+        let events = receive_messages(&mut peer, 6);
+        assert_eq!(
+            events.iter().map(|m| m.opcode).collect::<Vec<u16>>(),
+            vec![0, 1, 3, 4, 5, 2]
+        );
+        let mut mode = wire::Cursor::new(&events[1].payload);
+        assert_eq!(mode.u32().unwrap(), 3);
+        let width = mode.i32().unwrap();
+        let height = mode.i32().unwrap();
+        mode.i32().unwrap();
+        mode.finish().unwrap();
+        assert_eq!(usize::try_from(width).unwrap(), described.dimensions.width);
+        assert_eq!(
+            usize::try_from(height).unwrap(),
+            described.dimensions.height
+        );
+        assert_eq!(
+            (width, height),
+            (120, 80 + i32::try_from(BAR_HEIGHT).unwrap())
+        );
+    }
+
+    /// §M's sixth row: the wl_output events are the DESCRIPTOR's values.
+    ///
+    /// Encoded against an output the one backend cannot report — a rotated,
+    /// scale-3 second output — because at `FIRST`/`Normal`/scale 1 every
+    /// field this commit changed is satisfied by the literal it replaced, and
+    /// a test that cannot tell the two apart proves nothing about the change.
+    ///
+    /// The mode assertion is the sharpest: 800x600 is the SCANOUT size, and a
+    /// `send_output` that sent the logical size would put 200x266 on the wire
+    /// here, so this pins the choice the commit had to make rather than
+    /// merely reporting it.
+    #[test]
+    fn the_output_events_carry_the_descriptors_values_not_literals() {
+        let stem = format!(
+            "td-wayland-output-desc-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(89, server, runtime, test_keymap()).unwrap();
+
+        let described = Output {
+            id: crate::output::OutputId::new(7),
+            dimensions: OutputDimensions {
+                width: 800,
+                height: 600,
+            },
+            scale: crate::output::OutputScale::new(3).unwrap(),
+            transform: crate::output::OutputTransform::Rotate90,
+        };
+        let object = 7;
+        client.send_described_output(object, 4, &described).unwrap();
+
+        // geometry, mode, scale, name, description, done.
+        let events = receive_messages(&mut peer, 6);
+        assert_eq!(
+            events.iter().map(|m| m.opcode).collect::<Vec<u16>>(),
+            vec![0, 1, 3, 4, 5, 2]
+        );
+
+        let mut geometry = wire::Cursor::new(&events[0].payload);
+        for _ in 0..5 {
+            geometry.i32().unwrap();
+        }
+        geometry.string().unwrap();
+        geometry.string().unwrap();
+        assert_eq!(geometry.i32().unwrap(), 1);
+        geometry.finish().unwrap();
+
+        let mut mode = wire::Cursor::new(&events[1].payload);
+        assert_eq!(mode.u32().unwrap(), 3);
+        assert_eq!((mode.i32().unwrap(), mode.i32().unwrap()), (800, 600));
+        mode.i32().unwrap();
+        mode.finish().unwrap();
+
+        let mut scale = wire::Cursor::new(&events[2].payload);
+        assert_eq!(scale.i32().unwrap(), 3);
+        scale.finish().unwrap();
+
+        let mut name = wire::Cursor::new(&events[3].payload);
+        assert_eq!(name.string().unwrap(), "TD-7");
+        name.finish().unwrap();
+
+        let mut description = wire::Cursor::new(&events[4].payload);
+        assert_eq!(description.string().unwrap(), "td software framebuffer");
+        description.finish().unwrap();
+        wire::Cursor::new(&events[5].payload).finish().unwrap();
     }
 
     /// §F of APPLICATIONS.md states td's advertised globals as a fact about

@@ -7771,9 +7771,11 @@ ran out, and neither is a decision an accessor can make for it.
 `Surface::resident_bytes` is deleted rather than left beside the charge,
 since a number meaning "bytes" is what this row replaces.
 
-Row 3: `td-compositor/src/output.rs` holds `OutputBackend` —
-`dimensions`/`supported_formats`/`begin_frame(damage)`/`present`/`poll_events`
-— with `Framebuffer` as its one implementation, and `paint` defined as submit.
+Row 3: `td-compositor/src/output.rs` holds `OutputBackend`, with
+`Framebuffer` as its one implementation. Its required methods are `output`,
+`supported_formats`, `begin_frame(damage)`, `present` and `poll_events`, and
+it provides two more: `dimensions`, a view of `output` since row 6, and
+`paint`, which is defined as submit.
 It returns a `Submission`, so no caller can read a return as pixels on glass;
 fbdev answers `Presented` and a KMS backend will answer `Queued`. The
 whole-output repair a tiling command reaches for is now `Damage::Whole` passed
@@ -7790,6 +7792,14 @@ no caller, because the delivery path is asynchronous, a completion cannot be
 matched to its frame without an identity neither type carries, and the
 presentation-dependent evidence published on submit today would announce a
 frame that is not yet on glass. `td-compositor/DESIGN.md` carries the list.
+
+Row 6: `Output` names the screen — an `OutputId`, the scanout dimensions, an
+`OutputScale` and an `OutputTransform` — and a backend answers it rather than
+inheriting a default. The wire carries the SCANOUT size, and so does
+everything else in td: nothing consumes a logical size yet, because doing so
+needs a renderer that scales and rotates. Naming the two apart is what this
+row buys; moving callers to the logical one is the KMS landing's.
+`td-compositor/DESIGN.md` carries why each caller reads what it reads.
 
 Three seams are already right and must stay: `Scene::render` is pure
 bytes-in-bytes-out and needs nothing; `framebuffer.rs` is already the

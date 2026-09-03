@@ -584,12 +584,12 @@ by default. Clients combine that per-key property with
 `wl_keyboard.repeat_info`.
 
 Scanout sits behind `output.rs`'s `OutputBackend`, and `Framebuffer` is its
-one implementation. The trait is `dimensions`, `supported_formats`,
-`begin_frame(damage)`, `present` and `poll_events`, with one provided method,
-`paint`, that renders a scene into the target and submits it. That split is
-`APPLICATIONS.md` §M's third row, and it exists so the fbdev assumptions the
-renderer had absorbed become one backend's answers rather than the shape of
-the code.
+one implementation. The trait is `output`, `supported_formats`,
+`begin_frame(damage)`, `present` and `poll_events`, with two provided methods:
+`dimensions`, a view of `output()`, and `paint`, which renders a scene into
+the target and submits it. That split is `APPLICATIONS.md` §M's third row, and
+it exists so the fbdev assumptions the renderer had absorbed become one
+backend's answers rather than the shape of the code.
 
 **`paint` is defined as SUBMIT, and that is the load-bearing part.** It
 returns a `Submission`: `Presented` means the pixels are on glass, `Queued`
@@ -626,9 +626,10 @@ KMS author must not rediscover:
 - neither `Submission` nor `OutputEvent` carries a frame identity, so a
   completion drained after submitting frame N cannot be distinguished from
   N-1's. The draft marked the just-queued frame as on glass.
-- `Changed` invalidates every size derived from `dimensions`, not only the
-  damage: the shadow copy, the frame storage, and the layout the views were
-  configured against.
+- `Changed` invalidates everything computed from a previous `output()`, not
+  only the damage: the shadow copy, the frame storage, and the layout the
+  views were configured against. The scale and the transform change with it
+  too, and neither is a size.
 - presentation-dependent evidence must move with it. Application readiness and
   cursor evidence are published today after a successful submit, which is
   correct while submit means presented; under a backend that answers `Queued`
@@ -649,21 +650,66 @@ composition fallback exists is untouched: what a backend can put on glass and
 what td will accept from a client are separate questions, and this answers
 only the first.
 
+**The output is named** — §M's sixth row. `Output` carries an `OutputId`, the
+scanout `dimensions`, an `OutputScale` and an `OutputTransform`, and a backend
+answers it from `output()` rather than inheriting a default: a backend that
+reported `Normal` at scale 1 by default would be claiming something about its
+connector that it never checked.
+
+Two sizes now exist and they are different questions. `dimensions` is what the
+backend scans out and what a frame is allocated at. `logical_dimensions` is
+what a layout places windows in — the scanout size with its axes exchanged if
+the transform turns the output, divided by the scale, clamped to a pixel
+because a zero-width layout would divide by zero somewhere further from the
+cause. They are equal at `Normal` and scale 1, so nothing moves today; the
+reason to separate them first is that every caller currently reads one number
+and means whichever of the two it happens to need.
+
+Everything in td is on the SCANOUT pair today, and that is correct rather than
+pending. `Runtime::width` and `height` answer it because both their callers
+are `require_surface_dimensions`, which bounds the pixels a client may attach
+and so counts in the same pixels the screen does. Giving that check a logical
+size would collapse its allowance: the bound is twice the output, so at scale
+2 twice a half-width is the width itself — exactly the exact-output bound
+rejected below as too tight for client-side shadows. The layout, input and
+rendering paths read the scanout size too, and they agree with the logical one
+only because the single backend reports `Normal` at scale 1. Nothing consumes
+`logical_dimensions` yet, because consuming it needs a renderer that scales
+and rotates: td composites into a target of scanout dimensions with no
+transform, so a logical layout would be painted small into a corner and a
+reported rotation would tell clients td turns a picture it does not turn.
+Moving them is the KMS landing's work; naming the two sizes apart first is
+this row's. `wl_output.mode` carries the SCANOUT pair, because a client
+divides by the scale itself and would otherwise divide twice.
+
+`OutputId` is a type rather than a `u32` because the number a client sees is a
+different one: `wl_output` is bound per client and carries that client's
+object id, so a server-side identity and a protocol object id would otherwise
+share a type. The id is what the reported output name is built from, so `TD-1`
+names the first output instead of being a string that happens to end in a 1.
+
+`OutputTransform` carries all eight `wl_output` values though td drives only
+`Normal`, because `to_wl` has to be total and the alternative is an unchecked
+`u32` at the wire. `exchanges_axes` is the whole of what a transform means to
+a layout: a quarter turn makes a landscape output portrait and a half turn
+does not.
+
 **What the split does NOT yet do**, so the seam is not read as wider than it
 is: `Runtime` still holds a concrete `Framebuffer` and its constructor still
-names one. Every OUTPUT-GEOMETRY read goes through `dimensions()`, and the
-width, height and stride fields are private, so no caller reads the output's
-shape out of this backend. Three things stay inherent to it, and each is a
-caller a second backend would break: the row pitch, which `main.rs`'s startup
-diagnostic reads through `stride()` — a dumb buffer's pitch is the kernel's
-to choose and is a property of this backend's memory rather than of the
-output, which is why it is not on the trait; the pixel-attribution the
-application observer needs (`surface_rgb_pixel_counts`); and the
-`#[cfg(test)]` hooks. Substituting a second backend therefore still needs
-`Runtime` to become generic over one or to hold a boxed trait object, and
-that is the KMS landing's work rather than something this split can claim.
-What it claims is the interface, the submit semantics, and that fbdev's
-output geometry is no longer readable outside its own module.
+names one. Every OUTPUT-GEOMETRY read goes through `output()`, whether
+directly or through the `dimensions()` view of it, and the width, height and
+stride fields are private, so no caller reads the output's shape out of this
+backend. Three things stay inherent to it, and each is a caller a second
+backend would break: the row pitch, which `main.rs`'s startup diagnostic reads
+through `stride()` — a dumb buffer's pitch is the kernel's to choose and is a
+property of this backend's memory rather than of the output, which is why it
+is not on the trait; the pixel-attribution the application observer needs
+(`surface_rgb_pixel_counts`); and the `#[cfg(test)]` hooks. Substituting a
+second backend therefore still needs `Runtime` to become generic over one or
+to hold a boxed trait object, and that is the KMS landing's work rather than
+something this split can claim. What it claims is the interface, the submit
+semantics, and that fbdev's output geometry is no longer readable outside its
+own module.
 
 The framebuffer is single-buffered from userspace's perspective. The renderer
 allocates its frame storage once and composes a full frame after scene changes.

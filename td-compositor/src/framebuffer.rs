@@ -1,6 +1,6 @@
 use crate::output::{
-    Damage, Fourcc, FrameTarget, OutputBackend, OutputDimensions, OutputEvent, Submission,
-    DRM_FORMAT_XRGB8888,
+    Damage, Fourcc, FrameTarget, Output, OutputBackend, OutputDimensions, OutputEvent, OutputId,
+    OutputScale, OutputTransform, Submission, DRM_FORMAT_XRGB8888,
 };
 use crate::scene::{Scene, SurfaceKey};
 use crate::{MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
@@ -20,10 +20,11 @@ const RESEND_INTERVAL: usize = 240;
 
 pub struct Framebuffer {
     file: File,
-    // Private: the output's size is `dimensions()`, which is the trait's
-    // question and not this backend's field. A caller that reached the field
-    // would be reading fbdev rather than an output, which is the coupling
-    // the split exists to remove.
+    // Private: the output's size is `output().dimensions`, which is the
+    // trait's question and not this backend's field — `dimensions()` is a
+    // view of that, not a second home for it. A caller that reached the
+    // field would be reading fbdev rather than an output, which is the
+    // coupling the split exists to remove.
     width: usize,
     height: usize,
     stride: usize,
@@ -321,10 +322,19 @@ impl Framebuffer {
 }
 
 impl OutputBackend for Framebuffer {
-    fn dimensions(&self) -> OutputDimensions {
-        OutputDimensions {
-            width: self.width,
-            height: self.height,
+    /// fbdev has one device, no mode list and no connector to ask, so its
+    /// answer is fixed — and fixed is the point: it is reported from one
+    /// place instead of being spelled as literals wherever the wire needs it.
+    /// `dimensions` is the trait's view of this, not a second answer.
+    fn output(&self) -> Output {
+        Output {
+            id: OutputId::FIRST,
+            dimensions: OutputDimensions {
+                width: self.width,
+                height: self.height,
+            },
+            scale: OutputScale::ONE,
+            transform: OutputTransform::Normal,
         }
     }
 

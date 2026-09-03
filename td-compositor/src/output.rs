@@ -60,6 +60,196 @@ pub struct OutputDimensions {
     pub height: usize,
 }
 
+/// Which output. One exists, and that is why it gets a name now: "the
+/// output" is a fact about this code's shape rather than about the machine,
+/// and a KMS backend enumerates connectors.
+///
+/// A newtype rather than a bare `u32` because the number a client sees is a
+/// DIFFERENT one: `wl_output` is bound per client and carries that client's
+/// object id, so a server-side output identity and a protocol object id are
+/// two namespaces that would otherwise both be `u32`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputId(u32);
+
+impl OutputId {
+    /// The first output. Named rather than written as a literal at the one
+    /// construction site, so a second output is a value and not an edit.
+    pub const FIRST: OutputId = OutputId(1);
+
+    /// Any output. A backend enumerating connectors names them with this;
+    /// without it `FIRST` would be the only id that exists and a second
+    /// output would mean editing this file, which is what the constant above
+    /// claims it does not.
+    #[allow(dead_code)]
+    pub const fn new(id: u32) -> OutputId {
+        OutputId(id)
+    }
+
+    /// The number, for a name a client can read.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// `wl_output.scale`: how many device pixels one logical pixel occupies.
+///
+/// Integer, because that is what `wl_output` carries; fractional scaling is
+/// `wp_fractional_scale_v1` and a separate decision. Zero is refused at
+/// construction rather than guarded at every division.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputScale(u32);
+
+impl OutputScale {
+    /// One device pixel per logical pixel, which is td's only scale today.
+    pub const ONE: OutputScale = OutputScale(1);
+
+    /// `None` for zero, which would make a logical size meaningless rather
+    /// than merely wrong, and `None` beyond `i32::MAX`, which `wl_output`
+    /// cannot carry — a scale that no client can be told about would fail
+    /// every bind rather than the one construction that was wrong.
+    ///
+    /// Nothing in the software phase constructs a scale other than `ONE`;
+    /// what will is a backend reading a connector's scale, and the checked
+    /// constructor is how it will do that. Kept rather than deferred because
+    /// the alternative is a public field and the invariant that the divisor
+    /// is non-zero, which `logical_dimensions` relies on, would then be
+    /// nobody's.
+    #[allow(dead_code)]
+    pub fn new(factor: u32) -> Option<OutputScale> {
+        match factor {
+            0 => None,
+            factor if factor > i32::MAX as u32 => None,
+            factor => Some(OutputScale(factor)),
+        }
+    }
+
+    /// The factor, for the wire and for dividing a pixel size by.
+    pub fn factor(self) -> u32 {
+        self.0
+    }
+}
+
+/// How the output's contents sit relative to its native scanout.
+///
+/// The eight `wl_output.transform` values, complete because the protocol
+/// enumerant is what goes on the wire and a partial set would have to encode
+/// something it does not name. td drives `Normal` today; the others exist so
+/// a rotated connector is a VALUE a backend reports rather than a case the
+/// wire encoder has to invent.
+///
+/// Only `Normal` is constructed in the software phase — fbdev has no
+/// connector to ask — so the seven below are dead until a KMS backend reads
+/// one. The alternative to carrying them is `to_wl` taking a raw `u32` nobody
+/// checked, which is the mix-up `Fourcc` above exists to refuse one layer up.
+/// No `Default`: a transform nobody chose is exactly what this row removes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputTransform {
+    Normal,
+    #[allow(dead_code)]
+    Rotate90,
+    #[allow(dead_code)]
+    Rotate180,
+    #[allow(dead_code)]
+    Rotate270,
+    #[allow(dead_code)]
+    Flipped,
+    #[allow(dead_code)]
+    FlippedRotate90,
+    #[allow(dead_code)]
+    FlippedRotate180,
+    #[allow(dead_code)]
+    FlippedRotate270,
+}
+
+impl OutputTransform {
+    /// The `wl_output.transform` enumerant.
+    pub fn to_wl(self) -> u32 {
+        match self {
+            OutputTransform::Normal => 0,
+            OutputTransform::Rotate90 => 1,
+            OutputTransform::Rotate180 => 2,
+            OutputTransform::Rotate270 => 3,
+            OutputTransform::Flipped => 4,
+            OutputTransform::FlippedRotate90 => 5,
+            OutputTransform::FlippedRotate180 => 6,
+            OutputTransform::FlippedRotate270 => 7,
+        }
+    }
+
+    /// Whether this transform exchanges the two axes, which is the whole of
+    /// what a transform means to a LAYOUT: a quarter turn makes a landscape
+    /// output portrait, and every size derived from it swaps with it.
+    ///
+    /// Dead for the same reason as `logical_dimensions`, its only caller.
+    #[allow(dead_code)]
+    pub fn exchanges_axes(self) -> bool {
+        match self {
+            OutputTransform::Rotate90
+            | OutputTransform::Rotate270
+            | OutputTransform::FlippedRotate90
+            | OutputTransform::FlippedRotate270 => true,
+            OutputTransform::Normal
+            | OutputTransform::Rotate180
+            | OutputTransform::Flipped
+            | OutputTransform::FlippedRotate180 => false,
+        }
+    }
+}
+
+/// One output, named — `APPLICATIONS.md` §M's sixth row.
+///
+/// `dimensions` is the SCANOUT size in device pixels, which is what a backend
+/// allocates and what `wl_output.mode` carries. `logical_dimensions` is what
+/// a layout places windows in. They are equal today, at `Normal` and scale 1,
+/// and the reason to separate them before they differ is that every caller
+/// currently reads one number and means whichever of the two it happens to
+/// need.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Output {
+    pub id: OutputId,
+    pub dimensions: OutputDimensions,
+    pub scale: OutputScale,
+    pub transform: OutputTransform,
+}
+
+impl Output {
+    /// The size a layout works in: scanout pixels, axes exchanged if the
+    /// transform turns the output, divided by the scale.
+    ///
+    /// NOTHING CONSUMES THIS YET, and that is the honest state rather than an
+    /// oversight. Consuming a logical size requires a renderer that scales and
+    /// rotates: td composites into a target of SCANOUT dimensions with no
+    /// transform anywhere, so a layout in logical pixels would be painted
+    /// small into a corner, and a reported rotation would tell clients td
+    /// turns a picture it does not turn. Layout, input and rendering are all
+    /// in scanout pixels today and agree only because the one backend reports
+    /// `Normal` at scale 1. This function is the definition they will have to
+    /// move to, not a switch that has been thrown. Hence the allowance: it is
+    /// a definition waiting for the renderer that can honour it, and writing
+    /// it while there is one buffer kind and one backend is cheaper than
+    /// deriving it later from callers that have each assumed something.
+    ///
+    /// Truncating division, and then clamped to at least one pixel per axis.
+    /// An output smaller than its own scale is not a configuration td
+    /// produces, and a zero-width layout is a worse answer than a
+    /// one-pixel one: it would divide by zero somewhere further away from
+    /// the cause.
+    #[allow(dead_code)]
+    pub fn logical_dimensions(&self) -> OutputDimensions {
+        let OutputDimensions { width, height } = self.dimensions;
+        let (width, height) = match self.transform.exchanges_axes() {
+            true => (height, width),
+            false => (width, height),
+        };
+        // At least 1 by construction, so the division below cannot trap.
+        let factor = usize::try_from(self.scale.factor()).unwrap_or(usize::MAX);
+        OutputDimensions {
+            width: (width / factor).max(1),
+            height: (height / factor).max(1),
+        }
+    }
+}
+
 /// The bytes a frame is rendered into, with the geometry describing them.
 ///
 /// `stride` is the TARGET's, not the output's: a dumb buffer's pitch is the
@@ -99,16 +289,34 @@ pub enum OutputEvent {
     /// A submission that answered `Queued` reached the screen.
     #[allow(dead_code)]
     Presented,
-    /// The mode or connection changed; `dimensions` must be read again, and
-    /// so must every size derived from them.
+    /// The mode or connection changed; `output()` must be read again, and
+    /// every value computed from a previous one is stale. Not only the
+    /// sizes: the scale and the transform are `output()`'s own fields and
+    /// change with it.
     #[allow(dead_code)]
     Changed,
 }
 
 /// Scanout, behind one interface.
 pub trait OutputBackend {
-    /// The output's size in pixels.
-    fn dimensions(&self) -> OutputDimensions;
+    /// This output, named: id, scanout size, scale and transform.
+    ///
+    /// Not defaulted. A backend that reported `Normal` at scale 1 by
+    /// inheriting a default would be claiming something about its connector
+    /// that it never checked, which is the answer §M's sixth row exists to
+    /// stop being implicit.
+    fn output(&self) -> Output;
+
+    /// The output's size in pixels — what this backend scans out, and what a
+    /// frame is allocated at.
+    ///
+    /// A view of `output()` rather than a second thing to implement. Two
+    /// independent answers to one question is how a backend ends up
+    /// advertising one size and rendering another, and nothing would have
+    /// compared them.
+    fn dimensions(&self) -> OutputDimensions {
+        self.output().dimensions
+    }
 
     /// The formats this backend can scan out. §M's rule is that nothing here
     /// may be advertised to a CLIENT until a linear CPU composition fallback
@@ -143,8 +351,10 @@ pub trait OutputBackend {
     /// - neither `Submission` nor `OutputEvent` carries a frame identity, so
     ///   a completion drained after submitting frame N cannot be told apart
     ///   from N-1's. Pairing them needs an identity that does not exist yet.
-    /// - `Changed` invalidates every size derived from `dimensions`, not just
-    ///   the damage: the shadow copy, the frame storage and the layout.
+    /// - `Changed` invalidates everything computed from a previous
+    ///   `output()`, not just the damage: the shadow copy, the frame storage
+    ///   and the layout. The scale and the transform change with it too, and
+    ///   neither is a size.
     ///
     /// Writing those down is the point; guessing at the response is what §M
     /// calls painting into the corner.
@@ -178,5 +388,105 @@ mod tests {
     #[test]
     fn the_xrgb_fourcc_is_the_four_characters_it_names() {
         assert_eq!(&DRM_FORMAT_XRGB8888.code(), b"XR24");
+    }
+
+    fn output_of(transform: OutputTransform, scale: u32) -> Output {
+        Output {
+            id: OutputId::FIRST,
+            dimensions: OutputDimensions {
+                width: 1920,
+                height: 1080,
+            },
+            scale: OutputScale::new(scale).expect("test scale is not zero"),
+            transform,
+        }
+    }
+
+    /// The whole of what a transform means to a layout. A landscape screen
+    /// turned a quarter is a PORTRAIT one, and every size derived from it has
+    /// to turn with it — the half-turn does not, which is why this cannot be
+    /// "is the transform Normal".
+    #[test]
+    fn a_quarter_turn_exchanges_the_layouts_axes_and_a_half_turn_does_not() {
+        for turned in [
+            OutputTransform::Rotate90,
+            OutputTransform::Rotate270,
+            OutputTransform::FlippedRotate90,
+            OutputTransform::FlippedRotate270,
+        ] {
+            let logical = output_of(turned, 1).logical_dimensions();
+            assert_eq!((logical.width, logical.height), (1080, 1920), "{turned:?}");
+        }
+        for upright in [
+            OutputTransform::Normal,
+            OutputTransform::Rotate180,
+            OutputTransform::Flipped,
+            OutputTransform::FlippedRotate180,
+        ] {
+            let logical = output_of(upright, 1).logical_dimensions();
+            assert_eq!((logical.width, logical.height), (1920, 1080), "{upright:?}");
+        }
+    }
+
+    /// A scale divides the logical size and leaves the scanout size alone:
+    /// they are different questions, and a client is told the pixel mode and
+    /// the scale and does the division once itself. td lays out in scanout
+    /// pixels and is right to while its one backend reports scale 1 — a
+    /// backend that reported otherwise is what would make the two differ.
+    #[test]
+    fn a_scale_divides_the_logical_size_and_the_scanout_size_is_untouched() {
+        let output = output_of(OutputTransform::Normal, 2);
+        assert_eq!(output.dimensions.width, 1920);
+        let logical = output.logical_dimensions();
+        assert_eq!((logical.width, logical.height), (960, 540));
+    }
+
+    /// Both at once. Not an ordering claim — exchanging a pair and dividing
+    /// each component commute, so there is no order here to get wrong — but
+    /// the combination is what a rotated HiDPI panel reports and it is worth
+    /// one value.
+    #[test]
+    fn a_turned_and_scaled_output_gives_both_effects() {
+        let logical = output_of(OutputTransform::Rotate90, 2).logical_dimensions();
+        assert_eq!((logical.width, logical.height), (540, 960));
+    }
+
+    /// A zero-size layout would divide by zero somewhere further from the
+    /// cause, so the clamp is here where the reason is legible.
+    #[test]
+    fn an_output_smaller_than_its_own_scale_still_has_a_pixel() {
+        let output = Output {
+            id: OutputId::FIRST,
+            dimensions: OutputDimensions {
+                width: 1,
+                height: 1,
+            },
+            scale: OutputScale::new(4).expect("test scale is not zero"),
+            transform: OutputTransform::Normal,
+        };
+        let logical = output.logical_dimensions();
+        assert_eq!((logical.width, logical.height), (1, 1));
+    }
+
+    /// These are wire values, so they are pinned as wire values rather than
+    /// trusted to the declaration order of an enum somebody may reorder.
+    #[test]
+    fn the_transform_enumerants_are_the_ones_wl_output_defines() {
+        assert_eq!(OutputTransform::Normal.to_wl(), 0);
+        assert_eq!(OutputTransform::Rotate90.to_wl(), 1);
+        assert_eq!(OutputTransform::Rotate180.to_wl(), 2);
+        assert_eq!(OutputTransform::Rotate270.to_wl(), 3);
+        assert_eq!(OutputTransform::Flipped.to_wl(), 4);
+        assert_eq!(OutputTransform::FlippedRotate90.to_wl(), 5);
+        assert_eq!(OutputTransform::FlippedRotate180.to_wl(), 6);
+        assert_eq!(OutputTransform::FlippedRotate270.to_wl(), 7);
+    }
+
+    /// Refused at construction, so no divide has to ask.
+    #[test]
+    fn a_zero_scale_is_refused_rather_than_guarded_at_every_division() {
+        assert!(OutputScale::new(0).is_none());
+        assert_eq!(OutputScale::new(3).map(OutputScale::factor), Some(3));
+        assert_eq!(OutputScale::ONE.factor(), 1);
     }
 }

@@ -8,7 +8,7 @@ use crate::keyboard::{
 };
 use crate::launcher::{LaunchRequest, LauncherAction};
 use crate::layout::{Command, ViewLayout};
-use crate::output::{Damage, OutputBackend, Submission};
+use crate::output::{Damage, Output, OutputBackend, Submission};
 use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerScroll, PointerSnapshot, PointerState,
     PointerTarget, RoutedPointerFrame,
@@ -600,12 +600,25 @@ impl Runtime {
         self.scene.set_launcher_application(application);
     }
 
+    /// The output's width in SCANOUT pixels.
+    ///
+    /// Scanout and not logical: both callers are `require_surface_dimensions`,
+    /// which bounds the pixels a client may attach, and a client's buffer is
+    /// counted in the same pixels the screen is. Nothing in td consumes a
+    /// logical size yet — see `Output::logical_dimensions` for why that is a
+    /// renderer's decision rather than an accessor's.
     pub fn width(&self) -> usize {
-        self.framebuffer.dimensions().width
+        self.output().dimensions.width
     }
 
+    /// The output's height in scanout pixels. See `width`.
     pub fn height(&self) -> usize {
-        self.framebuffer.dimensions().height
+        self.output().dimensions.height
+    }
+
+    /// This runtime's output, named — id, scanout size, scale and transform.
+    pub fn output(&self) -> Output {
+        self.framebuffer.output()
     }
 
     /// Pessimistic across the paint, as the framebuffer's shadow copy is across
