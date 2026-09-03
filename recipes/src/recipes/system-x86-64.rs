@@ -4612,6 +4612,58 @@ mod tests {
         false
     }
 
+    /// The passwd file this generates never trips td-login's alias refusal.
+    ///
+    /// `db::account_in` refuses to resolve a uid two names claim, because a
+    /// class is a property of a name while the uid is what the kernel
+    /// enforces. That refusal is fail-closed, so a duplicate in the generated
+    /// file costs exactly the accounts that share the uid: both names stop
+    /// resolving, while an account whose uid is unique still logs in. A
+    /// collision on `tester` would take autologin down with it; one between
+    /// two service identities would not, and would surface as a daemon that
+    /// cannot start.
+    ///
+    /// Every collision reachable from today's inputs is already refused, and
+    /// this does not pretend otherwise: `system_def_is_self_consistent` and
+    /// `openssh_privilege_separation_identity_is_locked_and_prepared` both
+    /// red for a declared duplicate and for a privsep collision, the latter
+    /// reading `build_passwd`'s output as well. What they check is the set of
+    /// DECLARED uids. This parses the generated string instead, so it also
+    /// covers a line `build_passwd` appends OUTSIDE the `SYSTEM.users` loop —
+    /// the `sshd` entry is one such line today, and a second would be caught
+    /// here first. `SYSTEM` is the repository's only `SystemDef` and
+    /// `build_passwd` its only caller; a second image definition would need
+    /// this assertion too.
+    #[test]
+    fn the_generated_passwd_gives_each_uid_exactly_one_name() {
+        let passwd = build_passwd(&SYSTEM);
+        let mut seen: Vec<(u32, &str)> = Vec::new();
+        for line in passwd.lines().filter(|l| !l.trim().is_empty()) {
+            let mut fields = line.split(':');
+            let name = fields.next().unwrap_or_else(|| unreachable!("split yields one"));
+            let uid = fields
+                .nth(1)
+                .unwrap_or_else(|| panic!("{line:?} has no uid field"))
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("{line:?} has a non-numeric uid"));
+            if let Some((_, other)) = seen.iter().find(|(u, _)| *u == uid) {
+                panic!(
+                    "uid {uid} is claimed by both {other:?} and {name:?}; \
+                     td-login resolves neither name, so anything that must \
+                     enter either account fails"
+                );
+            }
+            seen.push((uid, name));
+        }
+        // Name the appended entry rather than counting past it: a length check
+        // proves only that SOME extra line exists, so a build_passwd that
+        // dropped the sshd entry and gained another would pass vacuously.
+        assert!(
+            seen.iter().any(|(_, name)| *name == SSHD_PRIVSEP_USER),
+            "the appended sshd entry is missing, so this read the wrong roster"
+        );
+    }
+
     #[test]
     fn openssh_privilege_separation_identity_is_locked_and_prepared() {
         assert!(

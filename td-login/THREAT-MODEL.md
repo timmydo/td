@@ -189,9 +189,9 @@ capability no shipped td image uses. The policy is therefore fail-closed
 by construction — the shadow field is classified, and only one class
 authenticates:
 
-The second and third columns below are the *forced* paths — `login -f`,
-`su` and `exec-as` — which skip authentication because the caller has by
-then already established the right to start the session. **"Reachable
+The `login -f` and `su`/`exec-as` columns below are the *forced* paths,
+which skip authentication because the caller has by then already
+established the right to start the session. **"Reachable
 only by root" is how that used to be stated here and it is not quite
 true**, which is worth correcting rather than repeating: what root is
 needed for is a switch that CHANGES something, and §4's
@@ -252,6 +252,39 @@ Consequences worth stating plainly:
   account has a `/bin/false` shell and a volatile `/run/td-audio` home and is
   the sole current `exec-service-as` target. None of the three can be entered
   through td-login's human forced modes or an interactive login.
+- **A class is a property of a name; the uid is what the kernel
+  enforces.** `classify` reads one account's shadow field, so
+  `!td-service` says that the NAME `audio` is refused by every human
+  path. It says nothing about uid 994. A second passwd entry sharing
+  that uid carries its own shadow field and its own `/etc/group`
+  membership. An empty field is `NoPassword`, which is admitted on
+  EVERY path in the table above — interactive `login` included, where no
+  caller has established anything and none is asked to. So the alias is
+  not merely a root-operated `exec-as` shortcut: an unauthenticated
+  console caller reaches the daemon's uid, with any argv and any
+  supplementary groups, never consulting the service class at all.
+
+  `account_in` therefore refuses to resolve a uid two names claim, in
+  either direction: asking for `audio` fails as surely as asking for the
+  alias. A second name for one uid is a second account policy for one
+  kernel identity, and refusing only the alias would leave "which name
+  did you ask for" deciding which policy applies — the thing being
+  removed. `the_service_class_is_reached_by_a_uid_no_other_name_claims`
+  is what holds the class and the uid together.
+
+  This is not a defence against root, which §4 places outside the threat
+  model: root writes `/etc/passwd`. It is what lets the rest of this
+  crate reason about a uid rather than a name, and what makes "who may
+  be 994" answerable by reading the file. The generated image never
+  contains such a pair — `system_def_is_self_consistent` requires each
+  declared uid to belong to exactly one user, and a separate assertion
+  keeps every declared account off the `sshd` privilege-separation uid —
+  so the parser refuses a case the image generator already cannot
+  produce, on any machine and however `/etc/passwd` got there.
+  `the_generated_passwd_gives_each_uid_exactly_one_name` is the one that
+  parses the generated file rather than the declaration, which is what
+  covers a line `build_passwd` appends outside its loop over
+  `SYSTEM.users`.
 - `system-x86-64`'s `system_def_is_self_consistent` test refuses to ship
   a `SYSTEM` definition whose auto-login user is not passwordless, so the
   image cannot be tailored into a machine that will not let anyone in.
