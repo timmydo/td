@@ -37,17 +37,33 @@ const MAX_ACCEPT_FAILURE: Duration = Duration::from_secs(60);
 /// How long a hand-off to the worker pool waits between attempts.
 const HANDOFF_POLL: Duration = Duration::from_millis(100);
 /// How long `check-host-stop` waits for its answer before reporting that it
-/// did not get one. A stop needs a free worker to dequeue it, so a wedged pool
-/// would otherwise hang the command with nothing said anywhere.
+/// did not get one. The accept loop answers a stop itself, so a wedged pool no
+/// longer swallows one — but the loop does not answer while it is waiting out
+/// a connection no worker will take, which can hold it for `HANDOFF_TIMEOUT`,
+/// and a stop the CHANNEL took before the look could recognise it still waits
+/// for a worker. This bound is what stops either hanging the command with
+/// nothing said anywhere.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `check-host-stop` waits for an accepted stop to actually finish
+/// before saying that it has not. A host with nothing in flight exits in
+/// milliseconds; anything longer is either real work or a wedge, and the
+/// operator is told which are possible rather than left with a bare success.
+const SHUTDOWN_NOTICE: Duration = Duration::from_secs(2);
+/// How often that wait looks again. Its own grain rather than a borrowed one,
+/// because it is watching a process leave, not a hand-off to a worker.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 /// How long one connection may wait for a worker before it is dropped.
 ///
-/// `stop` is set only by a worker that has DEQUEUED a stop request, so a pool
-/// with no worker able to dequeue anything can never be asked to stop. Waiting
-/// on that flag would be waiting on something the wedged case cannot produce,
-/// so the wait is bounded by the clock instead and the loop goes back to
-/// accepting. The client whose connection is dropped reads an ending and is
-/// pointed at this log, which says what happened to it.
+/// A run waits here, and so does a control request the look did not recognise
+/// because the client had sent nothing yet. A run needs a worker and there may
+/// be none, so the wait is bounded by the clock rather than by a flag a wedged
+/// pool cannot produce, and the loop goes back to accepting. The client whose
+/// connection is dropped reads an ending and is pointed at this log, which
+/// says what happened to it.
+///
+/// Note what this bound also costs: the loop does not accept while it waits,
+/// so a stop arriving behind an undeliverable run is not looked at for up to
+/// this long.
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 const MAGIC: &[u8; 8] = b"TDCHV2\0\n";
 const REQUEST_RUN: u8 = 1;
@@ -99,6 +115,88 @@ struct RunRequest {
     cwd: OsString,
     args: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
+}
+
+/// The nine bytes that name a request: the magic, then the kind.
+const CONTROL_PREFIX: usize = MAGIC.len() + 1;
+
+/// What the accept loop hands a worker.
+enum Job {
+    /// Nothing has been taken off this socket.
+    Unread(UnixStream),
+    /// A run whose prefix the accept loop consumed while finding out whether
+    /// it needed a worker at all. Only the body is left to read.
+    RunBody(UnixStream),
+}
+
+/// What the accept loop learned about a connection before queuing it.
+enum Glance {
+    /// A stop, already answered. The host must exit.
+    Stopped,
+    /// A ping, already answered. Nothing further is owed.
+    Answered,
+    /// A run. Its prefix is off the socket and its body is not; it needs a
+    /// worker like any other.
+    Run(UnixStream),
+    /// Nothing had arrived. NOTHING was taken off the socket, so this is
+    /// queued and read by a worker exactly as it always was.
+    Unsent(UnixStream),
+    /// Unusable, and already reported.
+    Discarded,
+}
+
+/// Why the accept loop ended.
+///
+/// An orderly exit and a failure have to be distinguishable in the process
+/// status and not only in the log. A host that gave up on its listener, or
+/// that has no worker left to hand a request to, stopped because it could no
+/// longer do its job; reporting success for that makes the exit status say the
+/// opposite of the line above it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitReason {
+    StopRequest,
+    IdleTimeout,
+    AcceptKeptFailing,
+    NoWorkerLeft,
+}
+
+impl ExitReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StopRequest => "stop request",
+            Self::IdleTimeout => "idle timeout",
+            Self::AcceptKeptFailing => "accept kept failing",
+            Self::NoWorkerLeft => "no worker left to accept requests",
+        }
+    }
+
+    /// Whether the host failed rather than was dismissed.
+    ///
+    /// An exhaustive match rather than a `matches!`, so a new reason cannot be
+    /// added without deciding which of the two it is: the compiler asks,
+    /// instead of silently calling it orderly.
+    fn is_failure(self) -> bool {
+        match self {
+            Self::StopRequest | Self::IdleTimeout => false,
+            Self::AcceptKeptFailing | Self::NoWorkerLeft => true,
+        }
+    }
+
+    /// The next reason, so a test can walk them.
+    ///
+    /// Exhaustive, so a fifth reason cannot be added without the compiler
+    /// demanding an arm here. That is the whole of the guarantee: nothing
+    /// forces the new arm to be spliced INTO the chain rather than ending it,
+    /// so the order is still hand-maintained and the test pins its length.
+    #[cfg(test)]
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::StopRequest => Some(Self::IdleTimeout),
+            Self::IdleTimeout => Some(Self::AcceptKeptFailing),
+            Self::AcceptKeptFailing => Some(Self::NoWorkerLeft),
+            Self::NoWorkerLeft => None,
+        }
+    }
 }
 
 enum Request {
@@ -417,19 +515,138 @@ pub fn serve_cli(args: &[String]) -> ExitCode {
 }
 
 pub fn stop_cli() -> ExitCode {
-    // Annotated like a run failure. A stop that reports a bare ending is the
-    // symptom this commit's own record says to expect a recurrence of, and
-    // sending the reader to the host's log is the entire remedy on offer.
-    let outcome = runtime_dir().and_then(|runtime| {
-        stop(&runtime.join(SOCKET_NAME)).map_err(|e| describe_response_error(e, &runtime))
-    });
-    match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+    let runtime = match runtime_dir() {
+        Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("td-builder: check-host-stop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Annotated like a run failure. A stop that reports a bare ending is the
+    // symptom the previous commit's record says to expect a recurrence of, and
+    // sending the reader to the host's log is the entire remedy on offer.
+    match stop(&runtime.join(SOCKET_NAME)) {
+        Ok(()) => {
+            report_unfinished_shutdown(&runtime);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "td-builder: check-host-stop: {}",
+                describe_response_error(e, &runtime)
+            );
             ExitCode::FAILURE
         }
     }
+}
+
+/// Say so when a host took the stop but has not finished leaving.
+///
+/// An accepted stop ends the accept loop — at once when the loop itself
+/// answered it, at its next flag check when a worker did — and the socket goes
+/// with it. `serve` then joins its workers, and that wait is as long as the
+/// longest check still in flight, or forever if a worker is wedged. Reporting
+/// bare success would leave the operator with a host that answers nothing, a
+/// socket that is gone, and no hint that anything is still owed. Answering the stop
+/// is what removed the old signal: before, this timed out and reported a
+/// failure, and that is what sent them to `kill`.
+///
+/// Success either way. A host finishing real work is doing the right thing and
+/// is indistinguishable from a wedged one from out here, so this says what is
+/// known and points at the log rather than guessing which it is.
+fn report_unfinished_shutdown(runtime: &Path) {
+    if ensure_private_dir(runtime).is_err() {
+        return;
+    }
+    // The probe has to TAKE the lifetime lock to learn whether anyone holds
+    // it, and `ensure_server` serialises its identical probe under the start
+    // lock for exactly that reason: a probe that owns a free lock for even a
+    // microsecond can make a host that is starting right then exit saying
+    // another one is already running. Hold the same lock or do not probe.
+    //
+    // Failing to take it means somebody else is using the start lock — a host
+    // starting, or another stop probing exactly like this one — and neither is
+    // this process's warning to make. An error taking it is treated the same
+    // way, because silence beats a false alarm. Holding it also means no
+    // replacement can appear WHILE the probe runs, which is what makes the two
+    // readings below a clean pair rather than a race against a host that has
+    // not bound its socket yet.
+    // The cost is on the other side, and it is bounded: a caller whose ping
+    // has already failed waits behind this for up to `SHUTDOWN_NOTICE` before
+    // it can start a replacement, on a path that was already headed for a
+    // `START_TIMEOUT` wait. A caller that found a serving host never takes
+    // this lock at all.
+    let start_path = runtime.join(START_LOCK_NAME);
+    let Ok(start) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&start_path)
+    else {
+        return;
+    };
+    if !crate::sys::flock_try_exclusive(start.as_raw_fd()).unwrap_or(false) {
+        return;
+    }
+
+    let socket = runtime.join(SOCKET_NAME);
+    let deadline = Instant::now()
+        .checked_add(SHUTDOWN_NOTICE)
+        .unwrap_or_else(Instant::now);
+    // At least one look happens whatever the clock says, so the warning can
+    // never be printed having checked nothing.
+    let mut looked_once = false;
+    loop {
+        // A published socket means a host is answering here — a replacement,
+        // or the one this stop reached, not gone yet. Neither is silent about
+        // itself the way the notice below would claim, so say nothing rather
+        // than say that. Not consulted on the FIRST pass: the host
+        // unlinks its socket a few syscalls after answering, and reading its
+        // own socket as somebody else's would swallow the notice in exactly
+        // the case it exists for.
+        if looked_once && path_is_socket(&socket) {
+            return;
+        }
+        if !host_lock_held(runtime) {
+            return;
+        }
+        looked_once = true;
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(SHUTDOWN_POLL);
+    }
+    let where_to_look = match host_logs(runtime) {
+        Some(logs) => format!("Its log is {logs}"),
+        None => format!("Nothing under {} says more", runtime.display()),
+    };
+    eprintln!(
+        "td-builder: check-host-stop: the host accepted the stop, but {}s \
+         later it still holds the lifetime lock and has published no socket: \
+         it is finishing checks that were in flight, or a worker is wedged and \
+         it cannot finish at all. No replacement host can start until it \
+         exits. {where_to_look}",
+        SHUTDOWN_NOTICE.as_secs()
+    );
+}
+
+/// Whether a host still holds the lifetime lock.
+///
+/// Silent on error: a false alarm about a host that is behaving is worse than
+/// saying nothing, and the caller is only ever adding a note to a success.
+fn host_lock_held(runtime: &Path) -> bool {
+    let path = runtime.join(HOST_LOCK_NAME);
+    let Ok(probe) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+    else {
+        return false;
+    };
+    // Taking it proves nobody else has it. The descriptor is dropped on the
+    // way out, which releases it again.
+    !crate::sys::flock_try_exclusive(probe.as_raw_fd()).unwrap_or(true)
 }
 
 fn runtime_dir() -> Result<PathBuf, String> {
@@ -511,8 +728,10 @@ fn ensure_server(runtime: &Path, socket: &Path) -> Result<(), String> {
     if ping(socket).is_ok() {
         return Ok(());
     }
-    // A health request can queue behind all request workers while the host is
-    // waiting for memory. Its lifetime flock, rather than ping latency, is the
+    // The accept loop answers a ping itself, so it no longer queues behind the
+    // request workers — but it still waits while the loop is holding a
+    // connection no worker will take, and a host mid-shutdown answers nothing
+    // at all. Its lifetime flock, rather than ping latency, remains the
     // authoritative one-host test. The startup lock closes the probe-to-spawn
     // race between concurrent first callers.
     let host_lock_path = runtime.join(HOST_LOCK_NAME);
@@ -812,24 +1031,38 @@ fn ping(socket: &Path) -> Result<(), String> {
 fn stop(socket: &Path) -> Result<(), ResponseError> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|e| ResponseError::Local(format!("connect to {}: {e}", socket.display())))?;
-    // Bounded, like `ping`. A stop queued behind 32 busy workers is never
-    // dequeued, and without this the CLI simply hangs with no output and
-    // nothing in the log to explain the silence.
+    // Bounded, like `ping`. The accept loop answers a stop without a worker,
+    // but it does not answer while it is waiting out a connection no worker
+    // will take, and a stop the channel swallowed before the look could
+    // recognise it waits for a worker that, while the pool stays wedged, never
+    // comes. Without this the CLI simply hangs with no output and nothing in
+    // the log to explain the silence.
     stream
         .set_read_timeout(Some(STOP_TIMEOUT))
         .map_err(|e| ResponseError::Local(format!("set check-host stop timeout: {e}")))?;
     write_control_request(&mut stream, REQUEST_STOP).map_err(ResponseError::Local)?;
     let (kind, bytes) = read_frame(&mut stream).map_err(|e| match e {
         FrameError::Closed => ResponseError::Closed,
-        // Local, not Host: the host's log cannot explain a request no worker
-        // ever dequeued, and a bare EAGAIN here would be indistinguishable
-        // from the failure this commit exists to make legible. Say what the
+        // Local, not Host: the host's log cannot explain a request that never
+        // reached it, and a bare EAGAIN here would be indistinguishable from
+        // the failure the previous commit exists to make legible. Say what the
         // silence means and what to do about it instead.
         FrameError::TimedOut => ResponseError::Local(format!(
-            "the check host did not answer a stop request within {}s; a stop \
-             needs a free worker to dequeue it, so a pool whose workers are \
-             all wedged cannot be stopped this way — kill the host instead",
-            STOP_TIMEOUT.as_secs()
+            "the check host did not answer a stop request within {}s. A stop \
+             needs no worker — the accept loop answers it — so silence means \
+             it has not reached that loop yet: the loop may be waiting out a \
+             connection no worker will take, which can hold it for {}s, or \
+             this request may have been queued before the loop could recognise \
+             it, or the host may not be accepting at all. A host that is merely \
+             slow to look will still honour this request, because its bytes \
+             stay buffered after this command gives up. A host whose queue was \
+             already FULL drops this connection after {}s and never honours \
+             it; one that queued the request instead holds it unread until a \
+             worker frees or the host dies. Check again before killing \
+             anything",
+            STOP_TIMEOUT.as_secs(),
+            HANDOFF_TIMEOUT.as_secs(),
+            HANDOFF_TIMEOUT.as_secs()
         )),
         FrameError::Other(message) => ResponseError::Host(message),
     })?;
@@ -879,7 +1112,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
         budget.token_count
     );
 
-    let (send, recv) = std::sync::mpsc::sync_channel::<UnixStream>(WORKER_THREADS);
+    let (send, recv) = std::sync::mpsc::sync_channel::<Job>(WORKER_THREADS);
     let recv = Arc::new(Mutex::new(recv));
     let stop = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
@@ -909,7 +1142,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
     // An ORDERLY exit has to be distinguishable from a death. Without this the
     // log of a host that is gone looks the same either way, and a client's EOF
     // cannot be attributed.
-    let mut reason = "stop request";
+    let mut reason = ExitReason::StopRequest;
     // An accept error that never clears (EMFILE, ENOBUFS) would otherwise be
     // reported forever into the one file that is supposed to be the record,
     // never reaching the idle check, holding the lock and the socket.
@@ -919,6 +1152,22 @@ fn serve(runtime: &Path) -> Result<(), String> {
             Ok((stream, _)) => {
                 failing_since = None;
                 idle_since = Instant::now();
+                // Ahead of the channel, not behind it. A stop the channel
+                // accepts is a stop nobody will ever dequeue if every worker
+                // is wedged, and that is the ordinary incident rather than an
+                // exotic one — so a stop the look RECOGNISES is never queued.
+                // One from a client that has not sent yet still is, and waits
+                // like any other connection.
+                let mut pending = match glance(stream) {
+                    Glance::Stopped => {
+                        stop.store(true, Ordering::Relaxed);
+                        reason = ExitReason::StopRequest;
+                        break 'accept;
+                    }
+                    Glance::Answered | Glance::Discarded => continue,
+                    Glance::Run(stream) => Job::RunBody(stream),
+                    Glance::Unsent(stream) => Job::Unread(stream),
+                };
                 // Workers that are alive but wedged — parked on a memory token
                 // that never frees, or polling a child that never exits for a
                 // client that never leaves — fill the channel without ever
@@ -926,7 +1175,6 @@ fn serve(runtime: &Path) -> Result<(), String> {
                 // here for good: `stop` never rechecked, lifetime lock held,
                 // socket still bound, which is the same mute hang the receiver
                 // fix removed, reached from the other side.
-                let mut pending = stream;
                 let waiting_since = Instant::now();
                 loop {
                     match send.try_send(pending) {
@@ -959,7 +1207,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
                             std::thread::sleep(HANDOFF_POLL);
                         }
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                            reason = "no worker left to accept requests";
+                            reason = ExitReason::NoWorkerLeft;
                             break 'accept;
                         }
                     }
@@ -969,7 +1217,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
                 // EAGAIN with nothing pending is the benign case, not a run.
                 failing_since = None;
                 if active.load(Ordering::Relaxed) == 0 && idle_since.elapsed() >= IDLE_TIMEOUT {
-                    reason = "idle timeout";
+                    reason = ExitReason::IdleTimeout;
                     break 'accept;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -978,7 +1226,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
                 eprintln!("td-builder: check host accept error: {e}");
                 let started = *failing_since.get_or_insert_with(Instant::now);
                 if started.elapsed() >= MAX_ACCEPT_FAILURE {
-                    reason = "accept kept failing";
+                    reason = ExitReason::AcceptKeptFailing;
                     break 'accept;
                 }
                 // The same pause the WouldBlock arm takes, so a transient
@@ -999,12 +1247,15 @@ fn serve(runtime: &Path) -> Result<(), String> {
     for worker in workers {
         let _ = worker.join();
     }
-    eprintln!(
-        "td-builder: check host {} exiting on {reason} at {}s",
-        std::process::id(),
-        epoch_seconds()
-    );
-    Ok(())
+    exit_result(
+        reason,
+        format!(
+            "check host {} exiting on {} at {}s",
+            std::process::id(),
+            reason.as_str(),
+            epoch_seconds()
+        ),
+    )
 }
 
 /// Holds the active-request count for as long as a request is in flight.
@@ -1028,7 +1279,7 @@ impl Drop for ActiveGuard {
 }
 
 fn worker_loop(
-    recv: Arc<Mutex<std::sync::mpsc::Receiver<UnixStream>>>,
+    recv: Arc<Mutex<std::sync::mpsc::Receiver<Job>>>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     pool: TokenPool,
@@ -1041,44 +1292,18 @@ fn worker_loop(
             Ok(receiver) => receiver.recv(),
             Err(_) => return,
         };
-        let mut stream = match next {
-            Ok(stream) => stream,
+        let job = match next {
+            Ok(job) => job,
             Err(_) => return,
         };
         let deadline = Instant::now()
             .checked_add(REQUEST_TIMEOUT)
             .unwrap_or_else(Instant::now);
-        match read_request(&mut stream, deadline) {
-            Ok(Request::Ping) => {
-                // Same reasoning as the stop arm: a ping that goes
-                // unanswered reads at the client as a host that vanished.
-                match FrameWriter::new(stream).and_then(|writer| writer.frame(FRAME_PONG, &[])) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("td-builder: check host could not answer a ping: {e}")
-                    }
-                }
-            }
+        let (stream, incoming) = job_request(job, deadline);
+        match incoming {
+            Ok(Request::Ping) => answer_ping(stream, STALL_BUDGET),
             Ok(Request::Stop) => {
-                // Answer first, then arm the shutdown. `serve` joins its
-                // workers, so this ordering is not what keeps the reply alive
-                // today; it is what stops a future teardown that does not join
-                // from turning an orderly exit into the EOF a dead host makes.
-                // A reply that cannot be sent still stops the host.
-                //
-                // Reported, never dropped: an unanswered stop leaves the
-                // stopper reading that same EOF and reporting a host that may
-                // have died, while this one exits perfectly normally. That is
-                // the exact confusion this commit exists to remove, so the
-                // one path that can cause it silently is made to speak.
-                match FrameWriter::new(stream)
-                    .and_then(|writer| writer.frame(FRAME_EXIT, &0u32.to_be_bytes()))
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("td-builder: check host could not answer the stop request: {e}")
-                    }
-                }
+                answer_stop(stream, STALL_BUDGET);
                 stop.store(true, Ordering::Relaxed);
             }
             Ok(Request::Run(request)) => {
@@ -1115,6 +1340,192 @@ fn worker_loop(
             Err(e) => eprintln!("td-builder: check host dropped malformed request: {e}"),
         }
     }
+}
+
+/// Answer a ping.
+///
+/// A ping that goes unanswered reads at the client as a host that vanished.
+fn answer_ping(stream: UnixStream, budget: Duration) {
+    match FrameWriter::with_budget(stream, budget).and_then(|writer| writer.frame(FRAME_PONG, &[]))
+    {
+        Ok(()) => {}
+        Err(e) => eprintln!("td-builder: check host could not answer a ping: {e}"),
+    }
+}
+
+/// Answer a stop. The caller arms the shutdown afterwards.
+///
+/// Answering comes first. `serve` joins its workers, so this ordering is not
+/// what keeps the reply alive today; it is what stops a future teardown that
+/// does not join from turning an orderly exit into the EOF a dead host makes.
+/// A reply that cannot be sent still stops the host.
+///
+/// Reported, never dropped: an unanswered stop leaves the stopper reading that
+/// same EOF and reporting a host that may have died, while this one exits
+/// perfectly normally.
+fn answer_stop(stream: UnixStream, budget: Duration) {
+    match FrameWriter::with_budget(stream, budget)
+        .and_then(|writer| writer.frame(FRAME_EXIT, &0u32.to_be_bytes()))
+    {
+        Ok(()) => {}
+        Err(e) => eprintln!("td-builder: check host could not answer the stop request: {e}"),
+    }
+}
+
+/// One non-blocking look at whatever has already arrived.
+///
+/// Zero means nothing has, and nothing was taken off the socket. The socket is
+/// returned to blocking mode whatever happens, because everything that reads
+/// it afterwards works by read timeouts, which a non-blocking socket turns
+/// into immediate failures rather than waits.
+fn first_arrival(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<usize> {
+    stream.set_nonblocking(true)?;
+    let arrival = match stream.read(buf) {
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the connection ended before it said anything",
+        )),
+        Ok(count) => Ok(count),
+        // Nothing yet, and EINTR moved no bytes either: both leave the socket
+        // untouched, so the connection is still queueable exactly as it came.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(0)
+        }
+        Err(e) => Err(e),
+    };
+    // The read's own error is the interesting one, so a failed restore reports
+    // only when there is nothing better to say. Either way this connection is
+    // given up rather than queued: a socket stuck non-blocking would fail
+    // every later timed read.
+    match (arrival, stream.set_nonblocking(false)) {
+        (Ok(count), Ok(())) => Ok(count),
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(e),
+    }
+}
+
+/// Settle what needs no worker, before the channel is involved.
+///
+/// A `try_send` that succeeds is not proof of service. Every wedged worker is
+/// stuck inside a request rather than in `recv`, so the channel quietly
+/// absorbs the next `WORKER_THREADS` connections and a stop among them waits
+/// for a worker that will never come. That is the ORDINARY wedged incident —
+/// the pool sticks, a human runs `check-host-stop`, and the one command meant
+/// to end that state is swallowed by it — and it needs no full queue to
+/// happen. Neither a stop nor a ping needs a worker: one sets a flag, the
+/// other is a five-byte frame. So the accept loop settles both itself, ahead
+/// of the channel rather than behind it.
+///
+/// The first look is NON-BLOCKING — two mode changes and a read — so a loop
+/// that is keeping up never waits. Every client writes its request straight
+/// after connecting, so the nine bytes are normally already here; when none
+/// has arrived, nothing is taken off the socket and the connection is queued
+/// unread exactly as before.
+///
+/// Once any byte IS taken the rest has to be waited for, and that wait is on
+/// the accept loop rather than on a worker. This is not a pathological case:
+/// `write_control_request` sends the magic and the kind in two separate
+/// writes, so an ordinary client genuinely can be seen eight bytes in. The
+/// ninth follows in microseconds, but the bound that makes it safe rather than
+/// likely is `REQUEST_TIMEOUT` — the same budget a worker would have spent on
+/// it, though a worker would have spent it alongside the others rather than
+/// ahead of them.
+fn glance(mut stream: UnixStream) -> Glance {
+    let mut prefix = [0u8; CONTROL_PREFIX];
+    let filled = match first_arrival(&mut stream, &mut prefix) {
+        Ok(0) => return Glance::Unsent(stream),
+        Ok(count) => count,
+        Err(e) => {
+            eprintln!(
+                "td-builder: check host dropped a connection it could not read at {}s: {e}",
+                epoch_seconds()
+            );
+            return Glance::Discarded;
+        }
+    };
+    // Bytes are off the socket now, so this connection can no longer be queued
+    // unread: the prefix is finished here, or the connection is given up.
+    let deadline = Instant::now()
+        .checked_add(REQUEST_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let mut budget = MAX_REQUEST_BYTES;
+    let Some(rest) = prefix.get_mut(filled..) else {
+        return Glance::Discarded;
+    };
+    if !rest.is_empty() {
+        if let Err(e) = read_exact(&mut stream, rest, &mut budget, deadline) {
+            eprintln!(
+                "td-builder: check host dropped a connection that stopped \
+                 mid-request at {}s: {e}",
+                epoch_seconds()
+            );
+            return Glance::Discarded;
+        }
+    }
+    if prefix.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
+        eprintln!(
+            "td-builder: check host dropped a connection with bad protocol \
+             magic at {}s",
+            epoch_seconds()
+        );
+        return Glance::Discarded;
+    }
+    match prefix.get(MAGIC.len()).copied() {
+        Some(REQUEST_STOP) => {
+            // A short budget, not `STALL_BUDGET`: an undeliverable run already
+            // parks this loop for longer than it should, and a reply must not
+            // add to that.
+            answer_stop(stream, REQUEST_TIMEOUT);
+            Glance::Stopped
+        }
+        Some(REQUEST_PING) => {
+            answer_ping(stream, REQUEST_TIMEOUT);
+            Glance::Answered
+        }
+        Some(REQUEST_RUN) => Glance::Run(stream),
+        other => {
+            eprintln!(
+                "td-builder: check host dropped an unknown request type {other:?} at {}s",
+                epoch_seconds()
+            );
+            Glance::Discarded
+        }
+    }
+}
+
+/// The request a job carries, read from wherever it still is.
+fn job_request(job: Job, deadline: Instant) -> (UnixStream, Result<Request, String>) {
+    match job {
+        Job::Unread(mut stream) => {
+            let request = read_request(&mut stream, deadline);
+            (stream, request)
+        }
+        Job::RunBody(mut stream) => {
+            // The prefix is already off the socket; only the body is left, and
+            // its allowance is what the prefix did not spend.
+            let mut budget = MAX_REQUEST_BYTES.saturating_sub(CONTROL_PREFIX);
+            let request = read_run_body(&mut stream, &mut budget, deadline).map(Request::Run);
+            (stream, request)
+        }
+    }
+}
+
+/// Report the ending once, in the place that matches what it means.
+///
+/// A failure hands the line back so `serve_cli` prints it and exits non-zero;
+/// an orderly exit prints it here. Doing both would put one fact in the log
+/// twice, the second time without the pid or the timestamp.
+fn exit_result(reason: ExitReason, ending: String) -> Result<(), String> {
+    if reason.is_failure() {
+        return Err(ending);
+    }
+    eprintln!("td-builder: {ending}");
+    Ok(())
 }
 
 fn run_request(
@@ -1515,40 +1926,51 @@ fn read_request(stream: &mut UnixStream, deadline: Instant) -> Result<Request, S
     }
     let mut kind = [0u8; 1];
     read_exact(stream, &mut kind, &mut budget, deadline)?;
-    match kind[0] {
+    let kind = kind
+        .first()
+        .copied()
+        .ok_or_else(|| "check-host request kind escaped its buffer".to_string())?;
+    match kind {
         REQUEST_PING => Ok(Request::Ping),
         REQUEST_STOP => Ok(Request::Stop),
-        REQUEST_RUN => {
-            let exe = OsString::from_vec(read_field(stream, &mut budget, deadline)?);
-            let cwd = OsString::from_vec(read_field(stream, &mut budget, deadline)?);
-            let argc = read_count(stream, &mut budget, MAX_ARGS, "argument", deadline)?;
-            let mut args = Vec::with_capacity(argc);
-            for _ in 0..argc {
-                args.push(OsString::from_vec(read_field(
-                    stream,
-                    &mut budget,
-                    deadline,
-                )?));
-            }
-            let envc = read_count(stream, &mut budget, MAX_ENVS, "environment", deadline)?;
-            let mut env = Vec::with_capacity(envc);
-            for _ in 0..envc {
-                let key = OsString::from_vec(read_field(stream, &mut budget, deadline)?);
-                let value = OsString::from_vec(read_field(stream, &mut budget, deadline)?);
-                if key.as_bytes().is_empty() || key.as_bytes().contains(&b'=') {
-                    return Err("check-host request has an invalid environment key".to_string());
-                }
-                env.push((key, value));
-            }
-            Ok(Request::Run(RunRequest {
-                exe,
-                cwd,
-                args,
-                env,
-            }))
-        }
+        REQUEST_RUN => Ok(Request::Run(read_run_body(stream, &mut budget, deadline)?)),
         other => Err(format!("unknown check-host request type {other}")),
     }
+}
+
+/// Everything after the kind byte.
+///
+/// Split out because the accept loop consumes the prefix when it looks for a
+/// control request, so the worker that eventually runs such a connection has
+/// to resume from exactly here rather than from the top of the message.
+fn read_run_body(
+    stream: &mut UnixStream,
+    budget: &mut usize,
+    deadline: Instant,
+) -> Result<RunRequest, String> {
+    let exe = OsString::from_vec(read_field(stream, budget, deadline)?);
+    let cwd = OsString::from_vec(read_field(stream, budget, deadline)?);
+    let argc = read_count(stream, budget, MAX_ARGS, "argument", deadline)?;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        args.push(OsString::from_vec(read_field(stream, budget, deadline)?));
+    }
+    let envc = read_count(stream, budget, MAX_ENVS, "environment", deadline)?;
+    let mut env = Vec::with_capacity(envc);
+    for _ in 0..envc {
+        let key = OsString::from_vec(read_field(stream, budget, deadline)?);
+        let value = OsString::from_vec(read_field(stream, budget, deadline)?);
+        if key.as_bytes().is_empty() || key.as_bytes().contains(&b'=') {
+            return Err("check-host request has an invalid environment key".to_string());
+        }
+        env.push((key, value));
+    }
+    Ok(RunRequest {
+        exe,
+        cwd,
+        args,
+        env,
+    })
 }
 
 fn read_count(
@@ -2479,6 +2901,274 @@ mod tests {
             0,
             "a request that unwinds must not leave the host permanently busy"
         );
+    }
+
+    /// A stop is settled before the channel can swallow it.
+    ///
+    /// The wedged-pool case, and it needs no full queue: every wedged worker
+    /// is stuck inside a request rather than in `recv`, so the channel accepts
+    /// the stop and nobody ever takes it out again. Answering ahead of the
+    /// channel is what makes the pool's state irrelevant to the one command
+    /// meant to end it.
+    #[test]
+    fn a_stop_is_answered_before_the_channel_can_swallow_it() {
+        let (mut client, host) = UnixStream::pair().unwrap();
+        write_control_request(&mut client, REQUEST_STOP).unwrap();
+        // Bounded, so a regression that answers nothing fails here rather than
+        // parking the suite on a reply that is never coming.
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        let outcome = glance(host);
+
+        assert!(
+            matches!(outcome, Glance::Stopped),
+            "a stop must stop the host without reaching a worker"
+        );
+        let (kind, body) = match read_frame(&mut client) {
+            Ok(frame) => frame,
+            Err(e) => panic!("the stopper must be answered: {}", e.message()),
+        };
+        assert_eq!(kind, FRAME_EXIT, "a stop is answered with an exit frame");
+        assert_eq!(body, 0u32.to_be_bytes(), "an honoured stop succeeded");
+    }
+
+    /// A ping is settled the same way, for the same reason.
+    ///
+    /// A saturated or wedged host is still a LISTENING host, and it is the
+    /// accept loop that knows so. Leaving the probe to a worker that may never
+    /// come reports a death that has not happened.
+    #[test]
+    fn a_ping_is_answered_before_the_channel_can_swallow_it() {
+        let (mut client, host) = UnixStream::pair().unwrap();
+        write_control_request(&mut client, REQUEST_PING).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        let outcome = glance(host);
+
+        assert!(
+            matches!(outcome, Glance::Answered),
+            "a ping is served, and asks for nothing further"
+        );
+        let (kind, body) = match read_frame(&mut client) {
+            Ok(frame) => frame,
+            Err(e) => panic!("the prober must be answered: {}", e.message()),
+        };
+        assert_eq!(kind, FRAME_PONG, "a ping is answered with a pong");
+        assert!(body.is_empty(), "a pong carries nothing");
+    }
+
+    /// A run survives having its prefix taken off the socket.
+    ///
+    /// The look consumes the magic and the kind, so the worker has to resume
+    /// from the body rather than from the top of the message. Get that wrong
+    /// and the host runs the wrong thing, or fails a request that arrived
+    /// perfectly intact — so every field is compared, not just the shape.
+    #[test]
+    fn a_run_keeps_its_body_when_its_prefix_is_taken() {
+        let (mut client, host) = UnixStream::pair().unwrap();
+        let sent = RunRequest {
+            exe: OsString::from("/td/store/td-builder"),
+            cwd: OsString::from("/home/tester/src/td"),
+            args: vec![OsString::from("check"), OsString::from("--frozen")],
+            env: vec![
+                (OsString::from("CARGO_TERM_COLOR"), OsString::from("never")),
+                (OsString::from("TD_STORE_DIR"), OsString::from("/td/store")),
+            ],
+        };
+        write_run_request(&mut client, &sent).unwrap();
+
+        let Glance::Run(queued) = glance(host) else {
+            panic!("a run needs a worker, so it is queued rather than answered");
+        };
+
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let (_kept, incoming) = job_request(Job::RunBody(queued), deadline);
+        match incoming {
+            Ok(Request::Run(got)) => {
+                assert_eq!(got.exe, sent.exe, "the program must survive the look");
+                assert_eq!(got.cwd, sent.cwd, "so must the working directory");
+                assert_eq!(got.args, sent.args, "so must every argument");
+                assert_eq!(got.env, sent.env, "so must the whole environment");
+            }
+            Ok(_) => panic!("a run job carries a run"),
+            Err(e) => panic!("the body must still be readable: {e}"),
+        }
+    }
+
+    /// A client that has not spoken yet is queued unread, and costs nothing.
+    ///
+    /// This is what keeps the look off the healthy path: the first read is
+    /// non-blocking, so a connection with nothing on it is handed straight to
+    /// the channel with NOTHING taken off the socket. The worker must then be
+    /// able to read the whole request in the ordinary way — which also proves
+    /// the socket was put back into blocking mode, since every later read
+    /// works by timeouts that a non-blocking socket would turn into failures.
+    #[test]
+    fn a_client_that_has_not_spoken_is_queued_unread() {
+        let (mut client, host) = UnixStream::pair().unwrap();
+
+        // Bounded from OUTSIDE the look. A look that started blocking would
+        // otherwise hang this test rather than fail it — and a hung test hangs
+        // the gate instead of reddening it, which is worse than no test.
+        let (done, looked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(glance(host));
+        });
+        let looked = looked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first look must not wait for a client that is silent");
+
+        let Glance::Unsent(queued) = looked else {
+            panic!("a silent connection is queued, not classified");
+        };
+
+        // Nothing was consumed, so the ordinary path still reads it whole —
+        // and it must WAIT for it. Writing late is the point: a socket left
+        // non-blocking would fail here the moment the data was not already
+        // there, which is precisely the state a queued connection is in.
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            write_control_request(&mut client, REQUEST_PING).unwrap();
+            client
+        });
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let (_kept, incoming) = job_request(Job::Unread(queued), deadline);
+        let _client = late.join().expect("the writing thread must not panic");
+        assert!(
+            matches!(incoming, Ok(Request::Ping)),
+            "a queued connection must still be read in full, and waited for"
+        );
+    }
+
+    /// A prefix split across two writes is still recognised.
+    ///
+    /// The client sends the magic and the kind with separate `write_all`
+    /// calls, so the accept loop can genuinely see eight bytes and then
+    /// nothing. Once any byte is taken the connection can no longer be queued
+    /// unread, so the rest has to be waited for rather than abandoned.
+    #[test]
+    fn a_prefix_split_across_writes_is_still_recognised() {
+        let (mut client, host) = UnixStream::pair().unwrap();
+        client.write_all(MAGIC).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        let (done, looked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(glance(host));
+        });
+        // Sleeping a writer thread and hoping proves nothing: if the writer
+        // wins the race the look sees all nine bytes and this quietly becomes
+        // a second copy of the already-complete case, still green. Requiring
+        // the look to be STILL WAITING is what pins the split.
+        assert!(
+            matches!(
+                looked.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "eight bytes are not a request; the look must wait for the ninth"
+        );
+
+        client.write_all(&[REQUEST_STOP]).unwrap();
+        let outcome = looked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the ninth byte must complete the look");
+
+        assert!(
+            matches!(outcome, Glance::Stopped),
+            "a prefix that arrives in two pieces is still a stop"
+        );
+        let (kind, _) = match read_frame(&mut client) {
+            Ok(frame) => frame,
+            Err(e) => panic!("the stopper must be answered: {}", e.message()),
+        };
+        assert_eq!(kind, FRAME_EXIT, "a stop is answered with an exit frame");
+    }
+
+    /// A host still holding the lifetime lock is seen to be holding it.
+    ///
+    /// This is what tells the operator that an accepted stop has not finished:
+    /// the socket is gone, so nothing else can be asked, and the lock is the
+    /// only thing left that answers. `flock` conflicts between open file
+    /// descriptions rather than between processes, so one held here is exactly
+    /// what a live host's would look like.
+    #[test]
+    fn a_host_that_has_not_finished_leaving_is_seen_to_hold_its_lock() {
+        let runtime = scratch_runtime("lifetime-lock");
+
+        assert!(
+            !host_lock_held(&runtime),
+            "nobody holds it before anybody takes it"
+        );
+
+        let held = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(runtime.join(HOST_LOCK_NAME))
+            .unwrap();
+        assert!(
+            crate::sys::flock_try_exclusive(held.as_raw_fd()).unwrap(),
+            "the test must be the one holding it"
+        );
+        assert!(
+            host_lock_held(&runtime),
+            "a host that has not finished leaving still holds its lock"
+        );
+
+        drop(held);
+        assert!(
+            !host_lock_held(&runtime),
+            "and releasing it must be visible, or every stop would nag"
+        );
+    }
+
+    /// A host that stopped serving must not report success.
+    ///
+    /// The walk is `next`, an exhaustive match, so a fifth reason cannot be
+    /// added without the compiler demanding an arm there and in the match
+    /// below — and that second arm is what puts its author in this test.
+    /// Nothing forces the new arm INTO the chain rather than onto its end,
+    /// so the length assertion is what pins that, once it is spliced in.
+    #[test]
+    fn a_host_that_stopped_serving_does_not_report_success() {
+        let mut reason = Some(ExitReason::StopRequest);
+        let mut seen: Vec<&str> = Vec::new();
+        while let Some(current) = reason {
+            let expected_failure = match current {
+                // Asked to go, or nobody came. Both are the host doing as it
+                // was told.
+                ExitReason::StopRequest | ExitReason::IdleTimeout => false,
+                // It could no longer listen, or had nothing left to listen
+                // with. Neither is a job finished.
+                ExitReason::AcceptKeptFailing | ExitReason::NoWorkerLeft => true,
+            };
+            assert_eq!(
+                current.is_failure(),
+                expected_failure,
+                "{current:?} is reported as the wrong kind of exit"
+            );
+            let ending = format!("check host 1 exiting on {} at 0s", current.as_str());
+            assert_eq!(
+                exit_result(current, ending).is_err(),
+                expected_failure,
+                "{current:?} must decide the process status, not only the log"
+            );
+            assert!(!current.as_str().is_empty(), "{current:?} must name itself");
+            assert!(
+                !seen.contains(&current.as_str()),
+                "{current:?} shares a name with another reason, so the log \
+                 cannot tell them apart"
+            );
+            seen.push(current.as_str());
+            reason = current.next();
+        }
+        assert_eq!(seen.len(), 4, "every reason must be walked");
     }
 
     #[test]
