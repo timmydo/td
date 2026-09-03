@@ -67,11 +67,19 @@ const FIREFOX_NAME: &str = "firefox";
 const PROC_CMDLINE_PATH: &str = "/proc/cmdline";
 const MAX_PROC_CMDLINE_BYTES: usize = 4096;
 const AUTOTEST_CMDLINE_TOKEN: &str = "td.autotest=1";
+const FIREFOX_INPUT_CMDLINE_TOKEN: &str = "td.firefox-input=1";
+const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = "td.firefox-seccomp-audit=1";
+const KERNEL_AUDIT_CMDLINE_TOKEN: &str = "audit=1";
+const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str = "audit_backlog_limit=8192";
+const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str = "log_buf_len=8M";
 const FIREFOX_AUTOTEST_POLICY_PATH: &str =
     "/run/td-firefox-autotest/policies.json";
 const FIREFOX_AUTOTEST_CA_PATH: &str = "/run/td-firefox-autotest/ca.pem";
+const FIREFOX_SECCOMP_PROBE_SOURCE: &str =
+    "/var/lib/td-test/td-jail-seccomp-probe";
 const MAX_FIREFOX_AUTOTEST_POLICY_BYTES: u64 = 1024;
 const MAX_FIREFOX_AUTOTEST_CA_BYTES: u64 = 64 * 1024;
+const MAX_FIREFOX_SECCOMP_PROBE_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const FIREFOX_AUTOTEST_POLICY: &str = concat!(
     "{\"policies\":{\"Certificates\":{\"Install\":[",
     "\"/etc/firefox/policies/td-firefox-autotest-ca.pem\"",
@@ -91,6 +99,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) resolv_conf: Option<ResolvedFile>,
     pub(crate) timezone: Option<ResolvedTimezone>,
     pub(crate) firefox_autotest_policy: Option<FirefoxAutotestPolicy>,
+    pub(crate) firefox_seccomp_probe: Option<ResolvedFile>,
     pub(crate) state: StatePlan,
     pub(crate) wayland_socket: PathBuf,
     pub(crate) bus_socket: PathBuf,
@@ -484,7 +493,30 @@ where
             MAX_RESOLV_CONF_BYTES,
         )?
     };
-    let firefox_autotest_policy = resolve_firefox_autotest_policy(name)?;
+    let firefox_cmdline = if name == FIREFOX_NAME {
+        Some(read_bounded(PROC_CMDLINE_PATH, MAX_PROC_CMDLINE_BYTES)?)
+    } else {
+        None
+    };
+    let firefox_autotest_policy = resolve_firefox_autotest_policy_at(
+        name,
+        firefox_cmdline.as_deref().is_some_and(|cmdline| {
+            cmdline_has_exact_token(cmdline, AUTOTEST_CMDLINE_TOKEN)
+        }),
+        Path::new(FIREFOX_AUTOTEST_POLICY_PATH),
+        Path::new(FIREFOX_AUTOTEST_CA_PATH),
+    )?;
+    let firefox_seccomp_probe = if config.host_mode {
+        None
+    } else {
+        resolve_firefox_seccomp_probe_at(
+            name,
+            firefox_cmdline
+                .as_deref()
+                .is_some_and(firefox_audit_boot),
+            Path::new(FIREFOX_SECCOMP_PROBE_SOURCE),
+        )?
+    };
     let timezone = resolve_timezone(config.timezone.as_deref(), &runtime_files)?;
 
     Ok(LaunchPlan {
@@ -495,6 +527,7 @@ where
         resolv_conf,
         timezone,
         firefox_autotest_policy,
+        firefox_seccomp_probe,
         state,
         wayland_socket,
         bus_socket,
@@ -2348,25 +2381,46 @@ fn resolve_optional_file(
     }
 }
 
-fn resolve_firefox_autotest_policy(
-    application: &str,
-) -> io::Result<Option<FirefoxAutotestPolicy>> {
-    if application != FIREFOX_NAME {
-        return Ok(None);
-    }
-    let cmdline = read_bounded(PROC_CMDLINE_PATH, MAX_PROC_CMDLINE_BYTES)?;
-    resolve_firefox_autotest_policy_at(
-        application,
-        cmdline_has_autotest_token(&cmdline),
-        Path::new(FIREFOX_AUTOTEST_POLICY_PATH),
-        Path::new(FIREFOX_AUTOTEST_CA_PATH),
-    )
-}
-
-fn cmdline_has_autotest_token(cmdline: &str) -> bool {
+fn cmdline_has_exact_token(cmdline: &str, token: &str) -> bool {
     cmdline
         .split_ascii_whitespace()
-        .any(|argument| argument == AUTOTEST_CMDLINE_TOKEN)
+        .any(|argument| argument == token)
+}
+
+fn firefox_audit_boot(cmdline: &str) -> bool {
+    [
+        AUTOTEST_CMDLINE_TOKEN,
+        FIREFOX_INPUT_CMDLINE_TOKEN,
+        FIREFOX_AUDIT_CMDLINE_TOKEN,
+        KERNEL_AUDIT_CMDLINE_TOKEN,
+        FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN,
+        FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN,
+    ]
+    .into_iter()
+    .all(|token| cmdline_has_exact_token(cmdline, token))
+}
+
+fn resolve_firefox_seccomp_probe_at(
+    application: &str,
+    audit_boot: bool,
+    path: &Path,
+) -> io::Result<Option<ResolvedFile>> {
+    if application != FIREFOX_NAME || !audit_boot {
+        return Ok(None);
+    }
+    let probe = resolve_direct_file(
+        path,
+        "Firefox outer-filter probe",
+        MAX_FIREFOX_SECCOMP_PROBE_BYTES,
+    )?;
+    let metadata = fs::symlink_metadata(&probe.path)?;
+    if !is_root_executable(metadata.uid(), metadata.gid(), metadata.mode()) {
+        return Err(invalid(format!(
+            "Firefox outer-filter probe {} is not root-owned mode 0555",
+            probe.path.display()
+        )));
+    }
+    Ok(Some(probe))
 }
 
 fn resolve_firefox_autotest_policy_at(
@@ -2450,6 +2504,10 @@ fn require_root_read_only(file: &ResolvedFile, label: &str) -> io::Result<()> {
 
 fn is_root_read_only(uid: u32, gid: u32, mode: u32) -> bool {
     uid == 0 && gid == 0 && mode & 0o7777 == 0o444
+}
+
+fn is_root_executable(uid: u32, gid: u32, mode: u32) -> bool {
+    uid == 0 && gid == 0 && mode & 0o7777 == 0o555
 }
 
 fn resolve_product_ca_bundle(path: &Path) -> io::Result<ResolvedFile> {
@@ -3218,16 +3276,23 @@ mod tests {
              -----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n",
         )
         .is_err());
-        assert!(resolve_firefox_autotest_policy("not-firefox")
-            .unwrap()
-            .is_none());
-        assert!(cmdline_has_autotest_token(
-            "console=ttyS0 td.autotest=1 td.persist=write"
+        assert!(cmdline_has_exact_token(
+            "console=ttyS0 td.autotest=1 td.persist=write",
+            AUTOTEST_CMDLINE_TOKEN,
         ));
-        assert!(!cmdline_has_autotest_token(
-            "console=ttyS0 td.autotest=10 td.persist=write"
+        assert!(!cmdline_has_exact_token(
+            "console=ttyS0 td.autotest=10 td.persist=write",
+            AUTOTEST_CMDLINE_TOKEN,
         ));
         let missing = Path::new("/definitely/missing/td-firefox-autotest");
+        assert!(resolve_firefox_autotest_policy_at(
+            "not-firefox",
+            true,
+            missing,
+            missing,
+        )
+        .unwrap()
+        .is_none());
         assert!(resolve_firefox_autotest_policy_at(
             FIREFOX_NAME,
             false,
@@ -3236,6 +3301,55 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn firefox_seccomp_probe_is_selected_only_by_the_complete_audit_plan() {
+        assert_eq!(
+            FIREFOX_AUDIT_CMDLINE_TOKEN,
+            "td.firefox-seccomp-audit=1"
+        );
+        let complete = "console=ttyS0 td.autotest=1 td.firefox-input=1 \
+                        td.firefox-seccomp-audit=1 audit=1 \
+                        audit_backlog_limit=8192 log_buf_len=8M";
+        assert!(firefox_audit_boot(complete));
+        for incomplete in [
+            "console=ttyS0 td.firefox-input=1 td.firefox-seccomp-audit=1 \
+             audit=1 audit_backlog_limit=8192 log_buf_len=8M",
+            "console=ttyS0 td.autotest=1 td.firefox-seccomp-audit=1 audit=1 \
+             audit_backlog_limit=8192 log_buf_len=8M",
+            "console=ttyS0 td.autotest=1 td.firefox-input=1 audit=1 \
+             audit_backlog_limit=8192 log_buf_len=8M",
+            "console=ttyS0 td.autotest=1 td.firefox-input=1 \
+             td.firefox-seccomp-audit=1 \
+             audit_backlog_limit=8192 log_buf_len=8M",
+            "console=ttyS0 td.autotest=1 td.firefox-input=1 \
+             td.firefox-seccomp-audit=1 audit=1 \
+             log_buf_len=8M",
+            "console=ttyS0 td.autotest=1 td.firefox-input=1 \
+             td.firefox-seccomp-audit=1 audit=1 \
+             audit_backlog_limit=8192",
+            "console=ttyS0 td.autotest=1 td.firefox-input=1 \
+             td.firefox-seccomp-audit=10 audit=1 \
+             audit_backlog_limit=8192 log_buf_len=8M",
+            "console=ttyS0 td.autotest=1 td.firefox-input=1 \
+             td.firefox-seccomp-audit=1 audit=10 \
+             audit_backlog_limit=8192 log_buf_len=8M",
+        ] {
+            assert!(!firefox_audit_boot(incomplete), "accepted {incomplete:?}");
+        }
+        let missing = Path::new("/definitely/missing/td-jail-seccomp-probe");
+        assert!(resolve_firefox_seccomp_probe_at("not-firefox", true, missing)
+            .unwrap()
+            .is_none());
+        assert!(resolve_firefox_seccomp_probe_at(FIREFOX_NAME, false, missing)
+            .unwrap()
+            .is_none());
+        assert!(resolve_firefox_seccomp_probe_at(FIREFOX_NAME, true, missing).is_err());
+        assert!(is_root_executable(0, 0, 0o100555));
+        assert!(!is_root_executable(1000, 0, 0o100555));
+        assert!(!is_root_executable(0, 1000, 0o100555));
+        assert!(!is_root_executable(0, 0, 0o100755));
     }
 
     #[test]

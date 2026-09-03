@@ -1081,12 +1081,12 @@ names the private `/home/td` assembled inside the jail. Their value is `deny`,
 home-relative locations, and the keyfile delimiter `=` is not a path character
 in this language. Blanket `host`/`home`, the Flatpak repositories,
 `/.flatpak-info`, and the
-`/app`, `/usr`, `/bin`, `/run`, `/proc`, `/sys`, `/dev`, `/tmp`, `/home`,
-`/root`, `/var/home`, `/var/root`, `/var/run`, `/var/tmp`, `/etc`, `/boot`, and
-td's `/var/lib/td` system state are refused here. The refusal includes a
-recursive grant above one of those fixed trees — `/var/lib` cannot smuggle the
-system Flatpak repository or td system state in, and `~/.local` cannot smuggle
-the per-user repository in.
+`/app`, `/usr`, `/opt`, `/bin`, `/run`, `/proc`, `/sys`, `/dev`, `/tmp`,
+`/home`, `/root`, `/var/home`, `/var/root`, `/var/run`, `/var/tmp`, `/etc`,
+`/boot`, and td's `/var/lib/td` system state are refused here. The refusal
+includes a recursive grant above one of those fixed trees: `/var/lib` cannot
+smuggle the system Flatpak repository or td system state in, and `~/.local`
+cannot smuggle the per-user repository in.
 The package and application-state roots remain configuration, not paths baked
 into this context-free parser. The rung-6 spec preserves these typed grants;
 rung 9's immutable-base mount plan accepts no caller paths. Rung 12b now
@@ -1678,11 +1678,17 @@ prompt, physically types `Welcome`, and waits until td-term reports the exact
 rendered target cells in the live viewport. It selects those cells,
 waits until their highlighted frame is visible, then waits for the seven-byte
 core-selection marker. It injects `Control+L` into Firefox and waits for a
-privileged browser-chrome focus acknowledgement before injecting `Control+V`;
-the final privileged observation accepts one through four events from that
-command to tolerate bounded TCG repeat. If the first command boundary exposes
-only empty paste data while leaving the selected URL unchanged, the guest
-emits one exact retry gate and the host may inject `Control+V` once more.
+privileged browser-chrome focus acknowledgement before injecting `Control+V`.
+After either of the first two clipboard-stage sessions fails, the guest emits
+its ordered exact retry gate. The host consumes that gate only while it is
+still awaiting URL-bar arm and may then inject one additional physical
+`Control+L`; a third failed session is terminal. Connection, protocol, parser,
+or later-stage failures therefore cannot be mistaken for successful URL-bar
+focus. The final privileged observation accepts
+one through four events from the paste command to tolerate bounded TCG repeat.
+If the first paste-command boundary exposes only empty paste data while leaving
+the selected URL unchanged, the guest emits one exact paste-retry gate and the
+host may inject `Control+V` once more.
 Across both bounded commands, every nonempty event must carry exact `Welcome`
 text and no other text is accepted. Firefox may expose empty event data while
 its default action asynchronously consumes the Wayland transfer, so the URL
@@ -2806,10 +2812,15 @@ on a load-bearing bind is fatal, never degraded:
     PR_CAP_AMBIENT_IS_SET -- capget does NOT return the ambient set, so it
     is the one that needs its own question
 17  PR_SET_NO_NEW_PRIVS, then PR_GET_NO_NEW_PRIVS readback
-18  seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog)
+18  seccomp(SECCOMP_SET_MODE_FILTER, flags, &prog), where flags is zero
+    except for the dedicated Firefox seccomp-audit proof variant's compiled
+    SECCOMP_FILTER_FLAG_LOG value
 19  READBACK: /proc/self/status says NoNewPrivs: 1 and Seccomp: 2,
     or stage 2 refuses to spawn anything
-20  spawn argv; wait4(-1) as the namespace's reaper until the direct entry
+20  spawn argv (the seccomp-audit proof variant starts its fixed helper
+    trampoline, which issues the blocked calls and execs the authenticated
+    Firefox entry in place); wait4(-1) as the namespace's reaper until the
+    direct entry
     exits; preserve that status; kill(-1, SIGTERM), poll/reap for at most two
     seconds, then repeatedly kill(-1, SIGKILL) while polling/reaping for at
     most two more seconds; if PID 1 still has not observed ECHILD, fail and
@@ -2967,9 +2978,9 @@ mount order. The current rung does not read a mutable per-user override; that
 lifecycle remains pending.
 
 **Refused, deliberately stricter than upstream:** `filesystem=host`,
-`filesystem=home`, `/`, `/usr`, `/bin`, `/app`, `/run`, `/proc`, `/sys`,
-`/tmp`, `/home`, `/root`, `/var/home`, `/var/root`, `/var/run`, `/var/tmp`,
-`/etc`, `/boot`, `/.flatpak-info`, the flatpak repo itself, td's
+`filesystem=home`, `/`, `/usr`, `/opt`, `/bin`, `/app`, `/run`, `/proc`,
+`/sys`, `/tmp`, `/home`, `/root`, `/var/home`, `/var/root`, `/var/run`,
+`/var/tmp`, `/etc`, `/boot`, `/.flatpak-info`, the flatpak repo itself, td's
 `/var/lib/td` system state, socket paths, and device trees. The configured
 package and application-state roots are also refused after source resolution,
 whatever their spelling. An app that genuinely needs blanket home access gets
@@ -2996,8 +3007,8 @@ rule would also refuse legitimate different-device mounts below the home. The
 shipped backing-volume reservation refuses the alias.
 Every source and target is preflighted before any `:create` mutation, then
 revalidated afterward. Targets in the fresh root are checked component by
-component and may not replace or overlap `/app`, `/usr`, `/run`, `/proc`,
-`/sys`, `/dev`, `/tmp`, `/var/tmp`, `/etc`, `/boot`, `/.flatpak-info`,
+component and may not replace or overlap `/app`, `/usr`, `/opt`, `/run`,
+`/proc`, `/sys`, `/dev`, `/tmp`, `/var/tmp`, `/etc`, `/boot`, `/.flatpak-info`,
 `/oldroot`, `/root-write-probe`, the private-home root, or its fixed config,
 cache, data and local-state mounts. Directory grants are recursive binds.
 Every mount at or below a granted target is enumerated from mountinfo and
@@ -3118,7 +3129,7 @@ direction. `seccomp_data` offsets are pinned constants (`nr`@0,
 word, which is correct for every rule above by construction — and for the
 two ioctls the truncation *is* the point.
 
-**Testing a filter you cannot test by reading**, in three layers:
+**Testing a filter you cannot test by reading**, in four layers:
 
 1. A ~120-line cBPF **interpreter** (test fixture, not shipped) executes
    the exact compiled array against synthetic `seccomp_data` for every
@@ -3144,6 +3155,51 @@ two ioctls the truncation *is* the point.
    because layer 1 proves the program and layer 2 proves *a* kernel
    loaded it — only the target kernel proves the pinned config supports
    every piece.
+4. A dedicated variant of the Firefox physical-input boot, selected by the
+   private `td.firefox-seccomp-audit=1` token only alongside autotest, physical
+   input, kernel audit, backlog, and log-buffer tokens, briefly binds that same
+   non-shipped helper into the jail as an executable. It installs the ordinary
+   outer application filter with `SECCOMP_FILTER_FLAG_LOG`, runs the 17 blocked
+   calls under the installed filter, and `execve`s Firefox in the same process.
+   Every helper record except the deliberately forked x32-kill probe must carry
+   the exact main-process pid independently read before and after the soak. The
+   process-token lookup admits only the token-bearing process whose current
+   procfs status proves the installed no-new-privileges seccomp sandbox. The
+   main-process token additionally requires a namespace PID greater than 1,
+   so the namespace-init td-jail stage carrying the same application argv
+   cannot substitute.
+   The x32 record must carry a distinct child pid.
+   Only that complete variant enables kernel audit and raises its backlog;
+   every other QEMU proof boot passes `audit=0`, because the compiled but
+   nominally disabled audit subsystem can still print unconditional
+   seccomp-kill records if it is initialized. The HDA-authoritative
+   physical-input boot and ordinary application filters retain flags zero.
+   The audit variant reserves an 8 MiB kernel log, disables printk rate
+   limiting, and keeps notice-level audit records in that ring while
+   suppressing them on the emulated serial console. Warnings remain visible.
+   Kernel audit work measurably perturbs QEMU's HDA timing under TCG even with
+   that serial suppression, so the audit variant repeats the complete real
+   input workload and five-minute soak with the host-silent audio backend; the
+   preceding audit-off physical-input boot remains the waveform authority. A
+   root-only helper queues distinct begin and end seccomp records through the
+   same kernel audit path, and the unit waits for the end record after the
+   workload. The parser therefore sees every earlier queued record before
+   accepting the interval.
+   It admits at most 32 MiB of rendered `dmesg`, 4,096 audit records, and 4,096
+   bytes per line. A `/dev/kmsg` overrun or a drain that reaches that byte
+   ceiling becomes an explicit refused incomplete-record marker. It also
+   rejects audit loss/suppression anywhere in the bounded snapshot, including
+   a direct loss notice printed before the asynchronously queued begin record,
+   plus malformed records, a uid other than 1000, and every syscall/action
+   class outside the compiled deny roster. The target kernel pins both i386
+   emulation and the x32 ABI off, so a compatibility-ABI record is impossible
+   and is refused rather than interpreted against an incomplete roster. Linux omits
+   `SECCOMP_RET_DATA` from the audit action, so the C helper proves each exact
+   returned errno while this parser proves the logged action class. All 17
+   expected records must appear, including three records for ioctl and the x32
+   kill; only the helper's behavioral check distinguishes the three ioctl
+   arguments. Rostered denials made later by Firefox may appear; an unrostered
+   denial cannot pass.
 
 Plus negative tests: omitting `NO_NEW_PRIVS` must make installation fail,
 and a corrupted-jump or wrong-length program must be refused before
@@ -3253,7 +3309,8 @@ The quoted block is the completed target mirrored by the implemented roster in
 > readback in step 16 that had no way to observe what it asserted was
 > the one about the set that survives an `exec`. `PR_SET_SECCOMP` is
 > still deliberately absent), `seccomp(2)` with
-> ONE pinned operation (`SECCOMP_SET_MODE_FILTER`=1, flags 0), `wait4(2)`
+> ONE pinned operation (`SECCOMP_SET_MODE_FILTER`=1, flags selected only from
+> `{0, SECCOMP_FILTER_FLAG_LOG=2}` by the proof plan), `wait4(2)`
 > and `kill(2)` for the reaper, `prlimit64(2)` for §P's per-process
 > backstop — which is here because `std` exposes NO rlimit API at all,
 > and because setting only the soft limit is a bound the application may
@@ -6627,10 +6684,14 @@ and image commits — showing:
    marker waits for the highlighted frame before the host injects the copy
    chord; it then waits for `TD-TERM-CLIPBOARD-READY bytes=7` evidence before
    returning focus to Firefox. Separate bounded content sessions arm and
-   acknowledge that physical refocus. After `Control+L`, one continuous
-   browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the
-   URL bar reports focused with its complete prior value selected, stays live
-   while that gate admits physical `Control+V`, and emits
+   acknowledge that physical refocus. After `Control+L`, bounded focus
+   sessions may fail at most twice and publish ordered exact retry markers.
+   The host consumes them only while awaiting URL-bar arm, injecting at most
+   two additional physical `Control+L` chords; a third failed session is
+   terminal. One continuous browser-chrome session then emits
+   `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its
+   complete prior value selected, stays live while that gate admits physical
+   `Control+V`, and emits
    `TD-FIREFOX-CLIPBOARD-OK` only when every nonempty event carries exact
    `Welcome` text and the URL bar contains one or more exact copies, bounded
    above by all paste events and below by events exposing exact data. This
@@ -6638,10 +6699,11 @@ and image commits — showing:
    an empty `DataTransfer`. One guest-acknowledged retry is permitted only
    when the first command boundary exposes one through four empty events and
    leaves the selected URL unchanged; the two commands and at most eight total
-   events are hard bounds, and any other nonempty text is fatal. Each command ends with a
-   separate Shift tap, and the chrome listener must observe that ordered keyup
-   before classifying its batch; no sleep substitutes for that boundary. td-term
-   independently emits `TD-TERM-CLIPBOARD-SENT bytes=7` only after writing
+   events are hard bounds, and any other nonempty text is fatal. Each command
+   ends with a separate Shift tap, and the chrome listener must observe that
+   ordered keyup before classifying its batch; no sleep substitutes for that
+   boundary. td-term independently emits
+   `TD-TERM-CLIPBOARD-SENT bytes=7` only after writing
    that exact proof payload to Firefox's supplied endpoint; closing the
    endpoint then delimits the transfer. Together these records prove the
    compositor's cross-client offer, Firefox's MIME receive and the supplied
@@ -6702,7 +6764,8 @@ and image commits — showing:
     root-owned unit waits for a private staging record; that record is not one
     the greeter accepts. The unit records Firefox's exact application-instance,
     main-process pid, and revalidated procfs start time for the `--marionette`
-    token. A fresh authenticated bus connection records the broker GUID and
+    token after requiring that process's installed no-new-privileges seccomp
+    sandbox. A fresh authenticated bus connection records the broker GUID and
     enumerates the exact sorted set of unique connections whose broker-derived
     credentials carry `td.AppId="firefox"`, including each kernel pid. This
     identifies Firefox without assuming that its versioned remote-control bus
@@ -6728,19 +6791,25 @@ and image commits — showing:
     validations, ten-second schedule, five-minute floor, and cleanup without
     adding five minutes to the ordinary test suite. The real TCG system boot
     remains the end-to-end timing and connection authority;
-11. blocked syscall probes still blocked in the outer app process, and
-    **zero seccomp denials for syscalls the application actually needs**
-    — which is the only false-hit test a deny list admits. An earlier
-    wording asked for "zero EPERMs for syscalls outside the roster",
-    which is vacuous: in a deny list everything outside the roster is
-    permitted, so it cannot be denied and the check could never fail.
-    A deny list's false hits are syscalls wrongly *inside* it, and they
-    surface as the application failing, so the observation that means
-    something is the trace: every denial recorded during the run is
-    matched against the roster and each one must be a syscall the roster
-    intends to refuse. The roster's *misses* — dangerous syscalls left
-    out — are invisible to this and are what §C's argued-row-by-row
-    construction and td's kernel config are for;
+11. **blocked syscall probes still blocked in the outer app process, with no
+    unrostered denial — LANDED.** A dedicated physical-input proof variant
+    compiles audit into the target kernel and enables it only for this run. The
+    helper described in §C executes all 17 blocked calls after td-jail installs
+    its ordinary outer filter, then replaces itself with Firefox without
+    changing pid or filter. The final root-owned unit queues an end barrier
+    through the audit path after the complete physical-input workload and
+    five-minute soak, then accepts only the bounded closed interval and exact
+    `TD-FIREFOX-SECCOMP-OK probes=17` result described there. This proves the
+    probes are blocked in the real outer application process and that every
+    audited non-allow decision during the workload belongs to the compiled
+    roster. An earlier wording asked for "zero EPERMs for syscalls outside the
+    roster", which is vacuous: a deny list permits those calls. A false hit is
+    instead a call wrongly placed *inside* the roster; audit cannot distinguish
+    that policy mistake from an intended denial. Firefox completing the real
+    workload is therefore the complementary liveness evidence, not a claim
+    that audit can infer application intent. Roster misses remain invisible to
+    this proof and are covered by §C's row-by-row construction and kernel
+    configuration;
 12. `kill -KILL` of stage 1 reaping the whole instance — **LANDED**, as
     td-jail's `--probe-kill-reaps`, on the unprivileged health leg beside
     the transition probe, and like that one it runs on every boot rather
@@ -6780,7 +6849,7 @@ and image commits — showing:
     is the opposite end of the lifecycle. Proving it needs a jailed instance
     with a cgroup a probe may kill, which the single-application rule
     denies;
-13. **audio PLAYING — LANDED.** The physical-input boot's first trusted
+13. **audio PLAYING — LANDED.** The audit-off physical-input boot's first trusted
     Firefox key starts exactly one 440 Hz Web Audio oscillator, schedules 1.2
     seconds at quarter gain followed by 500 ms at 0.001 gain on its exact 48 kHz
     audio clock, and records completion and closure before the input probe
@@ -6888,13 +6957,14 @@ Each row is one landing or a small family, leaving the tree green.
 | 27a | **Firefox HTTPS/NSS image proof — LANDED**; the source-built LibreSSL command supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The all-interface LibreSSL test listener is supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
 | 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
 | 27c | **Firefox physical-input image proof — LANDED**; the first system boot uses a bounded private QMP controller, the already enumerated virtio tablet, and the PC machine's PS/2 keyboard, while staged Firefox content/chrome probes and a compositor-owned cursor marker independently attest the semantic results. The handshake proves typing, pointer motion, scrolling, native right-click menu opening, outside-click dismissal, and a painted Firefox cursor without sleeps or manual observation. The test page retains the authenticated magenta/lime framebuffer sentinel and adds only a fixed focused input, scroll extent, and cursor style | the supported Firefox path accepts real emulated input end to end; rung 27d extends the same handshake across clipboard paste |
-| 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and injects `Control+L`. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two commands plus eight total events are hard bounds. A separate Shift tap ends each command, and Firefox must observe its ordered keyup before classifying the batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |
+| 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and injects `Control+L`. The first two failed clipboard-stage sessions publish ordered exact retry markers. The host consumes them only while awaiting URL-bar arm and injects at most two additional physical `Control+L` chords; a third failure is terminal. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second paste command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two paste commands plus eight total events are hard bounds. A separate Shift tap ends each paste command, and Firefox must observe its ordered keyup before classifying its batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |
 | 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input-stage record follows the download and FileChooser markers, so neither a synthetic DOM click nor a stale file can pass; rung 27j owns final greeter completion | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
 | 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content exposes a full-viewport focus control and a trusted physical click focuses the browser. A fresh bounded read-only probe validates that persistent click record and current focus, then the host sends physical `Control+O` to invoke Firefox's native Open File command without a DOM picker call or synthetic assignment. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter to select the file. Firefox must then load the exact granted `file:` URL as plain text with the fixture's exact contents before the private input-stage record. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
 | 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The deterministic system oracle remains NIC-less; public reachability is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
 | 27h | **Firefox Web Audio image proof — LANDED**; the deterministic audit-off physical-input boot uses its first trusted key to start one 440 Hz oscillator in Firefox, schedules 1.2 seconds at quarter gain plus a 500 ms 0.001-gain tail on the same audio clock, then closes the context after the oscillator ends and a bounded downstream-drain interval. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, its 50 ms working target against a larger HDA ring, the built-in test loopback taking card 0 ahead of HDA, and TCG audio-clock progress that can outrun the frames cubeb delivers to HDA. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. The negotiated working target is raised to at least the selected device ring plus one transfer period, retaining bounded software refill headroom behind the initially primed ring. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep continuous client frames contiguous instead of starting HDA on an empty period; moving the last private-queue frame into a live device ring is not an underflow; each stream rearms only if the shared playhead reaches its exhausted accepted endpoint before a refill extends it. `TRIGGER`, `DRAIN`, bounded shutdown, an initial completed prebuffer gate, a below-period target watermark, or an explicit zero prebuffer may release a complete shorter tail. The scheduled sub-oracle-floor tail and delayed close keep cubeb alive past the bounded downstream queues; that guest schedule is not evidence, and the host WAV duration and waveform checks remain authoritative. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 512 MiB bound and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, 900–1300 ms duration, peak and per-channel AC energy, no internal below-floor run over 64 frames, the median of each channel's overlapping 100 ms-window zero-crossing estimates inside 435–445 Hz, and both channels' mean correlation of at least 0.85 with one shared-frequency sine over those windows. No channel may have more than seven sub-0.9 windows or two contiguous transient runs. Window-local phase therefore tolerates the measured bounded HDA startup and recovery regions; half-window overlap makes repeated boundary-aligned phase resets cross too many measured windows or runs, so the combined checks reject silence, noise, an intermittent signal or an unrelated tone. The authoritative exact-tree TCG run measured 1,174 ms active at fitted 440.00 Hz, 440.08/440.08 Hz median zero-crossing estimates, 5,792.4/5,792.4 AC RMS, 0.9990/0.9990 mean correlation, and no sub-0.9 transient window or run in either channel. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a long quiet interval, repeated phase resets, a short tone, an overlong tone and low or high off-band frequencies, accept bounded phase-reset and clock-stretch fixtures, pin the exact float conversion, accounting, refill-before-endpoint continuity, device-ring-plus-period target floor, prebuffer/start continuity, mixed HDA/loopback selection and audio-clock tail, and pin the exact QEMU argv including comma-safe capture paths. The dedicated seccomp-audit variant repeats the real input/soak workload against a host-silent backend; other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
 | 27i | **unsupported portal discovery proof — LANDED**; the live uid-1000 portal client asks the version property and `GetAll` for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`, calls one real entry member on each, and accepts only complete exact error replies from the activated service's unique sender. Live introspection must omit every interface, and QEMU requires a distinct trusted service-prefixed marker after the whole sequence | unsupported capture, remote-control, camera, secret, and print capabilities fail closed rather than appearing to succeed |
 | 27j | **Firefox five-minute connection soak — LANDED**; one Marionette session alternates 31 exact guest-local HTTPS navigations at ten-second boundaries through at least 300 seconds. Before/after equality pins Firefox's application instance, pid and procfs start time; the bus GUID plus its exact broker-authenticated Firefox connection/pid set; and the compositor generation. Its live-latched readiness answer separately proves the publishing Wayland client did not depart. Only the final unit can publish the greeter's completion, and QEMU requires its exact soak line | browser, bus and compositor connections survive a bounded real navigation workload without manual observation |
+| 27k | **Firefox outer-seccomp denial audit — LANDED**; a dedicated physical-input variant alone enables the target kernel audit path and asks the standard outer filter to log non-allow decisions without changing their actions. A root-owned, executable-only bind of the existing non-shipped helper makes all 17 blocked calls under that installed filter, then replaces itself with Firefox in the same pid. After the full input workload and five-minute soak, a bounded root parser requires every helper denial, rejects loss, suppression, malformed ABI/uid/action data and any unrostered denial, and emits one exact host-required result. The variant retains all real input, browser, bus and compositor continuity evidence but uses the host-silent audio backend because kernel audit work measurably perturbs the separate TCG HDA waveform oracle | the shipped Firefox path proves its outer deny filter blocks the rostered probes while completing its real workload without an unrostered denial |
 | 28 | the remaining §H proof run to green; `AGENTS.md` trust-zone section; **all four** application-path `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
 

@@ -13,6 +13,7 @@ const MAX_ACTIVE_SCAN: usize = 256;
 const MAX_PROCESS_TOKEN_BYTES: usize = 64;
 const MAX_PROCESS_CMDLINE_BYTES: u64 = 64 * 1024;
 const MAX_PROCESS_STATUS_BYTES: u64 = 64 * 1024;
+const FIREFOX_MAIN_PROCESS_TOKEN: &str = "--marionette";
 const MAX_FIREFOX_CHILDREN: usize = 256;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `ESRCH`. Named because `std` gives it no `ErrorKind`, so the only way to
@@ -326,6 +327,23 @@ fn revalidated_process_starttime(path: &Path, initial: u64) -> Option<u64> {
     (observed == initial).then_some(observed)
 }
 
+fn token_process_sandbox(
+    command: &[u8],
+    token: &str,
+    status: &str,
+    require_application_child: bool,
+) -> Option<ProcessSandbox> {
+    if !command_has_token(command, token) {
+        return None;
+    }
+    let sandbox = sandbox_status(status).ok()?;
+    (sandbox.no_new_privileges == 1
+        && sandbox.seccomp == 2
+        && sandbox.filters > 0
+        && (!require_application_child || sandbox.namespace_pid > 1))
+        .then_some(sandbox)
+}
+
 pub(crate) fn probe_process_token(
     application: &str,
     token: &str,
@@ -357,7 +375,17 @@ pub(crate) fn probe_process_token(
         let Some(command) = read_process_command(&proc_directory.join("cmdline")) else {
             continue;
         };
-        if !command_has_token(&command, token) {
+        let Ok(status) = read_bounded(&proc_directory.join("status")) else {
+            continue;
+        };
+        if token_process_sandbox(
+            &command,
+            token,
+            &status,
+            token == FIREFOX_MAIN_PROCESS_TOKEN,
+        )
+        .is_none()
+        {
             continue;
         }
         let membership_path = format!("/proc/{pid}/cgroup");
@@ -1132,6 +1160,56 @@ mod tests {
         assert_eq!(decimal_status_field(status, "Seccomp_filters:").unwrap(), 3);
         assert!(namespace_process_id(&status.replace("NSpid:", "Pidns:")).is_err());
         assert!(decimal_status_field(status, "NoNewPriv:").is_err());
+    }
+
+    #[test]
+    fn process_token_requires_the_installed_application_sandbox() {
+        let status =
+            "Name:\tfirefox\nNSpid:\t8123\t17\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n";
+        let command = b"/app/lib/firefox/firefox\0--marionette\0";
+        assert_eq!(
+            token_process_sandbox(command, "--marionette", status, true)
+                .unwrap()
+                .namespace_pid,
+            17
+        );
+        assert!(token_process_sandbox(command, "-contentproc", status, false).is_none());
+        assert!(token_process_sandbox(
+            command,
+            "--marionette",
+            &status.replace("NSpid:\t8123\t17", "NSpid:\t8123\t1"),
+            true,
+        )
+        .is_none());
+        assert!(token_process_sandbox(
+            command,
+            "--marionette",
+            &status.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
+            true,
+        )
+        .is_none());
+        assert!(token_process_sandbox(
+            command,
+            "--marionette",
+            &status.replace("Seccomp:\t2", "Seccomp:\t0"),
+            true,
+        )
+        .is_none());
+        assert!(token_process_sandbox(
+            command,
+            "--marionette",
+            &status.replace("Seccomp_filters:\t3", "Seccomp_filters:\t0"),
+            true,
+        )
+        .is_none());
+
+        let content_command = b"/app/lib/firefox/firefox-bin\0-contentproc\0";
+        assert_eq!(
+            token_process_sandbox(content_command, "-contentproc", status, false)
+                .unwrap()
+                .namespace_pid,
+            17
+        );
     }
 
     #[test]

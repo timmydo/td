@@ -596,7 +596,7 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// clamped 760-second health loop and the diagnostic margin. The tenth Codex block
 /// restored the former 70-second host margin at that revision. Even after the
 /// profiler predecessor grew from 315 to 915 seconds, this path totals 2155 seconds
-/// and retains 590 seconds below the value here; the longer Firefox path below still
+/// and retains 620 seconds below the value here; the longer Firefox path below still
 /// governs the final host ceiling.
 ///
 /// The Firefox download proof adds a 40-second one-shot browser boundary and a
@@ -607,8 +607,9 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// one further 60-second boundary to the network oracle's evidence transaction.
 /// The continuity soak adds its bounded 360-second Marionette session and a
 /// 30-second allowance for the four identity probes and local process reads
-/// which bracket it.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2745;
+/// which bracket it. The dedicated seccomp-audit variant adds its bounded
+/// 30-second end-barrier drain after that same soak.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2775;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// The source release identities and exact `--version` output shared by the
@@ -991,6 +992,10 @@ pub const TD_FIREFOX_INPUT_MARKER: &str = "TD-FIREFOX-INPUT-OK";
 /// and its Wayland connection survive 31 exact local HTTPS navigations over at
 /// least five minutes.
 pub const TD_FIREFOX_SOAK_MARKER: &str = "TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31";
+/// Emitted by the root audit oracle after the ordered end barrier proves every
+/// outer-filter denial in the interval arrived and matches the compiled roster.
+pub const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str =
+    "TD-FIREFOX-SECCOMP-OK probes=17";
 pub const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = "TD-TERM-CLIPBOARD-FOCUS-READY serial=";
 pub const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = "TD-TERM-CLIPBOARD-TARGET-READY ";
 pub const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str = "TD-TERM-CLIPBOARD-SELECTION-READY bytes=7";
@@ -998,6 +1003,14 @@ pub const TD_TERM_CLIPBOARD_MARKER: &str = "TD-TERM-CLIPBOARD-READY bytes=7";
 pub const TD_TERM_CLIPBOARD_SENT_MARKER: &str = "TD-TERM-CLIPBOARD-SENT bytes=7";
 pub const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED";
+/// Requests the first bounded physical Control+L retry after Firefox reports
+/// that the initial location-bar focus command did not settle.
+pub const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER: &str =
+    "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-1";
+/// Requests the final bounded physical Control+L retry before the input unit
+/// fails closed.
+pub const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER: &str =
+    "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-2";
 pub const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str = "TD-FIREFOX-CLIPBOARD-RETRY-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_MARKER: &str = "TD-FIREFOX-CLIPBOARD-OK";
@@ -1011,6 +1024,18 @@ pub const TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER: &str =
 pub const TD_FIREFOX_FILE_CHOOSER_MARKER: &str = "TD-FIREFOX-FILE-CHOOSER-OK bytes=23";
 /// Selects the physical-input oracle without changing an ordinary Firefox boot.
 pub const FIREFOX_INPUT_CMDLINE_TOKEN: &str = "td.firefox-input=1";
+/// Selects the dedicated Firefox outer-filter audit variant.
+pub const FIREFOX_AUDIT_CMDLINE_TOKEN: &str =
+    "td.firefox-seccomp-audit=1";
+/// Enables the kernel audit subsystem for that closed proof variant.
+pub const KERNEL_AUDIT_CMDLINE_TOKEN: &str = "audit=1";
+/// Prevents even unconditional seccomp-kill records on non-audit QEMU boots.
+pub const KERNEL_AUDIT_OFF_CMDLINE_TOKEN: &str = "audit=0";
+/// Keeps the proof's bounded 4096-record interval below the kernel queue.
+pub const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str =
+    "audit_backlog_limit=8192";
+/// Keeps the proof-only kernel ring above its bounded audit interval.
+pub const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str = "log_buf_len=8M";
 /// Must match the compositor's independently pinned client-cursor dimension cap.
 pub const FIREFOX_CURSOR_MAX_DIMENSION: usize = 256;
 

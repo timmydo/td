@@ -90,6 +90,10 @@ pub(crate) fn source() -> &'static str {
 #define TD_X32_SYSCALL_BIT 0x40000000UL
 #define TD_PROBE_MARKER "TD-JAIL-SECCOMP-PROBE-OK"
 #define TD_ALLOW_INHERITED_CONFINEMENT "--allow-inherited-confinement"
+#define TD_PROBE_INHERITED_EXEC "--probe-inherited-exec"
+#define TD_AUDIT_MARKER "--audit-marker"
+#define TD_AUDIT_BEGIN "begin"
+#define TD_AUDIT_END "end"
 #define TD_HOST_SKIP_MARKER "TD-JAIL-SECCOMP-PROBE-HOST-SKIPPED"
 
 struct td_filter_header {
@@ -102,6 +106,7 @@ _Static_assert(sizeof(struct sock_filter) == 8, "unexpected sock_filter ABI");
 _Static_assert(sizeof(struct sock_fprog) == 16, "unexpected sock_fprog ABI");
 _Static_assert(sizeof(struct td_filter_header) == 8, "unexpected filter header ABI");
 _Static_assert(SECCOMP_SET_MODE_FILTER == 1, "unexpected seccomp operation");
+_Static_assert(SECCOMP_FILTER_FLAG_LOG == 2, "unexpected seccomp log flag");
 _Static_assert(PR_SET_NO_NEW_PRIVS == 38, "unexpected no-new-privileges operation");
 _Static_assert(PR_GET_NO_NEW_PRIVS == 39, "unexpected no-new-privileges readback");
 _Static_assert(CLONE_NEWUSER == 0x10000000, "unexpected clone namespace flag");
@@ -235,6 +240,119 @@ static int expect_x32_kill(void) {
     return 0;
 }
 
+static int install_audit_marker_filter(uint32_t action) {
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, action),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog program = {
+        .len = sizeof(filter) / sizeof(filter[0]),
+        .filter = filter,
+    };
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+        return fail("set no-new-privileges for audit marker");
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                SECCOMP_FILTER_FLAG_LOG, &program) != 0)
+        return fail("install audit marker filter");
+    return 0;
+}
+
+static int emit_audit_marker(int begin) {
+    pid_t child;
+    int status;
+    if (getuid() != 0 || getgid() != 0)
+        return fail("audit marker requires root");
+    if (begin) {
+        child = fork();
+        if (child < 0)
+            return fail("fork audit begin marker");
+        if (child == 0) {
+            if (install_audit_marker_filter(SECCOMP_RET_KILL_PROCESS) != 0)
+                _exit(1);
+            syscall(SYS_getppid);
+            _exit(1);
+        }
+        if (waitpid(child, &status, 0) != child || !WIFSIGNALED(status) ||
+            WTERMSIG(status) != SIGSYS)
+            return fail("audit begin marker was not killed with SIGSYS");
+        return 0;
+    }
+    if (install_audit_marker_filter(SECCOMP_RET_ERRNO | EPERM) != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_getppid), EPERM, "audit end marker") != 0)
+        return 1;
+    return 0;
+}
+
+static int prove_denied_calls(void) {
+    errno = 0;
+    if (expect_errno(syscall(SYS_personality, READ_IMPLIES_EXEC), EPERM,
+                     "personality mutation") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(socket(AF_PACKET, SOCK_RAW, 0), EAFNOSUPPORT,
+                     "disallowed socket family") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0), EPERM,
+                     "ptrace") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_ioctl, -1, TIOCSTI, 0), EPERM,
+                     "TIOCSTI") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_ioctl, -1, (1UL << 32) | TIOCSTI, 0), EPERM,
+                     "TIOCSTI high-bit bypass") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_ioctl, -1, TIOCLINUX, 0), EPERM,
+                     "TIOCLINUX") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_clone, CLONE_NEWUSER | SIGCHLD, 0, 0, 0, 0),
+                     EPERM, "clone user namespace") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(TD_SYS_CLONE3, 0, 0), ENOSYS,
+                     "clone3 fallback") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_unshare, 0), EPERM, "unshare") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_mount, 0, 0, 0, 0, 0), EPERM,
+                     "mount") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(TD_SYS_OPEN_TREE_ATTR, 0, 0, 0, 0), EPERM,
+                     "open_tree_attr") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_userfaultfd, 0), EPERM,
+                     "userfaultfd") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_bpf, 0, 0, 0), EPERM, "bpf") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(TD_SYS_IO_URING_SETUP, 1, 0), EPERM,
+                     "io_uring_setup") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(TD_SYS_PIDFD_GETFD, -1, -1, 0), EPERM,
+                     "pidfd_getfd") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_process_vm_readv, getpid(), 0, 0, 0, 0, 0),
+                     EPERM, "process_vm_readv") != 0)
+        return 1;
+    return expect_x32_kill();
+}
+
 int main(int argc, char **argv) {
     struct sock_fprog program;
     const char *filter_path;
@@ -243,6 +361,19 @@ int main(int argc, char **argv) {
     int initial_seccomp;
     int fd;
     long result;
+    if (argc == 3 && strcmp(argv[1], TD_AUDIT_MARKER) == 0) {
+        if (strcmp(argv[2], TD_AUDIT_BEGIN) == 0)
+            return emit_audit_marker(1);
+        if (strcmp(argv[2], TD_AUDIT_END) == 0)
+            return emit_audit_marker(0);
+        return fail("audit marker must be begin or end");
+    }
+    if (argc >= 3 && strcmp(argv[1], TD_PROBE_INHERITED_EXEC) == 0) {
+        if (require_status() != 0 || prove_denied_calls() != 0)
+            return 1;
+        execv(argv[2], &argv[2]);
+        return fail("exec application after inherited filter probe");
+    }
     if (argc == 3 && strcmp(argv[1], TD_ALLOW_INHERITED_CONFINEMENT) == 0) {
         allow_inherited_confinement = 1;
         filter_path = argv[2];
@@ -283,73 +414,78 @@ int main(int argc, char **argv) {
     result = syscall(SYS_personality, 0xffffffffUL);
     if (result < 0)
         return fail("personality query was denied");
-    errno = 0;
-    if (expect_errno(syscall(SYS_personality, READ_IMPLIES_EXEC), EPERM,
-                     "personality mutation") != 0)
-        return 1;
-
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return fail("allowed AF_UNIX socket");
     close(fd);
-    errno = 0;
-    if (expect_errno(socket(AF_PACKET, SOCK_RAW, 0), EAFNOSUPPORT,
-                     "disallowed socket family") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0), EPERM,
-                     "ptrace") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_ioctl, -1, TIOCSTI, 0), EPERM, "TIOCSTI") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_ioctl, -1, (1UL << 32) | TIOCSTI, 0), EPERM,
-                     "TIOCSTI high-bit bypass") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_ioctl, -1, TIOCLINUX, 0), EPERM, "TIOCLINUX") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_clone, CLONE_NEWUSER | SIGCHLD, 0, 0, 0, 0), EPERM,
-                     "clone user namespace") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(TD_SYS_CLONE3, 0, 0), ENOSYS, "clone3 fallback") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_unshare, 0), EPERM, "unshare") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_mount, 0, 0, 0, 0, 0), EPERM, "mount") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(TD_SYS_OPEN_TREE_ATTR, 0, 0, 0, 0), EPERM,
-                     "open_tree_attr") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_userfaultfd, 0), EPERM, "userfaultfd") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_bpf, 0, 0, 0), EPERM, "bpf") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(TD_SYS_IO_URING_SETUP, 1, 0), EPERM,
-                     "io_uring_setup") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(TD_SYS_PIDFD_GETFD, -1, -1, 0), EPERM,
-                     "pidfd_getfd") != 0)
-        return 1;
-    errno = 0;
-    if (expect_errno(syscall(SYS_process_vm_readv, getpid(), 0, 0, 0, 0, 0), EPERM,
-                     "process_vm_readv") != 0)
-        return 1;
-    if (expect_x32_kill() != 0)
+    if (prove_denied_calls() != 0)
         return 1;
 
     puts(TD_PROBE_MARKER);
     return 0;
 }
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inherited_mode_probes_the_installed_filter_then_execs_in_place() {
+        let source = source();
+        assert_eq!(source.matches("#define TD_PROBE_INHERITED_EXEC").count(), 1);
+        assert_eq!(source.matches("execv(argv[2], &argv[2]);").count(), 1);
+        assert_eq!(source.matches("prove_denied_calls() != 0").count(), 2);
+        let inherited = source.find("if (argc >= 3").unwrap();
+        let status = source[inherited..].find("require_status()").unwrap();
+        let probes = source[inherited..].find("prove_denied_calls()").unwrap();
+        let exec = source[inherited..].find("execv(argv[2], &argv[2]);").unwrap();
+        assert!(status < probes && probes < exec);
+        let denied = source
+            .split_once("static int prove_denied_calls(void)")
+            .unwrap()
+            .1
+            .split_once("int main(")
+            .unwrap()
+            .0;
+        for call in [
+            "SYS_personality",
+            "AF_PACKET",
+            "SYS_ptrace",
+            "TIOCSTI",
+            "TIOCLINUX",
+            "SYS_clone",
+            "TD_SYS_CLONE3",
+            "SYS_unshare",
+            "SYS_mount",
+            "TD_SYS_OPEN_TREE_ATTR",
+            "SYS_userfaultfd",
+            "SYS_bpf",
+            "TD_SYS_IO_URING_SETUP",
+            "TD_SYS_PIDFD_GETFD",
+            "SYS_process_vm_readv",
+            "expect_x32_kill",
+        ] {
+            assert!(denied.contains(call), "inherited probe omitted {call}");
+        }
+        assert_eq!(denied.matches("SYS_ioctl").count(), 3);
+        assert_eq!(denied.matches("expect_errno(").count(), 16);
+        assert_eq!(denied.matches("return expect_x32_kill();").count(), 1);
+    }
+
+    #[test]
+    fn audit_barriers_use_one_logged_syscall_with_distinct_actions() {
+        let source = source();
+        for required in [
+            "SECCOMP_FILTER_FLAG_LOG, &program",
+            "SYS_getppid",
+            "install_audit_marker_filter(SECCOMP_RET_KILL_PROCESS)",
+            "install_audit_marker_filter(SECCOMP_RET_ERRNO | EPERM)",
+            "getuid() != 0 || getgid() != 0",
+        ] {
+            assert!(source.contains(required), "audit barrier omitted {required}");
+        }
+        assert_eq!(source.matches("return emit_audit_marker(").count(), 2);
+    }
 }

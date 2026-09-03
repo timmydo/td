@@ -145,6 +145,7 @@ const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_
 const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MENU_MARKER;
 const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MARKER;
 const TD_FIREFOX_SOAK_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SOAK_MARKER;
+const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SECCOMP_AUDIT_MARKER;
 const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
 const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_TARGET_PREFIX;
 const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str =
@@ -155,6 +156,10 @@ const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER;
 const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER;
+const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER;
+const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER;
 const TD_FIREFOX_CLIPBOARD_ARMED_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_CLIPBOARD_ARMED_MARKER;
 const TD_FIREFOX_CLIPBOARD_RETRY_MARKER: &str =
@@ -175,6 +180,14 @@ const TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER: &str = "TD-PORTAL-FILE-CHOOSER-CO
 const TD_APPLICATION_CURSOR_PREFIX: &str =
     "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
 const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_INPUT_CMDLINE_TOKEN;
+const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_AUDIT_CMDLINE_TOKEN;
+const KERNEL_AUDIT_CMDLINE_TOKEN: &str = td_recipe::ladder::KERNEL_AUDIT_CMDLINE_TOKEN;
+const KERNEL_AUDIT_OFF_CMDLINE_TOKEN: &str =
+    td_recipe::ladder::KERNEL_AUDIT_OFF_CMDLINE_TOKEN;
+const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str =
+    td_recipe::ladder::FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN;
+const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str =
+    td_recipe::ladder::FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN;
 const TD_PROFILER_ATTRIBUTION_MARKER: &str = td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
@@ -417,6 +430,7 @@ struct ConsoleEvidence {
     td_firefox_input_menu: bool,
     td_firefox_input: bool,
     td_firefox_soak: bool,
+    td_firefox_seccomp_audit: bool,
     td_term_clipboard_focus: Option<u32>,
     td_term_clipboard_target: Option<TerminalClipboardTarget>,
     td_term_clipboard_selection: bool,
@@ -424,6 +438,8 @@ struct ConsoleEvidence {
     td_term_clipboard_sent: bool,
     td_firefox_clipboard_refocus_armed: bool,
     td_firefox_clipboard_window_armed: bool,
+    td_firefox_clipboard_focus_retry_one: bool,
+    td_firefox_clipboard_focus_retry_two: bool,
     td_firefox_clipboard_armed: bool,
     td_firefox_clipboard_retry: bool,
     td_firefox_clipboard: bool,
@@ -545,6 +561,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             user_net: false,
             audio: false,
             physical_input: false,
+            capture_firefox_audio: false,
         },
         runner.scratch_dir(),
     )?;
@@ -600,6 +617,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             user_net: false,
             audio: false,
             physical_input: false,
+            capture_firefox_audio: false,
         },
         runner.scratch_dir(),
     )?;
@@ -666,7 +684,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         "{AUTOTEST_CMDLINE_TOKEN} {wait_token} {PERSIST_WRITE_CMDLINE_TOKEN} \
          {DEPLOY_INSTALL_CMDLINE_TOKEN}"
     );
-    let first_tokens = format!("{install_tokens} {FIREFOX_INPUT_CMDLINE_TOKEN}");
+    let first_tokens = firefox_input_boot_tokens(&install_tokens);
     let first = boot_system_once(
         &qemu,
         &bzimage,
@@ -683,7 +701,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         "install",
         SelectionExpectation::Current,
     )?;
-    validate_firefox_input(&first)?;
+    validate_firefox_input(&first, true)?;
+    validate_firefox_seccomp_audit(&first, false)?;
     require_selected_deployment(
         &first,
         td_boot_protocol::SELECTED_CURRENT_MARKER,
@@ -731,6 +750,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             user_net: false,
             audio: false,
             physical_input: false,
+            capture_firefox_audio: false,
         },
         runner.scratch_dir(),
     )?;
@@ -842,6 +862,49 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             "the acknowledged candidate retained boot-attempt state after success. \
              Last serial output:\n{}",
             tail(&stable_candidate.console, 80)
+        ));
+    }
+    check_persistent_volume(&btrfs, &volume)?;
+
+    // Audit is deliberately a second physical-input boot. Kernel audit work
+    // measurably perturbs the independent HDA waveform under TCG even when
+    // notice records stay off the serial console. The first boot above is the
+    // audio authority; this boot repeats the real Firefox workload with the
+    // exact LOG filter and audit oracle, but uses the host-silent audio backend.
+    let audit_tokens = firefox_audit_boot_tokens(&healthy_tokens);
+    let seccomp_audit = boot_system_once(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        &volume,
+        &audit_tokens,
+        "outer-seccomp audit",
+        runner.scratch_dir(),
+    )?;
+    validate_system_boot(
+        &seccomp_audit,
+        PersistencePhase::Read,
+        IdentityPhase::Reused,
+        "outer-seccomp audit",
+        SelectionExpectation::Current,
+    )?;
+    validate_firefox_input(&seccomp_audit, false)?;
+    validate_firefox_seccomp_audit(&seccomp_audit, true)?;
+    require_selected_deployment(
+        &seccomp_audit,
+        td_boot_protocol::SELECTED_CURRENT_MARKER,
+        &fixture.alternate_id,
+        "outer-seccomp audit boot",
+    )?;
+    require_same_identity(&first, &seccomp_audit, "install", "outer-seccomp audit")?;
+    if seccomp_audit.evidence.attempt_consumed
+        || seccomp_audit.evidence.attempts_exhausted
+        || seccomp_audit.evidence.bookkeeping_unavailable
+    {
+        return Err(format!(
+            "the outer-seccomp audit changed settled deployment state. \
+             Last serial output:\n{}",
+            tail(&seccomp_audit.console, 80)
         ));
     }
     check_persistent_volume(&btrfs, &volume)?;
@@ -1151,6 +1214,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          then held one Marionette session for five minutes across 31 exact HTTPS \
          navigations while the Firefox process, D-Bus connections, and Wayland connection \
          remained unchanged ({TD_FIREFOX_SOAK_MARKER}), \
+         repeated that full physical workload in a dedicated audit boot and accepted only \
+         the compiled outer-denial roster ({TD_FIREFOX_SECCOMP_AUDIT_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1162,6 +1227,42 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     Ok(())
 }
 
+fn firefox_input_boot_tokens(prefix: &str) -> String {
+    format!("{prefix} {FIREFOX_INPUT_CMDLINE_TOKEN}")
+}
+
+fn firefox_audit_boot_tokens(prefix: &str) -> String {
+    format!(
+        "{} {FIREFOX_AUDIT_CMDLINE_TOKEN} {KERNEL_AUDIT_CMDLINE_TOKEN} \
+         {FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN} \
+         {FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN}",
+        firefox_input_boot_tokens(prefix)
+    )
+}
+
+fn firefox_boot_oracles(tokens: &str) -> (bool, bool) {
+    let physical_input = tokens
+        .split_ascii_whitespace()
+        .any(|token| token == FIREFOX_INPUT_CMDLINE_TOKEN);
+    let audit = tokens
+        .split_ascii_whitespace()
+        .any(|token| token == FIREFOX_AUDIT_CMDLINE_TOKEN);
+    (physical_input, physical_input && !audit)
+}
+
+fn kernel_append(extra: &str) -> String {
+    let audit_enabled = extra
+        .split_ascii_whitespace()
+        .any(|token| token == KERNEL_AUDIT_CMDLINE_TOKEN);
+    let base = "console=ttyS0 panic=-1 rdinit=/init";
+    match (audit_enabled, extra.is_empty()) {
+        (true, false) => format!("{base} {extra}"),
+        (true, true) => base.to_string(),
+        (false, false) => format!("{base} {KERNEL_AUDIT_OFF_CMDLINE_TOKEN} {extra}"),
+        (false, true) => format!("{base} {KERNEL_AUDIT_OFF_CMDLINE_TOKEN}"),
+    }
+}
+
 fn boot_system_once(
     qemu: &str,
     bzimage: &Path,
@@ -1171,6 +1272,7 @@ fn boot_system_once(
     label: &str,
     scratch: &Path,
 ) -> Result<BootResult, String> {
+    let (physical_input, capture_firefox_audio) = firefox_boot_oracles(tokens);
     let result = boot(
         qemu,
         bzimage,
@@ -1186,9 +1288,8 @@ fn boot_system_once(
             extra_append: tokens,
             user_net: false,
             audio: true,
-            physical_input: tokens
-                .split_ascii_whitespace()
-                .any(|token| token == FIREFOX_INPUT_CMDLINE_TOKEN),
+            physical_input,
+            capture_firefox_audio,
         },
         scratch,
     )?;
@@ -1224,6 +1325,7 @@ fn boot_failed_target_once(
             user_net: false,
             audio: true,
             physical_input: false,
+            capture_firefox_audio: false,
         },
         scratch,
     )?;
@@ -1273,7 +1375,7 @@ fn validate_failed_target_boot(result: &BootResult, ordinal: &str) -> Result<(),
     Ok(())
 }
 
-fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
+fn validate_firefox_input(result: &BootResult, expect_audio_capture: bool) -> Result<(), String> {
     for (seen, marker, description) in [
         (
             result.evidence.td_firefox_input_armed,
@@ -1393,8 +1495,8 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
             ));
         }
     }
-    match &result.firefox_audio {
-        FirefoxAudioCapture::Verified(audio) => {
+    match (&result.firefox_audio, expect_audio_capture) {
+        (FirefoxAudioCapture::Verified(audio), true) => {
             println!(
                 "   [firefox-audio] {FIREFOX_AUDIO_RATE} Hz stereo, {} ms active, peak {}, fitted {:.2} Hz, zero-crossing {:.2}/{:.2} Hz, AC RMS {:.1}/{:.1}, mean window correlations {:.4}/{:.4}, transient windows {}/{} in {}/{} runs",
                 audio.active_ms,
@@ -1412,20 +1514,43 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
                 audio.right_transient_runs
             );
         }
-        FirefoxAudioCapture::Invalid(error) => {
+        (FirefoxAudioCapture::Invalid(error), _) => {
             return Err(format!(
                 "Firefox completed its trusted WebAudio stimulus but the QEMU WAV oracle failed: \
                  {error}. Last serial output:\n{}",
                 tail(&result.console, 80)
             ));
         }
-        FirefoxAudioCapture::NotRequested => {
+        (FirefoxAudioCapture::NotRequested, true) => {
             return Err(
                 "the Firefox physical-input boot did not request its QEMU WAV capture".to_string(),
             );
         }
+        (FirefoxAudioCapture::NotRequested, false) => {}
+        (FirefoxAudioCapture::Verified(_), false) => {
+            return Err(
+                "the Firefox audit boot unexpectedly requested the HDA WAV oracle".to_string(),
+            );
+        }
     }
     Ok(())
+}
+
+fn validate_firefox_seccomp_audit(result: &BootResult, expected: bool) -> Result<(), String> {
+    if result.evidence.td_firefox_seccomp_audit == expected {
+        return Ok(());
+    }
+    let description = if expected {
+        "Firefox outer seccomp denials did not match the compiled roster"
+    } else {
+        "the HDA-authoritative Firefox boot unexpectedly enabled seccomp audit"
+    };
+    Err(format!(
+        "{description}; console evidence {:?} had unexpected presence. \
+         Last serial output:\n{}",
+        TD_FIREFOX_SECCOMP_AUDIT_MARKER,
+        tail(&result.console, 80)
+    ))
 }
 
 fn require_action_marker(
@@ -2205,6 +2330,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             user_net: true,
             audio: true,
             physical_input: false,
+            capture_firefox_audio: false,
         },
         runner.scratch_dir(),
     )?;
@@ -2346,6 +2472,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             user_net: false,
             audio: false,
             physical_input: false,
+            capture_firefox_audio: false,
         },
         runner.scratch_dir(),
     )?;
@@ -3494,6 +3621,10 @@ struct BootPlan<'a> {
     /// Ask the bounded QMP controller to inject the first boot's staged
     /// Firefox keyboard, tablet, wheel, and outside-click sequence.
     physical_input: bool,
+    /// Record and validate the physical Firefox WebAudio path. The separate
+    /// audit workload remains real physical input but uses the host-silent
+    /// backend so audit scheduling cannot invalidate the HDA timing oracle.
+    capture_firefox_audio: bool,
 }
 
 /// Boot `bzImage` + `initramfs` under qemu per `plan` (see `BootPlan`), capturing ttyS0 to
@@ -3509,6 +3640,11 @@ fn boot(
     scratch_base: &Path,
 ) -> Result<BootResult, String> {
     validate_boot_plan_tokens(plan.extra_append)?;
+    if plan.capture_firefox_audio && (!plan.audio || !plan.physical_input) {
+        return Err(
+            "Firefox audio capture requires both system audio and physical input".to_string(),
+        );
+    }
     // Per-invocation console/diag dir created EXCLUSIVELY (mkdir, not mkdir -p)
     // with 0700 under the runner's private scratch base — NOT world-writable
     // `/tmp`. Exclusive creation means this process is the sole creator (a stale or
@@ -3522,8 +3658,9 @@ fn boot(
     let _scratch = Scratch { dir: dir.clone() };
     let console_path = dir.join("console.log");
     let diag_path = dir.join("diag.log");
-    let firefox_audio_path =
-        (plan.audio && plan.physical_input).then(|| dir.join("firefox-audio.wav"));
+    let firefox_audio_path = plan
+        .capture_firefox_audio
+        .then(|| dir.join("firefox-audio.wav"));
     let timeout = boot_timeout();
     let firefox_audio_ceiling = firefox_audio_path
         .as_ref()
@@ -3574,16 +3711,10 @@ fn boot(
     let qmp_path = qmp_scratch
         .as_ref()
         .map(|scratch| scratch.dir.join("qmp.sock"));
-    // Base cmdline: ttyS0 console, panic-reboots (=> qemu exits), and rdinit=/init runs
-    // the stage-1 (or single-stage) init from the initramfs. `extra_append`, when set,
-    // appends caller cmdline (qemu-boot-system's autotest token that makes the greeter
-    // self-exit) after a single space.
-    let base_append = "console=ttyS0 panic=-1 rdinit=/init";
-    let append = if plan.extra_append.is_empty() {
-        base_append.to_string()
-    } else {
-        format!("{base_append} {}", plan.extra_append)
-    };
+    // Every non-audit oracle disables audit initialization explicitly. Merely
+    // leaving the kernel's audit state off still permits unconditional seccomp
+    // kill records to reach printk when CONFIG_AUDIT is compiled in.
+    let append = kernel_append(plan.extra_append);
     let mut cmd = Command::new(qemu);
     cmd.args(["-M", "pc", "-accel", "tcg", "-m", plan.mem, "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
@@ -4464,6 +4595,27 @@ fn validate_boot_plan_tokens(extra_append: &str) -> Result<(), String> {
              {FIREFOX_INPUT_CMDLINE_TOKEN} local-fixture input plan are mutually exclusive"
         ));
     }
+    let autotest = has(AUTOTEST_CMDLINE_TOKEN);
+    let input = has(FIREFOX_INPUT_CMDLINE_TOKEN);
+    let audit = has(FIREFOX_AUDIT_CMDLINE_TOKEN);
+    let kernel_audit = has(KERNEL_AUDIT_CMDLINE_TOKEN);
+    let kernel_audit_off = has(KERNEL_AUDIT_OFF_CMDLINE_TOKEN);
+    let backlog = has(FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN);
+    let log_buffer = has(FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN);
+    if audit != kernel_audit
+        || audit != backlog
+        || audit != log_buffer
+        || (kernel_audit && kernel_audit_off)
+        || (audit && (!autotest || !input))
+    {
+        return Err(format!(
+            "{FIREFOX_AUDIT_CMDLINE_TOKEN}, \
+             {KERNEL_AUDIT_CMDLINE_TOKEN}, \
+             {FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN}, and \
+             {FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN} must be complete and require \
+             {AUTOTEST_CMDLINE_TOKEN} plus {FIREFOX_INPUT_CMDLINE_TOKEN}"
+        ));
+    }
     Ok(())
 }
 
@@ -4643,6 +4795,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_TERM_CLIPBOARD_SENT_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER),
+        exact_line_window(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_ARMED_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_RETRY_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_MARKER),
@@ -4656,6 +4810,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
             .saturating_add(256),
         exact_line_window(TD_FIREFOX_FILE_CHOOSER_MARKER),
         exact_line_window(TD_FIREFOX_SOAK_MARKER),
+        exact_line_window(TD_FIREFOX_SECCOMP_AUDIT_MARKER),
         TD_APPLICATION_CURSOR_PREFIX.len().saturating_add(32),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
@@ -4947,6 +5102,18 @@ fn latch_console_evidence_from(
         starts_at_stream_boundary,
     );
     latch_line_marker(
+        &mut evidence.td_firefox_clipboard_focus_retry_one,
+        buf,
+        TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_clipboard_focus_retry_two,
+        buf,
+        TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
         &mut evidence.td_firefox_clipboard_armed,
         buf,
         TD_FIREFOX_CLIPBOARD_ARMED_MARKER.as_bytes(),
@@ -5009,6 +5176,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_firefox_soak,
         buf,
         TD_FIREFOX_SOAK_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_seccomp_audit,
+        buf,
+        TD_FIREFOX_SECCOMP_AUDIT_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_application_cursor(
@@ -5623,6 +5796,7 @@ struct PhysicalInputController {
     qmp: Option<Qmp>,
     phase: PhysicalInputPhase,
     terminal_focus_floor: Option<u32>,
+    clipboard_focus_retries: u8,
 }
 
 impl PhysicalInputController {
@@ -5632,6 +5806,7 @@ impl PhysicalInputController {
             qmp: None,
             phase: PhysicalInputPhase::Arm,
             terminal_focus_floor: None,
+            clipboard_focus_retries: 0,
         }
     }
 
@@ -5726,6 +5901,28 @@ impl PhysicalInputController {
                 .ok_or_else(|| "QMP controller disappeared before Firefox URL focus".to_string())?;
             qmp.key_chord_until(&["ctrl", "l"], deadline)?;
             self.phase = PhysicalInputPhase::FirefoxPasteArm;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxPasteArm
+            && evidence.td_firefox_clipboard_focus_retry_one
+            && self.clipboard_focus_retries == 0
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self.qmp.as_mut().ok_or_else(|| {
+                "QMP controller disappeared before Firefox URL-focus retry".to_string()
+            })?;
+            qmp.key_chord_until(&["ctrl", "l"], deadline)?;
+            self.clipboard_focus_retries = 1;
+        }
+        if self.phase == PhysicalInputPhase::FirefoxPasteArm
+            && evidence.td_firefox_clipboard_focus_retry_two
+            && self.clipboard_focus_retries == 1
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self.qmp.as_mut().ok_or_else(|| {
+                "QMP controller disappeared before Firefox URL-focus retry".to_string()
+            })?;
+            qmp.key_chord_until(&["ctrl", "l"], deadline)?;
+            self.clipboard_focus_retries = 2;
         }
         if self.phase == PhysicalInputPhase::FirefoxPasteArm && evidence.td_firefox_clipboard_armed
         {
@@ -7069,7 +7266,7 @@ mod tests {
             stream.write_all(b"{\"QMP\":{\"version\":{}}}\r\n").unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut commands = Vec::new();
-            for _ in 0..35 {
+            for _ in 0..37 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 commands.push(line.trim_end().to_string());
@@ -7114,6 +7311,14 @@ mod tests {
         evidence.td_firefox_clipboard_window_armed = true;
         controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteArm);
+        evidence.td_firefox_clipboard_focus_retry_one = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteArm);
+        assert_eq!(controller.clipboard_focus_retries, 1);
+        evidence.td_firefox_clipboard_focus_retry_two = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteArm);
+        assert_eq!(controller.clipboard_focus_retries, 2);
         evidence.td_firefox_clipboard_armed = true;
         controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPaste);
@@ -7222,24 +7427,36 @@ mod tests {
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":24576"));
         assert!(commands.get(22).unwrap().contains("\"button\":\"left\""));
-        assert!(commands.get(23).unwrap().contains("\"data\":\"l\""));
-        assert!(commands.get(24).unwrap().contains("\"data\":\"v\""));
-        assert!(commands.get(25).unwrap().contains("\"data\":\"shift\""));
+        for index in 23..=25 {
+            assert_eq!(
+                commands.get(index).map(String::as_str),
+                Some(concat!(
+                    r#"{"execute":"input-send-event","arguments":{"events":["#,
+                    r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"ctrl"}}},"#,
+                    r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"l"}}},"#,
+                    r#"{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"l"}}},"#,
+                    r#"{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"ctrl"}}}"#,
+                    "]}}"
+                ))
+            );
+        }
         assert!(commands.get(26).unwrap().contains("\"data\":\"v\""));
         assert!(commands.get(27).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(28).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(28).unwrap().contains("\"data\":\"v\""));
         assert!(commands.get(29).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(30).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(31).unwrap().contains("\"data\":\"shift\""));
         assert!(commands
-            .get(30)
+            .get(32)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":24576"));
         assert!(commands
-            .get(30)
+            .get(32)
             .unwrap()
             .contains("\"axis\":\"y\",\"value\":16384"));
-        assert!(commands.get(31).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(33).unwrap().contains("\"button\":\"left\""));
         assert_eq!(
-            commands.get(32).map(String::as_str),
+            commands.get(34).map(String::as_str),
             Some(concat!(
                 r#"{"execute":"input-send-event","arguments":{"events":["#,
                 r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"ctrl"}}},"#,
@@ -7250,14 +7467,14 @@ mod tests {
             ))
         );
         assert!(commands
-            .get(33)
+            .get(35)
             .unwrap()
             .contains("\"execute\":\"screendump\""));
         assert!(commands
-            .get(33)
+            .get(35)
             .unwrap()
             .contains("portal-file-chooser.ppm"));
-        assert!(commands.get(34).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(36).unwrap().contains("\"data\":\"ret\""));
         let source = include_str!("qemu_boot.rs");
         assert!(
             source.contains("qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;")
@@ -8139,7 +8356,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 73] {
+    fn all_console_markers() -> [&'static str; 76] {
         [
             MARKER,
             EROFS_MARKER,
@@ -8199,6 +8416,8 @@ mod tests {
             TD_TERM_CLIPBOARD_SENT_MARKER,
             TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER,
             TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER,
+            TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
+            TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
             TD_FIREFOX_CLIPBOARD_ARMED_MARKER,
             TD_FIREFOX_CLIPBOARD_RETRY_MARKER,
             TD_FIREFOX_CLIPBOARD_MARKER,
@@ -8210,6 +8429,7 @@ mod tests {
             TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX,
             TD_FIREFOX_FILE_CHOOSER_MARKER,
             TD_FIREFOX_SOAK_MARKER,
+            TD_FIREFOX_SECCOMP_AUDIT_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
@@ -8288,6 +8508,26 @@ mod tests {
             let mut rejected = ConsoleEvidence::default();
             latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");
             assert!(!rejected.td_firefox_soak, "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn firefox_seccomp_audit_evidence_requires_one_exact_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_SECCOMP_AUDIT_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_seccomp_audit);
+        for invalid in [
+            format!("noise {TD_FIREFOX_SECCOMP_AUDIT_MARKER}\n"),
+            format!("\n{TD_FIREFOX_SECCOMP_AUDIT_MARKER} trailing\n"),
+            "\nTD-FIREFOX-SECCOMP-OK probes=16\n".to_string(),
+        ] {
+            let mut rejected = ConsoleEvidence::default();
+            latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");
+            assert!(!rejected.td_firefox_seccomp_audit, "accepted {invalid:?}");
         }
     }
 
@@ -8739,6 +8979,32 @@ mod tests {
 
         latch_console_evidence(
             &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_clipboard_focus_retry_one);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_clipboard_focus_retry_one);
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER} failed\n").as_bytes(),
+            b"target",
+        );
+        assert!(!evidence.td_firefox_clipboard_focus_retry_two);
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_clipboard_focus_retry_two);
+
+        latch_console_evidence(
+            &mut evidence,
             format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_ARMED_MARKER} failed\n").as_bytes(),
             b"target",
         );
@@ -8813,14 +9079,64 @@ mod tests {
     }
 
     #[test]
-    fn public_navigation_and_local_input_plans_are_mutually_exclusive() {
+    fn public_navigation_input_and_audit_plans_are_closed() {
         assert!(validate_boot_plan_tokens(NETTEST_CMDLINE_TOKEN).is_ok());
-        assert!(validate_boot_plan_tokens(FIREFOX_INPUT_CMDLINE_TOKEN).is_ok());
+        let input = FIREFOX_INPUT_CMDLINE_TOKEN.to_string();
+        assert!(validate_boot_plan_tokens(&input).is_ok());
+        let audit = firefox_audit_boot_tokens(AUTOTEST_CMDLINE_TOKEN);
+        assert!(validate_boot_plan_tokens(&audit).is_ok());
+        let audit_without_autotest = firefox_audit_boot_tokens("");
+        assert!(validate_boot_plan_tokens(&audit_without_autotest).is_err());
+        for incomplete in [
+            FIREFOX_AUDIT_CMDLINE_TOKEN,
+            KERNEL_AUDIT_CMDLINE_TOKEN,
+            FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN,
+            FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN,
+        ] {
+            assert!(validate_boot_plan_tokens(incomplete).is_err());
+        }
         assert!(validate_boot_plan_tokens(&format!(
             "{AUTOTEST_CMDLINE_TOKEN} {NETTEST_CMDLINE_TOKEN} \
-             {FIREFOX_INPUT_CMDLINE_TOKEN}"
+             {audit}"
         ))
         .is_err());
+        assert!(validate_boot_plan_tokens(&format!(
+            "{audit} {KERNEL_AUDIT_OFF_CMDLINE_TOKEN}"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn physical_input_and_audit_boot_tokens_are_separate_and_exact() {
+        assert_eq!(
+            firefox_input_boot_tokens("td.autotest=1"),
+            "td.autotest=1 td.firefox-input=1"
+        );
+        assert_eq!(
+            firefox_audit_boot_tokens("td.autotest=1"),
+            "td.autotest=1 td.firefox-input=1 td.firefox-seccomp-audit=1 \
+             audit=1 \
+             audit_backlog_limit=8192 log_buf_len=8M"
+        );
+        assert_eq!(firefox_boot_oracles("td.autotest=1"), (false, false));
+        assert_eq!(
+            firefox_boot_oracles(&firefox_input_boot_tokens("td.autotest=1")),
+            (true, true)
+        );
+        assert_eq!(
+            firefox_boot_oracles(&firefox_audit_boot_tokens("td.autotest=1")),
+            (true, false)
+        );
+        assert_eq!(
+            kernel_append("td.autotest=1"),
+            "console=ttyS0 panic=-1 rdinit=/init audit=0 td.autotest=1"
+        );
+        assert_eq!(
+            kernel_append(&firefox_audit_boot_tokens("td.autotest=1")),
+            "console=ttyS0 panic=-1 rdinit=/init td.autotest=1 \
+             td.firefox-input=1 td.firefox-seccomp-audit=1 audit=1 \
+             audit_backlog_limit=8192 log_buf_len=8M"
+        );
     }
 
     #[test]

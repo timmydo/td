@@ -421,6 +421,14 @@ pub fn recipe() -> Recipe {
     //    so nothing would notice if a future NET rework took it away. The pin makes an
     //    incidental symbol a declared one.
     //
+    //    AUDIT is compiled in for one test-only use: the physical-input Firefox
+    //    audit boot passes audit=1 and asks td-jail's outer filter to log its
+    //    denials. Every other QEMU oracle passes audit=0, which prevents audit
+    //    initialization and even unconditional seccomp-kill printk records.
+    //    AUDITSYSCALL is the x86-derived child that gives those records syscall
+    //    identity; like SECCOMP_FILTER it has no independent policy choice and is
+    //    guarded only after olddefconfig resolves the dependency graph.
+    //
     //    IPC_NS is NOT enabled and is guarded OFF. It is `default y` on `SYSVIPC ||
     //    POSIX_MQUEUE`, both off, so it cannot be enabled alone — and the same
     //    olddefconfig mechanism that handed us NET_NS would hand us an IPC namespace
@@ -535,6 +543,9 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_PID_NS[ =]/d; \
                   /^#? *CONFIG_UTS_NS[ =]/d; \
                   /^#? *CONFIG_NET_NS[ =]/d; \
+                  /^#? *CONFIG_AUDIT[ =]/d; \
+                  /^#? *CONFIG_IA32_EMULATION[ =]/d; \
+                  /^#? *CONFIG_X86_X32_ABI[ =]/d; \
                   /^#? *CONFIG_SECCOMP[ =]/d; \
                   /^#? *CONFIG_INOTIFY_USER[ =]/d; \
                   /^#? *CONFIG_CGROUPS[ =]/d; \
@@ -627,6 +638,9 @@ pub fn recipe() -> Recipe {
                    'CONFIG_PID_NS=y' \
                    'CONFIG_UTS_NS=y' \
                    'CONFIG_NET_NS=y' \
+                   'CONFIG_AUDIT=y' \
+                   '# CONFIG_IA32_EMULATION is not set' \
+                   '# CONFIG_X86_X32_ABI is not set' \
                    'CONFIG_SECCOMP=y' \
                    'CONFIG_INOTIFY_USER=y' \
                    'CONFIG_CGROUPS=y' \
@@ -715,6 +729,10 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_PID_NS=y' .config || { echo 'PID_NS off — a jailed app would see (and could signal) every process on the machine' >&2; exit 1; }; \
                  grep -q '^CONFIG_UTS_NS=y' .config || { echo 'UTS_NS off — a jail could not present its own hostname' >&2; exit 1; }; \
                  grep -q '^CONFIG_NET_NS=y' .config || { echo 'NET_NS off — a jail without shared=network could not be cut off from the network stack' >&2; exit 1; }; \
+                 grep -q '^CONFIG_AUDIT=y' .config || { echo 'AUDIT off — the physical Firefox proof cannot account for outer seccomp denials' >&2; exit 1; }; \
+                 grep -q '^CONFIG_AUDITSYSCALL=y' .config || { echo 'AUDITSYSCALL off — x86 seccomp audit records cannot carry syscall identity' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_IA32_EMULATION is not set$' .config || { echo 'IA32_EMULATION on — the Firefox audit proof has no i386 syscall roster' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_X86_X32_ABI is not set$' .config || { echo 'X86_X32_ABI on — x32 calls could reach an unmodelled compatibility ABI instead of the deliberate kill probe' >&2; exit 1; }; \
                  grep -q '^CONFIG_SECCOMP=y' .config || { echo 'SECCOMP off — seccomp(2) returns ENOSYS, so td-jail ships namespaces with no syscall filter' >&2; exit 1; }; \
                  grep -q '^CONFIG_SECCOMP_FILTER=y' .config || { echo 'SECCOMP_FILTER off — no BPF syscall filtering. It is unprompted (def_bool y on HAVE_ARCH_SECCOMP_FILTER && SECCOMP && NET), so it cannot be pinned: something took SECCOMP or NET away' >&2; exit 1; }; \
                  grep -q '^CONFIG_INOTIFY_USER=y' .config || { echo 'INOTIFY_USER off — GLib file monitoring in a jailed app degrades to polling' >&2; exit 1; }; \
@@ -1003,6 +1021,38 @@ mod tests {
                 "kernel profiler contract omitted {required}"
             );
         }
+    }
+
+    #[test]
+    fn firefox_outer_filter_audit_is_compiled_but_boot_opt_in() {
+        let command_text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for required in [
+            "/^#? *CONFIG_AUDIT[ =]/d",
+            "CONFIG_AUDIT=y",
+            "grep -q '^CONFIG_AUDIT=y' .config",
+            "grep -q '^CONFIG_AUDITSYSCALL=y' .config",
+            "/^#? *CONFIG_IA32_EMULATION[ =]/d",
+            "# CONFIG_IA32_EMULATION is not set",
+            "grep -q '^# CONFIG_IA32_EMULATION is not set$' .config",
+            "/^#? *CONFIG_X86_X32_ABI[ =]/d",
+            "# CONFIG_X86_X32_ABI is not set",
+            "grep -q '^# CONFIG_X86_X32_ABI is not set$' .config",
+        ] {
+            assert!(
+                command_text.contains(required),
+                "kernel Firefox audit contract omitted {required}"
+            );
+        }
+        assert_eq!(command_text.matches("'CONFIG_AUDITSYSCALL=y'").count(), 0);
     }
 
     #[test]

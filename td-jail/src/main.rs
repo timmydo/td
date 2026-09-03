@@ -60,6 +60,9 @@ fn run() -> std::io::Result<()> {
         transition::Mode::FirefoxSupportProbe => transition::probe_firefox_support(),
         transition::Mode::FirefoxNetworkProbe => transition::probe_firefox_network(),
         transition::Mode::FirefoxSoakProbe => transition::probe_firefox_soak(),
+        transition::Mode::FirefoxSeccompAuditProbe { firefox_pid } => {
+            transition::probe_firefox_seccomp_audit(firefox_pid)
+        }
         transition::Mode::FirefoxInputProbe { stage } => {
             transition::probe_firefox_input(stage)
         }
@@ -765,7 +768,13 @@ mod confinement {
         assert!(SYS.contains("std::mem::size_of::<Rlimit64>(), 16"));
         assert!(!shipped_sys.contains("request: usize"));
         assert!(SYS.contains("std::mem::size_of::<IfreqFlags>(), 40"));
-        assert!(SYS.contains("SYS_SECCOMP,\n        SECCOMP_SET_MODE_FILTER,\n        0,"));
+        assert!(SYS.contains("const SECCOMP_FILTER_FLAG_LOG: usize = 2;"));
+        assert!(SYS.contains(
+            "let flags = if log_denials {\n        SECCOMP_FILTER_FLAG_LOG\n    } else {\n        0\n    };"
+        ));
+        assert!(SYS.contains(
+            "SYS_SECCOMP,\n        SECCOMP_SET_MODE_FILTER,\n        flags,\n        std::ptr::from_ref(&program) as usize,\n        0,\n        0,"
+        ));
         assert!(TRANSITION.contains("sys::MS_REC | sys::MS_PRIVATE"));
         let reaper_mount = TRANSITION
             .split_once("fn mount_reaper_probe")
@@ -865,7 +874,9 @@ mod confinement {
         assert!(TRANSITION.contains(".into_raw_fd()"));
         assert!(TRANSITION.contains("require_descriptor_closed(descriptor)?;"));
         assert!(TRANSITION.contains("clear_and_require_empty_capabilities()?;"));
-        assert!(TRANSITION.contains("install_standard_seccomp_filter().map_err(|error|"));
+        assert!(TRANSITION.contains(
+            "install_standard_seccomp_filter(firefox_seccomp_probe).map_err(|error|"
+        ));
         assert!(TRANSITION.contains("probe_pid1_lifecycle()?;"));
         assert_eq!(TRANSITION.matches(".env_clear()").count(), 4);
         assert_eq!(TRANSITION.matches(".envs(").count(), 1);

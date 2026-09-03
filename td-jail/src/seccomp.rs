@@ -11,6 +11,19 @@ const EPERM: u32 = 1;
 const ENOSYS: u32 = 38;
 const EAFNOSUPPORT: u32 = 97;
 
+pub(crate) const FIREFOX_AUDIT_MARKER: &str =
+    "TD-FIREFOX-SECCOMP-OK probes=17";
+pub(crate) const FIREFOX_PROBE_PATH: &str =
+    "/opt/td-firefox-seccomp-probe";
+const FIREFOX_PROBE_EXE: &str = "\"/opt/td-firefox-seccomp-probe\"";
+const FIREFOX_AUDIT_PROBE_EXE: &str =
+    "\"/var/lib/td-test/td-jail-seccomp-probe\"";
+// Must match td-util's dmesg producer; the image source test binds them.
+const DMESG_INCOMPLETE_MARKER: &str = "TD-DMESG-INCOMPLETE";
+const AUDIT_SECCOMP_TYPE: &str = "type=1326";
+const MAX_AUDIT_RECORDS: usize = 4096;
+const MAX_AUDIT_LINE_BYTES: usize = 4096;
+
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
 const BPF_ALU_AND_K: u16 = 0x54;
@@ -24,6 +37,7 @@ const OFFSET_ARG1_LOW: u32 = 24;
 const SYS_IOCTL: u32 = 16;
 const SYS_SOCKET: u32 = 41;
 const SYS_CLONE: u32 = 56;
+const SYS_GETPPID: u32 = 110;
 const SYS_PERSONALITY: u32 = 135;
 const SYS_CLONE3: u32 = 435;
 const CLONE_NEWUSER: u32 = 0x1000_0000;
@@ -31,6 +45,24 @@ const X32_SYSCALL_MASK: u32 = 0xc000_0000;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541c;
+
+const FIREFOX_REQUIRED_AUDIT_SYSCALLS: [(u32, usize); 15] = [
+    (SYS_PERSONALITY, 1),
+    (SYS_SOCKET, 1),
+    (101, 1),
+    (SYS_IOCTL, 3),
+    (SYS_CLONE, 1),
+    (SYS_CLONE3, 1),
+    (272, 1),
+    (165, 1),
+    (467, 1),
+    (323, 1),
+    (321, 1),
+    (425, 1),
+    (438, 1),
+    (310, 1),
+    (X32_SYSCALL_BIT | 1, 1),
+];
 
 const AF_UNIX: u32 = 1;
 const AF_INET: u32 = 2;
@@ -78,8 +110,7 @@ macro_rules! define_filter {
 
 macro_rules! define_policy {
     ($($denied:expr),+ $(,)?) => {
-        #[cfg(test)]
-        const DENIED_SYSCALLS: &[u32] = &[$($denied),+];
+        pub(crate) const DENIED_SYSCALLS: &[u32] = &[$($denied),+];
 
         define_filter!(
             load(OFFSET_ARCH),
@@ -213,6 +244,253 @@ define_policy!(
     467, // open_tree_attr
 );
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuditAction {
+    code: u32,
+    signal: u32,
+}
+
+fn expected_audit_action(syscall: u32) -> Option<AuditAction> {
+    if syscall & X32_SYSCALL_MASK == X32_SYSCALL_BIT {
+        return Some(AuditAction {
+            code: SECCOMP_RET_KILL_PROCESS,
+            signal: 31,
+        });
+    }
+    if syscall == SYS_SOCKET
+        || matches!(syscall, SYS_PERSONALITY | SYS_IOCTL | SYS_CLONE | SYS_CLONE3)
+        || DENIED_SYSCALLS.contains(&syscall)
+    {
+        // Audit records omit SECCOMP_RET_DATA, so the helper proves the exact
+        // errno while the log can prove only the ERRNO action class.
+        Some(AuditAction {
+            code: SECCOMP_RET_ERRNO,
+            signal: 0,
+        })
+    } else {
+        None
+    }
+}
+
+fn audit_field<'a>(line: &'a str, name: &str) -> io::Result<&'a str> {
+    let mut values = line.split_ascii_whitespace().filter_map(|field| {
+        let (key, value) = field.split_once('=')?;
+        (key == name).then_some(value)
+    });
+    let value = values.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("seccomp audit record has no {name}"),
+        )
+    })?;
+    if values.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("seccomp audit record repeats {name}"),
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuditBarrier {
+    Begin,
+    End,
+}
+
+fn audit_barrier(line: &str) -> io::Result<Option<AuditBarrier>> {
+    if !line
+        .split_ascii_whitespace()
+        .any(|field| field == AUDIT_SECCOMP_TYPE)
+    {
+        return Ok(None);
+    }
+    if audit_field(line, "exe")? != FIREFOX_AUDIT_PROBE_EXE {
+        return Ok(None);
+    }
+    if parse_decimal_field(line, "uid")? != 0
+        || parse_decimal_field(line, "syscall")? != SYS_GETPPID
+    {
+        return Ok(None);
+    }
+    let arch = parse_hex_field(line, "arch")?;
+    let compat = parse_decimal_field(line, "compat")?;
+    let signal = parse_decimal_field(line, "sig")?;
+    let code = parse_hex_field(line, "code")?;
+    if arch != AUDIT_ARCH_X86_64 || compat != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Firefox seccomp audit barrier has the wrong ABI",
+        ));
+    }
+    match (code, signal) {
+        (SECCOMP_RET_KILL_PROCESS, 31) => Ok(Some(AuditBarrier::Begin)),
+        (SECCOMP_RET_ERRNO, 0) => Ok(Some(AuditBarrier::End)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Firefox seccomp audit barrier has the wrong action",
+        )),
+    }
+}
+
+fn parse_decimal_field(line: &str, name: &str) -> io::Result<u32> {
+    audit_field(line, name)?.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("seccomp audit record has invalid {name}"),
+        )
+    })
+}
+
+fn parse_hex_field(line: &str, name: &str) -> io::Result<u32> {
+    let value = audit_field(line, name)?;
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    u32::from_str_radix(value, 16).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("seccomp audit record has invalid {name}"),
+        )
+    })
+}
+
+pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32) -> io::Result<usize> {
+    if firefox_pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Firefox seccomp audit expected PID must be nonzero",
+        ));
+    }
+    let mut observed = FIREFOX_REQUIRED_AUDIT_SYSCALLS.map(|_| 0_usize);
+    let mut records = 0_usize;
+    let mut begun = false;
+    let mut ended = false;
+    for line in log.lines() {
+        if line.contains(DMESG_INCOMPLETE_MARKER) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Firefox seccomp audit has an incomplete kernel-log drain",
+            ));
+        }
+        if line.contains("audit_lost=")
+            || line.contains("audit: rate limit exceeded")
+            || (line.contains("audit:") && line.contains("callbacks suppressed"))
+            || (line.contains("kauditd_printk_skb:")
+                && line.contains("callbacks suppressed"))
+            || line.contains("audit: kauditd")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Firefox seccomp audit reports dropped or suppressed kernel records",
+            ));
+        }
+        match audit_barrier(line)? {
+            Some(AuditBarrier::Begin) if !begun && !ended => {
+                begun = true;
+                continue;
+            }
+            Some(AuditBarrier::End) if begun && !ended => {
+                ended = true;
+                continue;
+            }
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Firefox seccomp audit barriers are repeated or out of order",
+                ));
+            }
+            None => {}
+        }
+        if !begun || ended {
+            continue;
+        }
+        if line.len() > MAX_AUDIT_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Firefox seccomp audit line exceeds 4096 bytes",
+            ));
+        }
+        if !line.split_ascii_whitespace().any(|field| field == AUDIT_SECCOMP_TYPE) {
+            continue;
+        }
+        records = records.saturating_add(1);
+        if records > MAX_AUDIT_RECORDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Firefox seccomp audit exceeds 4096 records",
+            ));
+        }
+        let uid = parse_decimal_field(line, "uid")?;
+        let pid = parse_decimal_field(line, "pid")?;
+        let arch = parse_hex_field(line, "arch")?;
+        let syscall = parse_decimal_field(line, "syscall")?;
+        let compat = parse_decimal_field(line, "compat")?;
+        let signal = parse_decimal_field(line, "sig")?;
+        let code = parse_hex_field(line, "code")?;
+        if uid != 1000 || pid == 0 || arch != AUDIT_ARCH_X86_64 || compat != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "seccomp audit record is not an x86-64 uid-1000 Firefox-jail denial",
+            ));
+        }
+        let action = expected_audit_action(syscall).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("seccomp audit denied unrostered syscall {syscall}"),
+            )
+        })?;
+        if action.code != code || action.signal != signal {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "seccomp audit syscall {syscall} used code {code:#x}/signal {signal}, expected {:#x}/{}",
+                    action.code, action.signal
+                ),
+            ));
+        }
+        if audit_field(line, "exe")? == FIREFOX_PROBE_EXE {
+            let x32_child = syscall & X32_SYSCALL_MASK == X32_SYSCALL_BIT;
+            if (!x32_child && pid != firefox_pid) || (x32_child && pid == firefox_pid) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Firefox outer-process probe syscall {syscall} used pid {pid}, \
+                         expected main pid {firefox_pid}{}",
+                        if x32_child { " to differ" } else { "" }
+                    ),
+                ));
+            }
+            for (slot, (wanted_syscall, _)) in
+                FIREFOX_REQUIRED_AUDIT_SYSCALLS.iter().enumerate()
+            {
+                if syscall == *wanted_syscall {
+                    if let Some(count) = observed.get_mut(slot) {
+                        *count = count.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    if !begun || !ended {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Firefox seccomp audit has no complete ordered barrier pair",
+        ));
+    }
+    for (slot, (syscall, minimum)) in
+        FIREFOX_REQUIRED_AUDIT_SYSCALLS.iter().enumerate()
+    {
+        if observed.get(slot).copied().unwrap_or_default() < *minimum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Firefox outer-process probe did not log syscall {syscall} at least {minimum} time(s)"
+                ),
+            ));
+        }
+    }
+    Ok(records)
+}
+
 pub(crate) struct Program<'a> {
     instructions: &'a [SockFilter],
 }
@@ -330,6 +608,13 @@ mod tests {
     #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
     use super::*;
+
+    const FIREFOX_PID: u32 = 7;
+    const X32_CHILD_PID: u32 = 8;
+
+    fn verify_firefox_audit(log: &str) -> io::Result<usize> {
+        super::verify_firefox_audit(log, FIREFOX_PID)
+    }
 
     #[derive(Clone, Copy)]
     struct Data {
@@ -521,5 +806,237 @@ mod tests {
                 "syscall {syscall}"
             );
         }
+    }
+
+    fn audit_line(
+        uid: u32,
+        syscall: u32,
+        code: u32,
+        signal: u32,
+        executable: &str,
+    ) -> String {
+        let pid = if syscall & X32_SYSCALL_MASK == X32_SYSCALL_BIT {
+            X32_CHILD_PID
+        } else {
+            FIREFOX_PID
+        };
+        audit_line_for_pid(uid, pid, syscall, code, signal, executable)
+    }
+
+    fn audit_line_for_pid(
+        uid: u32,
+        pid: u32,
+        syscall: u32,
+        code: u32,
+        signal: u32,
+        executable: &str,
+    ) -> String {
+        format!(
+            "[  12.000] audit: type=1326 audit(1.2:3): auid=4294967295 uid={uid} gid={uid} ses=4294967295 pid={pid} comm=\"probe\" exe=\"{executable}\" sig={signal} arch=c000003e syscall={syscall} compat=0 ip=0x1 code=0x{code:x}\n"
+        )
+    }
+
+    fn barrier(action: AuditBarrier) -> String {
+        let (code, signal) = match action {
+            AuditBarrier::Begin => (SECCOMP_RET_KILL_PROCESS, 31),
+            AuditBarrier::End => (SECCOMP_RET_ERRNO, 0),
+        };
+        audit_line(
+            0,
+            SYS_GETPPID,
+            code,
+            signal,
+            "/var/lib/td-test/td-jail-seccomp-probe",
+        )
+    }
+
+    fn before_end(mut log: String, text: &str) -> String {
+        let end = barrier(AuditBarrier::End);
+        let offset = log.rfind(&end).unwrap();
+        log.insert_str(offset, text);
+        log
+    }
+
+    fn complete_audit() -> String {
+        let mut log = barrier(AuditBarrier::Begin);
+        for (syscall, code, signal) in [
+            (SYS_PERSONALITY, SECCOMP_RET_ERRNO, 0),
+            (SYS_SOCKET, SECCOMP_RET_ERRNO, 0),
+            (101, SECCOMP_RET_ERRNO, 0),
+            (SYS_IOCTL, SECCOMP_RET_ERRNO, 0),
+            (SYS_IOCTL, SECCOMP_RET_ERRNO, 0),
+            (SYS_IOCTL, SECCOMP_RET_ERRNO, 0),
+            (SYS_CLONE, SECCOMP_RET_ERRNO, 0),
+            (SYS_CLONE3, SECCOMP_RET_ERRNO, 0),
+            (272, SECCOMP_RET_ERRNO, 0),
+            (165, SECCOMP_RET_ERRNO, 0),
+            (467, SECCOMP_RET_ERRNO, 0),
+            (323, SECCOMP_RET_ERRNO, 0),
+            (321, SECCOMP_RET_ERRNO, 0),
+            (425, SECCOMP_RET_ERRNO, 0),
+            (438, SECCOMP_RET_ERRNO, 0),
+            (310, SECCOMP_RET_ERRNO, 0),
+            (X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31),
+        ] {
+            log.push_str(&audit_line(1000, syscall, code, signal, FIREFOX_PROBE_PATH));
+        }
+        log.push_str(&barrier(AuditBarrier::End));
+        log
+    }
+
+    #[test]
+    fn firefox_audit_requires_every_outer_probe_and_accepts_rostered_runtime_denials() {
+        assert_eq!(
+            FIREFOX_REQUIRED_AUDIT_SYSCALLS
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<usize>(),
+            17
+        );
+        assert_eq!(
+            FIREFOX_AUDIT_MARKER,
+            format!(
+                "TD-FIREFOX-SECCOMP-OK probes={}",
+                FIREFOX_REQUIRED_AUDIT_SYSCALLS
+                    .iter()
+                    .map(|(_, count)| count)
+                    .sum::<usize>()
+            )
+        );
+        let log = before_end(complete_audit(), &audit_line(
+            1000,
+            SYS_CLONE3,
+            SECCOMP_RET_ERRNO,
+            0,
+            "/app/lib/firefox/firefox",
+        ));
+        assert_eq!(verify_firefox_audit(&log).unwrap(), 18);
+
+        let missing = complete_audit().replacen(
+            &audit_line(1000, 310, SECCOMP_RET_ERRNO, 0, FIREFOX_PROBE_PATH),
+            "",
+            1,
+        );
+        assert!(verify_firefox_audit(&missing).is_err());
+    }
+
+    #[test]
+    fn firefox_audit_refuses_unrostered_malformed_or_lost_records() {
+        let good = complete_audit();
+        assert!(verify_firefox_audit(&good.replacen(
+            &barrier(AuditBarrier::Begin),
+            "",
+            1,
+        ))
+        .is_err());
+        assert!(verify_firefox_audit(&good.replacen(
+            &barrier(AuditBarrier::End),
+            "",
+            1,
+        ))
+        .is_err());
+        assert!(verify_firefox_audit(&before_end(
+            good.clone(),
+            "[  13.0] audit: audit_lost=1\n",
+        ))
+        .is_err());
+        for loss in [
+            "audit: audit_lost=1",
+            "audit: rate limit exceeded",
+            "audit: callbacks suppressed",
+            "kauditd_printk_skb: 17 callbacks suppressed",
+            "audit: kauditd hold queue overflow",
+        ] {
+            assert!(
+                verify_firefox_audit(&format!("{loss}\n{good}")).is_err(),
+                "pre-barrier loss indicator passed: {loss}"
+            );
+        }
+        assert!(verify_firefox_audit(&format!(
+            "net_ratelimit: callbacks suppressed\n{good}"
+        ))
+        .is_ok());
+        assert!(verify_firefox_audit(&good.replace(
+            "comm=\"probe\"",
+            "comm=\"kauditd\""
+        ))
+        .is_ok());
+        assert!(verify_firefox_audit(&before_end(
+            good.clone(),
+            &audit_line(
+                1000,
+                400,
+                SECCOMP_RET_ERRNO,
+                0,
+                "/app/lib/firefox/firefox",
+            ),
+        ))
+        .is_err());
+        assert!(verify_firefox_audit(&good.replacen("uid=1000", "uid=0", 1)).is_err());
+        assert!(verify_firefox_audit(&good.replacen(
+            &audit_line(
+                1000,
+                SYS_PERSONALITY,
+                SECCOMP_RET_ERRNO,
+                0,
+                FIREFOX_PROBE_PATH,
+            ),
+            &audit_line_for_pid(
+                1000,
+                9,
+                SYS_PERSONALITY,
+                SECCOMP_RET_ERRNO,
+                0,
+                FIREFOX_PROBE_PATH,
+            ),
+            1,
+        ))
+        .is_err());
+        assert!(verify_firefox_audit(&good.replacen(
+            &audit_line(
+                1000,
+                X32_SYSCALL_BIT | 1,
+                SECCOMP_RET_KILL_PROCESS,
+                31,
+                FIREFOX_PROBE_PATH,
+            ),
+            &audit_line_for_pid(
+                1000,
+                FIREFOX_PID,
+                X32_SYSCALL_BIT | 1,
+                SECCOMP_RET_KILL_PROCESS,
+                31,
+                FIREFOX_PROBE_PATH,
+            ),
+            1,
+        ))
+        .is_err());
+        assert!(verify_firefox_audit(&good.replacen("compat=0", "compat=1", 1)).is_err());
+        assert!(verify_firefox_audit(&good.replacen("code=0x50000", "code=0x30000", 1)).is_err());
+        assert!(verify_firefox_audit(&good.replacen(" sig=0 ", " sig=0 sig=0 ", 1)).is_err());
+        assert!(verify_firefox_audit(&format!("{good}{}", barrier(AuditBarrier::Begin))).is_err());
+        assert!(verify_firefox_audit(&format!("{DMESG_INCOMPLETE_MARKER}\n{good}")).is_err());
+    }
+
+    #[test]
+    fn firefox_audit_line_and_record_ceilings_are_exact() {
+        let good = complete_audit();
+        let padding = "x".repeat(MAX_AUDIT_LINE_BYTES);
+        assert!(verify_firefox_audit(&before_end(good.clone(), &format!("{padding}\n"))).is_ok());
+        assert!(verify_firefox_audit(&before_end(good.clone(), &format!("{padding}x\n"))).is_err());
+
+        let runtime = audit_line(
+            1000,
+            SYS_CLONE3,
+            SECCOMP_RET_ERRNO,
+            0,
+            "/app/lib/firefox/firefox",
+        );
+        let accepted = before_end(
+            good,
+            &runtime.repeat(MAX_AUDIT_RECORDS.saturating_sub(17)),
+        );
+        assert_eq!(verify_firefox_audit(&accepted).unwrap(), MAX_AUDIT_RECORDS);
+        assert!(verify_firefox_audit(&before_end(accepted, &runtime)).is_err());
     }
 }

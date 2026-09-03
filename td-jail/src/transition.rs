@@ -24,6 +24,8 @@ pub const PROCESS_TOKEN_PROBE_ARG: &str = "--probe-process-token";
 pub const FIREFOX_SUPPORT_PROBE_ARG: &str = "--probe-firefox-support";
 pub const FIREFOX_NETWORK_PROBE_ARG: &str = "--probe-firefox-network";
 pub const FIREFOX_SOAK_PROBE_ARG: &str = "--probe-firefox-soak";
+pub const FIREFOX_SECCOMP_AUDIT_PROBE_ARG: &str =
+    "--probe-firefox-seccomp-audit";
 pub const FIREFOX_INPUT_PROBE_ARG: &str = "--probe-firefox-input";
 pub const FIREFOX_DOWNLOAD_PROBE_ARG: &str = "--probe-firefox-download";
 const FILTER_ARG: &str = "--internal-write-seccomp-filter";
@@ -39,6 +41,8 @@ const STAGE2_MACHINE_ID_ARG: &str = "--machine-id";
 const STAGE2_TIMEZONE_ARG: &str = "--timezone";
 const STAGE2_FIREFOX_AUTOTEST_POLICY_ARG: &str =
     "--firefox-autotest-policy";
+const STAGE2_FIREFOX_SECCOMP_PROBE_ARG: &str =
+    "--firefox-seccomp-probe";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
@@ -143,6 +147,7 @@ const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const SURVIVOR_PROBE_LIFETIME: Duration = Duration::from_secs(30);
 const PULSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STAGE2_OUTPUT_LIMIT: usize = 4096;
+const FIREFOX_SECCOMP_AUDIT_LIMIT: u64 = 32 * 1024 * 1024;
 const WRITE_PROBE_PREFIX: &str = ".td-jail-write-probe-";
 const ETC_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const NSSWITCH_CONF: &str = "passwd: files\ngroup: files\nhosts: files dns\n";
@@ -291,6 +296,9 @@ pub enum Mode {
     FirefoxSupportProbe,
     FirefoxNetworkProbe,
     FirefoxSoakProbe,
+    FirefoxSeccompAuditProbe {
+        firefox_pid: u32,
+    },
     FirefoxInputProbe {
         stage: firefox::InputStage,
     },
@@ -337,6 +345,7 @@ pub struct Stage2Launch {
     machine_id: String,
     timezone: Option<String>,
     firefox_autotest_policy: bool,
+    firefox_seccomp_probe: bool,
     runtime_aliases: bool,
     environment: Vec<(OsString, OsString)>,
     filesystems: Vec<Stage2Filesystem>,
@@ -385,6 +394,7 @@ struct Stage2MountBinding<'a> {
     machine_id: &'a str,
     timezone: Option<&'a str>,
     firefox_autotest_policy: bool,
+    firefox_seccomp_probe: bool,
     loader_library_path: Option<&'a str>,
 }
 
@@ -474,6 +484,13 @@ where
             return Err(usage_error());
         }
         return Ok(Mode::FirefoxSoakProbe);
+    }
+    if mode == FIREFOX_SECCOMP_AUDIT_PROBE_ARG {
+        let firefox_pid = parse_positive_pid(args.next())?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::FirefoxSeccompAuditProbe { firefox_pid });
     }
     if mode == FIREFOX_INPUT_PROBE_ARG {
         let stage = args
@@ -656,6 +673,17 @@ where
                 Some("absent") => false,
                 _ => return Err(usage_error()),
             };
+        if args.next().as_deref()
+            != Some(STAGE2_FIREFOX_SECCOMP_PROBE_ARG.as_ref())
+        {
+            return Err(usage_error());
+        }
+        let firefox_seccomp_probe =
+            match args.next().as_deref().and_then(OsStr::to_str) {
+                Some("present") => true,
+                Some("absent") => false,
+                _ => return Err(usage_error()),
+            };
         if args.next().as_deref() != Some(STAGE2_LOADER_LIBRARY_PATH_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -766,6 +794,7 @@ where
             machine_id,
             timezone,
             firefox_autotest_policy,
+            firefox_seccomp_probe,
             runtime_aliases: loader_library_path.is_some(),
             environment,
             filesystems,
@@ -863,6 +892,12 @@ fn stage2_launch_arguments(
         } else {
             "absent"
         }),
+        OsString::from(STAGE2_FIREFOX_SECCOMP_PROBE_ARG),
+        OsString::from(if mounts.firefox_seccomp_probe {
+            "present"
+        } else {
+            "absent"
+        }),
     ]);
     stage2.push(OsString::from(STAGE2_LOADER_LIBRARY_PATH_ARG));
     match mounts.loader_library_path {
@@ -924,7 +959,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-kill-reaps, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-network, --probe-firefox-soak, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-kill-reaps, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-network, --probe-firefox-soak, --probe-firefox-seccomp-audit PID, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
     )
 }
 
@@ -1813,6 +1848,42 @@ fn mount_resolved_file(file: &ResolvedFile, target: &Path, label: &str) -> io::R
     )
 }
 
+fn mount_resolved_executable(
+    file: &ResolvedFile,
+    target: &Path,
+    label: &str,
+) -> io::Result<()> {
+    require_resolved_file_identity(file, label)?;
+    create_file(target, b"", 0o555)?;
+    let target_text = target
+        .to_str()
+        .ok_or_else(|| io::Error::other("resolved executable target is not UTF-8"))?;
+    mount_bind(&file.path, target_text)?;
+    remount_read_only(target_text, sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV)?;
+    let metadata = fs::symlink_metadata(target)?;
+    if !metadata.file_type().is_file()
+        || metadata.dev() != file.device
+        || metadata.ino() != file.inode
+        || metadata.len() != file.size
+        || metadata.mode() & 0o7777 != 0o555
+    {
+        return Err(io::Error::other(format!(
+            "{label} bind {} changed identity or mode",
+            target.display()
+        )));
+    }
+    require_resolved_file_identity(file, label)?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    require_bind_source(&mountinfo, &file.path, target)?;
+    require_mount(
+        &mountinfo,
+        target_text,
+        None,
+        &["ro", "nosuid", "nodev"],
+        &["rw", "noexec"],
+    )
+}
+
 fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
     let etc = PathBuf::from(format!("{NEW_ROOT}/etc"));
     let identity = Identity {
@@ -1976,6 +2047,14 @@ fn prepare_mount_plan(
         "mode=1777,size=268435456",
     )?;
     if let Some(application) = application {
+        if let Some(probe) = &application.firefox_seccomp_probe {
+            create_dir(&format!("{NEW_ROOT}/opt"), 0o555)?;
+            mount_resolved_executable(
+                probe,
+                Path::new(&format!("{NEW_ROOT}{}", seccomp::FIREFOX_PROBE_PATH)),
+                "Firefox outer-filter probe",
+            )?;
+        }
         let run = format!("{NEW_ROOT}/run");
         mount_tmpfs(
             &run,
@@ -2108,6 +2187,12 @@ fn prepare_mount_plan(
             (application.wayland_socket.clone(), wayland),
             (application.bus_socket.clone(), bus),
         ];
+        if let Some(probe) = &application.firefox_seccomp_probe {
+            mounted.push((
+                probe.path.clone(),
+                format!("{NEW_ROOT}{}", seccomp::FIREFOX_PROBE_PATH),
+            ));
+        }
         if let Some(pulse) = pulse {
             mounted.push((pulse.source.to_path_buf(), pulse.runtime_target));
             let path = format!("{NEW_ROOT}/run/flatpak");
@@ -2335,7 +2420,7 @@ fn require_runtime_confinement() -> io::Result<()> {
     Ok(())
 }
 
-fn install_standard_seccomp_filter() -> io::Result<()> {
+fn install_standard_seccomp_filter(log_denials: bool) -> io::Result<()> {
     let program = seccomp::standard_program()?;
     sys::set_no_new_privileges()?;
     if !sys::no_new_privileges()? {
@@ -2344,7 +2429,7 @@ fn install_standard_seccomp_filter() -> io::Result<()> {
             "PR_SET_NO_NEW_PRIVS succeeded without changing its readback",
         ));
     }
-    sys::install_seccomp_filter(program.instructions())?;
+    sys::install_seccomp_filter(program.instructions(), log_denials)?;
     require_runtime_confinement()
 }
 
@@ -2638,6 +2723,7 @@ fn require_read_only_mount(path: &str, token: &[u8; TOKEN_LEN]) -> io::Result<()
 fn grant_scaffold_names(
     application: bool,
     runtime_aliases: bool,
+    firefox_seccomp_probe: bool,
     filesystems: &[Stage2Filesystem],
 ) -> io::Result<BTreeMap<PathBuf, BTreeSet<String>>> {
     let mut root = if application {
@@ -2657,6 +2743,9 @@ fn grant_scaffold_names(
                 .iter()
                 .map(|(name, _)| (*name).to_string()),
         );
+    }
+    if firefox_seccomp_probe {
+        root.insert("opt".to_string());
     }
     let mut expected = BTreeMap::from([
         (PathBuf::from("/"), root),
@@ -3030,6 +3119,7 @@ struct Stage2MountExpectation<'a> {
     runtime_aliases: bool,
     pulse: bool,
     pulse_socket_mode: Option<u32>,
+    firefox_seccomp_probe: bool,
 }
 
 fn require_mount_plan(
@@ -3043,6 +3133,7 @@ fn require_mount_plan(
         runtime_aliases,
         pulse,
         pulse_socket_mode,
+        firefox_seccomp_probe,
     } = expected;
     let application = filesystems.is_some();
     if fs::symlink_metadata(OLD_ROOT).is_ok()
@@ -3052,9 +3143,12 @@ fn require_mount_plan(
             "detached host root remains reachable in the fresh root",
         ));
     }
-    for (path, expected) in
-        grant_scaffold_names(application, runtime_aliases, filesystems.unwrap_or_default())?
-    {
+    for (path, expected) in grant_scaffold_names(
+        application,
+        runtime_aliases,
+        firefox_seccomp_probe,
+        filesystems.unwrap_or_default(),
+    )? {
         let path_text = path
             .to_str()
             .ok_or_else(|| io::Error::other("filesystem scaffold path is not UTF-8"))?;
@@ -3167,6 +3261,27 @@ fn require_mount_plan(
                 &["ro", "nosuid", "nodev"],
                 &["rw", "noexec"],
             )?;
+        }
+        if firefox_seccomp_probe {
+            require_names("/opt", &["td-firefox-seccomp-probe"])?;
+            require_mode(seccomp::FIREFOX_PROBE_PATH, 0o555)?;
+            let metadata = fs::symlink_metadata(seccomp::FIREFOX_PROBE_PATH)?;
+            if !metadata.file_type().is_file() {
+                return Err(io::Error::other(
+                    "Firefox outer-filter probe is not a regular file",
+                ));
+            }
+            require_mount(
+                &mountinfo,
+                seccomp::FIREFOX_PROBE_PATH,
+                None,
+                &["ro", "nosuid", "nodev"],
+                &["rw", "noexec"],
+            )?;
+        } else if fs::symlink_metadata("/opt").is_ok() {
+            return Err(io::Error::other(
+                "ordinary application mount plan unexpectedly exposes /opt",
+            ));
         }
         require_mount(
             &mountinfo,
@@ -4444,6 +4559,35 @@ pub fn probe_firefox_soak() -> io::Result<()> {
     writeln!(io::stdout(), "{}", firefox::probe_soak()?)
 }
 
+pub fn probe_firefox_seccomp_audit(firefox_pid: u32) -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid != 0 || identity.gid != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the Firefox seccomp-audit probe requires root",
+        ));
+    }
+    let mut bytes = Vec::new();
+    io::stdin()
+        .lock()
+        .take(FIREFOX_SECCOMP_AUDIT_LIMIT.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > FIREFOX_SECCOMP_AUDIT_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Firefox seccomp audit exceeds 32 MiB",
+        ));
+    }
+    let log = String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Firefox seccomp audit is not UTF-8",
+        )
+    })?;
+    seccomp::verify_firefox_audit(&log, firefox_pid)?;
+    writeln!(io::stdout(), "{}", seccomp::FIREFOX_AUDIT_MARKER)
+}
+
 pub fn probe_firefox_input(stage: firefox::InputStage) -> io::Result<()> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
@@ -4696,6 +4840,7 @@ pub fn run_stage2(
         etc,
         runtime_aliases,
         pulse,
+        firefox_seccomp_probe,
     ) = match &action {
         Stage2Action::Probe | Stage2Action::KillHold => (
             None,
@@ -4705,6 +4850,7 @@ pub fn run_stage2(
                 firefox_autotest_policy: false,
                 machine_id: None,
             },
+            false,
             false,
             false,
         ),
@@ -4724,6 +4870,7 @@ pub fn run_stage2(
                 .environment
                 .iter()
                 .any(|(key, _)| key == "PULSE_SERVER"),
+            launch.firefox_seccomp_probe,
         ),
     };
     require_mount_plan(
@@ -4733,12 +4880,13 @@ pub fn run_stage2(
             runtime_aliases,
             pulse,
             pulse_socket_mode: pulse_socket_mode(pulse, host_mode),
+            firefox_seccomp_probe,
         },
         &mount_probe_token,
         identity,
     )?;
     clear_and_require_empty_capabilities()?;
-    install_standard_seccomp_filter().map_err(|error| {
+    install_standard_seccomp_filter(firefox_seccomp_probe).map_err(|error| {
         if host_mode {
             io::Error::new(
                 error.kind(),
@@ -4766,6 +4914,7 @@ pub fn run_stage2(
                 machine_id: _,
                 timezone: _,
                 firefox_autotest_policy: _,
+                firefox_seccomp_probe,
                 runtime_aliases: _,
                 environment,
                 filesystems: _,
@@ -4782,7 +4931,12 @@ pub fn run_stage2(
                 return Err(io::Error::other("PID 1 remained dumpable"));
             }
             start_stage1_liveness_watcher()?;
-            run_application(&entry, &environment, &arguments)
+            run_application(
+                &entry,
+                &environment,
+                &arguments,
+                firefox_seccomp_probe,
+            )
         }
     }
 }
@@ -4812,13 +4966,13 @@ fn run_application(
     entry: &str,
     environment: &[(OsString, OsString)],
     arguments: &[OsString],
+    firefox_seccomp_probe: bool,
 ) -> io::Result<()> {
     let null_input = fs::File::open("/dev/null")?;
     let null_output = OpenOptions::new().write(true).open("/dev/null")?;
     let null_error = OpenOptions::new().write(true).open("/dev/null")?;
-    let mut command = Command::new(entry);
+    let mut command = application_command(entry, arguments, firefox_seccomp_probe);
     command
-        .args(arguments)
         .env_clear()
         .envs(environment.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::from(null_input))
@@ -4860,6 +5014,25 @@ fn run_application(
         (None, _) => Err(io::Error::other(
             "application entry disappeared without a wait status",
         )),
+    }
+}
+
+fn application_command(
+    entry: &str,
+    arguments: &[OsString],
+    firefox_seccomp_probe: bool,
+) -> Command {
+    if firefox_seccomp_probe {
+        let mut command = Command::new(seccomp::FIREFOX_PROBE_PATH);
+        command
+            .arg("--probe-inherited-exec")
+            .arg(entry)
+            .args(arguments);
+        command
+    } else {
+        let mut command = Command::new(entry);
+        command.args(arguments);
+        command
     }
 }
 
@@ -5239,6 +5412,9 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                     .map(|zone| zone.name.as_str()),
                 firefox_autotest_policy: application
                     .firefox_autotest_policy
+                    .is_some(),
+                firefox_seccomp_probe: application
+                    .firefox_seccomp_probe
                     .is_some(),
                 loader_library_path: application.loader_library_path.as_deref(),
             },
@@ -5830,6 +6006,8 @@ mod tests {
                 "Europe/Berlin",
                 STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
                 "present",
+                STAGE2_FIREFOX_SECCOMP_PROBE_ARG,
+                "present",
                 STAGE2_LOADER_LIBRARY_PATH_ARG,
                 "absent",
                 STAGE2_ENVIRONMENT_ARG,
@@ -5870,6 +6048,7 @@ mod tests {
                 machine_id: machine_id.into(),
                 timezone: Some("Europe/Berlin".into()),
                 firefox_autotest_policy: true,
+                firefox_seccomp_probe: true,
                 runtime_aliases: false,
                 environment: [
                     ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
@@ -6037,6 +6216,7 @@ mod tests {
                 machine_id,
                 timezone: Some("Europe/Berlin"),
                 firefox_autotest_policy: true,
+                firefox_seccomp_probe: true,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
             },
             Stage2ResourceBinding {
@@ -6087,6 +6267,7 @@ mod tests {
                     machine_id: machine_id.into(),
                     timezone: Some("Europe/Berlin".into()),
                     firefox_autotest_policy: true,
+                    firefox_seccomp_probe: true,
                     runtime_aliases: true,
                     environment,
                     filesystems: vec![Stage2Filesystem {
@@ -6173,6 +6354,29 @@ mod tests {
     }
 
     #[test]
+    fn physical_firefox_launch_probes_then_execs_the_exact_entry_and_arguments() {
+        let arguments = [OsString::from("--marionette"), OsString::from("profile")];
+        let probed = application_command("/app/lib/firefox/firefox", &arguments, true);
+        assert_eq!(
+            probed.get_program(),
+            OsStr::new(seccomp::FIREFOX_PROBE_PATH)
+        );
+        assert_eq!(
+            probed.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("--probe-inherited-exec"),
+                OsStr::new("/app/lib/firefox/firefox"),
+                OsStr::new("--marionette"),
+                OsStr::new("profile"),
+            ]
+        );
+
+        let ordinary = application_command("/app/bin/app", &arguments, false);
+        assert_eq!(ordinary.get_program(), OsStr::new("/app/bin/app"));
+        assert_eq!(ordinary.get_args().collect::<Vec<_>>(), arguments);
+    }
+
+    #[test]
     fn resource_probe_mode_is_named_and_bounded() {
         assert_eq!(
             parse_mode(args(&[RESOURCE_PROBE_ARG, "td-jail-fixture"])).unwrap(),
@@ -6216,6 +6420,18 @@ mod tests {
             Mode::FirefoxSoakProbe
         );
         assert!(parse_mode(args(&[FIREFOX_SOAK_PROBE_ARG, "extra"])).is_err());
+        assert_eq!(
+            parse_mode(args(&[FIREFOX_SECCOMP_AUDIT_PROBE_ARG, "8123"])).unwrap(),
+            Mode::FirefoxSeccompAuditProbe { firefox_pid: 8123 }
+        );
+        assert!(parse_mode(args(&[FIREFOX_SECCOMP_AUDIT_PROBE_ARG])).is_err());
+        assert!(parse_mode(args(&[FIREFOX_SECCOMP_AUDIT_PROBE_ARG, "0"])).is_err());
+        assert!(parse_mode(args(&[
+            FIREFOX_SECCOMP_AUDIT_PROBE_ARG,
+            "8123",
+            "extra"
+        ]))
+        .is_err());
         for (name, stage) in [
             ("arm", firefox::InputStage::Arm),
             ("menu", firefox::InputStage::Menu),
@@ -7471,7 +7687,7 @@ mod tests {
                 ("sbin", "/usr/sbin"),
             ]
         );
-        let base = grant_scaffold_names(true, false, &[]).unwrap();
+        let base = grant_scaffold_names(true, false, false, &[]).unwrap();
         assert_eq!(
             base.get(Path::new("/")),
             Some(&BTreeSet::from([
@@ -7512,12 +7728,15 @@ mod tests {
                 source_kind: FilesystemSourceKind::Directory,
             },
         ];
-        let dynamic = grant_scaffold_names(true, true, &[]).unwrap();
+        let dynamic = grant_scaffold_names(true, true, false, &[]).unwrap();
         for alias in ["bin", "lib", "lib64", "sbin"] {
             assert!(dynamic[Path::new("/")].contains(alias));
             assert!(!base[Path::new("/")].contains(alias));
         }
-        let names = grant_scaffold_names(true, false, &filesystems).unwrap();
+        let probed = grant_scaffold_names(true, false, true, &[]).unwrap();
+        assert!(probed[Path::new("/")].contains("opt"));
+        assert!(!base[Path::new("/")].contains("opt"));
+        let names = grant_scaffold_names(true, false, false, &filesystems).unwrap();
         assert_eq!(
             names.get(Path::new("/mnt")),
             Some(&BTreeSet::from(["media".to_string()]))

@@ -67,6 +67,7 @@ const ESRCH: i32 = 3;
 const EINTR: i32 = 4;
 const ECHILD: i32 = 10;
 const SECCOMP_SET_MODE_FILTER: usize = 1;
+const SECCOMP_FILTER_FLAG_LOG: usize = 2;
 pub(crate) const SECCOMP_MAX_FILTER_INSNS: usize = 4096;
 const SIOCGIFFLAGS: usize = 0x8913;
 const SIOCSIFFLAGS: usize = 0x8914;
@@ -535,7 +536,10 @@ pub fn set_and_require_data_limit(bytes: u64) -> io::Result<()> {
     Ok(())
 }
 
-pub fn install_seccomp_filter(instructions: &[SockFilter]) -> io::Result<()> {
+pub fn install_seccomp_filter(
+    instructions: &[SockFilter],
+    log_denials: bool,
+) -> io::Result<()> {
     if instructions.len() > SECCOMP_MAX_FILTER_INSNS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -558,10 +562,15 @@ pub fn install_seccomp_filter(instructions: &[SockFilter]) -> io::Result<()> {
         len,
         filter: instructions.as_ptr(),
     };
+    let flags = if log_denials {
+        SECCOMP_FILTER_FLAG_LOG
+    } else {
+        0
+    };
     check(syscall5(
         SYS_SECCOMP,
         SECCOMP_SET_MODE_FILTER,
-        0,
+        flags,
         std::ptr::from_ref(&program) as usize,
         0,
         0,
@@ -629,6 +638,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<IfreqFlags>(), 40);
         assert_eq!(std::mem::align_of::<IfreqFlags>(), 8);
         assert_eq!(SECCOMP_SET_MODE_FILTER, 1);
+        assert_eq!(SECCOMP_FILTER_FLAG_LOG, 2);
         assert_eq!(SECCOMP_MAX_FILTER_INSNS, 4096);
         assert_eq!(SYS_IOCTL, 16);
         assert_eq!(SYS_KILL, 62);
@@ -663,7 +673,7 @@ mod tests {
             k: 0x7fff_0000,
         };
         let oversized = vec![instruction; SECCOMP_MAX_FILTER_INSNS + 1];
-        assert!(install_seccomp_filter(&oversized).is_err());
+        assert!(install_seccomp_filter(&oversized, false).is_err());
     }
 
     #[test]

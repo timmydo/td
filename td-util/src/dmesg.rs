@@ -6,8 +6,9 @@
 //! `std` file I/O and needs no `klogctl`/`syslog` syscall wrapper (which is the
 //! route busybox and util-linux take, and the reason a Rust dmesg usually wants
 //! `unsafe`). If the reader falls behind and records are overwritten the kernel
-//! returns EPIPE and re-seeks us to the oldest surviving record, so a retry is
-//! the correct response.
+//! returns EPIPE and re-seeks us to the oldest surviving record. Preserve that
+//! fact, and a stop at the byte ceiling, in the rendered stream so evidence
+//! consumers can fail closed on every incomplete drain.
 
 use std::io::Read;
 
@@ -17,6 +18,8 @@ const O_NONBLOCK: i32 = 0o4000;
 
 /// Bound the EPIPE retry: a pathologically busy log must not spin here forever.
 const MAX_OVERRUN_RETRIES: u32 = 64;
+/// Must match td-jail's seccomp-audit consumer; the image source test binds them.
+pub const INCOMPLETE_MARKER: &str = "TD-DMESG-INCOMPLETE";
 
 /// Unlike util-linux's `SYSLOG_ACTION_READ_ALL`, a /dev/kmsg drain is not a
 /// snapshot: EAGAIN only arrives once the reader catches up, so a kernel logging
@@ -66,15 +69,21 @@ fn read_kmsg(path: &str) -> Result<String, String> {
         .custom_flags(O_NONBLOCK)
         .open(path)
         .map_err(|e| format!("{path}: {e}"))?;
+    read_kmsg_from(&mut f, path)
+}
+
+fn read_kmsg_from(mut f: impl Read, path: &str) -> Result<String, String> {
     let mut text = String::new();
     let mut buf = vec![0u8; 8192];
     let mut overruns = 0u32;
+    let mut incomplete = false;
     loop {
         match f.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 text.push_str(&String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])));
                 if text.len() >= MAX_DRAIN_BYTES {
+                    incomplete = true;
                     break;
                 }
             }
@@ -83,14 +92,19 @@ fn read_kmsg(path: &str) -> Result<String, String> {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 overruns = overruns.saturating_add(1);
+                incomplete = true;
                 if overruns > MAX_OVERRUN_RETRIES {
-                    return Err(format!(
-                        "{path}: the ring buffer is being overwritten faster than it can be read"
-                    ));
+                    break;
                 }
             }
             Err(e) => return Err(format!("{path}: {e}")),
         }
+    }
+    if incomplete {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("3,0,0,-;{INCOMPLETE_MARKER}\n"));
     }
     Ok(text)
 }
@@ -280,6 +294,40 @@ mod tests {
             text.len() >= MAX_DRAIN_BYTES,
             "expected the drain to stop at its ceiling, got {} bytes",
             text.len()
+        );
+        assert_eq!(
+            render(&text, false, false).lines().last(),
+            Some(INCOMPLETE_MARKER),
+            "a bounded but incomplete drain must be visible to consumers"
+        );
+    }
+
+    #[test]
+    fn an_overrun_is_a_visible_fail_closed_record() {
+        struct Overrun {
+            step: u8,
+        }
+
+        impl Read for Overrun {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.step = self.step.saturating_add(1);
+                match self.step {
+                    1 => {
+                        let bytes = LINE.as_bytes();
+                        buffer[..bytes.len()].copy_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    2 => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                    _ => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                }
+            }
+        }
+
+        let text = read_kmsg_from(Overrun { step: 0 }, "test-kmsg").unwrap();
+        assert!(text.contains(LINE));
+        assert_eq!(
+            render(&text, false, false).lines().last(),
+            Some(INCOMPLETE_MARKER)
         );
     }
 }

@@ -61,7 +61,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)`; plus one scoped client-side clipboard descriptor adoption |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
-| 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation |
+| 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the private Wayland client's bounded descriptor transfer |
@@ -1135,10 +1135,15 @@ the same in both directions, and costs only the text of the word.
 
 The landed `td-jail` surface carries exactly FOURTEEN syscalls on x86-64
 through one `syscall5` body: `unshare(2)`, `close(2)`, `ioctl(2)`,
-`wait4(2)`, `kill(2)`, `setsid(2)`, `mount(2)`, `umount2(2)`, `pivot_root(2)`,
-`capset(2)`, `capget(2)`, `prctl(2)`, and `prlimit64(2)`, plus `seccomp(2)` with exactly
-one operation:
-`SECCOMP_SET_MODE_FILTER`=1 and flags zero.
+`wait4(2)`, `kill(2)`, `setsid(2)`, `mount(2)`, `umount2(2)`,
+`pivot_root(2)`, `capset(2)`, `capget(2)`, `prctl(2)`, and
+`prlimit64(2)`, plus `seccomp(2)` with exactly one operation,
+`SECCOMP_SET_MODE_FILTER`=1, and exactly two flag values. Ordinary launches
+use flags zero. The dedicated Firefox seccomp-audit proof variant alone uses
+`SECCOMP_FILTER_FLAG_LOG`=2 for the already-selected outer filter. That flag
+does not change any filter action; it asks the kernel to audit non-allow
+decisions so the root-owned proof unit can compare them with the compiled
+roster. No application chooses the operation, flags, or BPF program.
 The unshare wrapper accepts only the two compiled namespace sets the
 application design permits:
 `CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUTS`, with
@@ -1199,8 +1204,15 @@ bounded resolver file is bound read-only only when authenticated policy shares
 the network and the file exists. The `/etc` tmpfs is then remounted read-only.
 Probe mode overlays the current executable as one read-only, nosuid, nodev,
 executable file bind inside the otherwise-noexec `/tmp`, and source-identity
-checks that bind before detaching the old root; application mode never creates
-it. Application filesystem sources are canonicalized outside the namespace;
+checks that bind before detaching the old root. Ordinary application mode
+never creates an executable fixture mount. The dedicated Firefox seccomp-audit
+proof variant is the one exception: authority resolves the root-owned,
+mode-0555, bounded static seccomp helper from `/var/lib/td-test`, and stage 1
+binds that exact inode
+read-only, nosuid and nodev at its compiled `/opt` path. Stage 2 requires that
+single `/opt` entry and its mount flags before Firefox can start. No manifest,
+permission file, application argument, or environment value selects it.
+Application filesystem sources are canonicalized outside the namespace;
 reserved aliases and overlapping allowed grants are refused, deny
 intersections remove the containing grant before creation, and source
 type/device/inode are checked before and after the bind. Regular files require
@@ -1283,9 +1295,11 @@ destination.
 After capability removal, stage 2 validates the compiled constant cBPF
 program, sets and reads back no-new-privileges, installs that exact program,
 and requires `/proc/self/status` to report `NoNewPrivs: 1` and `Seccomp: 2`.
-It remains single-threaded through this flags-zero installation. Only after the
-readback does it create the liveness watcher, which therefore inherits the
-filter; the embedded-source test pins that ordering.
+It remains single-threaded through installation. Ordinary launches pass flags
+zero; only the dedicated Firefox seccomp-audit proof variant passes the compiled
+`SECCOMP_FILTER_FLAG_LOG` value. Only after the readback does it create the
+liveness watcher, which therefore inherits the filter; the embedded-source
+test pins that ordering.
 The filter's instruction count is derived from its array, and a safe validator
 refuses unknown opcodes, offsets, actions, out-of-range jumps, wrong lengths,
 more than the kernel's 4096 instructions, and programs without a final return
@@ -1304,7 +1318,17 @@ and requires both initial states to be zero.
 QEMU copies both inputs into a root-owned, non-writable `/run` tree before
 dropping identity, gates guest health on the exact result, and recognizes only
 an exact marker line. Reaper descendants require the installed restriction
-and filter readbacks too.
+and filter readbacks too. The Firefox physical-input boot separately reuses
+the static helper after td-jail has installed the outer filter with its exact
+LOG flag. The helper issues its 17 probes and then replaces itself with the
+authenticated Firefox entry in the same pid. A root-owned bounded parser
+requires the complete helper audit set between root-only begin/end records
+that traverse the same audit queue. It refuses audit loss anywhere in the
+bounded snapshot, plus kernel-log overrun or byte-ceiling truncation,
+malformed identities, wrong action classes, or any denial outside the compiled
+roster before QEMU accepts the distinct Firefox audit marker. Exact returned
+errno remains the C helper's behavioral check because Linux masks action data
+out of the audit record.
 
 `wait4(2)` is pinned to pid -1, a null rusage pointer, and either zero or
 `WNOHANG`. `kill(2)` is likewise closed: its pid is always -1 and its signal
@@ -1412,9 +1436,9 @@ an image-test oracle, not hostile-payload attestation.
 
 There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
 supplied namespace, mount set, or BPF program. A fifteenth syscall, a ninth
-prctl operation, a second seccomp operation or nonzero seccomp flag, a fourth
-ambient sub-operation, or a third unshare flag set
-is an amendment here.
+prctl operation, a second seccomp operation, a seccomp flag outside the exact
+`{0, SECCOMP_FILTER_FLAG_LOG}` set, a fourth ambient sub-operation, or a third
+unshare flag set is an amendment here.
 
 ## 10. `td-busd` — the session bus broker
 

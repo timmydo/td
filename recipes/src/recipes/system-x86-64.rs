@@ -1,18 +1,24 @@
 use crate::ladder::{
     post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, CODEX_BWRAP_VERSION_OUTPUT, CODEX_RUNTIME_MARKER,
-    CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN, FIREFOX_INPUT_CMDLINE_TOKEN,
+    CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN,
+    FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN, FIREFOX_AUDIT_CMDLINE_TOKEN,
+    FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN, FIREFOX_INPUT_CMDLINE_TOKEN,
     FIREFOX_NETWORK_RUNTIME_MARKER, GIT_HTTPS_RUNTIME_MARKER,
     GIT_HTTPS_TEST_URL, GIT_RUNTIME_MARKER, GREETER_MARKER,
-    NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
-    PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
+    KERNEL_AUDIT_CMDLINE_TOKEN, NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST,
+    NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN, PERSIST_WRITE_CMDLINE_TOKEN,
+    POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
     SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER,
     SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER,
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
     TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
-    TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
+    TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
+    TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
+    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
+    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
     TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
     TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_CHANNEL_RUNTIME_MARKER,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
@@ -267,6 +273,15 @@ const FIREFOX_INPUT_COMPLETION_TMP_PATH: &str = "/run/.td-firefox-input-complete
 const FIREFOX_INPUT_COMPLETION: &str = "td-firefox-input-complete-v1";
 const FIREFOX_INPUT_STAGES_COMPLETION: &str =
     "td-firefox-input-stages-complete-v1";
+const FIREFOX_SECCOMP_PROBE_PATH: &str =
+    "/var/lib/td-test/td-jail-seccomp-probe";
+const FIREFOX_SECCOMP_AUDIT_ERROR_PATH: &str =
+    "/run/td-firefox-seccomp-audit.err";
+// kauditd stores notice-level records in the kernel ring even when this
+// console threshold keeps them off the emulated serial device. Warnings and
+// more severe diagnostics remain visible.
+const FIREFOX_AUDIT_CONSOLE_LOGLEVEL: u8 = 5;
+const FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS: u16 = 30;
 // Each td-jail connection has this independent wall-clock deadline. Three
 // attempts cover the intentional host/guest hand-off race without multiplying
 // a stalled Marionette endpoint into an hour-long service.
@@ -318,7 +333,8 @@ const FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS: u16 =
 const FIREFOX_GREETER_WAIT_ITERATIONS: u16 =
     FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS
         + FIREFOX_SOAK_TIMEOUT_SECS
-        + FIREFOX_SOAK_BRACKET_MARGIN_SECS;
+        + FIREFOX_SOAK_BRACKET_MARGIN_SECS
+        + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS;
 
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
     name: FIREFOX_NAME,
@@ -1452,17 +1468,19 @@ fn build_td_svc_conf() -> String {
          # session across 31 exact local HTTPS navigations over five minutes.\n\
          [firefox-input]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/rm -f {firefox_download_path} {firefox_download_part_path} || exit 1; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input download || exit 1; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && break; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_download_observe_wait} ] || exit 1; portal_done=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_done\" ] || portal_done=0; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser-focus || exit 1; n=0; while [ \"$n\" -lt {firefox_file_chooser_wait} ]; do portal_now=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_now\" ] || portal_now=0; [ \"$portal_now\" -gt \"$portal_done\" ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_file_chooser_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser-result || exit 1; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/rm -f {firefox_download_path} {firefox_download_part_path} || exit 1; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard && break; n=$((n+1)); case \"$n\" in 1) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_one};; 2) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_two};; *) :;; esac; /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input download || exit 1; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && break; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_download_observe_wait} ] || exit 1; portal_done=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_done\" ] || portal_done=0; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser-focus || exit 1; n=0; while [ \"$n\" -lt {firefox_file_chooser_wait} ]; do portal_now=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_now\" ] || portal_now=0; [ \"$portal_now\" -gt \"$portal_done\" ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_file_chooser_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser-result || exit 1; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
          after=firefox-evidence\n\
          restart=never\n\
          \n\
          # The staged input marker is private coordination, not success. Only\n\
          # this unit publishes the completion the greeter accepts, after the\n\
          # same Firefox process, D-Bus connections and Wayland connection survive\n\
-         # complete navigation soak.\n\
+         # complete navigation soak. On the separate audit variant, a root-only\n\
+         # helper then queues the audit end barrier and the bounded retry waits\n\
+         # until kauditd has printed it.\n\
          [firefox-soak]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {firefox_input_pre_soak_wait} ]; do input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_stages_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_pre_soak_wait} ] || exit 1; process_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; wayland_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b}) || exit 1; soak=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-soak) || exit 1; [ \"$soak\" = \"{firefox_soak_marker}\" ] || exit 1; process_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; wayland_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b}) || exit 1; [ \"$wayland_after\" = \"$wayland_before\" ] || exit 1; /bin/td-util printf \"%s\\n\" \"$soak\"; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_final_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {firefox_input_pre_soak_wait} ]; do input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_stages_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_pre_soak_wait} ] || exit 1; process_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; set -- $process_before; [ \"$#\" = 5 ] || exit 1; case \"$4\" in pid=*) firefox_pid=${{4#pid=}};; *) exit 1;; esac; case \"$firefox_pid\" in \"\"|*[!0-9]*|0) exit 1;; esac; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; wayland_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b}) || exit 1; soak=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-soak) || exit 1; [ \"$soak\" = \"{firefox_soak_marker}\" ] || exit 1; process_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; wayland_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b}) || exit 1; [ \"$wayland_after\" = \"$wayland_before\" ] || exit 1; seccomp=; case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_audit_cmdline_token} \"*) {seccomp_probe} --audit-marker end || exit 1; n=0; /bin/rm -f {firefox_seccomp_audit_error_path} || exit 1; while [ \"$n\" -lt {firefox_seccomp_audit_wait} ]; do if seccomp=$(/bin/dmesg | /bin/td-jail --probe-firefox-seccomp-audit \"$firefox_pid\" 2>{firefox_seccomp_audit_error_path}); then break; fi; n=$((n+1)); /bin/td-util sleep 1; done; if [ \"$n\" -ge {firefox_seccomp_audit_wait} ]; then /bin/td-util cat {firefox_seccomp_audit_error_path} >&2; exit 1; fi; /bin/rm -f {firefox_seccomp_audit_error_path} || exit 1; [ \"$seccomp\" = \"{firefox_seccomp_audit_marker}\" ] || exit 1;; *) :;; esac; /bin/td-util printf \"%s\\n\" \"$soak\"; [ -z \"$seccomp\" ] || /bin/td-util printf \"%s\\n\" \"$seccomp\"; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_final_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
          after=firefox-input\n\
          restart=never\n\
          \n\
@@ -1570,6 +1588,9 @@ fn build_td_svc_conf() -> String {
         firefox_input_evidence_wait = FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
         firefox_support_attempts = FIREFOX_SUPPORT_ATTEMPTS,
         firefox_input_cmdline_token = FIREFOX_INPUT_CMDLINE_TOKEN,
+        firefox_clipboard_focus_retry_one = TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
+        firefox_clipboard_focus_retry_two = TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
+        firefox_audit_cmdline_token = FIREFOX_AUDIT_CMDLINE_TOKEN,
         firefox_input_wait = FIREFOX_INPUT_ATTEMPTS,
         firefox_download_path = FIREFOX_DOWNLOAD_PATH,
         firefox_download_part_path = FIREFOX_DOWNLOAD_PART_PATH,
@@ -1582,6 +1603,10 @@ fn build_td_svc_conf() -> String {
         firefox_input_stages_completion = FIREFOX_INPUT_STAGES_COMPLETION,
         firefox_input_pre_soak_wait = FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS,
         firefox_soak_marker = TD_FIREFOX_SOAK_MARKER,
+        firefox_seccomp_audit_marker = TD_FIREFOX_SECCOMP_AUDIT_MARKER,
+        firefox_seccomp_audit_error_path = FIREFOX_SECCOMP_AUDIT_ERROR_PATH,
+        firefox_seccomp_audit_wait = FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS,
+        seccomp_probe = FIREFOX_SECCOMP_PROBE_PATH,
         bus_socket = SESSION_BUS_SOCKET,
     )
 }
@@ -2405,6 +2430,16 @@ fn td_util_probe_args(applet: &str) -> &'static str {
     }
 }
 
+fn td_util_probe_command(applet: &str) -> String {
+    if applet == "dmesg" {
+        "td_dmesg=$(/bin/dmesg) && case \"$td_dmesg\" in \
+         *TD-DMESG-INCOMPLETE*) false;; *) :;; esac"
+            .to_string()
+    } else {
+        format!("/bin/{applet}{}", td_util_probe_args(applet))
+    }
+}
+
 fn build_bootsuccess(sys: &SystemDef) -> String {
     let mut uutils_behavior_probes = String::new();
     for probe in UUTILS_BEHAVIOR_PROBES {
@@ -2415,9 +2450,9 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     // off. Drop dmesg from the farm and that pin is orphaned.
     let mut td_util_probes = String::new();
     for applet in TD_UTIL_APPLETS {
-        let args = td_util_probe_args(applet);
+        let command = td_util_probe_command(applet);
         td_util_probes.push_str(&format!(
-            "/bin/{applet}{args} >/dev/null 2>&1 || \
+            "{command} >/dev/null 2>&1 || \
              {{ echo \"td-util: /bin/{applet} failed\"; u=0; }}; "
         ));
     }
@@ -3287,7 +3322,33 @@ fn build_firefox_tls_setup() -> String {
          /bin/td-util chmod 0400 \"$root/server.key\"\n\
          /bin/chown {ui_uid}:{ui_gid} \"$root/server.key\"\n\
          /bin/td-util chmod 0755 \"$root\"\n\
-         /bin/td-util chmod 0555 \"$origin\"\n",
+         /bin/td-util chmod 0555 \"$origin\"\n\
+         case \" $(/bin/cat /proc/cmdline) \" in\n\
+         *\" {audit} \"*)\n\
+           case \" $(/bin/cat /proc/cmdline) \" in\n\
+           *\" {firefox_input} \"*) :;;\n\
+           *) exit 1;;\n\
+           esac\n\
+           case \" $(/bin/cat /proc/cmdline) \" in\n\
+           *\" {kernel_audit} \"*) :;;\n\
+           *) exit 1;;\n\
+           esac\n\
+           case \" $(/bin/cat /proc/cmdline) \" in\n\
+           *\" {audit_backlog} \"*) :;;\n\
+           *) exit 1;;\n\
+           esac\n\
+           case \" $(/bin/cat /proc/cmdline) \" in\n\
+           *\" {audit_log_buffer} \"*) :;;\n\
+           *) exit 1;;\n\
+           esac\n\
+           /bin/td-util printf '%s\\n' 0 > /proc/sys/kernel/printk_ratelimit\n\
+           [ \"$(/bin/cat /proc/sys/kernel/printk_ratelimit)\" = 0 ] || exit 1\n\
+           /bin/td-util printf '%s\\n' {audit_console_loglevel} > /proc/sys/kernel/printk\n\
+           set -- $(/bin/cat /proc/sys/kernel/printk)\n\
+           [ \"$1\" = {audit_console_loglevel} ] || exit 1\n\
+           {seccomp_probe} --audit-marker begin || exit 1;;\n\
+         *) :;;\n\
+         esac\n",
         autotest = AUTOTEST_CMDLINE_TOKEN,
         root = FIREFOX_TLS_ROOT,
         origin = FIREFOX_TLS_ORIGIN,
@@ -3297,6 +3358,13 @@ fn build_firefox_tls_setup() -> String {
         download = FIREFOX_DOWNLOAD_FIXTURE,
         ui_uid = UI_UID,
         ui_gid = UI_GID,
+        firefox_input = FIREFOX_INPUT_CMDLINE_TOKEN,
+        audit = FIREFOX_AUDIT_CMDLINE_TOKEN,
+        kernel_audit = KERNEL_AUDIT_CMDLINE_TOKEN,
+        audit_backlog = FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN,
+        audit_log_buffer = FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN,
+        audit_console_loglevel = FIREFOX_AUDIT_CONSOLE_LOGLEVEL,
+        seccomp_probe = FIREFOX_SECCOMP_PROBE_PATH,
     )
 }
 
@@ -5108,6 +5176,15 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             Some("/etc/firefox-tls-ready")
         );
         let tls_setup = build_firefox_tls_setup();
+        let audit_branch = format!(
+            "*\" {FIREFOX_AUDIT_CMDLINE_TOKEN} \"*)\n\
+             case \" $(/bin/cat /proc/cmdline) \" in\n\
+             *\" {FIREFOX_INPUT_CMDLINE_TOKEN} \"*) :;;\n\
+             *) exit 1;;\n\
+             esac\n\
+             case \" $(/bin/cat /proc/cmdline) \" in\n\
+             *\" {KERNEL_AUDIT_CMDLINE_TOKEN} \"*) :;;"
+        );
         for required in [
             "/bin/td-netd loopback",
             "openssl=/bin/openssl",
@@ -5128,9 +5205,45 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             "/bin/td-util chmod 0444 \"$root/ca.pem\" \"$root/policies.json\"",
             "/bin/chown 1000:1000 \"$root/server.key\"",
             "/bin/td-util chmod 0555 \"$origin\"",
+            FIREFOX_INPUT_CMDLINE_TOKEN,
+            FIREFOX_AUDIT_CMDLINE_TOKEN,
+            KERNEL_AUDIT_CMDLINE_TOKEN,
+            FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN,
+            FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN,
+            "/proc/sys/kernel/printk_ratelimit",
+            "[ \"$(/bin/cat /proc/sys/kernel/printk_ratelimit)\" = 0 ] || exit 1",
+            "printf '%s\\n' 5 > /proc/sys/kernel/printk",
+            "set -- $(/bin/cat /proc/sys/kernel/printk)",
+            "[ \"$1\" = 5 ] || exit 1",
+            "/var/lib/td-test/td-jail-seccomp-probe --audit-marker begin",
+            &audit_branch,
         ] {
             assert!(tls_setup.contains(required), "TLS setup omitted {required:?}");
         }
+        let ratelimit_write = tls_setup
+            .find("printf '%s\\n' 0 > /proc/sys/kernel/printk_ratelimit")
+            .expect("audit setup omitted the printk rate-limit write");
+        let ratelimit_readback = tls_setup
+            .find("[ \"$(/bin/cat /proc/sys/kernel/printk_ratelimit)\" = 0 ] || exit 1")
+            .expect("audit setup omitted the printk rate-limit readback");
+        let console_write = tls_setup
+            .find("printf '%s\\n' 5 > /proc/sys/kernel/printk")
+            .expect("audit setup omitted the console-threshold write");
+        let console_read = tls_setup
+            .find("set -- $(/bin/cat /proc/sys/kernel/printk)")
+            .expect("audit setup omitted the console-threshold read");
+        let console_readback = tls_setup
+            .find("[ \"$1\" = 5 ] || exit 1")
+            .expect("audit setup omitted the console-threshold readback");
+        let audit_begin = tls_setup
+            .find("/var/lib/td-test/td-jail-seccomp-probe --audit-marker begin")
+            .expect("audit setup omitted the begin barrier");
+        assert_eq!(FIREFOX_AUDIT_CONSOLE_LOGLEVEL, 5);
+        assert!(ratelimit_write < ratelimit_readback);
+        assert!(ratelimit_readback < console_write);
+        assert!(console_write < console_read);
+        assert!(console_read < console_readback);
+        assert!(console_readback < audit_begin);
         assert_eq!(tls_setup.matches("-sha256").count(), 2);
         let tls_origin = build_firefox_tls_origin();
         assert!(tls_origin.contains("OPENSSL_CONF=/dev/null"));
@@ -5324,6 +5437,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS
                 + FIREFOX_SOAK_TIMEOUT_SECS
                 + FIREFOX_SOAK_BRACKET_MARGIN_SECS
+                + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS
         );
         assert_eq!(
             FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
@@ -5510,6 +5624,35 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             .find("--probe-firefox-input clipboard-refocus &&")
             .unwrap();
         let clipboard = input.find("--probe-firefox-input clipboard &&").unwrap();
+        let clipboard_focus_retry_one = input
+            .find(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER)
+            .unwrap();
+        let clipboard_focus_retry_two = input
+            .find(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER)
+            .unwrap();
+        assert_eq!(
+            input
+                .matches(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER)
+                .count(),
+            1
+        );
+        assert_eq!(
+            input
+                .matches(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER)
+                .count(),
+            1
+        );
+        assert_eq!(FIREFOX_INPUT_ATTEMPTS, 3);
+        let clipboard_retry_protocol = format!(
+            "--probe-firefox-input clipboard && break; n=$((n+1)); \
+             case \"$n\" in 1) /bin/td-util printf \"%s\\n\" \
+             {TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER};; \
+             2) /bin/td-util printf \"%s\\n\" \
+             {TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER};; \
+             *) :;; esac; /bin/td-util sleep 1; done; \
+             [ \"$n\" -lt 3 ] || exit 1"
+        );
+        assert_eq!(input.matches(&clipboard_retry_protocol).count(), 1);
         let download = input.find("--probe-firefox-input download ||").unwrap();
         let file_probe = input.find("--probe-firefox-download").unwrap();
         let file_chooser = input
@@ -5533,7 +5676,9 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 && final_stage < clipboard_refocus_arm
                 && clipboard_refocus_arm < clipboard_refocus
                 && clipboard_refocus < clipboard
-                && clipboard < download
+                && clipboard < clipboard_focus_retry_one
+                && clipboard_focus_retry_one < clipboard_focus_retry_two
+                && clipboard_focus_retry_two < download
                 && download < file_probe
                 && file_probe < portal_completions[0]
                 && portal_completions[0] < file_chooser
@@ -5564,17 +5709,42 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         assert!(unit_key("firefox-input", "requires").is_none());
 
         let soak = unit_key("firefox-soak", "exec").unwrap_or_default();
+        let audit_case = format!(
+            "case \" $(/bin/cat /proc/cmdline) \" in *\" \
+             {FIREFOX_AUDIT_CMDLINE_TOKEN} \"*)"
+        );
         for exact in [
             format!("[ \"$n\" -lt {FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS} ]"),
             format!("[ \"$input\" = {FIREFOX_INPUT_STAGES_COMPLETION} ]"),
             format!(
                 "/bin/td-jail --probe-process-token {FIREFOX_NAME} --marionette"
             ),
+            "set -- $process_before; [ \"$#\" = 5 ]".to_string(),
+            "case \"$4\" in pid=*) firefox_pid=${4#pid=};;".to_string(),
+            "case \"$firefox_pid\" in \"\"|*[!0-9]*|0) exit 1;;"
+                .to_string(),
             format!(
                 "/bin/td-busd application {SESSION_BUS_SOCKET} {FIREFOX_NAME}"
             ),
             "/bin/td-jail --probe-firefox-soak".to_string(),
             format!("[ \"$soak\" = \"{TD_FIREFOX_SOAK_MARKER}\" ]"),
+            audit_case.clone(),
+            format!("{FIREFOX_SECCOMP_PROBE_PATH} --audit-marker end"),
+            format!(
+                "[ \"$n\" -lt {FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS} ]"
+            ),
+            "/bin/dmesg | /bin/td-jail --probe-firefox-seccomp-audit \
+             \"$firefox_pid\""
+                .to_string(),
+            format!("2>{FIREFOX_SECCOMP_AUDIT_ERROR_PATH}"),
+            format!(
+                "/bin/td-util cat {FIREFOX_SECCOMP_AUDIT_ERROR_PATH} >&2"
+            ),
+            format!(
+                "[ \"$seccomp\" = \"{TD_FIREFOX_SECCOMP_AUDIT_MARKER}\" ]"
+            ),
+            "[ -z \"$seccomp\" ] || /bin/td-util printf \"%s\\n\" \"$seccomp\""
+                .to_string(),
             format!(
                 "/bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} \
                  {FIREFOX_APP_ID} {FIREFOX_CONTENT_RGB_A} {FIREFOX_CONTENT_RGB_B}"
@@ -5587,7 +5757,16 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         assert_eq!(soak.matches("/bin/td-busd application").count(), 2);
         assert_eq!(soak.matches("/bin/td-compositor probe-application").count(), 2);
         assert_eq!(soak.matches("--probe-firefox-soak").count(), 1);
+        assert_eq!(
+            soak.matches(&format!(
+                "/bin/td-util cat {FIREFOX_SECCOMP_AUDIT_ERROR_PATH} >&2"
+            ))
+            .count(),
+            1,
+            "the terminal audit failure must preserve its parser diagnostic"
+        );
         let before_process = soak.find("process_before=").unwrap();
+        let process_pid = soak.find("set -- $process_before").unwrap();
         let before_bus = soak.find("bus_before=").unwrap();
         let before_wayland = soak.find("wayland_before=").unwrap();
         let navigation = soak.find("soak=$(").unwrap();
@@ -5599,10 +5778,17 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         let same_wayland = soak
             .find("[ \"$wayland_after\" = \"$wayland_before\" ]")
             .unwrap();
+        let audit_case = soak.find(&audit_case).unwrap();
+        let audit_end = soak.find("--audit-marker end").unwrap();
+        let seccomp = soak.find("seccomp=$(/bin/dmesg |").unwrap();
         let marker = soak.find("/bin/td-util printf \"%s\\n\" \"$soak\"").unwrap();
+        let seccomp_marker = soak
+            .find("/bin/td-util printf \"%s\\n\" \"$seccomp\"")
+            .unwrap();
         let published = soak.find(FIREFOX_INPUT_COMPLETION).unwrap();
         assert!(
-            before_process < before_bus
+            before_process < process_pid
+                && process_pid < before_bus
                 && before_bus < before_wayland
                 && before_wayland < navigation
                 && navigation < after_process
@@ -5611,8 +5797,12 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 && after_bus < same_bus
                 && same_bus < after_wayland
                 && after_wayland < same_wayland
-                && same_wayland < marker
-                && marker < published,
+                && same_wayland < audit_case
+                && audit_case < audit_end
+                && audit_end < seccomp
+                && seccomp < marker
+                && marker < seccomp_marker
+                && seccomp_marker < published,
             "Firefox continuity evidence or publication is out of order"
         );
         assert_eq!(unit_after("firefox-soak"), vec!["firefox-input"]);
@@ -5623,6 +5813,58 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         assert!(
             !build_td_svc_conf().contains("/bin/td-ui-demo"),
             "the synthetic client must not remain on the system boot path"
+        );
+    }
+
+    #[test]
+    fn seccomp_audit_wire_markers_are_bound_across_components() {
+        const TD_UTIL_DMESG: &str =
+            include_str!("../../../td-util/src/dmesg.rs");
+        const TD_JAIL_SECCOMP: &str =
+            include_str!("../../../td-jail/src/seccomp.rs");
+        const TD_JAIL_AUTHORITY: &str =
+            include_str!("../../../td-jail/src/authority.rs");
+        assert_eq!(
+            TD_UTIL_DMESG
+                .matches("pub const INCOMPLETE_MARKER: &str = \"TD-DMESG-INCOMPLETE\";")
+                .count(),
+            1
+        );
+        assert_eq!(
+            TD_JAIL_SECCOMP
+                .matches("const DMESG_INCOMPLETE_MARKER: &str = \"TD-DMESG-INCOMPLETE\";")
+                .count(),
+            1
+        );
+        assert_eq!(
+            TD_FIREFOX_SECCOMP_AUDIT_MARKER,
+            "TD-FIREFOX-SECCOMP-OK probes=17"
+        );
+        assert_eq!(
+            FIREFOX_AUDIT_CMDLINE_TOKEN,
+            "td.firefox-seccomp-audit=1"
+        );
+        for declaration in [
+            "const AUTOTEST_CMDLINE_TOKEN: &str = \"td.autotest=1\";",
+            "const FIREFOX_INPUT_CMDLINE_TOKEN: &str = \"td.firefox-input=1\";",
+            "const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = \
+             \"td.firefox-seccomp-audit=1\";",
+            "const KERNEL_AUDIT_CMDLINE_TOKEN: &str = \"audit=1\";",
+            "const FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN: &str = \
+             \"audit_backlog_limit=8192\";",
+            "const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str = \
+             \"log_buf_len=8M\";",
+        ] {
+            assert_eq!(TD_JAIL_AUTHORITY.matches(declaration).count(), 1);
+        }
+        assert_eq!(
+            TD_JAIL_SECCOMP
+                .matches(
+                    "pub(crate) const FIREFOX_AUDIT_MARKER: &str =\n    \
+                     \"TD-FIREFOX-SECCOMP-OK probes=17\";"
+                )
+                .count(),
+            1
         );
     }
 
@@ -10399,10 +10641,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             // command could be deleted and this would pass. And matching everything except
             // `u=0` leaves the gate defeatable: drop that one assignment and the marker
             // prints unconditionally, so the oracle greens with a broken applet.
-            let args = td_util_probe_args(applet);
+            let command = td_util_probe_command(applet);
             assert!(
                 bootsuccess.contains(&format!(
-                    "/bin/{applet}{args} >/dev/null 2>&1 || {{ echo \"td-util: /bin/{applet} \
+                    "{command} >/dev/null 2>&1 || {{ echo \"td-util: /bin/{applet} \
                      failed\"; u=0; }}"
                 )),
                 "the health target must RUN /bin/{applet} by its literal /bin path AND clear the \
@@ -10410,6 +10652,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                  the oracle passes a broken applet"
             );
         }
+        assert!(bootsuccess.contains(
+            "td_dmesg=$(/bin/dmesg) && case \"$td_dmesg\" in \
+             *TD-DMESG-INCOMPLETE*) false;; *) :;; esac"
+        ));
         // A pager with no operand reads stdin. Deriving the args above means the
         // assertion follows whatever the generator does, so state the one property
         // the derivation cannot: that `less` is given something to page.

@@ -396,7 +396,10 @@ mod tests {
     fn the_kill_hold_arm_starts_its_watcher_after_the_filter_too() {
         let transition = source("transition").expect("transition source");
         let install = transition
-            .find("install_standard_seccomp_filter().map_err(|error|")
+            .find(
+                "install_standard_seccomp_filter(firefox_seccomp_probe)\
+                 .map_err(|error|",
+            )
             .expect("seccomp installation");
         let dispatch = transition
             .find("Stage2Action::KillHold => run_stage2_kill_hold(),")
@@ -468,7 +471,10 @@ mod tests {
             assert!(sys.contains(row), "td-jail syscall source lacks {row}");
         }
         let filter = transition
-            .find("install_standard_seccomp_filter().map_err(|error|")
+            .find(
+                "install_standard_seccomp_filter(firefox_seccomp_probe)\
+                 .map_err(|error|",
+            )
             .expect("seccomp installation");
         let nondumpable = transition
             .find("sys::set_dumpable(false)?;")
@@ -489,7 +495,7 @@ mod tests {
             .find("sys::set_and_require_data_limit(resources.memory_max_bytes)?;")
             .expect("data limit");
         let application = transition
-            .find("run_application(&entry, &environment, &arguments)")
+            .find("run_application(\n                &entry,")
             .expect("application launch");
         assert!(
             filter < data_limit

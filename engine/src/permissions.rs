@@ -28,6 +28,7 @@ const MAX_BUS_NAME_BYTES: usize = 255;
 pub const RESERVED_FILESYSTEM_TREES: &[&str] = &[
     "/app",
     "/usr",
+    "/opt",
     "/bin",
     "/run",
     "/proc",
