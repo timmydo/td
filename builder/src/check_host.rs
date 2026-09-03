@@ -67,6 +67,17 @@ const WORKER_STACK_BYTES: usize = 512 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one write may make NO progress before its client is treated as
+/// stuck rather than slow.
+///
+/// `OUTPUT_TIMEOUT` is how often the write wakes up to look, NOT the verdict.
+/// Reading a 5s socket timeout as "the client is gone" ends a multi-minute
+/// hosted check because a log reader paused, which is a far worse outcome than
+/// waiting. What this still protects against — a client wedged forever holding
+/// a worker and its memory permit — needs minutes, not seconds, and real
+/// memory pressure is cancelled by the emergency reserve check instead, which
+/// is the mechanism actually aimed at that.
+const STALL_BUDGET: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const FEED_NO_DAEMON_ENV: &str = "TD_FEED_NO_DAEMON";
@@ -103,42 +114,94 @@ fn supervisor_executable(request: &RunRequest) -> &OsStr {
 struct FrameWriter {
     stream: Mutex<UnixStream>,
     disconnected: AtomicBool,
+    /// Set when this request is being cancelled. Patience is for a client that
+    /// might still be served; once the check is dead there is nothing left to
+    /// deliver, and a pump parked on a stalled socket would otherwise hold its
+    /// worker and its memory permit for the rest of the budget.
+    abandoned: AtomicBool,
+    /// How long one write may make NO progress before the client is called
+    /// stuck. Held per writer so a test can shorten it; production uses
+    /// `STALL_BUDGET`.
+    stall_budget: Duration,
 }
 
 impl FrameWriter {
     fn new(stream: UnixStream) -> io::Result<Arc<Self>> {
+        Self::with_budget(stream, STALL_BUDGET)
+    }
+
+    fn with_budget(stream: UnixStream, stall_budget: Duration) -> io::Result<Arc<Self>> {
         stream.set_write_timeout(Some(OUTPUT_TIMEOUT))?;
         Ok(Arc::new(Self {
             stream: Mutex::new(stream),
             disconnected: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
+            stall_budget,
         }))
     }
 
+    /// Stop waiting for this client: the request it belonged to is over.
+    fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Relaxed);
+    }
+
+    /// Frame only if no pump holds the stream, and only briefly.
+    ///
+    /// For cancellation's own last word to the client. `try_lock` because the
+    /// pump it would queue behind is precisely the one parked on the stalled
+    /// socket, so blocking here would reintroduce the delay cancellation
+    /// exists to end. Best effort by design: the host log records the cause
+    /// either way, and the client is told to read it.
+    fn frame_if_free(&self, kind: u8, bytes: &[u8], budget: Duration) -> io::Result<()> {
+        let stream = self
+            .stream
+            .try_lock()
+            .map_err(|_| io::Error::other("check-host output is busy"))?;
+        self.frame_locked(stream, kind, bytes, budget, false)
+    }
+
     fn frame(&self, kind: u8, bytes: &[u8]) -> io::Result<()> {
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "oversized host frame"))?;
-        let mut stream = self
+        let stream = self
             .stream
             .lock()
             .map_err(|_| io::Error::other("check-host output lock poisoned"))?;
-        // Checked under the lock, not before it: `write_all` can fail having
-        // already committed part of a frame (the 5s SO_SNDTIMEO turns a full
-        // socket buffer into a short write), which leaves no boundary to
-        // resume from. A second pump writing its header after that splices it
-        // into the first one's body, and the client reports a framing bug that
-        // never happened — a manufactured sibling of the very message this
-        // file exists to make trustworthy. One writer giving up ends the
-        // stream for all of them.
+        self.frame_locked(stream, kind, bytes, self.stall_budget, true)
+    }
+
+    fn frame_locked(
+        &self,
+        mut stream: std::sync::MutexGuard<'_, UnixStream>,
+        kind: u8,
+        bytes: &[u8],
+        budget: Duration,
+        heed_abandon: bool,
+    ) -> io::Result<()> {
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "oversized host frame"))?;
+        // Checked under the lock, not before it. A write that gives up may
+        // have committed part of a frame, leaving no boundary to resume from,
+        // and the stdout and stderr pumps share this writer: a second pump
+        // writing its header after that splices it into the first one's body,
+        // and the client reports a framing bug that never happened — a
+        // manufactured sibling of the very message this file exists to make
+        // trustworthy. One writer giving up ends the stream for all of them.
+        // A timeout alone no longer truncates anything: only budget
+        // exhaustion, cancellation, or a hard error can.
         if self.disconnected.load(Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "check-host response stream already gave up",
             ));
         }
-        let result = stream
-            .write_all(&[kind])
-            .and_then(|()| stream.write_all(&len.to_be_bytes()))
-            .and_then(|()| stream.write_all(bytes));
+        // Destructured rather than indexed: total, panic-free, and it cannot
+        // silently produce a zero-length header the way a fallible write into
+        // a fixed array could. A malformed header is a desynchronised stream,
+        // which is the class of lie this file exists to stop telling.
+        let [a, b, c, d] = len.to_be_bytes();
+        let header = [kind, a, b, c, d];
+        let abandoned = heed_abandon.then_some(&self.abandoned);
+        let result = write_patiently(&mut stream, &header, budget, abandoned)
+            .and_then(|()| write_patiently(&mut stream, bytes, budget, abandoned));
         if result.is_err() {
             self.disconnected.store(true, Ordering::Relaxed);
             // Give the client a clean EOF to report rather than half a frame
@@ -148,6 +211,81 @@ impl FrameWriter {
         }
         result
     }
+}
+
+/// Write every byte, waiting out a client that is slow without burying it.
+///
+/// Two things go wrong with `write_all` on this socket. It reports a timeout
+/// without saying how much it committed, so a partially written frame leaves
+/// no boundary to resume from; and it cannot distinguish a client that has
+/// died from one whose own stdout blocked for five seconds. The first
+/// manufactures framing errors, and the second kills hosted checks that were
+/// doing nothing wrong.
+///
+/// Tracking progress fixes both: the offset keeps the boundary, and the budget
+/// — reset by any progress at all — is what separates slow from stuck. A peer
+/// that is genuinely gone reports EPIPE or ECONNRESET rather than timing out,
+/// so it still fails at once.
+fn write_patiently(
+    stream: &mut UnixStream,
+    buf: &[u8],
+    budget: Duration,
+    abandoned: Option<&AtomicBool>,
+) -> io::Result<()> {
+    let mut written = 0usize;
+    let mut since_progress = Instant::now();
+    while written < buf.len() {
+        let rest = buf
+            .get(written..)
+            .ok_or_else(|| io::Error::other("check-host frame write ran past its buffer"))?;
+        match stream.write(rest) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "check-host client accepted no bytes",
+                ))
+            }
+            Ok(n) => {
+                written = written.saturating_add(n);
+                since_progress = Instant::now();
+            }
+            // A signal is not progress. Retrying is right — the offset is
+            // intact — but exempting it from the budget would let a stream of
+            // interruptions hold a worker and its memory permit forever, which
+            // is the bound this function advertises.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                // The socket wakes at least every `OUTPUT_TIMEOUT`, so this
+                // is where a cancelled request gets to stop waiting.
+                if abandoned.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "check-host request was cancelled while writing",
+                    ));
+                }
+                if since_progress.elapsed() >= budget {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        // `{:?}`, not `as_secs()`: a sub-second budget (the
+                        // tests use one) would truncate to "0s" and read as
+                        // though no time had been given at all.
+                        // Not "the client accepted nothing": an EINTR storm
+                        // reaches here too, and that is the host's own signal
+                        // traffic, not the client's fault.
+                        format!("no progress writing to the check-host client for {budget:?}"),
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 pub fn should_forward(args: &[String]) -> bool {
@@ -1104,6 +1242,9 @@ fn run_request(
         Err(e) => {
             terminate_tree(pid);
             let _ = child.wait();
+            // Same reason as the cancel path: a pump parked on a stalled
+            // client would otherwise hold this worker for the whole budget.
+            writer.abandon();
             let _ = out_thread.join();
             return Err(e);
         }
@@ -1121,6 +1262,7 @@ fn run_request(
                 // the same stream. Leaving them running splices one into the
                 // other and manufactures a framing error.
                 terminate_tree(pid);
+                writer.abandon();
                 let _ = out_thread.join();
                 let _ = err_thread.join();
                 return Err(format!("wait for hosted command {pid}: {e}"));
@@ -1153,17 +1295,31 @@ fn run_request(
                 causes.join(", "),
                 epoch_seconds()
             );
+            // Kill FIRST, explain second. The reserve being crossed is the
+            // one moment nothing may wait, and this diagnostic goes to the
+            // client whose stalled reading may be why the write would wait at
+            // all — so writing it before the kill can keep the memory-heavy
+            // child alive for the whole stall budget, precisely when that is
+            // most expensive. The explanation is worth a few seconds, not
+            // minutes, so it also carries its own short deadline.
+            terminate_tree(pid);
             if pressure {
-                let _ = writer.frame(
+                let _ = writer.frame_if_free(
                     FRAME_STDERR,
                     b"td-builder: check host: emergency memory reserve crossed; cancelling hosted check\n",
+                    OUTPUT_TIMEOUT,
                 );
             }
-            terminate_tree(pid);
+            // Release any pump already parked on this client. Without this the
+            // kill frees the child's memory but the worker and its permit stay
+            // held for the rest of the budget, so a few stalled clients shrink
+            // the pool for minutes.
+            writer.abandon();
             match child.wait() {
                 Ok(status) => break status,
                 Err(e) => {
                     // Same reason as above: never return past a live pump.
+                    writer.abandon();
                     let _ = out_thread.join();
                     let _ = err_thread.join();
                     return Err(format!("wait after cancelling hosted command {pid}: {e}"));
@@ -1856,6 +2012,141 @@ mod tests {
         assert!(!ended_at_boundary(io::ErrorKind::InvalidData));
     }
 
+    /// A client that is merely SLOW must not be buried.
+    ///
+    /// This is the flake, at the only level it can be staged: the response
+    /// socket's 5s `SO_SNDTIMEO` used to be read as "the client is gone", so a
+    /// hosted check was cancelled and SIGKILLed because a log reader paused.
+    /// The client then saw an ending at a frame boundary and reported a host
+    /// that had died, while the host was healthy throughout. Nothing here is
+    /// wrong except the reader's timing, so nothing may be killed.
+    #[test]
+    fn a_slow_client_is_waited_for_rather_than_buried() {
+        let (mut client, host) = UnixStream::pair().unwrap();
+        let mut clone = host.try_clone().unwrap();
+        let writer = FrameWriter::new(host).unwrap();
+        // Wake often, so the timeout path is taken many times over the pause
+        // below without the test having to wait five seconds for each.
+        clone
+            .set_write_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+
+        // Position-dependent, so a write that resumes from the wrong offset
+        // or repeats a slice cannot go unnoticed the way a run of one byte
+        // would. Far larger than any plausible socket buffer, so the write
+        // cannot simply be swallowed whole.
+        const PAYLOAD: usize = 8 * 1024 * 1024;
+        let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
+        let mut expected = Vec::with_capacity(PAYLOAD + 5);
+        expected.push(FRAME_STDOUT);
+        expected.extend_from_slice(&(PAYLOAD as u32).to_be_bytes());
+        expected.extend_from_slice(&payload);
+
+        // The reader stalls, then comes back — a slow consumer, not a dead one.
+        let stall = Duration::from_millis(300);
+        // Bounded, so a mutation that writes too few bytes fails this test
+        // instead of parking the suite on a read that will never complete.
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let drained = std::thread::spawn(move || {
+            std::thread::sleep(stall);
+            let mut sink = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            while sink.len() < PAYLOAD + 5 {
+                match client.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+                }
+            }
+            sink
+        });
+
+        let started = Instant::now();
+        let sent = writer.frame(FRAME_STDOUT, &payload);
+        let waited = started.elapsed();
+        assert!(
+            sent.is_ok(),
+            "a client that paused and came back must be waited for: {sent:?}"
+        );
+        assert!(
+            !writer.disconnected.load(Ordering::Relaxed),
+            "a slow client must not be marked gone; that is what kills the check"
+        );
+        // Without this the test could pass having never blocked at all — if
+        // the buffer swallowed the frame, restoring "a timeout is fatal" would
+        // stay green and this would pin nothing.
+        assert!(
+            waited >= stall,
+            "the write must actually have waited on the reader, waited {waited:?}"
+        );
+
+        // Exact bytes, header included: this is what pins the offset
+        // arithmetic and the five-byte header the resumed writes must not
+        // disturb. Read below the protocol layer deliberately — the frame is
+        // larger than `IO_CHUNK_BYTES`, so a real client would refuse it, but
+        // the contract under test is the writer's, not the reader's.
+        let read_back = drained.join().unwrap_or_default();
+        assert_eq!(
+            read_back.len(),
+            expected.len(),
+            "the frame must arrive whole once the reader returns"
+        );
+        assert!(
+            read_back == expected,
+            "the frame must arrive byte-for-byte across the resumed writes"
+        );
+    }
+
+    /// Cancelling reaches a write that is ALREADY parked on a stalled client.
+    ///
+    /// Patience is for a client that might still be served. Once the check is
+    /// dead there is nothing left to deliver, and a pump still waiting out its
+    /// budget holds a worker and a memory permit that the host needs back —
+    /// so a handful of stalled clients would shrink the pool for minutes.
+    #[test]
+    fn cancelling_releases_a_write_already_parked_on_a_stalled_client() {
+        let (client, host) = UnixStream::pair().unwrap();
+        let mut clone = host.try_clone().unwrap();
+        // The production budget: nothing here may depend on it expiring.
+        let writer = FrameWriter::with_budget(host, STALL_BUDGET).unwrap();
+        clone
+            .set_write_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+
+        let writing = Arc::clone(&writer);
+        let parked = std::thread::spawn(move || {
+            let payload = vec![b'x'; 8 * 1024 * 1024];
+            writing.frame(FRAME_STDOUT, &payload)
+        });
+
+        // Let it fill the buffer and settle into waiting. `client` is never
+        // read and never dropped: the peer is alive, just not listening.
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        writer.abandon();
+        let outcome = parked.join();
+        let waited = started.elapsed();
+
+        assert!(outcome.is_ok(), "the writing thread must not have panicked");
+        let result = outcome.unwrap_or(Ok(()));
+        assert!(
+            result.is_err(),
+            "a cancelled write must stop rather than deliver"
+        );
+        assert_eq!(
+            result.map_err(|e| e.kind()).unwrap_err(),
+            io::ErrorKind::Interrupted,
+            "cancellation is not the client's failure"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "cancelling must not wait out the budget, waited {waited:?}"
+        );
+
+        drop(client);
+    }
+
     /// A failed frame shuts the write half for EVERY handle on the socket.
     ///
     /// `frame`'s refusal only covers writers sharing one `FrameWriter`, and a
@@ -1863,43 +2154,39 @@ mod tests {
     /// pumps one handle while its caller holds another. The `shutdown` is the
     /// part that reaches those, so it is pinned rather than assumed.
     ///
-    /// Staged with a live peer and a full buffer, which is the case that
-    /// matters: a dead peer would fail the clone's write anyway and prove
+    /// Staged with a live peer whose budget has run out, which is the case
+    /// that matters: a dead peer would fail the clone's write anyway and prove
     /// nothing about whether the shutdown happened.
     #[test]
     fn a_failed_frame_shuts_the_write_half_for_every_handle() {
         let (mut client, host) = UnixStream::pair().unwrap();
         let mut clone = host.try_clone().unwrap();
-        let writer = FrameWriter::new(host).unwrap();
+        // A budget this short makes "stuck" reachable in a test. Production
+        // waits `STALL_BUDGET`; the verdict is the same, only later.
+        let writer = FrameWriter::with_budget(host, Duration::from_millis(100)).unwrap();
         // SO_SNDTIMEO is a socket option, so this reaches the writer's handle
-        // too, and turns the 5s production timeout into a testable one.
+        // too: it is how often the write wakes to look, not the verdict.
         clone
-            .set_write_timeout(Some(Duration::from_millis(100)))
+            .set_write_timeout(Some(Duration::from_millis(20)))
             .unwrap();
 
-        // Fill the buffer against a client that is not reading, until a write
-        // times out with the peer still very much alive.
+        // Fill the buffer against a client that never reads, until the budget
+        // is spent and the writer gives up on it.
         let payload = vec![b'x'; 64 * 1024];
-        let mut timed_out = false;
+        let mut gave_up = false;
         for _ in 0..64 {
             if writer.frame(FRAME_STDOUT, &payload).is_err() {
-                timed_out = true;
+                gave_up = true;
                 break;
             }
         }
         assert!(
-            timed_out,
+            gave_up,
             "the socket buffer must fill for this to test anything"
         );
-        // The crux, and the reason this matters beyond framing: the peer is
-        // ALIVE and merely slow, and the host has just marked it gone. The
-        // cancel loop reads exactly this flag and SIGKILLs the whole hosted
-        // check, after which the client reads an ending at a frame boundary —
-        // the reported flake's shape, produced by a healthy host and a client
-        // that stopped draining for five seconds.
         assert!(
             writer.disconnected.load(Ordering::Relaxed),
-            "a write timeout marks a live client disconnected"
+            "a client that never accepts a byte is eventually stuck, not slow"
         );
 
         // Drain it, so a write would succeed again if nothing had shut the
