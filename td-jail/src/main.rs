@@ -59,6 +59,7 @@ fn run() -> std::io::Result<()> {
         }
         transition::Mode::FirefoxSupportProbe => transition::probe_firefox_support(),
         transition::Mode::FirefoxNetworkProbe => transition::probe_firefox_network(),
+        transition::Mode::FirefoxSoakProbe => transition::probe_firefox_soak(),
         transition::Mode::FirefoxInputProbe { stage } => {
             transition::probe_firefox_input(stage)
         }

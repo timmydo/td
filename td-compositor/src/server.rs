@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GLOBAL_COMPOSITOR: u32 = 1;
 const GLOBAL_SHM: u32 = 2;
@@ -7199,10 +7199,32 @@ fn content_rgb_text(rgb: [u8; 3]) -> String {
 
 const MAX_APPLICATION_EVIDENCE_BYTES: usize = 1_024;
 const APPLICATION_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(5);
+const APPLICATION_GENERATION_BYTES: usize = 16;
 
-fn application_evidence_line(evidence: &ApplicationEvidence) -> Result<String, String> {
+fn valid_application_generation(generation: &str) -> bool {
+    generation.len() == APPLICATION_GENERATION_BYTES * 2
+        && generation
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn application_generation() -> Result<String, String> {
+    let mut bytes = [0_u8; APPLICATION_GENERATION_BYTES];
+    File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut bytes))
+        .map_err(|error| format!("read application generation randomness: {error}"))?;
+    Ok(format!("{:032x}", u128::from_ne_bytes(bytes)))
+}
+
+fn application_evidence_line(
+    evidence: &ApplicationEvidence,
+    generation: &str,
+) -> Result<String, String> {
     if !valid_expected_app_id(&evidence.app_id) {
         return Err("application evidence contains an invalid identity token".to_string());
+    }
+    if !valid_application_generation(generation) {
+        return Err("application evidence contains an invalid compositor generation".to_string());
     }
     if !evidence.content_pixels.iter().all(|count| {
         (MIN_APPLICATION_CONTENT_PIXELS..=MAX_APPLICATION_PIXEL_SCAN).contains(count)
@@ -7213,8 +7235,9 @@ fn application_evidence_line(evidence: &ApplicationEvidence) -> Result<String, S
     let [content_pixels_a, content_pixels_b] = evidence.content_pixels;
     let resources = evidence.resources;
     Ok(format!(
-        "TD-APPLICATION-CONTENT-READY app-id={} content-rgb-a={} content-rgb-b={} content-pixels-a={} content-pixels-b={} objects={} shm-pools={} shm-bytes={} callbacks={} cached-commits={} deferred-events={} deferred-bytes={} copied-shm-bytes={} copied-buffers={}\n",
+        "TD-APPLICATION-CONTENT-READY app-id={} generation={} content-rgb-a={} content-rgb-b={} content-pixels-a={} content-pixels-b={} objects={} shm-pools={} shm-bytes={} callbacks={} cached-commits={} deferred-events={} deferred-bytes={} copied-shm-bytes={} copied-buffers={}\n",
         evidence.app_id,
+        generation,
         content_rgb_text(content_rgb_a),
         content_rgb_text(content_rgb_b),
         content_pixels_a,
@@ -7272,6 +7295,10 @@ fn parse_application_evidence(
         return Err("application evidence has the wrong marker".to_string());
     }
     let app_id = parse_evidence_field(&mut fields, "app-id=")?;
+    let generation = parse_evidence_field(&mut fields, "generation=")?;
+    if !valid_application_generation(generation) {
+        return Err("application evidence has an invalid compositor generation".to_string());
+    }
     let observed_content_rgb_a = parse_evidence_field(&mut fields, "content-rgb-a=")?;
     let observed_content_rgb_b = parse_evidence_field(&mut fields, "content-rgb-b=")?;
     let content_rgbs = [
@@ -7381,6 +7408,7 @@ pub(crate) struct ApplicationObserver {
     pub content_wake: SyncSender<ApplicationEvidence>,
     pub cursor_wake: SyncSender<ApplicationCursorEvidence>,
     pub content_rgbs: [[u8; 3]; 2],
+    pub connection_live: Arc<AtomicBool>,
 }
 
 /// Start the one-shot publisher before clients can connect. Its socket is
@@ -7409,8 +7437,11 @@ pub fn watch_application(
     let path = path.to_path_buf();
     let app_id = app_id.to_string();
     let cursor_app_id = app_id.clone();
+    let generation = application_generation()?;
     let (wake, receiver) = mpsc::sync_channel::<ApplicationEvidence>(1);
     let (cursor_wake, cursor_receiver) = mpsc::sync_channel::<ApplicationCursorEvidence>(1);
+    let connection_live = Arc::new(AtomicBool::new(false));
+    let publisher_live = Arc::clone(&connection_live);
     thread::Builder::new()
         .name("application-client-cursor".into())
         .spawn(move || {
@@ -7442,14 +7473,19 @@ pub fn watch_application(
                     "td-compositor: application readiness identity changed before publication");
                 std::process::exit(1);
             }
-            let answer = match application_evidence_line(&evidence) {
+            let answer = match application_evidence_line(&evidence, &generation) {
                 Ok(answer) => answer.into_bytes(),
                 Err(error) => {
                     eprintln!("td-compositor: application readiness: {error}");
                     std::process::exit(1);
                 }
             };
-            match socket::publish(&path, "application-ready", answer) {
+            match socket::publish_while(
+                &path,
+                "application-ready",
+                answer,
+                publisher_live,
+            ) {
                 Ok(published) => {
                     if let Err(error) = announce_application_ready(
                         &mut std::io::stdout().lock(),
@@ -7481,6 +7517,7 @@ pub fn watch_application(
         content_wake: wake,
         cursor_wake,
         content_rgbs,
+        connection_live,
     })
 }
 
@@ -7636,6 +7673,85 @@ pub fn probe(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("connect Wayland socket {}: {e}", path.display()))
 }
 
+fn application_remaining(deadline: Instant) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("application evidence probe exceeded its deadline".to_string());
+    }
+    Ok(remaining)
+}
+
+fn connect_application_within(path: &Path, deadline: Instant) -> Result<UnixStream, String> {
+    let target = path.to_path_buf();
+    connect_application_with(
+        format!("application-window readiness socket {}", path.display()),
+        deadline,
+        move || UnixStream::connect(target),
+    )
+}
+
+fn connect_application_with<F>(
+    label: String,
+    deadline: Instant,
+    connect: F,
+) -> Result<UnixStream, String>
+where
+    F: FnOnce() -> std::io::Result<UnixStream> + Send + 'static,
+{
+    let (send, receive) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("application-probe-connect".into())
+        .spawn(move || {
+            let _ = send.send(connect());
+        })
+        .map_err(|error| format!("start bounded application evidence connect: {error}"))?;
+    match receive.recv_timeout(application_remaining(deadline)?) {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(format!("connect {label}: {error}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("connect {label}: deadline exceeded")),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("application evidence connect worker stopped without an answer".to_string())
+        }
+    }
+}
+
+fn read_application_evidence(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 256];
+    loop {
+        stream
+            .set_read_timeout(Some(application_remaining(deadline)?))
+            .map_err(|error| format!("set application evidence read timeout: {error}"))?;
+        let count = match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err("read application evidence: deadline exceeded".to_string());
+            }
+            Err(error) => return Err(format!("read application evidence: {error}")),
+        };
+        let read = chunk
+            .get(..count)
+            .ok_or_else(|| "application evidence read escaped its buffer".to_string())?;
+        bytes.extend_from_slice(read);
+        if bytes.len() > MAX_APPLICATION_EVIDENCE_BYTES {
+            return Err(format!(
+                "application evidence exceeds {MAX_APPLICATION_EVIDENCE_BYTES} bytes"
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
 pub fn probe_application(
     path: &Path,
     expected_app_id: &str,
@@ -7653,27 +7769,15 @@ pub fn probe_application(
     if parsed_rgb_a == parsed_rgb_b {
         return Err("probe application content colors must be distinct".to_string());
     }
-    let mut stream = UnixStream::connect(path).map_err(|error| {
-        format!(
-            "connect application-window readiness socket {}: {error}",
-            path.display()
-        )
-    })?;
-    stream
-        .set_read_timeout(Some(APPLICATION_EVIDENCE_TIMEOUT))
-        .map_err(|error| format!("set application evidence read timeout: {error}"))?;
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut stream)
-        .take(
-            u64::try_from(MAX_APPLICATION_EVIDENCE_BYTES.saturating_add(1))
-                .unwrap_or(u64::MAX),
-        )
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("read application evidence: {error}"))?;
-    if bytes.len() > MAX_APPLICATION_EVIDENCE_BYTES {
-        return Err(format!(
-            "application evidence exceeds {MAX_APPLICATION_EVIDENCE_BYTES} bytes"
-        ));
+    let deadline = Instant::now()
+        .checked_add(APPLICATION_EVIDENCE_TIMEOUT)
+        .ok_or_else(|| "application evidence deadline overflow".to_string())?;
+    let mut stream = connect_application_within(path, deadline)?;
+    let bytes = read_application_evidence(&mut stream, deadline)?;
+    if bytes.is_empty() {
+        return Err(
+            "application readiness was withdrawn after its Wayland client departed".to_string(),
+        );
     }
     let line = String::from_utf8(bytes)
         .map_err(|error| format!("application evidence is not UTF-8: {error}"))?;
@@ -7782,6 +7886,7 @@ mod tests {
     const APPLICATION_CONTENT_RGB_A_TEXT: &str = "ff00ff";
     const APPLICATION_CONTENT_RGB_B_TEXT: &str = "00ff00";
     const APPLICATION_CONTENT_RGBS: [[u8; 3]; 2] = [[0xff, 0x00, 0xff], [0x00, 0xff, 0x00]];
+    const APPLICATION_GENERATION: &str = "0123456789abcdef0123456789abcdef";
 
     fn application_evidence(app_id: &str) -> ApplicationEvidence {
         ApplicationEvidence {
@@ -7824,6 +7929,7 @@ mod tests {
         )
         .is_err());
 
+        observer.connection_live.store(true, Ordering::Release);
         observer
             .content_wake
             .try_send(application_evidence(app_id))
@@ -7848,9 +7954,45 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        observer.connection_live.store(false, Ordering::Release);
+        let error = probe_application(
+            &path,
+            app_id,
+            APPLICATION_CONTENT_RGB_A_TEXT,
+            APPLICATION_CONTENT_RGB_B_TEXT,
+        )
+        .expect_err("departed client retained application readiness");
+        assert!(error.contains("Wayland client departed"), "{error}");
 
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn application_probe_connect_and_read_share_absolute_deadlines() {
+        let (connected, _peer) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let error = connect_application_with("stalled test socket".to_string(), deadline, move || {
+            thread::sleep(Duration::from_millis(60));
+            Ok(connected)
+        })
+        .expect_err("stalled connect escaped deadline");
+        assert!(error.contains("deadline"), "{error}");
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let served = thread::spawn(move || {
+            for byte in [b'x'; 16] {
+                thread::sleep(Duration::from_millis(5));
+                if writer.write_all(&[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let error = read_application_evidence(&mut reader, deadline)
+            .expect_err("dribbled evidence escaped deadline");
+        assert!(error.contains("deadline"), "{error}");
+        served.join().unwrap();
     }
 
     #[test]
@@ -7942,7 +8084,14 @@ mod tests {
     fn application_evidence_parser_pins_identity_shape_and_resource_bounds() {
         let app_id = "org.mozilla.firefox";
         let evidence = application_evidence(app_id);
-        let line = application_evidence_line(&evidence).unwrap();
+        let line = application_evidence_line(&evidence, APPLICATION_GENERATION).unwrap();
+        assert!(line.starts_with(
+            "TD-APPLICATION-CONTENT-READY app-id=org.mozilla.firefox \
+             generation=0123456789abcdef0123456789abcdef content-rgb-a=ff00ff "
+        ));
+        assert!(valid_application_generation(
+            &application_generation().unwrap()
+        ));
         assert_eq!(
             parse_application_evidence(
                 &line,
@@ -7958,10 +8107,13 @@ mod tests {
             MIN_APPLICATION_CONTENT_PIXELS - 1,
             MAX_APPLICATION_PIXEL_SCAN + 1,
         ] {
-            let invalid = application_evidence_line(&ApplicationEvidence {
-                content_pixels: [content_pixels, 9_000],
-                ..evidence.clone()
-            });
+            let invalid = application_evidence_line(
+                &ApplicationEvidence {
+                    content_pixels: [content_pixels, 9_000],
+                    ..evidence.clone()
+                },
+                APPLICATION_GENERATION,
+            );
             assert!(invalid.is_err());
         }
 
@@ -8027,11 +8179,14 @@ mod tests {
                 ..evidence.resources
             },
         ] {
-            let invalid = application_evidence_line(&ApplicationEvidence {
-                app_id: app_id.to_string(),
-                resources,
-                ..evidence.clone()
-            })
+            let invalid = application_evidence_line(
+                &ApplicationEvidence {
+                    app_id: app_id.to_string(),
+                    resources,
+                    ..evidence.clone()
+                },
+                APPLICATION_GENERATION,
+            )
             .unwrap();
             assert!(parse_application_evidence(
                 &invalid,
@@ -8057,6 +8212,14 @@ mod tests {
         .is_err());
         assert!(parse_application_evidence(
             &line.replacen('\n', " extra=true\n", 1),
+            app_id,
+            APPLICATION_CONTENT_RGB_A_TEXT,
+            APPLICATION_CONTENT_RGB_B_TEXT,
+        )
+        .is_err());
+        assert!(application_evidence_line(&evidence, "not-a-generation").is_err());
+        assert!(parse_application_evidence(
+            &line.replace(APPLICATION_GENERATION, "ABCDEF0123456789ABCDEF0123456789"),
             app_id,
             APPLICATION_CONTENT_RGB_A_TEXT,
             APPLICATION_CONTENT_RGB_B_TEXT,

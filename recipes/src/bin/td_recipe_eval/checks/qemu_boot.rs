@@ -141,6 +141,7 @@ const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MA
 const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_ARMED_MARKER;
 const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MENU_MARKER;
 const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MARKER;
+const TD_FIREFOX_SOAK_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SOAK_MARKER;
 const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
 const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_TARGET_PREFIX;
 const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str =
@@ -404,6 +405,7 @@ struct ConsoleEvidence {
     td_firefox_input_armed: bool,
     td_firefox_input_menu: bool,
     td_firefox_input: bool,
+    td_firefox_soak: bool,
     td_term_clipboard_focus: Option<u32>,
     td_term_clipboard_target: Option<TerminalClipboardTarget>,
     td_term_clipboard_selection: bool,
@@ -1124,6 +1126,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          matched the portal's announced frame to its centred QMP-captured pixels \
          ({TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX}), physically selected the download, and \
          validated its exact name, size and bytes in Firefox ({TD_FIREFOX_FILE_CHOOSER_MARKER}), \
+         then held one Marionette session for five minutes across 31 exact HTTPS \
+         navigations while the Firefox process, D-Bus connections, and Wayland connection \
+         remained unchanged ({TD_FIREFOX_SOAK_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1352,6 +1357,11 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
             result.evidence.td_firefox_file_chooser,
             TD_FIREFOX_FILE_CHOOSER_MARKER,
             "Firefox did not receive the exact selected file and its authenticated bytes",
+        ),
+        (
+            result.evidence.td_firefox_soak,
+            TD_FIREFOX_SOAK_MARKER,
+            "Firefox did not survive the five-minute HTTPS continuity soak",
         ),
     ] {
         if !seen {
@@ -4317,6 +4327,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
             .len()
             .saturating_add(256),
         exact_line_window(TD_FIREFOX_FILE_CHOOSER_MARKER),
+        exact_line_window(TD_FIREFOX_SOAK_MARKER),
         TD_APPLICATION_CURSOR_PREFIX.len().saturating_add(32),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
@@ -4658,6 +4669,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_firefox_file_chooser,
         buf,
         TD_FIREFOX_FILE_CHOOSER_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_soak,
+        buf,
+        TD_FIREFOX_SOAK_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_application_cursor(
@@ -6768,6 +6785,11 @@ mod tests {
         assert!(firefox.contains("file:///home/td/Downloads/td-firefox-download.txt"));
         assert!(firefox.contains("document.contentType === \"text/plain\""));
         assert!(firefox.contains("document.body.textContent"));
+        assert!(firefox.contains(&format!("    \"{TD_FIREFOX_SOAK_MARKER}\";")));
+        assert!(firefox.contains("\"https://localhost:8443/content-alt.html\""));
+        assert!(firefox.contains("const SOAK_DURATION: Duration = Duration::from_secs(300);"));
+        assert!(firefox.contains("const SOAK_INTERVAL: Duration = Duration::from_secs(10);"));
+        assert!(firefox.contains("const SOAK_NAVIGATIONS: u8 = 31;"));
         let portal = include_str!("../../../../../td-portal/src/main.rs");
         let presented = TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX
             .strip_prefix("portal: ")
@@ -6782,6 +6804,7 @@ mod tests {
         assert!(system
             .contains("const FIREFOX_DOWNLOAD_SOURCE: &str = \"/var/home/tester/Downloads\";"));
         assert!(system.contains("https://localhost:8443/content.html"));
+        assert!(system.contains("$origin/content-alt.html"));
         assert!(system.contains("<a id=td-download href=download.txt "));
         assert!(system.contains("download=td-firefox-download.txt>Download</a>"));
         assert!(system.contains("/var/home/tester/Downloads/td-firefox-download.txt"));
@@ -7429,7 +7452,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 71] {
+    fn all_console_markers() -> [&'static str; 72] {
         [
             MARKER,
             EROFS_MARKER,
@@ -7498,6 +7521,7 @@ mod tests {
             TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER,
             TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX,
             TD_FIREFOX_FILE_CHOOSER_MARKER,
+            TD_FIREFOX_SOAK_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
@@ -7556,6 +7580,27 @@ mod tests {
             b"target",
         );
         assert!(evidence.firefox_network);
+    }
+
+    #[test]
+    fn firefox_soak_evidence_requires_one_exact_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_FIREFOX_SOAK_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_firefox_soak);
+        for invalid in [
+            format!("noise {TD_FIREFOX_SOAK_MARKER}\n"),
+            format!("\n{TD_FIREFOX_SOAK_MARKER} trailing\n"),
+            "\nTD-FIREFOX-SOAK-OK minimum-seconds=299 navigations=31\n".to_string(),
+            "\nTD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=30\n".to_string(),
+        ] {
+            let mut rejected = ConsoleEvidence::default();
+            latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");
+            assert!(!rejected.td_firefox_soak, "accepted {invalid:?}");
+        }
     }
 
     #[test]

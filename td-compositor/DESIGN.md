@@ -2402,7 +2402,8 @@ scheduled observation from surviving a later detach or buffer replacement in
 the same parent commit.
 
 The readiness answer is one newline-terminated structured line carrying the
-app id, both RGB values, both bounded matching-pixel counts and that
+app id, one random compositor-process generation, both RGB values, both
+bounded matching-pixel counts and that
 connection's monotonic high-water counts for objects, retained shm pools and
 bytes, frame callbacks, synchronized commit caches, deferred events and bytes,
 and copied surface bytes AND buffers, which are separate high-waters because a
@@ -2413,10 +2414,18 @@ least one object/pool/shm byte/copied byte/copied buffer, and every compiled
 resource ceiling before it reproduces the line. Matching surface keys remain
 after the one-shot publication so launcher activation can reuse the
 service-owned window; role, surface and client teardown remove them and their
-telemetry registration. `probe-application SOCKET ID RGB-A RGB-B` connects to
-that distinct socket and reproduces the structured line; its `--quiet` form
+telemetry registration. `probe-application SOCKET ID RGB-A RGB-B` connects and
+reads against one five-second absolute deadline, then reproduces the structured
+line; its `--quiet` form
 applies the same validation for supervisor readiness without putting a second
-evidence record on the console.
+evidence record on the console. The published answer is also latched to that
+exact Wayland client connection, and carries a random generation for this
+compositor process. Client teardown clears the latch, so a later probe receives
+no stale first-frame answer even if a new client asserts the same app id. The
+five-minute Firefox QEMU soak compares the complete record before and after its
+navigation loop: generation equality closes compositor restart, while the live
+latch closes original-client departure. The held Marionette session and stable
+process and bus identities independently cover those connections.
 
 The same configured observer has a second one-shot output for client-cursor
 evidence. It remains gated on successful content publication, then accepts

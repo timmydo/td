@@ -309,6 +309,20 @@ fn read_process_command(path: &Path) -> Option<Vec<u8>> {
     Some(command)
 }
 
+fn process_token_evidence(instance: &str, token: &str, pid: u32, starttime: u64) -> String {
+    format!(
+        "TD-JAIL-PROCESS-TOKEN-OK instance={instance} token={token} pid={pid} \
+         starttime={starttime}"
+    )
+}
+
+fn revalidated_process_starttime(path: &Path, initial: u64) -> Option<u64> {
+    let observed = read_process_stat(path)
+        .and_then(|stat| process_starttime(&stat))
+        .ok()?;
+    (observed == initial).then_some(observed)
+}
+
 pub(crate) fn probe_process_token(
     application: &str,
     token: &str,
@@ -331,8 +345,13 @@ pub(crate) fn probe_process_token(
                 "application cgroup {instance:?} has invalid process id {line:?}: {error}"
             ))
         })?;
-        let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
-        let Some(command) = read_process_command(&path) else {
+        let proc_directory = PathBuf::from(format!("/proc/{pid}"));
+        let stat_path = proc_directory.join("stat");
+        let Ok(starttime) = read_process_stat(&stat_path).and_then(|stat| process_starttime(&stat))
+        else {
+            continue;
+        };
+        let Some(command) = read_process_command(&proc_directory.join("cmdline")) else {
             continue;
         };
         if !command_has_token(&command, token) {
@@ -345,9 +364,10 @@ pub(crate) fn probe_process_token(
         if require_membership_text(&observed, &membership).is_err() {
             continue;
         }
-        return Ok(format!(
-            "TD-JAIL-PROCESS-TOKEN-OK instance={instance} token={token} pid={pid}"
-        ));
+        if revalidated_process_starttime(&stat_path, starttime).is_none() {
+            continue;
+        }
+        return Ok(process_token_evidence(&instance, token, pid, starttime));
     }
     Err(io::Error::other(format!(
         "no process in active application cgroup {instance:?} has argument {token:?}"
@@ -1020,5 +1040,19 @@ mod tests {
         let stat = "8123 (firefox child) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 20";
         assert_eq!(process_starttime(stat).unwrap(), 4242);
         assert!(process_starttime("8123 firefox S 1 2").is_err());
+        let path = std::env::temp_dir().join(format!(
+            "td-jail-process-starttime-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::write(&path, stat).unwrap();
+        assert_eq!(revalidated_process_starttime(&path, 4242), Some(4242));
+        assert_eq!(revalidated_process_starttime(&path, 4243), None);
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            process_token_evidence("firefox-abcd", "--marionette", 8123, 4242),
+            "TD-JAIL-PROCESS-TOKEN-OK instance=firefox-abcd token=--marionette \
+             pid=8123 starttime=4242"
+        );
     }
 }

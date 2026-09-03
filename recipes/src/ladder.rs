@@ -602,7 +602,10 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// portal completion and result. Raising the host ceiling by those bounds keeps
 /// it beyond the guest and diagnostic clocks. The public Firefox navigation adds
 /// one further 60-second boundary to the network oracle's evidence transaction.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2355;
+/// The continuity soak adds its bounded 360-second Marionette session and a
+/// 30-second allowance for the four identity probes and local process reads
+/// which bracket it.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2745;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// The source release identities and exact `--version` output shared by the
@@ -909,6 +912,10 @@ pub const TD_FIREFOX_SUPPORT_MARKER: &str = "TD-FIREFOX-SUPPORT-READY";
 pub const TD_FIREFOX_INPUT_ARMED_MARKER: &str = "TD-FIREFOX-INPUT-ARMED";
 pub const TD_FIREFOX_INPUT_MENU_MARKER: &str = "TD-FIREFOX-INPUT-MENU";
 pub const TD_FIREFOX_INPUT_MARKER: &str = "TD-FIREFOX-INPUT-OK";
+/// Emitted after one Firefox process, its broker-authenticated connection set,
+/// and its Wayland connection survive 31 exact local HTTPS navigations over at
+/// least five minutes.
+pub const TD_FIREFOX_SOAK_MARKER: &str = "TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31";
 pub const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = "TD-TERM-CLIPBOARD-FOCUS-READY serial=";
 pub const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = "TD-TERM-CLIPBOARD-TARGET-READY ";
 pub const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str = "TD-TERM-CLIPBOARD-SELECTION-READY bytes=7";

@@ -338,6 +338,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
             observer.content_rgbs,
             observer.content_wake,
             observer.cursor_wake,
+            observer.connection_live,
         )?;
     }
     let runtime = Arc::new(Mutex::new(runtime));

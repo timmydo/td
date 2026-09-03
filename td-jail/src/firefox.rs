@@ -7,12 +7,17 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const MARIONETTE_PORT: u16 = 2828;
 const PROBE_DEADLINE: Duration = Duration::from_secs(60);
 const NETWORK_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 const DOWNLOAD_PROBE_DEADLINE: Duration = Duration::from_secs(40);
+const SOAK_PROBE_DEADLINE: Duration = Duration::from_secs(360);
+const SOAK_DURATION: Duration = Duration::from_secs(300);
+const SOAK_INTERVAL: Duration = Duration::from_secs(10);
+const SOAK_NAVIGATIONS: u8 = 31;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_HEADER_DIGITS: usize = 7;
@@ -49,6 +54,21 @@ const FIREFOX_NETWORK_TEST_URL: &str = "https://git.kernel.org/";
 const FIREFOX_NETWORK_CONTENT_OK: &str = "TD-FIREFOX-NETWORK-CONTENT-OK";
 pub(crate) const FIREFOX_NETWORK_RUNTIME_MARKER: &str =
     "TD-FIREFOX-NETWORK-HTTPS-OK";
+pub(crate) const FIREFOX_SOAK_RUNTIME_MARKER: &str =
+    "TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31";
+const FIREFOX_SOAK_CONTENT_OK: &str = "TD-FIREFOX-SOAK-CONTENT-OK";
+const FIREFOX_SOAK_PAGES: [(&str, &str, &str); 2] = [
+    (
+        "https://localhost:8443/content.html",
+        "TD-FIREFOX-HTTPS-CONTENT-V1",
+        "TD-FIREFOX-SOAK-CONTENT-A-V1",
+    ),
+    (
+        "https://localhost:8443/content-alt.html",
+        "TD-FIREFOX-HTTPS-SOAK-ALT-V1",
+        "TD-FIREFOX-SOAK-CONTENT-B-V1",
+    ),
+];
 const DOWNLOAD_DIRECTORY: &str = "/var/home/tester/Downloads";
 const DOWNLOAD_NAME: &str = "td-firefox-download.txt";
 const DOWNLOAD_BYTES: &[u8] = b"TD-FIREFOX-DOWNLOAD-V1\n";
@@ -87,6 +107,41 @@ fn network_document_script() -> String {
         "__TD_EXPECTED_URL__",
         &json_string(FIREFOX_NETWORK_TEST_URL),
     )
+}
+
+const SOAK_DOCUMENT_SCRIPT_TEMPLATE: &str = r#"
+const done = arguments[arguments.length - 1];
+try {
+  const expectedUrl = __TD_EXPECTED_URL__;
+  const expectedTitle = __TD_EXPECTED_TITLE__;
+  const expectedBody = __TD_EXPECTED_BODY__;
+  const navigation = performance.getEntriesByType("navigation")[0];
+  const marker = document.getElementById("td-soak");
+  if (document.readyState !== "complete") {
+    done("TD-FIREFOX-SOAK-ERROR:not-complete");
+  } else if (document.location.href !== expectedUrl ||
+      document.documentURI !== expectedUrl ||
+      new URL(document.location.href).origin !== new URL(expectedUrl).origin) {
+    done("TD-FIREFOX-SOAK-ERROR:wrong-url");
+  } else if (!navigation || Number(navigation.responseStatus) !== 200) {
+    done("TD-FIREFOX-SOAK-ERROR:http-status");
+  } else if (document.title !== expectedTitle || !marker ||
+      marker.textContent !== expectedBody) {
+    done("TD-FIREFOX-SOAK-ERROR:wrong-content");
+  } else {
+    done("TD-FIREFOX-SOAK-CONTENT-OK");
+  }
+} catch (error) {
+  done("TD-FIREFOX-SOAK-ERROR:" +
+    String(error).replace(/[|,"\\\r\n]/g, "_").slice(0, 256));
+}
+"#;
+
+fn soak_document_script(url: &str, title: &str, body: &str) -> String {
+    SOAK_DOCUMENT_SCRIPT_TEMPLATE
+        .replace("__TD_EXPECTED_URL__", &json_string(url))
+        .replace("__TD_EXPECTED_TITLE__", &json_string(title))
+        .replace("__TD_EXPECTED_BODY__", &json_string(body))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -740,6 +795,19 @@ pub(crate) fn probe_network() -> io::Result<&'static str> {
     Ok(FIREFOX_NETWORK_RUNTIME_MARKER)
 }
 
+pub(crate) fn probe_soak() -> io::Result<&'static str> {
+    let address = SocketAddr::from(([127, 0, 0, 1], MARIONETTE_PORT));
+    let deadline = Instant::now()
+        .checked_add(SOAK_PROBE_DEADLINE)
+        .ok_or_else(|| io::Error::other("Firefox soak probe deadline overflow"))?;
+    let stream = TcpStream::connect_timeout(&address, remaining(deadline)?)
+        .map_err(|error| contextual("connect to Firefox Marionette on loopback", error))?;
+    let mut stream = DeadlineStream { stream, deadline };
+    let mut clock = WallClock::new();
+    probe_soak_stream(&mut stream, &mut clock)?;
+    Ok(FIREFOX_SOAK_RUNTIME_MARKER)
+}
+
 pub(crate) fn probe_input<W: Write>(
     stage: InputStage,
     progress: &mut W,
@@ -934,6 +1002,59 @@ fn probe_network_stream<S: Read + Write>(stream: &mut S) -> io::Result<()> {
     }
 }
 
+trait SoakClock {
+    fn begin(&mut self);
+    fn elapsed(&self) -> Duration;
+    fn sleep(&mut self, duration: Duration);
+}
+
+struct WallClock {
+    start: Instant,
+}
+
+impl WallClock {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl SoakClock for WallClock {
+    fn begin(&mut self) {
+        self.start = Instant::now();
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+fn probe_soak_stream<S: Read + Write, C: SoakClock>(
+    stream: &mut S,
+    clock: &mut C,
+) -> io::Result<()> {
+    start_session(stream)?;
+    clock.begin();
+    let result = run_soak_probe(stream, clock);
+    let cleanup_id = SOAK_NAVIGATIONS
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(3))
+        .ok_or_else(|| io::Error::other("Firefox soak command id overflow"))?;
+    let cleanup = delete_session_with_id(stream, cleanup_id);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe), Err(cleanup)) => Err(io::Error::other(format!(
+            "Firefox soak probe failed: {probe}; session cleanup also failed: {cleanup}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 fn probe_input_stream<S: Read + Write>(stream: &mut S, stage: InputStage) -> io::Result<()> {
     probe_input_stream_with_progress(stream, stage, &mut io::sink())
@@ -1099,6 +1220,39 @@ fn run_network_probe<S: Read + Write>(stream: &mut S) -> io::Result<()> {
         &script,
         FIREFOX_NETWORK_CONTENT_OK,
     )
+}
+
+fn run_soak_probe<S: Read + Write, C: SoakClock>(stream: &mut S, clock: &mut C) -> io::Result<()> {
+    set_context(stream, 2, "content")?;
+    for index in 0..SOAK_NAVIGATIONS {
+        let target = SOAK_INTERVAL
+            .checked_mul(u32::from(index))
+            .ok_or_else(|| io::Error::other("Firefox soak schedule overflow"))?;
+        if let Some(wait) = target.checked_sub(clock.elapsed()) {
+            if !wait.is_zero() {
+                clock.sleep(wait);
+            }
+        }
+        let navigate_id = index
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(3))
+            .ok_or_else(|| io::Error::other("Firefox soak navigation id overflow"))?;
+        let script_id = navigate_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Firefox soak script id overflow"))?;
+        let page = FIREFOX_SOAK_PAGES
+            .get(usize::from(index % 2))
+            .ok_or_else(|| io::Error::other("Firefox soak page table is incomplete"))?;
+        navigate(stream, navigate_id, page.0)?;
+        let script = soak_document_script(page.0, page.1, page.2);
+        require_script_value(stream, script_id, &script, FIREFOX_SOAK_CONTENT_OK)?;
+    }
+    if clock.elapsed() < SOAK_DURATION {
+        return Err(io::Error::other(
+            "Firefox soak completed before its five-minute floor",
+        ));
+    }
+    Ok(())
 }
 
 fn navigate<S: Read + Write>(stream: &mut S, id: u8, url: &str) -> io::Result<()> {
@@ -1711,6 +1865,28 @@ mod tests {
         output: Vec<u8>,
     }
 
+    #[derive(Default)]
+    struct FakeSoakClock {
+        elapsed: Duration,
+        sleeps: Vec<Duration>,
+    }
+
+    impl SoakClock for FakeSoakClock {
+        fn begin(&mut self) {
+            self.elapsed = Duration::ZERO;
+            self.sleeps.clear();
+        }
+
+        fn elapsed(&self) -> Duration {
+            self.elapsed
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.elapsed = self.elapsed.saturating_add(duration);
+            self.sleeps.push(duration);
+        }
+    }
+
     impl Read for ScriptedIo {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             self.input.read(buf)
@@ -1769,6 +1945,10 @@ mod tests {
         assert_eq!(PROBE_DEADLINE, Duration::from_secs(60));
         assert_eq!(NETWORK_PROBE_DEADLINE, Duration::from_secs(60));
         assert_eq!(DOWNLOAD_PROBE_DEADLINE, Duration::from_secs(40));
+        assert_eq!(SOAK_PROBE_DEADLINE, Duration::from_secs(360));
+        assert_eq!(SOAK_DURATION, Duration::from_secs(300));
+        assert_eq!(SOAK_INTERVAL, Duration::from_secs(10));
+        assert_eq!(SOAK_NAVIGATIONS, 31);
         assert_eq!(
             remaining(Instant::now()).unwrap_err().kind(),
             io::ErrorKind::TimedOut
@@ -1963,6 +2143,98 @@ mod tests {
                 r#"[0,5,"WebDriver:DeleteSession",{}]"#,
             ]
         );
+    }
+
+    fn soak_transcript(failure_at: Option<u8>) -> ScriptedIo {
+        let mut responses = vec![
+            HELLO.to_string(),
+            r#"[1,1,null,{"sessionId":"td","capabilities":{}}]"#.to_string(),
+            r#"[1,2,null,{"value":null}]"#.to_string(),
+        ];
+        for index in 0..SOAK_NAVIGATIONS {
+            let navigate_id = 3 + index * 2;
+            let script_id = navigate_id + 1;
+            responses.push(format!(r#"[1,{navigate_id},null,{{"value":null}}]"#));
+            let value = if failure_at == Some(index) {
+                "TD-FIREFOX-SOAK-ERROR:wrong-content"
+            } else {
+                FIREFOX_SOAK_CONTENT_OK
+            };
+            responses.push(format!(r#"[1,{script_id},null,{{"value":"{value}"}}]"#));
+            if failure_at == Some(index) {
+                break;
+            }
+        }
+        responses.push(r#"[1,65,null,{"value":null}]"#.to_string());
+        let mut input = Vec::new();
+        for response in responses {
+            write_frame(&mut input, &response).unwrap();
+        }
+        ScriptedIo {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn soak_holds_one_session_for_five_minutes_and_validates_31_pages() {
+        assert_eq!(
+            FIREFOX_SOAK_RUNTIME_MARKER,
+            "TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31"
+        );
+        let mut io = soak_transcript(None);
+        let mut clock = FakeSoakClock::default();
+        probe_soak_stream(&mut io, &mut clock).unwrap();
+        assert_eq!(clock.elapsed, SOAK_DURATION);
+        assert_eq!(clock.sleeps, vec![SOAK_INTERVAL; 30]);
+
+        let mut commands = Cursor::new(io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        for index in 0..SOAK_NAVIGATIONS {
+            let navigate_id = 3 + index * 2;
+            let script_id = navigate_id + 1;
+            let page = FIREFOX_SOAK_PAGES.get(usize::from(index % 2)).unwrap();
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                format!(
+                    r#"[0,{navigate_id},"WebDriver:Navigate",{{"url":{}}}]"#,
+                    json_string(page.0)
+                )
+            );
+            let script = soak_document_script(page.0, page.1, page.2);
+            assert!(script.contains("document.location.href !== expectedUrl"));
+            assert!(script.contains("document.documentURI !== expectedUrl"));
+            assert!(script.contains("Number(navigation.responseStatus) !== 200"));
+            assert!(script.contains("marker.textContent !== expectedBody"));
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                execute_command_with_id(script_id, &script).unwrap()
+            );
+        }
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,65,"WebDriver:DeleteSession",{}]"#
+        );
+        assert!(read_frame(&mut commands).is_err());
+    }
+
+    #[test]
+    fn soak_rejects_a_wrong_page_and_still_deletes_the_session() {
+        let mut io = soak_transcript(Some(4));
+        let mut clock = FakeSoakClock::default();
+        let error = probe_soak_stream(&mut io, &mut clock).unwrap_err();
+        assert!(error.to_string().contains("wrong-content"));
+        let mut commands = Cursor::new(io.output);
+        let mut last = String::new();
+        while let Ok(command) = read_frame(&mut commands) {
+            last = command;
+        }
+        assert_eq!(last, r#"[0,65,"WebDriver:DeleteSession",{}]"#);
+        assert_eq!(clock.elapsed, Duration::from_secs(40));
     }
 
     fn input_transcript(stage: InputStage, values: &[&str]) -> ScriptedIo {

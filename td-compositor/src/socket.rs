@@ -3,6 +3,8 @@ use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -78,6 +80,27 @@ pub fn publish(
     thread_name: &'static str,
     answer: Vec<u8>,
 ) -> Result<Published, String> {
+    publish_inner(path, thread_name, answer, None)
+}
+
+/// Publish an answer that becomes stale when the observed resource departs.
+/// `live` is latched false by that resource's owner; later callers receive EOF
+/// rather than evidence produced by a connection which no longer exists.
+pub fn publish_while(
+    path: &Path,
+    thread_name: &'static str,
+    answer: Vec<u8>,
+    live: Arc<AtomicBool>,
+) -> Result<Published, String> {
+    publish_inner(path, thread_name, answer, Some(live))
+}
+
+fn publish_inner(
+    path: &Path,
+    thread_name: &'static str,
+    answer: Vec<u8>,
+    live: Option<Arc<AtomicBool>>,
+) -> Result<Published, String> {
     remove_stale(path, "readiness")?;
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("bind readiness socket {}: {e}", path.display()))?;
@@ -93,7 +116,7 @@ pub fn publish(
         .map_err(|e| format!("chmod readiness socket {}: {e}", path.display()))?;
     thread::Builder::new()
         .name(thread_name.into())
-        .spawn(move || serve(listener.incoming(), &answer))
+        .spawn(move || serve(listener.incoming(), &answer, live.as_deref()))
         .map_err(|e| format!("start readiness listener {}: {e}", path.display()))?;
     Ok(published)
 }
@@ -108,6 +131,7 @@ pub fn publish(
 fn serve(
     connections: impl Iterator<Item = std::io::Result<UnixStream>>,
     answer: &[u8],
+    live: Option<&AtomicBool>,
 ) -> AcceptOutcome {
     let mut consecutive = 0;
     for connection in connections {
@@ -119,6 +143,9 @@ fn serve(
             continue;
         };
         consecutive = 0;
+        if live.is_some_and(|live| !live.load(Ordering::Acquire)) {
+            continue;
+        }
         // A caller that hung up mid-answer is the caller's business — but a
         // caller that never READS would park this thread in `write` and stop
         // every later probe, so the wait is bounded even though an answer is
@@ -231,7 +258,11 @@ mod tests {
     fn a_run_of_failed_accepts_is_survived_but_not_an_endless_one() {
         let (caller, mut peer) = UnixStream::pair().unwrap();
         let refused = (0..MAX_ACCEPT_FAILURES).map(|_| aborted());
-        let outcome = serve(refused.chain(std::iter::once(Ok(caller))), b"answered\n");
+        let outcome = serve(
+            refused.chain(std::iter::once(Ok(caller))),
+            b"answered\n",
+            None,
+        );
         assert_eq!(outcome, AcceptOutcome::Exhausted);
         let mut said = String::new();
         peer.read_to_string(&mut said).unwrap();
@@ -241,7 +272,11 @@ mod tests {
         // listener that will never accept anything again.
         let (caller, mut peer) = UnixStream::pair().unwrap();
         let refused = (0..=MAX_ACCEPT_FAILURES).map(|_| aborted());
-        let outcome = serve(refused.chain(std::iter::once(Ok(caller))), b"answered\n");
+        let outcome = serve(
+            refused.chain(std::iter::once(Ok(caller))),
+            b"answered\n",
+            None,
+        );
         assert_eq!(outcome, AcceptOutcome::GaveUp);
         let mut said = String::new();
         peer.read_to_string(&mut said).unwrap();
@@ -262,13 +297,41 @@ mod tests {
             connections.push(Ok(caller));
             peers.push(peer);
         }
-        let outcome = serve(connections.into_iter(), b"answered\n");
+        let outcome = serve(connections.into_iter(), b"answered\n", None);
         assert_eq!(outcome, AcceptOutcome::Exhausted);
         for mut peer in peers {
             let mut said = String::new();
             peer.read_to_string(&mut said).unwrap();
             assert_eq!(said, "answered\n");
         }
+    }
+
+    #[test]
+    fn a_latched_departure_withholds_the_old_answer() {
+        let directory = scratch("latched");
+        let path = directory.join("ready");
+        let live = Arc::new(AtomicBool::new(true));
+        let published = publish_while(
+            &path,
+            "latched-ready",
+            b"same-client\n".to_vec(),
+            Arc::clone(&live),
+        )
+        .unwrap();
+
+        let mut first = caller(&path);
+        let mut said = String::new();
+        first.read_to_string(&mut said).unwrap();
+        assert_eq!(said, "same-client\n");
+
+        live.store(false, Ordering::Release);
+        let mut after = caller(&path);
+        said.clear();
+        after.read_to_string(&mut said).unwrap();
+        assert!(said.is_empty(), "a departed resource retained readiness");
+
+        drop(published);
+        fs::remove_dir(&directory).unwrap();
     }
 
     /// The name is what an operator reading `ps -T` sees, so it has to reach

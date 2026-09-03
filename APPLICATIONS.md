@@ -1590,8 +1590,10 @@ service while the browser waits for the human's decision.
 The exact autotest launch additionally enables Firefox's Marionette server and
 the Firefox 138-and-later system-access opt-in. Marionette's own pinned server
 implementation binds loopback only with a backlog of one, and the td probe
-accepts protocol version 3 with one active session, bounded frames and one
-60-second end-to-end deadline. This unauthenticated privileged channel is test
+accepts protocol version 3 with one active session and bounded frames. Ordinary
+support/input probes have one 60-second end-to-end deadline; item 10's single
+continuity session has a separate 360-second backstop around its 300-second
+schedule. This unauthenticated privileged channel is test
 machinery, not a product interface: neither flag reaches an ordinary boot,
 the profile is volatile, and `td.autotest=1` remains supported only in the
 NIC-less or inbound-unreachable QEMU plans described below.
@@ -6110,9 +6112,10 @@ observation that startup requests a fifth simultaneous pool resource. The
 staged physical-input trace added a native Firefox cursor and context menu and
 reached nine retained pools, so the count ceiling rose from eight to sixteen
 while the independent 256 MiB byte ceiling stayed fixed. This is a real
-navigation/content trace, but it is one small fixed page rather than the
-five-minute mixed workload in §H. A later cap change therefore still needs
-evidence from that broader run.
+navigation/content trace. Item 10 now adds its five-minute mixed workload, but
+the structured resource record remains the first-window snapshot rather than
+a post-soak high-water query. A later cap change therefore still needs
+explicit resource evidence from the broader run.
 
 And a performance caveat that belongs in the claim rather than in a
 surprise: the renderer copies client pixels and software-composites the
@@ -6475,7 +6478,7 @@ global fallback sandbox facts, nested filters in every reported live required
 process role, and the staged physical-input subset of item 7. The complete
 browser claim also proves the fixed guest-local HTTPS download through its
 declared writable grant and native Open File portal round-trip. It still
-requires the remaining isolation and soak evidence below.
+requires the remaining isolation and stage-1 teardown evidence below.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -6630,16 +6633,15 @@ and image commits — showing:
    activation. A following physical Shift keyup is the ordered command boundary,
    so delayed repeats are observed before success. The volatile Firefox
    profile selects its compiled `/home/td/Downloads` grant without a prompt.
-   Outside the jail, a td-owned
-   unprivileged probe then requires one stable regular inode at the
-   corresponding `/var/home/tester/Downloads` source: uid/gid 1000, no special
-   or executable bits, no group/other write, one link, exact 23-byte size and
-   fixture contents, unchanged path/descriptor identity, and no partial or
-   duplicate proof name in a bounded directory scan. Only that probe emits
-   `TD-FIREFOX-DOWNLOAD-OK bytes=23`, and the input completion record is written
-   only after item 9. This proves Firefox's real HTTPS download path through
-   the authenticated read-write grant; it does not claim a public-network
-   download;
+   Outside the jail, a td-owned unprivileged probe then requires one stable
+   regular inode at the corresponding `/var/home/tester/Downloads` source:
+   uid/gid 1000, no special or executable bits, no group/other write, one link,
+   exact 23-byte size and fixture contents, unchanged path/descriptor identity,
+   and no partial or duplicate proof name in a bounded directory scan. Only
+   that probe emits `TD-FIREFOX-DOWNLOAD-OK bytes=23`, and the private
+   input-stage record is written only after item 9. This proves Firefox's real
+   HTTPS download path through the authenticated read-write grant; it does not
+   claim a public-network download;
 9. **the Settings portal, Request lifecycle and FileChooser succeeding —
    LANDED.** The separate uid-1000 direct-reply/directed-signal oracle in item
    6 proves Settings and Request routing. In the input-enabled system boot,
@@ -6654,10 +6656,9 @@ and image commits — showing:
    persistent record and current Firefox focus before it closes. Only then may
    the host send physical `Control+O`, invoking Firefox's native Open File
    command without a DOM picker call or synthetic file assignment. The oracle
-   accepts only the exact broker-derived Request
-   path and the bounded
-   640x432 first-frame record. It captures the 1280x800 virtio display through
-   QMP, requires the compositor's centred client rectangle, the chooser's
+   accepts only the exact broker-derived Request path and the bounded 640x432
+   first-frame record. It captures the 1280x800 virtio display through QMP,
+   requires the compositor's centred client rectangle, the chooser's
    background, panel and selected-row palette with bounded pixel counts, and
    recomputes the portal's FNV checksum from that exact client rectangle.
    Only then does it inject Enter. The root-owned input oracle waits for the
@@ -6667,12 +6668,43 @@ and image commits — showing:
    automation input can race the native command. Firefox must load the exact
    `file:///home/td/Downloads/td-firefox-download.txt` URL as `text/plain` and
    expose exact `TD-FIREFOX-DOWNLOAD-V1\n` document text before the final
-   marker and atomic input-completion record. The portal marker follows its
-   private manager
-   acknowledgement, keyboard enter, shm release and frame callback, so neither
-   a D-Bus-only stub, a hidden/non-modal surface, synthetic DOM assignment nor
-   a directed response that Firefox never consumed can pass;
-10. five minutes of navigation with no compositor or bus disconnect;
+   FileChooser marker and private input-stage record. Item 10 alone promotes
+   that record to the greeter's atomic input completion. The portal marker
+   follows its private manager acknowledgement, keyboard enter, shm release
+   and frame callback, so neither a D-Bus-only stub, a hidden/non-modal surface,
+   synthetic DOM assignment nor a directed response that Firefox never
+   consumed can pass;
+10. **five minutes of navigation with no compositor or bus disconnect —
+    LANDED.** After the physical-input and FileChooser proof, a separate
+    root-owned unit waits for a private staging record; that record is not one
+    the greeter accepts. The unit records Firefox's exact application-instance,
+    main-process pid, and revalidated procfs start time for the `--marionette`
+    token. A fresh authenticated bus connection records the broker GUID and
+    enumerates the exact sorted set of unique connections whose broker-derived
+    credentials carry `td.AppId="firefox"`, including each kernel pid. This
+    identifies Firefox without assuming that its versioned remote-control bus
+    name has one fixed spelling. The compositor readiness record carries a
+    random generation for its own process. The unit then holds one Marionette
+    session while alternating between two authenticated guest-local HTTPS
+    documents every ten seconds.
+    The first navigation occurs at time zero and the thirty-first no earlier
+    than 300 seconds. Every navigation requires its exact URL and origin,
+    HTTP-200 navigation entry, title, and fixed body marker; a failed or
+    shortened sequence deletes the session and withholds success.
+    Afterwards, all three records must be byte-for-byte unchanged. The bus
+    GUID closes broker restart while unique names and pids close connection
+    replacement. The compositor generation closes compositor restart, and its
+    readiness answer is live-latched to the exact client which published it,
+    so client teardown makes the second probe unavailable rather than
+    replaying stale first-frame evidence. Only after all three continuity
+    checks does the unit print
+    `TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31` and atomically
+    replace the staging record with the completion the greeter accepts. The
+    host QEMU oracle requires that exact line. A fake-clock wire transcript
+    permanently checks all 31 alternating commands, their IDs, content
+    validations, ten-second schedule, five-minute floor, and cleanup without
+    adding five minutes to the ordinary test suite. The real TCG system boot
+    remains the end-to-end timing and connection authority;
 11. blocked syscall probes still blocked in the outer app process, and
     **zero seccomp denials for syscalls the application actually needs**
     — which is the only false-hit test a deny list admits. An earlier
@@ -6781,12 +6813,13 @@ Each row is one landing or a small family, leaving the tree green.
 | 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
 | 27c | **Firefox physical-input image proof — LANDED**; the first system boot uses a bounded private QMP controller, the already enumerated virtio tablet, and the PC machine's PS/2 keyboard, while staged Firefox content/chrome probes and a compositor-owned cursor marker independently attest the semantic results. The handshake proves typing, pointer motion, scrolling, native right-click menu opening, outside-click dismissal, and a painted Firefox cursor without sleeps or manual observation. The test page retains the authenticated magenta/lime framebuffer sentinel and adds only a fixed focused input, scroll extent, and cursor style | the supported Firefox path accepts real emulated input end to end; rung 27d extends the same handshake across clipboard paste |
 | 27d | **Firefox clipboard image proof — LANDED**; after the physical menu proof, the same marker-driven QMP controller waits for td-term's focus acknowledgement, clears its prompt, physically types `Welcome`, and waits until td-term attests the visible word's settled live grid and cell coordinates. It drags those exact cells, waits for a second marker proving the highlighted frame is visible, injects the terminal-owned copy chord, waits for `TD-TERM-CLIPBOARD-READY bytes=7`, then focuses Firefox and injects `Control+L`. One continuous bounded privileged browser-chrome session emits `TD-FIREFOX-CLIPBOARD-ARMED` only after the URL bar reports focused with its old value selected, then remains live while that gate admits physical `Control+V`. A second command is admitted by one exact retry marker only when the first boundary exposes no nonempty paste data and leaves that URL unchanged. Firefox may expose an empty `DataTransfer` while its default action consumes the asynchronous Wayland transfer, so the final gate accounts delayed insertions through the URL value: every nonempty event must be exact `Welcome`, the URL must be one or more exact `Welcome` copies no greater than the paste-event count, and an event that exposes exact data must have a corresponding final copy. The two commands plus eight total events are hard bounds. A separate Shift tap ends each command, and Firefox must observe its ordered keyup before classifying the batch, so success cannot precede an unobserved chord. The input unit completes only after that browser record and td-term's exact-payload transfer record. The proof-only terminal scan, markers and repeat suppression require the exact input-test boot token. Unit tests pin all QMP commands and marker gates; the full-system QEMU boot is the end-to-end authority | core selection crosses from td-term to Firefox without manual testing |
-| 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input completion record now follows the download marker, so neither a synthetic DOM click nor a stale file can pass | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
-| 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content exposes a full-viewport focus control and a trusted physical click focuses the browser. A fresh bounded read-only probe validates that persistent click record and current focus, then the host sends physical `Control+O` to invoke Firefox's native Open File command without a DOM picker call or synthetic assignment. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter to select the file. Firefox must then load the exact granted `file:` URL as plain text with the fixture's exact contents before input completion. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
+| 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input-stage record follows the download and FileChooser markers, so neither a synthetic DOM click nor a stale file can pass; rung 27j owns final greeter completion | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
+| 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content exposes a full-viewport focus control and a trusted physical click focuses the browser. A fresh bounded read-only probe validates that persistent click record and current focus, then the host sends physical `Control+O` to invoke Firefox's native Open File command without a DOM picker call or synthetic assignment. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter to select the file. Firefox must then load the exact granted `file:` URL as plain text with the fixture's exact contents before the private input-stage record. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
 | 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The deterministic system oracle remains NIC-less; public reachability is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
 | 27h | **Firefox Web Audio image proof — LANDED**; the deterministic physical-input boot uses its first trusted key to start and finish one exact one-second 440 Hz oscillator in Firefox. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, the built-in test loopback taking card 0 ahead of HDA, and then 48,000 correct tone frames stretched across 1,600 ms by about 28,000 frames of daemon-inserted silence. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep those client frames contiguous instead of starting HDA on an empty period. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 512 MiB bound and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, duration, peak and per-channel AC energy, then requires both channels to correlate above 0.9 with one shared frequency in the narrow 435–445 Hz physical-output band independent of phase. The fit tolerates the measured QEMU HDA/WAV clock rate without accepting an unrelated tone. The authoritative TCG run measured 1,004 ms, peak 8,192, a 438.25 Hz fit, per-channel AC RMS 5,780.9 and correlations 0.9719/0.9719 before completing every rollback/fallback boot. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a short tone and an off-band frequency, accept the bounded clock-stretch fixture, pin exact float conversion, accounting, prebuffer/start continuity and mixed HDA/loopback selection, and pin the exact QEMU argv including comma-safe capture paths. Other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
 | 27i | **unsupported portal discovery proof — LANDED**; the live uid-1000 portal client asks the version property and `GetAll` for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`, calls one real entry member on each, and accepts only complete exact error replies from the activated service's unique sender. Live introspection must omit every interface, and QEMU requires a distinct trusted service-prefixed marker after the whole sequence | unsupported capture, remote-control, camera, secret, and print capabilities fail closed rather than appearing to succeed |
-| 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
+| 27j | **Firefox five-minute connection soak — LANDED**; one Marionette session alternates 31 exact guest-local HTTPS navigations at ten-second boundaries through at least 300 seconds. Before/after equality pins Firefox's application instance, pid and procfs start time; the bus GUID plus its exact broker-authenticated Firefox connection/pid set; and the compositor generation. Its live-latched readiness answer separately proves the publishing Wayland client did not depart. Only the final unit can publish the greeter's completion, and QEMU requires its exact soak line | browser, bus and compositor connections survive a bounded real navigation workload without manual observation |
+| 28 | the remaining §H proof run to green; `AGENTS.md` trust-zone section; **all four** application-path `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
 
 **Of the two reversals this ladder used to omit entirely, timezone now

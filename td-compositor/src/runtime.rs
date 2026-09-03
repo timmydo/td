@@ -446,6 +446,10 @@ struct ApplicationReady {
     /// observer. Cursor evidence must come from this same connection: another
     /// matching toplevel is a launch candidate, not authority for this proof.
     published_client: Option<u64>,
+    /// False until the proved client is published, then latched false when
+    /// that exact Wayland connection departs. The readiness socket consults
+    /// it for every caller, so one-shot pixels cannot outlive their client.
+    connection_live: Arc<AtomicBool>,
     cursor_wake: Option<SyncSender<ApplicationCursorEvidence>>,
     cursor_published: bool,
 }
@@ -536,7 +540,13 @@ impl Runtime {
         expected_content_rgbs: [[u8; 3]; 2],
         wake: SyncSender<ApplicationEvidence>,
     ) -> Result<(), String> {
-        self.watch_application_inner(expected_app_id, expected_content_rgbs, wake, None)
+        self.watch_application_inner(
+            expected_app_id,
+            expected_content_rgbs,
+            wake,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     pub(crate) fn watch_application_with_cursor(
@@ -545,12 +555,14 @@ impl Runtime {
         expected_content_rgbs: [[u8; 3]; 2],
         wake: SyncSender<ApplicationEvidence>,
         cursor_wake: SyncSender<ApplicationCursorEvidence>,
+        connection_live: Arc<AtomicBool>,
     ) -> Result<(), String> {
         self.watch_application_inner(
             expected_app_id,
             expected_content_rgbs,
             wake,
             Some(cursor_wake),
+            connection_live,
         )
     }
 
@@ -560,6 +572,7 @@ impl Runtime {
         expected_content_rgbs: [[u8; 3]; 2],
         wake: SyncSender<ApplicationEvidence>,
         cursor_wake: Option<SyncSender<ApplicationCursorEvidence>>,
+        connection_live: Arc<AtomicBool>,
     ) -> Result<(), String> {
         if self.application_ready.is_some() {
             return Err("application-window observer is already configured".to_string());
@@ -572,6 +585,7 @@ impl Runtime {
             diagnosed_messages: 0,
             wake,
             published_client: None,
+            connection_live,
             cursor_wake,
             cursor_published: false,
         });
@@ -1498,11 +1512,13 @@ impl Runtime {
             content_pixels,
             resources,
         };
+        ready.connection_live.store(true, Ordering::Release);
         match ready.wake.try_send(evidence) {
             Ok(()) | Err(TrySendError::Full(_)) => {
                 ready.published_client = Some(key.client);
             }
             Err(TrySendError::Disconnected(_)) => {
+                ready.connection_live.store(false, Ordering::Release);
                 return Err("application-window observer stopped before publication".to_string());
             }
         }
@@ -1618,6 +1634,9 @@ impl Runtime {
         self.forget_drag(|dragged| dragged.client == client);
         self.unregister_client_resources(client);
         if let Some(ready) = self.application_ready.as_mut() {
+            if ready.published_client == Some(client) {
+                ready.connection_live.store(false, Ordering::Release);
+            }
             ready.candidates.retain(|key| key.client != client);
             ready
                 .surface_content
@@ -9192,12 +9211,14 @@ mod tests {
         let mut runtime = Runtime::new(framebuffer);
         let (wake, ready) = mpsc::sync_channel(1);
         let (cursor_wake, cursor_ready) = mpsc::sync_channel(1);
+        let connection_live = Arc::new(AtomicBool::new(false));
         runtime
             .watch_application_with_cursor(
                 "org.mozilla.firefox".to_string(),
                 APPLICATION_CONTENT_RGBS,
                 wake,
                 cursor_wake,
+                Arc::clone(&connection_live),
             )
             .unwrap();
 
@@ -9248,6 +9269,7 @@ mod tests {
             .apply_commit(key, Some(application_content_surface()), None, None)
             .unwrap();
         assert!(ready.try_recv().is_ok());
+        assert!(connection_live.load(Ordering::Acquire));
 
         // A second client with the same app id is a valid launcher candidate,
         // but its selected cursor cannot complete the evidence produced by
@@ -9302,6 +9324,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor_ready.try_recv(), Err(TryRecvError::Empty));
+
+        runtime.remove_client(key.client).unwrap();
+        assert!(
+            !connection_live.load(Ordering::Acquire),
+            "the published Wayland connection outlived client removal"
+        );
     }
 
     #[test]

@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::thread;
 
 fn usage() -> String {
-    "usage: td-busd selftest | run --socket PATH | probe PATH".into()
+    "usage: td-busd selftest | run --socket PATH | probe PATH | application PATH APP_ID".into()
 }
 
 /// How long to wait after a failed accept before trying again, and how many
@@ -265,6 +265,15 @@ fn dispatch(args: &[String]) -> Result<String, String> {
             transport::probe(path, current_uid()?)
         }
         Some("probe") => Err(format!("probe takes one socket path\n{}", usage())),
+        Some("application") if args.len() == 3 => {
+            let path = Path::new(args.get(1).map(String::as_str).unwrap_or(""));
+            let app_id = args.get(2).map(String::as_str).unwrap_or("");
+            transport::probe_application(path, current_uid()?, app_id)
+        }
+        Some("application") => Err(format!(
+            "application takes one socket path and one td application id\n{}",
+            usage()
+        )),
         Some(other) => Err(format!("unrecognised subcommand '{other}'\n{}", usage())),
         None => Err(usage()),
     }
@@ -337,6 +346,9 @@ mod tests {
             vec!["run", "--socket", "a", "b"],
             vec!["probe"],
             vec!["probe", "a", "b"],
+            vec!["application"],
+            vec!["application", "a"],
+            vec!["application", "a", "firefox", "extra"],
         ] {
             let refusal = match dispatch(&argv(&wrong)) {
                 Ok(output) => panic!("{wrong:?} claimed success: {output}"),

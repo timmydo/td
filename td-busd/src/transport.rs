@@ -12,6 +12,7 @@
 //! the roster, and rung 14's routing gets a registry behind a lock rather than
 //! a readiness set to rebuild on every wakeup.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -3399,7 +3400,16 @@ fn probe_within(
     uid: u32,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    use std::io::{Read, Write};
+    let (_, _, guid) = authenticate_probe(path, uid, timeout)?;
+    Ok(format!("bus at {} answered OK {guid}", path.display()))
+}
+
+fn authenticate_probe(
+    path: &Path,
+    uid: u32,
+    timeout: std::time::Duration,
+) -> Result<(UnixStream, std::time::Instant, String), String> {
+    use std::io::Read;
 
     // ONE deadline for the whole probe, and it starts HERE rather than after
     // the connect. `connect(2)` on a unix socket whose accept queue is full
@@ -3428,9 +3438,12 @@ fn probe_within(
         .bytes()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    stream
-        .write_all(format!("\0AUTH EXTERNAL {hex}\r\n").as_bytes())
-        .map_err(|error| format!("write AUTH: {error}"))?;
+    probe_write_all(
+        &mut stream,
+        deadline,
+        format!("\0AUTH EXTERNAL {hex}\r\n").as_bytes(),
+        "AUTH",
+    )?;
 
     // The same deadline the connect was held to, so the answer gets what the
     // connect did not spend rather than a fresh allowance. A socket timeout is
@@ -3468,10 +3481,434 @@ fn probe_within(
     if guid.len() != GUID_LEN || !guid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("the bus answered OK with a bad guid: {guid}"));
     }
-    stream
-        .write_all(b"BEGIN\r\n")
-        .map_err(|error| format!("write BEGIN: {error}"))?;
-    Ok(format!("bus at {} answered OK {guid}", path.display()))
+    probe_write_all(&mut stream, deadline, b"BEGIN\r\n", "BEGIN")?;
+    Ok((stream, deadline, guid.to_string()))
+}
+
+const MAX_PROBE_NAMES: usize =
+    1 + MAX_CONNECTIONS * (1 + crate::registry::MAX_NAMES_PER_CONNECTION);
+// One fixed header, the broker's complete bounded header-field array and
+// alignment, then the array length and every maximum-length encoded name.
+const MAX_PROBE_FRAME: usize = message::HEADER_LEN
+    + message::MAX_HEADER_FIELDS_BYTES as usize
+    + 7
+    + 4
+    + MAX_PROBE_NAMES * (4 + crate::name::MAX_NAME_LEN + 1 + 3);
+
+fn probe_read_exact(
+    stream: &mut UnixStream,
+    deadline: std::time::Instant,
+    mut bytes: &mut [u8],
+    what: &str,
+) -> Result<(), String> {
+    use std::io::Read;
+
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(format!("read {what}: the bus identity probe exceeded its deadline"));
+        }
+        stream
+            .set_read_timeout(Some(left))
+            .map_err(|error| format!("set identity-probe read timeout: {error}"))?;
+        let count = match stream.read(bytes) {
+            Ok(0) => return Err(format!("read {what}: the bus closed the connection")),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(format!(
+                    "read {what}: the bus identity probe exceeded its deadline"
+                ));
+            }
+            Err(error) => return Err(format!("read {what}: {error}")),
+        };
+        bytes = bytes
+            .get_mut(count..)
+            .ok_or_else(|| format!("read {what}: byte count escaped the destination"))?;
+    }
+    Ok(())
+}
+
+fn probe_write_all(
+    stream: &mut UnixStream,
+    deadline: std::time::Instant,
+    mut bytes: &[u8],
+    what: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(format!("write {what}: the bus identity probe exceeded its deadline"));
+        }
+        stream
+            .set_write_timeout(Some(left))
+            .map_err(|error| format!("set identity-probe write timeout: {error}"))?;
+        let count = match stream.write(bytes) {
+            Ok(0) => return Err(format!("write {what}: the bus stopped accepting bytes")),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(format!(
+                    "write {what}: the bus identity probe exceeded its deadline"
+                ));
+            }
+            Err(error) => return Err(format!("write {what}: {error}")),
+        };
+        bytes = bytes
+            .get(count..)
+            .ok_or_else(|| format!("write {what}: byte count escaped the source"))?;
+    }
+    Ok(())
+}
+
+fn probe_frame(stream: &mut UnixStream, deadline: std::time::Instant) -> Result<Vec<u8>, String> {
+    let mut frame = vec![0_u8; message::HEADER_LEN];
+    probe_read_exact(stream, deadline, &mut frame, "identity-probe message header")?;
+    let total = message::frame_len(&frame)
+        .map_err(|error| format!("decode identity-probe message length: {error}"))?
+        .ok_or_else(|| "identity-probe message has no complete header".to_string())?;
+    if total > MAX_PROBE_FRAME {
+        return Err(format!(
+            "identity-probe message is {total} bytes, over the {MAX_PROBE_FRAME}-byte bound"
+        ));
+    }
+    frame.resize(total, 0);
+    let body = frame
+        .get_mut(message::HEADER_LEN..)
+        .ok_or_else(|| "identity-probe message body escaped its frame".to_string())?;
+    probe_read_exact(stream, deadline, body, "identity-probe message body")?;
+    Ok(frame)
+}
+
+fn probe_call(
+    stream: &mut UnixStream,
+    deadline: std::time::Instant,
+    bytes: &[u8],
+) -> Result<(), String> {
+    probe_write_all(stream, deadline, bytes, "identity-probe call")
+}
+
+fn probe_string_reply(
+    frame: &[u8],
+    serial: u32,
+    destination: Option<&str>,
+    what: &str,
+) -> Result<String, String> {
+    let (reply, used) =
+        message::decode(frame, 0).map_err(|error| format!("decode {what}: {error}"))?;
+    let Some(value) = reply.args().first().and_then(crate::wire::Value::as_str) else {
+        return Err(format!("{what} has the wrong reply shape"));
+    };
+    if used != frame.len()
+        || reply.kind != message::MessageType::MethodReturn
+        || reply.fields.sender != Some(BUS_NAME)
+        || reply.fields.reply_serial != Some(serial)
+        || destination.is_some_and(|expected| reply.fields.destination != Some(expected))
+        || reply.fields.unix_fds.unwrap_or(0) != 0
+        || reply.args().len() != 1
+    {
+        return Err(format!("{what} has the wrong reply shape"));
+    }
+    Ok(value.to_string())
+}
+
+fn probe_list_names_reply(
+    frame: &[u8],
+    serial: u32,
+    destination: &str,
+) -> Result<Vec<String>, String> {
+    let (reply, used) =
+        message::decode(frame, 0).map_err(|error| format!("decode ListNames reply: {error}"))?;
+    let Some(names) = reply.args().first().and_then(crate::wire::Value::as_seq) else {
+        return Err("ListNames reply has the wrong reply shape".into());
+    };
+    if used != frame.len()
+        || reply.kind != message::MessageType::MethodReturn
+        || reply.fields.sender != Some(BUS_NAME)
+        || reply.fields.reply_serial != Some(serial)
+        || reply.fields.destination != Some(destination)
+        || reply.fields.signature != Some("as")
+        || reply.fields.unix_fds.unwrap_or(0) != 0
+        || reply.args().len() != 1
+        || names.signature() != "s"
+    {
+        return Err("ListNames reply has the wrong reply shape".into());
+    }
+    let values = names
+        .values(MAX_PROBE_NAMES)
+        .map_err(|error| format!("read ListNames reply: {error}"))?;
+    let mut listed = Vec::with_capacity(values.len());
+    let mut distinct = BTreeSet::new();
+    for value in &values {
+        let Some(name) = value.as_str() else {
+            return Err("ListNames reply has a non-string name".into());
+        };
+        if !(crate::name::valid_unique_name(name)
+            || crate::name::valid_well_known_name(name))
+        {
+            return Err("ListNames reply has an invalid bus name".into());
+        }
+        if !distinct.insert(name.to_string()) {
+            return Err("ListNames reply has a duplicate bus name".into());
+        }
+        listed.push(name.to_string());
+    }
+    Ok(listed)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ProbeCredentials {
+    uid: u32,
+    pid: Option<u32>,
+    app_id: Option<String>,
+}
+
+fn probe_credentials_reply(
+    frame: &[u8],
+    serial: u32,
+    destination: &str,
+) -> Result<Option<ProbeCredentials>, String> {
+    let (reply, used) = message::decode(frame, 0)
+        .map_err(|error| format!("decode GetConnectionCredentials reply: {error}"))?;
+    if used != frame.len()
+        || reply.fields.sender != Some(BUS_NAME)
+        || reply.fields.reply_serial != Some(serial)
+        || reply.fields.destination != Some(destination)
+        || reply.fields.unix_fds.unwrap_or(0) != 0
+    {
+        return Err("GetConnectionCredentials reply has the wrong reply shape".into());
+    }
+    if reply.kind == message::MessageType::Error
+        && reply.fields.error_name == Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        && reply.fields.signature == Some("s")
+        && reply.args().len() == 1
+        && reply.args().first().and_then(crate::wire::Value::as_str)
+            == Some("no such connection on this bus")
+    {
+        return Ok(None);
+    }
+    let Some(entries) = reply.args().first().and_then(crate::wire::Value::as_seq) else {
+        return Err("GetConnectionCredentials reply has the wrong reply shape".into());
+    };
+    if reply.kind != message::MessageType::MethodReturn
+        || reply.fields.signature != Some("a{sv}")
+        || reply.args().len() != 1
+        || entries.signature() != "{sv}"
+    {
+        return Err("GetConnectionCredentials reply has the wrong reply shape".into());
+    }
+    let entries = entries
+        .values(3)
+        .map_err(|error| format!("read GetConnectionCredentials reply: {error}"))?;
+    let mut uid = None;
+    let mut pid = None;
+    let mut app_id = None;
+    for entry in &entries {
+        let Some(pair) = entry.as_seq() else {
+            return Err("GetConnectionCredentials reply has a malformed entry".into());
+        };
+        let pair = pair
+            .values(2)
+            .map_err(|error| format!("read credential entry: {error}"))?;
+        let Some(key) = pair.first().and_then(crate::wire::Value::as_str) else {
+            return Err("GetConnectionCredentials reply has a non-string key".into());
+        };
+        let Some(variant) = pair.get(1).and_then(crate::wire::Value::as_seq) else {
+            return Err("GetConnectionCredentials reply has a non-variant value".into());
+        };
+        let held = variant
+            .values(1)
+            .map_err(|error| format!("read credential value: {error}"))?;
+        let Some(value) = held.first() else {
+            return Err("GetConnectionCredentials reply has an empty variant".into());
+        };
+        match key {
+            "UnixUserID" if variant.signature() == "u" => {
+                let Some(value) = value.as_u32() else {
+                    return Err("GetConnectionCredentials has a mistyped UnixUserID".into());
+                };
+                if uid.replace(value).is_some() {
+                    return Err("GetConnectionCredentials repeats UnixUserID".into());
+                }
+            }
+            "ProcessID" if variant.signature() == "u" => {
+                let Some(value) = value.as_u32() else {
+                    return Err("GetConnectionCredentials has a mistyped ProcessID".into());
+                };
+                if value == 0 {
+                    return Err("GetConnectionCredentials has a zero ProcessID".into());
+                }
+                if pid.replace(value).is_some() {
+                    return Err("GetConnectionCredentials repeats ProcessID".into());
+                }
+            }
+            "td.AppId" if variant.signature() == "s" => {
+                let Some(value) = value.as_str() else {
+                    return Err("GetConnectionCredentials has a mistyped td.AppId".into());
+                };
+                if !valid_application_id(value) {
+                    return Err("GetConnectionCredentials has an invalid td.AppId".into());
+                }
+                if app_id.replace(value.to_string()).is_some() {
+                    return Err("GetConnectionCredentials repeats td.AppId".into());
+                }
+            }
+            "UnixUserID" | "ProcessID" | "td.AppId" => {
+                return Err(format!("GetConnectionCredentials has a mistyped {key}"));
+            }
+            _ => return Err(format!("GetConnectionCredentials has an unknown key {key:?}")),
+        }
+    }
+    let uid = uid.ok_or_else(|| "GetConnectionCredentials omitted UnixUserID".to_string())?;
+    Ok(Some(ProbeCredentials { uid, pid, app_id }))
+}
+
+fn probe_application_connection(
+    name: &str,
+    credentials: &ProbeCredentials,
+    uid: u32,
+    app_id: &str,
+) -> Result<Option<(String, u32)>, String> {
+    if credentials.app_id.as_deref() != Some(app_id) {
+        return Ok(None);
+    }
+    if credentials.uid != uid {
+        return Err(format!(
+            "application connection {name} belongs to uid {}, not probe uid {uid}",
+            credentials.uid
+        ));
+    }
+    let pid = credentials
+        .pid
+        .ok_or_else(|| format!("application connection {name} has no kernel process id"))?;
+    Ok(Some((name.to_string(), pid)))
+}
+
+/// Return the bus generation and every connection authenticated as one td
+/// application. The Firefox soak compares the complete stable record: a new
+/// GUID closes broker restart, while unique names and kernel pids close
+/// replacement of any connection present at the first snapshot.
+pub fn probe_application(path: &Path, uid: u32, app_id: &str) -> Result<String, String> {
+    probe_application_within(path, uid, app_id, PROBE_TIMEOUT)
+}
+
+fn probe_application_within(
+    path: &Path,
+    uid: u32,
+    app_id: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    if !valid_application_id(app_id) {
+        return Err("application probe requires one valid td application id".into());
+    }
+    let (mut stream, deadline, guid) = authenticate_probe(path, uid, timeout)?;
+    let hello = message::Builder::method_call(
+        crate::wire::Endian::Little,
+        BUS_PATH,
+        Some(BUS_NAME),
+        "Hello",
+    )
+    .destination(BUS_NAME)
+    .serial(1)
+    .encode()
+    .map_err(|error| format!("encode identity-probe Hello: {error}"))?;
+    probe_call(&mut stream, deadline, &hello)?;
+    let hello = probe_string_reply(&probe_frame(&mut stream, deadline)?, 1, None, "Hello reply")?;
+    if !crate::name::valid_unique_name(&hello) {
+        return Err("Hello reply did not contain a unique name".into());
+    }
+    let gained_frame = probe_frame(&mut stream, deadline)?;
+    let (gained, used) = message::decode(&gained_frame, 0)
+        .map_err(|error| format!("decode NameAcquired: {error}"))?;
+    if used != gained_frame.len()
+        || gained.kind != message::MessageType::Signal
+        || gained.fields.sender != Some(BUS_NAME)
+        || gained.fields.path != Some(BUS_PATH)
+        || gained.fields.interface != Some(BUS_NAME)
+        || gained.fields.member != Some("NameAcquired")
+        || gained.fields.destination != Some(hello.as_str())
+        || gained.fields.unix_fds.unwrap_or(0) != 0
+        || gained.args().len() != 1
+        || gained.args().first().and_then(crate::wire::Value::as_str) != Some(hello.as_str())
+    {
+        return Err("Hello was not followed by its exact NameAcquired signal".into());
+    }
+    let list = message::Builder::method_call(
+        crate::wire::Endian::Little,
+        BUS_PATH,
+        Some(BUS_NAME),
+        "ListNames",
+    )
+    .destination(BUS_NAME)
+    .serial(2)
+    .encode()
+    .map_err(|error| format!("encode application-probe ListNames: {error}"))?;
+    probe_call(&mut stream, deadline, &list)?;
+    let listed = probe_list_names_reply(&probe_frame(&mut stream, deadline)?, 2, &hello)?;
+    let mut connections = Vec::new();
+    let mut serial = 3u32;
+    for name in listed
+        .iter()
+        .filter(|name| crate::name::valid_unique_name(name))
+    {
+        let credentials = message::Builder::method_call(
+            crate::wire::Endian::Little,
+            BUS_PATH,
+            Some(BUS_NAME),
+            "GetConnectionCredentials",
+        )
+        .destination(BUS_NAME)
+        .serial(serial)
+        .body("s", |writer| writer.string(name))
+        .map_err(|error| format!("encode application-probe name: {error}"))?
+        .encode()
+        .map_err(|error| format!("encode application-probe call: {error}"))?;
+        probe_call(&mut stream, deadline, &credentials)?;
+        let Some(credentials) = probe_credentials_reply(
+            &probe_frame(&mut stream, deadline)?,
+            serial,
+            &hello,
+        )? else {
+            serial = serial
+                .checked_add(1)
+                .ok_or_else(|| "application-probe serial overflow".to_string())?;
+            continue;
+        };
+        if let Some(connection) =
+            probe_application_connection(name, &credentials, uid, app_id)?
+        {
+            connections.push(connection);
+        }
+        serial = serial
+            .checked_add(1)
+            .ok_or_else(|| "application-probe serial overflow".to_string())?;
+    }
+    if connections.is_empty() {
+        return Err(format!(
+            "the bus has no connection authenticated as application {app_id:?}"
+        ));
+    }
+    connections.sort();
+    let connections = connections
+        .iter()
+        .map(|(name, pid)| format!("{name}/{pid}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "guid={guid} application={app_id} connections={connections}"
+    ))
 }
 
 /// Bind a socket, serve one peer on it, and probe it — end to end, through
@@ -5314,6 +5751,12 @@ mod tests {
             peer.send(&name_query("GetConnectionCredentials", &me, 2));
             let frame = peer.frame();
             let (reply, _) = message::decode(&frame, 0).expect("decode credentials");
+            let parsed = probe_credentials_reply(&frame, 2, &me)
+                .expect("the production probe parses the broker's reply")
+                .expect("the connection remains live");
+            assert_eq!(parsed.uid, this_uid());
+            assert_eq!(parsed.pid, Some(std::process::id()));
+            assert_eq!(parsed.app_id.as_deref(), expected);
             let entries = reply
                 .args()
                 .first()
@@ -10622,6 +11065,396 @@ mod tests {
         let ended = served.join().expect("thread");
         assert!(matches!(ended, Ended::PeerLeft), "{ended:?}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_application_probe_uses_one_authenticated_exact_bus_exchange() {
+        let dir = scratch("application-probe");
+        let path = dir.join("bus");
+        let bound = bind(&path).expect("bind");
+        let listener = bound.listener().try_clone().expect("clone");
+        let served = thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            fn line(stream: &mut UnixStream) -> Vec<u8> {
+                let mut value = Vec::new();
+                while !value.ends_with(b"\r\n") {
+                    let mut byte = [0_u8; 1];
+                    stream.read_exact(&mut byte).expect("read probe line");
+                    value.push(byte[0]);
+                    assert!(value.len() <= 128, "probe line exceeded its bound");
+                }
+                value
+            }
+
+            let (mut stream, _) = listener.accept().expect("accept");
+            let authentication = line(&mut stream);
+            assert!(authentication.starts_with(b"\0AUTH EXTERNAL "));
+            stream
+                .write_all(format!("OK {GUID}\r\n").as_bytes())
+                .expect("answer authentication");
+            assert_eq!(line(&mut stream), b"BEGIN\r\n");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let hello_frame = probe_frame(&mut stream, deadline).expect("read Hello");
+            let (hello, used) = message::decode(&hello_frame, 0).expect("decode Hello");
+            assert_eq!(used, hello_frame.len());
+            assert_eq!(
+                (
+                    hello.kind,
+                    hello.serial,
+                    hello.fields.path,
+                    hello.fields.interface,
+                    hello.fields.member,
+                    hello.fields.destination,
+                ),
+                (
+                    message::MessageType::MethodCall,
+                    1,
+                    Some(BUS_PATH),
+                    Some(BUS_NAME),
+                    Some("Hello"),
+                    Some(BUS_NAME),
+                )
+            );
+            let probe_name = ":1.70";
+            let reply = message::Builder::method_return(crate::wire::Endian::Little, 1)
+                .sender(BUS_NAME)
+                .destination(probe_name)
+                .serial(1)
+                .body("s", |writer| writer.string(probe_name))
+                .expect("Hello body")
+                .encode()
+                .expect("Hello reply");
+            stream.write_all(&reply).expect("answer Hello");
+            let acquired = message::Builder::signal(
+                crate::wire::Endian::Little,
+                BUS_PATH,
+                BUS_NAME,
+                "NameAcquired",
+            )
+            .sender(BUS_NAME)
+            .destination(probe_name)
+            .serial(2)
+            .body("s", |writer| writer.string(probe_name))
+            .expect("NameAcquired body")
+            .encode()
+            .expect("NameAcquired");
+            stream.write_all(&acquired).expect("announce probe name");
+
+            let query_frame = probe_frame(&mut stream, deadline).expect("read ListNames");
+            let (query, used) = message::decode(&query_frame, 0).expect("decode ListNames");
+            assert_eq!(used, query_frame.len());
+            assert_eq!(
+                (
+                    query.kind,
+                    query.serial,
+                    query.fields.path,
+                    query.fields.interface,
+                    query.fields.member,
+                    query.fields.destination,
+                ),
+                (
+                    message::MessageType::MethodCall,
+                    2,
+                    Some(BUS_PATH),
+                    Some(BUS_NAME),
+                    Some("ListNames"),
+                    Some(BUS_NAME),
+                )
+            );
+            assert!(query.args().is_empty());
+            let firefox_name = ":1.42";
+            let firefox_name_two = ":1.10";
+            let answer = message::Builder::method_return(crate::wire::Endian::Little, 2)
+                .sender(BUS_NAME)
+                .destination(probe_name)
+                .serial(3)
+                .body("as", |writer| {
+                    writer.array("s", |names| {
+                        names.string(BUS_NAME)?;
+                        // Firefox's real remote-control name has a suffix.
+                        // Its broker-authenticated app id is the witness.
+                        names.string("org.mozilla.firefox")?;
+                        names.string(probe_name)?;
+                        names.string(":1.41")?;
+                        names.string(firefox_name)?;
+                        names.string(firefox_name_two)
+                    })
+                })
+                .expect("names body")
+                .encode()
+                .expect("ListNames reply");
+            stream.write_all(&answer).expect("answer ListNames");
+
+            for (serial, name, credentials, pid) in [
+                (3, probe_name, Some(None), 4242),
+                // A connection unrelated to Firefox may disappear after
+                // ListNames. That race must not invalidate Firefox evidence.
+                (4, ":1.41", None, 0),
+                (5, firefox_name, Some(Some("firefox")), 4242),
+                (6, firefox_name_two, Some(Some("firefox")), 4343),
+            ] {
+                let frame = probe_frame(&mut stream, deadline).expect("read credentials call");
+                let (query, used) =
+                    message::decode(&frame, 0).expect("decode credentials call");
+                assert_eq!(used, frame.len());
+                assert_eq!(query.kind, message::MessageType::MethodCall);
+                assert_eq!(query.serial, serial);
+                assert_eq!(query.fields.path, Some(BUS_PATH));
+                assert_eq!(query.fields.interface, Some(BUS_NAME));
+                assert_eq!(query.fields.member, Some("GetConnectionCredentials"));
+                assert_eq!(query.fields.destination, Some(BUS_NAME));
+                assert_eq!(
+                    query.args().first().and_then(crate::wire::Value::as_str),
+                    Some(name)
+                );
+                let answer = match credentials {
+                    None => message::Builder::error(
+                        crate::wire::Endian::Little,
+                        "org.freedesktop.DBus.Error.NameHasNoOwner",
+                        serial,
+                    )
+                    .sender(BUS_NAME)
+                    .destination(probe_name)
+                    .serial(serial.saturating_add(1))
+                    .body("s", |writer| writer.string("no such connection on this bus"))
+                    .expect("departure body")
+                    .encode()
+                    .expect("departure reply"),
+                    Some(app_id) => message::Builder::method_return(
+                        crate::wire::Endian::Little,
+                        serial,
+                    )
+                    .sender(BUS_NAME)
+                    .destination(probe_name)
+                    .serial(serial.saturating_add(1))
+                    .body("a{sv}", |writer| {
+                        writer.array("{sv}", |entries| {
+                            entries.dict_entry(|entry| {
+                                entry.string("UnixUserID")?;
+                                entry.variant("u", |value| {
+                                    value.uint32(this_uid());
+                                    Ok(())
+                                })
+                            })?;
+                            entries.dict_entry(|entry| {
+                                entry.string("ProcessID")?;
+                                entry.variant("u", |value| {
+                                    value.uint32(pid);
+                                    Ok(())
+                                })
+                            })?;
+                            if let Some(app_id) = app_id {
+                                entries.dict_entry(|entry| {
+                                    entry.string("td.AppId")?;
+                                    entry.variant("s", |value| value.string(app_id))
+                                })?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .expect("credentials body")
+                    .encode()
+                    .expect("credentials reply"),
+                };
+                stream
+                    .write_all(&answer)
+                    .expect("answer credentials call");
+            }
+        });
+
+        assert_eq!(
+            probe_application_within(
+                &path,
+                this_uid(),
+                "firefox",
+                std::time::Duration::from_secs(5),
+            )
+            .expect("application probe"),
+            format!(
+                "guid={GUID} application=firefox connections=:1.10/4343,:1.42/4242"
+            )
+        );
+        served.join().expect("server thread");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_application_probe_refuses_ids_outside_the_td_grammar() {
+        let error = probe_application_within(
+            Path::new("/not/contacted"),
+            this_uid(),
+            "-not-an-app",
+            std::time::Duration::from_millis(1),
+        )
+        .expect_err("invalid application id was accepted");
+        assert!(error.contains("valid td application id"), "{error}");
+    }
+
+    #[test]
+    fn the_application_probe_bounds_and_validates_listed_names() {
+        use std::io::Write;
+
+        fn reply(names: &[String]) -> Vec<u8> {
+            message::Builder::method_return(crate::wire::Endian::Little, 2)
+                .sender(BUS_NAME)
+                .destination(":1.70")
+                .serial(3)
+                .body("as", |writer| {
+                    writer.array("s", |values| {
+                        for name in names {
+                            values.string(name)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .expect("names body")
+                .encode()
+                .expect("ListNames reply")
+        }
+
+        let names: Vec<String> = (0..MAX_PROBE_NAMES)
+            .map(|index| {
+                let prefix = format!(":1.{index}.");
+                let fill = crate::name::MAX_NAME_LEN
+                    .checked_sub(prefix.len())
+                    .expect("the numeric prefix fits a bus name");
+                format!("{prefix}{}", "a".repeat(fill))
+            })
+            .collect();
+        let encoded = reply(&names);
+        assert!(encoded.len() > 64 * 1024, "the boundary stayed under the old cap");
+        assert!(encoded.len() <= MAX_PROBE_FRAME);
+        let (mut reader, mut writer) = UnixStream::pair().expect("socket pair");
+        let served = thread::spawn(move || writer.write_all(&encoded));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let framed = probe_frame(&mut reader, deadline).expect("the maximum ListNames frame");
+        served.join().expect("writer thread").expect("write reply");
+        assert_eq!(
+            probe_list_names_reply(&framed, 2, ":1.70").expect("the exact name ceiling"),
+            names
+        );
+
+        let mut over = names;
+        over.push(format!(":1.{MAX_PROBE_NAMES}"));
+        let error = probe_list_names_reply(&reply(&over), 2, ":1.70")
+            .expect_err("a name beyond the ceiling was admitted");
+        assert!(error.contains("ListNames"), "{error}");
+
+        let duplicate = vec![":1.1".to_string(), ":1.1".to_string()];
+        let error = probe_list_names_reply(&reply(&duplicate), 2, ":1.70")
+            .expect_err("a duplicate name was admitted");
+        assert!(error.contains("duplicate bus name"), "{error}");
+
+        let invalid = vec!["-not-a-name".to_string()];
+        let error = probe_list_names_reply(&reply(&invalid), 2, ":1.70")
+            .expect_err("an invalid name was admitted");
+        assert!(error.contains("invalid bus name"), "{error}");
+    }
+
+    #[test]
+    fn the_application_probe_requires_a_positive_kernel_pid_for_a_match() {
+        fn reply(pid: Option<u32>) -> Vec<u8> {
+            message::Builder::method_return(crate::wire::Endian::Little, 3)
+                .sender(BUS_NAME)
+                .destination(":1.70")
+                .serial(4)
+                .body("a{sv}", |writer| {
+                    writer.array("{sv}", |entries| {
+                        entries.dict_entry(|entry| {
+                            entry.string("UnixUserID")?;
+                            entry.variant("u", |value| {
+                                value.uint32(this_uid());
+                                Ok(())
+                            })
+                        })?;
+                        if let Some(pid) = pid {
+                            entries.dict_entry(|entry| {
+                                entry.string("ProcessID")?;
+                                entry.variant("u", |value| {
+                                    value.uint32(pid);
+                                    Ok(())
+                                })
+                            })?;
+                        }
+                        entries.dict_entry(|entry| {
+                            entry.string("td.AppId")?;
+                            entry.variant("s", |value| value.string("firefox"))
+                        })
+                    })
+                })
+                .expect("credentials body")
+                .encode()
+                .expect("credentials reply")
+        }
+
+        let error = probe_credentials_reply(&reply(Some(0)), 3, ":1.70")
+            .expect_err("a zero process id was admitted");
+        assert!(error.contains("zero ProcessID"), "{error}");
+
+        let credentials = probe_credentials_reply(&reply(None), 3, ":1.70")
+            .expect("parse missing process id")
+            .expect("connection is live");
+        let error = probe_application_connection(
+            ":1.42",
+            &credentials,
+            this_uid(),
+            "firefox",
+        )
+        .expect_err("a matching application without a process id was admitted");
+        assert!(error.contains("no kernel process id"), "{error}");
+    }
+
+    #[test]
+    fn the_application_probe_frame_read_has_one_absolute_deadline() {
+        use std::io::Write;
+
+        let (mut reader, mut writer) = UnixStream::pair().expect("socket pair");
+        let served = thread::spawn(move || {
+            for byte in [0_u8; message::HEADER_LEN] {
+                thread::sleep(std::time::Duration::from_millis(5));
+                if writer.write_all(&[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let error = probe_frame(&mut reader, deadline).expect_err("dribble escaped deadline");
+        assert!(error.contains("deadline") || error.contains("timed out"), "{error}");
+        served.join().expect("server thread");
+    }
+
+    #[test]
+    fn the_application_probe_write_has_one_absolute_deadline() {
+        use std::io::Write;
+
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        writer.set_nonblocking(true).expect("nonblocking writer");
+        let fill = [0_u8; 4_096];
+        loop {
+            match writer.write(&fill) {
+                Ok(0) => panic!("socket stopped before its send buffer filled"),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill socket send buffer: {error}"),
+            }
+        }
+        writer.set_nonblocking(false).expect("blocking writer");
+        let (send, receive) = std::sync::mpsc::channel();
+        let served = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+            let result = probe_write_all(&mut writer, deadline, b"x", "stalled test write");
+            let _ = send.send(result);
+        });
+        let outcome = receive.recv_timeout(std::time::Duration::from_millis(250));
+        // A broken implementation might block without a socket timeout. Close
+        // its peer before joining so the gate itself remains bounded and red.
+        drop(reader);
+        served.join().expect("write worker");
+        let error = outcome
+            .expect("stalled write did not observe its absolute deadline")
+            .expect_err("stalled write escaped deadline");
+        assert!(error.contains("deadline"), "{error}");
     }
 
     /// A probe against a bus that refuses it must FAIL, or `ready=` would pass
