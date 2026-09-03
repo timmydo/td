@@ -892,6 +892,78 @@ pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 /// td-jail's exported filter and observes the compiled errno and kill actions.
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 
+/// APPLICATIONS.md §H item 12: `kill -KILL` of stage 1 reaped the whole
+/// instance.
+///
+/// This doc is the ONE declared owner of what the marker attests. Everything
+/// else that mentions it — the boot unit that runs the probe, the console
+/// oracle that latches it, the operator diagnostic that explains its absence
+/// — points here rather than restating it, because a requirement copied into
+/// four places drifts in three of them.
+///
+/// td-jail's driver emitted it, and only after all of:
+///
+/// - a real stage-1 transition built an instance: fresh user and pid
+///   namespaces, identity maps read back, the mount plan prepared and
+///   pivoted into, capabilities cleared, the standard filter installed and
+///   read back — the same `start_probe_instance` `--probe-transition` uses,
+///   so this is not a second, easier transition;
+/// - stage 2 came up as PID 1 of that namespace, armed BOTH liveness
+///   mechanisms §C describes (`PR_SET_PDEATHSIG` and the proof-pipe watcher
+///   thread), and spawned a descendant inside the namespace;
+/// - stage 1 reported outward the two things only it knows: stage 2's HOST
+///   pid, and the namespace pid stage 2 named for the descendant. It does
+///   not resolve the descendant itself and cannot, because stage 2 pivots
+///   in the mount namespace stage 1 created and shares, and `pivot_root(2)`
+///   re-roots every process in it — leaving stage 1's `/proc` showing the
+///   jail rather than the host;
+/// - the DRIVER, which never unshares and so still has the host's `/proc`,
+///   walked it for stage 2's single child and cross-checked that child's
+///   namespace pid against the one stage 2 named;
+/// - the driver then checked the shape it was about to measure: both alive
+///   rather than merely present, stage 2 answering to pid 1 inside its own
+///   namespace, and the descendant being stage 2's child and answering to a
+///   pid that is not its host one — twice, the second time as late as
+///   possible before the kill;
+/// - the driver SIGKILLed stage 1 and confirmed stage 1 died BY that signal
+///   rather than exiting on its own;
+/// - both host pids then STOPPED EXECUTING — gone from `/proc`, or left as
+///   a zombie, which has exited and released everything but its pid-table
+///   entry — pinned by start time so a reused pid reads as gone rather
+///   than as a survivor.
+///
+/// The zombie case is counted as gone on purpose, and the marker says so
+/// rather than claiming the stronger thing. What this attests is the
+/// release of the namespace and what was in it, which a zombie has already
+/// done; whether its pid-table entry has additionally been collected
+/// depends on when an unrelated reaper runs, and gating the marker on that
+/// would make it a statement about the host's reaping latency rather than
+/// about td-jail's teardown.
+///
+/// The descendant is what makes this "the whole instance" and not "stage 2":
+/// the driver never spawned it, and the only signal this probe sends goes to
+/// stage 1. It does resolve the descendant's host pid, by walking `/proc`
+/// for stage 2's child, because watching that pid stop is the measurement.
+/// The claim is about what this code does rather than what it could do: a
+/// process in an ancestor pid namespace with a matching uid can signal by
+/// host pid. So the descendant's disappearance is evidence about namespace
+/// teardown.
+///
+/// What this marker does NOT attest is §C's other sentence — that the
+/// independent cgroup watcher drains the leaf. The probe's instance has no
+/// cgroup, because the only shipped application is Firefox and a second
+/// `firefox-` leaf would break the one-active-instance rule
+/// `--probe-resource-caps` depends on.
+///
+/// That half is UNPROVEN. It is argued in §C and wired in `cgroup.rs`, but
+/// nothing exercises it: `remove_abandoned` has source-text pins on its
+/// ordering rather than a test that drains a populated leaf, and
+/// `--probe-resource-caps` reads a leaf while it is still populated, which
+/// is the opposite end of the lifecycle. Proving it needs a jailed instance
+/// with a cgroup that a probe may kill, which the single-application rule
+/// currently denies.
+pub const TD_JAIL_KILL_REAPS_MARKER: &str = "TD-JAIL-KILL-REAPS-OK";
+
 /// Compatibility marker emitted by the trusted Firefox-evidence unit after
 /// the stronger HTTPS-content, live-process and resource-cap proof below.
 pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";

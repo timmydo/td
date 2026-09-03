@@ -135,6 +135,9 @@ const TD_PORTAL_CHANNEL_CONSOLE_MARKER: &str =
 const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
+/// APPLICATIONS.md §H item 12. What it attests is stated once, on
+/// `td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER`; read it there.
+const TD_JAIL_KILL_REAPS_MARKER: &str = td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER;
 const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_BOOT_MARKER;
 const TD_FIREFOX_CONTENT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CONTENT_MARKER;
 const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MARKER;
@@ -399,6 +402,7 @@ struct ConsoleEvidence {
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
     td_jail_seccomp: bool,
+    td_jail_kill_reaps: bool,
     td_firefox: bool,
     td_firefox_content: bool,
     td_firefox_support: bool,
@@ -1100,7 +1104,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          naturally reaped filtered descendants as PID 1, and exercised bounded TERM/KILL \
          survivor cleanup ({TD_JAIL_TRANSITION_MARKER}); a \
          non-shipped target probe exercised its errno and kill actions \
-         ({TD_JAIL_SECCOMP_PROBE_MARKER}), then assigned the single-user \
+         ({TD_JAIL_SECCOMP_PROBE_MARKER}), and a SIGKILL of a live stage 1 reaped \
+         that instance's PID 1 and a descendant it never spawned \
+         ({TD_JAIL_KILL_REAPS_MARKER}), then assigned the single-user \
          graphical seat and brought \
          the software Wayland socket up on virtio-gpu ({TD_WAYLAND_RUNTIME_MARKER}), \
          read an absolute position and its span off the virtio tablet \
@@ -1810,6 +1816,25 @@ fn validate_system_boot(
              The Rust interpreter proves the program's bytes and the build-host run is only a \
              host-policy smoke test; this marker is the target-kernel behavior proof. Last \
              serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_jail_kill_reaps {
+        return Err(format!(
+            "td-jail's transition and filter proofs passed, but the §H item 12 marker \
+             ({TD_JAIL_KILL_REAPS_MARKER:?}) was absent — killing stage 1 did not reap the \
+             whole instance. What the marker attests is on \
+             `td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER`; what its ABSENCE means is one of \
+             these, and they are worth separating because only the first is the failure this \
+             item is about: the instance outlived stage 1, so a dead launcher leaves a jailed \
+             process running with no supervisor — either PID 1 did not exit, or it exited and \
+             the kernel did not tear the namespace down under it. Or the probe never got far \
+             enough to kill anything, which needs the same transition {TD_JAIL_TRANSITION_MARKER:?} \
+             covers, and that marker passing above makes it unlikely. Or stage 1 exited on its \
+             own before the SIGKILL landed, which the probe refuses rather than counts, because \
+             a stage 1 that was already leaving proves nothing about killing one. The probe's \
+             own diagnostic line names the pids it watched and how long it waited. Last serial \
+             output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -4372,6 +4397,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_SANDBOX_KERNEL_MARKER.len(),
         TD_JAIL_TRANSITION_MARKER.len(),
         exact_line_window(TD_JAIL_SECCOMP_PROBE_MARKER),
+        exact_line_window(TD_JAIL_KILL_REAPS_MARKER),
         exact_line_window(TD_FIREFOX_BOOT_MARKER),
         exact_line_window(TD_FIREFOX_CONTENT_MARKER),
         exact_line_window(TD_FIREFOX_SUPPORT_MARKER),
@@ -4604,6 +4630,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_jail_seccomp,
         buf,
         TD_JAIL_SECCOMP_PROBE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_jail_kill_reaps,
+        buf,
+        TD_JAIL_KILL_REAPS_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -7560,7 +7592,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 72] {
+    fn all_console_markers() -> [&'static str; 73] {
         [
             MARKER,
             EROFS_MARKER,
@@ -7606,6 +7638,7 @@ mod tests {
             TD_SANDBOX_KERNEL_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
+            TD_JAIL_KILL_REAPS_MARKER,
             TD_FIREFOX_BOOT_MARKER,
             TD_FIREFOX_CONTENT_MARKER,
             TD_FIREFOX_SUPPORT_MARKER,
@@ -7786,6 +7819,135 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_jail_seccomp);
+    }
+
+    /// The boot-validation row itself, not merely the latch that feeds it.
+    ///
+    /// The first version of this commit argued that no `validate_system_boot`
+    /// row has unit coverage and the real boot is their oracle. That is true
+    /// as precedent and false as a reason: the function is pure host logic
+    /// over a struct this test can build, so a row CAN be pinned here, and a
+    /// row that silently stopped rejecting would otherwise only be noticed
+    /// by a boot that started passing when it should not.
+    ///
+    /// It asserts the difference the row makes rather than a whole valid
+    /// boot: with the flag set the complaint is about something else, with
+    /// it cleared the complaint names this marker. Anything that stops the
+    /// row being reached shows up as the second half failing, which is the
+    /// safe direction.
+    #[test]
+    fn the_kill_reaps_row_is_what_rejects_a_boot_missing_its_marker() {
+        // Set field by field rather than latched from the marker roster.
+        // The roster does not cover every field this walk reads, and the
+        // ones it does cover it sets to a combination no real boot
+        // produces -- every selection outcome at once, which the selection
+        // check rightly refuses. What this needs is a boot whose only
+        // difference between the two calls below is ONE field. It is not a
+        // wholly valid boot: with the marker set the walk runs on to the
+        // persistent-shutdown row and complains about that instead, which
+        // is why the assertions below are about WHICH marker the complaint
+        // names rather than about there being no complaint.
+        let mut evidence = ConsoleEvidence::default();
+        evidence.boot_success = true;
+        evidence.codex_runtime = true;
+        evidence.etc_mutable = true;
+        evidence.etc_read_only = true;
+        evidence.firstboot_new = true;
+        evidence.git_runtime = true;
+        evidence.host_key = Some("ssh-ed25519 AAAA".to_string());
+        evidence.persist_read = true;
+        evidence.persist_write = true;
+        evidence.ripgrep_fd_runtime = true;
+        evidence.root_read_only = true;
+        evidence.selected_current = true;
+        evidence.sshd = true;
+        evidence.state_owner = true;
+        evidence.state_writable = true;
+        evidence.target = true;
+        evidence.td_busd_runtime = true;
+        evidence.td_firefox = true;
+        evidence.td_firefox_content = true;
+        evidence.td_firefox_support = true;
+        evidence.td_init_runtime = true;
+        evidence.td_jail_kill_reaps = true;
+        evidence.td_jail_seccomp = true;
+        evidence.td_jail_transition = true;
+        evidence.td_login_runtime = true;
+        evidence.td_pointer_absolute = true;
+        evidence.td_portal_channel_runtime = true;
+        evidence.td_portal_request_runtime = true;
+        evidence.td_portal_runtime = true;
+        evidence.td_portal_unavailable_runtime = true;
+        evidence.td_profiler_attribution = true;
+        evidence.td_sandbox_kernel = true;
+        evidence.td_term_runtime = true;
+        evidence.td_txt_runtime = true;
+        evidence.td_util_runtime = true;
+        evidence.td_wayland_runtime = true;
+        evidence.uutils_runtime = true;
+
+        // The console is left EMPTY even though the markers were latched
+        // from it. Every complaint echoes a serial tail, and a tail holding
+        // every marker would make `contains` below true whatever the row
+        // said -- the first version of this test asserted exactly that and
+        // passed itself.
+        let result = BootResult {
+            evidence,
+            exited_clean: true,
+            reason: String::new(),
+            console: String::new(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        let complaint = validate_system_boot(
+            &result,
+            PersistencePhase::None,
+            IdentityPhase::Fresh,
+            "first",
+            SelectionExpectation::Current,
+        );
+        let with_marker = complaint.err().unwrap_or_default();
+        assert!(
+            !with_marker.contains(TD_JAIL_KILL_REAPS_MARKER),
+            "with the marker latched this row must not be the complaint: {with_marker}"
+        );
+
+        let mut without = result;
+        without.evidence.td_jail_kill_reaps = false;
+        let complaint = validate_system_boot(
+            &without,
+            PersistencePhase::None,
+            IdentityPhase::Fresh,
+            "first",
+            SelectionExpectation::Current,
+        )
+        .expect_err("a boot missing the kill-reaps marker must be rejected");
+        assert!(
+            complaint.contains(TD_JAIL_KILL_REAPS_MARKER),
+            "the rejection must name the marker that was absent: {complaint}"
+        );
+    }
+
+    #[test]
+    fn kill_reaps_evidence_requires_an_exact_console_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\ntd-jail: kill-reaps returned unexpected output: {TD_JAIL_KILL_REAPS_MARKER} x\n")
+                .as_bytes(),
+            b"target",
+        );
+        assert!(
+            !evidence.td_jail_kill_reaps,
+            "the marker quoted inside the leg's own failure diagnostic must not latch"
+        );
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_JAIL_KILL_REAPS_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_jail_kill_reaps);
     }
 
     #[test]
@@ -8339,6 +8501,7 @@ mod tests {
             TD_PORTAL_CHANNEL_CONSOLE_MARKER,
             TD_JAIL_TRANSITION_MARKER,
             TD_JAIL_SECCOMP_PROBE_MARKER,
+            TD_JAIL_KILL_REAPS_MARKER,
             TD_FIREFOX_BOOT_MARKER,
             TD_FIREFOX_CONTENT_MARKER,
             TD_FIREFOX_SUPPORT_MARKER,
@@ -8405,6 +8568,7 @@ mod tests {
         assert!(evidence.td_portal_channel_runtime);
         assert!(evidence.td_jail_transition);
         assert!(evidence.td_jail_seccomp);
+        assert!(evidence.td_jail_kill_reaps);
         assert!(evidence.td_firefox);
         assert!(evidence.td_firefox_content);
         assert!(evidence.td_firefox_support);

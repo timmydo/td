@@ -13,7 +13,7 @@ use crate::ladder::{
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
     TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
     TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
-    TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
     TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_CHANNEL_RUNTIME_MARKER,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
@@ -2488,7 +2488,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          bg={BUS_MARKER_GRACE_SWEEPS}\n\
          [ \"$bg\" -ge \"$wait\" ] && bg=$((wait-1))\n\
          mu=0; mrf=0; mg=0; mc=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0; btb=0\n\
-         msk=0; mtj=0; mts=1\n\
+         msk=0; mtj=0; mtk=0; mts=1\n\
          if /bin/su -s /bin/sh {} -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
          echo {TD_SANDBOX_KERNEL_MARKER}; msk=1; fi\n\
@@ -2498,6 +2498,13 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$j\" = \"{TD_JAIL_TRANSITION_MARKER} pid=1\" ] || \
          {{ echo \"td-jail: target transition returned unexpected output: $j\"; \
          exit 1; }}'; then echo {TD_JAIL_TRANSITION_MARKER}; mtj=1; fi\n\
+         if /bin/su -s /bin/sh {} -c \
+         'k=$(/bin/td-jail --probe-kill-reaps 2>&1) || \
+         {{ echo \"td-jail: kill-reaps probe failed: $k\"; exit 1; }}; \
+         /bin/td-util printf \"%s\\n\" \"$k\" | \
+         /bin/grep -q -x -F {TD_JAIL_KILL_REAPS_MARKER} || \
+         {{ echo \"td-jail: kill-reaps returned unexpected output: $k\"; \
+         exit 1; }}'; then echo {TD_JAIL_KILL_REAPS_MARKER}; mtk=1; fi\n\
          if [ -e /var/lib/td-test/td-jail-seccomp-probe ]; then \
          mts=0; /bin/rm -rf /run/td-jail-seccomp-probe; \
          if [ -f /var/lib/td-test/td-jail-seccomp-probe ] \
@@ -2679,6 +2686,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          else btb=$((btb+1)); fi; \
          [ \"$msk\" = 1 ] || healthy=0; \
          [ \"$mtj\" = 1 ] || healthy=0; \
+         [ \"$mtk\" = 1 ] || healthy=0; \
          [ \"$mts\" = 1 ] || healthy=0; \
          if [ \"$healthy\" = 1 ] \
          && {{ [ \"$mtb\" = 1 ] || [ \"$btb\" -ge \"$bg\" ]; }} \
@@ -2730,6 +2738,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          fail\n",
+        sys.autologin,
         sys.autologin,
         sys.autologin,
         sys.autologin,
@@ -8819,6 +8828,27 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 && bootsuccess.contains(&format!(
                     "\"{TD_JAIL_TRANSITION_MARKER} pid=1\""
                 ))
+                // §H item 12, pinned leg-whole for the reason the comment
+                // further down gives: `contains` on the command and
+                // `contains` on the marker both keep matching if the `echo`
+                // moves out of the `then` branch, and the marker would then
+                // print for a probe that failed. The match is pinned too,
+                // because it is what refuses a probe that exited 0 having
+                // printed something else, and its SHAPE is the pin: the
+                // probe's diagnostic line comes first on stdout, so a bare
+                // equality test would never match, while the
+                // `case "$k" in *"MARKER")` this replaced accepted any
+                // output ENDING in the marker's bytes --
+                // `garbageTD-JAIL-KILL-REAPS-OK` among them. `grep -x -F`
+                // is the whole-line match that was meant.
+                && bootsuccess.contains("/bin/td-jail --probe-kill-reaps")
+                && bootsuccess.contains(&format!(
+                    "/bin/grep -q -x -F {TD_JAIL_KILL_REAPS_MARKER} ||"
+                ))
+                && bootsuccess.contains(&format!(
+                    "}}'; then echo {TD_JAIL_KILL_REAPS_MARKER}; mtk=1; fi"
+                ))
+                && bootsuccess.contains("td-jail: kill-reaps probe failed: $k")
                 && bootsuccess.contains("/bin/td-jail --internal-write-seccomp-filter")
                 && bootsuccess.contains("/var/lib/td-test/td-jail-seccomp-probe")
                 && bootsuccess.contains("/run/td-jail-seccomp-probe/probe")
@@ -8872,6 +8902,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 // sentence on ttyS0 for five different faults.
                 && bootsuccess.contains("/run/user/1000/bus: $b\"; exit 1; }")
                 && bootsuccess.contains("[ \"$mtj\" = 1 ] || healthy=0")
+                && bootsuccess.contains("[ \"$mtk\" = 1 ] || healthy=0")
                 && bootsuccess.contains("[ \"$mts\" = 1 ] || healthy=0")
                 && bootsuccess
                     .contains("td-boot success /dev/vda /run/td-update \"$deployment\"")

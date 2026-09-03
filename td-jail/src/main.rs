@@ -81,6 +81,11 @@ fn run() -> std::io::Result<()> {
         transition::Mode::ReaperOrphan => transition::run_reaper_orphan(),
         transition::Mode::SurvivorChild => transition::run_survivor_child(),
         transition::Mode::SurvivorOrphan => transition::run_survivor_orphan(),
+        transition::Mode::KillReapsProbe => transition::probe_kill_reaps(),
+        transition::Mode::KillReapsStage1 { expected_parent } => {
+            transition::run_kill_reaps_stage_1(expected_parent)
+        }
+        transition::Mode::KillHoldChild => transition::run_kill_hold_child(),
     }
 }
 
@@ -661,7 +666,7 @@ mod confinement {
             .split_once("pub fn contain_application_session")
             .unwrap()
             .1
-            .split_once("pub fn probe_transition")
+            .split_once("struct ProbeInstance")
             .unwrap()
             .0;
         let at = |needle: &str| {

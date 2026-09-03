@@ -279,7 +279,12 @@ mount bridge, enters the fresh immutable root, clears and reads back every
 capability set, installs and reads back no-new-privileges and the compiled
 filter, reaps a filtered reparented descendant, and gates boot success on
 `TD-JAIL-TRANSITION-OK`. A non-shipped target probe staged only into the QEMU
-fixture exercises the exact filter's errno and kill actions. Failure disables
+fixture exercises the exact filter's errno and kill actions. A third leg then
+proves §H item 12 on the same kernel: it builds an instance through that same
+transition, SIGKILLs stage 1, and gates boot success on
+`TD-JAIL-KILL-REAPS-OK` once PID 1 and a descendant it never spawned have both
+stopped executing — gone from the host's `/proc`, or a zombie, which has
+exited and released all it held. Failure disables
 application launch with a named diagnostic; it never silently selects a weaker
 sandbox.
 
@@ -6733,7 +6738,45 @@ and image commits — showing:
     intends to refuse. The roster's *misses* — dangerous syscalls left
     out — are invisible to this and are what §C's argued-row-by-row
     construction and td's kernel config are for;
-12. `kill -KILL` of stage 1 reaping the whole instance;
+12. `kill -KILL` of stage 1 reaping the whole instance — **LANDED**, as
+    td-jail's `--probe-kill-reaps`, on the unprivileged health leg beside
+    the transition probe, and like that one it runs on every boot rather
+    than only an autotest one. (The seccomp leg beside them does not: it is
+    gated on a fixture staged only into the QEMU image.) It builds a real
+    instance through the same `start_probe_instance` `--probe-transition`
+    uses, so this is not a second, easier transition; stage 2 comes up as
+    PID 1 with both §C liveness mechanisms armed and spawns a descendant
+    inside the namespace; the driver SIGKILLs stage 1 and requires both
+    host pids to stop executing — gone from `/proc`, or a zombie, which
+    has exited and holds nothing but a pid-table entry — pinned by start
+    time. The descendant is
+    what makes it *the whole instance*: the driver never spawned it, and
+    the only signal this probe sends goes to stage 1. It does resolve the
+    descendant's host pid, by walking `/proc` for stage 2's child, because
+    watching that pid leave is the measurement — the claim is about what
+    this code does, not what it could do, since a process in an ancestor
+    pid namespace with a matching uid can signal by host pid. The walk is
+    the DRIVER's: stage 2 pivots in the mount namespace stage 1 created and
+    shares, and `pivot_root(2)` re-roots every process in it, so stage 1's
+    `/proc` shows the jail rather than the host once stage 2 has reported.
+    Stage 1 forwards only stage 2's host pid and the namespace pid stage 2
+    named.
+    The driver spawns stage 1 rather than finding one so the kill is safe
+    `Child::kill`; reaching a pid td-jail did not spawn would mean
+    `kill(2)` with a real pid, and `UNSAFE.md` §9 pins that syscall to
+    `-1`, so an outside-in probe would widen an audited syscall surface
+    to test it. What did NOT land is §C's other
+    sentence, that the independent cgroup watcher drains the leaf: the
+    probe's instance has no cgroup, because Firefox is the only shipped
+    application and a second `firefox-` leaf would break the
+    one-active-instance rule `--probe-resource-caps` depends on. That half
+    is **unproven** — argued in §C and wired in `cgroup.rs`, but nothing
+    exercises it: `remove_abandoned` has source-text pins on its ordering
+    rather than a test that drains a populated leaf, and
+    `--probe-resource-caps` reads a leaf while it is still populated, which
+    is the opposite end of the lifecycle. Proving it needs a jailed instance
+    with a cgroup a probe may kill, which the single-application rule
+    denies;
 13. **audio PLAYING — LANDED.** The physical-input boot's first trusted
     Firefox key starts exactly one one-second, 440 Hz Web Audio oscillator at
     quarter gain and records its exact 48 kHz context rate, completion and

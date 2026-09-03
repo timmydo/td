@@ -194,6 +194,228 @@ mod tests {
         assert!(transition.contains(crate::ladder::TD_JAIL_TRANSITION_MARKER));
     }
 
+    /// The §H item 12 marker is a literal in td-jail and a constant in
+    /// `ladder.rs`, in different crates with no compiler relationship. The
+    /// boot oracle reads the ladder one and the guest prints the td-jail
+    /// one, so if they ever differ the marker simply never appears and the
+    /// boot fails with the row's absence diagnostic rather than with the
+    /// truth, which is that two strings drifted.
+    #[test]
+    fn recipe_embeds_the_kill_reaps_marker() {
+        let transition = source("transition").expect("transition source");
+        assert!(transition.contains(&format!(
+            "pub const KILL_REAPS_MARKER: &str = \"{}\";",
+            crate::ladder::TD_JAIL_KILL_REAPS_MARKER
+        )));
+    }
+
+    /// §H item 12's driver, pinned at source level because its composition
+    /// is what no test can reach.
+    ///
+    /// A reviewer showed the gap by mutation: deleting the
+    /// `require_instance_shape` CALL, or replacing the
+    /// `require_killed_by_signal` call with a bare wait, left the whole
+    /// suite green. The helpers have tests; their USE had nothing, because
+    /// reaching those lines needs a live instance, and building one needs
+    /// `CLONE_NEWUSER` in a single-threaded process -- which libtest cannot
+    /// give. This is the crate's usual answer to an invariant the compiler
+    /// cannot express, applied to one a test cannot either.
+    #[test]
+    fn the_kill_reaps_driver_still_uses_the_checks_it_documents() {
+        let transition = source("transition").expect("transition source");
+        let driver = transition
+            .split_once("fn observe_kill_reaps(")
+            .expect("kill-reaps driver")
+            .1
+            .split_once("\nfn ")
+            .expect("driver end")
+            .0;
+        for call in [
+            "require_live(\"stage 2\", stage2)?",
+            "require_live(\"the jailed descendant\", descendant)?",
+            "require_killed_by_signal(stage1.wait()?)?",
+            "stage1.kill()?",
+            "is_gone(stage2, before_stage2.starttime)?",
+            "is_gone(descendant, before_descendant.starttime)?",
+        ] {
+            assert!(
+                driver.contains(call),
+                "the kill-reaps driver no longer calls {call}"
+            );
+        }
+        // TWICE, not once: the shape is established, and then re-established
+        // as late as possible before the kill, because an instance that
+        // ended itself in between would leave exactly the evidence a
+        // teardown leaves. A `contains` here would have been satisfied by
+        // either call alone, and a reviewer's mutation deleting the second
+        // one stayed green until this counted them.
+        assert_eq!(
+            driver.matches("require_instance_shape(stage2, descendant,").count(),
+            2,
+            "the driver must check the instance shape on both readings"
+        );
+        assert_eq!(
+            driver.matches("require_live(").count(),
+            4,
+            "the driver must read both witnesses on both readings"
+        );
+        // And the kill is between the checks and the watching, which is the
+        // only order in which any of it means anything.
+        //
+        // The LAST shape check, not the first. A reviewer's mutation moved
+        // the late re-check to AFTER the kill: the count above still read
+        // 2, a `find` still reported a check before the kill, and the whole
+        // suite stayed green -- while the self-termination window the second
+        // read exists to narrow was silently reopened. It re-reads structs
+        // captured before the kill, so it would still pass at runtime too.
+        let last_shape = driver
+            .rfind("require_instance_shape")
+            .expect("last shape check");
+        let shape = driver.find("require_instance_shape").expect("shape check");
+        let kill = driver.find("stage1.kill()?").expect("the kill");
+        let killed = driver
+            .find("require_killed_by_signal")
+            .expect("signal check");
+        let watch = driver.find("is_gone(stage2").expect("the watch");
+        assert!(
+            shape < kill && last_shape < kill && kill < killed && killed < watch,
+            "the driver must check the instance -- BOTH times -- then kill, confirm the \
+             signal, and watch"
+        );
+        // The reuse guard is what gives the second reading its meaning: two
+        // live pids that were checked are only the same two processes if
+        // their start times did not move. Deleting it reds nothing else.
+        assert!(
+            driver.contains("confirm_stage2.starttime != before_stage2.starttime"),
+            "the driver must confirm the witnesses were not replaced between readings"
+        );
+        assert!(
+            driver.contains("confirm_descendant.starttime != before_descendant.starttime"),
+            "the driver must confirm the descendant was not replaced between readings"
+        );
+    }
+
+    /// The two things stage 1 must NOT do, both of which it once did.
+    ///
+    /// Neither is a style preference; each is a kernel rule that made the
+    /// probe unable to pass, and neither reds any test, because reaching
+    /// stage 1's body needs a live jail.
+    ///
+    /// 1. No watchdog thread. `CLONE_NEWUSER` refuses a multi-threaded
+    ///    caller, so no thread may exist before the unshare; and after
+    ///    `unshare(CLONE_NEWPID)` the kernel refuses `CLONE_THREAD` while
+    ///    `pid_ns_for_children` differs from the active pid namespace, which
+    ///    is exactly what an unshared-but-unforked task has. There is no
+    ///    moment in between, so stage 1 can never hold one.
+    /// 2. No `/proc` walk. Stage 2 pivots in the mount namespace stage 1
+    ///    created and shares, and `pivot_root(2)` re-roots every process in
+    ///    it -- so once stage 2 has reported, stage 1's `/proc` is the
+    ///    jail's, showing namespace pids. A host pid cannot be resolved
+    ///    there.
+    ///
+    /// The second is about WALKING `/proc` for other processes, after the
+    /// unshare. Stage 1 does read `/proc/self/stat`, once, BEFORE the
+    /// unshare, to check its parent is still the driver -- that read is
+    /// against the host's `/proc` and about stage 1 itself, so it is not
+    /// what this forbids and the forbidden list is written to let it
+    /// through.
+    #[test]
+    fn stage_1_neither_threads_nor_walks_proc() {
+        let transition = source("transition").expect("transition source");
+        let stage1 = transition
+            .split_once("pub fn run_kill_reaps_stage_1(")
+            .expect("kill-reaps stage-1 role")
+            .1
+            .split_once("\nfn ")
+            .expect("stage-1 role end")
+            .0;
+        let body = stage1.split_once("\n}").map_or(stage1, |(body, _)| body);
+        // Substrings, not full call spellings: a reviewer showed that
+        // `std::thread::spawn` and `fs::read_dir(Path::new("/proc"))` both
+        // slipped past an earlier list of four exact forms, which made this
+        // pin look stronger than it was.
+        for forbidden in [
+            "start_probe_watchdog(",
+            "thread::Builder",
+            "thread::spawn",
+            "find_jailed_descendant(",
+            "read_dir(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "stage 1 must not use {forbidden}: it holds neither a thread nor a host \
+                 /proc view, and both were once assumed"
+            );
+        }
+        assert!(
+            body.contains("sys::set_parent_death_signal()?;"),
+            "stage 1's only bound is the driver's deadline reaching it through PDEATHSIG"
+        );
+    }
+
+    /// The driver, not stage 1, resolves the descendant's host pid.
+    ///
+    /// This is the other half of the pin above: the walk has to happen
+    /// somewhere, and the driver is the last process in the chain that
+    /// still has the host's `/proc`, because it never unshares.
+    #[test]
+    fn the_driver_resolves_the_descendant_in_its_own_host_proc() {
+        let transition = source("transition").expect("transition source");
+        let driver = transition
+            .split_once("fn observe_kill_reaps(")
+            .expect("kill-reaps driver")
+            .1
+            .split_once("\nfn ")
+            .expect("driver end")
+            .0;
+        assert!(
+            driver.contains("find_jailed_descendant(stage2, namespace_pid)?"),
+            "the driver must resolve the descendant itself"
+        );
+        // Before the liveness reads, or it would be measuring a pid it had
+        // not yet resolved.
+        let resolve = driver
+            .find("find_jailed_descendant(")
+            .expect("descendant resolution");
+        let live = driver.find("require_live(").expect("liveness read");
+        assert!(
+            resolve < live,
+            "the descendant must be resolved before it is measured"
+        );
+    }
+
+    /// `run_stage2_kill_hold` starts a SECOND liveness watcher, and the
+    /// ordering pin above it covers only the Launch arm's.
+    ///
+    /// UNSAFE.md §9 says the watcher is created after the filter readback
+    /// so it inherits the filter, and names the embedded-source test as
+    /// what holds that. This keeps that sentence true for both sites: the
+    /// arm is dispatched from `run_stage2`'s terminal `match`, which is
+    /// after the install, so pinning the dispatch pins the ordering.
+    #[test]
+    fn the_kill_hold_arm_starts_its_watcher_after_the_filter_too() {
+        let transition = source("transition").expect("transition source");
+        let install = transition
+            .find("install_standard_seccomp_filter().map_err(|error|")
+            .expect("seccomp installation");
+        let dispatch = transition
+            .find("Stage2Action::KillHold => run_stage2_kill_hold(),")
+            .expect("kill-hold dispatch");
+        assert!(
+            install < dispatch,
+            "the kill-hold arm must be dispatched after the filter is installed"
+        );
+        let hold = transition
+            .split_once("fn run_stage2_kill_hold()")
+            .expect("kill-hold arm")
+            .1;
+        assert!(
+            hold.starts_with(" -> io::Result<()> {\n    start_stage1_liveness_watcher()?;"),
+            "the kill-hold arm must start the liveness watcher first, so the mechanism \
+             under test is the production one"
+        );
+    }
+
     #[test]
     fn cgroup_paths_match_the_distribution_hierarchy() {
         let authority = source("authority").expect("authority source");
@@ -251,8 +473,17 @@ mod tests {
         let nondumpable = transition
             .find("sys::set_dumpable(false)?;")
             .expect("nondumpable transition");
+        // Anchored on the readback that precedes it rather than on the call
+        // alone: §H item 12's held stage 2 starts the SAME watcher, earlier
+        // in the file, so a bare `find` would return that one and this
+        // ordering assertion would silently be about a different frame.
+        const WATCHER_AFTER_DUMPABLE_READBACK: &str = concat!(
+            "return Err(io::Error::other(\"PID 1 remained dumpable\"));\n",
+            "            }\n",
+            "            start_stage1_liveness_watcher()?;",
+        );
         let watcher = transition
-            .find("start_stage1_liveness_watcher()?;")
+            .find(WATCHER_AFTER_DUMPABLE_READBACK)
             .expect("liveness watcher");
         let data_limit = transition
             .find("sys::set_and_require_data_limit(resources.memory_max_bytes)?;")

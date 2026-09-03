@@ -15,6 +15,9 @@ const MAX_PROCESS_CMDLINE_BYTES: u64 = 64 * 1024;
 const MAX_PROCESS_STATUS_BYTES: u64 = 64 * 1024;
 const MAX_FIREFOX_CHILDREN: usize = 256;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// `ESRCH`. Named because `std` gives it no `ErrorKind`, so the only way to
+/// recognise it is the raw number.
+const ESRCH: i32 = 3;
 const CLEANUP_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -483,6 +486,98 @@ fn read_process_stat(path: &Path) -> io::Result<String> {
     read_bounded(path)
 }
 
+/// One host process's identity, for a caller that has to tell "this exact
+/// process is gone" from "its pid came back as something else".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostProcess {
+    pub(crate) parent: u32,
+    pub(crate) starttime: u64,
+    /// `/proc/<pid>/stat`'s state character. `Z` matters to a caller
+    /// proving a teardown: a zombie has exited and holds nothing, but its
+    /// `/proc` entry stays until someone waits for it, so a reader that
+    /// only asked "does this path exist" would call a dead process live.
+    pub(crate) state: char,
+    /// The pid it answers to in the INNERMOST namespace it belongs to. For a
+    /// process outside every nested pid namespace this is its host pid; for
+    /// one inside a jail it is the jail's number for it, which is how a
+    /// reader in the outer namespace tells the two apart.
+    pub(crate) namespace_pid: u32,
+}
+
+/// Whether an error from reading a process's `/proc` files means it is gone.
+///
+/// Two errnos, and the second is the one that catches people out. A path
+/// that has already vanished gives `ENOENT`, which `std` maps to
+/// `NotFound`. But a task being REAPED between the open and the read gives
+/// `ESRCH`, and `std` has no `ErrorKind` for that -- it arrives as
+/// `Uncategorized`, indistinguishable by kind from a permission problem or
+/// a bad read.
+///
+/// Getting this wrong is not academic. A caller watching for a teardown
+/// polls exactly while tasks are being reaped, so `ESRCH` is not an
+/// unlucky edge: it is the single most likely error, and it is the
+/// STRONGEST evidence the process is gone. Treating it as "unreadable,
+/// therefore fail" makes the proof fail on the very thing it was looking
+/// for. `killing_the_waiting_parent_kills_the_detached_application_session`
+/// has been seen failing with exactly `No such process (os error 3)` from
+/// its own reader for this reason.
+fn reads_as_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH)
+}
+
+/// Read one, or `None` if it is already gone.
+///
+/// Two files, so the process can exit between them; that is a `None`, not an
+/// error. Every other failure is real and propagates, because a caller using
+/// this to prove a teardown must not read "unreadable" as "reaped".
+pub(crate) fn host_process(pid: u32) -> io::Result<Option<HostProcess>> {
+    let stat = match read_process_stat(&PathBuf::from(format!("/proc/{pid}/stat"))) {
+        Ok(stat) => stat,
+        Err(error) if reads_as_gone(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let status = match read_process_status(&PathBuf::from(format!("/proc/{pid}/status"))) {
+        Ok(status) => status,
+        Err(error) if reads_as_gone(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(HostProcess {
+        parent: process_parent(&stat)?,
+        starttime: process_starttime(&stat)?,
+        state: process_state(&stat)?,
+        namespace_pid: namespace_process_id(&status)?,
+    }))
+}
+
+/// The parent pid from a `/proc/<pid>/stat`, in the READER's pid namespace.
+///
+/// Split after the LAST `") "` for the same reason `process_starttime` does:
+/// a process chooses its own comm and may put spaces and parentheses in it,
+/// so nothing before that terminator can be counted from the left.
+fn process_parent(stat: &str) -> io::Result<u32> {
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| io::Error::other("process stat has no command-field terminator"))?;
+    fields
+        .split_ascii_whitespace()
+        .nth(1)
+        .ok_or_else(|| io::Error::other("process stat has no parent pid"))?
+        .parse::<u32>()
+        .map_err(|error| io::Error::other(format!("process stat has invalid parent pid: {error}")))
+}
+
+/// The state character, the first field after the command terminator.
+fn process_state(stat: &str) -> io::Result<char> {
+    stat.rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| io::Error::other("process stat has no command-field terminator"))?
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|field| field.chars().next())
+        .ok_or_else(|| io::Error::other("process stat has no state"))
+}
+
 fn process_starttime(stat: &str) -> io::Result<u64> {
     let fields = stat
         .rsplit_once(") ")
@@ -890,6 +985,34 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn a_task_reaped_mid_read_is_gone_rather_than_unreadable() {
+        // The reason this function exists, pinned: `std` does NOT map
+        // `ESRCH` to `NotFound`, so a caller matching on kind alone treats
+        // the clearest possible "this process is gone" as a hard error.
+        // Should a future `std` start mapping it, this assertion is what
+        // says so rather than leaving the special case looking redundant.
+        let esrch = std::io::Error::from_raw_os_error(super::ESRCH);
+        assert_ne!(
+            esrch.kind(),
+            std::io::ErrorKind::NotFound,
+            "ESRCH now has a kind; the raw-number check may be redundant"
+        );
+        assert!(super::reads_as_gone(&esrch));
+        assert!(super::reads_as_gone(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        // And nothing else. A permission problem or a short read is a
+        // reason to fail, not evidence of a teardown.
+        for errno in [13, 5, 22] {
+            let other = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                !super::reads_as_gone(&other),
+                "errno {errno} must not read as a reaped process"
+            );
+        }
+    }
 
     #[test]
     fn instance_and_membership_grammars_are_closed() {

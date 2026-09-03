@@ -15,7 +15,7 @@ use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 pub const PROBE_ARG: &str = "--probe-transition";
@@ -52,12 +52,37 @@ const REAPER_CHILD_ARG: &str = "--internal-reaper-child";
 const REAPER_ORPHAN_ARG: &str = "--internal-reaper-orphan";
 const SURVIVOR_CHILD_ARG: &str = "--internal-survivor-child";
 const SURVIVOR_ORPHAN_ARG: &str = "--internal-survivor-orphan";
+/// §H item 12's three roles. The driver is the only one an operator names.
+///
+/// The driver spawns the stage-1 role rather than being stage 1 itself for
+/// one reason that decides the whole shape: it has to KILL stage 1, and the
+/// only kill safe Rust offers is `Child::kill` on a process you spawned.
+/// Reaching a pid td-jail did not spawn would mean `kill(2)` with a real pid,
+/// and `UNSAFE.md` §9 pins that syscall to pid -1 — so an outside-in probe
+/// would have to widen the crate's audited syscall surface to test it.
+pub const KILL_REAPS_PROBE_ARG: &str = "--probe-kill-reaps";
+const KILL_REAPS_STAGE1_ARG: &str = "--internal-kill-reaps-stage-1";
+const KILL_HOLD_CHILD_ARG: &str = "--internal-kill-hold-child";
+const STAGE2_KILL_HOLD_ARG: &str = "--kill-hold";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 pub const HOST_DEGRADATION_CGROUP: &str =
     "TD-JAIL-HOST-DEGRADATION aggregate-memory-task-and-cpu-caps=unenforced reason=no-delegated-cgroup";
 pub const HOST_DEGRADATION_WAYLAND: &str =
     "TD-JAIL-HOST-DEGRADATION wayland-global-filter=unenforced reason=direct-host-socket";
 const STAGE2_MARKER: &str = "TD-JAIL-STAGE2-OK";
+/// What the §H item 12 driver prints once the killed instance is gone.
+///
+/// Fixed rather than carrying the pids it observed: the pids differ every
+/// boot, and a console oracle that has to pattern-match cannot say the line
+/// was produced by the code that did the proving. The pids go on a separate
+/// diagnostic line that nothing depends on.
+///
+/// That diagnostic reaches the console only when the probe FAILS, which is
+/// when it is worth reading: the boot leg captures the probe's whole output
+/// in a command substitution and echoes it back only on the failure path.
+/// On success the leg prints this marker and nothing else.
+pub const KILL_REAPS_MARKER: &str = "TD-JAIL-KILL-REAPS-OK";
+const STAGE2_HOLD_MARKER: &str = "TD-JAIL-STAGE2-HOLDING";
 const TOKEN_LEN: usize = 32;
 /// Bytes of randomness in an instance name's suffix.
 ///
@@ -78,6 +103,41 @@ const OLD_ROOT: &str = "/oldroot";
 const REAPER_PROBE_PATH: &str = "/tmp/td-jail-reaper-probe";
 const REAPER_TIMEOUT: Duration = Duration::from_secs(2);
 const REAPER_POLL: Duration = Duration::from_millis(5);
+/// How long §H item 12's driver gives the kernel to empty the killed
+/// instance out of the host's `/proc`.
+///
+/// Generous because the failure it must not produce is a flake: the teardown
+/// it waits for is a kernel one with no userspace polling in it, so a real
+/// pass takes milliseconds and only a real defect approaches this.
+const KILL_REAPS_TIMEOUT: Duration = Duration::from_secs(10);
+const KILL_REAPS_POLL: Duration = Duration::from_millis(10);
+/// The ceiling on every process that deliberately holds still for item 12.
+///
+/// The driver's own deadline is far shorter, so no passing run reaches this.
+/// It exists so that a defect in the probe cannot leave a jailed process
+/// holding a boot open until the QEMU oracle's whole-run timeout, which
+/// would report the failure as something else entirely.
+const KILL_HOLD_CEILING: Duration = Duration::from_secs(120);
+/// The ceiling on the two roles that BLOCK, which is a different problem
+/// from the ceiling on the two that hold.
+///
+/// `hold_until_reaped` only binds a role that has already reported. A stage
+/// 2 that hangs BEFORE its report leaves stage 1 blocked in
+/// `read_report_line`, and a stage 1 that hangs leaves the driver blocked in
+/// the same call -- and neither read can carry a deadline of its own,
+/// because a pipe read in `std` has no timeout. So the deadline lives
+/// outside the read, in a thread.
+///
+/// Below `KILL_HOLD_CEILING` on purpose: the blocked roles give up first,
+/// and the holders then expire on their own rather than being left behind
+/// by a process that has already reported failure.
+const KILL_REAPS_CEILING: Duration = Duration::from_secs(60);
+const KILL_HOLD_POLL: Duration = Duration::from_millis(50);
+/// Ceiling on the one line the stage-1 role reports to the driver, and on the
+/// one the held stage 2 reports to it.
+const KILL_REAPS_REPORT_LIMIT: u64 = 128;
+/// Ceiling on the `/proc` walk that resolves the jailed descendant.
+const MAX_PROC_SCAN: usize = 4096;
 const SURVIVOR_TERM_TIMEOUT: Duration = Duration::from_secs(2);
 const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const SURVIVOR_PROBE_LIFETIME: Duration = Duration::from_secs(30);
@@ -257,6 +317,11 @@ pub enum Mode {
     ReaperOrphan,
     SurvivorChild,
     SurvivorOrphan,
+    KillReapsProbe,
+    KillReapsStage1 {
+        expected_parent: u32,
+    },
+    KillHoldChild,
 }
 
 /// Everything stage 2 was told to launch, which is most of what `Mode` is.
@@ -283,6 +348,13 @@ pub struct Stage2Launch {
 #[derive(Debug, Eq, PartialEq)]
 pub enum Stage2Action {
     Probe,
+    /// §H item 12: become the instance, then wait to be torn down.
+    ///
+    /// It shares `Probe`'s containment exactly — same absent filesystem plan,
+    /// same empty `/etc` binding, same probe-only reaper-probe bind — because
+    /// the thing under test is what stage 1's death does, not what stage 2
+    /// was told to mount. The one difference is the terminal arm.
+    KillHold,
     Launch(Box<Stage2Launch>),
 }
 
@@ -500,6 +572,25 @@ where
         }
         return Ok(Mode::SurvivorOrphan);
     }
+    if mode == KILL_REAPS_PROBE_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::KillReapsProbe);
+    }
+    if mode == KILL_REAPS_STAGE1_ARG {
+        let expected_parent = parse_positive_pid(args.next())?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::KillReapsStage1 { expected_parent });
+    }
+    if mode == KILL_HOLD_CHILD_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::KillHoldChild);
+    }
     Err(usage_error())
 }
 
@@ -513,6 +604,12 @@ where
             return Err(usage_error());
         }
         return Ok(Stage2Action::Probe);
+    }
+    if action == STAGE2_KILL_HOLD_ARG {
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Stage2Action::KillHold);
     }
     if action == STAGE2_LAUNCH_ARG {
         let entry = args
@@ -827,7 +924,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-network, --probe-firefox-soak, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-kill-reaps, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-network, --probe-firefox-soak, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
     )
 }
 
@@ -3548,7 +3645,29 @@ pub fn contain_application_session(expected_parent: u32) -> io::Result<()> {
     require_detached_session("application launcher", session, &after)
 }
 
-pub fn probe_transition() -> io::Result<()> {
+/// One live stage-1/stage-2 pair and the three handles stage 1 must keep to
+/// hold it that way.
+struct ProbeInstance {
+    child: Child,
+    /// The proof pipe's write end (§C). Stage 2's liveness watcher reads the
+    /// other end, so CLOSING this is how stage 1 says "I am gone" — and §H
+    /// item 12 is the proof that stage 1 dying says it too. A role that
+    /// drops this has ended its own instance.
+    proof_writer: io::PipeWriter,
+    stage2_output: io::PipeReader,
+}
+
+/// The namespace transition `--probe-transition` and §H item 12 share.
+///
+/// One function rather than two because item 12's whole claim is about what
+/// stage 1's death does to a REAL transition: a kill-reaps role that built
+/// its instance a little differently would be proving the property about
+/// something the production path does not have.
+///
+/// Returns with the token already through the pipe, so stage 2 is released
+/// and running. The caller decides what to do with the write end, which is
+/// the only thing the two roles disagree about.
+fn start_probe_instance(stage2_action: &str) -> io::Result<ProbeInstance> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
         return Err(io::Error::new(
@@ -3583,7 +3702,7 @@ pub fn probe_transition() -> io::Result<()> {
         .arg(identity.gid.to_string())
         .arg(identity.uid.to_string())
         .arg(identity.gid.to_string())
-        .arg(STAGE2_PROBE_ARG)
+        .arg(stage2_action)
         .stdin(Stdio::from(proof_reader))
         .stdout(Stdio::from(stage2_writer))
         .stderr(Stdio::from(stage2_error_writer))
@@ -3600,6 +3719,22 @@ pub fn probe_transition() -> io::Result<()> {
         let _ = child.wait();
         return Err(error);
     }
+    Ok(ProbeInstance {
+        child,
+        proof_writer,
+        stage2_output,
+    })
+}
+
+pub fn probe_transition() -> io::Result<()> {
+    let ProbeInstance {
+        mut child,
+        proof_writer,
+        stage2_output,
+    } = start_probe_instance(STAGE2_PROBE_ARG)?;
+    // This action's stage 2 runs to completion and is read to EOF, so the
+    // proof pipe has done its whole job once the token is through. The
+    // kill-reaps role is the one for which holding it open is the point.
     drop(proof_writer);
 
     let expected = format!("{STAGE2_MARKER} pid=1\n");
@@ -3633,6 +3768,610 @@ pub fn probe_transition() -> io::Result<()> {
         )));
     }
     writeln!(io::stdout(), "{TRANSITION_MARKER} pid=1")
+}
+
+/// What the §H item 12 driver saw, so its diagnostic can name it.
+struct KillReapsObservation {
+    stage1: u32,
+    stage2: u32,
+    descendant: u32,
+    descendant_namespace_pid: u32,
+    waited: Duration,
+}
+
+/// §H item 12: `kill -KILL` of stage 1 reaps the whole instance.
+///
+/// The driver spawns the stage-1 role, learns stage 2's host pid from it,
+/// resolves the descendant's host pid itself by walking its own `/proc`,
+/// SIGKILLs stage 1, and then waits for BOTH to stop executing. The only
+/// signal it sends goes to stage 1, so what happens to the other two is a
+/// consequence of the teardown rather than of anything the driver did.
+///
+/// Note the verb, because an earlier version of this paragraph got it
+/// wrong twice. The claim is NOT that the driver could not signal them:
+/// a process in an ancestor pid namespace with a matching uid can signal
+/// by host pid, and the driver holds both pids precisely so it can watch
+/// them. The claim is that this code does not.
+///
+/// The descendant is what makes it "the whole instance" rather than
+/// "stage 2": the driver never spawned it, stage 2 did, inside the
+/// namespace.
+///
+/// What this does NOT prove is §C's other sentence — that the independent
+/// cgroup watcher drains the leaf. This instance has no cgroup: the only
+/// shipped application is Firefox, whose leaf `--probe-resource-caps`
+/// already reads live, and creating a second `firefox-` leaf beside it would
+/// break the one-active-instance rule that probe depends on.
+///
+/// That half is UNPROVEN, not covered elsewhere, and an earlier version of
+/// this comment said otherwise. `remove_abandoned` has source-text pins on
+/// its ordering rather than a test that drains a populated leaf, and
+/// `--probe-resource-caps` reads a leaf while it is still populated, which
+/// is the opposite end of the lifecycle. Proving it needs a jailed instance
+/// with a cgroup that this probe is allowed to kill, which is what the
+/// single-application rule currently denies.
+pub fn probe_kill_reaps() -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the kill-reaps probe requires the nonzero application identity",
+        ));
+    }
+    start_probe_watchdog("the kill-reaps driver")?;
+    let executable = std::env::current_exe()?;
+    let mut stage1 = Command::new(executable)
+        .arg(KILL_REAPS_STAGE1_ARG)
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| io::Error::other(format!("spawn the kill-reaps stage-1 role: {e}")))?;
+    // Taken before anything can fail, so the cleanup below covers every
+    // path out of this function. As a `?` after the spawn this was the one
+    // early return that left a held stage 1 running for its whole ceiling.
+    let Some(mut reports) = stage1.stdout.take() else {
+        let _ = stage1.kill();
+        let _ = stage1.wait();
+        return Err(io::Error::other(
+            "kill-reaps stage-1 stdout pipe was not created",
+        ));
+    };
+    let observed = observe_kill_reaps(&mut stage1, &mut reports);
+    // For the paths that failed BEFORE the kill: the stage-1 role holds its
+    // instance open on purpose, so an early return that left it running
+    // would leak a held jail into the rest of the boot. `Child::kill` after
+    // a successful observation is a no-op that reports an error, which is
+    // why this discards the result rather than reading it.
+    let _ = stage1.kill();
+    let _ = stage1.wait();
+    let observed = observed?;
+    writeln!(
+        io::stdout(),
+        "TD-JAIL-KILL-REAPS stage-1={} stage-2={} descendant={} \
+         descendant-namespace-pid={} waited-ms={}",
+        observed.stage1,
+        observed.stage2,
+        observed.descendant,
+        observed.descendant_namespace_pid,
+        observed.waited.as_millis()
+    )?;
+    writeln!(io::stdout(), "{KILL_REAPS_MARKER}")
+}
+
+/// Takes the report stream separately from the process rather than reading
+/// `stage1.stdout` itself, so a caller can drive it over a helper reporting
+/// on a different descriptor.
+///
+/// No host test does: one was written and could not survive libtest, which
+/// runs tests off the main thread while `CLONE_NEWUSER` demands a
+/// single-threaded caller. So this function's own composition -- that it
+/// calls the shape check and the signal check at all -- is pinned in the
+/// td-jail recipe's source assertions rather than by a test, the same way
+/// the crate pins its other orderings the compiler cannot express.
+fn observe_kill_reaps(
+    stage1: &mut Child,
+    reports: &mut impl Read,
+) -> io::Result<KillReapsObservation> {
+    let report = read_report_line(reports, "the kill-reaps stage-1 role")?;
+    let (stage2, namespace_pid) = parse_kill_reaps_report(&report)?;
+    // Resolved HERE, not in stage 1. The driver never unshares, so this is
+    // the last process in the chain that still sees the host's `/proc`.
+    let descendant = find_jailed_descendant(stage2, namespace_pid)?;
+    // Everything up to the kill runs first, so a failure here reports what
+    // the probe could not establish rather than blaming the teardown for it.
+    let before_stage2 = require_live("stage 2", stage2)?;
+    let before_descendant = require_live("the jailed descendant", descendant)?;
+    require_instance_shape(stage2, descendant, before_stage2, before_descendant)?;
+
+    // Read both witnesses again, as late as possible. An instance that
+    // ended ITSELF between the reads above and the kill below would leave
+    // exactly the evidence a successful teardown leaves, and the probe
+    // would credit the kill for it. This does not close that window --
+    // nothing available here can, since the two events are only ordered in
+    // time and not causally observable -- but it shrinks it to the gap
+    // between two adjacent statements, from a gap that had the whole shape
+    // check in it.
+    let confirm_stage2 = require_live("stage 2", stage2)?;
+    let confirm_descendant = require_live("the jailed descendant", descendant)?;
+    require_instance_shape(stage2, descendant, confirm_stage2, confirm_descendant)?;
+    if confirm_stage2.starttime != before_stage2.starttime
+        || confirm_descendant.starttime != before_descendant.starttime
+    {
+        return Err(io::Error::other(
+            "the instance's pids were reused between the two readings, so the processes about \
+             to be measured are not the ones that were checked",
+        ));
+    }
+
+    let stage1_pid = stage1.id();
+    // The one kill, and the reason this probe spawns stage 1 rather than
+    // finding one: `Child::kill` is safe std and sends exactly SIGKILL.
+    stage1.kill()?;
+    require_killed_by_signal(stage1.wait()?)?;
+
+    let started = Instant::now();
+    let deadline = started + KILL_REAPS_TIMEOUT;
+    loop {
+        let stage2_gone = is_gone(stage2, before_stage2.starttime)?;
+        let descendant_gone = is_gone(descendant, before_descendant.starttime)?;
+        if stage2_gone && descendant_gone {
+            return Ok(KillReapsObservation {
+                stage1: stage1_pid,
+                stage2,
+                descendant,
+                descendant_namespace_pid: before_descendant.namespace_pid,
+                waited: started.elapsed(),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "SIGKILL of stage 1 ({stage1_pid}) did not reap the whole instance within \
+                 {KILL_REAPS_TIMEOUT:?}: stage 2 ({stage2}) is {}, its jailed descendant \
+                 ({descendant}) is {}",
+                if stage2_gone { "gone" } else { "still live" },
+                if descendant_gone { "gone" } else { "still live" },
+            )));
+        }
+        std::thread::sleep(KILL_REAPS_POLL);
+    }
+}
+
+/// What the two readings must say before killing stage 1 means anything.
+///
+/// Separate from the driver because a namespace the host cannot create is
+/// exactly the thing these branches are about: `--probe-transition` cannot
+/// run outside the target either, so without this every one of these
+/// rejections would first be exercised by a QEMU boot, and would show up
+/// there as a boot failure rather than as a named wrong assumption.
+fn require_instance_shape(
+    stage2: u32,
+    descendant: u32,
+    stage2_process: cgroup::HostProcess,
+    descendant_process: cgroup::HostProcess,
+) -> io::Result<()> {
+    // Alive, not merely present. A process that has already exited still
+    // has a `/proc` entry until someone waits for it, and watching such a
+    // one "go" proves nothing about the kill -- it was gone before it.
+    for (role, pid, process) in [
+        ("stage 2", stage2, stage2_process),
+        ("the jailed descendant", descendant, descendant_process),
+    ] {
+        if process.state == 'Z' {
+            return Err(io::Error::other(format!(
+                "{role} ({pid}) had already exited before the kill, so its disappearance \
+                 would not be evidence about one"
+            )));
+        }
+    }
+    if descendant_process.parent != stage2 {
+        return Err(io::Error::other(format!(
+            "the reported descendant {descendant} is a child of {}, not of stage 2 ({stage2})",
+            descendant_process.parent
+        )));
+    }
+    if stage2_process.namespace_pid != 1 {
+        return Err(io::Error::other(format!(
+            "the reported stage 2 ({stage2}) answers to pid {} inside its own namespace, not 1",
+            stage2_process.namespace_pid
+        )));
+    }
+    // A descendant whose innermost pid is its host pid is in no namespace of
+    // its own, so its death would prove nothing about namespace teardown —
+    // and this is the check that fails if the whole instance was built
+    // outside a pid namespace by mistake.
+    if descendant_process.namespace_pid == descendant || descendant_process.namespace_pid <= 1 {
+        return Err(io::Error::other(format!(
+            "the reported descendant {descendant} answers to pid {} inside its own namespace, \
+             so it is not inside the jail's",
+            descendant_process.namespace_pid
+        )));
+    }
+    Ok(())
+}
+
+/// Stage 1 must have died BY the probe's signal, not on its own.
+///
+/// A stage 1 that was already leaving proves nothing about killing one, and
+/// without this the probe would count it: the pids vanish either way, so
+/// every check after it would pass on evidence about the wrong event.
+///
+/// Its own function because reaching this line for real needs an instance
+/// the host cannot build, while an `ExitStatus` from a killed child is
+/// something the host can produce exactly.
+fn require_killed_by_signal(status: ExitStatus) -> io::Result<()> {
+    if status.signal() == Some(sys::SIGKILL) {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "the kill-reaps stage-1 role ended as {status}, not by SIGKILL — it exited on its \
+         own, so nothing measured after it would be about what killing it does"
+    )))
+}
+
+/// Whether the process this pid named at `starttime` is gone.
+///
+/// Three ways, and the probe needs all three because only the first is the
+/// obvious one:
+///
+/// - its `/proc` entry is gone;
+/// - the pid came back with a different start time, so it is a DIFFERENT
+///   process and the one being measured is gone. Without this the probe
+///   would wait out its deadline on pid reuse in a busy boot and report a
+///   teardown that never failed;
+/// - it is a ZOMBIE. Stage 2 is orphaned the moment stage 1 dies, so
+///   whether it lingers in `Z` depends on how quickly whichever process
+///   adopts it gets round to waiting — which is not a property of the
+///   teardown under test. A zombie has exited and holds nothing, so
+///   counting it as live would fail this probe for someone else's
+///   scheduling. `killing_the_waiting_parent_kills_the_detached_application_session`
+///   reads the same field for the same reason.
+fn is_gone(pid: u32, starttime: u64) -> io::Result<bool> {
+    Ok(cgroup::host_process(pid)?
+        .is_none_or(|process| process.starttime != starttime || process.state == 'Z'))
+}
+
+fn require_live(role: &str, pid: u32) -> io::Result<cgroup::HostProcess> {
+    if pid <= 1 {
+        return Err(io::Error::other(format!(
+            "the kill-reaps stage-1 role reported {pid} for {role}"
+        )));
+    }
+    cgroup::host_process(pid)?
+        .ok_or_else(|| io::Error::other(format!("{role} ({pid}) was already gone before the kill")))
+}
+
+/// Parse stage 1's report: stage 2's HOST pid, then the descendant's
+/// NAMESPACE pid.
+///
+/// The two are not interchangeable and the second is not a host pid at all.
+/// Stage 1 cannot supply a host pid for the descendant -- see the comment in
+/// `run_kill_reaps_stage_1` -- so the driver resolves that itself, using this
+/// namespace pid as the cross-check.
+fn parse_kill_reaps_report(report: &str) -> io::Result<(u32, u32)> {
+    let mut fields = report.split(' ');
+    let stage2 = parse_reported_pid(fields.next(), "stage 2")?;
+    let namespace_pid = parse_reported_pid(fields.next(), "the jailed descendant's namespace")?;
+    if fields.next().is_some() {
+        return Err(io::Error::other(format!(
+            "the kill-reaps stage-1 role reported more than two values: {report:?}"
+        )));
+    }
+    // Pid 1 of the jail is stage 2. A descendant reported as pid 1 is stage 2
+    // named twice, and the whole point of the descendant is that it is a
+    // SECOND process, so this is refused rather than measured.
+    if namespace_pid <= 1 {
+        return Err(io::Error::other(format!(
+            "the kill-reaps stage-1 role reported the descendant as namespace pid \
+             {namespace_pid}, which is stage 2 itself rather than a process it spawned: \
+             {report:?}"
+        )));
+    }
+    Ok((stage2, namespace_pid))
+}
+
+fn parse_reported_pid(field: Option<&str>, role: &str) -> io::Result<u32> {
+    let field = field
+        .ok_or_else(|| io::Error::other(format!("the kill-reaps report has no pid for {role}")))?;
+    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::other(format!(
+            "the kill-reaps report gave {role} an invalid pid: {field:?}"
+        )));
+    }
+    field
+        .parse::<u32>()
+        .map_err(|error| io::Error::other(format!("the kill-reaps {role} pid is invalid: {error}")))
+}
+
+/// Read one newline-terminated report from a writer that stays alive after it.
+///
+/// A byte at a time, because both usual shapes are wrong here: `read_to_end`
+/// waits for an EOF that arrives only when the process being measured dies,
+/// and a buffered fill blocks for bytes that are not coming.
+fn read_report_line(reader: &mut impl Read, role: &str) -> io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::other(format!(
+                    "{role} closed its report without a line terminator"
+                )));
+            }
+            Ok(_) if byte[0] == b'\n' => {
+                return String::from_utf8(line).map_err(|error| {
+                    io::Error::other(format!("{role} report is not UTF-8: {error}"))
+                });
+            }
+            Ok(_) => {
+                if line.len() as u64 >= KILL_REAPS_REPORT_LIMIT {
+                    return Err(io::Error::other(format!(
+                        "{role} report exceeded {KILL_REAPS_REPORT_LIMIT} bytes"
+                    )));
+                }
+                line.push(byte[0]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// §H item 12's stage 1: build a real instance, name it to the driver, then
+/// hold the proof pipe open and wait to be killed.
+///
+/// It reports ONE host pid and ONE namespace pid, and the asymmetry is the
+/// whole point. Stage 2's host pid is usable because
+/// `unshare(CLONE_NEWPID)` does not move the caller: stage 1 stays in the
+/// outer namespace, so the pid `Command::spawn` handed it is one the driver
+/// can look up in `/proc`. §C says the same thing about the pid stage 1
+/// registers with the broker.
+///
+/// The descendant's is a NAMESPACE pid, because stage 1 has no way to learn
+/// its host one. By the time stage 2 reports, stage 2 has pivoted -- in the
+/// mount namespace stage 1 created and shares -- and `pivot_root(2)` re-roots
+/// every process in it, so stage 1's `/proc` is the jail's. The driver
+/// resolves the host pid itself, and this is the cross-check it resolves it
+/// against.
+pub fn run_kill_reaps_stage_1(expected_parent: u32) -> io::Result<()> {
+    // Before anything else, and this is not only tidiness. Stage 1 inherits
+    // the driver's stderr, which under the boot leg is the pipe a `$(...)`
+    // substitution is reading -- so a stage 1 that outlives the driver
+    // holds that substitution open on a probe that has already finished.
+    // The driver's watchdog exits without killing anything, which is
+    // exactly the path that would do it.
+    //
+    // It is also the ONLY bound this role has, and it has to be, because
+    // stage 1 cannot run a watchdog thread at all. `CLONE_NEWUSER` refuses a
+    // multi-threaded caller, so no thread may exist BEFORE the unshare; and
+    // after `unshare(CLONE_NEWPID)` the kernel refuses `CLONE_THREAD` while
+    // a task's `pid_ns_for_children` differs from its active pid namespace,
+    // which for an unshared-but-not-yet-forked task it always does. There is
+    // no moment in between. So the driver holds the only deadline and this
+    // signal carries it here: when the driver's watchdog exits, stage 1 dies
+    // with it, and stage 1 dying is what tears the instance down.
+    sys::set_parent_death_signal()?;
+    // Armed, then CHECKED, because `PR_SET_PDEATHSIG` is not retroactive: a
+    // driver that died between this process's exec and the line above sends
+    // nothing, and an orphaned stage 1 holds the boot leg's command
+    // substitution open for the rest of its life -- the exact hang the
+    // signal was added to prevent. This is the same arm-then-check the
+    // application launcher does. Read before the unshare, while `/proc` is
+    // still the host's and this pid still means what the driver meant.
+    let stat = fs::read_to_string("/proc/self/stat")?;
+    let observed = process_containment(&stat)?.parent;
+    if observed != expected_parent {
+        return Err(io::Error::other(format!(
+            "the kill-reaps stage-1 role expected the driver ({expected_parent}) as its \
+             parent and read {observed}, so the driver is already gone and nothing is \
+             waiting for the instance this would build"
+        )));
+    }
+    let ProbeInstance {
+        child,
+        proof_writer,
+        mut stage2_output,
+    } = start_probe_instance(STAGE2_KILL_HOLD_ARG)?;
+    let stage2 = child.id();
+    let hold = read_report_line(&mut stage2_output, "the held stage 2")?;
+    let namespace_pid = parse_stage2_hold(&hold)?;
+    // Report, do not resolve. Stage 1 shares the mount namespace that stage
+    // 2 pivots in -- stage 2 unshares nothing -- and `pivot_root(2)` re-roots
+    // EVERY process in that namespace, stage 1 included. So by the time this
+    // hold line arrives, stage 1's `/proc` is no longer the host's: it is the
+    // jail's procfs, bound to the new pid namespace, holding stage 2 as pid 1
+    // and the descendant and nothing else.
+    //
+    // An earlier version walked `/proc` HERE for a host pid. A host run of it
+    // read exactly those two namespace entries, found nothing whose parent
+    // was stage 2's host pid, and reported that stage 2 had never spawned a
+    // descendant. The driver never unshares and still holds the host view, so
+    // that walk belongs there; stage 1 forwards only what it alone knows --
+    // stage 2's host pid, and the namespace pid stage 2 named itself.
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{stage2} {namespace_pid}")?;
+    stdout.flush()?;
+    drop(stdout);
+    // Held to the end of the process, both on purpose: `proof_writer` is the
+    // pipe whose closing tears the instance down, and `child` is the stage 2
+    // this role must not reap. Dying is what releases them, which is the
+    // whole experiment.
+    let held = (child, proof_writer);
+    let outcome = hold_until_reaped("the kill-reaps stage-1 role");
+    drop(held);
+    outcome
+}
+
+fn parse_stage2_hold(line: &str) -> io::Result<u32> {
+    let prefix = format!("{STAGE2_HOLD_MARKER} descendant=");
+    let namespace_pid = line.strip_prefix(&prefix).ok_or_else(|| {
+        io::Error::other(format!("the held stage 2 reported {line:?}, not {prefix:?}"))
+    })?;
+    if namespace_pid.is_empty() || !namespace_pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::other(format!(
+            "the held stage 2 reported an invalid descendant pid: {namespace_pid:?}"
+        )));
+    }
+    namespace_pid.parse::<u32>().map_err(|error| {
+        io::Error::other(format!("the held stage 2 descendant pid is invalid: {error}"))
+    })
+}
+
+/// The host pid of stage 2's one child, cross-checked against the pid stage 2
+/// knows it by.
+///
+/// The `NSpid` check is what makes this an identification rather than a
+/// guess: stage 2 reported a number from inside the namespace and this
+/// resolves a number outside it, so a walk that landed on the wrong process
+/// fails here instead of being killed and counted.
+///
+/// A `/proc` entry that cannot be read is skipped rather than refused,
+/// which is safe for the case this probe actually has: stage 2 spawns
+/// exactly one child, so missing it leaves none and the probe fails. It is
+/// NOT safe in general -- were stage 2 ever to have two children and one of
+/// them unreadable, this would find the other and accept it. The
+/// exactly-one requirement below is what would otherwise have caught that,
+/// so the two are load-bearing together rather than separately.
+fn find_jailed_descendant(stage2: u32, namespace_pid: u32) -> io::Result<u32> {
+    let mut children = Vec::new();
+    let mut seen = 0usize;
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        seen = seen.saturating_add(1);
+        if seen > MAX_PROC_SCAN {
+            return Err(io::Error::other(format!(
+                "/proc holds more than {MAX_PROC_SCAN} entries"
+            )));
+        }
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(Some(process)) = cgroup::host_process(pid) else {
+            continue;
+        };
+        if process.parent == stage2 {
+            children.push((pid, process.namespace_pid));
+        }
+    }
+    let (pid, found_namespace_pid) = match children.as_slice() {
+        [] => {
+            return Err(io::Error::other(format!(
+                "stage 2 ({stage2}) has no child in the host /proc: either it never spawned \
+                 the descendant this probe measures, or the walk could not read the entry \
+                 that is it"
+            )));
+        }
+        [only] => *only,
+        many => {
+            return Err(io::Error::other(format!(
+                "stage 2 ({stage2}) has {} children in the host /proc, so the descendant is \
+                 ambiguous; this probe's stage 2 spawns exactly one",
+                many.len()
+            )));
+        }
+    };
+    if found_namespace_pid != namespace_pid {
+        return Err(io::Error::other(format!(
+            "stage 2's child {pid} answers to pid {found_namespace_pid} inside the namespace, \
+             but stage 2 reported spawning {namespace_pid}"
+        )));
+    }
+    Ok(pid)
+}
+
+/// Stage 2's §H item 12 role: become the instance a `kill -KILL` of stage 1
+/// must reap, then wait to be reaped.
+///
+/// It starts the SAME liveness watcher `Launch` does rather than a
+/// probe-shaped imitation, because that watcher is the mechanism under test:
+/// stage 1's death closes fd 0, the watcher's read returns, and PID 1 exits,
+/// which is what makes the kernel tear the namespace down. `PR_SET_PDEATHSIG`
+/// was armed at the top of `run_stage2` and races it to the same end; the
+/// driver observes the OUTCOME, so which one wins does not matter and is not
+/// claimed either way.
+fn run_stage2_kill_hold() -> io::Result<()> {
+    start_stage1_liveness_watcher()?;
+    let child = Command::new(REAPER_PROBE_PATH)
+        .arg(KILL_HOLD_CHILD_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| io::Error::other(format!("spawn the kill-hold descendant: {e}")))?;
+    let descendant = child.id();
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{STAGE2_HOLD_MARKER} descendant={descendant}")?;
+    stdout.flush()?;
+    drop(stdout);
+    // Held, never waited for: PID 1 reaping it would remove the very process
+    // whose disappearance is the evidence.
+    let outcome = hold_until_reaped("the held stage 2");
+    drop(child);
+    outcome
+}
+
+pub fn run_kill_hold_child() -> io::Result<()> {
+    hold_until_reaped("the kill-hold descendant")
+}
+
+/// Bound a role that is about to block on a read nothing may ever answer.
+///
+/// Exits the process rather than unwinding: the point is that the caller is
+/// stuck inside a blocking read and cannot be returned to. A non-zero exit
+/// is what the boot leg reads as the probe having failed, which is what it
+/// is -- and the diagnostic says which role gave up, because "the probe
+/// timed out" without that is three different faults spelled the same way.
+///
+/// Only the driver may arm this, and that is a kernel constraint rather than
+/// a choice. `CLONE_NEWUSER` refuses a multi-threaded caller, so a role that
+/// unshares may hold no thread beforehand; and after `unshare(CLONE_NEWPID)`
+/// the kernel refuses `CLONE_THREAD` outright while `pid_ns_for_children`
+/// differs from the active pid namespace, which is exactly the state an
+/// unshared-but-not-yet-forked task is in. An earlier version of this
+/// function was armed by stage 1 "after the unshare"; a host run of that
+/// role reds `clone(CLONE_THREAD...) = EINVAL`, surfacing through musl as
+/// EAGAIN, on every attempt. Stage 1 is bounded by this deadline reaching it
+/// through `PR_SET_PDEATHSIG` instead of by a watchdog of its own.
+fn start_probe_watchdog(role: &'static str) -> io::Result<()> {
+    let watchdog = std::thread::Builder::new()
+        .name("td-jail-kill-reaps-watchdog".to_string())
+        .spawn(move || {
+            std::thread::sleep(KILL_REAPS_CEILING);
+            let _ = writeln!(
+                io::stderr(),
+                "{role} gave up after {KILL_REAPS_CEILING:?} without reaching a verdict"
+            );
+            std::process::exit(126);
+        })?;
+    drop(watchdog);
+    Ok(())
+}
+
+/// Block until something else ends this process.
+///
+/// The ceiling is not a timeout on anything: the driver's own deadline is far
+/// shorter, so no passing run reaches it. It bounds a role that has REPORTED
+/// and is now waiting to be torn down -- and only that. A role that hangs
+/// before reporting never arrives here, which is what the DRIVER's
+/// `start_probe_watchdog` is for -- reaching stage 2 through stage 1's
+/// `PR_SET_PDEATHSIG` and the proof pipe, since neither stage may hold a
+/// watchdog thread of its own. An earlier version of this comment credited
+/// this ceiling with covering both, and was wrong about the half that
+/// matters more: a hang before the report is the one that blocks the boot
+/// leg's command substitution.
+fn hold_until_reaped(role: &str) -> io::Result<()> {
+    let deadline = Instant::now() + KILL_HOLD_CEILING;
+    while Instant::now() < deadline {
+        std::thread::sleep(KILL_HOLD_POLL);
+    }
+    Err(io::Error::other(format!(
+        "{role} was still alive after the {KILL_HOLD_CEILING:?} kill-reaps hold ceiling"
+    )))
 }
 
 pub fn probe_resource_caps(application: &str) -> io::Result<()> {
@@ -3958,7 +4697,7 @@ pub fn run_stage2(
         runtime_aliases,
         pulse,
     ) = match &action {
-        Stage2Action::Probe => (
+        Stage2Action::Probe | Stage2Action::KillHold => (
             None,
             EtcBinding {
                 resolv_conf: false,
@@ -4014,6 +4753,7 @@ pub fn run_stage2(
             probe_pid1_lifecycle()?;
             writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
         }
+        Stage2Action::KillHold => run_stage2_kill_hold(),
         Stage2Action::Launch(launch) => {
             // Every field named, none elided. The mount-plan facts are
             // already spent above, but a `..` here would let the NEXT field
@@ -5362,6 +6102,76 @@ mod tests {
         );
     }
 
+    /// Each §H item 12 role takes exactly the argv it needs and no more,
+    /// and every sibling probe arg in this parser has a test saying so.
+    /// These had none: a reviewer deleted the extra-argument guard from the
+    /// driver's arm and the whole suite stayed green.
+    ///
+    /// It matters most for the two INTERNAL roles. They are argv the
+    /// launcher could be handed, and a role that silently ignored trailing
+    /// arguments would accept an invocation nothing in this crate produces.
+    #[test]
+    fn the_argument_free_kill_reaps_roles_take_no_arguments() {
+        for (arg, mode) in [
+            (KILL_REAPS_PROBE_ARG, Mode::KillReapsProbe),
+            (KILL_HOLD_CHILD_ARG, Mode::KillHoldChild),
+        ] {
+            assert_eq!(parse_mode(args(&[arg])).unwrap(), mode);
+            assert!(
+                parse_mode(args(&[arg, "extra"])).is_err(),
+                "{arg} must refuse a trailing argument"
+            );
+        }
+    }
+
+    /// Stage 1 takes the driver's pid, and takes it as a POSITIVE pid.
+    ///
+    /// It is not decoration: stage 1 reads its parent back after arming
+    /// `PR_SET_PDEATHSIG` and refuses to build an instance if the driver has
+    /// already gone, because that signal is not retroactive. A role that
+    /// accepted a missing or junk pid would skip that check.
+    #[test]
+    fn the_kill_reaps_stage_1_role_takes_the_drivers_pid() {
+        assert_eq!(
+            parse_mode(args(&[KILL_REAPS_STAGE1_ARG, "4242"])).unwrap(),
+            Mode::KillReapsStage1 {
+                expected_parent: 4242
+            }
+        );
+        for refused in [
+            vec![KILL_REAPS_STAGE1_ARG],
+            vec![KILL_REAPS_STAGE1_ARG, "0"],
+            vec![KILL_REAPS_STAGE1_ARG, "-1"],
+            vec![KILL_REAPS_STAGE1_ARG, "x"],
+            vec![KILL_REAPS_STAGE1_ARG, ""],
+            vec![KILL_REAPS_STAGE1_ARG, "4242", "extra"],
+        ] {
+            assert!(
+                parse_mode(args(&refused)).is_err(),
+                "{refused:?} must not parse as the kill-reaps stage-1 role"
+            );
+        }
+    }
+
+    #[test]
+    fn the_kill_hold_stage_2_action_takes_no_arguments() {
+        let token = encode_token(&[7_u8; TOKEN_LEN]);
+        let base = [STAGE2_ARG, token.as_str(), "1000", "1000", "1000", "1000"];
+        let with = |tail: &[&str]| {
+            let mut all: Vec<&str> = base.to_vec();
+            all.extend_from_slice(tail);
+            parse_mode(args(&all))
+        };
+        assert!(matches!(
+            with(&[STAGE2_KILL_HOLD_ARG]).unwrap(),
+            Mode::Stage2 {
+                action: Stage2Action::KillHold,
+                ..
+            }
+        ));
+        assert!(with(&[STAGE2_KILL_HOLD_ARG, "extra"]).is_err());
+    }
+
     #[test]
     fn resource_probe_mode_is_named_and_bounded() {
         assert_eq!(
@@ -5644,6 +6454,443 @@ mod tests {
         }
     }
 
+    /// §H item 12's driver, in the parts a host can run.
+    ///
+    /// What it cannot run is the instance: stage 1 unshares `CLONE_NEWUSER`,
+    /// which the kernel refuses to a multi-threaded caller, and libtest runs
+    /// every test off the main thread — the same constraint §C states as the
+    /// reason stage 1 unshares in its own `main` before spawning anything.
+    /// A helper that unshared here gets `EINVAL` however the harness is
+    /// configured. `--probe-transition` has the same target-only shape.
+    ///
+    /// So the split is deliberate: the target run proves the teardown, and
+    /// these prove the reasoning around it — which is where a wrong
+    /// assumption would otherwise first appear as a QEMU boot failure with
+    /// no name on it.
+    #[test]
+    fn kill_hold_descendant_helper() {
+        if std::env::var_os("TD_JAIL_TEST_KILL_HOLD_DESCENDANT").is_none() {
+            return;
+        }
+        // Bounded rather than parked forever. One caller kills this
+        // directly, but the other kills its PARENT, which orphans it — and
+        // an orphan that never returns is a process leaked into the rest of
+        // the suite. The bound is far longer than either caller needs and
+        // far shorter than a gate run.
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    /// Stands in for stage 2: a process whose ONLY child is the descendant.
+    ///
+    /// The walk has to be asked about a process with a known child set, and
+    /// the TEST process is not one — every other test spawning a subprocess
+    /// is another child of it. Asking about this helper instead makes the
+    /// answer independent of what the rest of the suite is doing, which is
+    /// exactly what the first version of this test got wrong: it passed
+    /// filtered and failed under the full gate.
+    ///
+    /// Reports on stderr because the harness owns stdout, and reports the
+    /// pid `Command::spawn` handed it, which outside a pid namespace is
+    /// also the pid the descendant answers to — so it is what stage 2
+    /// would have reported.
+    // Never waits for its child, deliberately: this stands in for a stage 2
+    // whose descendant must still be there for the walk to find. The child
+    // bounds itself, and the caller kills this whole helper.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn kill_hold_stage2_helper() {
+        // The value is how many descendants to spawn: one for the ordinary
+        // case, more so the ambiguity branch has something to be ambiguous
+        // about. It always reports the FIRST, which is the one a correct
+        // walk would have to agree on.
+        let Some(count) = std::env::var_os("TD_JAIL_TEST_KILL_HOLD_STAGE2") else {
+            return;
+        };
+        let count: usize = count.to_str().unwrap().parse().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut first = None;
+        for _ in 0..count {
+            let child = Command::new(&executable)
+                .args([
+                    "--exact",
+                    "transition::tests::kill_hold_descendant_helper",
+                    "--nocapture",
+                ])
+                .env("TD_JAIL_TEST_KILL_HOLD_DESCENDANT", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            first.get_or_insert(child.id());
+        }
+        writeln!(
+            io::stderr(),
+            "{STAGE2_HOLD_MARKER} descendant={}",
+            first.unwrap()
+        )
+        .unwrap();
+        io::stderr().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn the_jailed_descendant_is_identified_by_parent_and_namespace_pid() {
+        let executable = std::env::current_exe().unwrap();
+        let mut stage2 = Command::new(executable)
+            .args([
+                "--exact",
+                "transition::tests::kill_hold_stage2_helper",
+                "--nocapture",
+            ])
+            .env("TD_JAIL_TEST_KILL_HOLD_STAGE2", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stage2_pid = stage2.id();
+        let mut reports = stage2.stderr.take().unwrap();
+        let hold = read_report_line(&mut reports, "the stage-2 stand-in").unwrap();
+        let descendant_pid = parse_stage2_hold(&hold).unwrap();
+
+        let found = find_jailed_descendant(stage2_pid, descendant_pid);
+        // The cross-check is the point: a walk that found the right parent
+        // but the wrong child must fail rather than name it.
+        let mismatch = find_jailed_descendant(stage2_pid, descendant_pid.wrapping_add(1));
+        // A stage 2 with no child at all is a failure, never a pass.
+        let childless = find_jailed_descendant(descendant_pid, 1);
+
+        // The helper holds a child of its own, so killing it first would
+        // leave that child parented to the test harness. Take the whole
+        // pair down before asserting, so a failing assertion cannot leak a
+        // parked process into the rest of the suite.
+        stage2.kill().unwrap();
+        stage2.wait().unwrap();
+
+        assert_eq!(found.unwrap(), descendant_pid);
+        let mismatch = mismatch.unwrap_err();
+        assert!(
+            mismatch.to_string().contains("but stage 2"),
+            "a namespace-pid mismatch must be reported as one: {mismatch}"
+        );
+        let childless = childless.unwrap_err();
+        assert!(
+            childless.to_string().contains("has no child"),
+            "a childless stage 2 must be reported as one: {childless}"
+        );
+    }
+
+    #[test]
+    fn a_stage_2_with_more_than_one_child_is_ambiguous_rather_than_guessed_at() {
+        let executable = std::env::current_exe().unwrap();
+        let mut stage2 = Command::new(executable)
+            .args([
+                "--exact",
+                "transition::tests::kill_hold_stage2_helper",
+                "--nocapture",
+            ])
+            // Two, so the walk finds a child the report does not name. It
+            // must say so rather than take the one that matches: this
+            // probe's stage 2 spawns exactly one, so a second means the
+            // instance is not the shape the proof assumes.
+            .env("TD_JAIL_TEST_KILL_HOLD_STAGE2", "2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stage2_pid = stage2.id();
+        let mut reports = stage2.stderr.take().unwrap();
+        let hold = read_report_line(&mut reports, "the stage-2 stand-in").unwrap();
+        let descendant_pid = parse_stage2_hold(&hold).unwrap();
+        let ambiguous = find_jailed_descendant(stage2_pid, descendant_pid);
+
+        stage2.kill().unwrap();
+        stage2.wait().unwrap();
+
+        let ambiguous = ambiguous.unwrap_err();
+        assert!(
+            ambiguous.to_string().contains("2 children"),
+            "an ambiguous stage 2 must be reported as one, and counted: {ambiguous}"
+        );
+    }
+
+    #[test]
+    fn a_stage_1_that_exited_on_its_own_is_not_a_kill() {
+        let executable = std::env::current_exe().unwrap();
+        let mut killed = Command::new(&executable)
+            .args([
+                "--exact",
+                "transition::tests::kill_hold_descendant_helper",
+                "--nocapture",
+            ])
+            .env("TD_JAIL_TEST_KILL_HOLD_DESCENDANT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        killed.kill().unwrap();
+        require_killed_by_signal(killed.wait().unwrap()).unwrap();
+
+        // The same helper with its env var unset returns immediately and
+        // exits 0, which is exactly the "was already leaving" shape: the
+        // process is gone, and it is gone for a reason the probe did not
+        // cause.
+        let quiet = Command::new(&executable)
+            .args([
+                "--exact",
+                "transition::tests::kill_hold_descendant_helper",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(quiet.status.success(), "the quiet helper must exit cleanly");
+        assert!(require_killed_by_signal(quiet.status).is_err());
+    }
+
+    #[test]
+    fn the_instance_shape_is_required_before_the_kill_can_mean_anything() {
+        // Stage 2 is PID 1 of its own namespace; the descendant is inside
+        // that namespace, so its innermost pid is not its host pid.
+        let stage2 = cgroup::HostProcess {
+            parent: 900,
+            starttime: 10,
+            state: 'S',
+            namespace_pid: 1,
+        };
+        let descendant = cgroup::HostProcess {
+            parent: 901,
+            starttime: 11,
+            state: 'S',
+            namespace_pid: 2,
+        };
+        require_instance_shape(901, 902, stage2, descendant).unwrap();
+
+        // A descendant of something other than stage 2 is not this
+        // instance's, so killing stage 1 says nothing about it.
+        let stray = cgroup::HostProcess {
+            parent: 903,
+            ..descendant
+        };
+        assert!(require_instance_shape(901, 902, stage2, stray).is_err());
+        // A stage 2 that is not PID 1 never made a namespace, so nothing
+        // below it would be torn down by its exit.
+        let unnested = cgroup::HostProcess {
+            namespace_pid: 901,
+            ..stage2
+        };
+        assert!(require_instance_shape(901, 902, unnested, descendant).is_err());
+        // A descendant whose namespace pid is its host pid is in the host
+        // namespace: it would have to be killed by something, and this probe
+        // kills only stage 1.
+        let outside = cgroup::HostProcess {
+            namespace_pid: 902,
+            ..descendant
+        };
+        assert!(require_instance_shape(901, 902, stage2, outside).is_err());
+        let init = cgroup::HostProcess {
+            namespace_pid: 1,
+            ..descendant
+        };
+        assert!(require_instance_shape(901, 902, stage2, init).is_err());
+    }
+
+    /// The false pass this probe would otherwise admit, pinned as
+    /// arithmetic rather than as prose.
+    ///
+    /// Stage 2 and the descendant end THEMSELVES at `KILL_HOLD_CEILING`. If
+    /// the driver could still be inside its polling window when that
+    /// happens, both would leave `/proc` for a reason that has nothing to
+    /// do with stage 1, and the probe would print its marker having proved
+    /// nothing -- even with both liveness mechanisms broken.
+    ///
+    /// The watchdogs are what stop it: no run reaches the kill later than
+    /// `KILL_REAPS_CEILING`, and the window is `KILL_REAPS_TIMEOUT` long.
+    /// That is only safe while the sum stays under the holders' ceiling,
+    /// which is a relationship between four constants that any one of them
+    /// could be edited out of.
+    #[test]
+    fn the_holders_outlive_every_window_the_driver_can_still_be_watching_in() {
+        assert!(
+            KILL_REAPS_CEILING + KILL_REAPS_TIMEOUT < KILL_HOLD_CEILING,
+            "a held role must not be able to end itself while the driver is still \
+             watching for it to go: the driver gives up at {KILL_REAPS_CEILING:?} and \
+             watches for {KILL_REAPS_TIMEOUT:?} after that, but the holders end at \
+             {KILL_HOLD_CEILING:?}"
+        );
+    }
+
+    #[test]
+    fn a_witness_pid_below_two_is_refused_without_reading_proc() {
+        // 0 is not a pid and 1 is the host's init, which is neither stage 2
+        // nor anything this probe spawned. Reading either would be asking
+        // /proc about the wrong process, so the floor comes first.
+        for pid in [0, 1] {
+            let refused = require_live("stage 2", pid).unwrap_err();
+            assert!(
+                refused.to_string().contains(&format!("reported {pid}")),
+                "pid {pid} must be refused by name: {refused}"
+            );
+        }
+        // And two is not refused for being small: the floor is a floor,
+        // not a guess at which pids are real. Whether pid 2 exists here is
+        // the host's business -- what matters is that the answer came from
+        // looking, so the floor's own complaint must not be the one back.
+        if let Err(error) = require_live("stage 2", 2) {
+            assert!(
+                !error.to_string().contains("reported 2"),
+                "pid 2 must be looked up, not refused out of hand: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_already_dead_witness_is_refused_before_the_kill() {
+        let live = cgroup::HostProcess {
+            parent: 900,
+            starttime: 10,
+            state: 'S',
+            namespace_pid: 1,
+        };
+        let descendant = cgroup::HostProcess {
+            parent: 901,
+            starttime: 11,
+            state: 'S',
+            namespace_pid: 2,
+        };
+        require_instance_shape(901, 902, live, descendant).unwrap();
+        // Either witness already exited is a refusal, because the whole
+        // measurement is "these two were here, then the kill, then they
+        // were not".
+        let dead = cgroup::HostProcess { state: 'Z', ..live };
+        assert!(require_instance_shape(901, 902, dead, descendant).is_err());
+        let dead = cgroup::HostProcess {
+            state: 'Z',
+            ..descendant
+        };
+        assert!(require_instance_shape(901, 902, live, dead).is_err());
+    }
+
+    #[test]
+    fn a_reused_pid_reads_as_gone_rather_than_as_a_survivor() {
+        let live = std::process::id();
+        let starttime = cgroup::host_process(live).unwrap().unwrap().starttime;
+        assert!(!is_gone(live, starttime).unwrap());
+        // The same pid with any other start time is a different process, so
+        // whatever was being measured is gone. Without this the driver would
+        // wait out its whole deadline on a busy host and blame the teardown.
+        assert!(is_gone(live, starttime.wrapping_add(1)).unwrap());
+    }
+
+    #[test]
+    fn a_zombie_reads_as_gone_rather_than_as_a_survivor() {
+        // A real one: spawn, let it exit, and never wait for it. Its
+        // `/proc` entry survives with its original start time, which is
+        // exactly the shape an orphaned stage 2 has between exiting and
+        // being adopted -- and reading it as live would fail the probe for
+        // someone else's scheduling rather than for a teardown that broke.
+        let executable = std::env::current_exe().unwrap();
+        let mut corpse = Command::new(executable)
+            .args([
+                "--exact",
+                "transition::tests::kill_hold_descendant_helper",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = corpse.id();
+        let starttime = cgroup::host_process(pid).unwrap().unwrap().starttime;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let zombie = loop {
+            let process = cgroup::host_process(pid).unwrap();
+            match process {
+                Some(process) if process.state == 'Z' => break true,
+                // Reaped by something else before it was observed: the
+                // teardown reading is the same, so the assertion below
+                // still holds and the test is not weakened.
+                None => break false,
+                Some(_) if Instant::now() >= deadline => {
+                    panic!("the helper never exited, so no zombie was produced")
+                }
+                Some(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        assert!(
+            is_gone(pid, starttime).unwrap(),
+            "a {} process must read as gone",
+            if zombie { "zombie" } else { "reaped" }
+        );
+        corpse.wait().unwrap();
+    }
+
+    /// The report is a HOST pid and a NAMESPACE pid, in that order.
+    ///
+    /// `"41 1"` is the interesting refusal: pid 1 of the jail is stage 2, so
+    /// a descendant reported as 1 is stage 2 named a second time, and the
+    /// descendant exists precisely to be a different process. The two pids
+    /// being EQUAL is not refused any more and must not be -- a host pid and
+    /// a namespace pid share no numbering, so `"41 41"` is an ordinary run
+    /// in which the jail's second process happens to be numbered like stage
+    /// 2's host pid.
+    #[test]
+    fn the_kill_reaps_report_admits_a_host_pid_and_a_namespace_pid() {
+        assert_eq!(parse_kill_reaps_report("41 42").unwrap(), (41, 42));
+        assert_eq!(parse_kill_reaps_report("41 41").unwrap(), (41, 41));
+        for refused in ["41", "41 42 43", "41 1", "41 0", "41  42", " 41 42", "41 x", ""] {
+            assert!(
+                parse_kill_reaps_report(refused).is_err(),
+                "{refused:?} must not parse as a kill-reaps report"
+            );
+        }
+    }
+
+    #[test]
+    fn the_held_stage_2_is_read_by_its_exact_marker() {
+        let line = format!("{STAGE2_HOLD_MARKER} descendant=2");
+        assert_eq!(parse_stage2_hold(&line).unwrap(), 2);
+        for refused in [
+            "TD-JAIL-STAGE2-OK descendant=2",
+            "TD-JAIL-STAGE2-HOLDING descendant=",
+            "TD-JAIL-STAGE2-HOLDING descendant=-1",
+            "TD-JAIL-STAGE2-HOLDING 2",
+            "descendant=2",
+            "",
+        ] {
+            assert!(
+                parse_stage2_hold(refused).is_err(),
+                "{refused:?} must not read as a stage-2 hold report"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_without_its_terminator_is_refused_rather_than_used() {
+        let mut whole = "41 42\n".as_bytes();
+        assert_eq!(
+            read_report_line(&mut whole, "role").unwrap(),
+            "41 42".to_string()
+        );
+        // EOF mid-line is the shape a role that died before reporting
+        // produces, and reading it as a complete report would name pids it
+        // never finished writing.
+        let mut truncated = "41 4".as_bytes();
+        assert!(read_report_line(&mut truncated, "role").is_err());
+        let long = format!("{}\n", "9".repeat(KILL_REAPS_REPORT_LIMIT as usize + 1));
+        let mut long = long.as_bytes();
+        assert!(read_report_line(&mut long, "role").is_err());
+    }
+
     #[test]
     fn application_session_child_helper() {
         let Some(parent) = std::env::var_os("TD_JAIL_TEST_APPLICATION_SESSION_CHILD") else {
@@ -5770,7 +7017,18 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                // ESRCH as well as ENOENT: a task being reaped between the
+                // open and the read gives `ESRCH`, which `std` leaves as
+                // `Uncategorized`, and this loop polls exactly while that
+                // is happening. Seen failing here as `No such process (os
+                // error 3)`. `cgroup::reads_as_gone` says the same thing
+                // for the production readers.
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(3) =>
+                {
+                    break
+                }
                 Err(error) => panic!("read application session: {error}"),
                 Ok(stat) => {
                     let (state, current_starttime) = process_state_and_starttime(&stat).unwrap();
