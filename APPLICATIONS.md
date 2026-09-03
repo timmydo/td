@@ -554,7 +554,7 @@ caller-derived handle receives a directed denial `Request.Response`, and the
 §H item 14 checks that each unsupported portal is unpublished and refuses;
 td-svc discards readiness output, so `portal-evidence` repeats the same
 bounded exchanges through its captured service log and `console=yes` for
-QEMU. Readiness therefore depends on those four portals staying
+QEMU. Readiness therefore depends on those five portals staying
 unimplemented: whoever implements one must drop it from the probe's roster
 in the same change, or the daemon never comes ready.
 Firefox is ordered after `portal` but does not
@@ -5343,51 +5343,32 @@ method reply carries that path, and byte-compares the directed `Response`.
 Only then does it emit `TD-PORTAL-READY namespaces=2 settings=10 version=1`
 and `TD-PORTAL-REQUEST-READY response=2`.
 
-The same client then puts each portal §H item 14 names unsupported —
-`ScreenCast`, `RemoteDesktop`, `Camera` and `Secret` — through two routed
-checks, and emits `TD-PORTAL-UNSUPPORTED-REFUSED portals=4` only if all four
-pass both. The two markers above are printed before these checks run, so a
-regression here cannot also erase the evidence for proofs that already
-passed and be reported as three failures with one cause.
+The same client proves five capability-bearing interfaces unavailable:
+`ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`. It first
+byte-compares the live root introspection reply to the compiled document and
+requires all five names to be absent. For each interface it then calls both
+`Properties.Get(<interface>, "version")` and `GetAll(<interface>)`; each must
+return `org.freedesktop.DBus.Error.UnknownInterface` with the exact single
+string `that portal interface is not published`. Finally it calls a real
+entry-member name on the interface and requires the dispatcher's exact
+`org.freedesktop.DBus.Error.UnknownMethod` single-string refusal. The direct
+call deliberately carries no interface-specific arguments: discovery and
+live introspection prove that the interface is not published, while this
+third check proves that its entry path refuses rather than fabricating a
+successful result.
 
-The first check is `Properties.Get(<interface>, "version")`, which must
-answer `org.freedesktop.DBus.Error.UnknownInterface`. That is the
-availability question §H actually asks, and it is protocol-valid for every
-entry whatever that portal's own methods take, because `Properties.Get`
-takes `ss`. The second is a bare call to a member a real client would reach
-for, which must be refused with the dispatcher's
-`org.freedesktop.DBus.Error.UnknownMethod` catch-all. Both exact names are
-required, so the check fails if either arm later moves and the probe quietly
-stops testing what it names.
-
-The method call carries an options-only `a{sv}` body. That IS the real
-signature for ScreenCast and RemoteDesktop `CreateSession` and for Camera
-`AccessCamera`, so for those three it is a well-formed call refused on its
-merits. `Secret.RetrieveSecret` really takes `ha{sv}` with an attached
-descriptor this probe cannot send, so for Secret the method call shows only
-that a malformed request is refused. That is exactly why the
-`Properties.Get` check exists: a signature-aware Secret implementation could
-serve valid requests while the malformed one still reached the catch-all,
-and only the unpublished-interface check would notice.
-
-Both checks additionally require the reply to come FROM the portal, matched
-against the unique name the `Background` method return carried earlier in the
-same exchange. Without that the marker would attest only that something
-refused with the expected name. td-busd already makes another answer hard —
-a directed call to a name nobody owns is refused `NameHasNoOwner`, and the
-broker emits `UnknownMethod` only for calls addressed to its own name — but
-the evidence pins the sender rather than resting on that, exactly as the
-directed `Request.Response` check does.
-
-Unit tests additionally hold all three introspection documents — root,
-request and session — to naming none of the four, since an advertised
-interface reads as available however a call to it is answered.
+Every reply must come from the same unique portal sender as the preceding
+exact Settings reply. A method return, extra error argument, different error
+name or text, wrong sender, malformed body, missing reply, or transport
+failure stops the probe. Only after these checks and the Background Request
+exchange all succeed does it emit the three readiness lines, including
+`TD-PORTAL-UNAVAILABLE-READY interfaces=5 error=UnknownInterface`.
 
 QEMU requires all three markers as exact td-svc-prefixed
-`portal-evidence:` lines on every validated boot. The evidence
-unit is not a dependency of `bootsuccess`, so absence makes application
-evidence red without granting mutable user service state authority over
-deployment acknowledgement.
+`portal-evidence:` lines on every validated boot. The evidence unit is not a
+dependency of `bootsuccess`, so absence makes application evidence red
+without granting mutable user service state authority over deployment
+acknowledgement.
 
 A second, likewise non-health-authoritative evidence unit exercises the
 private compositor channel described below. As uid 1000 it performs
@@ -6438,11 +6419,12 @@ packaged selftest, boot oracle — with **network never in the gate**.
    version-1 `Background.RequestBackground`, requires the method reply before
    the directed denial signal, byte-compares response 2 and its false results,
    and emits exact
-   `portal-evidence: TD-PORTAL-REQUEST-READY response=2`. It then requires
-   each portal §H item 14 names unsupported to report its interface
-   unpublished and to refuse a call to it, and emits exact
-   `portal-evidence: TD-PORTAL-UNSUPPORTED-REFUSED portals=4`. These prove
-   live routed portal exchanges, not that Firefox made them.
+   `portal-evidence: TD-PORTAL-REQUEST-READY response=2`. It also
+   byte-compares live introspection and requires exact discovery and direct
+   refusal replies for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and
+   `Print`, then emits exact
+   `portal-evidence: TD-PORTAL-UNAVAILABLE-READY interfaces=5 error=UnknownInterface`.
+   These prove live routed portal exchanges, not that Firefox made them.
 7. **Recipe tests**: every new crate — `td-jail`, `td-busd`, `td-portal`,
    `td-audio` —
    stays a one-package dependency-free crate and is picked up by
@@ -6493,9 +6475,7 @@ global fallback sandbox facts, nested filters in every reported live required
 process role, and the staged physical-input subset of item 7. The complete
 browser claim also proves the fixed guest-local HTTPS download through its
 declared writable grant and native Open File portal round-trip. It still
-requires the
-remaining items below, notably other portal classes, isolation, soak and audio
-evidence.
+requires the remaining isolation and soak evidence below.
 
 A recorded proof naming exact hashes for the Firefox package, its
 runtime package, the pinned seed archives behind both, and the td kernel
@@ -6729,11 +6709,23 @@ and image commits — showing:
     Firefox's trusted Web Audio action through cubeb, the jailed Pulse socket,
     `td-audio`, ALSA, HDA and QEMU to the recorded waveform. Ordinary boots and
     the interactive runner retain the host-silent backend;
-14. *unsupported* portals — `ScreenCast`, `RemoteDesktop`, `Camera`,
-    `Secret` — reported unavailable rather than succeeding, which is the
-    half of the old item 13 that is still right and is a real check: a
-    portal that answers a call it does not implement is worse than one
-    that refuses.
+14. **unsupported portals unavailable — LANDED.** The same unprivileged live
+    portal client uses `Properties.Get(interface, "version")` and `GetAll`
+    for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`. td
+    deliberately answers each discovery call with one exact
+    `org.freedesktop.DBus.Error.UnknownInterface` string; GLib's reference
+    implementation commonly uses `InvalidArgs` for an unregistered
+    properties interface, but clients treat either error as unavailable.
+    The client also calls one real entry member on each interface and requires
+    the exact `UnknownMethod` refusal. It accepts every error only from the
+    unique sender that supplied the preceding exact Settings reply, and it
+    byte-checks live portal introspection and requires all five interfaces to
+    be absent. A method return, extra error argument, other sender, other
+    error, missing reply, or transport failure prevents the marker and fails
+    every validated QEMU boot. This proves the service reports those
+    capability-bearing interfaces unavailable instead of handing an
+    application a fake PipeWire, input-control, camera, secret, or print
+    result.
 
 A screenshot alone is insufficient.
 
@@ -6793,6 +6785,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content exposes a full-viewport focus control and a trusted physical click focuses the browser. A fresh bounded read-only probe validates that persistent click record and current focus, then the host sends physical `Control+O` to invoke Firefox's native Open File command without a DOM picker call or synthetic assignment. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter to select the file. Firefox must then load the exact granted `file:` URL as plain text with the fixture's exact contents before input completion. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
 | 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The deterministic system oracle remains NIC-less; public reachability is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
 | 27h | **Firefox Web Audio image proof — LANDED**; the deterministic physical-input boot uses its first trusted key to start and finish one exact one-second 440 Hz oscillator in Firefox. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, the built-in test loopback taking card 0 ahead of HDA, and then 48,000 correct tone frames stretched across 1,600 ms by about 28,000 frames of daemon-inserted silence. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep those client frames contiguous instead of starting HDA on an empty period. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 512 MiB bound and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, duration, peak and per-channel AC energy, then requires both channels to correlate above 0.9 with one shared frequency in the narrow 435–445 Hz physical-output band independent of phase. The fit tolerates the measured QEMU HDA/WAV clock rate without accepting an unrelated tone. The authoritative TCG run measured 1,004 ms, peak 8,192, a 438.25 Hz fit, per-channel AC RMS 5,780.9 and correlations 0.9719/0.9719 before completing every rollback/fallback boot. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a short tone and an off-band frequency, accept the bounded clock-stretch fixture, pin exact float conversion, accounting, prebuffer/start continuity and mixed HDA/loopback selection, and pin the exact QEMU argv including comma-safe capture paths. Other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
+| 27i | **unsupported portal discovery proof — LANDED**; the live uid-1000 portal client asks the version property and `GetAll` for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`, calls one real entry member on each, and accepts only complete exact error replies from the activated service's unique sender. Live introspection must omit every interface, and QEMU requires a distinct trusted service-prefixed marker after the whole sequence | unsupported capture, remote-control, camera, secret, and print capabilities fail closed rather than appearing to succeed |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
 

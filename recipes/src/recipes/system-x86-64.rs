@@ -15,8 +15,7 @@ use crate::ladder::{
     TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
     TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_CHANNEL_RUNTIME_MARKER,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
-    TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER,
-    TD_TXT_RUNTIME_MARKER,
+    TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
     TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
@@ -1289,8 +1288,8 @@ fn build_td_svc_conf() -> String {
          # service prefix is an attributable exact line. This is ordering only:\n\
          # TLS setup is deliberately not required by portal evidence.\n\
          # td-recipe-eval requires exact {portal_runtime_marker},\n\
-         # {portal_request_runtime_marker} and\n\
-         # {portal_unsupported_runtime_marker} lines.\n\
+         # {portal_request_runtime_marker}, and\n\
+         # {portal_unavailable_runtime_marker} lines.\n\
          [portal-evidence]\n\
          type=oneshot\n\
          cgroup=session\n\
@@ -1489,7 +1488,7 @@ fn build_td_svc_conf() -> String {
         portal_settings = TD_PORTAL_SETTINGS_PATH,
         portal_runtime_marker = TD_PORTAL_RUNTIME_MARKER,
         portal_request_runtime_marker = TD_PORTAL_REQUEST_RUNTIME_MARKER,
-        portal_unsupported_runtime_marker = TD_PORTAL_UNSUPPORTED_RUNTIME_MARKER,
+        portal_unavailable_runtime_marker = TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER,
         portal_channel_runtime_marker = TD_PORTAL_CHANNEL_RUNTIME_MARKER,
         portal_wayland_socket = PORTAL_WAYLAND_SOCKET,
         portal_service_log = PORTAL_SERVICE_LOG,
