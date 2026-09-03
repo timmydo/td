@@ -857,11 +857,31 @@ mod tests {
         assert_eq!((control.0.as_ptr() as usize) % CMSG_ALIGN, 0);
     }
 
-    fn rejected_control_closes_sentinels(
+    /// Which file this is, in terms that survive being unlinked.
+    fn file_identity(file: &File) -> (u64, u64) {
+        let metadata = file.metadata().unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    /// Which file descriptor NUMBER `raw` names now, if any.
+    ///
+    /// `stat`, never `open`: once a number is closed it belongs to the process
+    /// again and a parallel test may already hold it. This suite opens
+    /// `/dev/ptmx`, so that number can name a character device, where an open
+    /// can block and a read need never end. Stat opens nothing and reads
+    /// nothing, so it can do neither, and it answers the only question a
+    /// closed descriptor raises.
+    fn identity_of_number(raw: RawFd) -> Option<(u64, u64)> {
+        std::fs::metadata(format!("/proc/self/fd/{raw}"))
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+
+    fn rejected_control_closes_its_descriptors(
         mut control: Vec<u8>,
         fd_offsets: &[usize],
     ) -> String {
-        let mut sentinels = Vec::new();
+        let mut handed_over = Vec::new();
         for fd_offset in fd_offsets {
             let sequence = SEQ.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
@@ -869,23 +889,50 @@ mod tests {
                 std::process::id(),
                 sequence
             ));
-            let sentinel = format!("rejected-close-sentinel-{sequence}");
-            fs::write(&path, sentinel.as_bytes()).unwrap();
-            let raw = File::open(&path).unwrap().into_raw_fd();
+            // Created and opened once: nothing reads this file, only its
+            // identity is used. Cleared first so that this user's own leavings,
+            // from a run that crashed at this pid and sequence, do not fail
+            // `create_new`. The error is discarded because a path that is not
+            // ours to remove is not ours to diagnose here either.
+            let _ = fs::remove_file(&path);
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
             fs::remove_file(path).unwrap();
+            let identity = file_identity(&file);
+            // A second handle, kept until the check is done. The parser owns
+            // and closes `raw`, which would drop the last reference to an
+            // already-unlinked file and free its inode — and a freed inode
+            // number can be handed straight to the next file created, which is
+            // the one thing that could make this identity name something else.
+            let pin = file.try_clone().unwrap();
+            let raw = file.into_raw_fd();
             control[*fd_offset..*fd_offset + 4].copy_from_slice(&raw.to_ne_bytes());
-            sentinels.push((raw, sentinel));
+            handed_over.push((raw, identity, pin));
         }
 
         let error = parse_fds(&control).unwrap_err();
-        for (raw, sentinel) in sentinels {
-            // Another test thread may reuse `raw` after the parser closes it.
-            // It still must not reopen this uniquely identified sentinel.
-            if let Ok(mut reused) = File::open(format!("/proc/self/fd/{raw}")) {
-                let mut contents = String::new();
-                let _ = reused.read_to_string(&mut contents);
-                assert_ne!(contents, sentinel);
-            }
+        for (raw, identity, pin) in handed_over {
+            // A parallel test may already hold `raw`, so its availability
+            // settles nothing. What must be true is that the number no longer
+            // names the file the parser had to close.
+            // The pin is a second handle on the same file, so its own number
+            // must still name that file. A negative below means nothing if the
+            // oracle is mute or answers with somebody else's.
+            assert_eq!(
+                identity_of_number(pin.as_raw_fd()),
+                Some(identity),
+                "the pin must still name its own file"
+            );
+            assert_ne!(
+                identity_of_number(raw),
+                Some(identity),
+                "the parser must close the descriptor it refused"
+            );
+            drop(pin);
         }
         error
     }
@@ -900,7 +947,7 @@ mod tests {
         control[24..28].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[28..32].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
         assert_eq!(
-            rejected_control_closes_sentinels(control, &[32]),
+            rejected_control_closes_its_descriptors(control, &[32]),
             "unsupported ancillary message level=1 type=99"
         );
     }
@@ -915,7 +962,7 @@ mod tests {
         control[32..36].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[36..40].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
         assert_eq!(
-            rejected_control_closes_sentinels(control, &[40]),
+            rejected_control_closes_its_descriptors(control, &[40]),
             "invalid SCM_RIGHTS payload length 1"
         );
     }
@@ -931,7 +978,7 @@ mod tests {
         control[32..36].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[36..40].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
         assert_eq!(
-            rejected_control_closes_sentinels(control, &[40]),
+            rejected_control_closes_its_descriptors(control, &[40]),
             "received invalid descriptor -1"
         );
     }
@@ -944,7 +991,7 @@ mod tests {
         control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
         control[20..24].copy_from_slice(&(-1i32).to_ne_bytes());
         assert_eq!(
-            rejected_control_closes_sentinels(control, &[16, 24]),
+            rejected_control_closes_its_descriptors(control, &[16, 24]),
             "received invalid descriptor -1"
         );
     }

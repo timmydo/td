@@ -412,36 +412,67 @@ mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::MetadataExt;
 
-    fn rejected_control_closes_sentinels(
+    /// Which file this is, in terms that survive being unlinked.
+    fn file_identity(file: &File) -> (u64, u64) {
+        let metadata = file.metadata().unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    /// Which file descriptor NUMBER `raw` names now, if any.
+    ///
+    /// `stat`, never `open`: once a number is closed it belongs to the process
+    /// again and a parallel test may hold it, so it can name anything that
+    /// suite has open — a socket here, a character device in td-compositor's.
+    /// Opening one of those can block and reading one can never end. Stat
+    /// opens nothing and reads nothing, so it can do neither, and it answers
+    /// the only question a closed descriptor raises.
+    fn identity_of_number(raw: RawFd) -> Option<(u64, u64)> {
+        std::fs::metadata(format!("/proc/self/fd/{raw}"))
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+
+    fn rejected_control_closes_its_descriptors(
         name: &str,
         mut control: Vec<u8>,
         fd_offsets: &[usize],
     ) -> String {
-        let mut sentinels = Vec::new();
+        let mut handed_over = Vec::new();
         for (index, fd_offset) in fd_offsets.iter().enumerate() {
-            let file_name = format!("{name}-{index}");
-            let sentinel = format!("portal-{file_name}-close-sentinel");
-            let mut file = tempfile(&file_name);
-            file.write_all(sentinel.as_bytes()).unwrap();
-            file.seek(SeekFrom::Start(0)).unwrap();
+            let file = tempfile(&format!("{name}-{index}"));
+            let identity = file_identity(&file);
+            // A second handle, kept until the check is done. The parser owns
+            // and closes `raw`, which would drop the last reference to an
+            // already-unlinked file and free its inode — and a freed inode
+            // number can be handed straight to the next file created, which is
+            // the one thing that could make this identity name something else.
+            let pin = file.try_clone().unwrap();
             let raw = file.into_raw_fd();
             control[*fd_offset..*fd_offset + 4].copy_from_slice(&raw.to_ne_bytes());
-            sentinels.push((raw, sentinel));
+            handed_over.push((raw, identity, pin));
         }
 
         let error = parse_fds(&control).unwrap_err();
-        for (raw, sentinel) in sentinels {
-            // A parallel test may reuse `raw`, but its distinct sentinel must
-            // not be mistaken for the descriptor this parser had to close.
-            if let Ok(mut reused) = OpenOptions::new()
-                .read(true)
-                .open(format!("/proc/self/fd/{raw}"))
-            {
-                let mut contents = String::new();
-                let _ = reused.read_to_string(&mut contents);
-                assert_ne!(contents, sentinel);
-            }
+        for (raw, identity, pin) in handed_over {
+            // A parallel test may already hold `raw`, so its availability
+            // settles nothing. What must be true is that the number no longer
+            // names the file the parser had to close.
+            // The pin is a second handle on the same file, so its own number
+            // must still name that file. A negative below means nothing if the
+            // oracle is mute or answers with somebody else's.
+            assert_eq!(
+                identity_of_number(pin.as_raw_fd()),
+                Some(identity),
+                "the pin must still name its own file"
+            );
+            assert_ne!(
+                identity_of_number(raw),
+                Some(identity),
+                "the parser must close the descriptor it refused"
+            );
+            drop(pin);
         }
         error
     }
@@ -481,7 +512,7 @@ mod tests {
         control[24..28].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[28..32].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
         assert_eq!(
-            rejected_control_closes_sentinels("unsupported", control, &[32]),
+            rejected_control_closes_its_descriptors("unsupported", control, &[32]),
             "unsupported ancillary message level=1 type=99"
         );
     }
@@ -496,7 +527,7 @@ mod tests {
         control[32..36].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[36..40].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
         assert_eq!(
-            rejected_control_closes_sentinels("width", control, &[40]),
+            rejected_control_closes_its_descriptors("width", control, &[40]),
             "invalid SCM_RIGHTS payload length 1"
         );
     }
@@ -512,7 +543,7 @@ mod tests {
         control[32..36].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[36..40].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
         assert_eq!(
-            rejected_control_closes_sentinels("negative", control, &[40]),
+            rejected_control_closes_its_descriptors("negative", control, &[40]),
             "received invalid descriptor -1"
         );
     }
@@ -525,7 +556,7 @@ mod tests {
         control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
         control[20..24].copy_from_slice(&(-1i32).to_ne_bytes());
         assert_eq!(
-            rejected_control_closes_sentinels("neighbors", control, &[16, 24]),
+            rejected_control_closes_its_descriptors("neighbors", control, &[16, 24]),
             "received invalid descriptor -1"
         );
     }
@@ -569,13 +600,39 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_consumes_the_received_number() {
+    fn duplicate_consumes_the_received_descriptor() {
         let file = tempfile("consume");
+        let received = file_identity(&file);
         let raw = file.into_raw_fd();
-        let _duplicate = duplicate_received(raw).unwrap();
-        assert!(OpenOptions::new()
-            .read(true)
-            .open(format!("/proc/self/fd/{raw}"))
-            .is_err());
+        // Held open past the check on purpose: it keeps the inode alive, so
+        // `received` cannot be recycled onto some other file mid-test.
+        let duplicate = duplicate_received(raw).unwrap();
+        // The duplicate is a second handle on the same file, so its own number
+        // must still name that file. A negative below means nothing if the
+        // oracle is mute or answers with somebody else's.
+        assert_eq!(
+            identity_of_number(duplicate.as_raw_fd()),
+            Some(received),
+            "the duplicate must still name the file it duplicated"
+        );
+
+        // Reclaim the number deliberately — the kernel hands back the lowest
+        // free descriptor — so the reuse case is exercised rather than waited
+        // for. This does not make the test any better at catching a missing
+        // close; it keeps the reuse-tolerant path from going unobserved.
+        let reclaimed = tempfile("reclaim");
+        let now = identity_of_number(raw);
+        if reclaimed.as_raw_fd() == raw {
+            assert_eq!(
+                now,
+                Some(file_identity(&reclaimed)),
+                "a number this thread now holds must name the file holding it"
+            );
+        }
+        assert_ne!(
+            now,
+            Some(received),
+            "the received descriptor must not still name the received file"
+        );
     }
 }
