@@ -912,11 +912,13 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    FAT32 ESP + Btrfs volume onto a device or a regular file,
    `#[path]`-including `gpt.rs`/`fat.rs`/`crc32.rs` and `protocol.rs`, and
    delegating the publish to `td-boot install` (D1). Carries the
-   `mkfs.btrfs` build-time binding (D7). Registering a new crate is three
-   touch points that must land with it: the cargo-test gate's one-package
-   `Cargo.lock` assertion plus its clippy and test lines
-   (`builder/src/gate_defs/325-cargo-test.rs`), a route and assertions in
-   `builder/src/affected.rs`, and the workspace `exclude` list.
+   `mkfs.btrfs` build-time binding (D7). Registering a new crate no longer
+   has touch points: `builder/src/affected.rs` discovers every
+   `td-*/Cargo.toml` at the repo root and derives the lock roster, the routes
+   and the cargo commands, and the cargo-test gate
+   (`builder/src/gate_defs/325-cargo-test.rs`) asks it for the same list.
+   Commit the crate's `Cargo.lock` and declare any non-default gating in its
+   own `[package.metadata.td-gate]`; the workspace `exclude` list is gone.
 
    Split in three, because the volume and the publish each bring a
    dependency the layout does not. **7a, the LAYOUT**, is landed: the crate,

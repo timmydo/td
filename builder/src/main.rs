@@ -179,6 +179,73 @@ fn contains_gcc_lib_ref(text: &str) -> bool {
         .any(|line| line.contains("-gcc-") && line.contains("-lib"))
 }
 
+/// `gate-crates locks|cargo-cmds|names` — the gate roster, derived.
+///
+/// Gate 325 used to spell this out three times over: a dependency-free lock
+/// check per crate, a clippy line per crate, a `cargo test` line per crate, and
+/// a closing sentence naming them all. That was a fourth hand-kept copy of the
+/// roster `affected.rs` already derives, and it had drifted: td-jail, td-portal
+/// and td-profiler were absent from every one of them, so the in-loop gate
+/// silently did not lint or test three shipped crates.
+///
+/// The script asks for the roster now, so a crate joins the gate by existing —
+/// the same rule the host preflight already follows.
+fn gate_crates_cli(args: &[String]) -> ExitCode {
+    let fail = |msg: &str| {
+        eprintln!("td-builder: gate-crates: {msg}");
+        ExitCode::FAILURE
+    };
+    let root = crate::affected::resolve_root();
+    match args {
+        [op] if op == "locks" => {
+            let locks = match crate::affected::dependency_free_locks(&root) {
+                Ok(locks) => locks,
+                Err(e) => return fail(&e),
+            };
+            // Belt-and-braces: `discover_gate_crates` already refuses an empty
+            // roster, and this list always carries the workspace root lock. It
+            // is here so a future change to either cannot make this arm report
+            // success over nothing.
+            if locks.is_empty() {
+                return fail("the derived roster is empty — it cannot be");
+            }
+            for (lock, packages) in &locks {
+                if let Err(e) = crate::affected::assert_dependency_free(&root, lock, *packages) {
+                    return fail(&e);
+                }
+            }
+            println!("{} dependency-free lock(s) verified", locks.len());
+            ExitCode::SUCCESS
+        }
+        [op] if op == "cargo-cmds" => match crate::affected::gate_cargo_cmds(&root) {
+            Ok(cmds) if !cmds.is_empty() => {
+                for cmd in cmds {
+                    println!("{cmd}");
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(_) => fail("the derived command list is empty — it cannot be"),
+            Err(e) => fail(&e),
+        },
+        [op] if op == "names" => match crate::affected::gate_crate_names(&root) {
+            Ok(names) if !names.is_empty() => {
+                println!("{}", names.join(", "));
+                ExitCode::SUCCESS
+            }
+            Ok(_) => fail("the derived roster is empty — it cannot be"),
+            Err(e) => fail(&e),
+        },
+        _ => {
+            eprintln!("usage: td-builder gate-crates locks");
+            eprintln!("       td-builder gate-crates cargo-cmds");
+            eprintln!("       td-builder gate-crates names");
+            // 2 for "typed wrong", as `text_cli` does — a failed CHECK is 1,
+            // and the gate script must be able to tell them apart.
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn text_cli(args: &[String]) -> ExitCode {
     let fail = |msg: &str| {
         eprintln!("td-builder: text: {msg}");
@@ -8324,6 +8391,7 @@ fn main() -> ExitCode {
         // assertions and manifest shuffling. These are intentionally typed, not a
         // general regex tool clone.
         Some("text") => text_cli(args.get(2..).unwrap_or(&[])),
+        Some("gate-crates") => gate_crates_cli(args.get(2..).unwrap_or(&[])),
         Some("lock") => lock_cli(args.get(2..).unwrap_or(&[])),
         Some("files") => match args.get(2..).filter(|rest| !rest.is_empty()) {
             Some(rest) => match regular_files_under(rest) {
@@ -11282,6 +11350,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder check-rung HARNESS [ARG...] # dev: run a harness inside the loop sandbox");
             eprintln!("       td-builder text <op> ...               # typed text assertions/extraction for loop scripts");
             eprintln!("       td-builder lock <op> ...               # typed lock path extraction/rewrites");
+            eprintln!("       td-builder gate-crates <op> ...        # the derived crate roster gate 325 runs");
             eprintln!("       td-builder files PATH...");
             eprintln!("       td-builder files-name-first PATTERN PATH...");
             eprintln!("       td-builder tree-fingerprint PATH...");

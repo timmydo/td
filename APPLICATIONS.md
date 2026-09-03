@@ -8125,13 +8125,15 @@ Two are gone; the third is a standing instruction:
    Selection is derived too, not just the roster: a path inside a
    discovered crate reaches the preflight that compiles it, so a branch
    adding only a new crate does not skip its own lock guard, tests and
-   lints. **One copy is left**: `builder/src/gate_defs/325-cargo-test.rs`
-   still hand-lists the crate set, and is already three crates stale
-   (`td-jail`, `td-portal`, `td-profiler`). It causes no live coverage
-   loss — that gate degrades to an Unprovisioned SKIP and this preflight
-   is the tier that runs — but until it derives from the same roster,
-   "adding a crate edits nothing central" is true of the preflight and
-   not yet of the whole tree.
+   lints. The last copy is gone too: `builder/src/gate_defs/325-cargo-test.rs`
+   spelled the set out four times over — a lock check, a clippy line, a
+   test line and a closing sentence per crate — and was three crates
+   stale (`td-jail`, `td-portal`, `td-profiler`). Its script now asks
+   `td-builder gate-crates` for the same derivation, so both tiers read
+   one roster and "adding a crate edits nothing central" is true of the
+   whole tree. A crate whose in-sandbox suite differs from the host
+   preflight's declares `gate-test-args` beside `test-args`; td-review is
+   the only one, and the two legs are pinned apart by a test.
 2. `Cargo.toml`'s `exclude` — **LANDED**, and by deletion rather than the
    reformat this section asked for. Every standalone crate already
    carried its own empty `[workspace]` table, which is what actually

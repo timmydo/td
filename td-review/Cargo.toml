@@ -11,6 +11,9 @@ license = "GPL-3.0-or-later"
 [package.metadata.td-gate]
 clippy-all-targets = true
 test-args = "--include-ignored"
+# ... but the in-sandbox gate runs only the binary targets: the ignored tests
+# the host preflight opts into need an environment the guix-free loop has not.
+gate-test-args = "--bins"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from a
 # worktree nested under it.

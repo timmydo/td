@@ -280,9 +280,10 @@ message.
   the crate's `Cargo.lock` or the gate reds. A crate wanting non-default gating
   declares it in its own `[package.metadata.td-gate]`; a crate that cannot wear
   the `td-` prefix is an amendment to that discovery rule.
-  `builder/src/gate_defs/325-cargo-test.rs` still hand-lists the same set and
-  has not been converted, so a crate added today is gated by the preflight that
-  runs and absent from that non-running gate's script.
+  The in-sandbox gate `builder/src/gate_defs/325-cargo-test.rs` asks for the
+  same roster (`td-builder gate-crates`), so one derivation feeds both tiers.
+  A crate whose in-sandbox suite differs from the host preflight's declares
+  `gate-test-args` beside `test-args`.
 - Use `std`, not `no_std`. Allocate buffers and collections outside hot loops
   where practical. Keep comments terse and explain a non-obvious why; design
   rationale and review history belong in the commit message or normative doc.

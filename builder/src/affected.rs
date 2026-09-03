@@ -1296,11 +1296,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // above there is no target artifact for recipe-checks to link.
     //
     // The only arm that selects NO check target. `cargo-test` is the one gate
-    // whose body names td-review at all — clippy --all-targets, its tests, and
-    // its 1-package lock — and the preflight above covers all three and then
+    // that reaches td-review at all — clippy --all-targets, its tests, and
+    // its 1-package lock, now through the derived roster rather than a name in
+    // its body — and the preflight above covers all three and then
     // some: it runs the tests with --include-ignored where the gate runs
-    // --bins, and its lock guard also rejects a `source =` line. Superset, not
-    // equal, and in the safe direction. `check` would add the cheap+heavy pools and
+    // --bins. The lock guard is now the SAME code in both tiers
+    // (`dependency_free_locks` -> `assert_dependency_free`), so that half is
+    // equal rather than a superset; the suite is what still differs, and in
+    // the safe direction. `check` would add the cheap+heavy pools and
     // build-recipes on top — the source-bootstrap ladder from the stage0 seed,
     // an hour of mes/tcc/gcc that cannot read a host-side crate. Bounded means
     // bounded by what the diff can break; a selection nothing in it inspects is
@@ -2655,10 +2658,12 @@ fn shell_quote(p: &Path) -> Option<String> {
 /// the AGENTS.md dependency-free rule. Both, because they catch different
 /// things: the count catches a new crate, the source line catches a registry
 /// one that a stale count would miss.
-fn assert_dependency_free(root: &Path, lock: &str, packages: usize) -> Result<(), String> {
+pub(crate) fn assert_dependency_free(root: &Path, lock: &str, packages: usize) -> Result<(), String> {
     // An unreadable lock is a failure, not a pass: a guard that answers OK when
-    // it cannot see the file is a guard that has silently stopped guarding, and
-    // gate 325's `count-line-exact` fails the same way on a missing one.
+    // it cannot see the file is a guard that has silently stopped guarding.
+    // Gate 325 reaches this through `gate-crates locks`, so both tiers fail an
+    // unreadable lock the same way — it used to red on its own
+    // `text count-line-exact`, which no gate calls any more.
     let text = std::fs::read_to_string(root.join(lock))
         .map_err(|e| format!("{lock} could not be read: {e}"))?;
     dependency_free(lock, &text, packages)
@@ -2716,6 +2721,13 @@ struct GateCrate {
     /// of the same one, and inheriting it repo-wide would run every crate's
     /// deliberately-ignored tests.
     test_args: Option<String>,
+    /// Extra arguments BEFORE `cargo test`'s `--` separator, for the in-sandbox
+    /// gate leg only. Separate from `test_args` because the two legs want
+    /// different suites from the same crate: the host preflight opts INTO a
+    /// crate's ignored tests, while gate 325 runs inside the guix-free loop
+    /// sandbox, where those tests have no environment to run in. Spelling them
+    /// as one key would silently give one leg the other's suite.
+    gate_test_args: Option<String>,
 }
 
 /// The `td-*` directories under `root` carrying a `Cargo.toml`, alphabetically
@@ -2860,6 +2872,7 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
         name: name.to_string(),
         clippy_all_targets: false,
         test_args: None,
+        gate_test_args: None,
     };
     let mut inside = false;
     let mut in_metadata_root = false;
@@ -2925,6 +2938,9 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
                 out.clippy_all_targets = gate_bool(name, "clippy-all-targets", value.trim())?;
             }
             "test-args" => out.test_args = Some(gate_string(name, "test-args", value.trim())?),
+            "gate-test-args" => {
+                out.gate_test_args = Some(gate_string(name, "gate-test-args", value.trim())?)
+            }
             other => {
                 return Err(format!(
                     "{name}: unknown [package.metadata.td-gate] key `{other}`"
@@ -3025,7 +3041,7 @@ fn workspace_member_count(root: &Path) -> Result<usize, String> {
 /// enforcement — so in the only tier that executes, this is where the
 /// dependency-free claim is actually checked. `--frozen` does not stand in: it
 /// demands that the committed lock RESOLVE, not that it be empty.
-fn dependency_free_locks(root: &Path) -> Result<Vec<(String, usize)>, String> {
+pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, usize)>, String> {
     let mut out = vec![("Cargo.lock".to_string(), workspace_member_count(root)?)];
     for krate in discover_gate_crates(root)? {
         out.push((format!("{}/Cargo.lock", krate.name), 1));
@@ -3141,6 +3157,43 @@ fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
         out.push(cmd);
     }
     Ok(out)
+}
+
+/// The cargo commands gate 325 runs IN the loop sandbox, derived from the same
+/// roster as the host preflight's.
+///
+/// Kept apart from `cargo_test_cmds_all` rather than shared: the two legs run
+/// deliberately different suites (see `GateCrate::gate_test_args`), and the
+/// gate lints before it tests so a coding-rules violation reds before a long
+/// test run rather than after it.
+pub(crate) fn gate_cargo_cmds(root: &Path) -> Result<Vec<String>, String> {
+    let crates = discover_gate_crates(root)?;
+    let mut out = vec!["cargo clippy --frozen --workspace".to_string()];
+    for k in &crates {
+        let mut cmd = format!("cargo clippy --frozen --manifest-path {}/Cargo.toml", k.name);
+        if k.clippy_all_targets {
+            cmd.push_str(" --all-targets");
+        }
+        out.push(cmd);
+    }
+    out.push("cargo test --frozen --workspace".to_string());
+    for k in &crates {
+        let mut cmd = format!("cargo test --frozen --manifest-path {}/Cargo.toml", k.name);
+        if let Some(args) = &k.gate_test_args {
+            cmd.push(' ');
+            cmd.push_str(args);
+        }
+        out.push(cmd);
+    }
+    Ok(out)
+}
+
+/// The crate names gate 325 reports, in roster order.
+pub(crate) fn gate_crate_names(root: &Path) -> Result<Vec<String>, String> {
+    Ok(discover_gate_crates(root)?
+        .into_iter()
+        .map(|k| k.name)
+        .collect())
 }
 
 fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
@@ -5154,6 +5207,110 @@ mod tests {
         assert!(got.is_err(), "a missing gate dir must be an error: {got:?}");
     }
 
+    /// Gate 325 runs the roster, not a list of its own.
+    ///
+    /// The gate used to spell the crates out four times over — a lock check, a
+    /// clippy line, a test line, and a closing sentence — and had drifted three
+    /// crates behind the tree. Its script asks `gate-crates` now, so the only
+    /// thing that can go stale is this derivation.
+    #[test]
+    fn the_in_sandbox_gate_runs_every_crate_the_roster_names() {
+        let root = repo_root();
+        let names = gate_crate_names(&root).expect("the roster derives");
+        assert!(!names.is_empty(), "the roster is empty");
+        let cmds = gate_cargo_cmds(&root).expect("the gate command list derives");
+        for krate in &names {
+            let manifest = format!("--manifest-path {krate}/Cargo.toml");
+            for driver in ["cargo clippy", "cargo test"] {
+                assert!(
+                    cmds.iter()
+                        .any(|c| c.starts_with(driver) && c.contains(&manifest)),
+                    "gate 325 never runs `{driver}` for {krate}"
+                );
+            }
+        }
+        for driver in ["cargo clippy --frozen --workspace", "cargo test --frozen --workspace"] {
+            assert!(cmds.iter().any(|c| c == driver), "gate 325 drops `{driver}`");
+        }
+        assert_eq!(
+            cmds.len(),
+            2 * (names.len() + 1),
+            "one clippy and one test command per crate, plus the workspace pair"
+        );
+        // The declared FLAGS, not just the command's presence. Without this,
+        // deleting the `--all-targets` branch leaves every test green while
+        // silently dropping the lint of nine crates' test targets — coverage
+        // the old hand-written script at least stated where a reader could see
+        // it.
+        let crates = discover_gate_crates(&root).expect("the roster derives");
+        for k in &crates {
+            let clippy = cmds
+                .iter()
+                .find(|c| {
+                    c.starts_with("cargo clippy")
+                        && c.contains(&format!("--manifest-path {}/Cargo.toml", k.name))
+                })
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                clippy.ends_with(" --all-targets"),
+                k.clippy_all_targets,
+                "{}: --all-targets does not follow its declaration: `{clippy}`",
+                k.name
+            );
+            let test = cmds
+                .iter()
+                .find(|c| {
+                    c.starts_with("cargo test")
+                        && c.contains(&format!("--manifest-path {}/Cargo.toml", k.name))
+                })
+                .map(String::as_str)
+                .unwrap_or_default();
+            match &k.gate_test_args {
+                Some(args) => assert!(
+                    test.ends_with(args.as_str()),
+                    "{}: declared gate-test-args `{args}` missing from `{test}`",
+                    k.name
+                ),
+                None => assert!(
+                    test.ends_with("/Cargo.toml"),
+                    "{}: undeclared arguments appeared in `{test}`",
+                    k.name
+                ),
+            }
+        }
+    }
+
+    /// The gate leg and the host preflight run deliberately DIFFERENT suites for
+    /// a crate that declares both, and must not inherit each other's.
+    ///
+    /// td-review's App tests drive a real git repo and are `#[ignore]`d: the
+    /// host preflight opts into them, the git-less sandbox gate runs `--bins`.
+    /// One key for both would silently hand one leg the other's suite.
+    #[test]
+    fn the_gate_leg_and_the_host_preflight_keep_their_own_test_arguments() {
+        let root = repo_root();
+        let gate = gate_cargo_cmds(&root).expect("the gate command list derives");
+        let host = cargo_test_cmds_all(&root).expect("the preflight list derives");
+        let line = |cmds: &[String], krate: &str| {
+            cmds.iter()
+                .find(|c| c.starts_with("cargo test") && c.contains(krate))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let gate_review = line(&gate, "td-review/Cargo.toml");
+        let host_review = line(&host, "td-review/Cargo.toml");
+        assert!(
+            gate_review.ends_with("--bins"),
+            "the sandbox gate must run td-review's bins only: `{gate_review}`"
+        );
+        assert!(
+            host_review.contains("-- --include-ignored"),
+            "the host preflight must opt into td-review's ignored tests: `{host_review}`"
+        );
+        assert_ne!(gate_review, host_review);
+    }
+
     /// The declaration parser, over manifest TEXT so its cases are literals
     /// rather than a fixture tree.
     #[test]
@@ -5164,14 +5321,30 @@ mod tests {
         let got = parse_gate_crate("td-x", bare).expect("defaults");
         assert!(!got.clippy_all_targets);
         assert_eq!(got.test_args, None);
+        assert_eq!(got.gate_test_args, None);
 
-        // Both keys, with the trailing comments these manifests write.
+        // All three keys, with the trailing comments these manifests write.
+        // `test-args` and `gate-test-args` are read INDEPENDENTLY: they land on
+        // different argument planes (after `--` and before it) and feed
+        // different tiers, so one must never be taken as the other's default.
         let full = "[package.metadata.td-gate]\n\
                     clippy-all-targets = true # lints test targets too\n\
-                    test-args = \"--include-ignored\" # its only tier\n";
+                    test-args = \"--include-ignored\" # the host preflight's tier\n\
+                    gate-test-args = \"--bins\" # the sandbox gate's\n";
         let got = parse_gate_crate("td-x", full).expect("declared");
         assert!(got.clippy_all_targets);
         assert_eq!(got.test_args.as_deref(), Some("--include-ignored"));
+        assert_eq!(got.gate_test_args.as_deref(), Some("--bins"));
+
+        // Either alone leaves the other at its default.
+        let only_gate = "[package.metadata.td-gate]\ngate-test-args = \"--bins\"\n";
+        let got = parse_gate_crate("td-x", only_gate).expect("declared");
+        assert_eq!(got.gate_test_args.as_deref(), Some("--bins"));
+        assert_eq!(got.test_args, None);
+        let only_host = "[package.metadata.td-gate]\ntest-args = \"--include-ignored\"\n";
+        let got = parse_gate_crate("td-x", only_host).expect("declared");
+        assert_eq!(got.test_args.as_deref(), Some("--include-ignored"));
+        assert_eq!(got.gate_test_args, None);
 
         // Every spelling cargo accepts for the SAME table is the same table
         // here. Each of these was a silent default before review found it.
