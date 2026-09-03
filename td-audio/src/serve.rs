@@ -348,8 +348,10 @@ impl<S: AudioSink> Server<S> {
             };
             self.poll.push(client.fd(), interest)?;
         }
-        if let Some(fd) = self.sink.raw_fd() {
-            self.poll.push(fd, Interest::WRITE)?;
+        if self.mixer.has_device_work() {
+            if let Some(fd) = self.sink.raw_fd() {
+                self.poll.push(fd, Interest::WRITE)?;
+            }
         }
         self.poll.wait(WAIT_MS)?;
         Ok(())
@@ -487,8 +489,8 @@ impl<S: AudioSink> Server<S> {
             crate::sink::Wait::Timeout => return Ok(false),
             crate::sink::Wait::Writable => {}
         }
-        let pumped = match self.mixer.pump(&mut self.sink) {
-            Ok(pumped) => pumped,
+        match self.mixer.pump(&mut self.sink) {
+            Ok(_) => {}
             Err(error) if is_underrun(&error) => {
                 self.mixer.recover(&mut self.sink)?;
                 // Deliberately NOT started here. `PREPARE` left the ring empty
@@ -500,12 +502,16 @@ impl<S: AudioSink> Server<S> {
             }
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(true),
             Err(error) => return Err(error),
-        };
+        }
         // Start only once there is audio in the ring. `SwParams::set_playback`
         // sets `start_threshold` to the boundary so the device never starts
         // itself, which is what keeps the first sound aligned with the first
         // audio instead of with the silence before it.
-        if pumped.frames_written > 0 && !self.sink.is_running() {
+        if !self.sink.is_running()
+            && self
+                .mixer
+                .ready_to_start(self.sink.buffer_frames(), self.sink.period_frames())
+        {
             self.sink.start()?;
         }
         Ok(false)
@@ -821,7 +827,7 @@ mod tests {
 
         // And audio on the stream channel reaches the device.
         let mut pcm = Vec::new();
-        for _ in 0..1024 * 2 {
+        for _ in 0..9600 * 2 {
             pcm.extend_from_slice(&900i16.to_le_bytes());
         }
         let mut audio = wire::Descriptor::encode(pcm.len() as u32, 0, 0, 0).to_vec();
@@ -834,17 +840,10 @@ mod tests {
             server.sink.frames_written() > 0,
             "audio from the socket never reached the device"
         );
-        // The device may have been handed a period of silence before the
-        // client's first buffer arrived, so the assertion is that the client's
-        // audio is IN there as a contiguous run at unity gain — not that it
-        // starts at sample zero.
+        // Prebuffering forbids a silent period before the client's first data.
         let samples = server.sink.samples();
-        let start = samples
-            .iter()
-            .position(|sample| *sample == 900)
-            .expect("the client's audio never reached the device");
         assert!(
-            samples.get(start..start + 64).is_some_and(|run| run.iter().all(|s| *s == 900)),
+            samples.get(..64).is_some_and(|run| run.iter().all(|s| *s == 900)),
             "the client's audio arrived altered or in pieces"
         );
         server.shutdown();
@@ -923,6 +922,27 @@ mod tests {
         server.mixer.write(id, &audio).unwrap();
         server.pass().unwrap();
         assert!(server.sink.is_running(), "and it never started at all");
+        server.shutdown();
+    }
+
+    /// Production starts a prepared PCM only after every whole-period slot is
+    /// primed, rather than racing the first client period against playback.
+    #[test]
+    fn a_continuous_stream_primes_the_ring_before_device_start() {
+        let path = socket_path("prime");
+        let _ = std::fs::remove_file(&path);
+        let sink = MemorySink::new(crate::sink::Spec::fixed(), 12, 4);
+        let mut server = Server::bind(&path, sink, Policy::for_uid(own_uid())).unwrap();
+        let id = server.mixer.open(32).unwrap();
+        server.mixer.write(id, &[0u8; 16 * 4]).unwrap();
+
+        assert!(!server.drive_device().unwrap());
+        assert!(!server.sink.is_running());
+        assert!(!server.drive_device().unwrap());
+        assert!(!server.sink.is_running());
+        assert!(!server.drive_device().unwrap());
+        assert!(server.sink.is_running(), "the primed ring was never started");
+        assert_eq!(server.sink.frames_written(), 12);
         server.shutdown();
     }
 

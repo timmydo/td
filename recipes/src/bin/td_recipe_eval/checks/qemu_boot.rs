@@ -116,8 +116,7 @@ const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
 const TD_PORTAL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_RUNTIME_MARKER;
 const TD_PORTAL_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-READY namespaces=2 settings=10 version=1";
-const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str =
-    td_recipe::ladder::TD_PORTAL_REQUEST_RUNTIME_MARKER;
+const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_REQUEST_RUNTIME_MARKER;
 const TD_PORTAL_REQUEST_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-REQUEST-READY response=2";
 /// Printed by that same probe once every portal §H item 14 names unsupported
@@ -148,10 +147,8 @@ const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MA
 const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_ARMED_MARKER;
 const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MENU_MARKER;
 const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MARKER;
-const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str =
-    td_recipe::ladder::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
-const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str =
-    td_recipe::ladder::TD_TERM_CLIPBOARD_TARGET_PREFIX;
+const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
+const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_TARGET_PREFIX;
 const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str =
     td_recipe::ladder::TD_TERM_CLIPBOARD_SELECTION_MARKER;
 const TD_TERM_CLIPBOARD_MARKER: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_MARKER;
@@ -174,11 +171,9 @@ const TD_FIREFOX_FILE_CHOOSER_REFOCUS_ARMED_MARKER: &str =
 const TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_FOCUSED_MARKER;
 const TD_FIREFOX_FILE_CHOOSER_MARKER: &str = td_recipe::ladder::TD_FIREFOX_FILE_CHOOSER_MARKER;
-const TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX: &str =
-    "portal: TD-PORTAL-FILE-CHOOSER-PRESENTED ";
+const TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX: &str = "portal: TD-PORTAL-FILE-CHOOSER-PRESENTED ";
 #[cfg(test)]
-const TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER: &str =
-    "TD-PORTAL-FILE-CHOOSER-COMPLETED";
+const TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER: &str = "TD-PORTAL-FILE-CHOOSER-COMPLETED";
 const TD_APPLICATION_CURSOR_PREFIX: &str =
     "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
 const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::FIREFOX_INPUT_CMDLINE_TOKEN;
@@ -252,8 +247,7 @@ const SYSTEM_NET_UP_MARKER: &str = td_recipe::ladder::SYSTEM_NET_UP_MARKER;
 const SYSTEM_NET_RESOLVE_MARKER: &str = td_recipe::ladder::SYSTEM_NET_RESOLVE_MARKER;
 const SYSTEM_NET_REACH_MARKER: &str = td_recipe::ladder::SYSTEM_NET_REACH_MARKER;
 const GIT_HTTPS_RUNTIME_MARKER: &str = td_recipe::ladder::GIT_HTTPS_RUNTIME_MARKER;
-const FIREFOX_NETWORK_RUNTIME_MARKER: &str =
-    td_recipe::ladder::FIREFOX_NETWORK_RUNTIME_MARKER;
+const FIREFOX_NETWORK_RUNTIME_MARKER: &str = td_recipe::ladder::FIREFOX_NETWORK_RUNTIME_MARKER;
 const GIT_HTTPS_TEST_URL: &str = td_recipe::ladder::GIT_HTTPS_TEST_URL;
 const FIREFOX_NETWORK_TEST_URL: &str = td_recipe::ladder::FIREFOX_NETWORK_TEST_URL;
 
@@ -288,6 +282,24 @@ const MAX_QMP_LINE_BYTES: usize = 64 * 1024;
 const MAX_QMP_RESPONSE_LINES: usize = 32;
 const QMP_ABSOLUTE_EXTENT: u32 = 32_768;
 const QMP_OUTPUT_WIDTH: u32 = 1_280;
+const FIREFOX_AUDIO_RATE: u32 = 48_000;
+const FIREFOX_AUDIO_CHANNELS: u16 = 2;
+#[cfg(test)]
+const FIREFOX_AUDIO_HZ: f64 = 440.0;
+const FIREFOX_AUDIO_MIN_HZ: f64 = 435.0;
+const FIREFOX_AUDIO_MAX_HZ: f64 = 445.0;
+const FIREFOX_AUDIO_HZ_STEP: f64 = 0.25;
+const FIREFOX_AUDIO_MIN_ACTIVE_MS: u64 = 900;
+const FIREFOX_AUDIO_MAX_ACTIVE_MS: u64 = 1_100;
+const FIREFOX_AUDIO_ACTIVE_FLOOR: i32 = 256;
+const FIREFOX_AUDIO_MIN_PEAK: i32 = 1_000;
+const FIREFOX_AUDIO_MIN_AC_RMS: f64 = 1_000.0;
+const FIREFOX_AUDIO_MIN_CORRELATION: f64 = 0.9;
+const FIREFOX_AUDIO_CAPTURE_MARGIN_SECS: u64 = 2;
+/// At 48 kHz stereo S16, the physical-input boot's 2,355-second host timeout
+/// produces under 432 MiB. QEMU records leading/trailing silence too, so the
+/// disk ceiling covers that whole bound while verification streams it.
+const MAX_AUDIO_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
 const QMP_OUTPUT_HEIGHT: u32 = 800;
 const PORTAL_CLIENT_X: usize = 160;
 const PORTAL_CLIENT_Y: usize = 141;
@@ -347,6 +359,7 @@ enum EndReason {
     QemuExited(ExitStatus),
     TimedOut(u64),
     Flooded(u64),
+    AudioFlooded { bytes: u64, ceiling: u64 },
 }
 
 /// Outcome of a boot attempt.
@@ -465,6 +478,29 @@ struct BootResult {
     console: String,
     /// Wall-clock time from qemu spawn through the bounded final console drain.
     elapsed: Duration,
+    /// The first physical-input boot replaces the silent QEMU audio backend with
+    /// a bounded WAV capture. Keeping a failed parse here lets the more specific
+    /// browser/guest markers report first, rather than hiding them behind a
+    /// secondary missing-file error.
+    firefox_audio: FirefoxAudioCapture,
+}
+
+#[derive(Debug)]
+enum FirefoxAudioCapture {
+    NotRequested,
+    Verified(FirefoxAudioEvidence),
+    Invalid(String),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FirefoxAudioEvidence {
+    active_ms: u64,
+    peak: i32,
+    fitted_hz: f64,
+    left_ac_rms: f64,
+    right_ac_rms: f64,
+    left_correlation: f64,
+    right_correlation: f64,
 }
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
@@ -1329,6 +1365,32 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
                 "{description}; missing console evidence {marker:?}. Last serial output:\n{}",
                 tail(&result.console, 80)
             ));
+        }
+    }
+    match &result.firefox_audio {
+        FirefoxAudioCapture::Verified(audio) => {
+            println!(
+                "   [firefox-audio] {FIREFOX_AUDIO_RATE} Hz stereo, {} ms active, peak {}, fitted {:.2} Hz, AC RMS {:.1}/{:.1}, correlations {:.4}/{:.4}",
+                audio.active_ms,
+                audio.peak,
+                audio.fitted_hz,
+                audio.left_ac_rms,
+                audio.right_ac_rms,
+                audio.left_correlation,
+                audio.right_correlation
+            );
+        }
+        FirefoxAudioCapture::Invalid(error) => {
+            return Err(format!(
+                "Firefox completed its trusted WebAudio stimulus but the QEMU WAV oracle failed: \
+                 {error}. Last serial output:\n{}",
+                tail(&result.console, 80)
+            ));
+        }
+        FirefoxAudioCapture::NotRequested => {
+            return Err(
+                "the Firefox physical-input boot did not request its QEMU WAV capture".to_string(),
+            );
         }
     }
     Ok(())
@@ -3353,6 +3415,13 @@ fn boot(
     let _scratch = Scratch { dir: dir.clone() };
     let console_path = dir.join("console.log");
     let diag_path = dir.join("diag.log");
+    let firefox_audio_path =
+        (plan.audio && plan.physical_input).then(|| dir.join("firefox-audio.wav"));
+    let timeout = boot_timeout();
+    let firefox_audio_ceiling = firefox_audio_path
+        .as_ref()
+        .map(|_| firefox_audio_capture_ceiling(timeout))
+        .transpose()?;
     let diag =
         File::create(&diag_path).map_err(|e| format!("create {}: {e}", diag_path.display()))?;
     let diag_err = diag
@@ -3436,7 +3505,7 @@ fn boot(
         cmd.args(["-nic", "none"]);
     }
     if plan.audio {
-        attach_system_audio(&mut cmd);
+        attach_system_audio(&mut cmd, firefox_audio_path.as_deref());
     }
     // Optional raw disk: if=none defines the backing store and a separate
     // virtio-blk-pci device attaches it as /dev/vda.
@@ -3453,7 +3522,6 @@ fn boot(
         .spawn()
         .map_err(|e| format!("spawn {qemu}: {e}"))?;
 
-    let timeout = boot_timeout();
     let start = Instant::now();
     let marker_bytes = plan.target_marker.as_bytes();
     let mut console_file: Option<File> = None;
@@ -3522,6 +3590,20 @@ fn boot(
             end = EndReason::Flooded(on_disk);
             break;
         }
+        if let Some((path, ceiling)) = firefox_audio_path.as_deref().zip(firefox_audio_ceiling) {
+            let capture_bytes = fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if capture_bytes > ceiling {
+                let _ = child.kill();
+                let _ = child.wait();
+                end = EndReason::AudioFlooded {
+                    bytes: capture_bytes,
+                    ceiling,
+                };
+                break;
+            }
+        }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
@@ -3575,8 +3657,9 @@ fn boot(
         }
     }
 
+    let audio_flooded = matches!(&end, EndReason::AudioFlooded { .. });
     let reason = format_end_reason(end, evidence.target);
-    if final_flooded {
+    if final_flooded || audio_flooded {
         return Err(format!(
             "{reason}. Last serial output:\n{}",
             tail(&console, 80)
@@ -3588,20 +3671,465 @@ fn boot(
             tail(&console, 80)
         ));
     }
+    let firefox_audio = match firefox_audio_path.as_deref().zip(firefox_audio_ceiling) {
+        Some((path, ceiling)) => match verify_firefox_audio(path, ceiling) {
+            Ok(evidence) => FirefoxAudioCapture::Verified(evidence),
+            Err(error) => FirefoxAudioCapture::Invalid(error),
+        },
+        None => FirefoxAudioCapture::NotRequested,
+    };
     Ok(BootResult {
         evidence,
         exited_clean,
         reason,
         console,
         elapsed: start.elapsed(),
+        firefox_audio,
     })
 }
 
-fn attach_system_audio(command: &mut Command) {
-    command
-        .args(["-audiodev", "none,id=audio0"])
-        .args(["-device", "intel-hda"])
-        .args(["-device", "hda-output,audiodev=audio0"]);
+fn attach_system_audio(command: &mut Command, capture: Option<&Path>) {
+    let capturing = capture.is_some();
+    command.arg("-audiodev");
+    match capture {
+        Some(path) => {
+            command.arg(wav_audiodev_arg(path));
+        }
+        None => {
+            command.arg("none,id=audio0");
+        }
+    }
+    command.args(["-device", "intel-hda"]).args([
+        "-device",
+        if capturing {
+            // Linux initializes the emulated codec mixer independently of
+            // the PCM stream. The audio daemon deliberately owns no ALSA
+            // control node, so the deterministic capture bypasses QEMU's
+            // gain/mute emulation while retaining the HDA PCM transport.
+            "hda-output,audiodev=audio0,mixer=off"
+        } else {
+            "hda-output,audiodev=audio0"
+        },
+    ]);
+}
+
+fn wav_audiodev_arg(path: &Path) -> OsString {
+    let mut argument = OsString::from("wav,id=audio0,path=");
+    let mut escaped = Vec::with_capacity(path.as_os_str().as_bytes().len());
+    for byte in path.as_os_str().as_bytes() {
+        if *byte == b',' {
+            escaped.push(b',');
+        }
+        escaped.push(*byte);
+    }
+    argument.push(OsString::from_vec(escaped));
+    argument.push(",out.frequency=48000,out.channels=2,out.format=s16");
+    argument
+}
+
+fn wav_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    let field = bytes
+        .get(offset..offset.saturating_add(2))
+        .ok_or_else(|| "the QEMU WAV header is truncated".to_string())?;
+    let array: [u8; 2] = field
+        .try_into()
+        .map_err(|_| "the QEMU WAV u16 field is truncated".to_string())?;
+    Ok(u16::from_le_bytes(array))
+}
+
+fn wav_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let field = bytes
+        .get(offset..offset.saturating_add(4))
+        .ok_or_else(|| "the QEMU WAV header is truncated".to_string())?;
+    let array: [u8; 4] = field
+        .try_into()
+        .map_err(|_| "the QEMU WAV u32 field is truncated".to_string())?;
+    Ok(u32::from_le_bytes(array))
+}
+
+fn wav_sample(data: &[u8], frame: usize, channel: usize) -> Result<i16, String> {
+    let offset = frame
+        .checked_mul(usize::from(FIREFOX_AUDIO_CHANNELS).saturating_mul(2))
+        .and_then(|value| value.checked_add(channel.saturating_mul(2)))
+        .ok_or_else(|| "the QEMU WAV sample offset overflowed".to_string())?;
+    let sample = data
+        .get(offset..offset.saturating_add(2))
+        .ok_or_else(|| "the QEMU WAV sample data is truncated".to_string())?;
+    let array: [u8; 2] = sample
+        .try_into()
+        .map_err(|_| "the QEMU WAV sample is truncated".to_string())?;
+    Ok(i16::from_le_bytes(array))
+}
+
+fn phase_independent_tone_correlation(
+    data: &[u8],
+    frames: usize,
+    channel: usize,
+    hertz: f64,
+) -> Result<(f64, f64), String> {
+    let count = frames as f64;
+    if frames == 0 {
+        return Ok((0.0, 0.0));
+    }
+    let mut sum_sample = 0.0_f64;
+    let mut sum_sample_sq = 0.0_f64;
+    let mut sum_sine = 0.0_f64;
+    let mut sum_sine_sq = 0.0_f64;
+    let mut sum_cosine = 0.0_f64;
+    let mut sum_cosine_sq = 0.0_f64;
+    let mut sum_sample_sine = 0.0_f64;
+    let mut sum_sample_cosine = 0.0_f64;
+    for relative in 0..frames {
+        let sample = f64::from(wav_sample(data, relative, channel)?);
+        let angle = std::f64::consts::TAU * hertz * relative as f64 / f64::from(FIREFOX_AUDIO_RATE);
+        let sine = angle.sin();
+        let cosine = angle.cos();
+        sum_sample += sample;
+        sum_sample_sq += sample * sample;
+        sum_sine += sine;
+        sum_sine_sq += sine * sine;
+        sum_cosine += cosine;
+        sum_cosine_sq += cosine * cosine;
+        sum_sample_sine += sample * sine;
+        sum_sample_cosine += sample * cosine;
+    }
+    let sample_variance = sum_sample_sq - sum_sample * sum_sample / count;
+    let sine_variance = sum_sine_sq - sum_sine * sum_sine / count;
+    let cosine_variance = sum_cosine_sq - sum_cosine * sum_cosine / count;
+    if sample_variance <= 0.0 || sine_variance <= 0.0 || cosine_variance <= 0.0 {
+        return Ok((0.0, 0.0));
+    }
+    let sine_covariance = sum_sample_sine - sum_sample * sum_sine / count;
+    let cosine_covariance = sum_sample_cosine - sum_sample * sum_cosine / count;
+    let sine_correlation = sine_covariance / (sample_variance * sine_variance).sqrt();
+    let cosine_correlation = cosine_covariance / (sample_variance * cosine_variance).sqrt();
+    let correlation = (sine_correlation * sine_correlation
+        + cosine_correlation * cosine_correlation)
+        .sqrt()
+        .min(1.0);
+    Ok((correlation, (sample_variance / count).sqrt()))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FirefoxToneFit {
+    hertz: f64,
+    left_correlation: f64,
+    right_correlation: f64,
+    left_ac_rms: f64,
+    right_ac_rms: f64,
+}
+
+fn fit_firefox_tone(data: &[u8], frames: usize) -> Result<FirefoxToneFit, String> {
+    let steps =
+        ((FIREFOX_AUDIO_MAX_HZ - FIREFOX_AUDIO_MIN_HZ) / FIREFOX_AUDIO_HZ_STEP).round() as u32;
+    let mut best: Option<FirefoxToneFit> = None;
+    for step in 0..=steps {
+        let hertz = FIREFOX_AUDIO_MIN_HZ + f64::from(step) * FIREFOX_AUDIO_HZ_STEP;
+        let (left_correlation, left_ac_rms) =
+            phase_independent_tone_correlation(data, frames, 0, hertz)?;
+        let (right_correlation, right_ac_rms) =
+            phase_independent_tone_correlation(data, frames, 1, hertz)?;
+        let candidate = FirefoxToneFit {
+            hertz,
+            left_correlation,
+            right_correlation,
+            left_ac_rms,
+            right_ac_rms,
+        };
+        let candidate_score = left_correlation.min(right_correlation);
+        let best_score = best
+            .map(|fit| fit.left_correlation.min(fit.right_correlation))
+            .unwrap_or(-1.0);
+        if candidate_score > best_score {
+            best = Some(candidate);
+        }
+    }
+    best.ok_or_else(|| "the bounded Firefox tone fit had no candidates".to_string())
+}
+
+fn firefox_audio_capture_ceiling(timeout: Duration) -> Result<u64, String> {
+    let bytes_per_second = u64::from(FIREFOX_AUDIO_RATE)
+        .saturating_mul(u64::from(FIREFOX_AUDIO_CHANNELS))
+        .saturating_mul(2);
+    let required = timeout
+        .as_secs()
+        .saturating_add(FIREFOX_AUDIO_CAPTURE_MARGIN_SECS)
+        .saturating_mul(bytes_per_second)
+        .saturating_add(44);
+    if required > MAX_AUDIO_CAPTURE_BYTES {
+        return Err(format!(
+            "the selected {}-second QEMU boot timeout requires a {required}-byte WAV ceiling, \
+             over the absolute {MAX_AUDIO_CAPTURE_BYTES}-byte capture bound",
+            timeout.as_secs()
+        ));
+    }
+    Ok(required)
+}
+
+fn verify_firefox_audio(path: &Path, ceiling: u64) -> Result<FirefoxAudioEvidence, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() < 44 {
+        return Err(
+            "QEMU did not produce a regular WAV capture with a complete header".to_string(),
+        );
+    }
+    if metadata.len() > ceiling {
+        return Err(format!(
+            "QEMU WAV capture is {} bytes, over the {ceiling}-byte ceiling",
+            metadata.len()
+        ));
+    }
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut header = [0_u8; 44];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("read {} header: {error}", path.display()))?;
+    let data_len = validate_firefox_audio_header(&header, metadata.len())?;
+
+    // A timeout-sized capture is hundreds of MiB because QEMU writes silence
+    // for the whole boot. Scan it in one fixed buffer, then seek back and retain
+    // only the already-bounded active span for the correlation calculation.
+    let mut scratch = [0_u8; 64 * 1024];
+    let mut remaining = data_len;
+    let mut frame_base = 0_usize;
+    let mut scan = FirefoxAudioScan::default();
+    while remaining > 0 {
+        let take = remaining.min(scratch.len());
+        let window = scratch
+            .get_mut(..take)
+            .ok_or_else(|| "QEMU WAV scan window is out of bounds".to_string())?;
+        file.read_exact(window)
+            .map_err(|error| format!("read {} samples: {error}", path.display()))?;
+        for (relative, frame) in window.chunks_exact(4).enumerate() {
+            let left = i32::from(i16::from_le_bytes([
+                frame.first().copied().unwrap_or(0),
+                frame.get(1).copied().unwrap_or(0),
+            ]))
+            .abs();
+            let right = i32::from(i16::from_le_bytes([
+                frame.get(2).copied().unwrap_or(0),
+                frame.get(3).copied().unwrap_or(0),
+            ]))
+            .abs();
+            let frame_peak = left.max(right);
+            scan.observe(frame_base.saturating_add(relative), frame_peak);
+        }
+        remaining -= take;
+        frame_base = frame_base.saturating_add(take / 4);
+    }
+    let span = scan.finish()?;
+    let first = span.first;
+    let last = span.last;
+    let active_frames = last
+        .checked_sub(first)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| "QEMU WAV active-frame span overflowed".to_string())?;
+    let detail = span.detail();
+    validate_firefox_audio_shape(active_frames, span.peak)
+        .map_err(|error| format!("{error}; {detail}"))?;
+    let active_bytes = active_frames
+        .checked_mul(4)
+        .ok_or_else(|| "QEMU WAV active-byte span overflowed".to_string())?;
+    let active_offset = first
+        .checked_mul(4)
+        .and_then(|offset| offset.checked_add(44))
+        .ok_or_else(|| "QEMU WAV active offset overflowed".to_string())?;
+    let active_offset = u64::try_from(active_offset)
+        .map_err(|_| "QEMU WAV active offset does not fit the host file API".to_string())?;
+    file.seek(SeekFrom::Start(active_offset))
+        .map_err(|error| format!("seek {} active samples: {error}", path.display()))?;
+    let mut active = Vec::new();
+    active
+        .try_reserve_exact(active_bytes)
+        .map_err(|_| "could not reserve the bounded QEMU WAV active span".to_string())?;
+    active.resize(active_bytes, 0);
+    file.read_exact(&mut active)
+        .map_err(|error| format!("read {} active samples: {error}", path.display()))?;
+    verify_firefox_audio_active(&active, span.peak).map_err(|error| format!("{error}; {detail}"))
+}
+
+#[cfg(test)]
+fn verify_firefox_audio_bytes(bytes: &[u8]) -> Result<FirefoxAudioEvidence, String> {
+    let data_len = validate_firefox_audio_header(bytes, bytes.len() as u64)?;
+    let data = bytes
+        .get(44..)
+        .ok_or_else(|| "QEMU WAV capture has no sample data".to_string())?;
+    if data.len() != data_len {
+        return Err("QEMU WAV data length is inconsistent".to_string());
+    }
+    let span = firefox_audio_active_span(data)?;
+    let first = span.first;
+    let last = span.last;
+    let active_end = last
+        .checked_add(1)
+        .and_then(|frame| frame.checked_mul(4))
+        .ok_or_else(|| "QEMU WAV active end overflowed".to_string())?;
+    let active_start = first
+        .checked_mul(4)
+        .ok_or_else(|| "QEMU WAV active start overflowed".to_string())?;
+    let active = data
+        .get(active_start..active_end)
+        .ok_or_else(|| "QEMU WAV active span is truncated".to_string())?;
+    verify_firefox_audio_active(active, span.peak)
+        .map_err(|error| format!("{error}; {}", span.detail()))
+}
+
+fn validate_firefox_audio_header(bytes: &[u8], actual_file: u64) -> Result<usize, String> {
+    if bytes.get(..4) != Some(b"RIFF")
+        || bytes.get(8..12) != Some(b"WAVE")
+        || bytes.get(12..16) != Some(b"fmt ")
+        || bytes.get(36..40) != Some(b"data")
+    {
+        return Err("QEMU WAV capture does not have the canonical RIFF/PCM layout".to_string());
+    }
+    let declared_file = u64::from(wav_u32(bytes, 4)?).saturating_add(8);
+    if declared_file != actual_file
+        || wav_u32(bytes, 16)? != 16
+        || wav_u16(bytes, 20)? != 1
+        || wav_u16(bytes, 22)? != FIREFOX_AUDIO_CHANNELS
+        || wav_u32(bytes, 24)? != FIREFOX_AUDIO_RATE
+        || wav_u32(bytes, 28)? != FIREFOX_AUDIO_RATE.saturating_mul(4)
+        || wav_u16(bytes, 32)? != 4
+        || wav_u16(bytes, 34)? != 16
+    {
+        return Err("QEMU WAV capture is not exact 48 kHz stereo signed 16-bit PCM".to_string());
+    }
+    let data_len = usize::try_from(wav_u32(bytes, 40)?)
+        .map_err(|_| "QEMU WAV data length does not fit memory".to_string())?;
+    if (data_len as u64).saturating_add(44) != actual_file || !data_len.is_multiple_of(4) {
+        return Err("QEMU WAV data length is inconsistent or not frame-aligned".to_string());
+    }
+    Ok(data_len)
+}
+
+#[derive(Debug, Default)]
+struct FirefoxAudioScan {
+    first: Option<usize>,
+    last: Option<usize>,
+    peak: i32,
+    above_floor: usize,
+    quiet_after_active: usize,
+    longest_internal_quiet: usize,
+}
+
+impl FirefoxAudioScan {
+    fn observe(&mut self, frame: usize, frame_peak: i32) {
+        self.peak = self.peak.max(frame_peak);
+        if frame_peak >= FIREFOX_AUDIO_ACTIVE_FLOOR {
+            if self.first.is_none() {
+                self.first = Some(frame);
+            } else {
+                self.longest_internal_quiet =
+                    self.longest_internal_quiet.max(self.quiet_after_active);
+            }
+            self.last = Some(frame);
+            self.above_floor = self.above_floor.saturating_add(1);
+            self.quiet_after_active = 0;
+        } else if self.first.is_some() {
+            self.quiet_after_active = self.quiet_after_active.saturating_add(1);
+        }
+    }
+
+    fn finish(self) -> Result<FirefoxAudioSpan, String> {
+        let first = self
+            .first
+            .ok_or_else(|| "QEMU WAV capture is silent".to_string())?;
+        let last = self
+            .last
+            .ok_or_else(|| "QEMU WAV capture has no active tail".to_string())?;
+        Ok(FirefoxAudioSpan {
+            first,
+            last,
+            peak: self.peak,
+            above_floor: self.above_floor,
+            longest_internal_quiet: self.longest_internal_quiet,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct FirefoxAudioSpan {
+    first: usize,
+    last: usize,
+    peak: i32,
+    above_floor: usize,
+    longest_internal_quiet: usize,
+}
+
+impl FirefoxAudioSpan {
+    fn detail(&self) -> String {
+        format!(
+            "active frames span {}..={}; {} frames reached the {}-sample floor; longest internal quiet run was {} frames",
+            self.first,
+            self.last,
+            self.above_floor,
+            FIREFOX_AUDIO_ACTIVE_FLOOR,
+            self.longest_internal_quiet
+        )
+    }
+}
+
+#[cfg(test)]
+fn firefox_audio_active_span(data: &[u8]) -> Result<FirefoxAudioSpan, String> {
+    let frames = data.len() / 4;
+    let mut scan = FirefoxAudioScan::default();
+    for frame in 0..frames {
+        let left = i32::from(wav_sample(data, frame, 0)?).abs();
+        let right = i32::from(wav_sample(data, frame, 1)?).abs();
+        scan.observe(frame, left.max(right));
+    }
+    scan.finish()
+}
+
+fn validate_firefox_audio_shape(active_frames: usize, peak: i32) -> Result<u64, String> {
+    let active_ms = (active_frames as u64).saturating_mul(1_000) / u64::from(FIREFOX_AUDIO_RATE);
+    if !(FIREFOX_AUDIO_MIN_ACTIVE_MS..=FIREFOX_AUDIO_MAX_ACTIVE_MS).contains(&active_ms) {
+        return Err(format!(
+            "QEMU WAV active span is {active_ms} ms, outside \
+             {FIREFOX_AUDIO_MIN_ACTIVE_MS}..={FIREFOX_AUDIO_MAX_ACTIVE_MS} ms"
+        ));
+    }
+    if peak < FIREFOX_AUDIO_MIN_PEAK {
+        return Err(format!(
+            "QEMU WAV peak {peak} is below the {FIREFOX_AUDIO_MIN_PEAK}-sample floor"
+        ));
+    }
+    Ok(active_ms)
+}
+
+fn verify_firefox_audio_active(data: &[u8], peak: i32) -> Result<FirefoxAudioEvidence, String> {
+    if !data.len().is_multiple_of(4) {
+        return Err("QEMU WAV active span is not frame-aligned".to_string());
+    }
+    let active_frames = data.len() / 4;
+    let active_ms = validate_firefox_audio_shape(active_frames, peak)?;
+    let fit = fit_firefox_tone(data, active_frames)?;
+    if fit.left_ac_rms < FIREFOX_AUDIO_MIN_AC_RMS || fit.right_ac_rms < FIREFOX_AUDIO_MIN_AC_RMS {
+        return Err(format!(
+            "QEMU WAV per-channel AC RMS is {:.1}/{:.1}, below \
+             {FIREFOX_AUDIO_MIN_AC_RMS:.1}",
+            fit.left_ac_rms, fit.right_ac_rms
+        ));
+    }
+    if fit.left_correlation < FIREFOX_AUDIO_MIN_CORRELATION
+        || fit.right_correlation < FIREFOX_AUDIO_MIN_CORRELATION
+    {
+        return Err(format!(
+            "QEMU WAV best {FIREFOX_AUDIO_MIN_HZ:.0}..={FIREFOX_AUDIO_MAX_HZ:.0} Hz fit is \
+             {:.2} Hz with correlations {:.4}/{:.4}, below \
+             {FIREFOX_AUDIO_MIN_CORRELATION:.1}",
+            fit.hertz, fit.left_correlation, fit.right_correlation
+        ));
+    }
+    Ok(FirefoxAudioEvidence {
+        active_ms,
+        peak,
+        fitted_hz: fit.hertz,
+        left_ac_rms: fit.left_ac_rms,
+        right_ac_rms: fit.right_ac_rms,
+        left_correlation: fit.left_correlation,
+        right_correlation: fit.right_correlation,
+    })
 }
 
 fn validate_boot_plan_tokens(extra_append: &str) -> Result<(), String> {
@@ -3641,6 +4169,14 @@ fn format_end_reason(end: EndReason, target_seen: bool) -> String {
         EndReason::Flooded(bytes) => format!(
             "console+diagnostic output flooded past the {MAX_CONSOLE_BYTES}-byte on-disk ceiling \
              without reaching the marker ({bytes} bytes across console.log + diag.log); qemu was killed"
+        ),
+        EndReason::AudioFlooded { bytes, ceiling } if target_seen => format!(
+            "Firefox QEMU WAV capture exceeded its {ceiling}-byte timeout-derived ceiling after \
+             the marker ({bytes} bytes); qemu was killed"
+        ),
+        EndReason::AudioFlooded { bytes, ceiling } => format!(
+            "Firefox QEMU WAV capture exceeded its {ceiling}-byte timeout-derived ceiling without \
+             reaching the marker ({bytes} bytes); qemu was killed"
         ),
     }
 }
@@ -3693,9 +4229,7 @@ fn drain_console(
                     let prior_len = buf.len();
                     buf.extend_from_slice(slice);
                     drained += n;
-                    let scan_from = prior_len
-                        .saturating_sub(overlap)
-                        .saturating_sub(1);
+                    let scan_from = prior_len.saturating_sub(overlap).saturating_sub(1);
                     let scan = buf.get(scan_from..).unwrap_or(buf.as_slice());
                     latch_console_evidence_from(evidence, scan, marker, scan_from == 0);
                     if buf.len() > CAP {
@@ -4713,7 +5247,9 @@ fn qmp_absolute_pixel(pixel: u32, extent: u32) -> Result<u16, String> {
         .ok_or_else(|| "QMP absolute coordinate overflow".to_string())?
         .div_ceil(extent);
     if scaled >= QMP_ABSOLUTE_EXTENT {
-        return Err(format!("QMP absolute coordinate {scaled} is outside its extent"));
+        return Err(format!(
+            "QMP absolute coordinate {scaled} is outside its extent"
+        ));
     }
     u16::try_from(scaled).map_err(|_| "QMP absolute coordinate escaped u16".to_string())
 }
@@ -4854,8 +5390,7 @@ impl PhysicalInputController {
             qmp.key_chord_until(&["ctrl", "l"], deadline)?;
             self.phase = PhysicalInputPhase::FirefoxPasteArm;
         }
-        if self.phase == PhysicalInputPhase::FirefoxPasteArm
-            && evidence.td_firefox_clipboard_armed
+        if self.phase == PhysicalInputPhase::FirefoxPasteArm && evidence.td_firefox_clipboard_armed
         {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
             let qmp = self
@@ -5045,17 +5580,7 @@ impl Qmp {
             || keys.iter().any(|key| {
                 !matches!(
                     *key,
-                    "ctrl"
-                        | "shift"
-                        | "c"
-                        | "e"
-                        | "l"
-                        | "m"
-                        | "o"
-                        | "ret"
-                        | "v"
-                        | "w"
-                        | "x"
+                    "ctrl" | "shift" | "c" | "e" | "l" | "m" | "o" | "ret" | "v" | "w" | "x"
                 )
             })
         {
@@ -5505,7 +6030,7 @@ mod tests {
     #[test]
     fn system_audio_uses_one_explicit_silent_backend_and_hda_codec() {
         let mut command = Command::new("qemu-system-x86_64");
-        attach_system_audio(&mut command);
+        attach_system_audio(&mut command, None);
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -5521,6 +6046,191 @@ mod tests {
                 "hda-output,audiodev=audio0",
             ]
         );
+    }
+
+    #[test]
+    fn firefox_audio_uses_one_bounded_exact_wav_backend() {
+        let mut command = Command::new("qemu-system-x86_64");
+        attach_system_audio(&mut command, Some(Path::new("/tmp/td,audio.wav")));
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "-audiodev",
+                "wav,id=audio0,path=/tmp/td,,audio.wav,out.frequency=48000,out.channels=2,out.format=s16",
+                "-device",
+                "intel-hda",
+                "-device",
+                "hda-output,audiodev=audio0,mixer=off",
+            ]
+        );
+    }
+
+    fn synthetic_firefox_wave_signal(
+        hertz: f64,
+        active_ms: u64,
+        dc: f64,
+        amplitude: f64,
+    ) -> Vec<u8> {
+        let leading = 4_800_usize;
+        let active =
+            usize::try_from(u64::from(FIREFOX_AUDIO_RATE).saturating_mul(active_ms) / 1_000)
+                .unwrap();
+        let trailing = 9_600_usize;
+        let frames = leading + active + trailing;
+        let data_len = u32::try_from(frames.saturating_mul(4)).unwrap();
+        let mut wave = Vec::with_capacity(44 + data_len as usize);
+        wave.extend_from_slice(b"RIFF");
+        wave.extend_from_slice(&data_len.saturating_add(36).to_le_bytes());
+        wave.extend_from_slice(b"WAVEfmt ");
+        wave.extend_from_slice(&16_u32.to_le_bytes());
+        wave.extend_from_slice(&1_u16.to_le_bytes());
+        wave.extend_from_slice(&FIREFOX_AUDIO_CHANNELS.to_le_bytes());
+        wave.extend_from_slice(&FIREFOX_AUDIO_RATE.to_le_bytes());
+        wave.extend_from_slice(&FIREFOX_AUDIO_RATE.saturating_mul(4).to_le_bytes());
+        wave.extend_from_slice(&4_u16.to_le_bytes());
+        wave.extend_from_slice(&16_u16.to_le_bytes());
+        wave.extend_from_slice(b"data");
+        wave.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..frames {
+            let sample = if frame < leading || frame >= leading + active {
+                0_i16
+            } else {
+                let active_frame = frame - leading;
+                let angle = std::f64::consts::TAU * hertz * active_frame as f64
+                    / f64::from(FIREFOX_AUDIO_RATE)
+                    + 0.73;
+                (dc + angle.sin() * amplitude) as i16
+            };
+            wave.extend_from_slice(&sample.to_le_bytes());
+            wave.extend_from_slice(&sample.to_le_bytes());
+        }
+        wave
+    }
+
+    fn synthetic_firefox_wave(hertz: f64, active_ms: u64) -> Vec<u8> {
+        synthetic_firefox_wave_signal(hertz, active_ms, 0.0, 8_000.0)
+    }
+
+    fn synthetic_clock_stretched_firefox_wave(output_frames: usize) -> Vec<u8> {
+        let leading = 4_800_usize;
+        let trailing = 9_600_usize;
+        let frames = leading + output_frames + trailing;
+        let data_len = u32::try_from(frames.saturating_mul(4)).unwrap();
+        let mut wave = Vec::with_capacity(44 + data_len as usize);
+        wave.extend_from_slice(b"RIFF");
+        wave.extend_from_slice(&data_len.saturating_add(36).to_le_bytes());
+        wave.extend_from_slice(b"WAVEfmt ");
+        wave.extend_from_slice(&16_u32.to_le_bytes());
+        wave.extend_from_slice(&1_u16.to_le_bytes());
+        wave.extend_from_slice(&FIREFOX_AUDIO_CHANNELS.to_le_bytes());
+        wave.extend_from_slice(&FIREFOX_AUDIO_RATE.to_le_bytes());
+        wave.extend_from_slice(&FIREFOX_AUDIO_RATE.saturating_mul(4).to_le_bytes());
+        wave.extend_from_slice(&4_u16.to_le_bytes());
+        wave.extend_from_slice(&16_u16.to_le_bytes());
+        wave.extend_from_slice(b"data");
+        wave.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..frames {
+            let sample = if frame < leading || frame >= leading + output_frames {
+                0_i16
+            } else {
+                let output_frame = frame - leading;
+                let source_frame =
+                    output_frame as f64 * f64::from(FIREFOX_AUDIO_RATE) / output_frames as f64;
+                let angle = std::f64::consts::TAU * FIREFOX_AUDIO_HZ * source_frame
+                    / f64::from(FIREFOX_AUDIO_RATE)
+                    + 0.73;
+                (angle.sin() * 8_000.0) as i16
+            };
+            wave.extend_from_slice(&sample.to_le_bytes());
+            wave.extend_from_slice(&sample.to_le_bytes());
+        }
+        wave
+    }
+
+    #[test]
+    fn firefox_wave_oracle_accepts_only_the_expected_active_tone() {
+        let wave = synthetic_firefox_wave(440.0, 1_000);
+        let accepted = verify_firefox_audio_bytes(&wave).unwrap();
+        assert!((990..=1_000).contains(&accepted.active_ms));
+        assert!(accepted.peak > 7_900);
+        assert!(accepted.left_ac_rms > 5_000.0);
+        assert!(accepted.right_ac_rms > 5_000.0);
+        assert_eq!(accepted.fitted_hz, 440.0);
+        assert!(accepted.left_correlation > 0.999);
+        assert!(accepted.right_correlation > 0.999);
+
+        let stretched =
+            verify_firefox_audio_bytes(&synthetic_clock_stretched_firefox_wave(48_194)).unwrap();
+        assert!((438.0..=438.5).contains(&stretched.fitted_hz));
+        assert!(stretched.left_correlation > 0.99);
+        assert!(stretched.right_correlation > 0.99);
+
+        let seq = AtomicU64::new(2700);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let path = dir.join("firefox.wav");
+        fs::write(&path, &wave).unwrap();
+        let streamed = verify_firefox_audio(&path, MAX_AUDIO_CAPTURE_BYTES).unwrap();
+        assert_eq!(streamed.active_ms, accepted.active_ms);
+        assert_eq!(streamed.peak, accepted.peak);
+        assert_eq!(streamed.fitted_hz, accepted.fitted_hz);
+        assert_eq!(streamed.left_correlation, accepted.left_correlation);
+        assert_eq!(streamed.right_correlation, accepted.right_correlation);
+
+        let oversized = dir.join("oversized.wav");
+        File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_AUDIO_CAPTURE_BYTES + 1)
+            .unwrap();
+        assert!(verify_firefox_audio(&oversized, MAX_AUDIO_CAPTURE_BYTES)
+            .unwrap_err()
+            .contains("over the"));
+
+        assert!(
+            verify_firefox_audio(&path, u64::try_from(wave.len() - 1).unwrap())
+                .unwrap_err()
+                .contains("over the")
+        );
+
+        let tiny_tone = synthetic_firefox_wave_signal(440.0, 1_000, 2_000.0, 1.0);
+        fs::write(&path, tiny_tone).unwrap();
+        let tiny_error = verify_firefox_audio(&path, MAX_AUDIO_CAPTURE_BYTES).unwrap_err();
+        assert!(tiny_error.contains("AC RMS"));
+        assert!(tiny_error.contains("active frames span 4800..=52799"));
+        assert!(tiny_error.contains("frames reached the 256-sample floor"));
+        assert!(tiny_error.contains("longest internal quiet run was"));
+
+        let wrong_tone = verify_firefox_audio_bytes(&synthetic_firefox_wave(430.0, 1_000));
+        assert!(wrong_tone.unwrap_err().contains("correlations"));
+        let short = verify_firefox_audio_bytes(&synthetic_firefox_wave(440.0, 500));
+        assert!(short.unwrap_err().contains("active span"));
+        let mut silence = synthetic_firefox_wave(440.0, 1_000);
+        silence.get_mut(44..).unwrap().fill(0);
+        assert!(verify_firefox_audio_bytes(&silence)
+            .unwrap_err()
+            .contains("silent"));
+
+        let mut one_channel = synthetic_firefox_wave(440.0, 1_000);
+        for frame in one_channel.get_mut(44..).unwrap().chunks_exact_mut(4) {
+            frame.get_mut(2..4).unwrap().fill(0);
+        }
+        assert!(verify_firefox_audio_bytes(&one_channel)
+            .unwrap_err()
+            .contains("AC RMS"));
+
+        let mut malformed = synthetic_firefox_wave(440.0, 1_000);
+        malformed.get_mut(..4).unwrap().copy_from_slice(b"NOPE");
+        assert!(verify_firefox_audio_bytes(&malformed)
+            .unwrap_err()
+            .contains("canonical RIFF/PCM"));
+        fs::write(&path, malformed).unwrap();
+        assert!(verify_firefox_audio(&path, MAX_AUDIO_CAPTURE_BYTES)
+            .unwrap_err()
+            .contains("canonical RIFF/PCM"));
     }
 
     fn portal_test_ppm() -> Vec<u8> {
@@ -5682,7 +6392,10 @@ mod tests {
         let guard = Scratch {
             dir: created.clone(),
         };
-        assert_eq!(fs::metadata(&created).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         drop(guard);
         assert!(!created.exists());
 
@@ -5894,9 +6607,9 @@ mod tests {
             .contains("portal-file-chooser.ppm"));
         assert!(commands.get(34).unwrap().contains("\"data\":\"ret\""));
         let source = include_str!("qemu_boot.rs");
-        assert!(source.contains(
-            "qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;"
-        ));
+        assert!(
+            source.contains("qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;")
+        );
         assert!(source.contains(concat!(
             "let selection_deadline = qmp_deadline(QMP_IO_TIMEOUT)?;\n",
             "            qmp.file_chooser_select_until(selection_deadline)?;"
@@ -5943,9 +6656,7 @@ mod tests {
         let bar = include_str!("../../../../../td-compositor/src/bar.rs");
         assert!(bar.contains("pub const BAR_HEIGHT: usize = 24;"));
         let chooser = include_str!("../../../../../td-portal/src/file_chooser.rs");
-        assert!(chooser.contains(&format!(
-            "pub const WIDTH: usize = {PORTAL_CLIENT_WIDTH};"
-        )));
+        assert!(chooser.contains(&format!("pub const WIDTH: usize = {PORTAL_CLIENT_WIDTH};")));
         assert!(chooser.contains(&format!(
             "pub const HEIGHT: usize = {PORTAL_CLIENT_HEIGHT};"
         )));
@@ -6060,9 +6771,7 @@ mod tests {
         )));
         assert!(firefox.contains("DOWNLOAD_DIRECTORY: &str = \"/var/home/tester/Downloads\""));
         assert!(firefox.contains("DOWNLOAD_NAME: &str = \"td-firefox-download.txt\""));
-        assert!(firefox.contains(
-            "const expected = \"https://localhost:8443/download.txt\";"
-        ));
+        assert!(firefox.contains("const expected = \"https://localhost:8443/download.txt\";"));
         assert!(firefox.contains("DOWNLOAD_BYTES: &[u8] = b\"TD-FIREFOX-DOWNLOAD-V1\\n\""));
         assert!(firefox.contains("\"TD-FIREFOX-DOWNLOAD-OK bytes={}\""));
         assert_eq!(
@@ -6073,9 +6782,7 @@ mod tests {
             TD_FIREFOX_FILE_CHOOSER_MARKER,
             format!("TD-FIREFOX-FILE-CHOOSER-OK bytes={}", DOWNLOAD.len())
         );
-        assert!(firefox.contains(
-            "file:///home/td/Downloads/td-firefox-download.txt"
-        ));
+        assert!(firefox.contains("file:///home/td/Downloads/td-firefox-download.txt"));
         assert!(firefox.contains("document.contentType === \"text/plain\""));
         assert!(firefox.contains("document.body.textContent"));
         let portal = include_str!("../../../../../td-portal/src/main.rs");
@@ -6086,12 +6793,11 @@ mod tests {
         assert!(portal.contains(TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER));
         let system = include_str!("../../../recipes/system-x86-64.rs");
         assert!(system.contains(TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER));
-        assert!(system.contains(
-            "const FIREFOX_DOWNLOAD_FIXTURE: &str = \"TD-FIREFOX-DOWNLOAD-V1\";"
-        ));
-        assert!(system.contains(
-            "const FIREFOX_DOWNLOAD_SOURCE: &str = \"/var/home/tester/Downloads\";"
-        ));
+        assert!(
+            system.contains("const FIREFOX_DOWNLOAD_FIXTURE: &str = \"TD-FIREFOX-DOWNLOAD-V1\";")
+        );
+        assert!(system
+            .contains("const FIREFOX_DOWNLOAD_SOURCE: &str = \"/var/home/tester/Downloads\";"));
         assert!(system.contains("https://localhost:8443/content.html"));
         assert!(system.contains("<a id=td-download href=download.txt "));
         assert!(system.contains("download=td-firefox-download.txt>Download</a>"));
@@ -6202,8 +6908,7 @@ mod tests {
         // same deployment.
         let other_trust = RunTrust::generate().unwrap();
         let resigned = dir.join("incoming/resigned");
-        let resigned_id =
-            create_bootable_candidate(&deployment, &resigned, &other_trust).unwrap();
+        let resigned_id = create_bootable_candidate(&deployment, &resigned, &other_trust).unwrap();
         assert_eq!(
             resigned_id, candidate_id,
             "D3: re-signing under another key must not change the deployment id"
@@ -6263,7 +6968,11 @@ mod tests {
         // the line above.
         let mut tampered = staged.clone();
         tampered[0] ^= 1;
-        assert!(!td_engine::ed25519::verify(&trust.public, &tampered, &signature));
+        assert!(!td_engine::ed25519::verify(
+            &trust.public,
+            &tampered,
+            &signature
+        ));
         let stranger = RunTrust::generate().unwrap();
         assert!(
             !td_engine::ed25519::verify(&stranger.public, &staged, &signature),
@@ -6304,7 +7013,10 @@ mod tests {
         ] {
             // `--rootdir` copies a mode in verbatim, so an ambient umask would
             // otherwise decide what the fixture's trust root looks like.
-            let mode = fs::metadata(seed.join(relative)).unwrap().permissions().mode();
+            let mode = fs::metadata(seed.join(relative))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o644, "{relative} must be staged 0644");
         }
 
@@ -6318,8 +7030,8 @@ mod tests {
         // install something and print an id), and 0755 as `td-install` leaves
         // the real one.
         let idle = seed.join(td_recipe::ladder::DEPLOY_IDLE_CHANNEL);
-        let staged = fs::metadata(&idle)
-            .unwrap_or_else(|e| panic!("the idle channel must be staged: {e}"));
+        let staged =
+            fs::metadata(&idle).unwrap_or_else(|e| panic!("the idle channel must be staged: {e}"));
         assert!(staged.is_dir(), "the idle channel must be a directory");
         assert_eq!(
             fs::read_dir(&idle).unwrap().count(),
@@ -6378,7 +7090,11 @@ mod tests {
         const S_IFDIR: u32 = 0o040000;
         const S_IFREG: u32 = 0o100000;
         for (name, mode, _) in &members {
-            let expected = if name == "etc/td/deployment.pub" { S_IFREG } else { S_IFDIR };
+            let expected = if name == "etc/td/deployment.pub" {
+                S_IFREG
+            } else {
+                S_IFDIR
+            };
             assert_eq!(
                 mode & S_IFMT,
                 expected,
@@ -6405,9 +7121,9 @@ mod tests {
         assert_eq!(hex_line(&[0xde, 0xad, 0xbe, 0xef]), b"deadbeef\n".to_vec());
         let signature = hex_line(&[0u8; 64]);
         assert_eq!(signature.len(), 129, "64 bytes as hex plus the newline");
-        assert!(signature.iter().all(|b| b.is_ascii_lowercase()
-            || b.is_ascii_digit()
-            || *b == b'\n'));
+        assert!(signature
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'\n'));
     }
 
     /// The WIRING, which none of the other tests reach: that what
@@ -6439,8 +7155,14 @@ mod tests {
         let trust = RunTrust::generate().unwrap();
         let booted = provision_selector(&VerifiedSelector(store.clone()), &out, &trust).unwrap();
 
-        assert_ne!(booted, store, "the bootable path must not be the store output");
-        assert!(booted.starts_with(&out), "the copy belongs in the destination dir");
+        assert_ne!(
+            booted, store,
+            "the bootable path must not be the store output"
+        );
+        assert!(
+            booted.starts_with(&out),
+            "the copy belongs in the destination dir"
+        );
 
         // The store output is untouched, bytes and mode: the append widens the
         // COPY, and a chmod of the original would break the store's invariant.
@@ -6463,7 +7185,10 @@ mod tests {
 
         // And what boots really does carry this run's key.
         let bytes = fs::read(&booted).unwrap();
-        assert!(bytes.starts_with(BASE), "the base archive must still be first");
+        assert!(
+            bytes.starts_with(BASE),
+            "the base archive must still be first"
+        );
         let members = appendix_members(&bytes, BASE_LEN);
         let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(names, vec!["etc", "etc/td", "etc/td/deployment.pub"]);
@@ -6504,8 +7229,7 @@ mod tests {
                 let s = at + 6 + i * 8;
                 u32::from_str_radix(std::str::from_utf8(&bytes[s..s + 8]).unwrap(), 16).unwrap()
             };
-            let (mode, filesize, namesize) =
-                (field(1), field(6) as usize, field(11) as usize);
+            let (mode, filesize, namesize) = (field(1), field(6) as usize, field(11) as usize);
             let name =
                 String::from_utf8(bytes[at + 110..at + 110 + namesize - 1].to_vec()).unwrap();
             let data = (at + 110 + namesize).next_multiple_of(4);
@@ -6586,7 +7310,10 @@ mod tests {
 
         let private = seed.join(OPENSSH_ADMIN_PRIVATE_KEY_PATH);
         let authorized = seed.join(OPENSSH_ADMIN_AUTHORIZED_KEYS_PATH);
-        assert_eq!(fs::read_to_string(&private).unwrap(), OPENSSH_ADMIN_PRIVATE_KEY);
+        assert_eq!(
+            fs::read_to_string(&private).unwrap(),
+            OPENSSH_ADMIN_PRIVATE_KEY
+        );
         assert_eq!(
             fs::read_to_string(&authorized).unwrap(),
             OPENSSH_ADMIN_AUTHORIZATION
@@ -6620,14 +7347,16 @@ mod tests {
         fs::create_dir(&seed).unwrap();
         let td_test = seed.join("@var/lib/td-test");
         fs::create_dir_all(&td_test).unwrap();
-        fs::set_permissions(&seed.join("@var/lib"), fs::Permissions::from_mode(0o700))
-            .unwrap();
+        fs::set_permissions(&seed.join("@var/lib"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&td_test, fs::Permissions::from_mode(0o700)).unwrap();
 
         stage_td_jail_seccomp_probe(&seed, &source).unwrap();
         let target = seed.join(TD_JAIL_SECCOMP_PROBE_PATH);
         assert_eq!(fs::read(&target).unwrap(), b"target-probe");
-        assert_eq!(fs::metadata(target).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
         for directory in [seed.join("@var/lib"), td_test] {
             assert_eq!(
                 fs::metadata(directory).unwrap().permissions().mode() & 0o777,
@@ -6909,10 +7638,8 @@ mod tests {
         let mut evidence = ConsoleEvidence::default();
         latch_console_evidence(
             &mut evidence,
-            format!(
-                "\ntd-jail: probe printed {TD_JAIL_SECCOMP_PROBE_MARKER} before failing\n"
-            )
-            .as_bytes(),
+            format!("\ntd-jail: probe printed {TD_JAIL_SECCOMP_PROBE_MARKER} before failing\n")
+                .as_bytes(),
             b"target",
         );
         assert!(!evidence.td_jail_seccomp);
@@ -7141,8 +7868,7 @@ mod tests {
 
         latch_console_evidence(
             &mut evidence,
-            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER} failed\n")
-                .as_bytes(),
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER} failed\n").as_bytes(),
             b"target",
         );
         assert!(!evidence.td_firefox_clipboard_refocus_armed);
@@ -7155,8 +7881,7 @@ mod tests {
 
         latch_console_evidence(
             &mut evidence,
-            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER} failed\n")
-                .as_bytes(),
+            format!("\ntd-jail: {TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER} failed\n").as_bytes(),
             b"target",
         );
         assert!(!evidence.td_firefox_clipboard_window_armed);
@@ -7275,10 +8000,8 @@ mod tests {
 
         latch_console_evidence(
             &mut evidence,
-            format!(
-                "\n{TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}\r\n"
-            )
-            .as_bytes(),
+            format!("\n{TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}\r\n")
+                .as_bytes(),
             b"target",
         );
         assert!(evidence.td_profiler_attribution);
@@ -7291,9 +8014,7 @@ mod tests {
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
         let path = dir.join("console.log");
-        let line = format!(
-            "{TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}"
-        );
+        let line = format!("{TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}");
         let start = CHUNK - (line.len() - 1);
         let mut bytes = vec![b'x'; start];
         *bytes.last_mut().unwrap() = b'\n';
@@ -7396,6 +8117,26 @@ mod tests {
         assert_eq!(parse_timeout(Some("nope".into())), dflt); // unparsable → default
         assert_eq!(parse_timeout(Some("".into())), dflt); // empty → default
         assert_eq!(parse_timeout(None), dflt); // unset → default
+    }
+
+    #[test]
+    fn audio_capture_ceiling_covers_the_default_host_timeout() {
+        let bytes_per_second = u64::from(FIREFOX_AUDIO_RATE)
+            * u64::from(FIREFOX_AUDIO_CHANNELS)
+            * u64::try_from(size_of::<i16>()).unwrap();
+        let maximum_capture =
+            (DEFAULT_BOOT_TIMEOUT_SECS + FIREFOX_AUDIO_CAPTURE_MARGIN_SECS) * bytes_per_second + 44;
+        assert_eq!(
+            firefox_audio_capture_ceiling(Duration::from_secs(DEFAULT_BOOT_TIMEOUT_SECS)).unwrap(),
+            maximum_capture
+        );
+        let first_unsupported =
+            MAX_AUDIO_CAPTURE_BYTES / bytes_per_second - FIREFOX_AUDIO_CAPTURE_MARGIN_SECS + 1;
+        assert!(
+            firefox_audio_capture_ceiling(Duration::from_secs(first_unsupported))
+                .unwrap_err()
+                .contains("absolute")
+        );
     }
 
     #[test]
@@ -7719,6 +8460,24 @@ mod tests {
 
         let before = format_end_reason(EndReason::Flooded(42), false);
         let after = format_end_reason(EndReason::Flooded(42), true);
+        assert!(before.contains("without reaching the marker"));
+        assert!(after.contains("after the marker"));
+
+        let before = format_end_reason(
+            EndReason::AudioFlooded {
+                bytes: 43,
+                ceiling: 42,
+            },
+            false,
+        );
+        let after = format_end_reason(
+            EndReason::AudioFlooded {
+                bytes: 43,
+                ceiling: 42,
+            },
+            true,
+        );
+        assert!(before.contains("43 bytes"));
         assert!(before.contains("without reaching the marker"));
         assert!(after.contains("after the marker"));
     }

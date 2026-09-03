@@ -142,10 +142,39 @@ const input = document.getElementById("td-input");
 if (!input) {
   done("TD-FIREFOX-INPUT-ERROR:no-input");
 } else {
-  const state = { moves: 0, inputs: 0, wheels: 0, contexts: 0 };
+  const state = {
+    moves: 0, inputs: 0, wheels: 0, contexts: 0,
+    audio: { starts: 0, ended: 0, closed: 0, rate: 0, error: "" }
+  };
   window.__tdPhysicalInput = state;
   document.addEventListener("mousemove", () => state.moves++);
   input.addEventListener("input", () => state.inputs++);
+  input.addEventListener("keydown", event => {
+    const audio = state.audio;
+    if (!event.isTrusted || audio.starts !== 0) return;
+    audio.starts++;
+    try {
+      const context = new AudioContext({ sampleRate: 48000 });
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      audio.rate = context.sampleRate;
+      audio.context = context;
+      audio.oscillator = oscillator;
+      oscillator.frequency.value = 440;
+      gain.gain.value = 0.25;
+      oscillator.connect(gain).connect(context.destination);
+      oscillator.addEventListener("ended", () => {
+        audio.ended++;
+        context.close().then(() => audio.closed++).catch(error => {
+          audio.error = String(error).slice(0, 128);
+        });
+      }, { once: true });
+      oscillator.start();
+      oscillator.stop(context.currentTime + 1);
+    } catch (error) {
+      audio.error = String(error).slice(0, 128);
+    }
+  }, { capture: true });
   document.addEventListener("wheel", event => {
     if (event.deltaY > 0) state.wheels++;
   }, { passive: true });
@@ -177,17 +206,22 @@ const expires = Date.now() + 20000;
 const check = () => {
   const state = window.__tdPhysicalInput;
   const input = document.getElementById("td-input");
+  const audio = state && state.audio;
   const typed = input && input.value.length > 0 && input.value.length <= 4 &&
     Array.from(input.value).every(value => value === "x");
   const ok = state && input && state.moves > 0 && state.inputs > 0 &&
     state.wheels > 0 && state.contexts > 0 && typed &&
-    window.scrollY > 0;
+    window.scrollY > 0 && audio && audio.starts === 1 &&
+    audio.ended === 1 && audio.closed === 1 && audio.rate === 48000 &&
+    audio.error === "";
   if (!ok && Date.now() < expires) {
     setTimeout(check, 50);
     return;
   }
   const detail = state ? [state.moves, state.inputs, state.wheels,
-    state.contexts, input && input.value, window.scrollY].join(",") :
+    state.contexts, input && input.value, window.scrollY,
+    audio && audio.starts, audio && audio.ended, audio && audio.closed,
+    audio && audio.rate, audio && audio.error].join(",") :
     "no-state";
   done(ok ? "TD-FIREFOX-INPUT-CONTENT-OK" :
     "TD-FIREFOX-INPUT-ERROR:content:" + detail);
@@ -2313,9 +2347,24 @@ mod tests {
         for event in ["mousemove", "input", "wheel", "contextmenu"] {
             assert!(CONTENT_ARM_SCRIPT.contains(event));
         }
+        assert_eq!(CONTENT_ARM_SCRIPT.matches("new AudioContext").count(), 1);
+        assert_eq!(CONTENT_ARM_SCRIPT.matches("oscillator.start()").count(), 1);
+        assert_eq!(CONTENT_ARM_SCRIPT.matches("oscillator.stop(").count(), 1);
+        let trusted = CONTENT_ARM_SCRIPT.find("if (!event.isTrusted").unwrap();
+        let context = CONTENT_ARM_SCRIPT.find("new AudioContext({ sampleRate: 48000 })").unwrap();
+        let start = CONTENT_ARM_SCRIPT.find("oscillator.start()").unwrap();
+        let stop = CONTENT_ARM_SCRIPT
+            .find("oscillator.stop(context.currentTime + 1)")
+            .unwrap();
+        assert!(trusted < context && context < start && start < stop);
         assert!(CONTENT_MENU_SCRIPT.contains("input.value.length <= 4"));
         assert!(CONTENT_MENU_SCRIPT.contains("value => value === \"x\""));
         assert!(CONTENT_MENU_SCRIPT.contains("window.scrollY > 0"));
+        assert!(CONTENT_MENU_SCRIPT.contains("audio.starts === 1"));
+        assert!(CONTENT_MENU_SCRIPT.contains("audio.ended === 1"));
+        assert!(CONTENT_MENU_SCRIPT.contains("audio.closed === 1"));
+        assert!(CONTENT_MENU_SCRIPT.contains("audio.rate === 48000"));
+        assert!(CONTENT_MENU_SCRIPT.contains("audio.error === \"\""));
         assert!(CHROME_ARM_SCRIPT.contains("contentAreaContextMenu"));
         assert!(CHROME_ARM_SCRIPT.contains("popupshown"));
         assert!(CHROME_ARM_SCRIPT.contains("popuphidden"));

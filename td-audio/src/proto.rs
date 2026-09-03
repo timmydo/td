@@ -304,6 +304,9 @@ pub mod format {
     /// `PA_SAMPLE_S16LE`, which is the tagstruct codec's own constant — one
     /// definition, so the wire and the schemas cannot disagree about it.
     pub const SAMPLE_S16LE: u8 = crate::tag::SAMPLE_S16LE;
+    /// `PA_SAMPLE_FLOAT32LE`. Accepted at the client boundary and converted to
+    /// the fixed S16 mixer format without changing rate or channel count.
+    pub const SAMPLE_FLOAT32LE: u8 = crate::tag::SAMPLE_FLOAT32LE;
     /// `PA_CHANNEL_POSITION_FRONT_LEFT`.
     pub const FRONT_LEFT: u8 = 1;
     /// `PA_CHANNEL_POSITION_FRONT_RIGHT`: u8 = 2.
@@ -631,6 +634,7 @@ mod tests {
     #[test]
     fn the_captured_stream_spec_is_the_format_this_server_speaks() {
         assert_eq!(format::SAMPLE_S16LE, tag::SAMPLE_S16LE);
+        assert_eq!(format::SAMPLE_FLOAT32LE, tag::SAMPLE_FLOAT32LE);
         assert_eq!(format::FRONT_LEFT, 1);
         assert_eq!(format::FRONT_RIGHT, 2);
         // From the transcript: `sample_spec fmt=3 ch=2 rate=48000`, then

@@ -137,6 +137,8 @@ pub struct SampleSpec {
 
 /// `PA_SAMPLE_S16LE`, the one format td's sink runs at.
 pub const SAMPLE_S16LE: u8 = 3;
+/// `PA_SAMPLE_FLOAT32LE`, Firefox Web Audio's native Pulse stream format.
+pub const SAMPLE_FLOAT32LE: u8 = 5;
 
 /// One property: a key and its bytes. Values are NOT strings — a proplist may
 /// carry arbitrary data — so they stay bytes until something decides otherwise.

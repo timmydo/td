@@ -16,9 +16,9 @@
 use std::io;
 use std::os::fd::RawFd;
 
-/// The rate the device is fixed at (§K.5). Clients are resampled to it by the
-/// client library — cubeb resamples to whatever spec the sink honestly reports —
-/// so this is a decision about the hardware, not about the protocol.
+/// The rate the device is fixed at (§K.5). The protocol admits only this rate
+/// and channel count; its one Firefox float format is converted without
+/// resampling before this boundary.
 pub const RATE: u32 = 48000;
 /// Stereo.
 pub const CHANNELS: u32 = 2;
@@ -173,6 +173,8 @@ pub struct MemorySink {
     /// How many times the ring emptied while running.
     pub underruns: u32,
     gone: bool,
+    write_limit: Option<usize>,
+    delay_error: Option<i32>,
 }
 
 #[cfg(test)]
@@ -188,6 +190,8 @@ impl MemorySink {
             underran: false,
             underruns: 0,
             gone: false,
+            write_limit: None,
+            delay_error: None,
         }
     }
 
@@ -238,6 +242,16 @@ impl MemorySink {
     pub fn unplug(&mut self) {
         self.gone = true;
     }
+
+    /// Restrict one test device's accepted frames per transfer.
+    pub fn limit_writes_to(&mut self, frames: Option<usize>) {
+        self.write_limit = frames;
+    }
+
+    /// Make DELAY return one exact device error.
+    pub fn fail_delay_with(&mut self, error: Option<i32>) {
+        self.delay_error = error;
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +265,9 @@ impl AudioSink for MemorySink {
     }
 
     fn device_delay(&mut self) -> io::Result<u64> {
+        if let Some(error) = self.delay_error {
+            return Err(io::Error::from_raw_os_error(error));
+        }
         Ok(self.queued)
     }
 
@@ -278,7 +295,9 @@ impl AudioSink for MemorySink {
         let frame_bytes = self.spec.frame_bytes.max(1);
         let offered = pcm.len() / frame_bytes;
         let room = self.buffer_frames.saturating_sub(self.queued);
-        let accepted = offered.min(usize::try_from(room).unwrap_or(usize::MAX));
+        let accepted = offered
+            .min(usize::try_from(room).unwrap_or(usize::MAX))
+            .min(self.write_limit.unwrap_or(usize::MAX));
         let taken = accepted.saturating_mul(frame_bytes);
         self.played.extend_from_slice(pcm.get(..taken).unwrap_or(pcm));
         self.queued = self.queued.saturating_add(accepted as u64);

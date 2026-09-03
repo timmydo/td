@@ -122,6 +122,10 @@ struct Stream {
     /// nothing, which is the difference between pausing and muting: muting
     /// plays silence over the audio, pausing leaves the audio where it is.
     corked: bool,
+    /// Do not consume this stream until its queue reaches `prebuffer_frames`.
+    prebuffering: bool,
+    /// The bounded Pulse threshold selected for this stream.
+    prebuffer_frames: u64,
     /// `frames_mixed` as it stood when the stream's CURRENT run of contiguous
     /// output began.
     ///
@@ -245,6 +249,8 @@ impl Mixer {
             drain_mark: Some(0),
             out_end: 0,
             corked: false,
+            prebuffering: false,
+            prebuffer_frames: 0,
             segment_base: 0,
             underflows: 0,
             overflows: 0,
@@ -337,6 +343,14 @@ impl Mixer {
         Ok(())
     }
 
+    /// Select and arm or release this stream's prebuffer threshold.
+    pub fn set_prebuffer(&mut self, id: StreamId, frames: u64, armed: bool) -> io::Result<()> {
+        let stream = self.find_mut(id).ok_or_else(|| Self::missing(id))?;
+        stream.prebuffer_frames = frames.min(stream.limit_frames);
+        stream.prebuffering = armed && stream.prebuffer_frames > 0;
+        Ok(())
+    }
+
     pub fn set_volume(&mut self, id: StreamId, volume: u32) -> io::Result<()> {
         let stream = self.find_mut(id).ok_or_else(|| Self::missing(id))?;
         stream.volume = volume.min(VOLUME_MAX);
@@ -421,6 +435,13 @@ impl Mixer {
     pub fn pump<S: AudioSink>(&mut self, sink: &mut S) -> io::Result<Pumped> {
         let mut pumped = Pumped::default();
         if self.pending_at >= self.pending.len() {
+            // An empty or threshold-gated mixer has no output clock to advance.
+            // Writing a zero period here starts the PCM before the client has
+            // buffered audio and inserts a device-sized gap at every refill.
+            if !self.arm_ready_streams() {
+                self.device_delay = sink.device_delay().unwrap_or(0);
+                return Ok(pumped);
+            }
             let frames = usize::try_from(sink.period_frames()).unwrap_or(0);
             if frames > 0 {
                 self.mix(frames)?;
@@ -442,8 +463,52 @@ impl Mixer {
         Ok(pumped)
     }
 
+    /// Whether the event loop must poll or drive the device.
+    pub fn has_device_work(&self) -> bool {
+        if self.pending_at < self.pending.len() || self.device_delay > 0 {
+            return true;
+        }
+        let frame_bytes = self.spec.frame_bytes.max(1);
+        self.streams.iter().any(|stream| {
+            let queued = stream.queued_frames(frame_bytes);
+            !stream.corked
+                && queued > 0
+                && (!stream.prebuffering || queued >= stream.prebuffer_frames)
+        })
+    }
+
+    /// The PCM may start once its ring is full, or it has accepted the whole
+    /// final device period containing a shorter finite client tail.
+    pub fn ready_to_start(&self, buffer_frames: u64, period_frames: u64) -> bool {
+        self.device_delay > 0
+            && (self.device_delay.saturating_add(period_frames) > buffer_frames
+                || (!self.has_runnable_audio() && self.pending_frames() == 0))
+    }
+
     fn pending_frames(&self) -> u64 {
         ((self.pending.len().saturating_sub(self.pending_at)) / self.spec.frame_bytes.max(1)) as u64
+    }
+
+    /// Release threshold-complete streams and report whether real audio runs.
+    fn arm_ready_streams(&mut self) -> bool {
+        let frame_bytes = self.spec.frame_bytes.max(1);
+        for stream in &mut self.streams {
+            if stream.prebuffering
+                && stream.queued_frames(frame_bytes) >= stream.prebuffer_frames
+            {
+                stream.prebuffering = false;
+            }
+        }
+        self.has_runnable_audio()
+    }
+
+    fn has_runnable_audio(&self) -> bool {
+        let frame_bytes = self.spec.frame_bytes.max(1);
+        self.streams.iter().any(|stream| {
+            !stream.corked
+                && !stream.prebuffering
+                && stream.queued_frames(frame_bytes) > 0
+        })
     }
 
     /// Sum every stream into `pending`.
@@ -466,7 +531,7 @@ impl Mixer {
 
         let out_base = self.out_frames_mixed;
         for stream in &mut self.streams {
-            if stream.corked {
+            if stream.corked || stream.prebuffering {
                 // Paused: contributes nothing, and is not starving. Its
                 // `out_end` stays where it is, so resuming is a gap and the
                 // segment bookkeeping below treats it as one.
@@ -509,6 +574,7 @@ impl Mixer {
             if stream.queue.len() < frame_bytes {
                 // Its audio ends here, at this output position.
                 stream.drain_mark = Some(out_base.saturating_add(available as u64));
+                stream.prebuffering = stream.prebuffer_frames > 0;
             }
         }
 
@@ -570,6 +636,12 @@ impl Mixer {
     /// otherwise make this loop forever, and a daemon that hangs on shutdown is
     /// worse than one that reports it could not drain.
     pub fn drain_all<S: AudioSink>(&mut self, sink: &mut S, max_passes: u32) -> io::Result<u32> {
+        // Device shutdown is an implicit drain of every client. A negotiated
+        // prebuffer threshold must not strand a final short tail here any more
+        // than an explicit Pulse DRAIN may strand it.
+        for stream in &mut self.streams {
+            stream.prebuffering = false;
+        }
         for pass in 0..max_passes {
             let all_drained = self
                 .streams
@@ -591,8 +663,8 @@ impl Mixer {
                     // `poll` saying writable and the ring emptying before the
                     // write lands is an ordinary race on a busy machine, and
                     // treating it as fatal ends a shutdown that was working.
-                    let pumped = match self.pump(sink) {
-                        Ok(pumped) => pumped,
+                    match self.pump(sink) {
+                        Ok(_) => {}
                         Err(error) if is_underrun(&error) => {
                             self.recover(sink)?;
                             continue;
@@ -604,7 +676,9 @@ impl Mixer {
                     // boundary so it never starts itself. Without this the
                     // drain fills a stationary ring and spends every pass
                     // waiting for a device that was never told to play.
-                    if pumped.frames_written > 0 && !sink.is_running() {
+                    if !sink.is_running()
+                        && self.ready_to_start(sink.buffer_frames(), sink.period_frames())
+                    {
                         sink.start()?;
                     }
                 }
@@ -648,6 +722,96 @@ mod tests {
         let third = mixer.open(1000).unwrap();
         assert_ne!(third, first);
         assert_ne!(third, second);
+    }
+
+    /// No client audio means no synthetic output, and a stream does not enter
+    /// the device until its negotiated prebuffer threshold is complete.
+    #[test]
+    fn idle_output_is_suppressed_and_prebuffering_is_rearmed() {
+        let mut sink = MemorySink::new(Spec::fixed(), 16, 4);
+        let mut mixer = Mixer::new(Spec::fixed());
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+        assert_eq!(sink.frames_written(), 0);
+
+        let id = mixer.open(16).unwrap();
+        mixer.set_prebuffer(id, 4, true).unwrap();
+        mixer.write(id, &stereo(&[700, 700, 700])).unwrap();
+        assert!(!mixer.has_device_work(), "three frames cannot cross a four-frame gate");
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+
+        mixer.write(id, &stereo(&[700])).unwrap();
+        assert!(mixer.has_device_work());
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        assert!(sink.samples().get(..8).is_some_and(|samples| {
+            samples.iter().all(|sample| *sample == 700)
+        }));
+
+        mixer.write(id, &stereo(&[800, 800, 800])).unwrap();
+        assert_eq!(
+            mixer.pump(&mut sink).unwrap().frames_written,
+            0,
+            "emptying the first run must re-arm the threshold"
+        );
+        mixer.set_prebuffer(id, 4, false).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+    }
+
+    /// The start predicate fills every whole-period slot before releasing a
+    /// continuous stream, while still allowing a finite short tail to start.
+    #[test]
+    fn the_device_start_predicate_primes_its_ring() {
+        let mut sink = MemorySink::new(Spec::fixed(), 12, 4);
+        let mut mixer = Mixer::new(Spec::fixed());
+        let id = mixer.open(32).unwrap();
+        mixer.write(id, &stereo(&[500; 16])).unwrap();
+        mixer.pump(&mut sink).unwrap();
+        assert!(!mixer.ready_to_start(12, 4));
+        mixer.pump(&mut sink).unwrap();
+        assert!(!mixer.ready_to_start(12, 4));
+        mixer.pump(&mut sink).unwrap();
+        assert!(mixer.ready_to_start(12, 4));
+
+        let mut short_sink = MemorySink::new(Spec::fixed(), 12, 4);
+        let mut short_mixer = Mixer::new(Spec::fixed());
+        let short = short_mixer.open(8).unwrap();
+        short_mixer.write(short, &stereo(&[600, 600])).unwrap();
+        short_mixer.pump(&mut short_sink).unwrap();
+        assert!(short_mixer.ready_to_start(12, 4));
+
+        let mut limited_sink = MemorySink::new(Spec::fixed(), 12, 4);
+        limited_sink.limit_writes_to(Some(0));
+        let mut limited_mixer = Mixer::new(Spec::fixed());
+        let limited = limited_mixer.open(8).unwrap();
+        limited_mixer.write(limited, &stereo(&[900, 900])).unwrap();
+        assert_eq!(limited_mixer.pump(&mut limited_sink).unwrap().frames_written, 0);
+        assert!(!limited_mixer.ready_to_start(12, 4));
+        limited_sink.limit_writes_to(Some(1));
+        assert_eq!(limited_mixer.pump(&mut limited_sink).unwrap().frames_written, 1);
+        assert!(
+            !limited_mixer.ready_to_start(12, 4),
+            "a finite tail is not staged while a mixed frame remains unaccepted"
+        );
+        assert_eq!(limited_mixer.pump(&mut limited_sink).unwrap().frames_written, 1);
+        assert!(!limited_mixer.ready_to_start(12, 4));
+        assert_eq!(limited_mixer.pump(&mut limited_sink).unwrap().frames_written, 1);
+        assert!(!limited_mixer.ready_to_start(12, 4));
+        assert_eq!(limited_mixer.pump(&mut limited_sink).unwrap().frames_written, 1);
+        assert!(limited_mixer.ready_to_start(12, 4));
+    }
+
+    #[test]
+    fn an_idle_delay_error_clears_the_stale_device_clock() {
+        let mut sink = MemorySink::new(Spec::fixed(), 12, 4);
+        sink.write(&stereo(&[100, 100])).unwrap();
+        let mut mixer = Mixer::new(Spec::fixed());
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+        assert!(mixer.has_device_work(), "the first DELAY answer was retained");
+        sink.fail_delay_with(Some(77));
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+        assert!(
+            !mixer.has_device_work(),
+            "a failed idle DELAY must not retain a stale device backlog"
+        );
     }
 
     /// A corked stream keeps its audio instead of playing it out.
@@ -990,10 +1154,9 @@ mod tests {
         mixer.create(StreamId(1), 48000).unwrap();
         mixer.write(StreamId(1), &vec![0u8; 100 * 4]).unwrap();
         sink.start().unwrap();
-        for _ in 0..5 {
-            mixer.pump(&mut sink).unwrap();
-            sink.advance(240);
-        }
+        let first = mixer.pump(&mut sink).unwrap();
+        sink.advance(first.frames_written);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
         assert_eq!(
             mixer.underflows(StreamId(1)).unwrap(),
             0,
@@ -1012,10 +1175,9 @@ mod tests {
         );
         // Playing that out and letting it run dry again is not a second
         // underflow until the client writes again.
-        for _ in 0..3 {
-            mixer.pump(&mut sink).unwrap();
-            sink.advance(240);
-        }
+        let second = mixer.pump(&mut sink).unwrap();
+        sink.advance(second.frames_written);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
         assert_eq!(mixer.underflows(StreamId(1)).unwrap(), 1);
         mixer.write(StreamId(1), &[0u8; 10 * 4]).unwrap();
         assert_eq!(mixer.underflows(StreamId(1)).unwrap(), 2);
@@ -1116,6 +1278,48 @@ mod tests {
         let passes = mixer.drain_all(&mut sink, 100).unwrap();
         assert!(passes < 100, "drained in {passes} passes");
         assert!(mixer.is_drained(StreamId(1)).unwrap());
+    }
+
+    #[test]
+    fn drain_all_releases_prebuffer_and_primes_a_stopped_device() {
+        let spec = Spec::fixed();
+        let mut short_sink = MemorySink::new(spec, 12, 4);
+        let mut short_mixer = Mixer::new(spec);
+        let short = short_mixer.open(16).unwrap();
+        short_mixer.set_prebuffer(short, 8, true).unwrap();
+        short_mixer.write(short, &stereo(&[700, 700, 700])).unwrap();
+        assert_eq!(short_mixer.drain_all(&mut short_sink, 1).unwrap(), 1);
+        assert_eq!(short_sink.frames_written(), 4);
+        assert!(short_sink.is_running(), "the released finite tail starts");
+
+        let mut sink = MemorySink::new(spec, 12, 4);
+        let mut mixer = Mixer::new(spec);
+        let id = mixer.open(32).unwrap();
+        mixer.write(id, &stereo(&[500; 16])).unwrap();
+        assert_eq!(mixer.drain_all(&mut sink, 1).unwrap(), 1);
+        assert!(!sink.is_running(), "one period cannot start a continuous tail");
+        assert_eq!(mixer.drain_all(&mut sink, 1).unwrap(), 1);
+        assert!(!sink.is_running(), "two periods cannot start a three-period ring");
+        assert_eq!(mixer.drain_all(&mut sink, 1).unwrap(), 1);
+        assert!(sink.is_running(), "a fully primed ring starts during shutdown");
+    }
+
+    #[test]
+    fn drain_all_reprimes_after_recovery_before_starting() {
+        let spec = Spec::fixed();
+        let mut sink = MemorySink::new(spec, 12, 4);
+        sink.write(&stereo(&[1])).unwrap();
+        sink.start().unwrap();
+        sink.advance(2);
+
+        let mut mixer = Mixer::new(spec);
+        let id = mixer.open(32).unwrap();
+        mixer.write(id, &stereo(&[500; 16])).unwrap();
+        assert_eq!(mixer.drain_all(&mut sink, 2).unwrap(), 2);
+        assert!(
+            !sink.is_running(),
+            "the recovery pass plus one period cannot start the empty ring"
+        );
     }
 
     /// The bound is real: a device that never consumes does not hang the daemon.

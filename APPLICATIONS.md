@@ -253,7 +253,7 @@ CONFIG_SND_PCI=y  CONFIG_SND_HDA_INTEL=y  CONFIG_SND_HDA_GENERIC=y
 #   NOT CONFIG_SND_HDA: SND_HDA_INTEL selects it and it has no prompt of
 #   its own, so olddefconfig drops a line naming it and writing one would
 #   read as a pin without being one
-CONFIG_SND_ALOOP=y                 # in-guest loopback, the audio test oracle
+CONFIG_SND_ALOOP=y                 # explicit-only in-guest audio test oracle
 # CONFIG_SND_PCM_OSS stays OFF — present in 7.1.4, deliberately refused (§K.3)
 # resource caps (§P) — NOT deferred after all, see below:
 CONFIG_CGROUPS=y  CONFIG_MEMCG=y  CONFIG_CGROUP_PIDS=y
@@ -6707,12 +6707,28 @@ and image commits — showing:
     out — are invisible to this and are what §C's argued-row-by-row
     construction and td's kernel config are for;
 12. `kill -KILL` of stage 1 reaping the whole instance;
-13. **audio PLAYING**, not reported unavailable — this item said the
-    opposite until the §K reversal, and it is the last place the old
-    answer survived. Milestone 28 asks for sound out of Firefox and
-    rungs 25–26 build it, so a proof run that accepted "unavailable"
-    here would pass while contradicting the rung it is the acceptance
-    test for;
+13. **audio PLAYING — LANDED.** The physical-input boot's first trusted
+    Firefox key starts exactly one one-second, 440 Hz Web Audio oscillator at
+    quarter gain and records its exact 48 kHz context rate, completion and
+    closure before the input probe succeeds. That boot alone replaces the
+    host-silent QEMU backend with an exact 48 kHz stereo S16 WAV sink. That
+    proof-only codec disables QEMU's emulated gain/mute mixer because the
+    playback daemon deliberately owns no ALSA control node; the guest still
+    crosses the emulated HDA PCM transport. After clean VM exit finalises the
+    header, the host refuses a missing, nonregular, malformed or over-512-MiB
+    capture, derives the live ceiling from the selected timeout plus margin,
+    and refuses a timeout needing more than that absolute bound before launch.
+    It streams across the bounded boot-time silence, retains only the bounded
+    active span, requires 900–1100 ms, a meaningful peak and per-channel AC
+    energy, and independently correlates both channels above 0.9 with the best
+    sine in a narrow 435–445 Hz physical output band while allowing arbitrary
+    phase and leading/trailing silence. The bounded fit admits the emulated
+    HDA/WAV clock's measured 0.4% rate difference without admitting an
+    unrelated tone. The guest evidence alone could pass with a dead audio
+    transport and non-silence alone could pass on noise; requiring both ties
+    Firefox's trusted Web Audio action through cubeb, the jailed Pulse socket,
+    `td-audio`, ALSA, HDA and QEMU to the recorded waveform. Ordinary boots and
+    the interactive runner retain the host-silent backend;
 14. *unsupported* portals — `ScreenCast`, `RemoteDesktop`, `Camera`,
     `Secret` — reported unavailable rather than succeeding, which is the
     half of the old item 13 that is still right and is a real check: a
@@ -6766,8 +6782,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 24 | runtime compatibility sweep; the launcher table is read from the image | none |
 | 24a | **dedicated audio service identity — LANDED**: the immutable account table carries locked, non-login `audio` uid/gid 994, and the seat assignment receives both the distinct graphical and audio identities. It creates and reads back `/run/td-audio` as audio-owned mode 0755 while retaining `/run/user/1000` as tester-owned mode 0700. Sound-device ownership and the service-only `td-login` credential class wait for the first ALSA backend, because no daemon starts in this precursor and the current kernel intentionally creates no `/dev/snd` nodes | the privilege and socket-directory boundary exists before an adversarial audio parser does |
 | 25 | **`td-audio` crate + surface #13 — LANDED**: the direct ALSA PCM back end is driven by a deterministic tone fixture. The surface number was written as `#11` when the audio reversal reached this ladder; `#11` was already `td-profiler` then and `td-portal` has since taken `#12` | the hardware-facing PCM path and its headless signal oracle exist without a browser or jail |
-| 26 | **`td-audio` PulseAudio protocol and daemon — LANDED**: frames, tagstruct codec, the captured command table, session state machine and daemon serve `/run/td-audio/native`; `getsockopt(2)`/`SO_PEERCRED` joins surface #13. Permanent fixtures replay the captured schemas, mix two socket clients, and prove exact PCM through the session state machine. A one-time libpulse 16.1 run established compatibility; rung 26a selects the daemon into the image and the final Firefox-to-WAV proof remains rung 28 | captured Pulse traffic plays through the bounded daemon and mixer without making the one-time host libpulse run a permanent gate |
-| 26a | **system and jail audio integration — LANDED**: `td-login` has an exact service-only credential path for the locked audio account; `td-seatd` assigns only ALSA playback PCMs to it; and td-svc starts the daemon after seat setup, probes its live socket as that identity, and orders Firefox behind that result. Every daemon start repeats the bounded playback-node assignment before dropping privilege, so a device that appeared after the seat oneshot is covered. Firefox's compiled `sockets=pulseaudio` policy derives the exact server/config environment. td-jail validates the owned server runtime and endpoint, then bind-mounts the stable directory read-only behind the private `/run/flatpak/pulse/native` alias. Replacement of a stale socket after a supervised daemon restart is therefore visible to existing clients instead of leaving their jail pinned to the dead inode; a missing mandatory runtime or endpoint still refuses launch rather than silently dropping the grant. Normal-system and interactive QEMU plans attach one explicit HDA codec to a host-silent backend; the full WAV capture remains rung 28 evidence rather than a claim of this wiring increment | the system image can start Firefox against its mediated audio server without exposing ALSA devices to the browser |
+| 26 | **`td-audio` PulseAudio protocol and daemon — LANDED**: frames, tagstruct codec, the captured command table, session state machine and daemon serve `/run/td-audio/native`; `getsockopt(2)`/`SO_PEERCRED` joins surface #13. Permanent fixtures replay the captured schemas, mix two socket clients, and prove exact PCM through the session state machine. A one-time libpulse 16.1 run established compatibility; rung 26a selects the daemon into the image and rung 27h carries the Firefox-to-WAV proof | captured Pulse traffic plays through the bounded daemon and mixer without making the one-time host libpulse run a permanent gate |
+| 26a | **system and jail audio integration — LANDED**: `td-login` has an exact service-only credential path for the locked audio account; `td-seatd` assigns only ALSA playback PCMs to it; and td-svc starts the daemon after seat setup, probes its live socket as that identity, and orders Firefox behind that result. Every daemon start repeats the bounded playback-node assignment before dropping privilege, so a device that appeared after the seat oneshot is covered. Firefox's compiled `sockets=pulseaudio` policy derives the exact server/config environment. td-jail validates the owned server runtime and endpoint, then bind-mounts the stable directory read-only behind the private `/run/flatpak/pulse/native` alias. Replacement of a stale socket after a supervised daemon restart is therefore visible to existing clients instead of leaving their jail pinned to the dead inode; a missing mandatory runtime or endpoint still refuses launch rather than silently dropping the grant. Normal-system and interactive QEMU plans attach one explicit HDA codec to a host-silent backend; rung 27h changes only the deterministic physical-input boot to a bounded WAV capture | the system image can start Firefox against its mediated audio server without exposing ALSA devices to the browser |
 | 27 | **Firefox policy, first-window and deterministic offline-content image proof — LANDED**; browser-scale compositor admission bounds retained shm resources, copied surface bytes, output-relative commits, synchronized caches, callbacks and deferred releases without raising the 512-object ceiling. The initial proof selected a fresh volatile automation profile and fixed local document, then accepted only an app-id-matched buffer with the bounded exact background-pixel region after a comparison render attributed both colors in the successfully rendered output to that same surface, a process with Firefox's exact `-contentproc` argv token revalidated in the same cgroup, and a validated per-client high-water record. Rung 27a retains that authority and replaces the local-file transport with verified HTTPS. The profile uses Mozilla's test-only pre-onboarding bypass and is never selected on an ordinary boot. The broader §H workload remains the authority for later tuning | Firefox starts, creates its content-role process and paints deterministic content without manual inspection |
 | 27a | **Firefox HTTPS/NSS image proof — LANDED**; the source-built LibreSSL command supplies a guest-local TLS origin. The exact autotest boot brings up loopback without waiting for DHCP, then mints an ephemeral CA and localhost leaf under `/run`; td-jail's own exact boot-token gate admits only the complete root-owned mode-0444 CA and exact Firefox `Certificates.Install` policy pair, binds them into the immutable synthetic `/etc`, and Firefox imports that CA into its fresh test profile. The independently chain-verified origin serves the sentinel document, and the existing same-cgroup, resource and framebuffer attribution gates emit `TD-FIREFOX-HTTPS-CONTENT-READY` only after Firefox paints it. Ordinary boots have no fixture CA, policy, profile or origin. The all-interface LibreSSL test listener is supported only inside the pinned NIC-less or inbound-unreachable QEMU harness, never on a physical/attached autotest boot | Firefox's NSS and TLS path accepts a verified certificate and paints an HTTPS page without manual inspection |
 | 27b | **Firefox renderer and nested-sandbox image proof — LANDED**; only the volatile QEMU profile enables Firefox's loopback-only Marionette server and privileged system access. A bounded protocol client runs one fixed browser-context script, validates Firefox's own `Troubleshoot.snapshot()` Wayland, Software WebRender and fallback level-6 sandbox facts, then maps Firefox's namespace-PID role report back to revalidated members of its active cgroup. Every reported live role must show no-new-privileges, seccomp mode 2 and at least two stacked filters; content, socket and one RDD or typed media-utility role are mandatory while the separate GPU role is conditional on Firefox creating it under Software WebRender. The independent `TD-FIREFOX-SUPPORT-READY` line is mandatory boot evidence; ordinary launches expose no remote-control listener | Firefox's own renderer and inner process sandboxes are proved without manual `about:support` inspection |
@@ -6776,6 +6792,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input completion record now follows the download marker, so neither a synthetic DOM click nor a stale file can pass | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
 | 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content exposes a full-viewport focus control and a trusted physical click focuses the browser. A fresh bounded read-only probe validates that persistent click record and current focus, then the host sends physical `Control+O` to invoke Firefox's native Open File command without a DOM picker call or synthetic assignment. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter to select the file. Firefox must then load the exact granted `file:` URL as plain text with the fixture's exact contents before input completion. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
 | 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The deterministic system oracle remains NIC-less; public reachability is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
+| 27h | **Firefox Web Audio image proof — LANDED**; the deterministic physical-input boot uses its first trusted key to start and finish one exact one-second 440 Hz oscillator in Firefox. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, the built-in test loopback taking card 0 ahead of HDA, and then 48,000 correct tone frames stretched across 1,600 ms by about 28,000 frames of daemon-inserted silence. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep those client frames contiguous instead of starting HDA on an empty period. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 512 MiB bound and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, duration, peak and per-channel AC energy, then requires both channels to correlate above 0.9 with one shared frequency in the narrow 435–445 Hz physical-output band independent of phase. The fit tolerates the measured QEMU HDA/WAV clock rate without accepting an unrelated tone. The authoritative TCG run measured 1,004 ms, peak 8,192, a 438.25 Hz fit, per-channel AC RMS 5,780.9 and correlations 0.9719/0.9719 before completing every rollback/fallback boot. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a short tone and an off-band frequency, accept the bounded clock-stretch fixture, pin exact float conversion, accounting, prebuffer/start continuity and mixed HDA/loopback selection, and pin the exact QEMU argv including comma-safe capture paths. Other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
 | 28 | the §H proof run to green; `AGENTS.md` trust-zone section; **all three** `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
 
@@ -7067,6 +7084,21 @@ pickers see "no microphone" rather than a broken server), `SUBSCRIBE`,
 happen at all — without byte grants the client writes one buffer and
 stops forever.
 
+The negotiated prebuffer is equally load-bearing. An omitted threshold
+uses Pulse's `tlength + one frame - minreq` default, while an explicit
+threshold is capped there. `PREBUF` and `FLUSH` arm it; `TRIGGER` and
+`DRAIN` release it, including a drain issued while the stream is empty.
+Device shutdown releases every stream's gate before its bounded drain.
+The mixer neither advances its output clock nor writes a synthetic silent
+period while every stream is empty, corked or below that threshold. Once
+real audio is runnable, the daemon fills every whole-period slot in the
+prepared ALSA ring before `START`; a finite tail shorter than the ring may
+start once the device has accepted the entire tail. The same predicate
+applies after recovery and during shutdown. These are continuity rules,
+not latency polish: starting on the first client fragment makes HDA
+consume faster than cubeb refills and turns one second of valid samples
+into a longer waveform separated by device-sized zero runs.
+
 **Latency is not polish.** The reported figure must be the client frames
 already accepted, plus the mixer/conversion queue, plus resampler delay,
 plus the frames still in the kernel and device (`SNDRV_PCM_IOCTL_DELAY`),
@@ -7316,9 +7348,15 @@ Mixing: a single-stream v1 is defensible but a daily driver wants
 clock, conversion to one internal rate and format, saturating summation,
 fair wakeup and backpressure, per-stream volume, and inclusion in the
 latency and drain accounting. Fix the device at 48 kHz stereo `S16_LE`
-and mix internally at `f32`. Output volume and device selection are
-session policy, not portal permissions; the portal becomes relevant only
-for capture.
+and mix internally at `f32`. The pinned Firefox Web Audio path requests
+48 kHz stereo `FLOAT32_LE` even after reading that sink description, so
+the landed protocol boundary accepts exactly same-rate/stereo `S16_LE`
+and `FLOAT32_LE`, converts the latter sample-by-sample with saturation in
+one reusable wire-frame-bounded scratch per connection, accounts grants
+and indexes in the client's negotiated frame size, and refuses partial
+frames or any other rate/channel/format. Output volume
+and device selection are session policy, not portal permissions; the
+portal becomes relevant only for capture.
 
 **No microphone in v1**: empty source list, `CREATE_RECORD_STREAM`
 refused with a real Pulse error, `/dev/snd` never bound into a jail, and
@@ -7341,19 +7379,26 @@ vectors plus a malformed-packet corpus; an in-memory `AudioSink`
 replacing ALSA, asserting exact decoded PCM, drain timing, underflow and
 mixing; `CONFIG_SND_ALOOP` in the guest, playing to the loopback
 playback side and reading the capture side, which exercises the real
-ALSA UAPI without speakers; and QEMU's `-audiodev wav` backend on the
-host, playing a deterministic tone, terminating so the WAV header
-finalises, then asserting rate, duration, non-silence and correlation
-with the expected waveform. `CONFIG_SND_DUMMY` proves only that writes
+ALSA UAPI without speakers (the daemon requires an explicit card/device
+selection for this exact test PCM rather than making it the ordinary default);
+and QEMU's `-audiodev wav` backend on the
+host, playing a deterministic tone through HDA with only QEMU's emulated
+gain/mute mixer disabled, terminating so the WAV header
+finalises, then asserting rate, duration, non-silence and high correlation
+with a sine in the narrow expected physical-output band. The fourth level is
+now rung 27h's Firefox
+Web Audio proof; the loopback level remains lower-level ALSA coverage.
+`CONFIG_SND_DUMMY` proves only that writes
 were accepted and is an error-path tool, not the oracle.
 
 **Size: 10,000–20,000 production lines**, plus a comparable test and
 fixture corpus. The two passes estimated 5.5–8k and 17–28k; the gap is
 almost entirely whether the server converts and mixes or fixes one
 format and serves one stream. A Firefox-only prototype can sit at the
-bottom of that range because cubeb resamples to whatever spec the sink
-honestly reports — but it would be tuned to one client's trace and not a
-sound server. Budget the middle.
+bottom of that range by accepting cubeb's one native float shape and
+converting it to the fixed sink without a general resampler — but it
+would be tuned to one client's trace and not a sound server. Budget the
+middle.
 
 ---
 

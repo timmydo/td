@@ -28,6 +28,11 @@ use std::path::{Path, PathBuf};
 /// Where the kernel publishes the PCM table.
 pub const PROC_ASOUND_PCM: &str = "/proc/asound/pcm";
 
+/// The exact id/name pair emitted by the built-in `snd-aloop` test device.
+/// It remains explicitly selectable, but it must not become the default sink
+/// merely because kernel registration assigned it the lowest card number.
+const TEST_LOOPBACK_PCM: &str = "Loopback PCM";
+
 /// One playback-capable PCM, as `/proc/asound/pcm` describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Playback {
@@ -196,9 +201,11 @@ pub fn read(path: &Path) -> io::Result<Vec<Playback>> {
 
 /// The device this daemon will use when nobody named one.
 ///
-/// The lowest card, then the lowest device on it. Deliberately NOT "the first
-/// line", which would depend on the kernel's registration order, and
-/// deliberately not a guess when the list is empty.
+/// The lowest non-test card, then the lowest device on it. The image builds
+/// `snd-aloop` for an explicit in-guest oracle; selecting it by default would
+/// silently discard ordinary Firefox output instead of reaching HDA. An
+/// explicit card/device selection may still choose it. Deliberately not a
+/// guess when no ordinary playback PCM exists.
 pub fn select(devices: &[Playback], wanted: Option<(u32, u32)>) -> io::Result<&Playback> {
     if let Some((card, device)) = wanted {
         return devices
@@ -215,11 +222,17 @@ pub fn select(devices: &[Playback], wanted: Option<(u32, u32)>) -> io::Result<&P
     }
     devices
         .iter()
+        .filter(|playback| {
+            playback.id != TEST_LOOPBACK_PCM || playback.name != TEST_LOOPBACK_PCM
+        })
         .min_by_key(|p| (p.card, p.device))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{PROC_ASOUND_PCM} lists no playback device"),
+                format!(
+                    "{PROC_ASOUND_PCM} lists no non-test playback device; select the loopback \
+                     explicitly with --card and --device"
+                ),
             )
         })
 }
@@ -292,6 +305,30 @@ mod tests {
     }
 
     #[test]
+    fn qemu_hda_wins_over_the_lower_numbered_test_loopback() {
+        let devices = parse(
+            "00-00: Loopback PCM : Loopback PCM : playback 8 : capture 8\n\
+             00-01: Loopback PCM : Loopback PCM : playback 8 : capture 8\n\
+             01-00: Generic : Generic Analog : playback 1\n",
+        )
+        .unwrap();
+        let chosen = select(&devices, None).unwrap();
+        assert_eq!((chosen.card, chosen.device), (1, 0));
+        assert_eq!(chosen.name, "Generic Analog");
+
+        let explicit = select(&devices, Some((0, 0))).unwrap();
+        assert_eq!(explicit.name, TEST_LOOPBACK_PCM);
+    }
+
+    #[test]
+    fn a_test_loopback_only_machine_needs_an_explicit_selection() {
+        let devices = parse(ALOOP).unwrap();
+        let error = select(&devices, None).unwrap_err();
+        assert!(error.to_string().contains("no non-test playback device"));
+        assert_eq!(select(&devices, Some((0, 1))).unwrap().device, 1);
+    }
+
+    #[test]
     fn the_qemu_and_loopback_fixtures_parse() {
         let hda = parse(QEMU_HDA).unwrap();
         assert_eq!(hda.len(), 1);
@@ -305,7 +342,7 @@ mod tests {
     fn an_empty_table_refuses_rather_than_inventing_a_device() {
         assert!(parse("").unwrap().is_empty());
         let err = select(&[], None).unwrap_err();
-        assert!(err.to_string().contains("lists no playback device"));
+        assert!(err.to_string().contains("lists no non-test playback device"));
     }
 
     /// §K.4's rule, tested: an unparseable line is refused with the line in the
