@@ -38,6 +38,10 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -158,6 +162,7 @@ const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_BOOT_MARKER;
 const TD_FIREFOX_CONTENT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CONTENT_MARKER;
 const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MARKER;
 const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_ARMED_MARKER;
+const TD_FIREFOX_INPUT_FOCUSED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_FOCUSED_MARKER;
 const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MENU_MARKER;
 const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MARKER;
 const TD_FIREFOX_SOAK_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SOAK_MARKER;
@@ -449,6 +454,7 @@ struct ConsoleEvidence {
     td_firefox_content: bool,
     td_firefox_support: bool,
     td_firefox_input_armed: bool,
+    td_firefox_input_focused: bool,
     td_firefox_input_menu: bool,
     td_firefox_input: bool,
     td_firefox_soak: bool,
@@ -1204,7 +1210,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          non-shipped target probe exercised its errno and kill actions \
          ({TD_JAIL_SECCOMP_PROBE_MARKER}), and a SIGKILL of a live stage 1 reaped \
          that instance's PID 1 and a descendant it never spawned \
-         ({TD_JAIL_KILL_REAPS_MARKER}), then assigned the single-user \
+         ({TD_JAIL_KILL_REAPS_MARKER}) and the detached production watcher removed \
+         that instance's populated application cgroup, then assigned the single-user \
          graphical seat and brought \
          the software Wayland socket up on virtio-gpu ({TD_WAYLAND_RUNTIME_MARKER}), \
          read an absolute position and its span off the virtio tablet \
@@ -1213,10 +1220,13 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_TERM_RUNTIME_MARKER}), \
          launched Firefox through td-jail and painted its first matching XDG frame \
          ({TD_FIREFOX_BOOT_MARKER}), armed content and chrome input observers \
-         ({TD_FIREFOX_INPUT_ARMED_MARKER}), drove QMP-acknowledged tablet motion, keyboard \
-         input, wheel scrolling and a native context menu into the jailed browser \
-         ({TD_FIREFOX_INPUT_MENU_MARKER}), observed Firefox's bounded client-owned cursor \
-         ({TD_APPLICATION_CURSOR_PREFIX}), and dismissed the menu with an outside click \
+         ({TD_FIREFOX_INPUT_ARMED_MARKER}), drove one tablet position, waited for Firefox's \
+         compositor-observed cursor ({TD_APPLICATION_CURSOR_PREFIX}), drove a second position, \
+         and waited for Firefox to observe real motion plus document/input focus \
+         ({TD_FIREFOX_INPUT_FOCUSED_MARKER}) before physically clicking that input and driving \
+         keyboard input, wheel scrolling and \
+         a native context menu into the jailed browser \
+         ({TD_FIREFOX_INPUT_MENU_MARKER}), and dismissed the menu with an outside click \
          ({TD_FIREFOX_INPUT_MARKER}), waited for td-term's keyboard-focus acknowledgement \
          ({TD_TERM_CLIPBOARD_FOCUS_PREFIX}), then physically typed and visibly settled an exact \
          seven-byte terminal word ({TD_TERM_CLIPBOARD_TARGET_PREFIX}), selected its visibly \
@@ -1403,6 +1413,11 @@ fn validate_firefox_input(result: &BootResult, expect_audio_capture: bool) -> Re
             result.evidence.td_firefox_input_armed,
             TD_FIREFOX_INPUT_ARMED_MARKER,
             "Firefox did not arm its content and chrome listeners",
+        ),
+        (
+            result.evidence.td_firefox_input_focused,
+            TD_FIREFOX_INPUT_FOCUSED_MARKER,
+            "Firefox did not acknowledge pointer-established keyboard focus before typing",
         ),
         (
             result.evidence.td_firefox_input_menu,
@@ -2041,12 +2056,14 @@ fn validate_system_boot(
         return Err(format!(
             "td-jail's transition and filter proofs passed, but the §H item 12 marker \
              ({TD_JAIL_KILL_REAPS_MARKER:?}) was absent — killing stage 1 did not reap the \
-             whole instance. What the marker attests is on \
+             whole instance or the detached cleanup watcher did not remove its populated \
+             application cgroup. What the marker attests is on \
              `td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER`; what its ABSENCE means is one of \
-             these, and they are worth separating because only the first is the failure this \
-             item is about: the instance outlived stage 1, so a dead launcher leaves a jailed \
+             these: the instance outlived stage 1, so a dead launcher leaves a jailed \
              process running with no supervisor — either PID 1 did not exit, or it exited and \
-             the kernel did not tear the namespace down under it. Or the probe never got far \
+             the kernel did not tear the namespace down under it. Or both processes exited, \
+             but the production watcher did not observe the empty leaf and remove it. Or the \
+             probe never got far \
              enough to kill anything, which needs the same transition {TD_JAIL_TRANSITION_MARKER:?} \
              covers, and that marker passing above makes it unlikely. Or stage 1 exited on its \
              own before the SIGKILL landed, which the probe refuses rather than counts, because \
@@ -4861,6 +4878,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FIREFOX_CONTENT_MARKER),
         exact_line_window(TD_FIREFOX_SUPPORT_MARKER),
         exact_line_window(TD_FIREFOX_INPUT_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_INPUT_FOCUSED_MARKER),
         exact_line_window(TD_FIREFOX_INPUT_MENU_MARKER),
         exact_line_window(TD_FIREFOX_INPUT_MARKER),
         TD_TERM_CLIPBOARD_FOCUS_PREFIX.len().saturating_add(12),
@@ -5128,6 +5146,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_firefox_input_armed,
         buf,
         TD_FIREFOX_INPUT_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_input_focused,
+        buf,
+        TD_FIREFOX_INPUT_FOCUSED_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -5873,6 +5897,8 @@ fn qmp_arg(path: &Path) -> OsString {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhysicalInputPhase {
     Arm,
+    Cursor,
+    Focus,
     Menu,
     Final,
     TerminalPrepare,
@@ -5956,14 +5982,35 @@ impl PhysicalInputController {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
             let mut qmp = Qmp::connect_until(&self.path, deadline)?;
             qmp.move_absolute_until(24_576, 16_384, deadline)?;
-            // The first absolute position enters Firefox. A second in-window
-            // position is required for a real wl_pointer.motion rather than an
-            // enter event which merely carries the initial coordinates.
-            qmp.move_absolute_until(25_600, 16_384, deadline)?;
+            self.qmp = Some(qmp);
+            self.phase = PhysicalInputPhase::Cursor;
+        }
+        if self.phase == PhysicalInputPhase::Cursor && evidence.td_application_cursor {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before Firefox motion".to_string())?;
+            // The first absolute position enters Firefox. Wait for Firefox's
+            // compositor-observed cursor before moving inside that surface;
+            // back-to-back tablet reports may otherwise coalesce into enter.
+            qmp.move_absolute_until(26_112, 16_384, deadline)?;
+            self.phase = PhysicalInputPhase::Focus;
+        }
+        if self.phase == PhysicalInputPhase::Focus && evidence.td_firefox_input_focused {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            let qmp = self
+                .qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before Firefox typing".to_string())?;
+            // DOM focus alone does not prove the compositor's keyboard focus:
+            // the audit boot reproduced a key delivered outside Firefox while
+            // the following pointer frames still reached it. Click the already
+            // attested input point before crossing from tablet to PS/2 input.
+            qmp.button_until("left", deadline)?;
             qmp.key_x_until(deadline)?;
             qmp.button_until("wheel-down", deadline)?;
             qmp.button_until("right", deadline)?;
-            self.qmp = Some(qmp);
             self.phase = PhysicalInputPhase::Menu;
         }
         if self.phase == PhysicalInputPhase::Menu && evidence.td_firefox_input_menu {
@@ -7396,21 +7443,34 @@ mod tests {
 
     #[test]
     fn staged_qmp_input_waits_for_each_guest_acknowledgement() {
+        assert_eq!(qmp_absolute_pixel(960, QMP_OUTPUT_WIDTH).unwrap(), 24_576);
+        assert_eq!(qmp_absolute_pixel(1_020, QMP_OUTPUT_WIDTH).unwrap(), 26_112);
+        assert_eq!(qmp_absolute_pixel(400, QMP_OUTPUT_HEIGHT).unwrap(), 16_384);
+        let firefox_tile_x = 652;
+        let first_client_x = 960 - firefox_tile_x;
+        let second_client_x = 1_020 - firefox_tile_x;
+        assert_eq!(first_client_x, 308);
+        assert_eq!(second_client_x, 368);
+        assert!(!(360..=380).contains(&first_client_x));
+        assert!((360..=380).contains(&second_client_x));
         let seq = AtomicU64::new(8_200);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
         let path = dir.join("qmp.sock");
         let screenshot = dir.join("portal-file-chooser.ppm");
         let listener = UnixListener::bind(&path).unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let server_seen = Arc::clone(&seen);
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream.write_all(b"{\"QMP\":{\"version\":{}}}\r\n").unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut commands = Vec::new();
-            for _ in 0..37 {
+            for _ in 0..38 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 commands.push(line.trim_end().to_string());
+                server_seen.fetch_add(1, Ordering::SeqCst);
                 if line.contains("\"execute\":\"screendump\"") {
                     fs::write(&screenshot, portal_test_ppm()).unwrap();
                 }
@@ -7426,7 +7486,16 @@ mod tests {
         assert_eq!(controller.phase, PhysicalInputPhase::Arm);
         evidence.td_firefox_input_armed = true;
         controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::Cursor);
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        evidence.td_application_cursor = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::Focus);
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+        evidence.td_firefox_input_focused = true;
+        controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::Menu);
+        assert_eq!(seen.load(Ordering::SeqCst), 7);
         evidence.td_firefox_input_menu = true;
         evidence.td_term_clipboard_focus = Some(7);
         controller.progress(&mut evidence).unwrap();
@@ -7517,28 +7586,33 @@ mod tests {
         assert!(commands
             .get(2)
             .unwrap()
-            .contains("\"axis\":\"x\",\"value\":25600"));
-        assert!(commands.get(3).unwrap().contains("\"data\":\"x\""));
+            .contains("\"axis\":\"x\",\"value\":26112"));
         assert!(commands
-            .get(4)
+            .get(2)
+            .unwrap()
+            .contains("\"axis\":\"y\",\"value\":16384"));
+        assert!(commands.get(3).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(4).unwrap().contains("\"data\":\"x\""));
+        assert!(commands
+            .get(5)
             .unwrap()
             .contains("\"button\":\"wheel-down\""));
-        assert!(commands.get(5).unwrap().contains("\"button\":\"right\""));
+        assert!(commands.get(6).unwrap().contains("\"button\":\"right\""));
         assert!(commands
-            .get(6)
+            .get(7)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":8192"));
-        assert!(commands.get(7).unwrap().contains("\"button\":\"left\""));
-        assert!(commands.get(8).unwrap().contains("\"data\":\"l\""));
-        assert!(commands.get(9).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(9).unwrap().contains("\"data\":\"w\""));
+        assert!(commands.get(8).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(9).unwrap().contains("\"data\":\"l\""));
+        assert!(commands.get(10).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(10).unwrap().contains("\"data\":\"w\""));
         for (index, key) in [
-            (10, "e"),
-            (11, "l"),
-            (12, "c"),
-            (13, "o"),
-            (14, "m"),
-            (15, "e"),
+            (11, "e"),
+            (12, "l"),
+            (13, "c"),
+            (14, "o"),
+            (15, "m"),
+            (16, "e"),
         ] {
             assert!(commands
                 .get(index)
@@ -7546,29 +7620,29 @@ mod tests {
                 .contains(&format!("\"data\":\"{key}\"")));
         }
         assert!(commands
-            .get(16)
+            .get(17)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":1536"));
         assert!(commands
-            .get(17)
+            .get(18)
             .unwrap()
             .contains("\"down\":true,\"button\":\"left\""));
         assert!(commands
-            .get(18)
+            .get(19)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":2765"));
         assert!(commands
-            .get(19)
+            .get(20)
             .unwrap()
             .contains("\"down\":false,\"button\":\"left\""));
-        assert!(commands.get(20).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(20).unwrap().contains("\"data\":\"c\""));
+        assert!(commands.get(21).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(21).unwrap().contains("\"data\":\"c\""));
         assert!(commands
-            .get(21)
+            .get(22)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":24576"));
-        assert!(commands.get(22).unwrap().contains("\"button\":\"left\""));
-        for index in 23..=25 {
+        assert!(commands.get(23).unwrap().contains("\"button\":\"left\""));
+        for index in 24..=26 {
             assert_eq!(
                 commands.get(index).map(String::as_str),
                 Some(concat!(
@@ -7581,23 +7655,23 @@ mod tests {
                 ))
             );
         }
-        assert!(commands.get(26).unwrap().contains("\"data\":\"v\""));
-        assert!(commands.get(27).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(28).unwrap().contains("\"data\":\"v\""));
-        assert!(commands.get(29).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(30).unwrap().contains("\"data\":\"ret\""));
-        assert!(commands.get(31).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(27).unwrap().contains("\"data\":\"v\""));
+        assert!(commands.get(28).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(29).unwrap().contains("\"data\":\"v\""));
+        assert!(commands.get(30).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(31).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(32).unwrap().contains("\"data\":\"shift\""));
         assert!(commands
-            .get(32)
+            .get(33)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":24576"));
         assert!(commands
-            .get(32)
+            .get(33)
             .unwrap()
             .contains("\"axis\":\"y\",\"value\":16384"));
-        assert!(commands.get(33).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(34).unwrap().contains("\"button\":\"left\""));
         assert_eq!(
-            commands.get(34).map(String::as_str),
+            commands.get(35).map(String::as_str),
             Some(concat!(
                 r#"{"execute":"input-send-event","arguments":{"events":["#,
                 r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"ctrl"}}},"#,
@@ -7608,14 +7682,14 @@ mod tests {
             ))
         );
         assert!(commands
-            .get(35)
+            .get(36)
             .unwrap()
             .contains("\"execute\":\"screendump\""));
         assert!(commands
-            .get(35)
+            .get(36)
             .unwrap()
             .contains("portal-file-chooser.ppm"));
-        assert!(commands.get(36).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(37).unwrap().contains("\"data\":\"ret\""));
         let source = include_str!("qemu_boot.rs");
         assert!(
             source.contains("qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;")
@@ -7748,6 +7822,7 @@ mod tests {
         let firefox = include_str!("../../../../../td-jail/src/firefox.rs");
         for marker in [
             TD_FIREFOX_INPUT_ARMED_MARKER,
+            TD_FIREFOX_INPUT_FOCUSED_MARKER,
             TD_FIREFOX_INPUT_MENU_MARKER,
             TD_FIREFOX_INPUT_MARKER,
             TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER,
@@ -8497,7 +8572,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 76] {
+    fn all_console_markers() -> [&'static str; 77] {
         [
             MARKER,
             EROFS_MARKER,
@@ -8548,6 +8623,7 @@ mod tests {
             TD_FIREFOX_CONTENT_MARKER,
             TD_FIREFOX_SUPPORT_MARKER,
             TD_FIREFOX_INPUT_ARMED_MARKER,
+            TD_FIREFOX_INPUT_FOCUSED_MARKER,
             TD_FIREFOX_INPUT_MENU_MARKER,
             TD_FIREFOX_INPUT_MARKER,
             TD_TERM_CLIPBOARD_FOCUS_PREFIX,

@@ -164,6 +164,29 @@ pub(crate) fn require_current_membership(expected: &str) -> io::Result<()> {
     require_membership_text(&actual, expected)
 }
 
+pub(crate) fn require_process_membership(pid: u32, expected: &str) -> io::Result<()> {
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a cgroup membership probe requires a positive pid",
+        ));
+    }
+    validate_membership(expected)?;
+    let path = PathBuf::from(format!("/proc/{pid}/cgroup"));
+    let actual = read_bounded(&path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("read cgroup membership for process {pid}: {error}"),
+        )
+    })?;
+    require_membership_text(&actual, expected).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("process {pid} cgroup membership: {error}"),
+        )
+    })
+}
+
 pub(crate) fn validate_expected_membership(expected: &str) -> io::Result<()> {
     validate_membership(expected)
 }
@@ -171,6 +194,53 @@ pub(crate) fn validate_expected_membership(expected: &str) -> io::Result<()> {
 pub(crate) fn membership_for_instance(instance: &str) -> io::Result<String> {
     validate_instance_name(instance)?;
     Ok(format!("/{DELEGATE_COMPONENT}/{instance}"))
+}
+
+pub(crate) fn validate_instance_for_application(
+    instance: &str,
+    application: &str,
+) -> io::Result<()> {
+    validate_instance_name(instance)?;
+    authority::validate_application_name(application)?;
+    if !instance_belongs_to(instance, application) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("application cgroup instance {instance:?} does not belong to {application:?}"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn wait_until_removed(expected: &str, timeout: Duration) -> io::Result<()> {
+    validate_membership(expected)?;
+    let instance = expected
+        .strip_prefix(&format!("/{DELEGATE_COMPONENT}/"))
+        .ok_or_else(|| io::Error::other("validated cgroup membership lost its prefix"))?;
+    let directory = Path::new(CGROUP_ROOT).join(instance);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("cgroup removal deadline overflow"))?;
+    loop {
+        match fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "observe application cgroup removal {}: {error}",
+                        directory.display()
+                    ),
+                ));
+            }
+            Ok(_) if Instant::now() >= deadline => {
+                return Err(io::Error::other(format!(
+                    "application cgroup {} remained after its removal deadline",
+                    directory.display()
+                )));
+            }
+            Ok(_) => std::thread::sleep(CLEANUP_POLL),
+        }
+    }
 }
 
 pub(crate) fn remove_abandoned(expected: &str, uid: u32, gid: u32) -> io::Result<()> {
@@ -1048,6 +1118,9 @@ mod tests {
         validate_instance_name(instance).unwrap();
         assert!(instance_belongs_to(instance, "firefox"));
         assert!(!instance_belongs_to(instance, "fire"));
+        validate_instance_for_application(instance, "firefox").unwrap();
+        assert!(validate_instance_for_application(instance, "fire").is_err());
+        assert!(require_process_membership(0, "/td-user-1000/firefox-0123456789abcdef").is_err());
         let membership = format!("/{DELEGATE_COMPONENT}/{instance}");
         assert_eq!(membership_for_instance(instance).unwrap(), membership);
         validate_membership(&membership).unwrap();

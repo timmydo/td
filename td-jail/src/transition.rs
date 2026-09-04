@@ -16,6 +16,7 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 pub const PROBE_ARG: &str = "--probe-transition";
@@ -69,6 +70,7 @@ pub const KILL_REAPS_PROBE_ARG: &str = "--probe-kill-reaps";
 const KILL_REAPS_STAGE1_ARG: &str = "--internal-kill-reaps-stage-1";
 const KILL_HOLD_CHILD_ARG: &str = "--internal-kill-hold-child";
 const STAGE2_KILL_HOLD_ARG: &str = "--kill-hold";
+const KILL_REAPS_APPLICATION: &str = "td-jail-cleanup";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 pub const HOST_DEGRADATION_CGROUP: &str =
     "TD-JAIL-HOST-DEGRADATION aggregate-memory-task-and-cpu-caps=unenforced reason=no-delegated-cgroup";
@@ -115,6 +117,10 @@ const REAPER_POLL: Duration = Duration::from_millis(5);
 /// it waits for is a kernel one with no userspace polling in it, so a real
 /// pass takes milliseconds and only a real defect approaches this.
 const KILL_REAPS_TIMEOUT: Duration = Duration::from_secs(10);
+/// The cleanup watcher gets its own window after the processes have stopped.
+/// Its internal empty-leaf wait has the same ten-second ceiling; the extra
+/// margin covers the final directory removal and the driver's observation.
+const KILL_REAPS_CGROUP_TIMEOUT: Duration = Duration::from_secs(12);
 const KILL_REAPS_POLL: Duration = Duration::from_millis(10);
 /// The ceiling on every process that deliberately holds still for item 12.
 ///
@@ -137,6 +143,10 @@ const KILL_HOLD_CEILING: Duration = Duration::from_secs(120);
 /// and the holders then expire on their own rather than being left behind
 /// by a process that has already reported failure.
 const KILL_REAPS_CEILING: Duration = Duration::from_secs(60);
+/// Fresh outer ceiling after the driver finishes its pre-kill proof.
+/// The two sequential production waits total 22 seconds; one extra second
+/// keeps the watchdog outside their own deadline decisions.
+const KILL_REAPS_POST_CEILING: Duration = Duration::from_secs(23);
 const KILL_HOLD_POLL: Duration = Duration::from_millis(50);
 /// Ceiling on the one line the stage-1 role reports to the driver, and on the
 /// one the held stage 2 reports to it.
@@ -338,6 +348,7 @@ pub enum Mode {
     KillReapsProbe,
     KillReapsStage1 {
         expected_parent: u32,
+        instance: String,
     },
     KillHoldChild,
 }
@@ -376,7 +387,9 @@ pub enum Stage2Action {
     /// same empty `/etc` binding, same probe-only reaper-probe bind — because
     /// the thing under test is what stage 1's death does, not what stage 2
     /// was told to mount. The one difference is the terminal arm.
-    KillHold,
+    KillHold {
+        cgroup_membership: String,
+    },
     Launch(Box<Stage2Launch>),
 }
 
@@ -613,10 +626,19 @@ where
     }
     if mode == KILL_REAPS_STAGE1_ARG {
         let expected_parent = parse_positive_pid(args.next())?;
+        let instance = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
         if args.next().is_some() {
             return Err(usage_error());
         }
-        return Ok(Mode::KillReapsStage1 { expected_parent });
+        cgroup::validate_instance_for_application(&instance, KILL_REAPS_APPLICATION)?;
+        return Ok(Mode::KillReapsStage1 {
+            expected_parent,
+            instance,
+        });
     }
     if mode == KILL_HOLD_CHILD_ARG {
         if args.next().is_some() {
@@ -639,10 +661,18 @@ where
         return Ok(Stage2Action::Probe);
     }
     if action == STAGE2_KILL_HOLD_ARG {
+        let cgroup_membership = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
         if args.next().is_some() {
             return Err(usage_error());
         }
-        return Ok(Stage2Action::KillHold);
+        cgroup::validate_expected_membership(&cgroup_membership)?;
+        return Ok(Stage2Action::KillHold {
+            cgroup_membership,
+        });
     }
     if action == STAGE2_LAUNCH_ARG {
         let entry = args
@@ -993,7 +1023,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-kill-reaps, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-network, --probe-firefox-soak, --probe-firefox-seccomp-audit PID, --probe-firefox-download, or --probe-firefox-input arm|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-kill-reaps, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-network, --probe-firefox-soak, --probe-firefox-seccomp-audit PID, --probe-firefox-download, or --probe-firefox-input arm|focus|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
     )
 }
 
@@ -3862,8 +3892,8 @@ pub fn contain_application_session(expected_parent: u32) -> io::Result<()> {
     require_detached_session("application launcher", session, &after)
 }
 
-/// One live stage-1/stage-2 pair and the three handles stage 1 must keep to
-/// hold it that way.
+/// One live stage-1/stage-2 pair and the handles stage 1 must keep to hold it
+/// that way.
 struct ProbeInstance {
     child: Child,
     /// The proof pipe's write end (§C). Stage 2's liveness watcher reads the
@@ -3884,7 +3914,10 @@ struct ProbeInstance {
 /// Returns with the token already through the pipe, so stage 2 is released
 /// and running. The caller decides what to do with the write end, which is
 /// the only thing the two roles disagree about.
-fn start_probe_instance(stage2_action: &str) -> io::Result<ProbeInstance> {
+fn start_probe_instance(
+    stage2_action: &str,
+    application_cgroup: &ManagedCgroup,
+) -> io::Result<ProbeInstance> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
         return Err(io::Error::new(
@@ -3895,6 +3928,17 @@ fn start_probe_instance(stage2_action: &str) -> io::Result<ProbeInstance> {
     let before = NamespaceSnapshot::read()?;
     let token = random_token()?;
     let executable = std::env::current_exe()?;
+    let cleanup_descriptor = application_cgroup.keepalive_descriptor()?;
+    let stage2_cgroup = match stage2_action {
+        STAGE2_PROBE_ARG => None,
+        STAGE2_KILL_HOLD_ARG => Some(application_cgroup.membership()?.to_string()),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported probe stage-2 action",
+            ));
+        }
+    };
 
     sys::unshare_namespaces(true)?;
     install_identity_maps(identity, identity)?;
@@ -3902,7 +3946,7 @@ fn start_probe_instance(stage2_action: &str) -> io::Result<ProbeInstance> {
     sys::bring_up_loopback()
         .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
     let test_leak = install_test_leak_if_requested()?;
-    close_inherited_descriptors(None)?;
+    close_inherited_descriptors(cleanup_descriptor)?;
     if let Some(descriptor) = test_leak {
         require_descriptor_closed(descriptor)?;
     }
@@ -3912,23 +3956,37 @@ fn start_probe_instance(stage2_action: &str) -> io::Result<ProbeInstance> {
     let (proof_reader, mut proof_writer) = io::pipe()?;
     let (stage2_output, stage2_writer) = io::pipe()?;
     let stage2_error_writer = stage2_writer.try_clone()?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg(STAGE2_ARG)
         .arg(encode_token(&token))
         .arg(identity.uid.to_string())
         .arg(identity.gid.to_string())
         .arg(identity.uid.to_string())
         .arg(identity.gid.to_string())
-        .arg(stage2_action)
+        .arg(stage2_action);
+    if let Some(membership) = &stage2_cgroup {
+        command.arg(membership);
+    }
+    command
         .stdin(Stdio::from(proof_reader))
         .stdout(Stdio::from(stage2_writer))
-        .stderr(Stdio::from(stage2_error_writer))
-        .spawn()?;
+        .stderr(Stdio::from(stage2_error_writer));
+    let mut child = command.spawn()?;
+    drop(command);
 
     if let Err(error) = require_child_pid_namespace_changed(&before, child.id()) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
+    }
+    if let Err(error) = application_cgroup.attach(child.id()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("attach probe stage 2 to its application cgroup: {error}"),
+        ));
     }
 
     if let Err(error) = proof_writer.write_all(&token) {
@@ -3944,11 +4002,12 @@ fn start_probe_instance(stage2_action: &str) -> io::Result<ProbeInstance> {
 }
 
 pub fn probe_transition() -> io::Result<()> {
+    let application_cgroup = ManagedCgroup::disabled();
     let ProbeInstance {
         mut child,
         proof_writer,
         stage2_output,
-    } = start_probe_instance(STAGE2_PROBE_ARG)?;
+    } = start_probe_instance(STAGE2_PROBE_ARG, &application_cgroup)?;
     // This action's stage 2 runs to completion and is read to EOF, so the
     // proof pipe has done its whole job once the token is through. The
     // kill-reaps role is the one for which holding it open is the point.
@@ -3994,6 +4053,7 @@ struct KillReapsObservation {
     descendant: u32,
     descendant_namespace_pid: u32,
     waited: Duration,
+    cgroup_membership: String,
 }
 
 /// §H item 12: `kill -KILL` of stage 1 reaps the whole instance.
@@ -4014,19 +4074,11 @@ struct KillReapsObservation {
 /// "stage 2": the driver never spawned it, stage 2 did, inside the
 /// namespace.
 ///
-/// What this does NOT prove is §C's other sentence — that the independent
-/// cgroup watcher drains the leaf. This instance has no cgroup: the only
-/// shipped application is Firefox, whose leaf `--probe-resource-caps`
-/// already reads live, and creating a second `firefox-` leaf beside it would
-/// break the one-active-instance rule that probe depends on.
-///
-/// That half is UNPROVEN, not covered elsewhere, and an earlier version of
-/// this comment said otherwise. `remove_abandoned` has source-text pins on
-/// its ordering rather than a test that drains a populated leaf, and
-/// `--probe-resource-caps` reads a leaf while it is still populated, which
-/// is the opposite end of the lifecycle. Proving it needs a jailed instance
-/// with a cgroup that this probe is allowed to kill, which is what the
-/// single-application rule currently denies.
+/// The instance uses the production detached cleanup watcher and a dedicated
+/// `td-jail-cleanup-*` leaf. That avoids Firefox's one-active-instance rule
+/// while proving §C's other teardown sentence: both stage 2 and its child are
+/// observed in the leaf before the kill, and success waits for the watcher to
+/// remove that populated leaf after the keepalive dies with stage 1.
 pub fn probe_kill_reaps() -> io::Result<()> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
@@ -4035,11 +4087,14 @@ pub fn probe_kill_reaps() -> io::Result<()> {
             "the kill-reaps probe requires the nonzero application identity",
         ));
     }
-    start_probe_watchdog("the kill-reaps driver")?;
+    let watchdog = start_probe_watchdog("the kill-reaps driver")?;
     let executable = std::env::current_exe()?;
+    let instance = instance_name(KILL_REAPS_APPLICATION)?;
+    let membership = cgroup::membership_for_instance(&instance)?;
     let mut stage1 = Command::new(executable)
         .arg(KILL_REAPS_STAGE1_ARG)
         .arg(std::process::id().to_string())
+        .arg(&instance)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -4055,7 +4110,12 @@ pub fn probe_kill_reaps() -> io::Result<()> {
             "kill-reaps stage-1 stdout pipe was not created",
         ));
     };
-    let observed = observe_kill_reaps(&mut stage1, &mut reports);
+    let observed = observe_kill_reaps(
+        &mut stage1,
+        &mut reports,
+        &membership,
+        &watchdog,
+    );
     // For the paths that failed BEFORE the kill: the stage-1 role holds its
     // instance open on purpose, so an early return that left it running
     // would leak a held jail into the rest of the boot. `Child::kill` after
@@ -4064,14 +4124,16 @@ pub fn probe_kill_reaps() -> io::Result<()> {
     let _ = stage1.kill();
     let _ = stage1.wait();
     let observed = observed?;
+    drop(watchdog);
     writeln!(
         io::stdout(),
         "TD-JAIL-KILL-REAPS stage-1={} stage-2={} descendant={} \
-         descendant-namespace-pid={} waited-ms={}",
+         descendant-namespace-pid={} cgroup={} waited-ms={}",
         observed.stage1,
         observed.stage2,
         observed.descendant,
         observed.descendant_namespace_pid,
+        observed.cgroup_membership,
         observed.waited.as_millis()
     )?;
     writeln!(io::stdout(), "{KILL_REAPS_MARKER}")
@@ -4090,6 +4152,8 @@ pub fn probe_kill_reaps() -> io::Result<()> {
 fn observe_kill_reaps(
     stage1: &mut Child,
     reports: &mut impl Read,
+    cgroup_membership: &str,
+    watchdog: &ProbeWatchdog,
 ) -> io::Result<KillReapsObservation> {
     let report = read_report_line(reports, "the kill-reaps stage-1 role")?;
     let (stage2, namespace_pid) = parse_kill_reaps_report(&report)?;
@@ -4101,6 +4165,8 @@ fn observe_kill_reaps(
     let before_stage2 = require_live("stage 2", stage2)?;
     let before_descendant = require_live("the jailed descendant", descendant)?;
     require_instance_shape(stage2, descendant, before_stage2, before_descendant)?;
+    cgroup::require_process_membership(stage2, cgroup_membership)?;
+    cgroup::require_process_membership(descendant, cgroup_membership)?;
 
     // Read both witnesses again, as late as possible. An instance that
     // ended ITSELF between the reads above and the kill below would leave
@@ -4113,6 +4179,8 @@ fn observe_kill_reaps(
     let confirm_stage2 = require_live("stage 2", stage2)?;
     let confirm_descendant = require_live("the jailed descendant", descendant)?;
     require_instance_shape(stage2, descendant, confirm_stage2, confirm_descendant)?;
+    cgroup::require_process_membership(stage2, cgroup_membership)?;
+    cgroup::require_process_membership(descendant, cgroup_membership)?;
     if confirm_stage2.starttime != before_stage2.starttime
         || confirm_descendant.starttime != before_descendant.starttime
     {
@@ -4122,6 +4190,7 @@ fn observe_kill_reaps(
         ));
     }
 
+    watchdog.begin_teardown()?;
     let stage1_pid = stage1.id();
     // The one kill, and the reason this probe spawns stage 1 rather than
     // finding one: `Child::kill` is safe std and sends exactly SIGKILL.
@@ -4134,13 +4203,7 @@ fn observe_kill_reaps(
         let stage2_gone = is_gone(stage2, before_stage2.starttime)?;
         let descendant_gone = is_gone(descendant, before_descendant.starttime)?;
         if stage2_gone && descendant_gone {
-            return Ok(KillReapsObservation {
-                stage1: stage1_pid,
-                stage2,
-                descendant,
-                descendant_namespace_pid: before_descendant.namespace_pid,
-                waited: started.elapsed(),
-            });
+            break;
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
@@ -4153,6 +4216,15 @@ fn observe_kill_reaps(
         }
         std::thread::sleep(KILL_REAPS_POLL);
     }
+    cgroup::wait_until_removed(cgroup_membership, KILL_REAPS_CGROUP_TIMEOUT)?;
+    Ok(KillReapsObservation {
+        stage1: stage1_pid,
+        stage2,
+        descendant,
+        descendant_namespace_pid: before_descendant.namespace_pid,
+        waited: started.elapsed(),
+        cgroup_membership: cgroup_membership.to_string(),
+    })
 }
 
 /// What the two readings must say before killing stage 1 means anything.
@@ -4351,7 +4423,7 @@ fn read_report_line(reader: &mut impl Read, role: &str) -> io::Result<String> {
 /// every process in it, so stage 1's `/proc` is the jail's. The driver
 /// resolves the host pid itself, and this is the cross-check it resolves it
 /// against.
-pub fn run_kill_reaps_stage_1(expected_parent: u32) -> io::Result<()> {
+pub fn run_kill_reaps_stage_1(expected_parent: u32, instance: &str) -> io::Result<()> {
     // Before anything else, and this is not only tidiness. Stage 1 inherits
     // the driver's stderr, which under the boot leg is the pipe a `$(...)`
     // substitution is reading -- so a stage 1 that outlives the driver
@@ -4385,11 +4457,23 @@ pub fn run_kill_reaps_stage_1(expected_parent: u32) -> io::Result<()> {
              waiting for the instance this would build"
         )));
     }
+    cgroup::validate_instance_for_application(instance, KILL_REAPS_APPLICATION)?;
+    let identity = current_identity()?;
+    let executable = std::env::current_exe()?;
+    let limits = ResolvedResourceLimits::from_stage2(
+        crate::permissions::DEFAULT_MEMORY_HIGH_BYTES,
+        crate::permissions::DEFAULT_MEMORY_MAX_BYTES,
+        crate::permissions::DEFAULT_PIDS_MAX,
+        crate::permissions::DEFAULT_CPU_QUOTA_USEC,
+        crate::permissions::DEFAULT_CPU_PERIOD_USEC,
+    )?;
+    let application_cgroup =
+        ManagedCgroup::create(&executable, instance, limits, identity, false)?;
     let ProbeInstance {
         child,
         proof_writer,
         mut stage2_output,
-    } = start_probe_instance(STAGE2_KILL_HOLD_ARG)?;
+    } = start_probe_instance(STAGE2_KILL_HOLD_ARG, &application_cgroup)?;
     let stage2 = child.id();
     let hold = read_report_line(&mut stage2_output, "the held stage 2")?;
     let namespace_pid = parse_stage2_hold(&hold)?;
@@ -4410,11 +4494,11 @@ pub fn run_kill_reaps_stage_1(expected_parent: u32) -> io::Result<()> {
     writeln!(stdout, "{stage2} {namespace_pid}")?;
     stdout.flush()?;
     drop(stdout);
-    // Held to the end of the process, both on purpose: `proof_writer` is the
-    // pipe whose closing tears the instance down, and `child` is the stage 2
-    // this role must not reap. Dying is what releases them, which is the
-    // whole experiment.
-    let held = (child, proof_writer);
+    // Held to the end of the process on purpose: `proof_writer` is the pipe
+    // whose closing tears the instance down, `child` is the stage 2 this role
+    // must not reap, and `application_cgroup` owns the real cleanup keepalive.
+    // Dying is what releases them, which is the whole experiment.
+    let held = (child, proof_writer, application_cgroup);
     let outcome = hold_until_reaped("the kill-reaps stage-1 role");
     drop(held);
     outcome
@@ -4554,19 +4638,47 @@ pub fn run_kill_hold_child() -> io::Result<()> {
 /// role reds `clone(CLONE_THREAD...) = EINVAL`, surfacing through musl as
 /// EAGAIN, on every attempt. Stage 1 is bounded by this deadline reaching it
 /// through `PR_SET_PDEATHSIG` instead of by a watchdog of its own.
-fn start_probe_watchdog(role: &'static str) -> io::Result<()> {
+struct ProbeWatchdog {
+    begin: Sender<()>,
+}
+
+impl ProbeWatchdog {
+    fn begin_teardown(&self) -> io::Result<()> {
+        self.begin.send(()).map_err(|_| {
+            io::Error::other("the kill-reaps watchdog ended before teardown began")
+        })
+    }
+}
+
+fn start_probe_watchdog(role: &'static str) -> io::Result<ProbeWatchdog> {
+    let (begin, phases) = mpsc::channel();
     let watchdog = std::thread::Builder::new()
         .name("td-jail-kill-reaps-watchdog".to_string())
         .spawn(move || {
-            std::thread::sleep(KILL_REAPS_CEILING);
-            let _ = writeln!(
-                io::stderr(),
-                "{role} gave up after {KILL_REAPS_CEILING:?} without reaching a verdict"
-            );
-            std::process::exit(126);
+            match phases.recv_timeout(KILL_REAPS_CEILING) {
+                Ok(()) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "{role} gave up after {KILL_REAPS_CEILING:?} before teardown"
+                    );
+                    std::process::exit(126);
+                }
+            }
+            match phases.recv_timeout(KILL_REAPS_POST_CEILING) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "{role} gave up after {KILL_REAPS_POST_CEILING:?} during teardown"
+                    );
+                    std::process::exit(126);
+                }
+            }
         })?;
     drop(watchdog);
-    Ok(())
+    Ok(ProbeWatchdog { begin })
 }
 
 /// Block until something else ends this process.
@@ -4946,7 +5058,7 @@ pub fn run_stage2(
         pulse,
         firefox_seccomp_probe,
     ) = match &action {
-        Stage2Action::Probe | Stage2Action::KillHold => (
+        Stage2Action::Probe | Stage2Action::KillHold { .. } => (
             None,
             EtcBinding {
                 resolv_conf: false,
@@ -5013,7 +5125,10 @@ pub fn run_stage2(
             probe_pid1_lifecycle()?;
             writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
         }
-        Stage2Action::KillHold => run_stage2_kill_hold(),
+        Stage2Action::KillHold { cgroup_membership } => {
+            cgroup::require_current_membership(&cgroup_membership)?;
+            run_stage2_kill_hold()
+        }
         Stage2Action::Launch(launch) => {
             // Every field named, none elided. The mount-plan facts are
             // already spent above, but a `..` here would let the NEXT field
@@ -6723,18 +6838,20 @@ mod tests {
         }
     }
 
-    /// Stage 1 takes the driver's pid, and takes it as a POSITIVE pid.
+    /// Stage 1 takes the driver's positive pid and its dedicated cgroup.
     ///
     /// It is not decoration: stage 1 reads its parent back after arming
     /// `PR_SET_PDEATHSIG` and refuses to build an instance if the driver has
     /// already gone, because that signal is not retroactive. A role that
     /// accepted a missing or junk pid would skip that check.
     #[test]
-    fn the_kill_reaps_stage_1_role_takes_the_drivers_pid() {
+    fn the_kill_reaps_stage_1_role_takes_the_driver_and_exact_instance() {
+        let instance = "td-jail-cleanup-0123456789abcdef";
         assert_eq!(
-            parse_mode(args(&[KILL_REAPS_STAGE1_ARG, "4242"])).unwrap(),
+            parse_mode(args(&[KILL_REAPS_STAGE1_ARG, "4242", instance])).unwrap(),
             Mode::KillReapsStage1 {
-                expected_parent: 4242
+                expected_parent: 4242,
+                instance: instance.into(),
             }
         );
         for refused in [
@@ -6743,7 +6860,10 @@ mod tests {
             vec![KILL_REAPS_STAGE1_ARG, "-1"],
             vec![KILL_REAPS_STAGE1_ARG, "x"],
             vec![KILL_REAPS_STAGE1_ARG, ""],
-            vec![KILL_REAPS_STAGE1_ARG, "4242", "extra"],
+            vec![KILL_REAPS_STAGE1_ARG, "4242"],
+            vec![KILL_REAPS_STAGE1_ARG, "4242", "firefox-0123456789abcdef"],
+            vec![KILL_REAPS_STAGE1_ARG, "4242", "td-jail-cleanup-short"],
+            vec![KILL_REAPS_STAGE1_ARG, "4242", instance, "extra"],
         ] {
             assert!(
                 parse_mode(args(&refused)).is_err(),
@@ -6753,22 +6873,25 @@ mod tests {
     }
 
     #[test]
-    fn the_kill_hold_stage_2_action_takes_no_arguments() {
+    fn the_kill_hold_stage_2_action_takes_its_exact_cgroup() {
         let token = encode_token(&[7_u8; TOKEN_LEN]);
         let base = [STAGE2_ARG, token.as_str(), "1000", "1000", "1000", "1000"];
+        let membership = "/td-user-1000/td-jail-cleanup-0123456789abcdef";
         let with = |tail: &[&str]| {
             let mut all: Vec<&str> = base.to_vec();
             all.extend_from_slice(tail);
             parse_mode(args(&all))
         };
         assert!(matches!(
-            with(&[STAGE2_KILL_HOLD_ARG]).unwrap(),
+            with(&[STAGE2_KILL_HOLD_ARG, membership]).unwrap(),
             Mode::Stage2 {
-                action: Stage2Action::KillHold,
+                action: Stage2Action::KillHold { cgroup_membership },
                 ..
-            }
+            } if cgroup_membership == membership
         ));
-        assert!(with(&[STAGE2_KILL_HOLD_ARG, "extra"]).is_err());
+        assert!(with(&[STAGE2_KILL_HOLD_ARG]).is_err());
+        assert!(with(&[STAGE2_KILL_HOLD_ARG, "none"]).is_err());
+        assert!(with(&[STAGE2_KILL_HOLD_ARG, membership, "extra"]).is_err());
     }
 
     #[test]
@@ -6881,6 +7004,7 @@ mod tests {
         .is_err());
         for (name, stage) in [
             ("arm", firefox::InputStage::Arm),
+            ("focus", firefox::InputStage::Focus),
             ("menu", firefox::InputStage::Menu),
             ("final", firefox::InputStage::Final),
             (
@@ -7374,19 +7498,22 @@ mod tests {
     /// do with stage 1, and the probe would print its marker having proved
     /// nothing -- even with both liveness mechanisms broken.
     ///
-    /// The watchdogs are what stop it: no run reaches the kill later than
-    /// `KILL_REAPS_CEILING`, and the window is `KILL_REAPS_TIMEOUT` long.
-    /// That is only safe while the sum stays under the holders' ceiling,
-    /// which is a relationship between four constants that any one of them
-    /// could be edited out of.
+    /// The two-phase watchdog is what stops it: no run reaches the kill later
+    /// than `KILL_REAPS_CEILING`, and teardown then gets a fresh
+    /// `KILL_REAPS_POST_CEILING`. That is only safe while their sum stays
+    /// under the holders' ceiling.
     #[test]
     fn the_holders_outlive_every_window_the_driver_can_still_be_watching_in() {
         assert!(
-            KILL_REAPS_CEILING + KILL_REAPS_TIMEOUT < KILL_HOLD_CEILING,
+            KILL_REAPS_CEILING + KILL_REAPS_POST_CEILING < KILL_HOLD_CEILING,
             "a held role must not be able to end itself while the driver is still \
-             watching for it to go: the driver gives up at {KILL_REAPS_CEILING:?} and \
-             watches for {KILL_REAPS_TIMEOUT:?} after that, but the holders end at \
+             watching for it to go: the driver gives up at {KILL_REAPS_CEILING:?} before \
+             teardown and {KILL_REAPS_POST_CEILING:?} after it begins, but the holders end at \
              {KILL_HOLD_CEILING:?}"
+        );
+        assert!(
+            KILL_REAPS_TIMEOUT + KILL_REAPS_CGROUP_TIMEOUT < KILL_REAPS_POST_CEILING,
+            "the post-kill watchdog must outlast both sequential teardown waits"
         );
     }
 

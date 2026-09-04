@@ -39,6 +39,18 @@ amend the corresponding document in the same landing.
 td has two bootstrap graphs. Do not confuse the host control plane with the
 target distribution artifact graph.
 
+## Trust zones
+
+td has three trust zones. Zone one is the source-bootstrapped target artifact
+graph. Zone two is the host control plane that evaluates and builds that graph
+but never enters it. Zone three is each marked foreign prebuilt application
+payload. A zone-three payload may live in `/td/store` and ship in the image,
+but it is never a tool, compilation input, or execution input to a
+source-built output. Only the explicit read-only `payload_inputs` channel may
+carry it into image composition or runtime association; td runs it only
+through the application confinement path described below and in
+`APPLICATIONS.md`.
+
 ## Control plane
 
 The host supplies a pinned Rust toolchain to compile host-seeded instances of

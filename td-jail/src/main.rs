@@ -85,8 +85,11 @@ fn run() -> std::io::Result<()> {
         transition::Mode::SurvivorChild => transition::run_survivor_child(),
         transition::Mode::SurvivorOrphan => transition::run_survivor_orphan(),
         transition::Mode::KillReapsProbe => transition::probe_kill_reaps(),
-        transition::Mode::KillReapsStage1 { expected_parent } => {
-            transition::run_kill_reaps_stage_1(expected_parent)
+        transition::Mode::KillReapsStage1 {
+            expected_parent,
+            instance,
+        } => {
+            transition::run_kill_reaps_stage_1(expected_parent, &instance)
         }
         transition::Mode::KillHoldChild => transition::run_kill_hold_child(),
     }
@@ -636,6 +639,75 @@ mod confinement {
             abandoned.find("fs::symlink_metadata(&directory)")
                 < abandoned.find("require_delegation(root, uid, gid)?")
         );
+
+        // The target-kernel lifecycle proof uses this exact production
+        // protocol, not a second cleanup implementation. Stage 1 creates
+        // the managed leaf before the namespace transition; the shared
+        // transition preserves the watcher, attaches stage 2 before its
+        // release token, and stage 2 checks its own membership. The driver
+        // checks both live processes twice, kills only stage 1, and then
+        // waits for the watcher to remove the leaf.
+        let kill_stage1 = TRANSITION
+            .split_once("pub fn run_kill_reaps_stage_1")
+            .unwrap()
+            .1
+            .split_once("fn parse_stage2_hold")
+            .unwrap()
+            .0;
+        assert!(
+            kill_stage1.find("ManagedCgroup::create(").unwrap()
+                < kill_stage1.find("start_probe_instance(").unwrap()
+        );
+        assert!(kill_stage1.contains(
+            "ManagedCgroup::create(&executable, instance, limits, identity, false)?"
+        ));
+        let shared_transition = TRANSITION
+            .split_once("fn start_probe_instance(")
+            .unwrap()
+            .1
+            .split_once("pub fn probe_transition")
+            .unwrap()
+            .0;
+        assert!(
+            shared_transition
+                .find("application_cgroup.keepalive_descriptor()?")
+                .unwrap()
+                < shared_transition
+                    .find("close_inherited_descriptors(cleanup_descriptor)?")
+                    .unwrap()
+        );
+        assert!(
+            shared_transition
+                .find("application_cgroup.attach(child.id())")
+                .unwrap()
+                < shared_transition.find("proof_writer.write_all(&token)").unwrap()
+        );
+        assert!(TRANSITION.contains(
+            "Stage2Action::KillHold { cgroup_membership } => {\n            \
+             cgroup::require_current_membership(&cgroup_membership)?;"
+        ));
+        let observe = TRANSITION
+            .split_once("fn observe_kill_reaps(")
+            .unwrap()
+            .1
+            .split_once("fn require_instance_shape")
+            .unwrap()
+            .0;
+        assert_eq!(
+            observe
+                .matches("cgroup::require_process_membership(")
+                .count(),
+            4
+        );
+        assert!(
+            observe.find("stage1.kill()?").unwrap()
+                < observe
+                    .find("cgroup::wait_until_removed(")
+                    .unwrap()
+        );
+        assert!(CGROUP.contains(
+            "pub(crate) fn wait_until_removed(expected: &str, timeout: Duration)"
+        ));
     }
 
     #[test]

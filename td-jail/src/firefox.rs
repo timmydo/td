@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 const MARIONETTE_PORT: u16 = 2828;
 const PROBE_DEADLINE: Duration = Duration::from_secs(60);
+const FOCUS_PROBE_DEADLINE: Duration = Duration::from_secs(20);
 const NETWORK_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 const DOWNLOAD_PROBE_DEADLINE: Duration = Duration::from_secs(40);
 const SOAK_PROBE_DEADLINE: Duration = Duration::from_secs(360);
@@ -29,6 +30,7 @@ const EXECUTE_RESPONSE_SUFFIX: &str = r#""}]"#;
 const REPORT_PREFIX: &str = "TD-FIREFOX-SUPPORT-V1";
 const INPUT_CONTENT_ARMED: &str = "TD-FIREFOX-INPUT-CONTENT-ARMED";
 const INPUT_CHROME_ARMED: &str = "TD-FIREFOX-INPUT-CHROME-ARMED";
+const INPUT_CONTENT_FOCUSED: &str = "TD-FIREFOX-INPUT-CONTENT-FOCUSED";
 const INPUT_CONTENT_OK: &str = "TD-FIREFOX-INPUT-CONTENT-OK";
 const INPUT_MENU_OK: &str = "TD-FIREFOX-INPUT-MENU-OK";
 const INPUT_FINAL_OK: &str = "TD-FIREFOX-INPUT-FINAL-OK";
@@ -147,6 +149,7 @@ fn soak_document_script(url: &str, title: &str, body: &str) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputStage {
     Arm,
+    Focus,
     Menu,
     Final,
     ClipboardRefocusArm,
@@ -162,6 +165,7 @@ impl InputStage {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "arm" => Some(Self::Arm),
+            "focus" => Some(Self::Focus),
             "menu" => Some(Self::Menu),
             "final" => Some(Self::Final),
             "clipboard-refocus-arm" => Some(Self::ClipboardRefocusArm),
@@ -178,6 +182,7 @@ impl InputStage {
     fn marker(self) -> &'static str {
         match self {
             Self::Arm => "TD-FIREFOX-INPUT-ARMED",
+            Self::Focus => "TD-FIREFOX-INPUT-FOCUSED",
             Self::Menu => "TD-FIREFOX-INPUT-MENU",
             Self::Final => "TD-FIREFOX-INPUT-OK",
             Self::ClipboardRefocusArm => "TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED",
@@ -198,11 +203,21 @@ if (!input) {
   done("TD-FIREFOX-INPUT-ERROR:no-input");
 } else {
   const state = {
-    moves: 0, inputs: 0, wheels: 0, contexts: 0,
+    moves: 0, focusMoves: 0, inputs: 0, wheels: 0, contexts: 0,
     audio: { starts: 0, ended: 0, closed: 0, rate: 0, error: "" }
   };
   window.__tdPhysicalInput = state;
-  document.addEventListener("mousemove", () => state.moves++);
+  document.addEventListener("mousemove", event => {
+    state.moves++;
+    // Only the second fixed X position enters the proof input's transparent
+    // full-viewport-height strip. Requiring that target makes the unchanged
+    // following click an attested compositor-focus action without guessing
+    // the browser chrome's content offset.
+    if (event.isTrusted && event.target === input &&
+        event.clientX >= 360 && event.clientX <= 380) {
+      state.focusMoves++;
+    }
+  });
   input.addEventListener("input", () => state.inputs++);
   input.addEventListener("keydown", event => {
     const audio = state.audio;
@@ -263,6 +278,28 @@ if (!popup) {
   popup.addEventListener("popuphidden", () => state.hidden++, { once: true });
   done("TD-FIREFOX-INPUT-CHROME-ARMED");
 }
+"#;
+
+const CONTENT_FOCUS_SCRIPT: &str = r#"
+const done = arguments[arguments.length - 1];
+const expires = Date.now() + 10000;
+const check = () => {
+  const state = window.__tdPhysicalInput;
+  const input = document.getElementById("td-input");
+  const focused = document.hasFocus() && document.activeElement === input;
+  const ok = state && state.focusMoves > 0 && state.focusMoves <= 4 && focused;
+  if (!ok && Date.now() < expires) {
+    setTimeout(check, 50);
+    return;
+  }
+  const detail = [Boolean(state), state && state.moves,
+    state && state.focusMoves, Boolean(input),
+    document.hasFocus(), Boolean(input && document.activeElement === input)]
+    .join(",");
+  done(ok ? "TD-FIREFOX-INPUT-CONTENT-FOCUSED" :
+    "TD-FIREFOX-INPUT-ERROR:focus:" + detail);
+};
+check();
 "#;
 
 const CONTENT_MENU_SCRIPT: &str = r#"
@@ -823,10 +860,10 @@ pub(crate) fn probe_input<W: Write>(
     progress: &mut W,
 ) -> io::Result<&'static str> {
     let address = SocketAddr::from(([127, 0, 0, 1], MARIONETTE_PORT));
-    let timeout = if stage == InputStage::Download {
-        DOWNLOAD_PROBE_DEADLINE
-    } else {
-        PROBE_DEADLINE
+    let timeout = match stage {
+        InputStage::Focus => FOCUS_PROBE_DEADLINE,
+        InputStage::Download => DOWNLOAD_PROBE_DEADLINE,
+        _ => PROBE_DEADLINE,
     };
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -1112,6 +1149,10 @@ fn run_input_stage<S: Read + Write, W: Write>(
             require_script_value(stream, 3, CONTENT_ARM_SCRIPT, INPUT_CONTENT_ARMED)?;
             set_context(stream, 4, "chrome")?;
             require_script_value(stream, 5, CHROME_ARM_SCRIPT, INPUT_CHROME_ARMED)
+        }
+        InputStage::Focus => {
+            set_context(stream, 2, "content")?;
+            require_script_value(stream, 3, CONTENT_FOCUS_SCRIPT, INPUT_CONTENT_FOCUSED)
         }
         InputStage::Menu => {
             set_context(stream, 2, "content")?;
@@ -1953,6 +1994,7 @@ mod tests {
     #[test]
     fn production_probe_has_one_end_to_end_deadline() {
         assert_eq!(PROBE_DEADLINE, Duration::from_secs(60));
+        assert_eq!(FOCUS_PROBE_DEADLINE, Duration::from_secs(20));
         assert_eq!(NETWORK_PROBE_DEADLINE, Duration::from_secs(60));
         assert_eq!(DOWNLOAD_PROBE_DEADLINE, Duration::from_secs(40));
         assert_eq!(SOAK_PROBE_DEADLINE, Duration::from_secs(360));
@@ -2265,7 +2307,8 @@ mod tests {
                     values.get(1).copied().unwrap_or_default()
                 ));
             }
-            InputStage::Final
+            InputStage::Focus
+            | InputStage::Final
             | InputStage::ClipboardRefocusArm
             | InputStage::ClipboardRefocus => {
                 responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
@@ -2349,6 +2392,24 @@ mod tests {
             );
             assert!(read_frame(&mut commands).is_err());
         }
+
+        let mut focus = input_transcript(InputStage::Focus, &[INPUT_CONTENT_FOCUSED]);
+        probe_input_stream(&mut focus, InputStage::Focus).unwrap();
+        let mut commands = Cursor::new(focus.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"content"}]"#
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(3, CONTENT_FOCUS_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+        assert!(read_frame(&mut commands).is_err());
 
         let mut final_io = input_transcript(InputStage::Final, &[INPUT_FINAL_OK]);
         probe_input_stream(&mut final_io, InputStage::Final).unwrap();
@@ -2658,6 +2719,19 @@ mod tests {
         assert!(CONTENT_ARM_SCRIPT.contains(close_on_end));
         assert_eq!(CONTENT_ARM_SCRIPT.matches("setTimeout(").count(), 1);
         assert_eq!(CONTENT_ARM_SCRIPT.matches("context.close()").count(), 1);
+        let trusted_focus_move = r#"if (event.isTrusted && event.target === input &&
+        event.clientX >= 360 && event.clientX <= 380) {
+      state.focusMoves++;
+    }"#;
+        assert!(CONTENT_ARM_SCRIPT.contains(trusted_focus_move));
+        assert!(CONTENT_FOCUS_SCRIPT.contains(
+            "state.focusMoves > 0 && state.focusMoves <= 4"
+        ));
+        assert!(CONTENT_FOCUS_SCRIPT.contains(
+            "document.hasFocus() && document.activeElement === input"
+        ));
+        assert!(CONTENT_FOCUS_SCRIPT.contains("Date.now() + 10000"));
+        assert!(CONTENT_FOCUS_SCRIPT.contains("setTimeout(check, 50)"));
         assert!(CONTENT_MENU_SCRIPT.contains("input.value.length <= 4"));
         assert!(CONTENT_MENU_SCRIPT.contains("value => value === \"x\""));
         assert!(CONTENT_MENU_SCRIPT.contains("window.scrollY > 0"));

@@ -233,6 +233,7 @@ mod tests {
         for call in [
             "require_live(\"stage 2\", stage2)?",
             "require_live(\"the jailed descendant\", descendant)?",
+            "watchdog.begin_teardown()?",
             "require_killed_by_signal(stage1.wait()?)?",
             "stage1.kill()?",
             "is_gone(stage2, before_stage2.starttime)?",
@@ -259,6 +260,13 @@ mod tests {
             4,
             "the driver must read both witnesses on both readings"
         );
+        assert_eq!(
+            driver
+                .matches("cgroup::require_process_membership(")
+                .count(),
+            4,
+            "the driver must read both witnesses' cgroup on both readings"
+        );
         // And the kill is between the checks and the watching, which is the
         // only order in which any of it means anything.
         //
@@ -271,16 +279,31 @@ mod tests {
         let last_shape = driver
             .rfind("require_instance_shape")
             .expect("last shape check");
+        let last_membership = driver
+            .rfind("cgroup::require_process_membership")
+            .expect("last cgroup membership check");
         let shape = driver.find("require_instance_shape").expect("shape check");
         let kill = driver.find("stage1.kill()?").expect("the kill");
+        let watchdog = driver
+            .find("watchdog.begin_teardown()?")
+            .expect("teardown watchdog phase");
         let killed = driver
             .find("require_killed_by_signal")
             .expect("signal check");
         let watch = driver.find("is_gone(stage2").expect("the watch");
+        let removed = driver
+            .find("cgroup::wait_until_removed(")
+            .expect("cgroup removal observation");
         assert!(
-            shape < kill && last_shape < kill && kill < killed && killed < watch,
-            "the driver must check the instance -- BOTH times -- then kill, confirm the \
-             signal, and watch"
+            shape < kill
+                && last_shape < kill
+                && last_membership < kill
+                && watchdog < kill
+                && kill < killed
+                && killed < watch
+                && watch < removed,
+            "the driver must check the instance and cgroup -- BOTH times -- then kill, \
+             confirm the signal, watch the processes, and observe leaf removal"
         );
         // The reuse guard is what gives the second reading its meaning: two
         // live pids that were checked are only the same two processes if
@@ -293,6 +316,23 @@ mod tests {
             driver.contains("confirm_descendant.starttime != before_descendant.starttime"),
             "the driver must confirm the descendant was not replaced between readings"
         );
+        let watchdog_body = transition
+            .split_once("fn start_probe_watchdog(")
+            .expect("kill-reaps watchdog")
+            .1
+            .split_once("\n/// Block until")
+            .expect("watchdog end")
+            .0;
+        let before = watchdog_body
+            .find("recv_timeout(KILL_REAPS_CEILING)")
+            .expect("pre-teardown watchdog phase");
+        let teardown = watchdog_body
+            .find("recv_timeout(KILL_REAPS_POST_CEILING)")
+            .expect("teardown watchdog phase");
+        assert!(before < teardown);
+        assert!(watchdog_body.contains(
+            "Err(mpsc::RecvTimeoutError::Disconnected) => return"
+        ));
     }
 
     /// The two things stage 1 must NOT do, both of which it once did.
@@ -402,11 +442,25 @@ mod tests {
             )
             .expect("seccomp installation");
         let dispatch = transition
-            .find("Stage2Action::KillHold => run_stage2_kill_hold(),")
+            .find("Stage2Action::KillHold { cgroup_membership } => {")
             .expect("kill-hold dispatch");
         assert!(
             install < dispatch,
             "the kill-hold arm must be dispatched after the filter is installed"
+        );
+        let membership = transition
+            .get(dispatch..)
+            .and_then(|arm| arm.find("cgroup::require_current_membership(&cgroup_membership)?;"))
+            .map(|at| dispatch + at)
+            .expect("kill-hold cgroup readback");
+        let hold_dispatch = transition
+            .get(membership..)
+            .and_then(|arm| arm.find("run_stage2_kill_hold()"))
+            .map(|at| membership + at)
+            .expect("kill-hold terminal arm");
+        assert!(
+            dispatch < membership && membership < hold_dispatch,
+            "the kill-hold arm must verify its application cgroup before waiting"
         );
         let hold = transition
             .split_once("fn run_stage2_kill_hold()")

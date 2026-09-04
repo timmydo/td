@@ -605,11 +605,13 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// portal completion and result. Raising the host ceiling by those bounds keeps
 /// it beyond the guest and diagnostic clocks. The public Firefox navigation adds
 /// one further 60-second boundary to the network oracle's evidence transaction.
+/// The pointer-to-key ordering barrier adds one terminal 20-second browser
+/// session after the retried input stages.
 /// The continuity soak adds its bounded 360-second Marionette session and a
 /// 30-second allowance for the four identity probes and local process reads
 /// which bracket it. The dedicated seccomp-audit variant adds its bounded
 /// 30-second end-barrier drain after that same soak.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2775;
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2794;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// The source release identities and exact `--version` output shared by the
@@ -1004,6 +1006,7 @@ pub const TD_FIREFOX_SUPPORT_MARKER: &str = "TD-FIREFOX-SUPPORT-READY";
 
 /// Staged markers emitted by td-jail's bounded Firefox physical-input probe.
 pub const TD_FIREFOX_INPUT_ARMED_MARKER: &str = "TD-FIREFOX-INPUT-ARMED";
+pub const TD_FIREFOX_INPUT_FOCUSED_MARKER: &str = "TD-FIREFOX-INPUT-FOCUSED";
 pub const TD_FIREFOX_INPUT_MENU_MARKER: &str = "TD-FIREFOX-INPUT-MENU";
 pub const TD_FIREFOX_INPUT_MARKER: &str = "TD-FIREFOX-INPUT-OK";
 /// Emitted after one Firefox process, its broker-authenticated connection set,
