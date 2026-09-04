@@ -74,7 +74,9 @@ impl HostBudget {
         Self::from_observed(physical, &finite_headrooms)
     }
 
-    fn from_observed(physical: u64, finite_headrooms: &[u64]) -> Result<Self, String> {
+    /// `pub(crate)` so a check-host test can assert that the budget it
+    /// injects is one this arithmetic would actually produce.
+    pub(crate) fn from_observed(physical: u64, finite_headrooms: &[u64]) -> Result<Self, String> {
         let proportional = physical / 4;
         let reserve_bytes = proportional.clamp(MIN_RESERVE_BYTES, MAX_RESERVE_BYTES);
         let mut work_bytes = physical.saturating_sub(reserve_bytes).min(MAX_WORK_BYTES);

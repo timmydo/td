@@ -52,6 +52,30 @@ const SHUTDOWN_NOTICE: Duration = Duration::from_secs(2);
 /// How often that wait looks again. Its own grain rather than a borrowed one,
 /// because it is watching a process leave, not a hand-off to a worker.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+/// How long the shutdown waits with NO request completing before it stops
+/// waiting and lets process exit reclaim the rest.
+///
+/// The budget is no progress AT ALL, renewed by any request that COMPLETES,
+/// which is `STALL_BUDGET`'s rule applied to the pool rather than to one
+/// write — and deliberately the same number, because it is the same judgment
+/// about the same machine.
+///
+/// Renewal cannot extend the wait indefinitely, because the work it waits for
+/// is finite: `send` is dropped before the wait begins, so nothing can arrive,
+/// and what is left is at most the requests in flight plus the
+/// `WORKER_THREADS` already queued behind them. The worst case is therefore
+/// that many budgets rather than an unbounded wait, and every one of them is
+/// bought by a request that actually finished.
+///
+/// A host with a genuinely long check in flight is cut short by this, and that
+/// is the trade rather than an oversight. Nothing out here distinguishes a
+/// worker running a slow check from one that will never finish, and the
+/// alternative was the one this replaces: a wedged host holds the lifetime
+/// lock forever, which fails every later check command on the machine until
+/// somebody kills it by hand.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(300);
+/// How often that wait looks at the workers.
+const SHUTDOWN_JOIN_POLL: Duration = Duration::from_millis(100);
 /// How long one connection may wait for a worker before it is dropped.
 ///
 /// A run waits here, and so does a control request the look did not recognise
@@ -544,8 +568,9 @@ pub fn stop_cli() -> ExitCode {
 ///
 /// An accepted stop ends the accept loop — at once when the loop itself
 /// answered it, at its next flag check when a worker did — and the socket goes
-/// with it. `serve` then joins its workers, and that wait is as long as the
-/// longest check still in flight, or forever if a worker is wedged. Reporting
+/// with it. `serve` then waits for its workers: as long as requests keep
+/// completing, and `SHUTDOWN_GRACE` past the last one that does — or past the
+/// stop itself, if none ever does. Reporting
 /// bare success would leave the operator with a host that answers nothing, a
 /// socket that is gone, and no hint that anything is still owed. Answering the stop
 /// is what removed the old signal: before, this timed out and reported a
@@ -623,10 +648,12 @@ fn report_unfinished_shutdown(runtime: &Path) {
     eprintln!(
         "td-builder: check-host-stop: the host accepted the stop, but {}s \
          later it still holds the lifetime lock and has published no socket: \
-         it is finishing checks that were in flight, or a worker is wedged and \
-         it cannot finish at all. No replacement host can start until it \
-         exits. {where_to_look}",
-        SHUTDOWN_NOTICE.as_secs()
+         it is finishing checks that were in flight, or a worker is wedged. \
+         Either way it leaves within {}s of the last request to complete, or \
+         of the stop itself if none does, and no replacement host can start \
+         until it goes. {where_to_look}",
+        SHUTDOWN_NOTICE.as_secs(),
+        SHUTDOWN_GRACE.as_secs()
     );
 }
 
@@ -754,11 +781,14 @@ fn ensure_server(runtime: &Path, socket: &Path) -> Result<(), String> {
             // Two shapes reach here and they read very differently. One is a
             // host still starting. The other is a host SHUTTING DOWN: it
             // withdraws the socket name as soon as its accept loop ends but
-            // holds the lifetime lock until its last worker finishes, so this
-            // window is as long as the longest check still in flight. Calling
-            // that a failure to publish sends the reader hunting a startup
-            // fault that is really an orderly exit, so name both and point at
-            // the log that tells them apart.
+            // holds the lifetime lock until its workers finish or
+            // `SHUTDOWN_GRACE` passes with no request completing, so this
+            // window is as long as the work honestly left, and bounded past
+            // it whether or not that work can ever end. Calling that a failure
+            // to publish sends the reader hunting a startup fault that is
+            // really a host on its way out — which may end well or may end
+            // abandoning what it could not finish, but is a shutdown either
+            // way. So name both and point at the log that tells them apart.
             return Err(match host_logs(runtime) {
                 Some(logs) => format!(
                     "a host holds the lifetime lock but has not published {} \
@@ -1075,7 +1105,27 @@ fn stop(socket: &Path) -> Result<(), ResponseError> {
     }
 }
 
+/// Discover what this machine can afford, then serve on it.
 fn serve(runtime: &Path) -> Result<(), String> {
+    serve_with_budget(runtime, HostBudget::discover()?)
+}
+
+/// Serve on a budget already decided.
+///
+/// Split from `serve` so the one test that starts a real host can state its
+/// budget instead of inheriting the machine's. `HostBudget::discover` refuses
+/// fewer than three 1 GiB tokens, which is a fact about where the suite runs
+/// and about nothing under test: a small machine, or a container with an
+/// ancestor `memory.max` leaving under five gigabytes of headroom, cannot run
+/// it however correct the code is. Holding a memory token is NOT such a case:
+/// a token is an `flock` on a file, so taking one reserves nothing the
+/// kernel accounts for and cannot lower either number `discover` reads.
+/// Believing otherwise is what this comment said for one revision.
+///
+/// Left inside, the only test that starts a host would red on those
+/// machines for want of RAM, or skip and read green having tested nothing,
+/// which `affected.rs` has already had to unpick once.
+fn serve_with_budget(runtime: &Path, budget: HostBudget) -> Result<(), String> {
     ensure_private_dir(runtime)?;
     let host_lock_path = runtime.join(HOST_LOCK_NAME);
     let host_lock = OpenOptions::new()
@@ -1089,7 +1139,6 @@ fn serve(runtime: &Path) -> Result<(), String> {
     {
         return Err("another per-user check host is already running".to_string());
     }
-    let budget = HostBudget::discover()?;
     let token_dir = runtime.join("memory-tokens-v1");
     let pool = TokenPool::create(&token_dir, &budget)?;
     let socket = runtime.join(SOCKET_NAME);
@@ -1114,13 +1163,11 @@ fn serve(runtime: &Path) -> Result<(), String> {
 
     let (send, recv) = std::sync::mpsc::sync_channel::<Job>(WORKER_THREADS);
     let recv = Arc::new(Mutex::new(recv));
-    let stop = Arc::new(AtomicBool::new(false));
-    let active = Arc::new(AtomicUsize::new(0));
+    let state = PoolState::new();
     let mut workers = Vec::with_capacity(WORKER_THREADS);
     for index in 0..WORKER_THREADS {
         let recv = recv.clone();
-        let stop = stop.clone();
-        let active = active.clone();
+        let state = state.clone();
         let pool = pool.clone();
         let budget = budget.clone();
         let runtime = runtime.to_path_buf();
@@ -1128,7 +1175,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
         let worker = std::thread::Builder::new()
             .name(format!("td-check-host-{index}"))
             .stack_size(WORKER_STACK_BYTES)
-            .spawn(move || worker_loop(recv, stop, active, pool, budget, runtime, token_dir))
+            .spawn(move || worker_loop(recv, state, pool, budget, runtime, token_dir))
             .map_err(|e| format!("spawn check-host worker {index}: {e}"))?;
         workers.push(worker);
     }
@@ -1147,7 +1194,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
     // reported forever into the one file that is supposed to be the record,
     // never reaching the idle check, holding the lock and the socket.
     let mut failing_since: Option<Instant> = None;
-    'accept: while !stop.load(Ordering::Relaxed) {
+    'accept: while !state.stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
                 failing_since = None;
@@ -1160,7 +1207,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
                 // like any other connection.
                 let mut pending = match glance(stream) {
                     Glance::Stopped => {
-                        stop.store(true, Ordering::Relaxed);
+                        state.stop.store(true, Ordering::Relaxed);
                         reason = ExitReason::StopRequest;
                         break 'accept;
                     }
@@ -1180,7 +1227,7 @@ fn serve(runtime: &Path) -> Result<(), String> {
                     match send.try_send(pending) {
                         Ok(()) => break,
                         Err(std::sync::mpsc::TrySendError::Full(returned)) => {
-                            if stop.load(Ordering::Relaxed) {
+                            if state.stop.load(Ordering::Relaxed) {
                                 break 'accept;
                             }
                             if waiting_since.elapsed() >= HANDOFF_TIMEOUT {
@@ -1216,7 +1263,8 @@ fn serve(runtime: &Path) -> Result<(), String> {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // EAGAIN with nothing pending is the benign case, not a run.
                 failing_since = None;
-                if active.load(Ordering::Relaxed) == 0 && idle_since.elapsed() >= IDLE_TIMEOUT {
+                if state.active.load(Ordering::Relaxed) == 0 && idle_since.elapsed() >= IDLE_TIMEOUT
+                {
                     reason = ExitReason::IdleTimeout;
                     break 'accept;
                 }
@@ -1244,18 +1292,144 @@ fn serve(runtime: &Path) -> Result<(), String> {
     // Established connections are unaffected; only the name goes.
     let _ = std::fs::remove_file(&socket);
     drop(send);
-    for worker in workers {
-        let _ = worker.join();
-    }
+    let spawned = workers.len();
+    let abandoned = wait_for_workers(workers, &state.completed, SHUTDOWN_GRACE);
     exit_result(
         reason,
-        format!(
-            "check host {} exiting on {} at {}s",
-            std::process::id(),
-            reason.as_str(),
-            epoch_seconds()
-        ),
+        abandoned,
+        ending_line(reason, abandoned, spawned, SHUTDOWN_GRACE),
     )
+}
+
+/// Wait for the workers to finish, and stop waiting if they will not.
+///
+/// Returns how many were still running when the wait ended, which is how the
+/// caller tells an ending that completed its work from one that dropped it.
+///
+/// `serve` used to join unconditionally. That is right for a pool that is
+/// merely busy and fatal for one that is wedged: the process never exits, so
+/// it never releases the lifetime lock, and `ensure_server` then fails every
+/// later command against a host that is never coming back. `kill` was the only
+/// way out of that, which is what this removes.
+///
+/// Abandoning works because of what a returned `JoinHandle` is not. Dropping
+/// one detaches the thread rather than waiting for it, `serve` returning drops
+/// the lifetime lock with its fd, and `main` returning ends the process
+/// whatever its other threads are doing — so the wedged workers cannot hold
+/// any of it open. Their clients get the EOF that closing those sockets makes,
+/// where the unbounded join left them reading a socket nobody would ever
+/// answer until they timed out on their own bounds.
+///
+/// Progress is a request COMPLETING, not a worker thread ending, and the
+/// difference is the whole of why `completed` exists. A worker draining the
+/// queue takes its next job without leaving `worker_loop`, so during exactly
+/// the drain this budget means to wait out, no thread finishes and no handle
+/// would ever have renewed anything. Keyed that way the wait gave up after
+/// `SHUTDOWN_GRACE` on a pool that was working the whole time.
+///
+/// The budget is a parameter rather than the constant so a test can use one it
+/// can afford to wait out.
+fn wait_for_workers(
+    workers: Vec<std::thread::JoinHandle<()>>,
+    completed: &AtomicUsize,
+    grace: Duration,
+) -> usize {
+    let mut pending = workers;
+    let mut seen = completed.load(Ordering::Relaxed);
+    let mut last_progress = Instant::now();
+    while !pending.is_empty() {
+        let mut running = Vec::with_capacity(pending.len());
+        for worker in pending {
+            if worker.is_finished() {
+                // Already returned, so this join is a reap and not a wait. It
+                // cannot be the block this function exists to bound.
+                let _ = worker.join();
+            } else {
+                running.push(worker);
+            }
+        }
+        pending = running;
+        if pending.is_empty() {
+            break;
+        }
+        let done = completed.load(Ordering::Relaxed);
+        if done != seen {
+            // The same rule `STALL_BUDGET` applies to a write that keeps
+            // moving, applied to the pool: the budget is for no progress AT
+            // ALL, so a pool still finishing requests is waited for.
+            seen = done;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= grace {
+            break;
+        }
+        std::thread::sleep(SHUTDOWN_JOIN_POLL);
+    }
+    pending.len()
+}
+
+/// The one line that says how the host ended.
+///
+/// Built here rather than inline so the abandoning case is pinned by a test.
+/// The count and the budget are the whole of what makes it actionable: an
+/// ending that says only "stop request" for a shutdown that dropped checks in
+/// progress is the same kind of lie as the exit status that used to say
+/// success, told in the other channel.
+///
+/// `spawned` and `grace` are passed rather than read from `WORKER_THREADS` and
+/// `SHUTDOWN_GRACE`, so the line cannot name a pool or a budget that was not
+/// the one used. And `spawned` is what the pool STARTED with, said as such: a
+/// panicking worker shrinks the pool, so "of 32" as a count of workers that
+/// were running would be the inference the accept loop's own drop message
+/// deliberately refuses to make.
+fn ending_line(reason: ExitReason, abandoned: usize, spawned: usize, grace: Duration) -> String {
+    let base = format!(
+        "check host {} exiting on {} at {}s",
+        std::process::id(),
+        reason.as_str(),
+        epoch_seconds()
+    );
+    if abandoned == 0 {
+        return base;
+    }
+    format!(
+        "{base}, abandoning {abandoned} worker(s) still running, of the \
+         {spawned} it started with, after {}s in which no request completed. \
+         Exiting anyway is what releases the lifetime lock and closes the \
+         connections they held; their checks did NOT complete",
+        grace.as_secs()
+    )
+}
+
+/// What every worker shares with the accept loop that feeds it.
+///
+/// Grouped rather than passed one by one because they travel together and are
+/// meaningless apart — and because adding the third to a list of separate
+/// arguments is what pushes `worker_loop` past the signature length clippy
+/// will not have.
+#[derive(Clone)]
+struct PoolState {
+    /// Set once the host has been told to stop, by whoever took the request.
+    stop: Arc<AtomicBool>,
+    /// Requests in flight right now. Falls back to zero, which is what lets
+    /// the idle timeout tell an idle host from a quiet but busy one.
+    active: Arc<AtomicUsize>,
+    /// Requests finished since the host started.
+    ///
+    /// Monotonic, and that is the point: the shutdown needs to know the pool
+    /// is still COMPLETING work, and `active` cannot say so. A pool draining a
+    /// queue holds `active` at the same number for as long as it takes, which
+    /// is indistinguishable from a pool stuck at that number.
+    completed: Arc<AtomicUsize>,
+}
+
+impl PoolState {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicUsize::new(0)),
+            completed: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 /// Holds the active-request count for as long as a request is in flight.
@@ -1280,8 +1454,7 @@ impl Drop for ActiveGuard {
 
 fn worker_loop(
     recv: Arc<Mutex<std::sync::mpsc::Receiver<Job>>>,
-    stop: Arc<AtomicBool>,
-    active: Arc<AtomicUsize>,
+    state: PoolState,
     pool: TokenPool,
     budget: HostBudget,
     runtime: PathBuf,
@@ -1304,10 +1477,10 @@ fn worker_loop(
             Ok(Request::Ping) => answer_ping(stream, STALL_BUDGET),
             Ok(Request::Stop) => {
                 answer_stop(stream, STALL_BUDGET);
-                stop.store(true, Ordering::Relaxed);
+                state.stop.store(true, Ordering::Relaxed);
             }
             Ok(Request::Run(request)) => {
-                let _active = ActiveGuard::new(&active);
+                let _active = ActiveGuard::new(&state.active);
                 // ONE writer for this connection, built here and shared with
                 // the error path. A second `FrameWriter` over a clone carries
                 // its own `disconnected` flag and its own mutex, so a stream
@@ -1339,6 +1512,11 @@ fn worker_loop(
             }
             Err(e) => eprintln!("td-builder: check host dropped malformed request: {e}"),
         }
+        // One request done, whatever it was and however it went. This is the
+        // shutdown's only evidence that the pool is still moving: a worker
+        // draining a queue never leaves this loop, so its thread does not
+        // finish and nothing else here changes.
+        state.completed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1355,14 +1533,18 @@ fn answer_ping(stream: UnixStream, budget: Duration) {
 
 /// Answer a stop. The caller arms the shutdown afterwards.
 ///
-/// Answering comes first. `serve` joins its workers, so this ordering is not
-/// what keeps the reply alive today; it is what stops a future teardown that
-/// does not join from turning an orderly exit into the EOF a dead host makes.
-/// A reply that cannot be sent still stops the host.
+/// Answering comes first, and that now carries weight rather than merely
+/// anticipating it. The teardown gives up on workers that will not finish, so
+/// `serve` can return while one is still mid-request; a reply left until after
+/// that would be racing a process on its way out, and would reach the stopper
+/// as the EOF a dead host makes. Written here it is on the socket before the
+/// shutdown it arms can begin. A reply that cannot be sent still stops the
+/// host.
 ///
 /// Reported, never dropped: an unanswered stop leaves the stopper reading that
-/// same EOF and reporting a host that may have died, while this one exits
-/// perfectly normally.
+/// same EOF and reporting a host that may have died, when what it is watching
+/// is a host shutting down as asked — whether that shutdown goes on to finish
+/// its work or to abandon what it cannot.
 fn answer_stop(stream: UnixStream, budget: Duration) {
     match FrameWriter::with_budget(stream, budget)
         .and_then(|writer| writer.frame(FRAME_EXIT, &0u32.to_be_bytes()))
@@ -1520,8 +1702,14 @@ fn job_request(job: Job, deadline: Instant) -> (UnixStream, Result<Request, Stri
 /// A failure hands the line back so `serve_cli` prints it and exits non-zero;
 /// an orderly exit prints it here. Doing both would put one fact in the log
 /// twice, the second time without the pid or the timestamp.
-fn exit_result(reason: ExitReason, ending: String) -> Result<(), String> {
-    if reason.is_failure() {
+///
+/// Two independent things make an ending a failure, and they are asked
+/// separately because they answer different questions. `reason` is why the
+/// accept loop ended; `abandoned` is whether the shutdown that followed left
+/// work running. A host dismissed by an operator that then dropped four checks
+/// on the floor was not an orderly exit, however politely it was asked.
+fn exit_result(reason: ExitReason, abandoned: usize, ending: String) -> Result<(), String> {
+    if reason.is_failure() || abandoned > 0 {
         return Err(ending);
     }
     eprintln!("td-builder: {ending}");
@@ -3154,8 +3342,11 @@ mod tests {
                 "{current:?} is reported as the wrong kind of exit"
             );
             let ending = format!("check host 1 exiting on {} at 0s", current.as_str());
+            // Nothing abandoned, so the reason is the only thing deciding
+            // here. The other axis is
+            // `an_abandoned_shutdown_does_not_report_success`.
             assert_eq!(
-                exit_result(current, ending).is_err(),
+                exit_result(current, 0, ending).is_err(),
                 expected_failure,
                 "{current:?} must decide the process status, not only the log"
             );
@@ -3258,5 +3449,292 @@ mod tests {
             supervisor_executable(&request),
             OsStr::new("/worktree/target/release/td-builder")
         );
+    }
+
+    /// A pool that finishes is waited for in full.
+    ///
+    /// The base case the bound must not break: giving up on workers that were
+    /// always going to return would turn every orderly shutdown into a
+    /// reported failure with checks blamed for being abandoned.
+    ///
+    /// The workers are held rather than merely slow, and the wait is observed
+    /// to be STILL RUNNING before any of them is let go. A sleep would not do
+    /// it: threads that finish on their own are finished whatever the wait
+    /// does, so a wait that gave up instantly would still count zero and this
+    /// would pass having tested nothing. It did exactly that until a mutation
+    /// said so, and a 300ms sleep only narrowed the window rather than
+    /// closing it.
+    ///
+    /// Bounded from outside like the rest, and for the same reason: a
+    /// regression that spins or parks must red here, not hang the suite. The
+    /// budget is a stand-in for `SHUTDOWN_GRACE`, which no test can afford to
+    /// wait out.
+    #[test]
+    fn workers_that_finish_are_all_waited_for() {
+        let release = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let held = release.clone();
+                std::thread::spawn(move || {
+                    while !held.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            })
+            .collect();
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (done, answer) = std::sync::mpsc::channel();
+        let waiting = {
+            let completed = completed.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(wait_for_workers(
+                    workers,
+                    &completed,
+                    Duration::from_secs(10),
+                ));
+            })
+        };
+
+        assert!(
+            answer.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the wait returned while every worker was still running"
+        );
+        release.store(true, Ordering::Relaxed);
+        assert_eq!(
+            answer
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the wait never returned once its workers were released"),
+            0
+        );
+        let _ = waiting.join();
+    }
+
+    /// A worker that will not finish is abandoned rather than waited for.
+    ///
+    /// The whole increment: `serve` used to join unconditionally, so one
+    /// wedged worker held the process, and with it the lifetime lock, until
+    /// somebody killed it by hand.
+    ///
+    /// Bounded from OUTSIDE the call. The mutation this pins is "wait anyway",
+    /// and a test that parks under its own mutation reports nothing at all.
+    #[test]
+    fn a_worker_that_will_not_finish_is_abandoned() {
+        let release = Arc::new(AtomicBool::new(false));
+        let held = release.clone();
+        let worker = std::thread::spawn(move || {
+            while !held.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (done, answer) = std::sync::mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            let _ = done.send(wait_for_workers(
+                vec![worker],
+                &completed,
+                Duration::from_millis(200),
+            ));
+        });
+        let abandoned = answer
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the wait never gave up on a worker that never finishes");
+
+        assert_eq!(abandoned, 1);
+        release.store(true, Ordering::Relaxed);
+        let _ = waiting.join();
+    }
+
+    /// A request completing renews the budget, though no thread ends.
+    ///
+    /// This is the production topology, and the first version of this test
+    /// missed it entirely by using one-shot threads. A worker draining the
+    /// queue takes its next job without leaving `worker_loop`, so its handle
+    /// never finishes: a budget renewed by thread exit is renewed by nothing
+    /// at all during exactly the drain it means to wait out. The worker here
+    /// therefore never ends either, and only the counter moves.
+    ///
+    /// Ten completions 300ms apart under a two-second budget: three seconds of
+    /// shutdown, no part of which is two seconds with nothing completing. A
+    /// budget measured from the start of the wait gives up at two, which the
+    /// elapsed assertion catches. The spacing is what buys the margin — a
+    /// 1.7-second overshoot on a gap is what it would take to red this
+    /// spuriously on a loaded machine — and it costs five seconds, where the
+    /// same ten completions a second apart would cost twelve. Five and not
+    /// three, because the wait still has to burn its whole budget after the
+    /// last completion: the worker is released only once it has returned.
+    #[test]
+    fn a_request_completing_renews_the_budget() {
+        let release = Arc::new(AtomicBool::new(false));
+        let held = release.clone();
+        let worker = std::thread::spawn(move || {
+            while !held.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (done, answer) = std::sync::mpsc::channel();
+        let waiting = {
+            let completed = completed.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let left = wait_for_workers(vec![worker], &completed, Duration::from_secs(2));
+                let _ = done.send((left, started.elapsed()));
+            })
+        };
+
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(300));
+            completed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let (abandoned, waited) = answer
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the wait never returned");
+        assert_eq!(abandoned, 1);
+        assert!(
+            waited >= Duration::from_secs(3),
+            "gave up after {waited:?}, so completing requests did not renew \
+             the budget"
+        );
+        release.store(true, Ordering::Relaxed);
+        let _ = waiting.join();
+    }
+
+    /// An ending that abandoned work does not report success.
+    ///
+    /// `is_failure` answers why the accept loop ended. It cannot answer what
+    /// the shutdown afterwards left running, and a stop that dropped four
+    /// checks is not the clean exit its reason alone suggests.
+    #[test]
+    fn an_abandoned_shutdown_does_not_report_success() {
+        assert!(exit_result(ExitReason::StopRequest, 0, "clean".to_string()).is_ok());
+        assert!(exit_result(ExitReason::IdleTimeout, 0, "clean".to_string()).is_ok());
+
+        assert!(exit_result(ExitReason::StopRequest, 1, "left one".to_string()).is_err());
+        assert!(exit_result(ExitReason::IdleTimeout, 4, "left four".to_string()).is_err());
+
+        // Still a failure for its own reason, whether or not it left anything.
+        assert!(exit_result(ExitReason::AcceptKeptFailing, 0, "broken".to_string()).is_err());
+    }
+
+    /// The abandoning ending names what it left, and why it left anyway.
+    ///
+    /// The budget is matched with its whole clause rather than as a bare
+    /// "300s". The line carries an `at <epoch>s` stamp of its own, so a bare
+    /// match would pass whenever that epoch happened to end in the budget's
+    /// digits, and a mutation reporting the wrong budget would go unnoticed.
+    #[test]
+    fn an_abandoned_ending_names_what_it_left() {
+        let grace = Duration::from_secs(300);
+        let clean = ending_line(ExitReason::StopRequest, 0, 32, grace);
+        assert!(clean.contains("stop request"), "{clean}");
+        assert!(!clean.contains("abandoning"), "{clean}");
+
+        let left = ending_line(ExitReason::StopRequest, 3, 32, grace);
+        assert!(left.contains("stop request"), "{left}");
+        assert!(left.contains("abandoning 3 worker(s)"), "{left}");
+        assert!(left.contains("of the 32 it started with"), "{left}");
+        assert!(
+            left.contains("after 300s in which no request completed"),
+            "{left}"
+        );
+        assert!(left.contains("did NOT complete"), "{left}");
+    }
+
+    /// A real host, told to stop, leaves — and calls it a clean ending.
+    ///
+    /// The first test here to boot a host, so it is the first to pin the
+    /// accept loop's own arms rather than only the pieces they call: that a
+    /// stop reaches the loop, ends it, withdraws the socket, waits out an idle
+    /// pool, and reports success for having abandoned nothing.
+    ///
+    /// It calls `serve_with_budget` rather than `serve`, which is the whole
+    /// of `serve` bar its one discovery line, so that line and the two-line
+    /// wrapper around it are what remains uncovered.
+    ///
+    /// Bounded throughout, and the host returning is checked by POLLING its
+    /// handle rather than by joining it, so a regression that hangs the
+    /// shutdown reds this test instead of parking the suite inside it.
+    #[test]
+    fn a_host_told_to_stop_leaves_with_nothing_abandoned() {
+        // Stated, not discovered. `HostBudget::discover` refuses a machine
+        // that cannot spare three 1 GiB tokens — a small box, or a container
+        // whose ancestor `memory.max` leaves under five gigabytes of
+        // headroom. A test that read the machine would red there for want of
+        // RAM rather than for anything it asserts, and one that skipped
+        // instead would read GREEN having started no host at all, captured
+        // `eprintln!` and all.
+        //
+        // Every field is what `HostBudget::from_observed` yields for four
+        // tokens, worked through by hand: 4 GiB of work, the 2 GiB minimum
+        // reserve, one base token below the six-token step, and
+        // `8.min(4 - 1).max(2)` gate tokens. A budget no machine could report
+        // would make this a test of a shape rather than of a host.
+        let budget = HostBudget {
+            work_bytes: 4 * check_memory::GIB,
+            reserve_bytes: 2 * check_memory::GIB,
+            token_count: 4,
+            base_tokens: 1,
+            gate_tokens: 3,
+        };
+        // And asserted rather than trusted: a 6 GiB machine with no cgroup
+        // ceiling is exactly the one that yields it. Working the arithmetic
+        // out by hand is how `gate_tokens` was wrong here for one revision.
+        assert_eq!(
+            budget,
+            check_memory::HostBudget::from_observed(6 * check_memory::GIB, &[]).unwrap()
+        );
+        let runtime = scratch_runtime("bounded-shutdown");
+        // A real host refuses a runtime directory anyone else can reach, and
+        // `scratch_runtime` makes one at the umask.
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = runtime.join(SOCKET_NAME);
+        let serving = {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || serve_with_budget(&runtime, budget))
+        };
+
+        let waited = Instant::now();
+        while !path_is_socket(&socket) {
+            // Asked before the clock, so a host that refused to start reports
+            // its own reason instead of being described as slow.
+            if serving.is_finished() {
+                panic!(
+                    "the host returned before publishing a socket: {:?}",
+                    serving.join()
+                );
+            }
+            assert!(
+                waited.elapsed() < Duration::from_secs(20),
+                "the host never published {}",
+                socket.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        stop(&socket).expect("the host did not answer the stop");
+
+        let left = Instant::now();
+        while !serving.is_finished() {
+            assert!(
+                left.elapsed() < Duration::from_secs(30),
+                "the host did not return after an accepted stop"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Ok(Ok(())) and nothing else: an idle pool abandons nothing, so this
+        // is also the assertion that a clean stop is not reported as a failure.
+        // The outcome is named in the failure, because the Err it would
+        // otherwise swallow is the ending line saying what went wrong.
+        let outcome = serving.join();
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "a stop with an idle pool must be a clean ending, got {outcome:?}"
+        );
+        assert!(!path_is_socket(&socket), "the socket outlived the host");
+        let _ = std::fs::remove_dir_all(&runtime);
     }
 }
