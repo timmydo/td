@@ -371,7 +371,7 @@ failed every boot; it was caught in review rather than in QEMU.
 | `td-jail` | `/bin/td-jail`, plus one `argv[0]` symlink per application | none | surface **#9** | namespaces, mounts, capability drop, seccomp, PID-1 reaping, and resolving `argv[0]` to a spec |
 | `td-busd` | `/bin/td-busd` | none | surface **#10** | the session D-Bus broker; SCM_RIGHTS forces the surface |
 | `td-portal` | `/bin/td-portal` | none | **none** | the activated desktop portal; the first static process serves Settings without a compositor connection (§E) |
-| `td-audio` | `/bin/td-audio` | none | surface **#11** | the PulseAudio-protocol sound server (§K), running as its own `audio` uid |
+| `td-audio` | `/bin/td-audio` | none | surface **#13** | the PulseAudio-protocol sound server (§K), running as its own `audio` uid |
 | `td-login` | new `exec-as` subcommand (§A's Supervision — NOT an applet, so no `/bin/exec-as`) | none | no new syscalls | launch a literal argv as another uid without a shell |
 
 There is **no application-manager binary**. With packages in the image
@@ -1700,13 +1700,16 @@ clipboard-proof scanning.
 
 Firefox also materially increases the first profiler report's symbolization
 work: the initial 60-second capture can finish sampling before its immutable
-report is published. The autotest therefore uses `td-profiler evidence`'s
-compiled maximum 300-second wait, with a distinct 315-second service
-backstop. The evidence rules are unchanged: the accepted capture must still
-have complete bounded reports, zero loss, corruption and omitted diagnostics,
-and the exact source-line attribution sample. A persisted capture from the
-first Firefox image boot passed that validator after publication; the longer
-window accommodates report latency rather than accepting weaker evidence.
+report is published. The full input, clipboard, download, FileChooser, audio,
+and soak workload produced 4,951 zero-loss records but was still writing its
+bounded report when the former 300-second wait expired. The exact attribution
+token therefore selects `td-profiler evidence`'s compiled maximum 900-second
+wait, with a distinct 915-second service backstop. Ordinary boots retain the
+300-second evidence wait and never run the synthetic attribution workload. The
+evidence rules are unchanged: the accepted capture must still have complete
+bounded reports, zero loss, corruption and omitted diagnostics, and the exact
+source-line attribution sample. The longer proof-only window accommodates
+report latency rather than accepting weaker evidence.
 
 The inspected Firefox entry is a short `#!/bin/bash` wrapper that sets
 `TMPDIR=$XDG_CACHE_HOME/tmp` and execs `/app/lib/firefox/firefox`. Its ELF
@@ -6778,24 +6781,39 @@ and image commits — showing:
     with a cgroup a probe may kill, which the single-application rule
     denies;
 13. **audio PLAYING — LANDED.** The physical-input boot's first trusted
-    Firefox key starts exactly one one-second, 440 Hz Web Audio oscillator at
-    quarter gain and records its exact 48 kHz context rate, completion and
-    closure before the input probe succeeds. That boot alone replaces the
-    host-silent QEMU backend with an exact 48 kHz stereo S16 WAV sink. That
-    proof-only codec disables QEMU's emulated gain/mute mixer because the
-    playback daemon deliberately owns no ALSA control node; the guest still
-    crosses the emulated HDA PCM transport. After clean VM exit finalises the
-    header, the host refuses a missing, nonregular, malformed or over-512-MiB
-    capture, derives the live ceiling from the selected timeout plus margin,
-    and refuses a timeout needing more than that absolute bound before launch.
+    Firefox key starts exactly one 440 Hz Web Audio oscillator, schedules 1.2
+    seconds at quarter gain followed by 500 ms at 0.001 gain on its exact 48 kHz
+    audio clock, and records completion and closure before the input probe
+    succeeds. The sub-oracle-floor tail keeps cubeb producing past td-audio's
+    negotiated working target and 170 ms HDA ring before stream destruction
+    can discard an accepted tone tail. The working target is never negotiated
+    below that selected ring. The guest schedule is not playback evidence.
+    That boot alone replaces the host-silent QEMU backend with an exact 48 kHz
+    stereo S16 WAV sink. That proof-only codec disables QEMU's emulated
+    gain/mute mixer because the playback daemon deliberately owns no ALSA
+    control node; the guest still crosses the emulated HDA PCM transport. After
+    clean VM exit finalises the header, the host refuses a missing, nonregular,
+    malformed or over-512-MiB capture, derives the live ceiling from the
+    selected timeout plus margin, and refuses a timeout needing more than that
+    absolute bound before launch.
     It streams across the bounded boot-time silence, retains only the bounded
-    active span, requires 900–1100 ms, a meaningful peak and per-channel AC
-    energy, and independently correlates both channels above 0.9 with the best
-    sine in a narrow 435–445 Hz physical output band while allowing arbitrary
-    phase and leading/trailing silence. The bounded fit admits the emulated
-    HDA/WAV clock's measured 0.4% rate difference without admitting an
-    unrelated tone. The guest evidence alone could pass with a dead audio
-    transport and non-silence alone could pass on noise; requiring both ties
+    active span, requires 900–1300 ms, a meaningful peak, per-channel AC
+    energy, and no internal below-floor run longer than 64 frames. It requires
+    the median of each channel's overlapping 100 ms-window zero-crossing
+    estimates inside the narrow 435–445 Hz physical output band, then
+    independently correlates both channels with one shared-frequency sine over
+    those windows. Each channel
+    must retain mean correlation of at least 0.85, with no more than seven
+    sub-0.9 windows in no more than two contiguous runs. Window-local phase
+    therefore tolerates the measured bounded HDA startup and recovery regions
+    without mistaking them for silence or requiring one phase across a device
+    restart. Half-window overlap makes repeated boundary-aligned phase resets
+    cross too many measured windows or runs; the shared frequency, energy,
+    quiet-run and correlation checks still reject an unrelated or intermittent
+    signal. The bounded fit admits the emulated HDA/WAV clock's measured rate
+    difference. The guest evidence alone could pass with a dead audio transport
+    and non-silence alone could pass on noise;
+    requiring both ties
     Firefox's trusted Web Audio action through cubeb, the jailed Pulse socket,
     `td-audio`, ALSA, HDA and QEMU to the recorded waveform. Ordinary boots and
     the interactive runner retain the host-silent backend;
@@ -6874,7 +6892,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 27e | **Firefox download image proof — LANDED**; the authenticated local HTTPS page carries one fixed fixture link. After the clipboard proof, Firefox content focuses and validates that link before admitting a real emulated Enter key. A td-owned probe outside the jail accepts completion only after the exact 23-byte regular file is stable at the uid-1000 source of Firefox's `/home/td/Downloads` grant, with bounded mode, link, identity and duplicate/partial checks. The same trusted input-stage record follows the download and FileChooser markers, so neither a synthetic DOM click nor a stale file can pass; rung 27j owns final greeter completion | Firefox writes a verified HTTPS download through its declared persistent grant without manual testing |
 | 27f | **Firefox FileChooser image proof — LANDED**; after the independent download validation, Firefox content exposes a full-viewport focus control and a trusted physical click focuses the browser. A fresh bounded read-only probe validates that persistent click record and current focus, then the host sends physical `Control+O` to invoke Firefox's native Open File command without a DOM picker call or synthetic assignment. The host accepts one exact portal first-frame record, validates the centred 640x432 chooser palette and selected row in a bounded 1280x800 PPM, and recomputes the announced client-buffer checksum from those displayed pixels before injecting Enter to select the file. Firefox must then load the exact granted `file:` URL as plain text with the fixture's exact contents before the private input-stage record. Ordinary boots expose none of the Marionette, QMP or fixture-page machinery | Firefox's broker-authenticated portal request, modal presentation, physical selection and directed result complete without manual testing |
 | 27g | **Firefox public-network image proof — LANDED**; the interactive runner replaces its explicit NIC absence with an explicit QEMU user-mode NIC and no host-to-guest forwarding. Guest-initiated SLIRP traffic can reach the operator host, LAN and public network. The operator-run network oracle retains td-netd DHCP/DNS/TCP and Git HTTPS evidence, then requires the jailed Firefox to navigate to the same public host, complete a verified HTTPS 200 document load and validate the final content origin/body inside one 60-second bounded Marionette session. The trusted evidence unit checks and prints one exact marker before its atomic completion, and the host accepts only that line. The deterministic system oracle remains NIC-less; public reachability is deliberately not a build gate | ordinary interactive Firefox can browse, and the same path has a repeatable non-manual public HTTPS check |
-| 27h | **Firefox Web Audio image proof — LANDED**; the deterministic physical-input boot uses its first trusted key to start and finish one exact one-second 440 Hz oscillator in Firefox. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, the built-in test loopback taking card 0 ahead of HDA, and then 48,000 correct tone frames stretched across 1,600 ms by about 28,000 frames of daemon-inserted silence. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep those client frames contiguous instead of starting HDA on an empty period. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 512 MiB bound and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, duration, peak and per-channel AC energy, then requires both channels to correlate above 0.9 with one shared frequency in the narrow 435–445 Hz physical-output band independent of phase. The fit tolerates the measured QEMU HDA/WAV clock rate without accepting an unrelated tone. The authoritative TCG run measured 1,004 ms, peak 8,192, a 438.25 Hz fit, per-channel AC RMS 5,780.9 and correlations 0.9719/0.9719 before completing every rollback/fallback boot. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a short tone and an off-band frequency, accept the bounded clock-stretch fixture, pin exact float conversion, accounting, prebuffer/start continuity and mixed HDA/loopback selection, and pin the exact QEMU argv including comma-safe capture paths. Other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
+| 27h | **Firefox Web Audio image proof — LANDED**; the deterministic audit-off physical-input boot uses its first trusted key to start one 440 Hz oscillator in Firefox, schedules 1.2 seconds at quarter gain plus a 500 ms 0.001-gain tail on the same audio clock, then closes the context after the oscillator ends and a bounded downstream-drain interval. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, its 50 ms working target against a larger HDA ring, the built-in test loopback taking card 0 ahead of HDA, and TCG audio-clock progress that can outrun the frames cubeb delivers to HDA. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. The negotiated working target is raised to at least the selected device ring plus one transfer period, retaining bounded software refill headroom behind the initially primed ring. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep continuous client frames contiguous instead of starting HDA on an empty period; moving the last private-queue frame into a live device ring is not an underflow; each stream rearms only if the shared playhead reaches its exhausted accepted endpoint before a refill extends it. `TRIGGER`, `DRAIN`, bounded shutdown, an initial completed prebuffer gate, a below-period target watermark, or an explicit zero prebuffer may release a complete shorter tail. The scheduled sub-oracle-floor tail and delayed close keep cubeb alive past the bounded downstream queues; that guest schedule is not evidence, and the host WAV duration and waveform checks remain authoritative. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 512 MiB bound and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, 900–1300 ms duration, peak and per-channel AC energy, no internal below-floor run over 64 frames, the median of each channel's overlapping 100 ms-window zero-crossing estimates inside 435–445 Hz, and both channels' mean correlation of at least 0.85 with one shared-frequency sine over those windows. No channel may have more than seven sub-0.9 windows or two contiguous transient runs. Window-local phase therefore tolerates the measured bounded HDA startup and recovery regions; half-window overlap makes repeated boundary-aligned phase resets cross too many measured windows or runs, so the combined checks reject silence, noise, an intermittent signal or an unrelated tone. The authoritative exact-tree TCG run measured 1,174 ms active at fitted 440.00 Hz, 440.08/440.08 Hz median zero-crossing estimates, 5,792.4/5,792.4 AC RMS, 0.9990/0.9990 mean correlation, and no sub-0.9 transient window or run in either channel. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a long quiet interval, repeated phase resets, a short tone, an overlong tone and low or high off-band frequencies, accept bounded phase-reset and clock-stretch fixtures, pin the exact float conversion, accounting, refill-before-endpoint continuity, device-ring-plus-period target floor, prebuffer/start continuity, mixed HDA/loopback selection and audio-clock tail, and pin the exact QEMU argv including comma-safe capture paths. The dedicated seccomp-audit variant repeats the real input/soak workload against a host-silent backend; other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
 | 27i | **unsupported portal discovery proof — LANDED**; the live uid-1000 portal client asks the version property and `GetAll` for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`, calls one real entry member on each, and accepts only complete exact error replies from the activated service's unique sender. Live introspection must omit every interface, and QEMU requires a distinct trusted service-prefixed marker after the whole sequence | unsupported capture, remote-control, camera, secret, and print capabilities fail closed rather than appearing to succeed |
 | 27j | **Firefox five-minute connection soak — LANDED**; one Marionette session alternates 31 exact guest-local HTTPS navigations at ten-second boundaries through at least 300 seconds. Before/after equality pins Firefox's application instance, pid and procfs start time; the bus GUID plus its exact broker-authenticated Firefox connection/pid set; and the compositor generation. Its live-latched readiness answer separately proves the publishing Wayland client did not depart. Only the final unit can publish the greeter's completion, and QEMU requires its exact soak line | browser, bus and compositor connections survive a bounded real navigation workload without manual observation |
 | 28 | the remaining §H proof run to green; `AGENTS.md` trust-zone section; **all four** application-path `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
@@ -7157,36 +7175,90 @@ against. Authenticate by `SO_PEERCRED` uid rather than by the cookie
 and clear both the SHM and memfd feature bits in the reply.
 
 Playback needs: `AUTH`, `SET_CLIENT_NAME`, `GET_SERVER_INFO`,
-`LOOKUP_SINK`, `GET_SINK_INFO`/`GET_SINK_INFO_LIST`,
+`GET_SINK_INFO`/`GET_SINK_INFO_LIST`,
 `GET_SOURCE_INFO_LIST` (an **empty list**, not an error, so device
 pickers see "no microphone" rather than a broken server), `SUBSCRIBE`,
 `CREATE_PLAYBACK_STREAM`, stream-channel writes, server-initiated
 `REQUEST` byte grants, `CORK`/`FLUSH`/`PREBUF`/`TRIGGER`/`DRAIN`,
 `GET_PLAYBACK_LATENCY`, per-stream volume and mute,
-`SET_PLAYBACK_STREAM_NAME`, `DELETE_PLAYBACK_STREAM`, and the
+`UPDATE_PLAYBACK_STREAM_PROPLIST`, `DELETE_PLAYBACK_STREAM`, and the
 `STARTED`/`UNDERFLOW`/`OVERFLOW` events. `REQUEST` is what makes sound
 happen at all — without byte grants the client writes one buffer and
 stops forever.
 
-The negotiated prebuffer is equally load-bearing. An omitted threshold
-uses Pulse's `tlength + one frame - minreq` default, while an explicit
-threshold is capped there. `PREBUF` and `FLUSH` arm it; `TRIGGER` and
+The negotiated target and prebuffer are equally load-bearing. The client's
+working `tlength` is raised to at least the selected device ring plus one
+transfer period (while a larger bounded request is preserved), so completing
+a short client threshold cannot deliberately start an underfilled ring with
+no software refill reserve behind it. `maxlength` is raised when needed to
+contain that target. An omitted threshold uses Pulse's `tlength + one frame -
+minreq` default, while an explicit threshold is capped there.
+`PREBUF` and `FLUSH` arm it; `TRIGGER` and
 `DRAIN` release it, including a drain issued while the stream is empty.
+Copying the last private-queue frame into a still-playing device ring does
+not rearm it and does not report `UNDERFLOW`. Each exhausted stream keeps the
+absolute endpoint of the samples the device accepted. A contiguous-output
+refill accepted before the shared playhead reaches that endpoint extends the
+same audible run. A refill after peer-only output is a distinct run and cannot
+erase the earlier gap, even if it enters the ring before the playhead reaches
+that gap. If the playhead reaches an exhausted endpoint first, that stream
+alone underflows and rearms its negotiated threshold even when another stream
+keeps the device running. Each event carries that candidate's exact
+stream-local byte endpoint. One service pass emits at most 32 positions; a
+shared 1,024-record ceiling covers both live discontinuous runs and queued
+event positions. A due candidate keeps its run reservation until the exact
+event replaces it; a full record budget backpressures that stream's next
+discontinuous run rather than dropping, coalescing, or growing another queue.
+`STARTED` for an already accepted later run waits until every older batched
+`UNDERFLOW` position has been emitted.
+Corking preserves the endpoint, but crossing it while the stream remains
+corked consumes the candidate without an event or rearm. Completing an active
+`DRAIN` likewise suppresses the event while acknowledging the drain. Device
+XRUN recovery resolves the accepted endpoints against the discarded device
+epoch rather than inventing a second, device-global underflow rule.
 Device shutdown releases every stream's gate before its bounded drain.
+Because streams share one device ring, an accepted unreleased contribution
+blocks another stream's finite-tail start until the ring is full, that stream
+is explicitly released, or its owner removes it; removal releases unavoidable
+frames already mixed into the shared ring rather than stranding every peer.
+Deletion or disconnect still discards that stream's private, unmixed queue, as
+Pulse stream teardown does; a client that needs its tail played must `DRAIN` or
+keep the stream alive through a bounded downstream-drain interval.
 The mixer neither advances its output clock nor writes a synthetic silent
 period while every stream is empty, corked or below that threshold. Once
 real audio is runnable, the daemon fills every whole-period slot in the
-prepared ALSA ring before `START`; a finite tail shorter than the ring may
-start once the device has accepted the entire tail. The same predicate
-applies after recovery and during shutdown. These are continuity rules,
-not latency polish: starting on the first client fragment makes HDA
-consume faster than cubeb refills and turns one second of valid samples
-into a longer waveform separated by device-sized zero runs.
+prepared ALSA ring before `START`. `TRIGGER`, `DRAIN`, bounded device shutdown,
+an explicit zero prebuffer, or crossing a non-zero prebuffer while the device
+is stopped may release a complete finite tail before that boundary. Reaching a
+negotiated target below one period must also release it, or a grant-respecting
+client can receive neither output nor another grant. A queue that is merely
+empty or below one device period between continuous client writes after START
+is not such a release. An
+unreleased sub-period remainder is not polled as writable: the client socket
+wakes the loop when more audio or a release arrives, and that wake also
+discovers and recovers a device underrun before transferring more samples. A
+period is the maximum transfer size rather than implicit audio. When every
+runnable stream holds less than one period, the mixer writes the largest
+explicitly released tail. A continuous peer contributes across that whole
+interval when it can do so without emptying; otherwise it retains at least one
+frame rather than having its whole available run mistaken for silence. If no
+stream is released, the mixer waits. One client's remainder therefore cannot
+block a peer's `DRAIN`, while neither stream gains invented zero frames. The
+same predicate applies after recovery and during shutdown. These are
+continuity rules, not latency polish: starting on the first fragment, draining
+a continuous
+remainder, or padding its last fragment makes HDA consume faster than cubeb
+refills and turns valid samples into a phase-reset or silence-separated
+waveform. The host oracle refuses a long quiet interval and evaluates the
+overlapping fixed-window waveform independently of a bounded device-recovery
+phase edge;
+it does not claim that a software stack can prevent every emulated HDA XRUN.
 
-**Latency is not polish.** The reported figure must be the client frames
-already accepted, plus the mixer/conversion queue, plus resampler delay,
-plus the frames still in the kernel and device (`SNDRV_PCM_IOCTL_DELAY`),
-every count converted at the actually-negotiated rate. Absent, the audio
+**Latency is not polish.** The reported figure must be the stream frames
+still queued before the mixer, plus any conversion or resampler delay, plus
+`SNDRV_PCM_IOCTL_DELAY`'s complete kernel-and-device delay, every count
+converted at the actually-negotiated rate. The accepted and consumed
+positions travel beside that derived latency. Absent, the audio
 clock never advances and video stalls or free-runs; fabricated, the clock
 is offset by exactly the hidden buffer, which is lip-sync error, jumpy
 seeking, and cubeb sizing its callbacks against a phantom margin.
@@ -7215,12 +7287,16 @@ deliberately slow sink producing underruns — and commit the captures as
 golden fixtures. This is the `.filez` rule again: the bytes in tree are
 the oracle.
 
-**Two commands in the list above are never sent, and capturing is what
-found it.** `pa_context_get_sink_info_by_name` sends `GET_SINK_INFO` (21)
+**Two plausible commands are never sent, and capturing is what found it.**
+`pa_context_get_sink_info_by_name` sends `GET_SINK_INFO` (21)
 with the name and an invalid index rather than `LOOKUP_SINK`; and
 `pa_stream_set_name` sends `UPDATE_PLAYBACK_STREAM_PROPLIST` (81) with a
 `media.name` property rather than `SET_PLAYBACK_STREAM_NAME`. Both
 survive in the protocol for clients older than anything td ships.
+The admitted property is one bounded UTF-8 string with exactly one final NUL
+and none inside it. A raw or interior-NUL value is refused before stream
+identity is allocated; otherwise the stored name and its later tagged reply
+would be different values.
 Implementing the two names above would therefore have added code no
 client exercises while leaving the paths clients actually use unhandled
 — which is the exact failure this capture rule exists to prevent, found
@@ -7274,6 +7350,17 @@ the argument is one type whose length is a tested constant, and no call
 site composes a request or sizes a buffer by hand. Both halves are needed
 and the earlier draft claimed the first covered the second.
 
+`SNDRV_PCM_IOCTL_DELAY` already reports the complete number of frames from
+the application-visible ring through the device output. The `fifo_size` in
+`snd_pcm_hw_params` is the configured FIFO capacity, not its current
+occupancy; adding it to `DELAY` double-counts hardware latency, makes the
+client clock late, and can prevent a bounded drain from ever reaching zero.
+The read-back ring is admitted only through one second at its exact negotiated
+rate. Device shutdown gives that ring one absolute monotonic 1.28-second
+deadline, sampling no faster than every 20 ms even when the PCM remains
+level-writable, before reporting timeout and dropping it. Every admitted ring
+therefore fits inside the drain deadline with explicit scheduler margin.
+
 **Every constant in the two paragraphs above is an x86-64 fact, not
 merely a Linux 7.1.4 fact, and premise 8 makes that worth flagging
 here rather than discovering on the first port.** `snd_pcm_uframes_t` and
@@ -7316,6 +7403,13 @@ single-device fixture. Both remain ordinary file reads — no new
 syscall — and `pcm`'s format is stable and line-oriented. The fallback
 if a line cannot be parsed is to refuse with a diagnostic naming the
 device, never to guess a number.
+
+Implicit selection orders card then device but excludes the exact
+`Loopback PCM` test oracle. The image kernel links `snd-aloop` before HDA and
+the loopback can therefore claim card zero; choosing it by default would make
+successful playback inaudible. Tests that need the capture oracle name its
+card and device explicitly, while a loopback-only machine has no implicit
+audible sink.
 
 **OSS emulation is refused, and the reason matters.** It survives in
 `linux-7.1.4` (`CONFIG_SND_PCM_OSS`, `sound/core/oss/pcm_oss.c`,
@@ -7442,6 +7536,41 @@ frames or any other rate/channel/format. Output volume
 and device selection are session policy, not portal permissions; the
 portal becomes relevant only for capture.
 
+The shared mixer admits at most 128 streams and reserves no more than 64 MiB
+across all queue limits. One connection has a separate 32-stream and 16 MiB
+reservation ceiling, so idle maximum-length streams cannot take every peer's
+queue budget without writing a byte.
+The event loop admits at most 32 complete protocol frames from one client and
+256 across all clients per pass, rotating the first client between passes.
+The 32-client table admits at most four connections from one kernel peer pid.
+When globally full, one listener pass may evict the oldest context with no
+stream, subscription, incomplete or ready input, pending global work, or
+pending output; further connections in that pass are refused. This admits a
+newcomer behind idle contexts without letting one listener wake churn the
+table or discard a live control observer. An incomplete frame has its own
+five-second monotonic deadline. Complete excess frames remain bounded in the
+decoder and force an immediate next pass.
+
+Each session refuses output before its framed buffer would exceed 1 MiB;
+global sink-input replies and subscription fan-out use that same door. The
+daemon retains at most 16 attacker-triggered diagnostics and writes them only
+after the device loop stops. Per-connection channels, process-global
+sink-input ids, mixer stream ids, and client ids stop before reserved wire
+values rather than wrapping onto stale identities. Timing and pending
+`UNDERFLOW` delivery share at most 1024 records per stream, so a stream that
+resumes across a peer's output gap does not claim its earlier device-buffered
+run has played or grow a second queue behind a stalled client.
+A single uid-1000 session is one Pulse authorization domain: any admitted
+client may enumerate another client's sink input and apply the supported
+volume or mute controls, just as an ordinary same-user Pulse control client
+may. The daemon never exposes another stream's samples and v1 exposes no
+capture source. Per-application playback-control isolation would require a
+different authenticated protocol boundary and is not claimed here.
+A final readable AF_UNIX queue is consumed before a simultaneous hangup;
+device loss queues `PLAYBACK_STREAM_KILLED` for one nonblocking attempt and
+then closes, so a backpressured client may observe EOF instead of that
+best-effort event.
+
 **No microphone in v1**: empty source list, `CREATE_RECORD_STREAM`
 refused with a real Pulse error, `/dev/snd` never bound into a jail, and
 the limitation reported explicitly when Firefox asks. This is a
@@ -7468,10 +7597,11 @@ selection for this exact test PCM rather than making it the ordinary default);
 and QEMU's `-audiodev wav` backend on the
 host, playing a deterministic tone through HDA with only QEMU's emulated
 gain/mute mixer disabled, terminating so the WAV header
-finalises, then asserting rate, duration, non-silence and high correlation
-with a sine in the narrow expected physical-output band. The fourth level is
-now rung 27h's Firefox
-Web Audio proof; the loopback level remains lower-level ALSA coverage.
+finalises, then asserting rate, duration, non-silence, bounded internal quiet,
+the median overlapping-window zero-crossing frequency, and high fixed-window
+correlation with a sine in the narrow expected physical-output band. The
+fourth level is now rung 27h's Firefox Web Audio proof; the loopback level
+remains lower-level ALSA coverage.
 `CONFIG_SND_DUMMY` proves only that writes
 were accepted and is an error-path tool, not the oracle.
 

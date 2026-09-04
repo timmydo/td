@@ -236,7 +236,8 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
         let next = arguments.get(index + 1);
         match argument.to_str() {
             Some("--proc") => {
-                options.proc_pcm = PathBuf::from(next.ok_or_else(|| bad("--proc needs a path".into()))?)
+                options.proc_pcm =
+                    PathBuf::from(next.ok_or_else(|| bad("--proc needs a path".into()))?)
             }
             Some("--card") => options.card = Some(number("--card", next)?),
             Some("--device") => options.device = Some(number("--device", next)?),
@@ -245,7 +246,9 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
             Some("--amplitude") => options.amplitude = number("--amplitude", next)?,
             Some("--ms") => options.milliseconds = number("--ms", next)?,
             Some("--wav") => {
-                options.wav = Some(PathBuf::from(next.ok_or_else(|| bad("--wav needs a path".into()))?))
+                options.wav = Some(PathBuf::from(
+                    next.ok_or_else(|| bad("--wav needs a path".into()))?,
+                ))
             }
             Some("--socket") => {
                 options.socket =
@@ -348,8 +351,8 @@ fn render(path: &Path, options: &Options) -> io::Result<()> {
             pcm.extend_from_slice(&sample);
         }
     }
-    let length =
-        u32::try_from(pcm.len()).map_err(|_| bad("a WAVE data chunk cannot exceed 4 GiB".into()))?;
+    let length = u32::try_from(pcm.len())
+        .map_err(|_| bad("a WAVE data chunk cannot exceed 4 GiB".into()))?;
     let mut file = wav::header(spec, length)?;
     file.extend_from_slice(&pcm);
     fs::write(path, &file)
@@ -378,8 +381,8 @@ fn verify_tone(arguments: &[OsString]) -> io::Result<()> {
         .ok_or_else(|| bad("verify-tone needs --wav PATH".into()))?;
     let spec = Spec::fixed();
     let voices = options.voices();
-    let bytes = fs::read(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    let bytes =
+        fs::read(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
     let wave = wav::parse(&bytes)?;
 
     let mut complaints = Vec::new();
@@ -654,13 +657,9 @@ mod tests {
 
     #[test]
     fn probe_accepts_only_its_fixed_socket_option() {
+        assert_eq!(parse_probe(&[]).unwrap(), PathBuf::from(serve::SOCKET_PATH));
         assert_eq!(
-            parse_probe(&[]).unwrap(),
-            PathBuf::from(serve::SOCKET_PATH)
-        );
-        assert_eq!(
-            parse_probe(&[OsString::from("--socket"), OsString::from("/tmp/audio")])
-                .unwrap(),
+            parse_probe(&[OsString::from("--socket"), OsString::from("/tmp/audio")]).unwrap(),
             PathBuf::from("/tmp/audio")
         );
         for bad in [
@@ -725,7 +724,10 @@ mod tests {
     }
 
     fn squeezed() -> String {
-        sources().into_iter().map(|(_, text)| squeeze(text)).collect()
+        sources()
+            .into_iter()
+            .map(|(_, text)| squeeze(text))
+            .collect()
     }
 
     /// The scoped allowance, assembled rather than written out: every string in
@@ -832,8 +834,10 @@ mod tests {
                 on_disk.push(name);
             }
         }
-        let mut scanned: Vec<String> =
-            sources().into_iter().map(|(file, _)| file.to_string()).collect();
+        let mut scanned: Vec<String> = sources()
+            .into_iter()
+            .map(|(file, _)| file.to_string())
+            .collect();
         on_disk.sort();
         scanned.sort();
         assert_eq!(
@@ -1157,7 +1161,8 @@ mod tests {
         // taking them from a variable — a level or option computed at the call
         // site is a different surface that every name-based scan would pass.
         assert_eq!(
-            sys.matches("SYS_GETSOCKOPT,fdasusize,SOL_SOCKET,SO_PEERCRED,").count(),
+            sys.matches("SYS_GETSOCKOPT,fdasusize,SOL_SOCKET,SO_PEERCRED,")
+                .count(),
             1,
             "one getsockopt call site, with the pinned level and option"
         );
@@ -1368,7 +1373,11 @@ mod tests {
             "(SYS_IOCTL,fdasusize,WRITEI_FRAMES,xferi.as_mut_ptr()asusize,)",
             "(SYS_POLL,pollfd.as_mut_ptr()asusize,1,timeout_msasusize,)",
         ];
-        assert_eq!(ARGUMENTS.len(), REQUESTS.len() + 1, "one pin per request, plus poll");
+        assert_eq!(
+            ARGUMENTS.len(),
+            REQUESTS.len() + 1,
+            "one pin per request, plus poll"
+        );
         let sys = squeeze(source("sys.rs"));
         for arguments in ARGUMENTS {
             assert_eq!(
@@ -1377,6 +1386,15 @@ mod tests {
                 "the {CALL} call site is not the pinned one: {arguments}"
             );
         }
+        const GETSOCKOPT: &str = concat!(
+            "(SYS_GETSOCKOPT,fdasusize,SOL_SOCKET,SO_PEERCRED,",
+            "cred.as_mut_ptr()asusize,len.as_mut_ptr()asusize,)"
+        );
+        assert_eq!(
+            sys.matches(&format!("{RAW}{GETSOCKOPT}")).count(),
+            1,
+            "the {RAW} getsockopt call site is not the pinned one"
+        );
     }
 
     /// The raw entry point is private to its module, and annotated.
@@ -1402,7 +1420,11 @@ mod tests {
         // region this scan does not pin.
         assert_eq!(sys.matches(&format!("fn{CALL}(")).count(), 1);
         assert_eq!(
-            sys.matches(&format!("{}fn{CALL}(", concat!("#[allow(un", "safe_code)]"))).count(),
+            sys.matches(&format!(
+                "{}fn{CALL}(",
+                concat!("#[allow(un", "safe_code)]")
+            ))
+            .count(),
             0,
             "the forwarder needs no allowance and must not carry one"
         );

@@ -216,16 +216,26 @@ if (!input) {
       audio.context = context;
       audio.oscillator = oscillator;
       oscillator.frequency.value = 440;
-      gain.gain.value = 0.25;
+      const toneStart = context.currentTime;
+      gain.gain.setValueAtTime(0.25, toneStart);
+      gain.gain.setValueAtTime(0.001, toneStart + 1.2);
       oscillator.connect(gain).connect(context.destination);
       oscillator.addEventListener("ended", () => {
         audio.ended++;
-        context.close().then(() => audio.closed++).catch(error => {
-          audio.error = String(error).slice(0, 128);
-        });
+        // `ended` is the renderer's clock, not proof that cubeb's bounded
+        // socket and device queues have played the last generated frame. Keep
+        // the context alive for one bounded downstream-drain interval.
+        setTimeout(() => {
+          context.close().then(() => audio.closed++).catch(error => {
+            audio.error = String(error).slice(0, 128);
+          });
+        }, 1500);
       }, { once: true });
-      oscillator.start();
-      oscillator.stop(context.currentTime + 1);
+      oscillator.start(toneStart);
+      // Keep cubeb producing through both bounded downstream queues after the
+      // 1.2-second tone. The sub-oracle-floor tail is on the audio clock;
+      // only the host WAV oracle establishes what was played.
+      oscillator.stop(toneStart + 1.7);
     } catch (error) {
       audio.error = String(error).slice(0, 128);
     }
@@ -2620,15 +2630,34 @@ mod tests {
             assert!(CONTENT_ARM_SCRIPT.contains(event));
         }
         assert_eq!(CONTENT_ARM_SCRIPT.matches("new AudioContext").count(), 1);
-        assert_eq!(CONTENT_ARM_SCRIPT.matches("oscillator.start()").count(), 1);
+        assert_eq!(CONTENT_ARM_SCRIPT.matches("oscillator.start(").count(), 1);
         assert_eq!(CONTENT_ARM_SCRIPT.matches("oscillator.stop(").count(), 1);
         let trusted = CONTENT_ARM_SCRIPT.find("if (!event.isTrusted").unwrap();
         let context = CONTENT_ARM_SCRIPT.find("new AudioContext({ sampleRate: 48000 })").unwrap();
-        let start = CONTENT_ARM_SCRIPT.find("oscillator.start()").unwrap();
+        let scheduled_tail = r#"const toneStart = context.currentTime;
+      gain.gain.setValueAtTime(0.25, toneStart);
+      gain.gain.setValueAtTime(0.001, toneStart + 1.2);
+      oscillator.connect(gain).connect(context.destination);"#;
+        assert!(CONTENT_ARM_SCRIPT.contains(scheduled_tail));
+        let start = CONTENT_ARM_SCRIPT.find("oscillator.start(toneStart)").unwrap();
         let stop = CONTENT_ARM_SCRIPT
-            .find("oscillator.stop(context.currentTime + 1)")
+            .find("oscillator.stop(toneStart + 1.7)")
             .unwrap();
         assert!(trusted < context && context < start && start < stop);
+        let close_on_end = r#"oscillator.addEventListener("ended", () => {
+        audio.ended++;
+        // `ended` is the renderer's clock, not proof that cubeb's bounded
+        // socket and device queues have played the last generated frame. Keep
+        // the context alive for one bounded downstream-drain interval.
+        setTimeout(() => {
+          context.close().then(() => audio.closed++).catch(error => {
+            audio.error = String(error).slice(0, 128);
+          });
+        }, 1500);
+      }, { once: true });"#;
+        assert!(CONTENT_ARM_SCRIPT.contains(close_on_end));
+        assert_eq!(CONTENT_ARM_SCRIPT.matches("setTimeout(").count(), 1);
+        assert_eq!(CONTENT_ARM_SCRIPT.matches("context.close()").count(), 1);
         assert!(CONTENT_MENU_SCRIPT.contains("input.value.length <= 4"));
         assert!(CONTENT_MENU_SCRIPT.contains("value => value === \"x\""));
         assert!(CONTENT_MENU_SCRIPT.contains("window.scrollY > 0"));

@@ -74,7 +74,11 @@ impl Wave {
     /// The largest absolute sample. Zero is silence, which §K says is a failure
     /// rather than a pass.
     pub fn peak(&self) -> i32 {
-        self.samples.iter().map(|s| i32::from(*s).abs()).max().unwrap_or(0)
+        self.samples
+            .iter()
+            .map(|s| i32::from(*s).abs())
+            .max()
+            .unwrap_or(0)
     }
 
     /// One channel's samples.
@@ -90,21 +94,30 @@ impl Wave {
 }
 
 fn malformed(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("not a usable WAVE file: {what}"))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("not a usable WAVE file: {what}"),
+    )
 }
 
 fn tag(bytes: &[u8], at: usize) -> io::Result<&[u8]> {
-    bytes.get(at..at.saturating_add(4)).ok_or_else(|| malformed("truncated"))
+    bytes
+        .get(at..at.saturating_add(4))
+        .ok_or_else(|| malformed("truncated"))
 }
 
 fn le_u32(bytes: &[u8], at: usize) -> io::Result<u32> {
-    let slice = bytes.get(at..at.saturating_add(4)).ok_or_else(|| malformed("truncated"))?;
+    let slice = bytes
+        .get(at..at.saturating_add(4))
+        .ok_or_else(|| malformed("truncated"))?;
     let array: [u8; 4] = slice.try_into().map_err(|_| malformed("truncated"))?;
     Ok(u32::from_le_bytes(array))
 }
 
 fn le_u16(bytes: &[u8], at: usize) -> io::Result<u16> {
-    let slice = bytes.get(at..at.saturating_add(2)).ok_or_else(|| malformed("truncated"))?;
+    let slice = bytes
+        .get(at..at.saturating_add(2))
+        .ok_or_else(|| malformed("truncated"))?;
     let array: [u8; 2] = slice.try_into().map_err(|_| malformed("truncated"))?;
     Ok(u16::from_le_bytes(array))
 }
@@ -289,7 +302,10 @@ mod tests {
         assert!(parse(b"RIFF\0\0\0\0NOTAWAVE").is_err());
         let mut headerless = b"RIFF\x24\x00\x00\x00WAVE".to_vec();
         headerless.extend_from_slice(b"data\x00\x00\x00\x00");
-        assert!(parse(&headerless).unwrap_err().to_string().contains("no fmt chunk"));
+        assert!(parse(&headerless)
+            .unwrap_err()
+            .to_string()
+            .contains("no fmt chunk"));
     }
 
     /// Correlation does what the oracle needs: one for the same wave at any
@@ -304,16 +320,32 @@ mod tests {
         assert!((correlation(&expected, &expected) - 1.0).abs() < 1e-9);
 
         let quiet: Vec<i16> = expected.iter().map(|s| s / 4).collect();
-        assert!(correlation(&expected, &quiet) > 0.999, "gain must not matter");
+        assert!(
+            correlation(&expected, &quiet) > 0.999,
+            "gain must not matter"
+        );
 
         let silence = vec![0i16; 4800];
         assert_eq!(correlation(&expected, &silence), 0.0);
 
         // A different frequency: 440 Hz against 997 Hz over a tenth of a second.
         let other: Vec<i16> = (0..4800)
-            .map(|f| Generator::sample_at(spec, Tone { hertz: 997, amplitude: 10000 }, f))
+            .map(|f| {
+                Generator::sample_at(
+                    spec,
+                    Tone {
+                        hertz: 997,
+                        amplitude: 10000,
+                    },
+                    f,
+                )
+            })
             .collect();
-        assert!(correlation(&expected, &other).abs() < 0.1, "{}", correlation(&expected, &other));
+        assert!(
+            correlation(&expected, &other).abs() < 0.1,
+            "{}",
+            correlation(&expected, &other)
+        );
 
         // A deterministic pseudo-random signal, so "not silence" is not enough
         // to pass the oracle.

@@ -87,7 +87,7 @@ pub fn parse(text: &str) -> io::Result<Vec<Playback>> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("{PROC_ASOUND_PCM}:{}: {what}: {line:?}", number + 1),
-                ))
+                ));
             }
         }
     }
@@ -99,13 +99,27 @@ fn parse_line(line: &str) -> Result<Option<Playback>, &'static str> {
     let (address, rest) = line.split_once(": ").ok_or("no 'CC-DD: ' prefix")?;
     let (card, device) = address.split_once('-').ok_or("no card-device address")?;
     let card: u32 = card.parse().map_err(|_| "card number is not a number")?;
-    let device: u32 = device.parse().map_err(|_| "device number is not a number")?;
+    let device: u32 = device
+        .parse()
+        .map_err(|_| "device number is not a number")?;
 
     // `id` and `name` are card-supplied strings that may themselves contain
     // ` : `, so the stream counts are found from the END rather than by
     // splitting the line into fields.
-    let playback = trailing_field(rest, " : playback ")?;
-    let capture = trailing_field(rest, " : capture ")?;
+    // The kernel emits one closed suffix chain: `capture N` at the end,
+    // optionally preceded immediately by `playback N`, or `playback N` at the
+    // end. A digit-looking field inside card text must not become a stream
+    // merely because some unrelated ` : ` field follows it.
+    let capture = terminal_field(rest, " : capture ")?;
+    let playback = match capture {
+        // Card text immediately before a real capture suffix may itself end in
+        // playback-like nonnumeric text. That is capture-only, not a malformed
+        // playback field and certainly not a playback device.
+        Some((_, at)) => {
+            terminal_field(rest.get(..at).unwrap_or(""), " : playback ").unwrap_or(None)
+        }
+        None => terminal_field(rest, " : playback ")?,
+    };
     // Where the real fields begin, not where the first text that looks like one
     // does: `find` here truncated the name of a card whose own name contained
     // the marker, which is the case the parse below exists to survive.
@@ -136,52 +150,34 @@ fn parse_line(line: &str) -> Result<Option<Playback>, &'static str> {
     }))
 }
 
-/// The number following `marker`, and where that field starts, if the marker
-/// appears as a whole trailing field at all.
-fn trailing_field(rest: &str, marker: &str) -> Result<Option<(u32, usize)>, &'static str> {
-    // From the END, and every occurrence rather than only the last. A card name
-    // is arbitrary text from the hardware, so one containing the marker — a
-    // device really called "playback 3 monitor" — has to lose to the real
-    // trailing field rather than beat it.
-    let mut search = rest;
-    let mut rightmost_tail: Option<&str> = None;
-    while let Some(at) = search.rfind(marker) {
-        let tail = rest.get(at + marker.len()..).unwrap_or("");
-        if rightmost_tail.is_none() {
-            rightmost_tail = Some(tail);
-        }
-        let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-        // A real field's count ENDS the field: what follows is the next ` : `
-        // field or the end of the line. Without that, a capture-only card whose
-        // own name contains `" : playback 3 monitor"` reads as a playback device
-        // with three subdevices, and the daemon goes looking for a `...p` node
-        // that does not exist.
-        let after = tail.get(digits.len()..).unwrap_or("");
-        if !digits.is_empty() && (after.is_empty() || after.starts_with(" : ")) {
-            return digits
-                .parse()
-                .map(|count| Some((count, at)))
-                .map_err(|_| "a stream count that does not fit");
-        }
-        search = search.get(..at).unwrap_or("");
+/// The number in an exact terminal field and where that field starts.
+fn terminal_field(rest: &str, marker: &str) -> Result<Option<(u32, usize)>, &'static str> {
+    let Some(at) = rest.rfind(marker) else {
+        return Ok(None);
+    };
+    let tail = rest.get(at + marker.len()..).unwrap_or("");
+    if tail.contains(" : ") {
+        return Ok(None);
     }
-    match rightmost_tail {
-        // Nothing after the rightmost occurrence could be another field, so it
-        // was meant to BE the trailing field, and it is corrupt. §K.4: refuse
-        // with a diagnostic rather than guess.
-        Some(tail) if !tail.contains(" : ") => Err("a stream count that is not a number"),
-        // Every occurrence sat inside a card-supplied string. Refusing here
-        // would make one oddly named card break `devices`, `tone` and `serve`
-        // for every device on the machine.
-        _ => Ok(None),
+    if tail.is_empty() || !tail.chars().all(|character| character.is_ascii_digit()) {
+        return Err("a stream count that is not a number");
     }
+    tail.parse()
+        .map(|count| Some((count, at)))
+        .map_err(|_| "a stream count that does not fit")
 }
 
 /// Card-supplied text reaches diagnostics and, once the protocol lands, sink
 /// descriptions sent to clients. Sanitised here, at the boundary.
 fn sanitise(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
         .collect()
 }
 
@@ -222,9 +218,7 @@ pub fn select(devices: &[Playback], wanted: Option<(u32, u32)>) -> io::Result<&P
     }
     devices
         .iter()
-        .filter(|playback| {
-            playback.id != TEST_LOOPBACK_PCM || playback.name != TEST_LOOPBACK_PCM
-        })
+        .filter(|playback| playback.id != TEST_LOOPBACK_PCM || playback.name != TEST_LOOPBACK_PCM)
         .min_by_key(|p| (p.card, p.device))
         .ok_or_else(|| {
             io::Error::new(
@@ -269,7 +263,10 @@ mod tests {
         let devices = parse(REAL).unwrap();
         assert_eq!(devices.len(), 4, "the capture-only device must not appear");
         assert!(!devices.iter().any(|p| p.card == 1 && p.device == 2));
-        let analog = devices.iter().find(|p| p.card == 1 && p.device == 0).unwrap();
+        let analog = devices
+            .iter()
+            .find(|p| p.card == 1 && p.device == 0)
+            .unwrap();
         assert_eq!(analog.name, "ALC1220 Analog");
         assert_eq!(analog.subdevices, 1);
         assert_eq!(analog.capture_subdevices, 1);
@@ -285,7 +282,11 @@ mod tests {
     #[test]
     fn the_device_number_is_not_zero_on_a_real_card() {
         let devices = parse(REAL).unwrap();
-        let card0: Vec<u32> = devices.iter().filter(|p| p.card == 0).map(|p| p.device).collect();
+        let card0: Vec<u32> = devices
+            .iter()
+            .filter(|p| p.card == 0)
+            .map(|p| p.device)
+            .collect();
         assert_eq!(card0, vec![3, 7]);
         assert!(!card0.contains(&0));
     }
@@ -332,17 +333,47 @@ mod tests {
     fn the_qemu_and_loopback_fixtures_parse() {
         let hda = parse(QEMU_HDA).unwrap();
         assert_eq!(hda.len(), 1);
-        assert_eq!(hda.first().unwrap().node().to_string_lossy(), "/dev/snd/pcmC0D0p");
+        assert_eq!(
+            hda.first().unwrap().node().to_string_lossy(),
+            "/dev/snd/pcmC0D0p"
+        );
         let loop_devices = parse(ALOOP).unwrap();
         assert_eq!(loop_devices.len(), 2);
         assert_eq!(loop_devices.first().unwrap().subdevices, 8);
+    }
+
+    /// `snd-aloop` is linked before HDA in the image kernel and can therefore
+    /// claim card zero. It remains explicitly selectable for capture tests,
+    /// but ordinary playback must reach the audible HDA device.
+    #[test]
+    fn the_test_loopback_is_not_the_default_sink() {
+        let devices = parse(
+            "00-00: Loopback PCM : Loopback PCM : playback 8 : capture 8\n\
+             00-01: Loopback PCM : Loopback PCM : playback 8 : capture 8\n\
+             01-00: ALC262 Analog : ALC262 Analog : playback 1 : capture 1\n",
+        )
+        .unwrap();
+        let default = select(&devices, None).unwrap();
+        assert_eq!((default.card, default.device), (1, 0));
+        let oracle = select(&devices, Some((0, 0))).unwrap();
+        assert_eq!(oracle.id, "Loopback PCM");
+    }
+
+    #[test]
+    fn a_loopback_only_machine_requires_explicit_selection() {
+        let devices = parse(ALOOP).unwrap();
+        let error = select(&devices, None).unwrap_err();
+        assert!(error.to_string().contains("no non-test playback device"));
+        assert_eq!(select(&devices, Some((0, 1))).unwrap().device, 1);
     }
 
     #[test]
     fn an_empty_table_refuses_rather_than_inventing_a_device() {
         assert!(parse("").unwrap().is_empty());
         let err = select(&[], None).unwrap_err();
-        assert!(err.to_string().contains("lists no non-test playback device"));
+        assert!(err
+            .to_string()
+            .contains("lists no non-test playback device"));
     }
 
     /// §K.4's rule, tested: an unparseable line is refused with the line in the
@@ -351,16 +382,31 @@ mod tests {
     fn a_line_that_does_not_parse_is_refused_by_name() {
         for (bad, why) in [
             ("00: HDMI : HDMI : playback 1", "no card-device address"),
-            ("xx-03: HDMI : HDMI : playback 1", "card number is not a number"),
-            ("00-yy: HDMI : HDMI : playback 1", "device number is not a number"),
-            ("00-03: HDMI : HDMI : playback many", "a stream count that is not a number"),
-            ("00-03: HDMI : HDMI : playback 0", "a playback device with no subdevices"),
+            (
+                "xx-03: HDMI : HDMI : playback 1",
+                "card number is not a number",
+            ),
+            (
+                "00-yy: HDMI : HDMI : playback 1",
+                "device number is not a number",
+            ),
+            (
+                "00-03: HDMI : HDMI : playback many",
+                "a stream count that is not a number",
+            ),
+            (
+                "00-03: HDMI : HDMI : playback 0",
+                "a playback device with no subdevices",
+            ),
             ("garbage", "no 'CC-DD: ' prefix"),
         ] {
             let err = parse(bad).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert!(err.to_string().contains(why), "{bad:?} -> {err}");
-            assert!(err.to_string().contains(bad), "the line must be quoted: {err}");
+            assert!(
+                err.to_string().contains(bad),
+                "the line must be quoted: {err}"
+            );
         }
     }
 
@@ -389,6 +435,12 @@ mod tests {
             "the name was cut at the first marker: {:?}",
             found.name
         );
+    }
+
+    #[test]
+    fn a_digit_field_inside_capture_only_card_text_is_not_playback() {
+        let line = "01-00: USBmic : Cheap : playback 3 : monitor : capture 1";
+        assert!(parse(line).unwrap().is_empty());
     }
 
     /// A card name containing the field separator does not shift the counts:

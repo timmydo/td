@@ -19,16 +19,16 @@
 //! candidate packet carried. The error codes were established the same way, by
 //! answering a request with `ERROR` and reading `pa_context_errno` back.
 //!
-//! Two commands §K.3's playback list names are NOT in this table, and their
-//! absence is a finding rather than an omission. §K.3 lists `LOOKUP_SINK` and
-//! `SET_PLAYBACK_STREAM_NAME` among the commands playback needs; libpulse 16.1
-//! at protocol 35 never sends either. `pa_context_get_sink_info_by_name` sends
-//! `GET_SINK_INFO` with the name and an invalid index, and `pa_stream_set_name`
-//! sends `UPDATE_PLAYBACK_STREAM_PROPLIST` with a `media.name` property — the
+//! Two plausible commands are NOT in this table, and their absence is a
+//! finding rather than an omission. Libpulse 16.1 at protocol 35 never sends
+//! `LOOKUP_SINK` or `SET_PLAYBACK_STREAM_NAME`.
+//! `pa_context_get_sink_info_by_name` sends `GET_SINK_INFO` with the name and
+//! an invalid index, and `pa_stream_set_name` sends
+//! `UPDATE_PLAYBACK_STREAM_PROPLIST` with a `media.name` property — the
 //! captured packet for the second is in this module's tests. Implementing the
-//! two named commands would have added code no client exercises while leaving
-//! the paths clients actually use unhandled, which is the exact failure §K.3's
-//! capture rule exists to prevent.
+//! two unused commands would have added code no client exercises while
+//! leaving the paths clients actually use unhandled, which is the exact
+//! failure §K.3's capture rule exists to prevent.
 
 /// The version this server advertises. §K.3: "A lower version would shrink the
 /// schemas but steer clients into downgrade paths nothing in the ecosystem
@@ -373,14 +373,16 @@ mod tests {
         /// `GET_PLAYBACK_LATENCY`, tag 14: channel, then a client timeval.
         pub const GET_PLAYBACK_LATENCY: &str = "4c0000000e4c0000000e4c00000000546a986546000c2970";
         /// `GET_SINK_INFO` by name, tag 5: an invalid index, then the name.
-        pub const GET_SINK_INFO_BY_NAME: &str = "4c000000154c000000054cffffffff7474642d617564696f00";
+        pub const GET_SINK_INFO_BY_NAME: &str =
+            "4c000000154c000000054cffffffff7474642d617564696f00";
         /// `GET_SINK_INFO` by index, tag 6: the index, then a NULL string.
         pub const GET_SINK_INFO_BY_INDEX: &str = "4c000000154c000000064c000000004e";
         /// `GET_SINK_INPUT_INFO`, tag 18.
         pub const GET_SINK_INPUT_INFO: &str = "4c0000001d4c000000124c00000000";
         /// `SET_SINK_INPUT_VOLUME`, tag 16: index, then a two-channel cvolume
         /// of half `PA_VOLUME_NORM`.
-        pub const SET_SINK_INPUT_VOLUME: &str = "4c000000254c000000104c0000000076020000800000008000";
+        pub const SET_SINK_INPUT_VOLUME: &str =
+            "4c000000254c000000104c0000000076020000800000008000";
         /// `CORK_PLAYBACK_STREAM` with `false` — uncork, tag 9.
         pub const UNCORK: &str = "4c000000294c000000094c0000000030";
         /// `CORK_PLAYBACK_STREAM` with `true` — cork, tag 10.
@@ -406,18 +408,36 @@ mod tests {
     #[test]
     fn every_pinned_command_matches_its_captured_packet() {
         let cases: [(&str, u32); 12] = [
-            (captured::GET_PLAYBACK_LATENCY, command::GET_PLAYBACK_LATENCY),
+            (
+                captured::GET_PLAYBACK_LATENCY,
+                command::GET_PLAYBACK_LATENCY,
+            ),
             (captured::GET_SINK_INFO_BY_NAME, command::GET_SINK_INFO),
             (captured::GET_SINK_INFO_BY_INDEX, command::GET_SINK_INFO),
             (captured::GET_SINK_INPUT_INFO, command::GET_SINK_INPUT_INFO),
-            (captured::SET_SINK_INPUT_VOLUME, command::SET_SINK_INPUT_VOLUME),
+            (
+                captured::SET_SINK_INPUT_VOLUME,
+                command::SET_SINK_INPUT_VOLUME,
+            ),
             (captured::UNCORK, command::CORK_PLAYBACK_STREAM),
             (captured::CORK, command::CORK_PLAYBACK_STREAM),
-            (captured::FLUSH_PLAYBACK_STREAM, command::FLUSH_PLAYBACK_STREAM),
-            (captured::TRIGGER_PLAYBACK_STREAM, command::TRIGGER_PLAYBACK_STREAM),
-            (captured::PREBUF_PLAYBACK_STREAM, command::PREBUF_PLAYBACK_STREAM),
+            (
+                captured::FLUSH_PLAYBACK_STREAM,
+                command::FLUSH_PLAYBACK_STREAM,
+            ),
+            (
+                captured::TRIGGER_PLAYBACK_STREAM,
+                command::TRIGGER_PLAYBACK_STREAM,
+            ),
+            (
+                captured::PREBUF_PLAYBACK_STREAM,
+                command::PREBUF_PLAYBACK_STREAM,
+            ),
             (captured::SET_SINK_INPUT_MUTE, command::SET_SINK_INPUT_MUTE),
-            (captured::RENAME_VIA_PROPLIST, command::UPDATE_PLAYBACK_STREAM_PROPLIST),
+            (
+                captured::RENAME_VIA_PROPLIST,
+                command::UPDATE_PLAYBACK_STREAM_PROPLIST,
+            ),
         ];
         for (hex, expected) in cases {
             let bytes = unhex(hex);
@@ -483,8 +503,8 @@ mod tests {
         reader.finish().unwrap();
     }
 
-    /// §K.3 lists `SET_PLAYBACK_STREAM_NAME`; the wire says otherwise. This is
-    /// the captured proof behind `K3_AMENDMENTS`.
+    /// The wire uses a property update, not `SET_PLAYBACK_STREAM_NAME`. This
+    /// is the captured proof behind §K.3's command list.
     #[test]
     fn renaming_a_stream_arrives_as_a_proplist_update() {
         let bytes = unhex(captured::RENAME_VIA_PROPLIST);
@@ -520,7 +540,10 @@ mod tests {
         let old_client_with_shm = FLAG_SHM | 13;
         assert_eq!(negotiate(old_client_with_shm), 13);
         assert_eq!(old_client_with_shm.min(VERSION), VERSION, "the bug, pinned");
-        assert_ne!(negotiate(old_client_with_shm), old_client_with_shm.min(VERSION));
+        assert_ne!(
+            negotiate(old_client_with_shm),
+            old_client_with_shm.min(VERSION)
+        );
         // And a client newer than this server is parsed at this server.
         assert_eq!(negotiate(FLAG_MEMFD | 40), 35);
     }
@@ -561,7 +584,11 @@ mod tests {
         assert_eq!(error::ACCESS, 1, "reported as \"Access denied\"");
         assert_eq!(error::INVALID, 3, "reported as \"Invalid argument\"");
         assert_eq!(error::NOENTITY, 5, "reported as \"No such entity\"");
-        assert_eq!(error::NOTIMPLEMENTED, 23, "reported as \"Missing implementation\"");
+        assert_eq!(
+            error::NOTIMPLEMENTED,
+            23,
+            "reported as \"Missing implementation\""
+        );
         // The neighbour that a from-memory table gets wrong: NOTSUPPORTED is
         // 19, and answering an unimplemented command with 19 tells the client
         // the wrong thing.
@@ -579,8 +606,14 @@ mod tests {
         );
         // An event word splits into a facility and a type.
         let event = subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE;
-        assert_eq!(event & subscription::EVENT_FACILITY_MASK, subscription::EVENT_SINK_INPUT);
-        assert_eq!(event & subscription::EVENT_TYPE_MASK, subscription::EVENT_CHANGE);
+        assert_eq!(
+            event & subscription::EVENT_FACILITY_MASK,
+            subscription::EVENT_SINK_INPUT
+        );
+        assert_eq!(
+            event & subscription::EVENT_TYPE_MASK,
+            subscription::EVENT_CHANGE
+        );
         assert_eq!(subscription::EVENT_NEW, 0);
         assert_ne!(subscription::EVENT_REMOVE, subscription::EVENT_CHANGE);
     }
@@ -645,7 +678,9 @@ mod tests {
             rate: 48_000,
         };
         let mut writer = tag::Writer::new();
-        writer.sample_spec(spec).channel_map(&[format::FRONT_LEFT, format::FRONT_RIGHT]);
+        writer
+            .sample_spec(spec)
+            .channel_map(&[format::FRONT_LEFT, format::FRONT_RIGHT]);
         let bytes = writer.into_bytes();
         let mut reader = tag::Reader::new(&bytes);
         assert_eq!(reader.sample_spec().unwrap(), spec);

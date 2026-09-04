@@ -456,8 +456,11 @@ identified as such rather than assigned a neighboring symbol.
 Captures live under `/var/lib/td-profiler/captures`. At rotation the collector
 hands its bounded in-memory roster to the processing worker and immediately
 returns to draining. The worker writes a new directory with a `.partial`
-suffix and fsyncs that parent-directory entry. Readers ignore `.partial` and
-`.quarantine` directories.
+suffix and fsyncs that parent-directory entry. No reader treats `.partial` or
+`.quarantine` as a completed report. The trusted evidence wait inventories the
+newest well-formed current-boot partial solely for a qualified timeout
+diagnostic; a malformed partial remains a structural diagnostic and takes
+priority over that unpublished-candidate context.
 Publication writes and fsyncs every file including the manifest, fsyncs the
 partial directory, atomically renames it, and then fsyncs the parent `captures`
 directory. A completed capture contains:
@@ -743,14 +746,18 @@ design:
    per-task snapshot failure and pin the three-attempt nonzero failure path.
    The system test proves the daemon produces a complete manifest and
    AI-readable summaries for a known CPU workload. On the exact QEMU autotest
-   kernel token, the trusted evidence process spends the capture interval in a
-   no-inline named function. It reads the persisted `lines.jsonl` and emits a
-   distinct host marker only after a row attributes samples to that function,
+   kernel token, the trusted evidence process may spend each bounded wait
+   iteration in a no-inline named function, alternating equal work and rest
+   slices until the report is published or the token-only 900-second ceiling
+   expires. Ordinary evidence retains a 300-second image wait and does not run
+   the synthetic workload. The proof reads the persisted `lines.jsonl` and
+   emits a distinct host marker only after a row attributes samples to that
+   function,
    the line-table-local `evidence.rs` source emitted by the bounded DWARF-v4
    reader, and a line inside the function. Rejected completed captures are
-   immutable and scanned only once, and the workload alternates equal work and
-   rest slices. Its hot loop uses primitive shift/XOR instructions attributed
-   directly to `evidence.rs`; an inlined library intrinsic whose machine code
+   immutable and scanned only once. Its hot loop uses primitive shift/XOR
+   instructions attributed directly to `evidence.rs`; an inlined library
+   intrinsic whose machine code
    carries the library's source location is not valid evidence. Normal boots do
    not run the synthetic workload and retain the generic complete-capture
    evidence path. Both evidence paths require zero lost and corrupt perf

@@ -98,7 +98,10 @@ const IOC_TYPE_A: u32 = 0x41;
 /// cannot be reached with a bad value (`assert!` in a const context is a
 /// compile error, not a runtime panic, when the argument is a constant).
 const fn ioc(dir: u32, nr: u32, size: usize) -> usize {
-    assert!(size <= 0x3fff, "an ioctl argument does not fit _IOC_SIZEBITS");
+    assert!(
+        size <= 0x3fff,
+        "an ioctl argument does not fit _IOC_SIZEBITS"
+    );
     ((dir << 30) | ((size as u32) << 16) | (IOC_TYPE_A << 8) | nr) as usize
 }
 
@@ -496,9 +499,20 @@ pub fn writei(fd: RawFd, frame_bytes: FrameBytes, buf: &[u8], frames: usize) -> 
         WRITEI_FRAMES,
         xferi.as_mut_ptr() as usize,
     ))?;
-    let accepted = read_i64(&xferi, 0)?;
-    usize::try_from(accepted)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative accepted frame count"))
+    accepted_frames(read_i64(&xferi, 0)?, frames)
+}
+
+/// Validate the kernel-written transfer result before it reaches any clock.
+fn accepted_frames(result: i64, offered: usize) -> io::Result<usize> {
+    let accepted = usize::try_from(result)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative accepted frame count"))?;
+    if accepted > offered {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WRITEI_FRAMES accepted more frames than were offered",
+        ));
+    }
+    Ok(accepted)
 }
 
 /// `poll(&pollfd, 1, timeout_ms)` on a playback PCM.
@@ -603,9 +617,18 @@ pub struct Interest {
 }
 
 impl Interest {
-    pub const READ: Self = Self { readable: true, writable: false };
-    pub const WRITE: Self = Self { readable: false, writable: true };
-    pub const BOTH: Self = Self { readable: true, writable: true };
+    pub const READ: Self = Self {
+        readable: true,
+        writable: false,
+    };
+    pub const WRITE: Self = Self {
+        readable: false,
+        writable: true,
+    };
+    pub const BOTH: Self = Self {
+        readable: true,
+        writable: true,
+    };
 
     fn events(self) -> i16 {
         let mut events = 0;
@@ -739,7 +762,9 @@ fn write_i16(bytes: &mut [u8], at: usize, value: i16) -> io::Result<()> {
 }
 
 fn read_i16(bytes: &[u8], at: usize) -> io::Result<i16> {
-    let slice = bytes.get(at..at.saturating_add(2)).ok_or_else(out_of_bounds)?;
+    let slice = bytes
+        .get(at..at.saturating_add(2))
+        .ok_or_else(out_of_bounds)?;
     let array: [u8; 2] = slice
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short read"))?;
@@ -747,7 +772,9 @@ fn read_i16(bytes: &[u8], at: usize) -> io::Result<i16> {
 }
 
 fn read_i32(bytes: &[u8], at: usize) -> io::Result<i32> {
-    let slice = bytes.get(at..at.saturating_add(4)).ok_or_else(out_of_bounds)?;
+    let slice = bytes
+        .get(at..at.saturating_add(4))
+        .ok_or_else(out_of_bounds)?;
     let array: [u8; 4] = slice
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short read"))?;
@@ -755,7 +782,9 @@ fn read_i32(bytes: &[u8], at: usize) -> io::Result<i32> {
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> io::Result<u32> {
-    let slice = bytes.get(at..at.saturating_add(4)).ok_or_else(out_of_bounds)?;
+    let slice = bytes
+        .get(at..at.saturating_add(4))
+        .ok_or_else(out_of_bounds)?;
     let array: [u8; 4] = slice
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short read"))?;
@@ -763,7 +792,9 @@ fn read_u32(bytes: &[u8], at: usize) -> io::Result<u32> {
 }
 
 fn read_i64(bytes: &[u8], at: usize) -> io::Result<i64> {
-    let slice = bytes.get(at..at.saturating_add(8)).ok_or_else(out_of_bounds)?;
+    let slice = bytes
+        .get(at..at.saturating_add(8))
+        .ok_or_else(out_of_bounds)?;
     let array: [u8; 8] = slice
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short read"))?;
@@ -846,7 +877,10 @@ mod tests {
             "a regular file must answer ENOTTY (25), not {err}"
         );
         let mut params = HwParams::zeroed();
-        assert_eq!(hw_params(fd, &mut params).unwrap_err().raw_os_error(), Some(25));
+        assert_eq!(
+            hw_params(fd, &mut params).unwrap_err().raw_os_error(),
+            Some(25)
+        );
         assert_eq!(prepare(fd).unwrap_err().raw_os_error(), Some(25));
         assert_eq!(delay(fd).unwrap_err().raw_os_error(), Some(25));
         let _ = std::fs::remove_file(&path);
@@ -892,7 +926,11 @@ mod tests {
         // ...and a device that is gone is gone, whatever else it says.
         assert_eq!(classify(POLLOUT | POLLERR | POLLHUP), Ready::Gone);
         // Nothing this daemon does not ask for is mistaken for readiness.
-        assert_eq!(classify(0x0001), Ready::Timeout, "POLLIN is not writability");
+        assert_eq!(
+            classify(0x0001),
+            Ready::Timeout,
+            "POLLIN is not writability"
+        );
     }
 
     /// `writei` refuses a frame count its buffer cannot back, BEFORE the kernel
@@ -919,6 +957,20 @@ mod tests {
         assert!(writei(-1, widest, &buf, usize::MAX / 2).is_err());
     }
 
+    #[test]
+    fn writei_refuses_an_impossible_kernel_result() {
+        assert_eq!(accepted_frames(0, 4).unwrap(), 0);
+        assert_eq!(accepted_frames(4, 4).unwrap(), 4);
+        assert_eq!(
+            accepted_frames(-1, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            accepted_frames(5, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     /// The frame size can only be built from what the DEVICE reported, and two
     /// classes of readback are refused outright: zero, and a frame that is not
     /// a whole number of bytes.
@@ -935,8 +987,14 @@ mod tests {
     /// still has the kernel read past the end of the buffer.
     #[test]
     fn a_frame_size_can_only_come_from_the_devices_own_answer() {
-        assert_eq!(FrameBytes::from_frame_bits(32).map(FrameBytes::get), Some(4));
-        assert_eq!(FrameBytes::from_frame_bits(16).map(FrameBytes::get), Some(2));
+        assert_eq!(
+            FrameBytes::from_frame_bits(32).map(FrameBytes::get),
+            Some(4)
+        );
+        assert_eq!(
+            FrameBytes::from_frame_bits(16).map(FrameBytes::get),
+            Some(2)
+        );
         assert_eq!(FrameBytes::from_frame_bits(8).map(FrameBytes::get), Some(1));
         // Zero is not a frame size: every transfer bound would be zero and the
         // kernel would read whatever the device's real size says.

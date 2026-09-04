@@ -288,15 +288,22 @@ const FIREFOX_AUDIO_MIN_HZ: f64 = 435.0;
 const FIREFOX_AUDIO_MAX_HZ: f64 = 445.0;
 const FIREFOX_AUDIO_HZ_STEP: f64 = 0.25;
 const FIREFOX_AUDIO_MIN_ACTIVE_MS: u64 = 900;
-const FIREFOX_AUDIO_MAX_ACTIVE_MS: u64 = 1_100;
+const FIREFOX_AUDIO_MAX_ACTIVE_MS: u64 = 1_300;
 const FIREFOX_AUDIO_ACTIVE_FLOOR: i32 = 256;
+const FIREFOX_AUDIO_MAX_INTERNAL_QUIET_FRAMES: usize = 64;
+const FIREFOX_AUDIO_FIT_WINDOW_FRAMES: usize = 4_800;
+const FIREFOX_AUDIO_FIT_STRIDE_FRAMES: usize = FIREFOX_AUDIO_FIT_WINDOW_FRAMES / 2;
 const FIREFOX_AUDIO_MIN_PEAK: i32 = 1_000;
 const FIREFOX_AUDIO_MIN_AC_RMS: f64 = 1_000.0;
-const FIREFOX_AUDIO_MIN_CORRELATION: f64 = 0.9;
+const FIREFOX_AUDIO_MIN_MEAN_CORRELATION: f64 = 0.85;
+const FIREFOX_AUDIO_MIN_WINDOW_CORRELATION: f64 = 0.9;
+const FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS: usize = 7;
+const FIREFOX_AUDIO_MAX_TRANSIENT_RUNS: usize = 2;
 const FIREFOX_AUDIO_CAPTURE_MARGIN_SECS: u64 = 2;
-/// At 48 kHz stereo S16, the physical-input boot's 2,355-second host timeout
-/// produces under 432 MiB. QEMU records leading/trailing silence too, so the
-/// disk ceiling covers that whole bound while verification streams it.
+/// At 48 kHz stereo S16, the physical-input boot's host timeout remains below
+/// the 512 MiB absolute capture ceiling. QEMU records leading/trailing silence
+/// too, so the disk ceiling covers that whole bound while verification streams
+/// it.
 const MAX_AUDIO_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
 const QMP_OUTPUT_HEIGHT: u32 = 800;
 const PORTAL_CLIENT_X: usize = 160;
@@ -497,10 +504,16 @@ struct FirefoxAudioEvidence {
     active_ms: u64,
     peak: i32,
     fitted_hz: f64,
+    left_crossing_hz: f64,
+    right_crossing_hz: f64,
     left_ac_rms: f64,
     right_ac_rms: f64,
     left_correlation: f64,
     right_correlation: f64,
+    left_transient_windows: usize,
+    right_transient_windows: usize,
+    left_transient_runs: usize,
+    right_transient_runs: usize,
 }
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
@@ -1383,14 +1396,20 @@ fn validate_firefox_input(result: &BootResult) -> Result<(), String> {
     match &result.firefox_audio {
         FirefoxAudioCapture::Verified(audio) => {
             println!(
-                "   [firefox-audio] {FIREFOX_AUDIO_RATE} Hz stereo, {} ms active, peak {}, fitted {:.2} Hz, AC RMS {:.1}/{:.1}, correlations {:.4}/{:.4}",
+                "   [firefox-audio] {FIREFOX_AUDIO_RATE} Hz stereo, {} ms active, peak {}, fitted {:.2} Hz, zero-crossing {:.2}/{:.2} Hz, AC RMS {:.1}/{:.1}, mean window correlations {:.4}/{:.4}, transient windows {}/{} in {}/{} runs",
                 audio.active_ms,
                 audio.peak,
                 audio.fitted_hz,
+                audio.left_crossing_hz,
+                audio.right_crossing_hz,
                 audio.left_ac_rms,
                 audio.right_ac_rms,
                 audio.left_correlation,
-                audio.right_correlation
+                audio.right_correlation,
+                audio.left_transient_windows,
+                audio.right_transient_windows,
+                audio.left_transient_runs,
+                audio.right_transient_runs
             );
         }
         FirefoxAudioCapture::Invalid(error) => {
@@ -3905,24 +3924,121 @@ struct FirefoxToneFit {
     right_correlation: f64,
     left_ac_rms: f64,
     right_ac_rms: f64,
+    left_transient_windows: usize,
+    right_transient_windows: usize,
+    left_transient_runs: usize,
+    right_transient_runs: usize,
+}
+
+fn channel_ac_rms(data: &[u8], frames: usize, channel: usize) -> Result<f64, String> {
+    if frames == 0 {
+        return Ok(0.0);
+    }
+    let mut sum = 0.0_f64;
+    let mut sum_sq = 0.0_f64;
+    for frame in 0..frames {
+        let sample = f64::from(wav_sample(data, frame, channel)?);
+        sum += sample;
+        sum_sq += sample * sample;
+    }
+    let count = frames as f64;
+    Ok((sum_sq - sum * sum / count).max(0.0).sqrt() / count.sqrt())
+}
+
+fn firefox_audio_window_layout(frames: usize) -> Result<(usize, usize, usize), String> {
+    let Some(after_first) = frames.checked_sub(FIREFOX_AUDIO_FIT_WINDOW_FRAMES) else {
+        return Err("the bounded Firefox audio analysis has no complete window".to_string());
+    };
+    let regular = after_first / FIREFOX_AUDIO_FIT_STRIDE_FRAMES + 1;
+    let last_regular_start = regular
+        .saturating_sub(1)
+        .saturating_mul(FIREFOX_AUDIO_FIT_STRIDE_FRAMES);
+    let terminal_start = frames.saturating_sub(FIREFOX_AUDIO_FIT_WINDOW_FRAMES);
+    let windows = regular.saturating_add(usize::from(terminal_start != last_regular_start));
+    Ok((regular, terminal_start, windows))
+}
+
+fn firefox_audio_window_start(window: usize, regular: usize, terminal_start: usize) -> usize {
+    if window < regular {
+        window.saturating_mul(FIREFOX_AUDIO_FIT_STRIDE_FRAMES)
+    } else {
+        terminal_start
+    }
 }
 
 fn fit_firefox_tone(data: &[u8], frames: usize) -> Result<FirefoxToneFit, String> {
+    let (regular_windows, terminal_start, windows) = firefox_audio_window_layout(frames)?;
+    let left_ac_rms = channel_ac_rms(data, frames, 0)?;
+    let right_ac_rms = channel_ac_rms(data, frames, 1)?;
     let steps =
         ((FIREFOX_AUDIO_MAX_HZ - FIREFOX_AUDIO_MIN_HZ) / FIREFOX_AUDIO_HZ_STEP).round() as u32;
     let mut best: Option<FirefoxToneFit> = None;
     for step in 0..=steps {
         let hertz = FIREFOX_AUDIO_MIN_HZ + f64::from(step) * FIREFOX_AUDIO_HZ_STEP;
-        let (left_correlation, left_ac_rms) =
-            phase_independent_tone_correlation(data, frames, 0, hertz)?;
-        let (right_correlation, right_ac_rms) =
-            phase_independent_tone_correlation(data, frames, 1, hertz)?;
+        let mut left_correlation = 0.0;
+        let mut right_correlation = 0.0;
+        let mut left_transient_windows = 0usize;
+        let mut right_transient_windows = 0usize;
+        let mut left_transient_runs = 0usize;
+        let mut right_transient_runs = 0usize;
+        let mut left_transient = false;
+        let mut right_transient = false;
+        for window in 0..windows {
+            let first = firefox_audio_window_start(window, regular_windows, terminal_start);
+            let first_byte = first.saturating_mul(4);
+            let last_byte = first
+                .saturating_add(FIREFOX_AUDIO_FIT_WINDOW_FRAMES)
+                .saturating_mul(4);
+            let samples = data
+                .get(first_byte..last_byte)
+                .ok_or_else(|| "the bounded Firefox tone window is truncated".to_string())?;
+            let left_window = phase_independent_tone_correlation(
+                samples,
+                FIREFOX_AUDIO_FIT_WINDOW_FRAMES,
+                0,
+                hertz,
+            )?
+            .0;
+            let right_window = phase_independent_tone_correlation(
+                samples,
+                FIREFOX_AUDIO_FIT_WINDOW_FRAMES,
+                1,
+                hertz,
+            )?
+            .0;
+            left_correlation += left_window;
+            right_correlation += right_window;
+            if left_window < FIREFOX_AUDIO_MIN_WINDOW_CORRELATION {
+                left_transient_windows = left_transient_windows.saturating_add(1);
+                if !left_transient {
+                    left_transient_runs = left_transient_runs.saturating_add(1);
+                }
+                left_transient = true;
+            } else {
+                left_transient = false;
+            }
+            if right_window < FIREFOX_AUDIO_MIN_WINDOW_CORRELATION {
+                right_transient_windows = right_transient_windows.saturating_add(1);
+                if !right_transient {
+                    right_transient_runs = right_transient_runs.saturating_add(1);
+                }
+                right_transient = true;
+            } else {
+                right_transient = false;
+            }
+        }
+        left_correlation /= windows as f64;
+        right_correlation /= windows as f64;
         let candidate = FirefoxToneFit {
             hertz,
             left_correlation,
             right_correlation,
             left_ac_rms,
             right_ac_rms,
+            left_transient_windows,
+            right_transient_windows,
+            left_transient_runs,
+            right_transient_runs,
         };
         let candidate_score = left_correlation.min(right_correlation);
         let best_score = best
@@ -3933,6 +4049,100 @@ fn fit_firefox_tone(data: &[u8], frames: usize) -> Result<FirefoxToneFit, String
         }
     }
     best.ok_or_else(|| "the bounded Firefox tone fit had no candidates".to_string())
+}
+
+fn validate_firefox_tone_correlation(fit: FirefoxToneFit) -> Result<(), String> {
+    if fit.left_correlation < FIREFOX_AUDIO_MIN_MEAN_CORRELATION
+        || fit.right_correlation < FIREFOX_AUDIO_MIN_MEAN_CORRELATION
+    {
+        return Err(format!(
+            "QEMU WAV best {FIREFOX_AUDIO_MIN_HZ:.0}..={FIREFOX_AUDIO_MAX_HZ:.0} Hz fit is \
+             {:.2} Hz with mean window correlations {:.4}/{:.4}, below \
+             {FIREFOX_AUDIO_MIN_MEAN_CORRELATION:.2}",
+            fit.hertz, fit.left_correlation, fit.right_correlation
+        ));
+    }
+    if fit.left_transient_windows > FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS
+        || fit.right_transient_windows > FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS
+        || fit.left_transient_runs > FIREFOX_AUDIO_MAX_TRANSIENT_RUNS
+        || fit.right_transient_runs > FIREFOX_AUDIO_MAX_TRANSIENT_RUNS
+    {
+        return Err(format!(
+            "QEMU WAV fit has {}/{} windows below {:.1} in {}/{} runs; limits are \
+             {FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS} windows and \
+             {FIREFOX_AUDIO_MAX_TRANSIENT_RUNS} runs per channel",
+            fit.left_transient_windows,
+            fit.right_transient_windows,
+            FIREFOX_AUDIO_MIN_WINDOW_CORRELATION,
+            fit.left_transient_runs,
+            fit.right_transient_runs
+        ));
+    }
+    Ok(())
+}
+
+fn window_zero_crossing_hertz(data: &[u8], frames: usize, channel: usize) -> Result<f64, String> {
+    let mut prior = wav_sample(data, 0, channel)?;
+    let mut first = None;
+    let mut last = None;
+    let mut crossings = 0_u64;
+    for frame in 1..frames {
+        let sample = wav_sample(data, frame, channel)?;
+        if prior <= 0 && sample > 0 {
+            first.get_or_insert(frame);
+            last = Some(frame);
+            crossings = crossings.saturating_add(1);
+        }
+        if sample != 0 {
+            prior = sample;
+        }
+    }
+    let (Some(first), Some(last)) = (first, last) else {
+        return Err("QEMU WAV active span has no positive zero crossings".to_string());
+    };
+    let intervals = crossings.saturating_sub(1);
+    let distance = last.saturating_sub(first);
+    if intervals == 0 || distance == 0 {
+        return Err("QEMU WAV active span has too few positive zero crossings".to_string());
+    }
+    Ok(intervals as f64 * f64::from(FIREFOX_AUDIO_RATE) / distance as f64)
+}
+
+fn zero_crossing_hertz(data: &[u8], frames: usize, channel: usize) -> Result<f64, String> {
+    let (regular_windows, terminal_start, windows) = firefox_audio_window_layout(frames)?;
+    let mut estimates = Vec::new();
+    estimates
+        .try_reserve_exact(windows)
+        .map_err(|_| "could not reserve the bounded zero-crossing estimates".to_string())?;
+    for window in 0..windows {
+        let first = firefox_audio_window_start(window, regular_windows, terminal_start);
+        let first_byte = first.saturating_mul(4);
+        let last_byte = first
+            .saturating_add(FIREFOX_AUDIO_FIT_WINDOW_FRAMES)
+            .saturating_mul(4);
+        let samples = data
+            .get(first_byte..last_byte)
+            .ok_or_else(|| "the bounded zero-crossing window is truncated".to_string())?;
+        estimates.push(window_zero_crossing_hertz(
+            samples,
+            FIREFOX_AUDIO_FIT_WINDOW_FRAMES,
+            channel,
+        )?);
+    }
+    estimates.sort_by(f64::total_cmp);
+    let middle = estimates.len() / 2;
+    let upper = estimates
+        .get(middle)
+        .copied()
+        .ok_or_else(|| "the bounded zero-crossing analysis had no estimates".to_string())?;
+    if estimates.len() % 2 == 1 {
+        return Ok(upper);
+    }
+    let lower = estimates
+        .get(middle.saturating_sub(1))
+        .copied()
+        .ok_or_else(|| "the bounded zero-crossing analysis had no lower median".to_string())?;
+    Ok((lower + upper) / 2.0)
 }
 
 fn firefox_audio_capture_ceiling(timeout: Duration) -> Result<u64, String> {
@@ -4013,7 +4223,7 @@ fn verify_firefox_audio(path: &Path, ceiling: u64) -> Result<FirefoxAudioEvidenc
         .and_then(|span| span.checked_add(1))
         .ok_or_else(|| "QEMU WAV active-frame span overflowed".to_string())?;
     let detail = span.detail();
-    validate_firefox_audio_shape(active_frames, span.peak)
+    validate_firefox_audio_shape(active_frames, span.peak, span.longest_internal_quiet)
         .map_err(|error| format!("{error}; {detail}"))?;
     let active_bytes = active_frames
         .checked_mul(4)
@@ -4033,7 +4243,8 @@ fn verify_firefox_audio(path: &Path, ceiling: u64) -> Result<FirefoxAudioEvidenc
     active.resize(active_bytes, 0);
     file.read_exact(&mut active)
         .map_err(|error| format!("read {} active samples: {error}", path.display()))?;
-    verify_firefox_audio_active(&active, span.peak).map_err(|error| format!("{error}; {detail}"))
+    verify_firefox_audio_active(&active, span.peak, span.longest_internal_quiet)
+        .map_err(|error| format!("{error}; {detail}"))
 }
 
 #[cfg(test)]
@@ -4058,7 +4269,7 @@ fn verify_firefox_audio_bytes(bytes: &[u8]) -> Result<FirefoxAudioEvidence, Stri
     let active = data
         .get(active_start..active_end)
         .ok_or_else(|| "QEMU WAV active span is truncated".to_string())?;
-    verify_firefox_audio_active(active, span.peak)
+    verify_firefox_audio_active(active, span.peak, span.longest_internal_quiet)
         .map_err(|error| format!("{error}; {}", span.detail()))
 }
 
@@ -4169,7 +4380,11 @@ fn firefox_audio_active_span(data: &[u8]) -> Result<FirefoxAudioSpan, String> {
     scan.finish()
 }
 
-fn validate_firefox_audio_shape(active_frames: usize, peak: i32) -> Result<u64, String> {
+fn validate_firefox_audio_shape(
+    active_frames: usize,
+    peak: i32,
+    longest_internal_quiet: usize,
+) -> Result<u64, String> {
     let active_ms = (active_frames as u64).saturating_mul(1_000) / u64::from(FIREFOX_AUDIO_RATE);
     if !(FIREFOX_AUDIO_MIN_ACTIVE_MS..=FIREFOX_AUDIO_MAX_ACTIVE_MS).contains(&active_ms) {
         return Err(format!(
@@ -4182,15 +4397,25 @@ fn validate_firefox_audio_shape(active_frames: usize, peak: i32) -> Result<u64, 
             "QEMU WAV peak {peak} is below the {FIREFOX_AUDIO_MIN_PEAK}-sample floor"
         ));
     }
+    if longest_internal_quiet > FIREFOX_AUDIO_MAX_INTERNAL_QUIET_FRAMES {
+        return Err(format!(
+            "QEMU WAV internal quiet run is {longest_internal_quiet} frames, over the \
+             {FIREFOX_AUDIO_MAX_INTERNAL_QUIET_FRAMES}-frame bound"
+        ));
+    }
     Ok(active_ms)
 }
 
-fn verify_firefox_audio_active(data: &[u8], peak: i32) -> Result<FirefoxAudioEvidence, String> {
+fn verify_firefox_audio_active(
+    data: &[u8],
+    peak: i32,
+    longest_internal_quiet: usize,
+) -> Result<FirefoxAudioEvidence, String> {
     if !data.len().is_multiple_of(4) {
         return Err("QEMU WAV active span is not frame-aligned".to_string());
     }
     let active_frames = data.len() / 4;
-    let active_ms = validate_firefox_audio_shape(active_frames, peak)?;
+    let active_ms = validate_firefox_audio_shape(active_frames, peak, longest_internal_quiet)?;
     let fit = fit_firefox_tone(data, active_frames)?;
     if fit.left_ac_rms < FIREFOX_AUDIO_MIN_AC_RMS || fit.right_ac_rms < FIREFOX_AUDIO_MIN_AC_RMS {
         return Err(format!(
@@ -4199,24 +4424,31 @@ fn verify_firefox_audio_active(data: &[u8], peak: i32) -> Result<FirefoxAudioEvi
             fit.left_ac_rms, fit.right_ac_rms
         ));
     }
-    if fit.left_correlation < FIREFOX_AUDIO_MIN_CORRELATION
-        || fit.right_correlation < FIREFOX_AUDIO_MIN_CORRELATION
+    let left_crossing_hz = zero_crossing_hertz(data, active_frames, 0)?;
+    let right_crossing_hz = zero_crossing_hertz(data, active_frames, 1)?;
+    if !(FIREFOX_AUDIO_MIN_HZ..=FIREFOX_AUDIO_MAX_HZ).contains(&left_crossing_hz)
+        || !(FIREFOX_AUDIO_MIN_HZ..=FIREFOX_AUDIO_MAX_HZ).contains(&right_crossing_hz)
     {
         return Err(format!(
-            "QEMU WAV best {FIREFOX_AUDIO_MIN_HZ:.0}..={FIREFOX_AUDIO_MAX_HZ:.0} Hz fit is \
-             {:.2} Hz with correlations {:.4}/{:.4}, below \
-             {FIREFOX_AUDIO_MIN_CORRELATION:.1}",
-            fit.hertz, fit.left_correlation, fit.right_correlation
+            "QEMU WAV zero-crossing frequency is {left_crossing_hz:.2}/{right_crossing_hz:.2} \
+             Hz, outside {FIREFOX_AUDIO_MIN_HZ:.0}..={FIREFOX_AUDIO_MAX_HZ:.0} Hz"
         ));
     }
+    validate_firefox_tone_correlation(fit)?;
     Ok(FirefoxAudioEvidence {
         active_ms,
         peak,
         fitted_hz: fit.hertz,
+        left_crossing_hz,
+        right_crossing_hz,
         left_ac_rms: fit.left_ac_rms,
         right_ac_rms: fit.right_ac_rms,
         left_correlation: fit.left_correlation,
         right_correlation: fit.right_correlation,
+        left_transient_windows: fit.left_transient_windows,
+        right_transient_windows: fit.right_transient_windows,
+        left_transient_runs: fit.left_transient_runs,
+        right_transient_runs: fit.right_transient_runs,
     })
 }
 
@@ -6220,6 +6452,152 @@ mod tests {
         synthetic_firefox_wave_signal(hertz, active_ms, 0.0, 8_000.0)
     }
 
+    fn synthetic_phase_reset_firefox_wave() -> Vec<u8> {
+        let leading = 4_800_usize;
+        let active = 57_600_usize;
+        let mut wave = synthetic_firefox_wave(440.0, 1_200);
+        for frame in 0..active {
+            let phase = if frame < 1_920 {
+                0.73
+            } else if frame < 5_760 {
+                2.91
+            } else {
+                -0.42
+            };
+            let angle = std::f64::consts::TAU * 440.0 * frame as f64
+                / f64::from(FIREFOX_AUDIO_RATE)
+                + phase;
+            let sample = (angle.sin() * 8_000.0) as i16;
+            let offset = 44_usize.saturating_add(leading.saturating_add(frame).saturating_mul(4));
+            if let Some(stereo) = wave.get_mut(offset..offset.saturating_add(4)) {
+                stereo
+                    .get_mut(..2)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+                stereo
+                    .get_mut(2..)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+            }
+        }
+        wave
+    }
+
+    fn synthetic_clustered_crossing_resets_firefox_wave() -> Vec<u8> {
+        let leading = 4_800_usize;
+        let active = 57_600_usize;
+        let reset_frames = 2_400_usize;
+        let mut wave = synthetic_firefox_wave(440.0, 1_200);
+        for frame in 0..active {
+            let phase_steps = frame.min(reset_frames) / 100;
+            let phase = phase_steps as f64 * std::f64::consts::FRAC_PI_2;
+            let angle = std::f64::consts::TAU * 440.0 * frame as f64
+                / f64::from(FIREFOX_AUDIO_RATE)
+                + phase;
+            let sample = (angle.sin() * 8_000.0) as i16;
+            let offset = 44_usize.saturating_add(leading.saturating_add(frame).saturating_mul(4));
+            if let Some(stereo) = wave.get_mut(offset..offset.saturating_add(4)) {
+                stereo
+                    .get_mut(..2)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+                stereo
+                    .get_mut(2..)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+            }
+        }
+        wave
+    }
+
+    fn synthetic_repeated_phase_reset_firefox_wave() -> Vec<u8> {
+        let leading = 4_800_usize;
+        let active = 57_600_usize;
+        let mut wave = synthetic_firefox_wave(440.0, 1_200);
+        for frame in 0..active {
+            let segment = frame / FIREFOX_AUDIO_FIT_WINDOW_FRAMES;
+            let phase = if segment.is_multiple_of(2) {
+                0.0
+            } else {
+                std::f64::consts::PI
+            };
+            let angle = std::f64::consts::TAU * 440.0 * frame as f64
+                / f64::from(FIREFOX_AUDIO_RATE)
+                + phase;
+            let sample = (angle.sin() * 8_000.0) as i16;
+            let offset = 44_usize.saturating_add(leading.saturating_add(frame).saturating_mul(4));
+            if let Some(stereo) = wave.get_mut(offset..offset.saturating_add(4)) {
+                stereo
+                    .get_mut(..2)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+                stereo
+                    .get_mut(2..)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+            }
+        }
+        wave
+    }
+
+    fn synthetic_seven_transient_runs_firefox_wave() -> Vec<u8> {
+        let leading = 4_800_usize;
+        let active = 57_600_usize;
+        let mut wave = synthetic_firefox_wave(440.0, 1_200);
+        for frame in 0..active {
+            let phase = if (frame / 7_200).is_multiple_of(2) {
+                0.0
+            } else {
+                std::f64::consts::FRAC_PI_2
+            };
+            let angle = std::f64::consts::TAU * 440.0 * frame as f64
+                / f64::from(FIREFOX_AUDIO_RATE)
+                + phase;
+            let sample = (angle.sin() * 8_000.0) as i16;
+            let offset = 44_usize.saturating_add(leading.saturating_add(frame).saturating_mul(4));
+            if let Some(stereo) = wave.get_mut(offset..offset.saturating_add(4)) {
+                stereo
+                    .get_mut(..2)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+                stereo
+                    .get_mut(2..)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+            }
+        }
+        wave
+    }
+
+    fn synthetic_transient_prefix_firefox_wave(prefix_frames: usize) -> Vec<u8> {
+        let leading = 4_800_usize;
+        let active = 57_600_usize;
+        let mut wave = synthetic_firefox_wave(440.0, 1_200);
+        for frame in 0..prefix_frames.min(active) {
+            let phase = if (frame / 2_400).is_multiple_of(2) {
+                0.73
+            } else {
+                2.20
+            };
+            let angle = std::f64::consts::TAU * 440.0 * frame as f64
+                / f64::from(FIREFOX_AUDIO_RATE)
+                + phase;
+            let sample = (angle.sin() * 8_000.0) as i16;
+            let offset = 44_usize.saturating_add(leading.saturating_add(frame).saturating_mul(4));
+            if let Some(stereo) = wave.get_mut(offset..offset.saturating_add(4)) {
+                stereo
+                    .get_mut(..2)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+                stereo
+                    .get_mut(2..)
+                    .unwrap()
+                    .copy_from_slice(&sample.to_le_bytes());
+            }
+        }
+        wave
+    }
+
     fn synthetic_clock_stretched_firefox_wave(output_frames: usize) -> Vec<u8> {
         let leading = 4_800_usize;
         let trailing = 9_600_usize;
@@ -6258,6 +6636,15 @@ mod tests {
 
     #[test]
     fn firefox_wave_oracle_accepts_only_the_expected_active_tone() {
+        assert_eq!(FIREFOX_AUDIO_MAX_INTERNAL_QUIET_FRAMES, 64);
+        assert_eq!(FIREFOX_AUDIO_MIN_HZ, 435.0);
+        assert_eq!(FIREFOX_AUDIO_MAX_HZ, 445.0);
+        assert_eq!(FIREFOX_AUDIO_FIT_WINDOW_FRAMES, 4_800);
+        assert_eq!(FIREFOX_AUDIO_FIT_STRIDE_FRAMES, 2_400);
+        assert_eq!(FIREFOX_AUDIO_MIN_MEAN_CORRELATION, 0.85);
+        assert_eq!(FIREFOX_AUDIO_MIN_WINDOW_CORRELATION, 0.9);
+        assert_eq!(FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS, 7);
+        assert_eq!(FIREFOX_AUDIO_MAX_TRANSIENT_RUNS, 2);
         let wave = synthetic_firefox_wave(440.0, 1_000);
         let accepted = verify_firefox_audio_bytes(&wave).unwrap();
         assert!((990..=1_000).contains(&accepted.active_ms));
@@ -6267,6 +6654,45 @@ mod tests {
         assert_eq!(accepted.fitted_hz, 440.0);
         assert!(accepted.left_correlation > 0.999);
         assert!(accepted.right_correlation > 0.999);
+        assert_eq!(accepted.left_transient_windows, 0);
+        assert_eq!(accepted.right_transient_windows, 0);
+        assert_eq!(accepted.left_transient_runs, 0);
+        assert_eq!(accepted.right_transient_runs, 0);
+
+        let boundary = FirefoxToneFit {
+            hertz: 440.0,
+            left_correlation: FIREFOX_AUDIO_MIN_MEAN_CORRELATION,
+            right_correlation: FIREFOX_AUDIO_MIN_MEAN_CORRELATION,
+            left_ac_rms: FIREFOX_AUDIO_MIN_AC_RMS,
+            right_ac_rms: FIREFOX_AUDIO_MIN_AC_RMS,
+            left_transient_windows: FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS,
+            right_transient_windows: FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS,
+            left_transient_runs: FIREFOX_AUDIO_MAX_TRANSIENT_RUNS,
+            right_transient_runs: FIREFOX_AUDIO_MAX_TRANSIENT_RUNS,
+        };
+        assert!(validate_firefox_tone_correlation(boundary).is_ok());
+        assert!(validate_firefox_tone_correlation(FirefoxToneFit {
+            left_correlation: FIREFOX_AUDIO_MIN_MEAN_CORRELATION - 0.01,
+            ..boundary
+        })
+        .unwrap_err()
+        .contains("mean window correlations"));
+        assert!(validate_firefox_tone_correlation(FirefoxToneFit {
+            left_transient_windows: FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS + 1,
+            ..boundary
+        })
+        .unwrap_err()
+        .contains("windows below"));
+        assert!(validate_firefox_tone_correlation(FirefoxToneFit {
+            right_transient_runs: FIREFOX_AUDIO_MAX_TRANSIENT_RUNS + 1,
+            ..boundary
+        })
+        .unwrap_err()
+        .contains("windows below"));
+
+        let scheduled =
+            verify_firefox_audio_bytes(&synthetic_firefox_wave(440.0, 1_200)).unwrap();
+        assert!((1_190..=1_200).contains(&scheduled.active_ms));
 
         let stretched =
             verify_firefox_audio_bytes(&synthetic_clock_stretched_firefox_wave(48_194)).unwrap();
@@ -6283,8 +6709,70 @@ mod tests {
         assert_eq!(streamed.active_ms, accepted.active_ms);
         assert_eq!(streamed.peak, accepted.peak);
         assert_eq!(streamed.fitted_hz, accepted.fitted_hz);
+        assert_eq!(streamed.left_crossing_hz, accepted.left_crossing_hz);
+        assert_eq!(streamed.right_crossing_hz, accepted.right_crossing_hz);
         assert_eq!(streamed.left_correlation, accepted.left_correlation);
         assert_eq!(streamed.right_correlation, accepted.right_correlation);
+
+        let reset = verify_firefox_audio_bytes(&synthetic_phase_reset_firefox_wave()).unwrap();
+        assert!((435.0..=445.0).contains(&reset.left_crossing_hz));
+        assert!((435.0..=445.0).contains(&reset.right_crossing_hz));
+        assert!(reset.left_correlation > 0.9);
+        assert!(reset.right_correlation > 0.9);
+        assert_eq!(reset.left_transient_windows, 3);
+        assert_eq!(reset.right_transient_windows, 3);
+        assert_eq!(reset.left_transient_runs, 1);
+        assert_eq!(reset.right_transient_runs, 1);
+
+        let clustered = synthetic_clustered_crossing_resets_firefox_wave();
+        let clustered_active = clustered
+            .get(44 + 4_800 * 4..44 + (4_800 + 57_600) * 4)
+            .unwrap();
+        let whole_span_crossing = window_zero_crossing_hertz(clustered_active, 57_600, 0).unwrap();
+        assert!(whole_span_crossing > FIREFOX_AUDIO_MAX_HZ);
+        let clustered = verify_firefox_audio_bytes(&clustered).unwrap();
+        assert!((439.0..=441.0).contains(&clustered.left_crossing_hz));
+        assert!((439.0..=441.0).contains(&clustered.right_crossing_hz));
+        assert_eq!(clustered.left_transient_windows, 1);
+        assert_eq!(clustered.right_transient_windows, 1);
+        assert_eq!(clustered.left_transient_runs, 1);
+        assert_eq!(clustered.right_transient_runs, 1);
+
+        let excessive_windows = synthetic_transient_prefix_firefox_wave(19_200);
+        let active = excessive_windows
+            .get(44 + 4_800 * 4..44 + (4_800 + 57_600) * 4)
+            .unwrap();
+        let excessive_window_fit = fit_firefox_tone(active, 57_600).unwrap();
+        assert!(excessive_window_fit.left_correlation >= FIREFOX_AUDIO_MIN_MEAN_CORRELATION);
+        assert!(excessive_window_fit.right_correlation >= FIREFOX_AUDIO_MIN_MEAN_CORRELATION);
+        assert_eq!(excessive_window_fit.left_transient_windows, 8);
+        assert_eq!(excessive_window_fit.right_transient_windows, 8);
+        assert_eq!(excessive_window_fit.left_transient_runs, 1);
+        assert_eq!(excessive_window_fit.right_transient_runs, 1);
+        assert!(verify_firefox_audio_bytes(&excessive_windows)
+            .unwrap_err()
+            .contains("windows below"));
+
+        let excessive_transients = synthetic_seven_transient_runs_firefox_wave();
+        let active = excessive_transients
+            .get(44 + 4_800 * 4..44 + (4_800 + 57_600) * 4)
+            .unwrap();
+        let excessive_fit = fit_firefox_tone(active, 57_600).unwrap();
+        assert!(excessive_fit.left_correlation >= FIREFOX_AUDIO_MIN_MEAN_CORRELATION);
+        assert!(excessive_fit.right_correlation >= FIREFOX_AUDIO_MIN_MEAN_CORRELATION);
+        assert_eq!(excessive_fit.left_transient_windows, 7);
+        assert_eq!(excessive_fit.right_transient_windows, 7);
+        assert_eq!(excessive_fit.left_transient_runs, 7);
+        assert_eq!(excessive_fit.right_transient_runs, 7);
+        assert!(verify_firefox_audio_bytes(&excessive_transients)
+            .unwrap_err()
+            .contains("windows below"));
+
+        let repeated_reset =
+            verify_firefox_audio_bytes(&synthetic_repeated_phase_reset_firefox_wave());
+        assert!(repeated_reset
+            .unwrap_err()
+            .contains("mean window correlations"));
 
         let oversized = dir.join("oversized.wav");
         File::create(&oversized)
@@ -6309,10 +6797,16 @@ mod tests {
         assert!(tiny_error.contains("frames reached the 256-sample floor"));
         assert!(tiny_error.contains("longest internal quiet run was"));
 
-        let wrong_tone = verify_firefox_audio_bytes(&synthetic_firefox_wave(430.0, 1_000));
-        assert!(wrong_tone.unwrap_err().contains("correlations"));
+        assert!(verify_firefox_audio_bytes(&synthetic_firefox_wave(435.25, 1_000)).is_ok());
+        assert!(verify_firefox_audio_bytes(&synthetic_firefox_wave(444.75, 1_000)).is_ok());
+        let wrong_tone = verify_firefox_audio_bytes(&synthetic_firefox_wave(434.75, 1_000));
+        assert!(wrong_tone.unwrap_err().contains("zero-crossing frequency"));
+        let high_tone = verify_firefox_audio_bytes(&synthetic_firefox_wave(445.25, 1_000));
+        assert!(high_tone.unwrap_err().contains("zero-crossing frequency"));
         let short = verify_firefox_audio_bytes(&synthetic_firefox_wave(440.0, 500));
         assert!(short.unwrap_err().contains("active span"));
+        let long = verify_firefox_audio_bytes(&synthetic_firefox_wave(440.0, 1_400));
+        assert!(long.unwrap_err().contains("active span"));
         let mut silence = synthetic_firefox_wave(440.0, 1_000);
         silence.get_mut(44..).unwrap().fill(0);
         assert!(verify_firefox_audio_bytes(&silence)
@@ -6327,6 +6821,22 @@ mod tests {
             .unwrap_err()
             .contains("AC RMS"));
 
+        let mut allowed_gap = synthetic_firefox_wave(440.0, 1_000);
+        let gap_start = 44 + (4_800 + 24_000) * 4;
+        allowed_gap
+            .get_mut(gap_start..gap_start + FIREFOX_AUDIO_MAX_INTERNAL_QUIET_FRAMES * 4)
+            .unwrap()
+            .fill(0);
+        assert!(verify_firefox_audio_bytes(&allowed_gap).is_ok());
+        let mut refused_gap = synthetic_firefox_wave(440.0, 1_000);
+        refused_gap
+            .get_mut(gap_start..gap_start + (FIREFOX_AUDIO_MAX_INTERNAL_QUIET_FRAMES + 1) * 4)
+            .unwrap()
+            .fill(0);
+        assert!(verify_firefox_audio_bytes(&refused_gap)
+            .unwrap_err()
+            .contains("internal quiet run"));
+
         let mut malformed = synthetic_firefox_wave(440.0, 1_000);
         malformed.get_mut(..4).unwrap().copy_from_slice(b"NOPE");
         assert!(verify_firefox_audio_bytes(&malformed)
@@ -6336,6 +6846,43 @@ mod tests {
         assert!(verify_firefox_audio(&path, MAX_AUDIO_CAPTURE_BYTES)
             .unwrap_err()
             .contains("canonical RIFF/PCM"));
+    }
+
+    #[test]
+    fn firefox_wave_fit_includes_the_terminal_active_samples() {
+        let active = usize::try_from(u64::from(FIREFOX_AUDIO_RATE) * 949 / 1_000).unwrap();
+        let leading = 4_800_usize;
+        let mut wave = synthetic_firefox_wave(440.0, 949);
+        let active_start = 44 + leading * 4;
+        let active_end = active_start + active * 4;
+        let original =
+            fit_firefox_tone(wave.get(active_start..active_end).unwrap(), active).unwrap();
+        let changed = 2_352_usize;
+        let changed_start = active_end - changed * 4;
+        for (frame, stereo) in wave
+            .get_mut(changed_start..active_end)
+            .unwrap()
+            .chunks_exact_mut(4)
+            .enumerate()
+        {
+            let sample = if frame.is_multiple_of(2) {
+                8_000_i16
+            } else {
+                -8_000_i16
+            };
+            stereo
+                .get_mut(..2)
+                .unwrap()
+                .copy_from_slice(&sample.to_le_bytes());
+            stereo
+                .get_mut(2..)
+                .unwrap()
+                .copy_from_slice(&sample.to_le_bytes());
+        }
+        let corrupted =
+            fit_firefox_tone(wave.get(active_start..active_end).unwrap(), active).unwrap();
+        assert!(corrupted.left_correlation < original.left_correlation - 0.02);
+        assert!(corrupted.right_correlation < original.right_correlation - 0.02);
     }
 
     fn portal_test_ppm() -> Vec<u8> {

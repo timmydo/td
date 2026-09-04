@@ -1,5 +1,6 @@
 use crate::contract::{
     ATTRIBUTION_FUNCTION_FRAGMENT, ATTRIBUTION_MARKER, ATTRIBUTION_SOURCE_FILE, CAPTURE_MARKER,
+    MAX_EVIDENCE_WAIT_SECS,
 };
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -15,6 +16,7 @@ const MAX_ATTRIBUTION_ROW_BYTES: u64 = 64 * 1024;
 const EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ATTRIBUTION_WORK_SLICE: Duration = Duration::from_millis(50);
 const ATTRIBUTION_REST_SLICE: Duration = Duration::from_millis(50);
+const MAX_EVIDENCE_WAIT: Duration = Duration::from_secs(MAX_EVIDENCE_WAIT_SECS as u64);
 const REQUIRED_FILES: [&str; 8] = [
     "manifest.json",
     "overview.jsonl",
@@ -26,22 +28,31 @@ const REQUIRED_FILES: [&str; 8] = [
     "samples.bin",
 ];
 
+struct CurrentCaptures {
+    complete: Vec<PathBuf>,
+    pending: Option<PathBuf>,
+    malformed: Option<String>,
+}
+
 pub fn wait(
     root: &Path,
     timeout: Duration,
+    attribution_timeout: Option<Duration>,
     uid: u32,
     gid: u32,
     attribution_cmdline_token: Option<&str>,
 ) -> Result<(), String> {
-    if !root.is_absolute()
-        || timeout.is_zero()
-        || timeout > Duration::from_secs(300)
-        || uid == 0
-        || gid == 0
-    {
-        return Err("evidence root must be absolute and timeout must be in 1ns..=300s".into());
+    validate_wait_request(root, timeout, uid, gid)?;
+    if let Some(timeout) = attribution_timeout {
+        validate_wait_request(root, timeout, uid, gid)?;
     }
     let require_attribution = attribution_enabled(attribution_cmdline_token)?;
+    let timeout = selected_wait_timeout(
+        timeout,
+        attribution_timeout,
+        attribution_cmdline_token.is_some(),
+        require_attribution,
+    )?;
     validate_mode(root, uid, gid, 0o2750, true)?;
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map_err(|e| format!("read evidence boot ID: {e}"))?;
@@ -53,11 +64,11 @@ pub fn wait(
     let mut rejected = Vec::new();
     loop {
         match current_captures(root, boot_id) {
-            Ok((captures, malformed)) => {
-                if let Some(error) = malformed {
+            Ok(captures) => {
+                if let Some(error) = current_capture_diagnostic(&captures) {
                     diagnostic = Some(error);
                 }
-                for capture in captures {
+                for capture in captures.complete {
                     if rejected.iter().any(|path| path == &capture) {
                         continue;
                     }
@@ -78,14 +89,7 @@ pub fn wait(
             Err(error) => diagnostic = Some(error),
         }
         if Instant::now() >= deadline {
-            let detail = diagnostic
-                .as_deref()
-                .map(|error| format!("; last candidate diagnostic: {error}"))
-                .unwrap_or_default();
-            return Err(format!(
-                "no valid completed current-boot capture appeared below {}{detail}",
-                root.display(),
-            ));
+            return Err(evidence_timeout_error(root, diagnostic.as_deref()));
         }
         if require_attribution {
             run_attribution_slice(ATTRIBUTION_WORK_SLICE)?;
@@ -94,6 +98,59 @@ pub fn wait(
             thread::sleep(EVIDENCE_POLL_INTERVAL);
         }
     }
+}
+
+fn selected_wait_timeout(
+    ordinary: Duration,
+    attribution: Option<Duration>,
+    token_configured: bool,
+    attribution_required: bool,
+) -> Result<Duration, String> {
+    if attribution.is_some() && !token_configured {
+        return Err("an attribution evidence timeout requires its cmdline token".into());
+    }
+    Ok(if attribution_required {
+        attribution.unwrap_or(ordinary)
+    } else {
+        ordinary
+    })
+}
+
+fn current_capture_diagnostic(captures: &CurrentCaptures) -> Option<String> {
+    if let Some(error) = &captures.malformed {
+        return Some(error.clone());
+    }
+    captures.pending.as_ref().map(|path| {
+        format!(
+            "current-boot partial capture remains unpublished: {}",
+            path.display()
+        )
+    })
+}
+
+fn evidence_timeout_error(root: &Path, diagnostic: Option<&str>) -> String {
+    let detail = diagnostic
+        .map(|error| format!("; last candidate diagnostic: {error}"))
+        .unwrap_or_default();
+    format!(
+        "no valid completed current-boot capture appeared below {}{detail}",
+        root.display(),
+    )
+}
+
+fn validate_wait_request(root: &Path, timeout: Duration, uid: u32, gid: u32) -> Result<(), String> {
+    if !root.is_absolute()
+        || timeout.is_zero()
+        || timeout > MAX_EVIDENCE_WAIT
+        || uid == 0
+        || gid == 0
+    {
+        return Err(format!(
+            "evidence root must be absolute and timeout must be in 1ns..={}s",
+            MAX_EVIDENCE_WAIT.as_secs()
+        ));
+    }
+    Ok(())
 }
 
 fn evidence_marker(require_attribution: bool) -> &'static str {
@@ -165,7 +222,7 @@ fn td_profiler_attribution_workload(mut state: u64) -> u64 {
 }
 const ATTRIBUTION_SOURCE_LINE_END: u64 = line!() as u64 - 1;
 
-fn current_captures(root: &Path, boot_id: &str) -> Result<(Vec<PathBuf>, Option<String>), String> {
+fn current_captures(root: &Path, boot_id: &str) -> Result<CurrentCaptures, String> {
     let mut entries = Vec::new();
     for entry in
         fs::read_dir(root).map_err(|e| format!("read capture root {}: {e}", root.display()))?
@@ -179,24 +236,30 @@ fn current_captures(root: &Path, boot_id: &str) -> Result<(Vec<PathBuf>, Option<
     }
     let prefix = format!("{boot_id}.");
     let mut captures = Vec::new();
+    let mut pending = Vec::new();
     let mut malformed = None;
     for entry in entries {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&prefix) || name.ends_with(".partial") || name.ends_with(".quarantine")
-        {
+        if !name.starts_with(&prefix) || name.ends_with(".quarantine") {
             continue;
         }
-        match capture_sequence(name, boot_id) {
+        let (candidate, is_pending) = name
+            .strip_suffix(".partial")
+            .map_or((name, false), |candidate| (candidate, true));
+        match capture_sequence(candidate, boot_id) {
+            Ok(sequence) if is_pending => pending.push((sequence, entry.path())),
             Ok(sequence) => captures.push((sequence, entry.path())),
             Err(error) => malformed = Some(error),
         }
     }
     captures.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-    Ok((
-        captures.into_iter().map(|(_, path)| path).collect(),
+    pending.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    Ok(CurrentCaptures {
+        complete: captures.into_iter().map(|(_, path)| path).collect(),
+        pending: pending.into_iter().next().map(|(_, path)| path),
         malformed,
-    ))
+    })
 }
 
 fn capture_sequence(name: &str, boot_id: &str) -> Result<u64, String> {
@@ -1068,13 +1131,18 @@ fn number(text: &str, label: &str) -> Result<u64, String> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        attribution_row, attribution_rows, capture_sequence, cmdline_has_token, current_captures,
-        evidence_marker, number, validate_integrity_counters, validate_overview,
-        ATTRIBUTION_FUNCTION_FRAGMENT, ATTRIBUTION_MARKER, ATTRIBUTION_SOURCE_FILE,
-        ATTRIBUTION_SOURCE_LINE_END, ATTRIBUTION_SOURCE_LINE_START, CAPTURE_MARKER,
-        MAX_ATTRIBUTION_ROW_BYTES,
+        attribution_row, attribution_rows, capture_sequence, cmdline_has_token,
+        current_capture_diagnostic, current_captures, evidence_marker, number,
+        selected_wait_timeout, validate_integrity_counters, validate_overview,
+        validate_wait_request, wait, CurrentCaptures, ATTRIBUTION_FUNCTION_FRAGMENT,
+        ATTRIBUTION_MARKER, ATTRIBUTION_SOURCE_FILE, ATTRIBUTION_SOURCE_LINE_END,
+        ATTRIBUTION_SOURCE_LINE_START, CAPTURE_MARKER, MAX_ATTRIBUTION_ROW_BYTES,
     };
     use std::io::Cursor;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn manifest_numbers_are_exact_decimal_fields() {
@@ -1127,6 +1195,32 @@ mod tests {
     }
 
     #[test]
+    fn evidence_wait_has_one_exact_compiled_ceiling() {
+        let root = Path::new("/var/lib/td-profiler/captures");
+        assert!(validate_wait_request(root, Duration::from_secs(900), 997, 996).is_ok());
+        let error = validate_wait_request(root, Duration::from_secs(901), 997, 996).unwrap_err();
+        assert!(error.contains("1ns..=900s"));
+        assert!(validate_wait_request(root, Duration::ZERO, 997, 996).is_err());
+    }
+
+    #[test]
+    fn attribution_timeout_is_selected_only_by_the_exact_boot_token() {
+        let ordinary = Duration::from_secs(300);
+        let attribution = Some(Duration::from_secs(900));
+        assert_eq!(
+            selected_wait_timeout(ordinary, attribution, true, false).unwrap(),
+            ordinary
+        );
+        assert_eq!(
+            selected_wait_timeout(ordinary, attribution, true, true).unwrap(),
+            Duration::from_secs(900)
+        );
+        assert!(selected_wait_timeout(ordinary, attribution, false, false)
+            .unwrap_err()
+            .contains("requires its cmdline token"));
+    }
+
+    #[test]
     fn completed_captures_sort_by_numeric_sequence_and_do_not_lexically_regress() {
         let boot = "12345678-1234-1234-1234-123456789abc";
         let root =
@@ -1140,13 +1234,81 @@ mod tests {
         ] {
             std::fs::create_dir(root.join(name)).unwrap();
         }
-        let (captures, malformed) = current_captures(&root, boot).unwrap();
-        assert!(malformed.is_some());
+        let pending_name = format!("{boot}.7.9.11.partial");
+        std::fs::create_dir(root.join(&pending_name)).unwrap();
+        let captures = current_captures(&root, boot).unwrap();
+        assert!(captures.malformed.is_some());
+        assert_eq!(
+            captures
+                .pending
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            pending_name
+        );
         let names: Vec<_> = captures
+            .complete
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, [format!("{boot}.7.9.10"), format!("{boot}.7.9.9")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expiry_identifies_an_unpublished_partial_through_wait() {
+        let root =
+            std::env::temp_dir().join(format!("td-profiler-expiry-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        let uid = metadata.uid();
+        let gid = metadata.gid();
+        if uid == 0 || gid == 0 {
+            // Root is outside the production wait contract, and a root-mapped
+            // user namespace may not map any supported nonzero owner.
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o2750)).unwrap();
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let pending = root.join(format!("{}.7.9.11.partial", boot.trim()));
+        std::fs::create_dir(&pending).unwrap();
+        let error = wait(&root, Duration::from_nanos(1), None, uid, gid, None).unwrap_err();
+        assert!(error.contains("current-boot partial capture remains unpublished"));
+        assert!(error.contains(&pending.to_string_lossy().into_owned()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_capture_diagnostic_precedes_an_unpublished_partial() {
+        let captures = CurrentCaptures {
+            complete: Vec::new(),
+            pending: Some(PathBuf::from("ignored.partial")),
+            malformed: Some("malformed current-boot capture".into()),
+        };
+        assert_eq!(
+            current_capture_diagnostic(&captures).as_deref(),
+            Some("malformed current-boot capture")
+        );
+    }
+
+    #[test]
+    fn malformed_partial_names_are_never_complete_captures() {
+        let boot = "12345678-1234-1234-1234-123456789abc";
+        let root = std::env::temp_dir().join(format!(
+            "td-profiler-malformed-partial-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join(format!("{boot}.7.9.010.partial"))).unwrap();
+        let captures = current_captures(&root, boot).unwrap();
+        assert!(captures.complete.is_empty());
+        assert!(captures.pending.is_none());
+        assert!(captures.malformed.is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
 

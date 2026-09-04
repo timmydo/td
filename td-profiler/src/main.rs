@@ -80,6 +80,7 @@ fn index_command(arguments: &[OsString]) -> Result<(), String> {
 fn evidence_command(arguments: &[OsString]) -> Result<(), String> {
     let root = arguments.first().ok_or_else(usage).map(PathBuf::from)?;
     let mut timeout = Duration::from_secs(30);
+    let mut attribution_timeout = None;
     let mut uid = None;
     let mut gid = None;
     let mut attribution_cmdline_token = None;
@@ -94,6 +95,12 @@ fn evidence_command(arguments: &[OsString]) -> Result<(), String> {
             "--timeout-secs" => {
                 timeout = Duration::from_secs(number(take(arguments, &mut at, option)?, option)?);
             }
+            "--attribution-timeout-secs" => {
+                attribution_timeout = Some(Duration::from_secs(number(
+                    take(arguments, &mut at, option)?,
+                    option,
+                )?));
+            }
             "--uid" => uid = Some(number(take(arguments, &mut at, option)?, option)?),
             "--gid" => gid = Some(number(take(arguments, &mut at, option)?, option)?),
             "--attribution-cmdline-token" => {
@@ -105,6 +112,7 @@ fn evidence_command(arguments: &[OsString]) -> Result<(), String> {
     evidence::wait(
         &root,
         timeout,
+        attribution_timeout,
         uid.ok_or("evidence requires --uid")?,
         gid.ok_or("evidence requires --gid")?,
         attribution_cmdline_token.as_deref(),
@@ -253,7 +261,7 @@ fn usage() -> String {
      [--object-index PATH|--no-object-index]  # maintenance writer; writes \
      ABSOLUTE-CAPTURE/regenerated\n       td-profiler index ROOT OUTPUT \
      [--exclude-registry REGISTRY APPLICATION_ROOTS]\n       td-profiler evidence CAPTURE-ROOT \
-     [--timeout-secs N] --uid N --gid N \
+     [--timeout-secs N] [--attribution-timeout-secs N] --uid N --gid N \
      [--attribution-cmdline-token TOKEN]\n       td-profiler probe"
         .into()
 }

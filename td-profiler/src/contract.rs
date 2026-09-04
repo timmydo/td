@@ -17,3 +17,8 @@ pub const ATTRIBUTION_FUNCTION_FRAGMENT: &str = "td_profiler_attribution_workloa
 /// not recovered from `.debug_info`, which the line-table-only reader does not
 /// load.
 pub const ATTRIBUTION_SOURCE_FILE: &str = "evidence.rs";
+
+/// Longest bounded wait accepted by `td-profiler evidence`. The system image
+/// imports this value only for the exact-token attribution path; ordinary
+/// evidence retains a shorter image-selected wait.
+pub const MAX_EVIDENCE_WAIT_SECS: u16 = 900;

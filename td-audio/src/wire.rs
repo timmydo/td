@@ -269,14 +269,33 @@ impl Decoder {
 
     /// How many bytes are held, waiting for the rest of a frame.
     ///
-    /// The daemon bounds this per client. Every individual frame is already
-    /// bounded by `Descriptor::parse`, but a client that sends a valid
-    /// descriptor and then stops holds that much until it disconnects, and a
-    /// client that never completes a frame is a connection that never makes
-    /// progress. The bound is the difference between a slow client and a stuck
-    /// one.
+    /// `Descriptor::parse` bounds the bytes and the daemon separately limits
+    /// how long an incomplete frame may reserve them.
+    #[cfg(test)]
     pub fn buffered(&self) -> usize {
         self.unread().len()
+    }
+
+    /// Whether the first unprocessed frame is waiting for more socket bytes.
+    /// Complete frames retained only by the per-pass work budget are deferred,
+    /// not partial, and must not start the abandoned-frame deadline.
+    pub fn is_incomplete(&self) -> bool {
+        if let Some(descriptor) = self.pending {
+            return self.unread().len() < descriptor.length as usize;
+        }
+        let unread = self.unread();
+        if unread.is_empty() {
+            return false;
+        }
+        match Descriptor::parse(unread) {
+            None => true,
+            Some(Ok(descriptor)) => {
+                unread.len() < DESCRIPTOR_LEN.saturating_add(descriptor.length as usize)
+            }
+            // A complete malformed descriptor is ready to be refused on the
+            // next bounded decoder turn; waiting cannot repair it.
+            Some(Err(_)) => false,
+        }
     }
 
     /// The next whole frame, if one has arrived.
@@ -406,7 +425,10 @@ mod tests {
             assert!(decoder.next_frame().is_none(), "not whole yet");
         }
         decoder.push(&[*wire.last().unwrap()]);
-        assert_eq!(decoder.next_frame().unwrap().unwrap(), Frame::Control(packet));
+        assert_eq!(
+            decoder.next_frame().unwrap().unwrap(),
+            Frame::Control(packet)
+        );
     }
 
     /// Several frames in one read all come out, in order.
@@ -430,6 +452,22 @@ mod tests {
         assert_eq!(decoder.buffered(), 0);
     }
 
+    #[test]
+    fn complete_deferred_frames_are_not_partial_input() {
+        let first = Descriptor::encode(0, 1, 0, 0);
+        let second = Descriptor::encode(0, 2, 0, 0);
+        let mut decoder = Decoder::new();
+        decoder.push(&[first.as_slice(), second.as_slice()].concat());
+        assert!(!decoder.is_incomplete());
+        assert!(decoder.next_frame().is_some());
+        assert!(!decoder.is_incomplete());
+        assert!(decoder.next_frame().is_some());
+
+        decoder.push(&Descriptor::encode(4, 3, 0, 0));
+        assert!(decoder.next_frame().is_none());
+        assert!(decoder.is_incomplete());
+    }
+
     /// A data frame carries its channel, seek mode and audio.
     #[test]
     fn a_data_frame_carries_its_channel_and_seek_mode() {
@@ -440,7 +478,12 @@ mod tests {
         decoder.push(&wire);
         assert_eq!(
             decoder.next_frame().unwrap().unwrap(),
-            Frame::Data { channel: 0, seek: Seek::Relative, offset: 0, pcm }
+            Frame::Data {
+                channel: 0,
+                seek: Seek::Relative,
+                offset: 0,
+                pcm
+            }
         );
     }
 
@@ -489,7 +532,8 @@ mod tests {
         decoder.push(&control);
         assert!(decoder.next_frame().unwrap().is_err());
         assert_eq!(
-            decoder.buffered(), 0,
+            decoder.buffered(),
+            0,
             "the body was never taken, and the bad descriptor is not kept either"
         );
         // The error is terminal. Re-parsing the same bad descriptor forever, or
@@ -529,10 +573,14 @@ mod tests {
         let mut decoder = Decoder::new();
         decoder.push(&wire);
         let frame = decoder.next_frame().unwrap().unwrap();
-        assert_eq!(command_and_tag(match &frame {
-            Frame::Control(packet) => packet,
-            _ => panic!("expected a control frame"),
-        }).unwrap(), (8, 0));
+        assert_eq!(
+            command_and_tag(match &frame {
+                Frame::Control(packet) => packet,
+                _ => panic!("expected a control frame"),
+            })
+            .unwrap(),
+            (8, 0)
+        );
     }
 
     /// A zero-length DATA frame is legitimate — it is how a client signals a
@@ -544,7 +592,12 @@ mod tests {
         decoder.push(&wire);
         assert_eq!(
             decoder.next_frame().unwrap().unwrap(),
-            Frame::Data { channel: 3, seek: Seek::Absolute, offset: -1000, pcm: Vec::new() }
+            Frame::Data {
+                channel: 3,
+                seek: Seek::Absolute,
+                offset: -1000,
+                pcm: Vec::new()
+            }
         );
     }
 

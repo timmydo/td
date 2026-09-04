@@ -14,9 +14,11 @@
 //! so a client that writes and a device that drains are the same event loop.
 
 use crate::mixer::Mixer;
+use crate::proto::subscription;
 use crate::session::{Disconnect, Session};
 use crate::sink::{is_underrun, AudioSink, Spec};
 use crate::sys::{self, Interest, PollSet};
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -43,6 +45,11 @@ pub const SEAT_UID: u32 = 1000;
 /// for everyone already playing.
 pub const MAX_CLIENTS: usize = 32;
 
+/// One kernel-authenticated process may not reserve the whole connection
+/// table. Multiple Pulse contexts are ordinary; thirty-two from one pid are a
+/// slot-exhaustion attack.
+pub const MAX_CLIENTS_PER_PID: usize = 4;
+
 /// The most connections one pass will take off the backlog.
 ///
 /// The socket is 0666 by design, so a uid the policy REFUSES can still keep the
@@ -65,20 +72,17 @@ pub const MAX_ACCEPTS_PER_PASS: usize = MAX_CLIENTS;
 /// forwards drops them all at once.
 pub const AUTH_DEADLINE: Duration = Duration::from_secs(10);
 
+/// A complete local protocol frame must arrive within this monotonic window.
+/// The descriptor bounds memory, while this bounds how long a peer may reserve
+/// that memory and an admission slot by trickling or abandoning its body.
+pub const FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
 /// How long one wait may block. A period at 48 kHz is about 21 ms, so this is
 /// generous enough to be a backstop rather than a poll rate.
 pub const WAIT_MS: i32 = 100;
 
 /// The most bytes read from one client per pass.
 const READ_CHUNK: usize = 64 * 1024;
-
-/// The most a client may leave half-framed before it is hung up on.
-///
-/// Every frame is bounded on its own by `wire::Descriptor::parse`, so this is
-/// not about one enormous frame — it is about a client that declares a frame
-/// and then stops. Two data frames' worth is enough that no honest client ever
-/// reaches it and small enough that a stuck one is found.
-const MAX_HALF_FRAMED: usize = 2 * crate::wire::DATA_MAX;
 
 /// Who may connect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +130,23 @@ impl Policy {
 /// keeps asking, and one jailed client could exhaust the daemon every other
 /// client depends on. Sixteen maximum-size control frames is far more than any
 /// exchange in this protocol needs and still a bound.
-const MAX_PENDING: usize = 16 * crate::wire::CONTROL_MAX;
+const MAX_PENDING: usize = crate::session::MAX_OUTPUT_BYTES;
+
+/// Resident storage may carry at most one consumed window beside the owed
+/// bytes. Crossing this threshold pays for one compaction only after roughly a
+/// whole `MAX_PENDING` window was consumed, rather than copying a megabyte for
+/// every one-byte read followed by a small query.
+const MAX_PENDING_STORAGE: usize = 2 * MAX_PENDING;
+
+/// Attacker-driven diagnostics retained over the daemon's whole lifetime.
+/// They are printed only after the audio loop stops, so even the first line
+/// cannot block that loop on an undrained stderr pipe.
+const MAX_DAEMON_DIAGNOSTICS: usize = 16;
+
+/// Tiny packets, not bytes, are the CPU/fan-out currency. One client gets at
+/// most this many frames and all clients share the second bound per pass.
+const MAX_FRAMES_PER_CLIENT_PASS: usize = 32;
+const MAX_FRAMES_PER_PASS: usize = 256;
 
 /// One connected client.
 struct Client {
@@ -139,6 +159,12 @@ struct Client {
     pending_at: usize,
     /// When it connected, for `AUTH_DEADLINE`.
     since: Instant,
+    /// When the current incomplete frame first reserved decoder bytes.
+    partial_since: Option<Instant>,
+    /// This fd was readable in the current poll snapshot, or it carries
+    /// decoder work deferred from the preceding pass. Admission may not call
+    /// it idle before that work reaches the session and router.
+    ready_input: bool,
 }
 
 impl Client {
@@ -155,6 +181,25 @@ impl Client {
         self.pending.len().saturating_sub(self.pending_at)
     }
 
+    fn evictable_idle(&self) -> bool {
+        self.session.stream_count() == 0
+            && !self.session.holds_idle_control_state()
+            && !self.ready_input
+            && !self.session.has_incomplete_input()
+            && !self.session.has_output()
+            && self.owed() == 0
+    }
+
+    fn update_partial_deadline(&mut self) {
+        if self.session.has_incomplete_input() {
+            if self.partial_since.is_none() {
+                self.partial_since = Some(Instant::now());
+            }
+        } else {
+            self.partial_since = None;
+        }
+    }
+
     /// Move whatever the session produced into the outgoing buffer.
     ///
     /// Compacting here rather than draining from the front keeps this a copy
@@ -162,8 +207,16 @@ impl Client {
     fn collect(&mut self) {
         if self.session.has_output() {
             let bytes = self.session.take_output();
-            if self.pending_at > 0 && self.pending_at >= self.pending.len() {
+            if self.pending_at >= self.pending.len() {
                 self.pending.clear();
+                self.pending_at = 0;
+            } else if self.pending_at > 0
+                && self.pending.len().saturating_add(bytes.len()) > MAX_PENDING_STORAGE
+            {
+                let consumed = self.pending_at.min(self.pending.len());
+                self.pending.copy_within(consumed.., 0);
+                self.pending
+                    .truncate(self.pending.len().saturating_sub(consumed));
                 self.pending_at = 0;
             }
             self.pending.extend_from_slice(&bytes);
@@ -191,7 +244,7 @@ impl Client {
 /// Why the daemon stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stopped {
-    /// The device went away. §K.5's clients are told before the socket closes.
+    /// The device went away. Clients get a best-effort KILLED event or EOF.
     DeviceGone,
     /// The run limit was reached, which only a test sets.
     Finished,
@@ -207,18 +260,13 @@ pub struct Server<S: AudioSink> {
     policy: Policy,
     spec: Spec,
     poll: PollSet,
-    next_client_index: u32,
-    /// How many clients the current poll set covers.
-    ///
-    /// `accept` appends AFTER `wait` built the set, so a client accepted this
-    /// pass has no slot of its own: reading one would read the slot belonging to
-    /// whatever `wait` pushed next, which is the PCM. A `POLLHUP` on the device
-    /// would then drop a brand-new client that had not been read once.
-    polled_clients: usize,
+    next_client_index: u64,
+    read_cursor: usize,
     /// Peers turned away, so a refusal is visible without a log scrape.
     pub refused: u32,
     /// Clients dropped for a protocol error, ditto.
     pub disconnected: u32,
+    diagnostics: Vec<String>,
 }
 
 impl<S: AudioSink> Server<S> {
@@ -235,19 +283,28 @@ impl<S: AudioSink> Server<S> {
         listener.set_nonblocking(true)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
         let spec = sink.spec();
+        // Keep one transfer of target headroom beyond the hardware ring. Pulse's
+        // default prebuffer threshold is `target + 1 - minreq`, so a target
+        // equal to the ring can start with no software frames left for the
+        // next refill. The extra period leaves the captured Firefox stream's
+        // bounded `period + 1 - minreq` reserve. That protects HDA from one
+        // scheduling delay immediately after START under the one-vCPU TCG
+        // proof.
+        let target_floor_frames = sink.buffer_frames().saturating_add(sink.period_frames());
         Ok(Self {
             listener,
             path: path.to_path_buf(),
             clients: Vec::new(),
-            mixer: Mixer::new(spec),
+            mixer: Mixer::with_target_floor(spec, target_floor_frames),
             sink,
             policy,
             spec,
             poll: PollSet::new(),
             next_client_index: 0,
-            polled_clients: 0,
+            read_cursor: 0,
             refused: 0,
             disconnected: 0,
+            diagnostics: Vec::new(),
         })
     }
 
@@ -317,29 +374,47 @@ impl<S: AudioSink> Server<S> {
     /// One trip round the loop. `true` means the device is gone.
     pub fn pass(&mut self) -> io::Result<bool> {
         self.wait()?;
-        self.accept();
+        // Order the device clock before commands delivered by this poll wake.
+        // A CORK/UNCORK or DRAIN cannot retroactively change whether an
+        // already-crossed stream endpoint was intentional.
+        if self.observe_device()? {
+            self.finish_device_gone();
+            return Ok(true);
+        }
         self.read_clients();
+        // Consume the poll snapshot before accepting. A full-table admission
+        // may evict an idle client and shift the vector; doing that first
+        // would apply an old fd's readiness to whichever client shifted into
+        // its slot.
+        self.accept();
+        self.route_global_requests();
+        self.broadcast_session_events();
+        self.drop_output_overflows();
         let gone = self.drive_device()?;
         self.service_clients();
         self.write_clients();
         if gone {
-            // Tell every client before the socket goes, so a client sees a
-            // stream killed rather than a connection that simply stopped.
-            for client in &mut self.clients {
-                client.session.kill_all_streams();
-                client.collect();
-                client.flush();
-            }
-            self.clients.clear();
-            self.forget_orphaned_streams();
+            self.finish_device_gone();
         }
         Ok(gone)
+    }
+
+    fn finish_device_gone(&mut self) {
+        // Queue KILLED and make one nonblocking delivery attempt before
+        // close. A backpressured peer observes EOF instead; device loss
+        // cannot block the single audio thread waiting for it to read.
+        for client in &mut self.clients {
+            client.session.kill_all_streams();
+            client.collect();
+            client.flush();
+        }
+        self.clients.clear();
+        self.forget_orphaned_streams();
     }
 
     fn wait(&mut self) -> io::Result<()> {
         self.poll.clear();
         self.poll.push(self.listener.as_raw_fd(), Interest::READ)?;
-        self.polled_clients = self.clients.len();
         for client in &self.clients {
             let interest = if client.wants_write() {
                 Interest::BOTH
@@ -348,12 +423,19 @@ impl<S: AudioSink> Server<S> {
             };
             self.poll.push(client.fd(), interest)?;
         }
-        if self.mixer.has_device_work() {
+        if self
+            .mixer
+            .has_device_work(self.sink.is_running(), self.sink.period_frames())
+        {
             if let Some(fd) = self.sink.raw_fd() {
                 self.poll.push(fd, Interest::WRITE)?;
             }
         }
-        self.poll.wait(WAIT_MS)?;
+        let deferred = self
+            .clients
+            .iter()
+            .any(|client| client.session.input_deferred());
+        self.poll.wait(if deferred { 0 } else { WAIT_MS })?;
         Ok(())
     }
 
@@ -361,6 +443,10 @@ impl<S: AudioSink> Server<S> {
         if !self.poll.readiness(0).readable {
             return;
         }
+        // One full-table replacement per snapshot admits progress without
+        // letting one listener wake churn every old idle context or the
+        // newcomer that this same wake just admitted.
+        let mut replaced_idle = false;
         for _ in 0..MAX_ACCEPTS_PER_PASS {
             let (stream, _) = match self.listener.accept() {
                 Ok(pair) => pair,
@@ -387,20 +473,56 @@ impl<S: AudioSink> Server<S> {
             if !self.policy.admits(&peer) {
                 // §K.5 asks for the decision to be "in code that can say why it
                 // refused", so it says so.
-                eprintln!("td-audio: refused a connection: {}", self.policy.refusal(&peer));
-                self.refused = self.refused.saturating_add(1);
-                continue;
-            }
-            if self.clients.len() >= MAX_CLIENTS {
-                eprintln!(
-                    "td-audio: refused uid {} (pid {}): already serving {MAX_CLIENTS} clients",
-                    peer.uid, peer.pid
+                diagnostic(
+                    &mut self.diagnostics,
+                    format_args!("refused a connection: {}", self.policy.refusal(&peer)),
                 );
                 self.refused = self.refused.saturating_add(1);
                 continue;
             }
-            let index = self.next_client_index;
-            self.next_client_index = self.next_client_index.saturating_add(1);
+            if self
+                .clients
+                .iter()
+                .filter(|client| client.peer.pid == peer.pid)
+                .count()
+                >= MAX_CLIENTS_PER_PID
+            {
+                diagnostic(
+                    &mut self.diagnostics,
+                    format_args!(
+                        "refused uid {} pid {}: already serving its \
+                         {MAX_CLIENTS_PER_PID} client limit",
+                        peer.uid, peer.pid
+                    ),
+                );
+                self.refused = self.refused.saturating_add(1);
+                continue;
+            }
+            if self.clients.len() >= MAX_CLIENTS {
+                let idle = if replaced_idle {
+                    None
+                } else {
+                    self.clients.iter().position(Client::evictable_idle)
+                };
+                if let Some(idle) = idle {
+                    self.drop_clients(&[idle]);
+                    replaced_idle = true;
+                } else {
+                    diagnostic(
+                        &mut self.diagnostics,
+                        format_args!(
+                            "refused uid {} (pid {}): already serving {MAX_CLIENTS} active clients",
+                            peer.uid, peer.pid
+                        ),
+                    );
+                    self.refused = self.refused.saturating_add(1);
+                    continue;
+                }
+            }
+            let Some(index) = self.allocate_client_index() else {
+                self.refused = self.refused.saturating_add(1);
+                continue;
+            };
             self.clients.push(Client {
                 stream,
                 session: Session::new(self.spec, index),
@@ -408,25 +530,144 @@ impl<S: AudioSink> Server<S> {
                 pending: Vec::new(),
                 pending_at: 0,
                 since: Instant::now(),
+                partial_since: None,
+                ready_input: false,
             });
+        }
+    }
+
+    fn allocate_client_index(&mut self) -> Option<u32> {
+        if self.next_client_index >= u64::from(crate::tag::INVALID_INDEX) {
+            return None;
+        }
+        let candidate = u32::try_from(self.next_client_index).ok()?;
+        self.next_client_index = self.next_client_index.saturating_add(1);
+        self.clients
+            .iter()
+            .all(|client| client.session.client_index() != candidate)
+            .then_some(candidate)
+    }
+
+    fn broadcast_session_events(&mut self) {
+        let mut events = Vec::new();
+        for (origin, client) in self.clients.iter_mut().enumerate() {
+            for (event, index) in client.session.take_global_events() {
+                events.push((origin, event, index));
+            }
+        }
+        for (origin, event, index) in events {
+            for (recipient, client) in self.clients.iter_mut().enumerate() {
+                if recipient != origin {
+                    client.session.notify_global(event, index);
+                }
+            }
+        }
+    }
+
+    fn route_global_requests(&mut self) {
+        let mut requests = Vec::new();
+        for (requester, client) in self.clients.iter_mut().enumerate() {
+            for request in client.session.take_global_requests() {
+                requests.push((requester, request));
+            }
+        }
+        let (clients, mixer) = (&mut self.clients, &mut self.mixer);
+        for (requester, request) in requests {
+            let index = match &request {
+                crate::session::GlobalRequest::Info { index, .. }
+                | crate::session::GlobalRequest::Volume { index, .. }
+                | crate::session::GlobalRequest::Mute { index, .. } => *index,
+            };
+            let owner = clients
+                .iter()
+                .position(|client| client.session.owns_sink_input(index));
+            let Some(owner) = owner else {
+                if let Some(client) = clients.get_mut(requester) {
+                    client.session.reject_global_request(request);
+                }
+                continue;
+            };
+            if owner == requester {
+                if let Some(client) = clients.get_mut(requester) {
+                    client.session.reject_global_request(request);
+                }
+                continue;
+            }
+            if requester < owner {
+                let (before_owner, from_owner) = clients.split_at_mut(owner);
+                if let (Some(requester), Some(owner)) =
+                    (before_owner.get_mut(requester), from_owner.first_mut())
+                {
+                    requester
+                        .session
+                        .complete_global_request(&mut owner.session, request, mixer);
+                }
+            } else {
+                let (through_owner, after_owner) = clients.split_at_mut(requester);
+                if let (Some(owner), Some(requester)) =
+                    (through_owner.get_mut(owner), after_owner.first_mut())
+                {
+                    requester
+                        .session
+                        .complete_global_request(&mut owner.session, request, mixer);
+                }
+            }
         }
     }
 
     fn read_clients(&mut self) {
         let mut buffer = [0u8; READ_CHUNK];
         let mut drop_indexes: Vec<usize> = Vec::new();
-        for (index, client) in self.clients.iter_mut().enumerate() {
-            if index >= self.polled_clients {
-                // Accepted after the poll set was built: it has no slot, and
-                // borrowing the next one would read the device's. It is read
-                // next pass, one `WAIT_MS` later at worst.
-                continue;
+        let mut frames_left = MAX_FRAMES_PER_PASS;
+        let client_count = self.clients.len();
+        let start = self.read_cursor % client_count.max(1);
+        let mut visited = 0usize;
+        for index in 0..client_count {
+            let readiness = self.poll.readiness(index.saturating_add(1));
+            if let Some(client) = self.clients.get_mut(index) {
+                client.ready_input = readiness.readable || client.session.input_deferred();
             }
+        }
+        for offset in 0..client_count {
+            if frames_left == 0 {
+                break;
+            }
+            let index = start.saturating_add(offset) % client_count.max(1);
+            visited = visited.saturating_add(1);
+            let Some(client) = self.clients.get_mut(index) else {
+                continue;
+            };
             // Slot 0 is the listener, so client `index` is poll slot
             // `index + 1`.
             let readiness = self.poll.readiness(index.saturating_add(1));
-            if readiness.gone {
+            if readiness.gone && !readiness.readable && !client.session.input_deferred() {
                 drop_indexes.push(index);
+                continue;
+            }
+            let per_client = frames_left.min(MAX_FRAMES_PER_CLIENT_PASS);
+            if client.session.input_deferred() {
+                match client
+                    .session
+                    .feed_limited(&[], &mut self.mixer, per_client)
+                {
+                    Ok(processed) => {
+                        frames_left = frames_left.saturating_sub(processed);
+                        client.update_partial_deadline();
+                    }
+                    Err(reason) => {
+                        // The failing frame can follow every allowed frame in
+                        // this turn. Charge the whole slice when the decoder
+                        // cannot return a precise successful count.
+                        frames_left = frames_left.saturating_sub(per_client);
+                        report_disconnect(
+                            &mut self.diagnostics,
+                            &client.peer,
+                            &reason,
+                            client.session.stream_count(),
+                        );
+                        drop_indexes.push(index);
+                    }
+                }
                 continue;
             }
             if !readiness.readable {
@@ -437,27 +678,36 @@ impl<S: AudioSink> Server<S> {
                 Ok(read) => {
                     let bytes = buffer.get(..read).unwrap_or(&[]);
                     let before = client.session.version();
-                    if let Err(reason) = client.session.feed(bytes, &mut self.mixer) {
+                    if let Err(reason) = client
+                        .session
+                        .feed_limited(bytes, &mut self.mixer, per_client)
+                        .map(|processed| {
+                            frames_left = frames_left.saturating_sub(processed);
+                        })
+                    {
+                        frames_left = frames_left.saturating_sub(per_client);
                         // A protocol error is not survivable: the stream is out
                         // of frame and every later byte would be read at the
                         // wrong offset. §K.3's schemas exist to detect exactly
                         // this, and detecting it means hanging up.
-                        report_disconnect(&client.peer, &reason, client.session.stream_count());
-                        drop_indexes.push(index);
-                    } else if client.session.buffered() > MAX_HALF_FRAMED {
-                        eprintln!(
-                            "td-audio: hung up on uid {} pid {}: {} bytes of an unfinished \
-                             frame, over the {MAX_HALF_FRAMED}-byte bound",
-                            client.peer.uid,
-                            client.peer.pid,
-                            client.session.buffered()
+                        report_disconnect(
+                            &mut self.diagnostics,
+                            &client.peer,
+                            &reason,
+                            client.session.stream_count(),
                         );
                         drop_indexes.push(index);
-                    } else if before.is_none() {
+                    } else {
+                        client.update_partial_deadline();
+                    }
+                    if !drop_indexes.contains(&index) && before.is_none() {
                         if let Some(version) = client.session.version() {
-                            eprintln!(
-                                "td-audio: uid {} (pid {}) authenticated at protocol {version}",
-                                client.peer.uid, client.peer.pid
+                            diagnostic(
+                                &mut self.diagnostics,
+                                format_args!(
+                                    "uid {} (pid {}) authenticated at protocol {version}",
+                                    client.peer.uid, client.peer.pid
+                                ),
                             );
                         }
                     }
@@ -467,10 +717,50 @@ impl<S: AudioSink> Server<S> {
                 Err(_) => drop_indexes.push(index),
             }
         }
+        if client_count > 0 {
+            self.read_cursor = start.saturating_add(visited) % client_count;
+        }
         self.drop_clients(&drop_indexes);
     }
 
-    /// Mix and hand a period to the device. `true` means the device is gone.
+    fn drop_output_overflows(&mut self) {
+        let indexes: Vec<usize> = self
+            .clients
+            .iter()
+            .enumerate()
+            .filter_map(|(index, client)| client.session.output_overflowed().then_some(index))
+            .collect();
+        self.drop_clients(&indexes);
+    }
+
+    /// Settle the device timeline before applying this wake's client commands.
+    /// `true` means the device is gone.
+    fn observe_device(&mut self) -> io::Result<bool> {
+        if !self.mixer.sink_is_running() {
+            return Ok(false);
+        }
+        match self.sink.wait(0)? {
+            crate::sink::Wait::Gone => Ok(true),
+            crate::sink::Wait::Underrun => {
+                self.mixer.recover(&mut self.sink)?;
+                Ok(false)
+            }
+            crate::sink::Wait::Writable | crate::sink::Wait::Timeout => {
+                match self.mixer.observe_playhead(&mut self.sink) {
+                    Ok(()) => Ok(false),
+                    Err(error) if is_underrun(&error) => {
+                        self.mixer.recover(&mut self.sink)?;
+                        Ok(false)
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(true),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Hand at most one period of real audio to the device.
+    /// `true` means the device is gone.
     fn drive_device(&mut self) -> io::Result<bool> {
         match self.sink.wait(0)? {
             crate::sink::Wait::Gone => return Ok(true),
@@ -482,8 +772,9 @@ impl<S: AudioSink> Server<S> {
                 // Deliberately NOT started here. `PREPARE` left the ring empty
                 // and `start_threshold` is the boundary, so a START now runs
                 // the device on nothing and underruns again immediately. The
-                // rule below — start once a period has actually been written —
-                // is the same rule, and the next pass reaches it.
+                // rule below — prime the ring, or accept an explicitly
+                // released finite tail — is the same rule, and a later pass
+                // reaches it.
                 return Ok(false);
             }
             crate::sink::Wait::Timeout => return Ok(false),
@@ -496,8 +787,9 @@ impl<S: AudioSink> Server<S> {
                 // Deliberately NOT started here. `PREPARE` left the ring empty
                 // and `start_threshold` is the boundary, so a START now runs
                 // the device on nothing and underruns again immediately. The
-                // rule below — start once a period has actually been written —
-                // is the same rule, and the next pass reaches it.
+                // rule below — prime the ring, or accept an explicitly
+                // released finite tail — is the same rule, and a later pass
+                // reaches it.
                 return Ok(false);
             }
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(true),
@@ -513,6 +805,7 @@ impl<S: AudioSink> Server<S> {
                 .ready_to_start(self.sink.buffer_frames(), self.sink.period_frames())
         {
             self.sink.start()?;
+            self.mixer.note_started();
         }
         Ok(false)
     }
@@ -522,24 +815,43 @@ impl<S: AudioSink> Server<S> {
         let mut drop_indexes: Vec<usize> = Vec::new();
         for (index, client) in self.clients.iter_mut().enumerate() {
             client.session.tick(now);
-            client.session.service(&self.mixer);
+            client.session.service(&mut self.mixer);
             client.collect();
             if client.session.version().is_none() && client.since.elapsed() > AUTH_DEADLINE {
-                eprintln!(
-                    "td-audio: hung up on uid {} pid {}: connected and never \
-                     authenticated",
-                    client.peer.uid, client.peer.pid
+                diagnostic(
+                    &mut self.diagnostics,
+                    format_args!(
+                        "hung up on uid {} pid {}: connected and never authenticated",
+                        client.peer.uid, client.peer.pid
+                    ),
+                );
+                drop_indexes.push(index);
+                continue;
+            }
+            if client
+                .partial_since
+                .is_some_and(|since| since.elapsed() > FRAME_DEADLINE)
+            {
+                diagnostic(
+                    &mut self.diagnostics,
+                    format_args!(
+                        "hung up on uid {} pid {}: an incomplete protocol frame exceeded \
+                         the {FRAME_DEADLINE:?} deadline",
+                        client.peer.uid, client.peer.pid
+                    ),
                 );
                 drop_indexes.push(index);
                 continue;
             }
             if client.owed() > MAX_PENDING {
-                eprintln!(
-                    "td-audio: hung up on uid {} pid {}: {} bytes owed and \
-                     not reading",
-                    client.peer.uid,
-                    client.peer.pid,
-                    client.owed()
+                diagnostic(
+                    &mut self.diagnostics,
+                    format_args!(
+                        "hung up on uid {} pid {}: {} bytes owed and not reading",
+                        client.peer.uid,
+                        client.peer.pid,
+                        client.owed()
+                    ),
                 );
                 drop_indexes.push(index);
             }
@@ -568,11 +880,13 @@ impl<S: AudioSink> Server<S> {
         let mut sorted = indexes.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
+        let mut removed_sink_inputs = Vec::new();
         for index in sorted.into_iter().rev() {
             if index >= self.clients.len() {
                 continue;
             }
-            self.clients.remove(index);
+            let removed = self.clients.remove(index);
+            removed_sink_inputs.extend(removed.session.sink_input_indexes());
             self.disconnected = self.disconnected.saturating_add(1);
         }
         // And every stream those clients had is the mixer's to forget. A client
@@ -580,6 +894,14 @@ impl<S: AudioSink> Server<S> {
         // would keep playing. Dropping the client does not do this: the mixer
         // is a separate table, reconciled here against the sessions that remain.
         self.forget_orphaned_streams();
+        for index in removed_sink_inputs {
+            for client in &mut self.clients {
+                client.session.notify_global(
+                    subscription::EVENT_SINK_INPUT | subscription::EVENT_REMOVE,
+                    index,
+                );
+            }
+        }
     }
 
     /// Streams whose session is gone.
@@ -605,6 +927,9 @@ impl<S: AudioSink> Server<S> {
     pub fn shutdown(&mut self) {
         let _ = self.mixer.drain_all(&mut self.sink, 64);
         let _ = self.sink.drain();
+        for diagnostic in &self.diagnostics {
+            eprintln!("td-audio: {diagnostic}");
+        }
         eprintln!(
             "td-audio: {} closing with {} client(s) and {} stream(s); \
              {} peer(s) refused, {} hung up on",
@@ -648,10 +973,25 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
 
 /// One line about a client that was hung up on. §K.5 wants the refusal to be
 /// able to say why.
-fn report_disconnect(peer: &sys::Peer, reason: &Disconnect, streams: usize) {
-    eprintln!(
-        "td-audio: hung up on uid {} pid {} with {streams} stream(s): {reason}",
-        peer.uid, peer.pid
+fn diagnostic(diagnostics: &mut Vec<String>, message: fmt::Arguments<'_>) {
+    if diagnostics.len() >= MAX_DAEMON_DIAGNOSTICS {
+        return;
+    }
+    diagnostics.push(message.to_string());
+}
+
+fn report_disconnect(
+    diagnostics: &mut Vec<String>,
+    peer: &sys::Peer,
+    reason: &Disconnect,
+    streams: usize,
+) {
+    diagnostic(
+        diagnostics,
+        format_args!(
+            "hung up on uid {} pid {} with {streams} stream(s): {reason}",
+            peer.uid, peer.pid
+        ),
     );
 }
 
@@ -660,7 +1000,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::proto::command;
-    use crate::sink::MemorySink;
+    use crate::sink::{AudioSink, MemorySink, Wait};
     use crate::tag;
     use crate::wire;
 
@@ -671,11 +1011,124 @@ mod tests {
     fn server(name: &str) -> (Server<MemorySink>, PathBuf) {
         let path = socket_path(name);
         let _ = std::fs::remove_file(&path);
-        let mut sink = MemorySink::fixed();
+        // Match the production default: eight 1,024-frame periods.  A larger
+        // synthetic ring would require correspondingly more client data
+        // before the target-floor invariant permits START.
+        let mut sink = MemorySink::new(Spec::fixed(), 8_192, 1_024);
         sink.start().unwrap();
         let uid = own_uid();
         let server = Server::bind(&path, sink, Policy::for_uid(uid)).unwrap();
         (server, path)
+    }
+
+    #[test]
+    fn production_sessions_keep_one_period_behind_the_selected_device_ring() {
+        let (mut server, path) = server("target-floor");
+        assert_eq!(server.sink.buffer_frames(), 8_192);
+        assert_eq!(server.sink.period_frames(), 1_024);
+        assert_eq!(server.mixer.target_floor_frames(), 9_216);
+        server.shutdown();
+        assert!(!path.exists());
+    }
+
+    /// A stopped sink whose descriptor is nevertheless always writable, which
+    /// is the state a prepared ALSA playback PCM presents before real audio.
+    struct WritableIdleSink {
+        inner: MemorySink,
+        ready: UnixStream,
+        _peer: UnixStream,
+    }
+
+    impl WritableIdleSink {
+        fn new() -> Self {
+            let (ready, peer) = UnixStream::pair().unwrap();
+            Self {
+                inner: MemorySink::fixed(),
+                ready,
+                _peer: peer,
+            }
+        }
+    }
+
+    impl AudioSink for WritableIdleSink {
+        fn spec(&self) -> Spec {
+            self.inner.spec()
+        }
+
+        fn device_delay(&mut self) -> io::Result<u64> {
+            self.inner.device_delay()
+        }
+
+        fn wait(&mut self, timeout_ms: i32) -> io::Result<Wait> {
+            self.inner.wait(timeout_ms)
+        }
+
+        fn write(&mut self, pcm: &[u8]) -> io::Result<usize> {
+            self.inner.write(pcm)
+        }
+
+        fn start(&mut self) -> io::Result<()> {
+            self.inner.start()
+        }
+
+        fn stop(&mut self) -> io::Result<()> {
+            self.inner.stop()
+        }
+
+        fn drain(&mut self) -> io::Result<()> {
+            self.inner.drain()
+        }
+
+        fn recover(&mut self) -> io::Result<()> {
+            self.inner.recover()
+        }
+
+        fn buffer_frames(&self) -> u64 {
+            self.inner.buffer_frames()
+        }
+
+        fn period_frames(&self) -> u64 {
+            self.inner.period_frames()
+        }
+
+        fn raw_fd(&self) -> Option<RawFd> {
+            Some(self.ready.as_raw_fd())
+        }
+
+        fn is_running(&self) -> bool {
+            self.inner.is_running()
+        }
+    }
+
+    #[test]
+    fn an_idle_writable_pcm_does_not_spin_the_event_loop() {
+        let path = socket_path("idle-writable");
+        let _ = std::fs::remove_file(&path);
+        let uid = own_uid();
+        let mut server =
+            Server::bind(&path, WritableIdleSink::new(), Policy::for_uid(uid)).unwrap();
+        let began = Instant::now();
+        assert_eq!(server.run(Some(2)).unwrap(), Stopped::Finished);
+        assert!(
+            began.elapsed() >= Duration::from_millis(WAIT_MS as u64),
+            "the permanently writable PCM bypassed the idle poll timeout"
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn each_poll_wake_observes_the_device_before_client_commands() {
+        let source = include_str!("serve.rs");
+        let start = source.find("pub fn pass(&mut self)").unwrap();
+        let end = source
+            .get(start..)
+            .unwrap()
+            .find("fn finish_device_gone")
+            .unwrap();
+        let pass = source.get(start..start + end).unwrap();
+        let observe = pass.find("self.observe_device()?").unwrap();
+        let commands = pass.find("self.read_clients();").unwrap();
+        assert!(observe < commands);
     }
 
     /// This test process's uid, read from `/proc/self/status` so the test needs
@@ -705,7 +1158,9 @@ mod tests {
 
     fn auth_packet() -> Vec<u8> {
         build(command::AUTH, 0, |writer| {
-            writer.u32(35).arbitrary(&[0u8; crate::session::AUTH_COOKIE_LEN]);
+            writer
+                .u32(35)
+                .arbitrary(&[0u8; crate::session::AUTH_COOKIE_LEN]);
         })
     }
 
@@ -725,12 +1180,79 @@ mod tests {
     }
 
     fn first_command(bytes: &[u8]) -> Option<u32> {
+        control_packets(bytes)
+            .first()
+            .and_then(|packet| wire::command_and_tag(packet).ok().map(|(c, _)| c))
+    }
+
+    fn control_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut decoder = wire::Decoder::new();
+        decoder.push(bytes);
+        let mut packets = Vec::new();
+        while let Some(frame) = decoder.next_frame() {
+            if let Ok(wire::Frame::Control(packet)) = frame {
+                packets.push(packet);
+            }
+        }
+        packets
+    }
+
+    fn created_sink_input(bytes: &[u8]) -> Option<u32> {
         let mut decoder = wire::Decoder::new();
         decoder.push(bytes);
         while let Some(frame) = decoder.next_frame() {
-            if let Ok(wire::Frame::Control(packet)) = frame {
-                return wire::command_and_tag(&packet).ok().map(|(c, _)| c);
+            let Ok(wire::Frame::Control(packet)) = frame else {
+                continue;
+            };
+            let mut reader = tag::Reader::new(&packet);
+            if reader.u32().ok()? != command::REPLY {
+                continue;
             }
+            let _tag = reader.u32().ok()?;
+            let _channel = reader.u32().ok()?;
+            return reader.u32().ok();
+        }
+        None
+    }
+
+    fn subscription_events(bytes: &[u8]) -> Vec<(u32, u32)> {
+        control_packets(bytes)
+            .into_iter()
+            .filter_map(|packet| {
+                let mut reader = tag::Reader::new(&packet);
+                if reader.u32().ok()? != command::SUBSCRIBE_EVENT
+                    || reader.u32().ok()? != tag::INVALID_INDEX
+                {
+                    return None;
+                }
+                let event = reader.u32().ok()?;
+                let index = reader.u32().ok()?;
+                reader.finish().ok()?;
+                Some((event, index))
+            })
+            .collect()
+    }
+
+    fn sink_input_state(bytes: &[u8], expected_tag: u32) -> Option<(u32, u32, Vec<u32>, bool)> {
+        for packet in control_packets(bytes) {
+            let mut reader = tag::Reader::new(&packet);
+            if reader.u32().ok()? != command::REPLY || reader.u32().ok()? != expected_tag {
+                continue;
+            }
+            let index = reader.u32().ok()?;
+            let _name = reader.string().ok()?;
+            let _module = reader.u32().ok()?;
+            let client = reader.u32().ok()?;
+            let _sink = reader.u32().ok()?;
+            let _spec = reader.sample_spec().ok()?;
+            let _map = reader.channel_map().ok()?;
+            let volume = reader.cvolume().ok()?;
+            let _queued = reader.usec().ok()?;
+            let _device = reader.usec().ok()?;
+            let _resample = reader.string().ok()?;
+            let _driver = reader.string().ok()?;
+            let muted = reader.boolean().ok()?;
+            return Some((index, client, volume, muted));
         }
         None
     }
@@ -745,6 +1267,128 @@ mod tests {
         assert_eq!(server.socket_path(), path.as_path());
         server.shutdown();
         assert!(!path.exists(), "the socket is removed on the way out");
+    }
+
+    #[test]
+    fn a_readiness_probe_does_not_start_or_break_the_pcm() {
+        let path = socket_path("probe");
+        let _ = std::fs::remove_file(&path);
+        let sink = MemorySink::fixed();
+        let uid = own_uid();
+        let mut server = Server::bind(&path, sink, Policy::for_uid(uid)).unwrap();
+        let probe = UnixStream::connect(&path).unwrap();
+        server.pass().unwrap();
+        drop(probe);
+        server.pass().unwrap();
+
+        assert_eq!(server.client_count(), 0);
+        assert_eq!(server.stream_count(), 0);
+        assert_eq!(server.sink.frames_written(), 0);
+        assert!(!server.sink.is_running());
+        server.shutdown();
+    }
+
+    /// A large readable socket gets one bounded batch while another readable
+    /// client gets its own batch in the same pass. The retained complete
+    /// frames force a zero-timeout next pass instead of blocking for new I/O.
+    #[test]
+    fn one_pass_bounds_each_clients_control_work() {
+        let (mut server, path) = server("control-fairness");
+        let mut first = UnixStream::connect(&path).unwrap();
+        let mut second = UnixStream::connect(&path).unwrap();
+        first.write_all(&auth_packet()).unwrap();
+        second.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut first);
+        let _ = drain_socket(&mut second);
+
+        let mut questions = Vec::new();
+        for tag_value in 0..64 {
+            questions.extend(build(command::GET_SERVER_INFO, tag_value, |_| {}));
+        }
+        first.write_all(&questions).unwrap();
+        second.write_all(&questions).unwrap();
+        server.pass().unwrap();
+
+        assert_eq!(control_packets(&drain_socket(&mut first)).len(), 32);
+        assert_eq!(control_packets(&drain_socket(&mut second)).len(), 32);
+        assert!(server
+            .clients
+            .iter()
+            .all(|client| client.session.input_deferred()));
+        assert!(server
+            .clients
+            .iter()
+            .all(|client| !client.session.output_overflowed()));
+        server.shutdown();
+    }
+
+    /// The global frame budget charges work performed, not each client's full
+    /// allowance. More than eight one-frame clients therefore all make
+    /// progress in one pass; charging 32 apiece would stop after the eighth.
+    #[test]
+    fn one_frame_clients_share_the_actual_work_budget() {
+        let (mut server, path) = server("actual-frame-budget");
+        let mut clients = Vec::new();
+        for batch in 0..3 {
+            let before = server.client_count();
+            for _ in 0..MAX_CLIENTS_PER_PID {
+                let mut client = UnixStream::connect(&path).unwrap();
+                client.write_all(&auth_packet()).unwrap();
+                clients.push(client);
+            }
+            server.pass().unwrap();
+            for held in server.clients.iter_mut().skip(before) {
+                held.peer.pid = 30_000 + batch;
+            }
+            server.pass().unwrap();
+        }
+        for client in &mut clients {
+            let _ = drain_socket(client);
+            client
+                .write_all(&build(command::GET_SERVER_INFO, 50, |_| {}))
+                .unwrap();
+        }
+        server.pass().unwrap();
+        assert!(clients.iter_mut().all(|client| {
+            control_packets(&drain_socket(client))
+                .iter()
+                .any(|packet| wire::command_and_tag(packet) == Ok((command::REPLY, 50)))
+        }));
+        server.shutdown();
+    }
+
+    /// A partial frame discovered only after the bounded complete-frame batch
+    /// still gets its own progress deadline.
+    #[test]
+    fn deferred_complete_frames_cannot_hide_an_abandoned_partial_frame() {
+        let (mut server, path) = server("deferred-partial-frame");
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut client);
+
+        let mut input = Vec::new();
+        for tag_value in 0..33 {
+            input.extend(build(command::GET_SERVER_INFO, tag_value, |_| {}));
+        }
+        input.extend(wire::Descriptor::encode(1024, 0, 0, 0));
+        client.write_all(&input).unwrap();
+        server.pass().unwrap();
+        assert!(server.clients.first().unwrap().session.input_deferred());
+        assert!(server.clients.first().unwrap().partial_since.is_none());
+
+        server.pass().unwrap();
+        let held = server.clients.first().unwrap();
+        assert!(!held.session.input_deferred());
+        assert!(held.session.has_incomplete_input());
+        assert!(
+            held.partial_since.is_some(),
+            "the deferred branch exposed a partial frame without arming it"
+        );
+        server.shutdown();
     }
 
     /// A stale socket is replaced; a regular file with the same name is not,
@@ -789,7 +1433,10 @@ mod tests {
         server.pass().unwrap();
         server.pass().unwrap();
         assert_eq!(server.client_count(), 1);
-        assert_eq!(first_command(&drain_socket(&mut client)), Some(command::REPLY));
+        assert_eq!(
+            first_command(&drain_socket(&mut client)),
+            Some(command::REPLY)
+        );
 
         // The version-35 create request.
         let create = build(command::CREATE_PLAYBACK_STREAM, 1, |writer| {
@@ -823,7 +1470,10 @@ mod tests {
         server.pass().unwrap();
         server.pass().unwrap();
         assert_eq!(server.stream_count(), 1, "the client has a mixer stream");
-        assert_eq!(first_command(&drain_socket(&mut client)), Some(command::REPLY));
+        assert_eq!(
+            first_command(&drain_socket(&mut client)),
+            Some(command::REPLY)
+        );
 
         // And audio on the stream channel reaches the device.
         let mut pcm = Vec::new();
@@ -843,7 +1493,9 @@ mod tests {
         // Prebuffering forbids a silent period before the client's first data.
         let samples = server.sink.samples();
         assert!(
-            samples.get(..64).is_some_and(|run| run.iter().all(|s| *s == 900)),
+            samples
+                .get(..64)
+                .is_some_and(|run| run.iter().all(|s| *s == 900)),
             "the client's audio arrived altered or in pieces"
         );
         server.shutdown();
@@ -892,7 +1544,11 @@ mod tests {
             server.pass().unwrap();
         }
         assert_eq!(server.client_count(), 0);
-        assert_eq!(server.stream_count(), 0, "the mixer still holds a dead stream");
+        assert_eq!(
+            server.stream_count(),
+            0,
+            "the mixer still holds a dead stream"
+        );
         server.shutdown();
     }
 
@@ -901,8 +1557,8 @@ mod tests {
     /// `PREPARE` discards the ring, and `start_threshold` is the boundary, so a
     /// `START` with nothing queued runs the device on silence and underruns
     /// again at the next pointer update — a prepare/start/XRUN churn that never
-    /// converges. The rule fifteen lines below the recovery path is the right
-    /// one and always was: start once a period has actually been written.
+    /// converges. The rule below starts only after the ring is fully primed or
+    /// every accepted contribution is an explicitly released finite tail.
     #[test]
     fn recovery_does_not_start_the_device_on_an_empty_ring() {
         let (mut server, _path) = server("recovery");
@@ -920,6 +1576,7 @@ mod tests {
         let id = server.mixer.open(4096).unwrap();
         let audio = vec![0u8; 4 * 512];
         server.mixer.write(id, &audio).unwrap();
+        server.mixer.set_prebuffer(id, 0, false).unwrap();
         server.pass().unwrap();
         assert!(server.sink.is_running(), "and it never started at all");
         server.shutdown();
@@ -941,13 +1598,16 @@ mod tests {
         assert!(!server.drive_device().unwrap());
         assert!(!server.sink.is_running());
         assert!(!server.drive_device().unwrap());
-        assert!(server.sink.is_running(), "the primed ring was never started");
+        assert!(
+            server.sink.is_running(),
+            "the primed ring was never started"
+        );
         assert_eq!(server.sink.frames_written(), 12);
         server.shutdown();
     }
 
     /// A create request at version 35, as a modern client sends it.
-    fn create_request(tag_number: u32) -> Vec<u8> {
+    fn create_request(tag_number: u32, corked: bool) -> Vec<u8> {
         build(command::CREATE_PLAYBACK_STREAM, tag_number, |writer| {
             writer
                 .sample_spec(tag::SampleSpec {
@@ -959,7 +1619,7 @@ mod tests {
                 .u32(tag::INVALID_INDEX)
                 .null_string()
                 .u32(tag::INVALID_INDEX)
-                .boolean(false)
+                .boolean(corked)
                 .u32(tag::INVALID_INDEX)
                 .u32(tag::INVALID_INDEX)
                 .u32(tag::INVALID_INDEX)
@@ -997,22 +1657,155 @@ mod tests {
         let _ = drain_socket(&mut first);
         let _ = drain_socket(&mut second);
 
-        first.write_all(&create_request(1)).unwrap();
-        second.write_all(&create_request(1)).unwrap();
+        first.write_all(&create_request(1, false)).unwrap();
+        second.write_all(&create_request(1, false)).unwrap();
         server.pass().unwrap();
         server.pass().unwrap();
 
+        let first_reply = drain_socket(&mut first);
+        let second_reply = drain_socket(&mut second);
         assert_eq!(
-            first_command(&drain_socket(&mut first)),
+            first_command(&first_reply),
             Some(command::REPLY),
             "the first client's stream"
         );
         assert_eq!(
-            first_command(&drain_socket(&mut second)),
+            first_command(&second_reply),
             Some(command::REPLY),
             "and the second client's, which used to be PA_ERR_INTERNAL"
         );
+        assert_ne!(
+            created_sink_input(&first_reply),
+            created_sink_input(&second_reply),
+            "sink-input indexes are process-global, not per connection"
+        );
         assert_eq!(server.stream_count(), 2, "two streams, not one");
+        server.shutdown();
+    }
+
+    /// Sink-input identity is daemon-global, not merely a unique number in a
+    /// create reply. A separate control connection can observe, inspect, and
+    /// change another client's stream, then observes its removal.
+    #[test]
+    fn a_control_client_routes_sink_input_operations_across_connections() {
+        let (mut server, path) = server("global-control");
+        let mut control = UnixStream::connect(&path).unwrap();
+        let mut playback = UnixStream::connect(&path).unwrap();
+        control.write_all(&auth_packet()).unwrap();
+        playback.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut control);
+        let _ = drain_socket(&mut playback);
+
+        control
+            .write_all(&build(command::SUBSCRIBE, 10, |writer| {
+                writer.u32(subscription::MASK_SINK_INPUT);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut control);
+
+        playback.write_all(&create_request(20, false)).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let created = drain_socket(&mut playback);
+        let index = created_sink_input(&created).expect("create reply has a sink-input id");
+        let new_events = subscription_events(&drain_socket(&mut control));
+        assert!(new_events.contains(&(
+            subscription::EVENT_SINK_INPUT | subscription::EVENT_NEW,
+            index,
+        )));
+
+        control
+            .write_all(&build(command::GET_SINK_INPUT_INFO, 30, |writer| {
+                writer.u32(index);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let state = sink_input_state(&drain_socket(&mut control), 30).unwrap();
+        assert_eq!(state.0, index);
+        assert_eq!(
+            state.1,
+            server.clients.get(1).unwrap().session.client_index(),
+            "the reply identifies the playback connection, not the requester"
+        );
+
+        let half = crate::mixer::VOLUME_NORM / 2;
+        let mut changes = build(command::SET_SINK_INPUT_VOLUME, 31, |writer| {
+            writer.u32(index).cvolume(&[half, half]);
+        });
+        changes.extend(build(command::SET_SINK_INPUT_MUTE, 32, |writer| {
+            writer.u32(index).boolean(true);
+        }));
+        control.write_all(&changes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let changed = drain_socket(&mut control);
+        assert_eq!(
+            subscription_events(&changed)
+                .iter()
+                .filter(|(event, event_index)| {
+                    *event == (subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE)
+                        && *event_index == index
+                })
+                .count(),
+            2,
+            "both remote mutations are broadcast"
+        );
+
+        control
+            .write_all(&build(command::GET_SINK_INPUT_INFO, 33, |writer| {
+                writer.u32(index);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let state = sink_input_state(&drain_socket(&mut control), 33).unwrap();
+        assert_eq!(state.2, vec![half, half]);
+        assert!(state.3, "the remote mute reached the owning stream");
+
+        drop(playback);
+        for _ in 0..3 {
+            server.pass().unwrap();
+        }
+        let removed = subscription_events(&drain_socket(&mut control));
+        assert!(removed.contains(&(
+            subscription::EVENT_SINK_INPUT | subscription::EVENT_REMOVE,
+            index,
+        )));
+        server.shutdown();
+    }
+
+    /// Creating a stream is control traffic, not a reason to start the PCM.
+    /// Initial cork state also has to reach the mixer even if a hostile client
+    /// sends data without waiting for a byte grant.
+    #[test]
+    fn empty_and_initially_corked_streams_do_not_start_the_pcm() {
+        let path = socket_path("idle-streams");
+        let _ = std::fs::remove_file(&path);
+        let uid = own_uid();
+        let mut server = Server::bind(&path, MemorySink::fixed(), Policy::for_uid(uid)).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut client);
+
+        client.write_all(&create_request(1, false)).unwrap();
+        client.write_all(&create_request(2, true)).unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut client);
+        let pcm = vec![1u8; 4 * 32];
+        let mut data = wire::Descriptor::encode(pcm.len() as u32, 1, 0, 0).to_vec();
+        data.extend_from_slice(&pcm);
+        client.write_all(&data).unwrap();
+        server.pass().unwrap();
+
+        assert_eq!(server.stream_count(), 2);
+        assert_eq!(server.sink.frames_written(), 0);
+        assert!(!server.sink.is_running());
         server.shutdown();
     }
 
@@ -1059,8 +1852,58 @@ mod tests {
                 server.owed_to_clients()
             );
         }
-        assert!(dropped, "it was never dropped, and the buffer grew unbounded");
+        assert!(
+            dropped,
+            "it was never dropped, and the buffer grew unbounded"
+        );
         server.shutdown();
+    }
+
+    /// Prefix compaction is bounded in memory and amortized across one whole
+    /// consumed window rather than copying the owed tail after every byte.
+    #[test]
+    fn a_slowly_drained_client_amortizes_prefix_compaction() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut session = Session::new(Spec::fixed(), 0);
+        let mut mixer = Mixer::new(Spec::fixed());
+        session.feed(&auth_packet(), &mut mixer).unwrap();
+        let _ = session.take_output();
+        let mut client = Client {
+            stream,
+            session,
+            peer: sys::Peer {
+                pid: 1,
+                uid: 1000,
+                gid: 1000,
+            },
+            pending: vec![0; MAX_PENDING_STORAGE - 1],
+            pending_at: MAX_PENDING,
+            since: Instant::now(),
+            partial_since: None,
+            ready_input: false,
+        };
+
+        client
+            .session
+            .feed(&build(command::GET_SERVER_INFO, 0, |_| {}), &mut mixer)
+            .unwrap();
+        client.collect();
+        assert_eq!(client.pending_at, 0, "the full window compacted once");
+        assert!(client.pending.len() <= MAX_PENDING_STORAGE);
+
+        for tag_value in 1..16 {
+            client.pending_at = client.pending_at.saturating_add(1);
+            client
+                .session
+                .feed(
+                    &build(command::GET_SERVER_INFO, tag_value, |_| {}),
+                    &mut mixer,
+                )
+                .unwrap();
+            client.collect();
+            assert_eq!(client.pending_at, tag_value as usize);
+            assert!(client.pending.len() <= MAX_PENDING_STORAGE);
+        }
     }
 
     /// A peer that connects and says nothing does not hold a slot forever.
@@ -1075,6 +1918,66 @@ mod tests {
         server.age_clients_for_test(AUTH_DEADLINE + Duration::from_secs(1));
         server.pass().unwrap();
         assert_eq!(server.client_count(), 0, "it never authenticated");
+        server.shutdown();
+    }
+
+    /// A framed body cannot reserve a decoder buffer and admission slot
+    /// forever merely by stopping after its descriptor.
+    #[test]
+    fn an_abandoned_frame_is_dropped_after_its_own_deadline() {
+        let (mut server, path) = server("partial-frame");
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut client);
+
+        client
+            .write_all(&wire::Descriptor::encode(1024, 0, 0, 0))
+            .unwrap();
+        server.pass().unwrap();
+        assert!(
+            server
+                .clients
+                .first()
+                .unwrap()
+                .session
+                .has_incomplete_input(),
+            "the incomplete descriptor is retained"
+        );
+        assert!(
+            server.clients.first().unwrap().partial_since.is_some(),
+            "reading the partial frame did not arm its deadline"
+        );
+        server.clients.first_mut().unwrap().partial_since =
+            Instant::now().checked_sub(FRAME_DEADLINE + Duration::from_secs(1));
+        server.pass().unwrap();
+        assert_eq!(server.client_count(), 0);
+        server.shutdown();
+    }
+
+    /// AF_UNIX reports readable data and HUP together after a peer closes.
+    /// Reading the queued bytes first lets the state machine and device observe
+    /// the final write; disconnect may still discard its unplayed tail.
+    #[test]
+    fn a_final_write_is_processed_before_peer_hangup() {
+        let (mut server, path) = server("write-then-close");
+        let mut client = UnixStream::connect(&path).unwrap();
+        let mut conversation = auth_packet();
+        conversation.extend(create_request(1, false));
+        let pcm = vec![7u8; 9600 * 4];
+        conversation.extend(wire::Descriptor::encode(pcm.len() as u32, 0, 0, 0));
+        conversation.extend(pcm);
+        client.write_all(&conversation).unwrap();
+        drop(client);
+
+        for _ in 0..4 {
+            server.pass().unwrap();
+        }
+        assert!(
+            server.sink.frames_written() > 0,
+            "queued audio was discarded when POLLIN arrived with POLLHUP"
+        );
         server.shutdown();
     }
 
@@ -1105,7 +2008,10 @@ mod tests {
         good.write_all(&build(command::GET_SINK_INFO_LIST, 4, |_| {}))
             .unwrap();
         server.pass().unwrap();
-        assert_eq!(first_command(&drain_socket(&mut good)), Some(command::REPLY));
+        assert_eq!(
+            first_command(&drain_socket(&mut good)),
+            Some(command::REPLY)
+        );
         server.shutdown();
     }
 
@@ -1149,7 +2055,11 @@ mod tests {
     #[test]
     fn the_policy_admits_exactly_two_uids() {
         let policy = Policy::for_uid(994);
-        let peer = |uid| sys::Peer { pid: 1, uid, gid: uid };
+        let peer = |uid| sys::Peer {
+            pid: 1,
+            uid,
+            gid: uid,
+        };
         assert!(policy.admits(&peer(994)), "the daemon's own uid");
         assert!(policy.admits(&peer(SEAT_UID)), "the seat user");
         assert!(!policy.admits(&peer(0)), "root is not on the list");
@@ -1182,24 +2092,188 @@ mod tests {
         server.shutdown();
     }
 
-    /// The daemon holds a bounded number of clients. A local process can call
-    /// `connect(2)` in a loop, and running out of descriptors would take the
-    /// audio down for everyone already playing.
+    /// One kernel-authenticated process cannot reserve the whole daemon table.
     #[test]
-    fn the_client_count_is_bounded() {
-        let (mut server, path) = server("bound");
+    fn one_pid_has_its_own_client_limit() {
+        let (mut server, path) = server("per-pid-bound");
         let mut held = Vec::new();
-        for _ in 0..MAX_CLIENTS + 8 {
+        for _ in 0..MAX_CLIENTS_PER_PID + 4 {
             match UnixStream::connect(&path) {
-                Ok(stream) => held.push(stream),
+                Ok(mut stream) => {
+                    stream.write_all(&auth_packet()).unwrap();
+                    held.push(stream);
+                }
                 Err(_) => break,
             }
         }
         for _ in 0..4 {
             server.pass().unwrap();
         }
+        assert_eq!(server.client_count(), MAX_CLIENTS_PER_PID);
+        assert!(
+            server
+                .clients
+                .iter()
+                .all(|client| client.session.version().is_some()),
+            "the admitted contexts reached authenticated idle state"
+        );
+        assert!(server.refused >= 4, "the surplus was refused, not queued");
+        server.shutdown();
+    }
+
+    /// The global ceiling still bounds descriptors, while one genuinely idle
+    /// context is evictable per pass so a full table cannot exclude newcomers
+    /// or churn the whole table in one listener wake.
+    #[test]
+    fn the_full_client_table_admits_a_newcomer_by_evicting_idle() {
+        let (mut server, path) = server("global-bound");
+        let mut held = Vec::new();
+        for batch in 0..(MAX_CLIENTS / MAX_CLIENTS_PER_PID) {
+            let before = server.client_count();
+            for _ in 0..MAX_CLIENTS_PER_PID {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                stream.write_all(&auth_packet()).unwrap();
+                held.push(stream);
+            }
+            server.pass().unwrap();
+            for client in server.clients.iter_mut().skip(before) {
+                client.peer.pid = 10_000 + batch as i32;
+            }
+            server.pass().unwrap();
+        }
         assert_eq!(server.client_count(), MAX_CLIENTS);
-        assert!(server.refused >= 8, "the surplus was refused, not queued");
+        assert!(
+            server
+                .clients
+                .iter()
+                .all(|client| client.session.version().is_some()),
+            "the full table consists of authenticated idle contexts"
+        );
+        let existing = server.clients.first().unwrap().session.client_index();
+        held.first_mut()
+            .unwrap()
+            .write_all(&build(command::GET_SINK_INPUT_INFO, 1, |writer| {
+                writer.u32(tag::INVALID_INDEX - 1);
+            }))
+            .unwrap();
+        let disconnected = server.disconnected;
+        let mut newcomer = UnixStream::connect(&path).unwrap();
+        newcomer.write_all(&auth_packet()).unwrap();
+        let mut surplus = UnixStream::connect(&path).unwrap();
+        surplus.write_all(&auth_packet()).unwrap();
+        held.push(newcomer);
+        held.push(surplus);
+        let refused = server.refused;
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert_eq!(server.client_count(), MAX_CLIENTS);
+        assert_eq!(server.disconnected, disconnected + 1);
+        assert_eq!(
+            server.refused,
+            refused + 1,
+            "one listener wake replaces no more than one old idle context"
+        );
+        assert!(
+            server
+                .clients
+                .iter()
+                .any(|client| client.session.client_index() == existing),
+            "the readable client's unrouted request was mistaken for idleness"
+        );
+        server.shutdown();
+    }
+
+    /// A streamless subscriber is a live control connection, not an idle
+    /// decoder slot that admission pressure may silently discard.
+    #[test]
+    fn a_subscribed_control_connection_is_not_idle_eviction_fodder() {
+        let (mut server, path) = server("subscribed-global-bound");
+        let mut held = Vec::new();
+        for batch in 0..(MAX_CLIENTS / MAX_CLIENTS_PER_PID) {
+            let before = server.client_count();
+            for _ in 0..MAX_CLIENTS_PER_PID {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                stream.write_all(&auth_packet()).unwrap();
+                held.push(stream);
+            }
+            server.pass().unwrap();
+            for client in server.clients.iter_mut().skip(before) {
+                client.peer.pid = 20_000 + batch as i32;
+            }
+            server.pass().unwrap();
+        }
+        let protected = server.clients.first().unwrap().session.client_index();
+        held.first_mut()
+            .unwrap()
+            .write_all(&build(command::SUBSCRIBE, 40, |writer| {
+                writer.u32(subscription::MASK_SINK_INPUT);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(held.first_mut().unwrap());
+
+        let mut newcomer = UnixStream::connect(&path).unwrap();
+        newcomer.write_all(&auth_packet()).unwrap();
+        held.push(newcomer);
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert!(
+            server
+                .clients
+                .iter()
+                .any(|client| client.session.client_index() == protected),
+            "the streamless subscriber was treated as disposable idleness"
+        );
+        assert_eq!(server.client_count(), MAX_CLIENTS);
+        server.shutdown();
+    }
+
+    /// Client indexes stop before Pulse's reserved INVALID value rather than
+    /// reusing an identity after counter exhaustion.
+    #[test]
+    fn client_indexes_exhaust_before_the_reserved_value() {
+        let (mut server, path) = server("client-index-wrap");
+        server.next_client_index = u64::from(u32::MAX - 1);
+        let first = UnixStream::connect(&path).unwrap();
+        server.pass().unwrap();
+        assert_eq!(
+            server.clients.first().unwrap().session.client_index(),
+            u32::MAX - 1
+        );
+
+        let second = UnixStream::connect(&path).unwrap();
+        server.pass().unwrap();
+        assert_eq!(server.client_count(), 1);
+        assert_eq!(server.refused, 1, "the exhausted admission was refused");
+        drop(first);
+        drop(second);
+        server.shutdown();
+    }
+
+    /// Refused reconnects remain observable, but only the daemon-global first
+    /// few are written to stderr. A per-connection budget would reset on each
+    /// attempt and let an untrusted local uid block the audio thread on logs.
+    #[test]
+    fn reconnect_floods_share_one_diagnostic_budget() {
+        let path = socket_path("diagnostic-budget");
+        let _ = std::fs::remove_file(&path);
+        let mut server = Server::bind(
+            &path,
+            MemorySink::fixed(),
+            Policy {
+                allowed_uids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let attempts = MAX_DAEMON_DIAGNOSTICS + 8;
+        for _ in 0..attempts {
+            let connection = UnixStream::connect(&path).unwrap();
+            server.pass().unwrap();
+            drop(connection);
+        }
+        assert_eq!(server.refused, attempts as u32);
+        assert_eq!(server.diagnostics.len(), MAX_DAEMON_DIAGNOSTICS);
         server.shutdown();
     }
 
@@ -1226,136 +2300,6 @@ mod tests {
         let (mut server, path) = server("limit");
         assert_eq!(server.run(Some(3)).unwrap(), Stopped::Finished);
         assert!(path.exists());
-        server.shutdown();
-    }
-
-    /// A `MemorySink` that also occupies a poll slot.
-    ///
-    /// `MemorySink::raw_fd` answers `None`, so in every other test here the
-    /// device is not in the poll set at all and the client indexes and the slot
-    /// indexes cannot disagree. That is why the guard below had no regression
-    /// test: the condition it defends against was unreachable in the harness,
-    /// not merely unexercised by it.
-    ///
-    /// The descriptor is one end of a `UnixStream` pair whose other end has been
-    /// dropped, so it polls as hung up. `wait` still delegates, because the
-    /// daemon asks the sink whether the device is gone and never asks the poll
-    /// set; the hangup is here to make the wrong slot say something a client
-    /// would be dropped for.
-    struct PollableSink {
-        inner: MemorySink,
-        endpoint: UnixStream,
-    }
-
-    impl PollableSink {
-        fn fixed() -> Self {
-            let (endpoint, peer) = UnixStream::pair().unwrap();
-            drop(peer);
-            Self {
-                inner: MemorySink::fixed(),
-                endpoint,
-            }
-        }
-    }
-
-    impl AudioSink for PollableSink {
-        fn spec(&self) -> Spec {
-            self.inner.spec()
-        }
-        fn device_delay(&mut self) -> io::Result<u64> {
-            self.inner.device_delay()
-        }
-        fn wait(&mut self, timeout_ms: i32) -> io::Result<crate::sink::Wait> {
-            self.inner.wait(timeout_ms)
-        }
-        fn write(&mut self, pcm: &[u8]) -> io::Result<usize> {
-            self.inner.write(pcm)
-        }
-        fn start(&mut self) -> io::Result<()> {
-            self.inner.start()
-        }
-        fn stop(&mut self) -> io::Result<()> {
-            self.inner.stop()
-        }
-        fn drain(&mut self) -> io::Result<()> {
-            self.inner.drain()
-        }
-        fn recover(&mut self) -> io::Result<()> {
-            self.inner.recover()
-        }
-        fn buffer_frames(&self) -> u64 {
-            self.inner.buffer_frames()
-        }
-        fn period_frames(&self) -> u64 {
-            self.inner.period_frames()
-        }
-        fn raw_fd(&self) -> Option<RawFd> {
-            Some(self.endpoint.as_raw_fd())
-        }
-        fn is_running(&self) -> bool {
-            self.inner.is_running()
-        }
-    }
-
-    /// A client accepted after the poll set was built has no slot of its own,
-    /// and the slot at its index belongs to the device.
-    ///
-    /// `accept` runs inside the pass that `wait` opened, so the client vector
-    /// can grow after the slots are fixed. Reading slot `index + 1` for such a
-    /// client reads the device's, and a client would be dropped for what the
-    /// device said — on its very first pass, before it could authenticate.
-    ///
-    /// The two poll views of the sink disagree here BY CONSTRUCTION, and no
-    /// real device produces that: `AlsaSink::wait` polls the same descriptor,
-    /// so on real hardware a `POLLHUP` in the shared poll is also a `Wait::Gone`
-    /// and `pass` clears every client anyway. The disagreement is what makes
-    /// the wrong slot observable at all — the device is pushed with
-    /// `Interest::WRITE`, so `POLLIN` never comes back for it, `errored` is not
-    /// consulted, and `POLLOUT` makes the unguarded path behave exactly like
-    /// the guarded one. What is under test is the index-to-slot mapping, which
-    /// is wrong without the guard whatever the device happens to be saying.
-    #[test]
-    fn a_client_accepted_after_the_poll_set_is_built_waits_for_its_own_slot() {
-        let path = socket_path("midpass");
-        let _ = std::fs::remove_file(&path);
-        let mut sink = PollableSink::fixed();
-        sink.start().unwrap();
-        let mut server = Server::bind(&path, sink, Policy::for_uid(own_uid())).unwrap();
-
-        // The first client gets a pass to itself, so it holds slot 1 and the
-        // device holds slot 2.
-        let mut first = UnixStream::connect(&path).unwrap();
-        server.pass().unwrap();
-        assert_eq!(
-            server.client_count(),
-            1,
-            "the first client is a mid-pass accept too — the poll set was built \
-             before it existed, so it reaches this guard first"
-        );
-
-        // The second is accepted during a pass that polled only the first.
-        let mut second = UnixStream::connect(&path).unwrap();
-        server.pass().unwrap();
-        assert_eq!(
-            server.client_count(),
-            2,
-            "the client accepted after the poll set was built read the device's \
-             slot, saw the device's hangup, and was dropped for it"
-        );
-
-        // Deferred, not forgotten: both authenticate on later passes.
-        first.write_all(&auth_packet()).unwrap();
-        second.write_all(&auth_packet()).unwrap();
-        for _ in 0..4 {
-            server.pass().unwrap();
-        }
-        assert_eq!(server.client_count(), 2);
-        assert_eq!(first_command(&drain_socket(&mut first)), Some(command::REPLY));
-        assert_eq!(
-            first_command(&drain_socket(&mut second)),
-            Some(command::REPLY),
-            "the deferred client is read on a later pass, not dropped"
-        );
         server.shutdown();
     }
 }

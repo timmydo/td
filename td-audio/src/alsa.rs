@@ -23,6 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::time::{Duration, Instant};
 
 /// `O_NONBLOCK`. The daemon has clients to serve, so it never parks inside a
 /// transfer: `poll(2)` is the wait, and `WRITEI_FRAMES` returns what fit.
@@ -45,8 +46,10 @@ pub struct Request {
     /// the result is read back.
     pub period_frames: u32,
     /// How many periods the ring should hold. Two is the minimum that can play
-    /// while the writer fills; four is the default, which at 1024-frame periods
-    /// is about 85 ms of slack at 48 kHz.
+    /// while the writer fills; eight is the default, which at 1024-frame
+    /// periods is about 170 ms of slack at 48 kHz. That exceeds the event
+    /// loop's 100 ms timer backstop, so one timer-length scheduling pause does
+    /// not consume the complete ring.
     pub periods: u32,
 }
 
@@ -56,7 +59,7 @@ impl Default for Request {
             rate: crate::sink::RATE,
             channels: crate::sink::CHANNELS,
             period_frames: 1024,
-            periods: 4,
+            periods: 8,
         }
     }
 }
@@ -84,9 +87,7 @@ impl AlsaSink {
             .write(true)
             .custom_flags(O_NONBLOCK)
             .open(&node)
-            .map_err(|e| {
-                    io::Error::new(e.kind(), format!("{}: {e}", node.display()))
-            })?;
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", node.display())))?;
         let fd = file.as_raw_fd();
 
         let version = sys::pversion(fd)?;
@@ -114,7 +115,12 @@ impl AlsaSink {
 
         let boundary = boundary_for(chosen.buffer_frames);
         let mut sw = SwParams::zeroed();
-        sw.set_playback(version, chosen.period_frames, chosen.buffer_frames, boundary)?;
+        sw.set_playback(
+            version,
+            chosen.period_frames,
+            chosen.buffer_frames,
+            boundary,
+        )?;
         sys::sw_params(fd, &mut sw)?;
         let kernel_boundary = sw.boundary()?;
         if kernel_boundary != boundary {
@@ -165,18 +171,12 @@ impl AlsaSink {
 
     /// The device's own FIFO depth in frames, as `hw_params` reported it.
     ///
-    /// Zero on most cards. Where it is not, it is frames of latency that
-    /// `SNDRV_PCM_IOCTL_DELAY` may not include.
-    ///
-    /// Reported, not yet summed: it reaches the `devices` output and no
-    /// further, so a card with a non-zero FIFO under-reports its latency by
-    /// that many frames. Folding it into `Mixer::timing` needs the mixer to
-    /// know a device property it is otherwise independent of, and no card on
-    /// hand reports a non-zero one to test the change against.
+    /// This is the configured capacity, useful in the diagnostic printed by
+    /// `play`; it is not added to `SNDRV_PCM_IOCTL_DELAY`, whose ALSA contract
+    /// already reports the overall frames until playback reaches the DAC.
     pub fn fifo_frames(&self) -> u64 {
         self.fifo_frames
     }
-
 }
 
 /// Ask the kernel what it just opened, and refuse if it is not what discovery
@@ -197,7 +197,9 @@ fn confirm_identity(fd: RawFd, playback: &Playback) -> io::Result<Identity> {
             ),
         ));
     }
-    if identity.card != i32::try_from(playback.card).unwrap_or(i32::MAX) || identity.device != playback.device {
+    if identity.card != i32::try_from(playback.card).unwrap_or(i32::MAX)
+        || identity.device != playback.device
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -256,10 +258,18 @@ fn choose_sizes(
             format!("the device admits no {what} at all"),
         )
     };
-    let period_low = period_range.lowest().ok_or_else(|| unsatisfiable("period size"))?;
-    let period_high = period_range.highest().ok_or_else(|| unsatisfiable("period size"))?;
-    let buffer_low = buffer_range.lowest().ok_or_else(|| unsatisfiable("buffer size"))?;
-    let buffer_high = buffer_range.highest().ok_or_else(|| unsatisfiable("buffer size"))?;
+    let period_low = period_range
+        .lowest()
+        .ok_or_else(|| unsatisfiable("period size"))?;
+    let period_high = period_range
+        .highest()
+        .ok_or_else(|| unsatisfiable("period size"))?;
+    let buffer_low = buffer_range
+        .lowest()
+        .ok_or_else(|| unsatisfiable("buffer size"))?;
+    let buffer_high = buffer_range
+        .highest()
+        .ok_or_else(|| unsatisfiable("buffer size"))?;
 
     let periods = request.periods.max(2);
     // The period must also be small enough that `periods` of them fit.
@@ -395,6 +405,12 @@ fn readback(params: &HwParams, request: Request) -> io::Result<Chosen> {
             "the device chose sample format {format:?}, not S16_LE"
         )));
     }
+    let subformat = params.mask_exact(Mask::Subformat)?;
+    if subformat != Some(SUBFORMAT_STD) {
+        return Err(refused(format!(
+            "the device chose sample subformat {subformat:?}, not STD"
+        )));
+    }
     let channels = params.require_exact(Interval::Channels)?;
     if channels != request.channels {
         return Err(refused(format!(
@@ -431,6 +447,13 @@ fn readback(params: &HwParams, request: Request) -> io::Result<Chosen> {
              periods, which cannot play one period while the writer fills another"
         )));
     }
+    let max_buffer_frames = u64::from(rate).saturating_mul(MAX_BUFFER_MS) / 1_000;
+    if buffer_frames > max_buffer_frames {
+        return Err(refused(format!(
+            "the device chose a {buffer_frames}-frame buffer, exceeding the bounded \
+             {MAX_BUFFER_MS} ms drain window ({max_buffer_frames} frames at {rate} Hz)"
+        )));
+    }
     Ok(Chosen {
         rate,
         channels,
@@ -441,13 +464,88 @@ fn readback(params: &HwParams, request: Request) -> io::Result<Chosen> {
     })
 }
 
-/// How many waits a device drain may take before it is stopped anyway. At
-/// `DRAIN_WAIT_MS` each this is a little over a second, which is longer than
-/// any buffer this daemon configures.
-const DRAIN_PASSES: u32 = 64;
+/// Largest device ring admitted by readback. The fixed drain deadline below is
+/// deliberately longer, so every accepted ring gets one complete playback
+/// interval plus scheduler margin before the daemon reports a wedged device.
+const MAX_BUFFER_MS: u64 = 1_000;
+
+/// Absolute monotonic device-drain deadline, longer than `MAX_BUFFER_MS`.
+const DRAIN_TIMEOUT_MS: u64 = 1_280;
 
 /// How long one of those waits blocks.
 const DRAIN_WAIT_MS: i32 = 20;
+
+/// ALSA's signed delay is zero once a driver reports playback past its data.
+fn playback_delay(frames: i64) -> u64 {
+    u64::try_from(frames).unwrap_or(0)
+}
+
+/// Wait for an asynchronous nonblocking drain, with a hard deadline.
+fn wait_for_drain(
+    delay: impl FnMut() -> io::Result<u64>,
+    wait: impl FnMut(i32) -> io::Result<sys::Ready>,
+) -> io::Result<()> {
+    wait_for_drain_bounded(
+        Duration::from_millis(DRAIN_TIMEOUT_MS),
+        Duration::from_millis(DRAIN_WAIT_MS as u64),
+        delay,
+        wait,
+    )
+}
+
+fn wait_for_drain_bounded(
+    timeout: Duration,
+    cadence: Duration,
+    mut delay: impl FnMut() -> io::Result<u64>,
+    mut wait: impl FnMut(i32) -> io::Result<sys::Ready>,
+) -> io::Result<()> {
+    let began = Instant::now();
+    loop {
+        // A failed DELAY is not an empty device. Poll still has the chance to
+        // report that an asynchronous drain stopped or the node disappeared.
+        if let Ok(0) = delay() {
+            return Ok(());
+        }
+        let remaining = timeout.saturating_sub(began.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let slice = remaining.min(cadence);
+        let wait_ms = i32::try_from(slice.as_millis().max(1)).unwrap_or(i32::MAX);
+        let wait_began = Instant::now();
+        match wait(wait_ms)? {
+            sys::Ready::Broken => match delay() {
+                Ok(0) => return Ok(()),
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "the playback device underrun while draining",
+                    ));
+                }
+                Err(error) => return Err(error),
+            },
+            sys::Ready::Gone => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the playback device disappeared while draining",
+                ));
+            }
+            sys::Ready::Writable | sys::Ready::Timeout => {}
+        }
+        // A draining PCM may remain level-writable while its playhead advances.
+        // An immediate POLLOUT therefore is not a progress clock. Pace that
+        // case to the same monotonic cadence instead of spending the whole
+        // deadline as a tight loop and dropping a still-playing ring.
+        let spent = wait_began.elapsed();
+        if spent < slice {
+            std::thread::sleep(slice - spent);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the playback device did not drain within the bounded wait",
+    ))
+}
 
 impl AudioSink for AlsaSink {
     fn spec(&self) -> Spec {
@@ -458,9 +556,11 @@ impl AudioSink for AlsaSink {
         let frames = sys::delay(self.fd())?;
         // A negative delay is what some drivers report once a stream has run
         // past its own data. It is not a count of anything that is still to be
-        // heard, so it contributes zero to the latency sum rather than being
-        // reinterpreted as a large unsigned number.
-        Ok(u64::try_from(frames).unwrap_or(0))
+        // heard, so it contributes zero rather than being reinterpreted as a
+        // large unsigned number. DELAY already includes the hardware path;
+        // adding the configured FIFO capacity would count it twice and would
+        // claim a full FIFO even when it is empty.
+        Ok(playback_delay(frames))
     }
 
     fn wait(&mut self, timeout_ms: i32) -> io::Result<Wait> {
@@ -511,37 +611,23 @@ impl AudioSink for AlsaSink {
     /// Play out what is queued, then stop.
     ///
     /// On a non-blocking descriptor the ioctl starts the drain and returns
-    /// `EAGAIN`; the wait is ours. `poll` reports the stream stopping as
-    /// `POLLERR`/`POLLHUP`, and `DELAY` reaching zero is the other end of it, so
-    /// either ends the wait. The pass bound is what stops a card that has
-    /// stopped consuming from hanging shutdown — §K.4's own argument for
-    /// bounding `drain_all` applies to the device drain too.
+    /// `EAGAIN`; the wait is ours. `DELAY` reaching zero proves completion.
+    /// `POLLERR` gets one final delay read but remains an underrun otherwise,
+    /// and `POLLHUP` is device loss. The absolute deadline stops a card that
+    /// no longer consumes from hanging shutdown.
     fn drain(&mut self) -> io::Result<()> {
         match sys::drain(self.fd())? {
             sys::Draining::Finished => {}
             sys::Draining::Started => {
-                for _ in 0..DRAIN_PASSES {
-                    // An error here is NOT "nothing left to play", and must
-                    // not end the loop: reading it as zero broke out and
-                    // dropped the device, truncating exactly the tail this
-                    // drain exists to finish. Keep waiting instead — the poll
-                    // below reports a device that has really gone, and
-                    // DRAIN_PASSES bounds the wait either way.
-                    if let Ok(0) = self.device_delay() {
-                        break;
-                    }
-                    match sys::poll_writable(self.fd(), DRAIN_WAIT_MS)? {
-                        sys::Ready::Broken | sys::Ready::Gone => break,
-                        sys::Ready::Writable | sys::Ready::Timeout => {}
-                    }
-                }
-                // However the wait ended — played out, stopped, or out of
-                // passes — the device is left stopped rather than in DRAINING,
-                // which is the state the caller asked for. The one path that
-                // skips this is a `poll` that fails outright, which propagates:
-                // a descriptor this daemon cannot even wait on is not a device
-                // to issue a further ioctl to.
-                sys::drop_pcm(self.fd())?;
+                let fd = self.fd();
+                let waited = wait_for_drain(
+                    || sys::delay(fd).map(playback_delay),
+                    |timeout| sys::poll_writable(fd, timeout),
+                );
+                // DROP is cleanup, not success: a timeout still discards the
+                // wedged tail, but it remains a timeout to the caller.
+                let dropped = sys::drop_pcm(fd);
+                waited.and(dropped)?;
             }
         }
         self.started = false;
@@ -569,17 +655,90 @@ mod tests {
     use super::*;
     use crate::pcm::HwParamsExt;
 
+    #[test]
+    fn a_negative_device_delay_is_zero_not_an_unsigned_latency() {
+        assert_eq!(playback_delay(1024), 1024);
+        assert_eq!(playback_delay(-1), 0);
+    }
+
+    #[test]
+    fn a_wedged_drain_is_cleaned_up_but_not_reported_as_success() {
+        let mut passes = 0u32;
+        let error = wait_for_drain_bounded(
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            || Ok(1),
+            |_| {
+                passes = passes.saturating_add(1);
+                Ok(sys::Ready::Timeout)
+            },
+        )
+        .unwrap_err();
+        assert!(passes > 0);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn immediate_writable_readiness_cannot_spend_the_deadline_early() {
+        use std::cell::Cell;
+
+        let reads = Cell::new(0u32);
+        let began = Instant::now();
+        wait_for_drain_bounded(
+            Duration::from_millis(20),
+            Duration::from_millis(2),
+            || {
+                let read = reads.get().saturating_add(1);
+                reads.set(read);
+                Ok(u64::from(read < 4))
+            },
+            |_| Ok(sys::Ready::Writable),
+        )
+        .unwrap();
+        assert!(began.elapsed() >= Duration::from_millis(4));
+    }
+
+    #[test]
+    fn an_underrun_or_lost_device_is_not_a_successful_drain() {
+        let mut delay_reads = [1u64, 1].into_iter();
+        let broken = wait_for_drain(
+            || Ok(delay_reads.next().unwrap_or(1)),
+            |_| Ok(sys::Ready::Broken),
+        )
+        .unwrap_err();
+        assert_eq!(broken.kind(), io::ErrorKind::BrokenPipe);
+
+        let gone = wait_for_drain(|| Ok(1), |_| Ok(sys::Ready::Gone)).unwrap_err();
+        assert_eq!(gone.kind(), io::ErrorKind::BrokenPipe);
+    }
+
     fn open(min: u32, max: u32) -> Range {
-        Range { min, max, openmin: false, openmax: false, integer: true, empty: false }
+        Range {
+            min,
+            max,
+            openmin: false,
+            openmax: false,
+            integer: true,
+            empty: false,
+        }
     }
 
     #[test]
     fn the_constraints_narrow_exactly_the_non_negotiable_parameters() {
         let mut params = HwParams::zeroed();
         constrain(&mut params, Request::default()).unwrap();
-        assert_eq!(params.mask_exact(Mask::Access).unwrap(), Some(ACCESS_RW_INTERLEAVED));
-        assert_eq!(params.mask_exact(Mask::Format).unwrap(), Some(FORMAT_S16_LE));
-        assert_eq!(params.mask_exact(Mask::Subformat).unwrap(), Some(SUBFORMAT_STD));
+        assert_eq!(
+            params.mask_exact(Mask::Access).unwrap(),
+            Some(ACCESS_RW_INTERLEAVED)
+        );
+        assert_eq!(
+            params.mask_exact(Mask::Format).unwrap(),
+            Some(FORMAT_S16_LE)
+        );
+        assert_eq!(
+            params.mask_exact(Mask::Subformat).unwrap(),
+            Some(SUBFORMAT_STD)
+        );
         assert_eq!(params.require_exact(Interval::Rate).unwrap(), 48000);
         assert_eq!(params.require_exact(Interval::Channels).unwrap(), 2);
         // Sizes are deliberately left open here: they come from the refinement.
@@ -589,11 +748,17 @@ mod tests {
 
     #[test]
     fn the_requested_sizes_survive_a_generous_device() {
+        assert_eq!(Request::default().periods, 8);
         let (period, buffer) =
             choose_sizes(open(64, 8192), open(128, 65536), Request::default()).unwrap();
         assert_eq!(period, 1024);
-        assert_eq!(buffer, 4096);
+        assert_eq!(buffer, 8192);
         assert_eq!(buffer % period, 0);
+        assert!(
+            u64::from(buffer).saturating_mul(1_000) / u64::from(crate::sink::RATE)
+                > crate::serve::WAIT_MS as u64,
+            "the default ring must outlast one event-loop timer backstop"
+        );
     }
 
     /// A card that will not go as small as the request gets the request clamped
@@ -604,7 +769,7 @@ mod tests {
         let (period, buffer) =
             choose_sizes(open(2048, 8192), open(4096, 65536), Request::default()).unwrap();
         assert_eq!(period, 2048);
-        assert_eq!(buffer, 8192);
+        assert_eq!(buffer, 16384);
         assert_eq!(buffer % period, 0);
         assert!(buffer / period >= 2);
     }
@@ -613,22 +778,36 @@ mod tests {
     /// buffer it cannot hold.
     #[test]
     fn a_small_buffer_reduces_the_period_count_not_the_alignment() {
-        let (period, buffer) = choose_sizes(open(64, 8192), open(64, 2048), Request::default()).unwrap();
+        let (period, buffer) =
+            choose_sizes(open(64, 8192), open(64, 2048), Request::default()).unwrap();
         assert!(buffer <= 2048);
         assert_eq!(buffer % period, 0);
-        assert!(buffer / period >= 2, "one period cannot play while the writer fills");
+        assert!(
+            buffer / period >= 2,
+            "one period cannot play while the writer fills"
+        );
     }
 
     #[test]
     fn at_least_two_periods_even_when_one_was_asked_for() {
-        let request = Request { periods: 1, ..Request::default() };
+        let request = Request {
+            periods: 1,
+            ..Request::default()
+        };
         let (period, buffer) = choose_sizes(open(64, 8192), open(64, 65536), request).unwrap();
         assert_eq!(buffer / period, 2);
     }
 
     #[test]
     fn an_unsatisfiable_device_is_refused_by_name() {
-        let empty = Range { min: 0, max: 0, openmin: false, openmax: false, integer: true, empty: true };
+        let empty = Range {
+            min: 0,
+            max: 0,
+            openmin: false,
+            openmax: false,
+            integer: true,
+            empty: true,
+        };
         let err = choose_sizes(empty, open(64, 65536), Request::default()).unwrap_err();
         assert!(err.to_string().contains("no period size"), "{err}");
         let err = choose_sizes(open(64, 8192), empty, Request::default()).unwrap_err();
@@ -678,6 +857,11 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not RW_INTERLEAVED"));
+        let params = base(|p| p.set_mask(Mask::Subformat, 1).unwrap());
+        assert!(readback(&params, Request::default())
+            .unwrap_err()
+            .to_string()
+            .contains("not STD"));
         // A frame size that is not channels * 16 bits would make every transfer
         // length wrong, so it is caught here rather than in the mixer.
         let params = base(|p| p.set_interval(Interval::FrameBits, 48).unwrap());
@@ -697,6 +881,24 @@ mod tests {
         params.set_interval(Interval::BufferSize, 1024).unwrap();
         let err = readback(&params, Request::default()).unwrap_err();
         assert!(err.to_string().contains("cannot play one period"), "{err}");
+    }
+
+    #[test]
+    fn readback_keeps_every_admitted_ring_inside_the_drain_deadline() {
+        let params = |buffer: u32| {
+            let mut params = HwParams::zeroed();
+            constrain(&mut params, Request::default()).unwrap();
+            params.set_interval(Interval::SampleBits, 16).unwrap();
+            params.set_interval(Interval::FrameBits, 32).unwrap();
+            params.set_interval(Interval::PeriodSize, 24000).unwrap();
+            params.set_interval(Interval::BufferSize, buffer).unwrap();
+            params
+        };
+        let accepted = readback(&params(48000), Request::default()).unwrap();
+        assert_eq!(accepted.buffer_frames, 48000);
+        let error = readback(&params(48001), Request::default()).unwrap_err();
+        assert!(error.to_string().contains("bounded 1000 ms drain window"));
+        assert!(std::hint::black_box(DRAIN_TIMEOUT_MS) > MAX_BUFFER_MS);
     }
 
     #[test]

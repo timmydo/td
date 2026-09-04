@@ -35,9 +35,10 @@ pub const SINK_INDEX: u32 = 0;
 /// cannot be queried.
 pub const OWNER_MODULE: u32 = tag::INVALID_INDEX;
 
-/// `PA_SINK_RUNNING`. Reported unconditionally: td's sink does not suspend, so
-/// a client that watches for suspension never sees one.
+/// `PA_SINK_RUNNING` and `PA_SINK_IDLE`. td does not suspend the sink, but idle
+/// is distinct: an empty/prebuffering server must not claim it is playing.
 pub const SINK_STATE_RUNNING: u32 = 0;
+pub const SINK_STATE_IDLE: u32 = 1;
 
 /// How much audio a stream may keep queued, by default, in milliseconds.
 /// This is Pulse's `tlength`, and the grant loop keeps the queue near it.
@@ -61,6 +62,11 @@ pub const MAXLENGTH_MULTIPLE: u64 = 4;
 /// times what an ordinary client asks for.
 pub const MAXLENGTH_CEILING: u64 = 4 * 1024 * 1024;
 
+/// Maximum framed protocol output retained inside one session before the
+/// daemon disconnects it. The server may carry one additional consumed-prefix
+/// window while a socket drains, but no peer can make this state grow further.
+pub const MAX_OUTPUT_BYTES: usize = 16 * crate::wire::CONTROL_MAX;
+
 /// The most streams one connection may hold.
 ///
 /// Every stream is a linear scan in the mixer and a `timing` call per pass, so
@@ -68,13 +74,16 @@ pub const MAXLENGTH_CEILING: u64 = 4 * 1024 * 1024;
 /// a tab per sound and a notification daemon beside it does not reach eight.
 pub const MAX_STREAMS_PER_CLIENT: usize = 32;
 
-/// How many refusals one connection may log before it stops being interesting.
-///
-/// The client chooses how often a refusal happens — a peer that has not
-/// authenticated can loop a malformed `AUTH` — and a line apiece turns one bad
-/// client into unbounded writes to a pipe whose reader can stall the whole
-/// single-threaded daemon.
-const REFUSAL_LOG_LIMIT: u32 = 8;
+/// Mixer queue reservation one connection may hold. Four maximum-sized S16
+/// streams or eight maximum-sized FLOAT32 streams fit, while four independent
+/// clients retain a share of the daemon-wide 64 MiB reservation ceiling.
+pub const MAX_RESERVED_BYTES_PER_CLIENT: u64 = 16 * 1024 * 1024;
+
+/// Underflow events one service pass may serialize for one stream. Further
+/// exact positions remain in the mixer's shared run/event record ceiling,
+/// keeping coarse playhead samples exact without an unbounded single-pass
+/// loop.
+const MAX_UNDERFLOW_EVENTS_PER_SERVICE: u32 = 32;
 
 /// Why a connection must end.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,26 +101,8 @@ pub enum Disconnect {
     PcmAlignment { bytes: usize, frame_bytes: usize },
     /// The bounded float conversion scratch could not be reserved.
     ConversionBuffer,
-}
-
-impl std::fmt::Display for Disconnect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Disconnect::Framing(error) => write!(f, "framing: {error}"),
-            Disconnect::Schema(error) => write!(f, "schema: {error}"),
-            Disconnect::Unauthenticated(command) => {
-                let name = crate::proto::command_name(*command).unwrap_or("an unknown command");
-                write!(f, "{name} ({command}) arrived before AUTH")
-            }
-            Disconnect::PcmAlignment { bytes, frame_bytes } => write!(
-                f,
-                "PCM frame has {bytes} bytes, not a multiple of {frame_bytes}"
-            ),
-            Disconnect::ConversionBuffer => {
-                write!(f, "could not reserve the bounded PCM conversion buffer")
-            }
-        }
-    }
+    /// Stream data named a position this append-only mixer cannot represent.
+    UnsupportedWrite { seek: Seek, offset: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +128,32 @@ impl PlaybackFormat {
     }
 }
 
+impl std::fmt::Display for Disconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Disconnect::Framing(error) => write!(f, "framing: {error}"),
+            Disconnect::Schema(error) => write!(f, "schema: {error}"),
+            Disconnect::Unauthenticated(command) => {
+                let name = crate::proto::command_name(*command).unwrap_or("an unknown command");
+                write!(f, "{name} ({command}) arrived before AUTH")
+            }
+            Disconnect::PcmAlignment { bytes, frame_bytes } => write!(
+                f,
+                "PCM frame has {bytes} bytes, not a multiple of {frame_bytes}"
+            ),
+            Disconnect::ConversionBuffer => {
+                write!(f, "could not reserve the bounded PCM conversion buffer")
+            }
+            Disconnect::UnsupportedWrite { seek, offset } => {
+                write!(
+                    f,
+                    "unsupported stream write position {seek:?} offset {offset}"
+                )
+            }
+        }
+    }
+}
+
 fn float32_to_s16(sample: f32) -> i16 {
     if sample.is_nan() {
         0
@@ -155,8 +172,7 @@ fn float32_to_s16(sample: f32) -> i16 {
 /// mixer; this is the bookkeeping the wire needs.
 #[derive(Debug, Clone)]
 struct Stream {
-    /// The Pulse channel, which is also this server's sink-input index. It is
-    /// this CONNECTION's name for the stream, and the only one the client sees.
+    /// The per-connection Pulse channel used by stream commands and data.
     channel: u32,
     /// The shared mixer's name for it. Distinct from `channel` because channels
     /// are per-connection: every client calls its first stream 0.
@@ -165,13 +181,15 @@ struct Stream {
     /// controls byte grants, position indexes, and boundary conversion.
     sample_spec: SampleSpec,
     format: PlaybackFormat,
+    /// The process-global identity exposed by sink-input introspection.
+    sink_input_index: u32,
     /// Frames the client may keep queued.
     target_frames: u64,
-    /// The hard ceiling.
-    maxlength_frames: u64,
+    /// Frames reserved in the fixed S16 mixer queue for this stream.
+    limit_frames: u64,
     /// The smallest grant this stream will be sent.
     minreq_frames: u64,
-    /// The bounded Pulse threshold, re-armed by PREBUF and flush.
+    /// The client's bounded prebuffer threshold, re-armed by PREBUF and flush.
     prebuffer_frames: u64,
     /// Bytes granted and not yet spent. A grant the client has not used is
     /// still owed to it, so re-granting the same bytes would let it write past
@@ -188,8 +206,6 @@ struct Stream {
     draining: Option<u32>,
     /// The client has been told the stream started.
     started: bool,
-    /// Underflows already reported, so each is announced once.
-    reported_underflows: u32,
 }
 
 impl Stream {
@@ -216,6 +232,35 @@ enum State {
     Ready(u32),
 }
 
+/// A sink-input command whose process-global index belongs to another client
+/// connection. The daemon routes these after the current bounded read pass.
+pub enum GlobalRequest {
+    Info {
+        tag: u32,
+        index: u32,
+        version: u32,
+    },
+    Volume {
+        tag: u32,
+        index: u32,
+        volumes: Vec<u32>,
+    },
+    Mute {
+        tag: u32,
+        index: u32,
+        muted: bool,
+    },
+}
+
+struct ServiceUpdate {
+    channel: u32,
+    grant: u64,
+    finish_drain: Option<u32>,
+    start: bool,
+    running: bool,
+    underflow_positions: Vec<u64>,
+}
+
 /// One connection.
 pub struct Session {
     state: State,
@@ -227,11 +272,14 @@ pub struct Session {
     /// it here instead of on every stream bounds retained scratch across all
     /// admitted clients to `MAX_CLIENTS * DATA_MAX / 2`.
     converted: Vec<u8>,
-    next_channel: u32,
+    next_channel: u64,
     client_index: u32,
     subscribed: u32,
-    /// Refusals already logged. See `REFUSAL_LOG_LIMIT`.
-    refusals_logged: u32,
+    /// Sink-input changes for the daemon to relay to every other subscriber.
+    global_events: Vec<(u32, u32)>,
+    global_requests: Vec<GlobalRequest>,
+    output_overflowed: bool,
+    input_deferred: bool,
     /// The clock the caller last supplied, in microseconds. Kept as data so
     /// this module reads no clock of its own.
     now_usec: u64,
@@ -249,7 +297,10 @@ impl Session {
             next_channel: 0,
             client_index,
             subscribed: 0,
-            refusals_logged: 0,
+            global_events: Vec::new(),
+            global_requests: Vec::new(),
+            output_overflowed: false,
+            input_deferred: false,
             now_usec: 0,
         }
     }
@@ -266,17 +317,128 @@ impl Session {
         self.streams.len()
     }
 
+    /// Choose a free per-connection playback channel without ever overwriting
+    /// a live stream when the u32 counter wraps.
+    fn allocate_channel(&mut self) -> Option<u32> {
+        if self.next_channel >= u64::from(tag::INVALID_INDEX) {
+            return None;
+        }
+        let candidate = u32::try_from(self.next_channel).ok()?;
+        self.next_channel = self.next_channel.saturating_add(1);
+        (!self.streams.contains_key(&candidate)).then_some(candidate)
+    }
+
     /// Bytes held for a frame that has not finished arriving. The daemon bounds
     /// this: a client that declares a frame and stops is a connection that
     /// never makes progress.
-    pub fn buffered(&self) -> usize {
-        self.decoder.buffered()
+    pub fn has_incomplete_input(&self) -> bool {
+        self.decoder.is_incomplete()
     }
 
     /// Every channel this session owns, for the daemon to reconcile the mixer
     /// against.
     pub fn stream_ids(&self) -> Vec<StreamId> {
         self.streams.values().map(|stream| stream.id).collect()
+    }
+
+    pub fn sink_input_indexes(&self) -> Vec<u32> {
+        self.streams
+            .values()
+            .map(|stream| stream.sink_input_index)
+            .collect()
+    }
+
+    pub fn client_index(&self) -> u32 {
+        self.client_index
+    }
+
+    /// Changes originated by this connection, for server-wide subscription
+    /// delivery. The originating session already received its local copy.
+    pub fn take_global_events(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.global_events)
+    }
+
+    pub fn take_global_requests(&mut self) -> Vec<GlobalRequest> {
+        std::mem::take(&mut self.global_requests)
+    }
+
+    /// State a streamless control connection must retain across admission
+    /// pressure. A subscriber is a live observer, and an unrouted request or
+    /// event is work the server has not completed yet.
+    pub fn holds_idle_control_state(&self) -> bool {
+        self.subscribed != 0 || !self.global_events.is_empty() || !self.global_requests.is_empty()
+    }
+
+    pub fn owns_sink_input(&self, index: u32) -> bool {
+        self.streams
+            .values()
+            .any(|stream| stream.sink_input_index == index)
+    }
+
+    pub fn notify_global(&mut self, event: u32, index: u32) {
+        self.notify(event, index);
+    }
+
+    /// Complete a request routed by the daemon to the owning session.
+    pub fn complete_global_request(
+        &mut self,
+        owner: &mut Session,
+        request: GlobalRequest,
+        mixer: &mut Mixer,
+    ) {
+        match request {
+            GlobalRequest::Info {
+                tag,
+                index,
+                version,
+            } => {
+                let Some(stream) = owner
+                    .streams
+                    .values()
+                    .find(|stream| stream.sink_input_index == index)
+                    .cloned()
+                else {
+                    self.error(tag, error::NOENTITY);
+                    return;
+                };
+                self.reply_sink_input_info(tag, version, owner.client_index, &stream, mixer);
+            }
+            GlobalRequest::Volume {
+                tag,
+                index,
+                volumes,
+            } => {
+                if !owner.apply_volume(index, &volumes, mixer) {
+                    self.error(tag, error::NOENTITY);
+                    return;
+                }
+                self.reply(tag, |_| {});
+                owner.announce(
+                    subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+                    index,
+                );
+            }
+            GlobalRequest::Mute { tag, index, muted } => {
+                if !owner.apply_mute(index, muted, mixer) {
+                    self.error(tag, error::NOENTITY);
+                    return;
+                }
+                self.reply(tag, |_| {});
+                owner.announce(
+                    subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+                    index,
+                );
+            }
+        }
+    }
+
+    pub fn reject_global_request(&mut self, request: GlobalRequest) {
+        let tag = match request {
+            GlobalRequest::Info { tag, .. }
+            | GlobalRequest::Volume { tag, .. }
+            | GlobalRequest::Mute { tag, .. } => tag,
+        };
+        self.error(tag, error::NOENTITY);
     }
 
     /// The mixer's name for the stream this connection calls `channel`.
@@ -303,11 +465,38 @@ impl Session {
         !self.out.is_empty()
     }
 
+    pub fn output_overflowed(&self) -> bool {
+        self.output_overflowed
+    }
+
+    pub fn input_deferred(&self) -> bool {
+        self.input_deferred
+    }
+
     /// Feed bytes read from the socket, handling every whole frame they
     /// complete.
+    #[cfg(test)]
     pub fn feed(&mut self, bytes: &[u8], mixer: &mut Mixer) -> Result<(), Disconnect> {
+        let _ = self.feed_limited(bytes, mixer, usize::MAX)?;
+        Ok(())
+    }
+
+    /// Feed at most `limit` complete frames, retaining any remainder for the
+    /// next daemon pass. This is the event-loop fairness boundary; socket read
+    /// size alone does not bound the number of tiny control frames it contains.
+    pub fn feed_limited(
+        &mut self,
+        bytes: &[u8],
+        mixer: &mut Mixer,
+        limit: usize,
+    ) -> Result<usize, Disconnect> {
         self.decoder.push(bytes);
-        while let Some(frame) = self.decoder.next_frame() {
+        self.input_deferred = false;
+        let mut processed = 0usize;
+        while processed < limit {
+            let Some(frame) = self.decoder.next_frame() else {
+                break;
+            };
             match frame.map_err(Disconnect::Framing)? {
                 Frame::Control(packet) => self.control(&packet, mixer)?,
                 Frame::Data {
@@ -317,8 +506,10 @@ impl Session {
                     pcm,
                 } => self.data(channel, seek, offset, &pcm, mixer)?,
             }
+            processed = processed.saturating_add(1);
         }
-        Ok(())
+        self.input_deferred = processed == limit;
+        Ok(processed)
     }
 
     /// Emit whatever the mixer's current state owes the client: byte grants,
@@ -327,8 +518,11 @@ impl Session {
     /// Kept separate from `feed` because most of it is caused by the device
     /// consuming audio rather than by the client saying anything, and a server
     /// that only spoke when spoken to would stall exactly as §K.3 describes.
-    pub fn service(&mut self, mixer: &Mixer) {
-        let mut updates: Vec<(u32, StreamId, u64, Option<u32>, bool, u32)> = Vec::new();
+    pub fn service(&mut self, mixer: &mut Mixer) {
+        let Some(version) = self.version() else {
+            return;
+        };
+        let mut updates = Vec::new();
         for stream in self.streams.values() {
             let id = stream.id;
             let Ok(timing) = mixer.timing(id) else {
@@ -340,17 +534,43 @@ impl Session {
             let held = queued.saturating_add(stream.outstanding_bytes);
             let grant = target.saturating_sub(held);
             let minreq = stream.minreq_frames.saturating_mul(frame_bytes);
-            let grant = if grant >= minreq && !stream.corked { grant } else { 0 };
+            let grant = if grant >= minreq && !stream.corked {
+                grant
+            } else {
+                0
+            };
 
             let drained = mixer.is_drained(id).unwrap_or(false);
             let finish_drain = stream.draining.filter(|_| drained);
 
-            let start = !stream.started && !stream.corked && timing.read_index > 0;
-            let underflows = mixer.underflows(id).unwrap_or(0);
-            updates.push((stream.channel, id, grant, finish_drain, start, underflows));
+            let underflow_positions = mixer
+                .take_underflow_positions(id, MAX_UNDERFLOW_EVENTS_PER_SERVICE as usize)
+                .unwrap_or_default();
+            let underflows_pending = mixer.has_underflow_positions(id).unwrap_or(false);
+            let running = mixer.is_running(id).unwrap_or(false);
+            let start = !stream.corked
+                && running
+                && !underflows_pending
+                && (!stream.started || !underflow_positions.is_empty());
+            updates.push(ServiceUpdate {
+                channel: stream.channel,
+                grant,
+                finish_drain,
+                start,
+                running,
+                underflow_positions,
+            });
         }
 
-        for (channel, id, grant, finish_drain, start, underflows) in updates {
+        for update in updates {
+            let ServiceUpdate {
+                channel,
+                grant,
+                finish_drain,
+                start,
+                running,
+                underflow_positions,
+            } = update;
             if grant > 0 {
                 let granted = u32::try_from(grant).unwrap_or(u32::MAX);
                 self.send(&packet(command::REQUEST, tag::INVALID_INDEX, |writer| {
@@ -361,6 +581,22 @@ impl Session {
                         stream.outstanding_bytes.saturating_add(u64::from(granted));
                 }
             }
+            for position in underflow_positions {
+                let read_index = self
+                    .streams
+                    .get(&channel)
+                    .map(|stream| stream.client_index(position, self.spec.frame_bytes as u64))
+                    .unwrap_or(0);
+                self.send(&packet(command::UNDERFLOW, tag::INVALID_INDEX, |writer| {
+                    writer.u32(channel);
+                    if version >= 23 {
+                        writer.s64(read_index as i64);
+                    }
+                }));
+            }
+            // One coarse DELAY sample can cross an exhausted endpoint and
+            // enter an already accepted later run. Announce that underflow
+            // before the later run's new STARTED transition.
             if start {
                 self.send(&packet(command::STARTED, tag::INVALID_INDEX, |writer| {
                     writer.u32(channel);
@@ -369,29 +605,9 @@ impl Session {
                     stream.started = true;
                 }
             }
-            let already = self
-                .streams
-                .get(&channel)
-                .map(|stream| stream.reported_underflows)
-                .unwrap_or(0);
-            if underflows > already {
-                let read_index = self
-                    .streams
-                    .get(&channel)
-                    .and_then(|stream| {
-                        mixer.timing(id).ok().map(|timing| {
-                            stream.client_index(
-                                timing.read_index,
-                                self.spec.frame_bytes as u64,
-                            )
-                        })
-                    })
-                    .unwrap_or(0);
-                self.send(&packet(command::UNDERFLOW, tag::INVALID_INDEX, |writer| {
-                    writer.u32(channel).s64(read_index as i64);
-                }));
+            if !running {
                 if let Some(stream) = self.streams.get_mut(&channel) {
-                    stream.reported_underflows = underflows;
+                    stream.started = false;
                 }
             }
             if let Some(tag) = finish_drain {
@@ -422,7 +638,7 @@ impl Session {
         &mut self,
         channel: u32,
         seek: Seek,
-        _offset: i64,
+        offset: i64,
         pcm: &[u8],
         mixer: &mut Mixer,
     ) -> Result<(), Disconnect> {
@@ -430,13 +646,13 @@ impl Session {
         // rewriting audio the mixer may already have summed, and answering that
         // correctly means a rewritable queue; refusing it plainly is better
         // than accepting it and playing the wrong thing.
-        if seek != Seek::Relative {
-            return Ok(());
-        }
         let (streams, converted) = (&mut self.streams, &mut self.converted);
         let Some(stream) = streams.get_mut(&channel) else {
             return Ok(());
         };
+        if seek != Seek::Relative || offset != 0 {
+            return Err(Disconnect::UnsupportedWrite { seek, offset });
+        }
         let client_frame_bytes = usize::try_from(stream.frame_bytes()).unwrap_or(usize::MAX);
         if !pcm.len().is_multiple_of(client_frame_bytes) {
             return Err(Disconnect::PcmAlignment {
@@ -498,8 +714,8 @@ impl Session {
         match command {
             command::SET_CLIENT_NAME => self.set_client_name(reader, tag, version),
             command::GET_SERVER_INFO => self.server_info(reader, tag, version),
-            command::GET_SINK_INFO => self.sink_info(reader, tag, version),
-            command::GET_SINK_INFO_LIST => self.sink_info_list(reader, tag, version),
+            command::GET_SINK_INFO => self.sink_info(reader, tag, version, mixer),
+            command::GET_SINK_INFO_LIST => self.sink_info_list(reader, tag, version, mixer),
             command::GET_SOURCE_INFO_LIST => self.source_info_list(reader, tag),
             command::GET_SINK_INPUT_INFO => self.sink_input_info(reader, tag, version, mixer),
             command::SUBSCRIBE => self.subscribe(reader, tag),
@@ -529,15 +745,10 @@ impl Session {
         reader.u32().map_err(Disconnect::Schema)?;
         reader.u32().map_err(Disconnect::Schema)?;
         let raw = reader.u32().map_err(Disconnect::Schema)?;
-        if crate::proto::requested_shared_memory(raw) {
-            // Worth a line: a client that asked for SHM and silently got socket
-            // data is a client whose performance question has an answer nobody
-            // wrote down. §K.2 is why the answer is no.
-            eprintln!(
-                "td-audio: a client asked for a shared-memory transport; \
-                 serving it over the socket instead (APPLICATIONS.md K.2)"
-            );
-        }
+        // The reply strips every transport feature bit, including SHM. This
+        // pure state machine does not log that peer-chosen request: reconnects
+        // could reset a local budget and block the daemon's audio thread.
+        let _requested_shared_memory = crate::proto::requested_shared_memory(raw);
         // §K.3: the cookie "is still parsed at its exact 256-byte length and
         // then ignored". Parsing it is not ceremony — it is what proves the
         // packet ends where the schema says, and the byte after it would
@@ -615,25 +826,21 @@ impl Session {
         mut reader: tag::Reader<'_>,
         tag: u32,
         version: u32,
+        mixer: &Mixer,
     ) -> Result<(), Disconnect> {
         // Captured in both forms: an index with a NULL name, or an invalid
         // index with a name. One command, two ways of asking.
         let index = reader.u32().map_err(Disconnect::Schema)?;
         let name = reader.string().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
-        let matched = match (index, name.as_deref()) {
-            (tag::INVALID_INDEX, Some(asked)) => asked == SINK_NAME || asked == "@DEFAULT_SINK@",
-            (tag::INVALID_INDEX, None) => true,
-            (SINK_INDEX, _) => true,
-            _ => false,
-        };
-        if !matched {
+        if !sink_lookup_matches(index, name.as_deref()) {
             self.error(tag, error::NOENTITY);
             return Ok(());
         }
         let spec = self.sample_spec();
+        let state = sink_state(mixer);
         self.reply(tag, |writer| {
-            write_sink_info(writer, spec, version);
+            write_sink_info(writer, spec, version, state);
         });
         Ok(())
     }
@@ -643,20 +850,18 @@ impl Session {
         reader: tag::Reader<'_>,
         tag: u32,
         version: u32,
+        mixer: &Mixer,
     ) -> Result<(), Disconnect> {
         reader.finish().map_err(Disconnect::Schema)?;
         let spec = self.sample_spec();
+        let state = sink_state(mixer);
         self.reply(tag, |writer| {
-            write_sink_info(writer, spec, version);
+            write_sink_info(writer, spec, version, state);
         });
         Ok(())
     }
 
-    fn source_info_list(
-        &mut self,
-        reader: tag::Reader<'_>,
-        tag: u32,
-    ) -> Result<(), Disconnect> {
+    fn source_info_list(&mut self, reader: tag::Reader<'_>, tag: u32) -> Result<(), Disconnect> {
         reader.finish().map_err(Disconnect::Schema)?;
         // §K.3 wants "an empty list, not an error, so device pickers see 'no
         // microphone' rather than a broken server". An empty list is a REPLY
@@ -674,10 +879,31 @@ impl Session {
     ) -> Result<(), Disconnect> {
         let index = reader.u32().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
-        let Some(stream) = self.streams.get(&index).cloned() else {
-            self.error(tag, error::NOENTITY);
+        let Some(stream) = self
+            .streams
+            .values()
+            .find(|stream| stream.sink_input_index == index)
+            .cloned()
+        else {
+            self.global_requests.push(GlobalRequest::Info {
+                tag,
+                index,
+                version,
+            });
             return Ok(());
         };
+        self.reply_sink_input_info(tag, version, self.client_index, &stream, mixer);
+        Ok(())
+    }
+
+    fn reply_sink_input_info(
+        &mut self,
+        tag: u32,
+        version: u32,
+        client: u32,
+        stream: &Stream,
+        mixer: &Mixer,
+    ) {
         let spec = stream.sample_spec;
         let queued_usec = mixer
             .timing(stream.id)
@@ -687,10 +913,9 @@ impl Session {
             .timing(stream.id)
             .map(|timing| self.spec.frames_to_usec(timing.device_delay_frames))
             .unwrap_or(0);
-        let client = self.client_index;
         self.reply(tag, |writer| {
             writer
-                .u32(index)
+                .u32(stream.sink_input_index)
                 .string(&stream.name)
                 .u32(OWNER_MODULE)
                 .u32(client)
@@ -718,16 +943,16 @@ impl Session {
                 writer.format_info(format::ENCODING_PCM, &[]);
             }
         });
-        Ok(())
     }
 
     fn subscribe(&mut self, mut reader: tag::Reader<'_>, tag: u32) -> Result<(), Disconnect> {
-        // Masked to the facilities that exist. A bit outside `MASK_ALL` is a
-        // client asking about something this protocol has no facility for, and
-        // keeping it would mean matching against it forever.
-        self.subscribed =
-            reader.u32().map_err(Disconnect::Schema)? & subscription::MASK_ALL;
+        let mask = reader.u32().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
+        if mask & !subscription::MASK_ALL != 0 {
+            self.error(tag, error::INVALID);
+            return Ok(());
+        }
+        self.subscribed = mask;
         self.reply(tag, |_| {});
         Ok(())
     }
@@ -743,9 +968,9 @@ impl Session {
         // it is ignored — see the sixteen booleans. A reader that skipped to
         // the values it wanted would be reading them from the wrong offsets.
         let requested = reader.sample_spec().map_err(Disconnect::Schema)?;
-        let _map = reader.channel_map().map_err(Disconnect::Schema)?;
-        let _sink_index = reader.u32().map_err(Disconnect::Schema)?;
-        let _sink_name = reader.string().map_err(Disconnect::Schema)?;
+        let map = reader.channel_map().map_err(Disconnect::Schema)?;
+        let sink_index = reader.u32().map_err(Disconnect::Schema)?;
+        let sink_name = reader.string().map_err(Disconnect::Schema)?;
         let maxlength = reader.u32().map_err(Disconnect::Schema)?;
         let corked = reader.boolean().map_err(Disconnect::Schema)?;
         let tlength = reader.u32().map_err(Disconnect::Schema)?;
@@ -753,16 +978,27 @@ impl Session {
         let minreq = reader.u32().map_err(Disconnect::Schema)?;
         let _syncid = reader.u32().map_err(Disconnect::Schema)?;
         let volumes = reader.cvolume().map_err(Disconnect::Schema)?;
-        for _ in 0..9 {
-            reader.boolean().map_err(Disconnect::Schema)?;
-        }
+        let _no_remap = reader.boolean().map_err(Disconnect::Schema)?;
+        let _no_remix = reader.boolean().map_err(Disconnect::Schema)?;
+        let _fix_format = reader.boolean().map_err(Disconnect::Schema)?;
+        let _fix_rate = reader.boolean().map_err(Disconnect::Schema)?;
+        let _fix_channels = reader.boolean().map_err(Disconnect::Schema)?;
+        let _no_move = reader.boolean().map_err(Disconnect::Schema)?;
+        let variable_rate = reader.boolean().map_err(Disconnect::Schema)?;
+        let requested_muted = reader.boolean().map_err(Disconnect::Schema)?;
+        let _adjust_latency = reader.boolean().map_err(Disconnect::Schema)?;
         let properties = reader.proplist().map_err(Disconnect::Schema)?;
-        for _ in 0..7 {
-            reader.boolean().map_err(Disconnect::Schema)?;
-        }
+        let volume_set = reader.boolean().map_err(Disconnect::Schema)?;
+        let _early_requests = reader.boolean().map_err(Disconnect::Schema)?;
+        let muted_set = reader.boolean().map_err(Disconnect::Schema)?;
+        let _dont_inhibit_auto_suspend = reader.boolean().map_err(Disconnect::Schema)?;
+        let _fail_on_suspend = reader.boolean().map_err(Disconnect::Schema)?;
+        let relative_volume = reader.boolean().map_err(Disconnect::Schema)?;
+        let passthrough = reader.boolean().map_err(Disconnect::Schema)?;
         let formats = reader.u8().map_err(Disconnect::Schema)?;
+        let mut encodings = Vec::with_capacity(formats as usize);
         for _ in 0..formats {
-            reader.format_info().map_err(Disconnect::Schema)?;
+            encodings.push(reader.format_info().map_err(Disconnect::Schema)?.0);
         }
         reader.finish().map_err(Disconnect::Schema)?;
 
@@ -775,12 +1011,42 @@ impl Session {
             self.error(tag, error::NOTSUPPORTED);
             return Ok(());
         };
-        if u32::from(requested.channels) != self.spec.channels
-            || requested.rate != self.spec.rate
+        if u32::from(requested.channels) != self.spec.channels || requested.rate != self.spec.rate {
+            self.error(tag, error::NOTSUPPORTED);
+            return Ok(());
+        }
+        if map != CHANNEL_MAP || volumes.len() != usize::from(requested.channels) {
+            self.error(tag, error::INVALID);
+            return Ok(());
+        }
+        if !sink_create_matches(sink_index, sink_name.as_deref()) {
+            self.error(tag, error::NOENTITY);
+            return Ok(());
+        }
+        if variable_rate
+            || relative_volume
+            || passthrough
+            || encodings
+                .iter()
+                .any(|encoding| *encoding != format::ENCODING_PCM)
         {
             self.error(tag, error::NOTSUPPORTED);
             return Ok(());
         }
+
+        let name = match properties
+            .iter()
+            .find(|property| property.key == "media.name")
+        {
+            Some(property) => match property_text(property) {
+                Ok(name) => name,
+                Err(()) => {
+                    self.error(tag, error::INVALID);
+                    return Ok(());
+                }
+            },
+            None => "playback".to_string(),
+        };
 
         if self.streams.len() >= MAX_STREAMS_PER_CLIENT {
             self.error(tag, error::TOOLARGE);
@@ -792,8 +1058,12 @@ impl Session {
             .max(1);
         let ceiling_frames = (MAXLENGTH_CEILING / frame_bytes).max(1);
         // Clamped, not trusted. Both numbers are the client's, and the queue
-        // they size is the daemon's.
+        // they size is the daemon's. The selected device ring plus one
+        // transfer period is also a floor: starting a larger ring after
+        // honoring a 50 ms client target leaves no software refill reserve
+        // behind it.
         let target_frames = attribute_frames(tlength, DEFAULT_TARGET_MS, self.spec, frame_bytes)
+            .max(mixer.target_floor_frames())
             .min(ceiling_frames);
         let maxlength_frames = match maxlength {
             tag::INVALID_INDEX => target_frames.saturating_mul(MAXLENGTH_MULTIPLE),
@@ -816,8 +1086,25 @@ impl Session {
             bytes => (u64::from(bytes) / frame_bytes).min(max_prebuffer_frames),
         };
 
-        let channel = self.next_channel;
-        self.next_channel = self.next_channel.saturating_add(1);
+        let sink_frame_bytes = self.spec.frame_bytes.max(1) as u64;
+        let reserved = self.streams.values().fold(0u64, |total, stream| {
+            total.saturating_add(stream.limit_frames.saturating_mul(sink_frame_bytes))
+        });
+        let requested_reservation = maxlength_frames.saturating_mul(sink_frame_bytes);
+        if reserved.saturating_add(requested_reservation) > MAX_RESERVED_BYTES_PER_CLIENT {
+            self.error(tag, error::TOOLARGE);
+            return Ok(());
+        }
+
+        if !mixer.can_open(maxlength_frames) {
+            self.error(tag, error::TOOLARGE);
+            return Ok(());
+        }
+
+        let Some(channel) = self.allocate_channel() else {
+            self.error(tag, error::INTERNAL);
+            return Ok(());
+        };
         // The channel is this connection's name for the stream; the id is the
         // shared mixer's. Two connected clients both call their first stream
         // channel 0, so the two names cannot be the same number.
@@ -825,14 +1112,17 @@ impl Session {
             self.error(tag, error::INTERNAL);
             return Ok(());
         };
-        let name = properties
-            .iter()
-            .find(|property| property.key == "media.name")
-            .and_then(property_text)
-            .unwrap_or_else(|| "playback".to_string());
-        let volume = volumes.first().copied().unwrap_or(VOLUME_NORM).min(VOLUME_NORM);
+        let sink_input_index = id.sink_input_index();
+        let volume = if volume_set {
+            volumes.iter().copied().max().unwrap_or(VOLUME_NORM)
+        } else {
+            VOLUME_NORM
+        }
+        .min(VOLUME_NORM);
+        let muted = muted_set && requested_muted;
         if mixer
-            .set_volume(id, volume)
+            .set_target_frames(id, target_frames)
+            .and_then(|()| mixer.set_volume(id, if muted { 0 } else { volume }))
             .and_then(|()| mixer.set_corked(id, corked))
             .and_then(|()| mixer.set_prebuffer(id, prebuffer_frames, true))
             .is_err()
@@ -848,24 +1138,24 @@ impl Session {
                 id,
                 sample_spec: requested,
                 format: playback_format,
+                sink_input_index,
                 target_frames,
-                maxlength_frames,
+                limit_frames: maxlength_frames,
                 minreq_frames,
                 prebuffer_frames,
                 outstanding_bytes: 0,
                 corked,
-                muted: false,
+                muted,
                 volume,
                 name,
                 draining: None,
                 started: false,
-                reported_underflows: 0,
             },
         );
 
-        self.notify(
+        self.announce(
             subscription::EVENT_SINK_INPUT | subscription::EVENT_NEW,
-            channel,
+            sink_input_index,
         );
         // The reply's `missing` is the first byte grant, and it is the only one
         // that does not arrive as a REQUEST frame. A server that sent 0 here
@@ -879,7 +1169,8 @@ impl Session {
             stream.outstanding_bytes = u64::from(missing);
         }
         let spec = requested;
-        let bytes = |frames: u64| u32::try_from(frames.saturating_mul(frame_bytes)).unwrap_or(u32::MAX);
+        let bytes =
+            |frames: u64| u32::try_from(frames.saturating_mul(frame_bytes)).unwrap_or(u32::MAX);
         let (maxlength_bytes, tlength_bytes, prebuf_bytes, minreq_bytes) = (
             bytes(maxlength_frames),
             bytes(target_frames),
@@ -887,7 +1178,7 @@ impl Session {
             bytes(minreq_frames),
         );
         self.reply(tag, |writer| {
-            writer.u32(channel).u32(channel).u32(missing);
+            writer.u32(channel).u32(sink_input_index).u32(missing);
             if version >= 9 {
                 writer
                     .u32(maxlength_bytes)
@@ -925,11 +1216,12 @@ impl Session {
             self.error(tag, error::NOENTITY);
             return Ok(());
         };
+        let sink_input_index = stream.sink_input_index;
         mixer.remove(stream.id);
         self.reply(tag, |_| {});
-        self.notify(
+        self.announce(
             subscription::EVENT_SINK_INPUT | subscription::EVENT_REMOVE,
-            channel,
+            sink_input_index,
         );
         Ok(())
     }
@@ -973,31 +1265,16 @@ impl Session {
             self.error(tag, error::NOENTITY);
             return Ok(());
         };
-        // Flush drops what this stream has queued and nothing else. Re-creating
-        // it in the mixer is how that is expressed without a discard path that
-        // no other caller would use.
-        let limit = stream.maxlength_frames;
+        // Flush drops what this stream has queued and nothing else. Its Pulse
+        // channel, mixer identity, lifetime byte clock, and event counters all
+        // remain the same stream.
         stream.outstanding_bytes = 0;
         stream.draining = None;
         stream.started = false;
-        let volume = stream.volume;
-        let muted = stream.muted;
-        let corked = stream.corked;
-        let prebuffer_frames = stream.prebuffer_frames;
-        let old = stream.id;
-        mixer.remove(old);
-        let Ok(id) = mixer.open(limit) else {
-            self.error(tag, error::INTERNAL);
+        if mixer.flush(stream.id).is_err() {
+            self.error(tag, error::NOENTITY);
             return Ok(());
-        };
-        // Re-admission issues a new id, so the stream has to be told its new
-        // name or every later lookup would use the one just removed.
-        if let Some(stream) = self.streams.get_mut(&channel) {
-            stream.id = id;
         }
-        let _ = mixer.set_volume(id, if muted { 0 } else { volume });
-        let _ = mixer.set_corked(id, corked);
-        let _ = mixer.set_prebuffer(id, prebuffer_frames, true);
         self.reply(tag, |_| {});
         Ok(())
     }
@@ -1041,20 +1318,22 @@ impl Session {
             self.error(tag, error::NOENTITY);
             return Ok(());
         };
-        // Pulse DRAIN disables prebuffering even when the stream is already
-        // empty, so a later sub-threshold write is allowed to run.
+        // §K.3: "A stream is drained when its own output-frame position has
+        // been consumed by the device, which is bookkeeping against the mixer
+        // rather than an ioctl; the ALSA DRAIN in the roster exists for
+        // shutting the device down, not for serving this command."
+        // DRAIN disables the prebuffer gate even when the stream is already
+        // empty. Otherwise an immediately answered drain followed by a short
+        // write remains stuck below the old threshold.
         if mixer
-            .set_prebuffer(stream.id, stream.prebuffer_frames, false)
+            .begin_drain(stream.id, stream.prebuffer_frames)
             .is_err()
         {
             self.error(tag, error::NOENTITY);
             return Ok(());
         }
-        // §K.3: "A stream is drained when its own output-frame position has
-        // been consumed by the device, which is bookkeeping against the mixer
-        // rather than an ioctl; the ALSA DRAIN in the roster exists for
-        // shutting the device down, not for serving this command."
         if mixer.is_drained(stream.id).unwrap_or(true) {
+            let _ = mixer.finish_drain(stream.id);
             self.reply(tag, |_| {});
         } else {
             stream.draining = Some(tag);
@@ -1072,10 +1351,10 @@ impl Session {
         let channel = reader.u32().map_err(Disconnect::Schema)?;
         let local = reader.timeval().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
-        let Some((id, corked, client_frame_bytes)) = self
+        let Some((id, client_frame_bytes)) = self
             .streams
             .get(&channel)
-            .map(|stream| (stream.id, stream.corked, stream.frame_bytes()))
+            .map(|stream| (stream.id, stream.frame_bytes()))
         else {
             self.error(tag, error::NOENTITY);
             return Ok(());
@@ -1085,7 +1364,6 @@ impl Session {
             return Ok(());
         };
         let now = self.now_usec;
-        let underruns = mixer.underflows(id).unwrap_or(0);
         let sink_frame_bytes = (self.spec.frame_bytes as u64).max(1);
         let write_index = timing
             .write_index
@@ -1107,7 +1385,7 @@ impl Session {
             writer
                 .usec(timing.latency_usec)
                 .usec(0)
-                .boolean(!corked)
+                .boolean(mixer.is_running(id).unwrap_or(false))
                 // The client's own timestamp, echoed. It computes the round
                 // trip from it, so a stamp of this server's own making would
                 // make every latency read look instantaneous.
@@ -1116,9 +1394,9 @@ impl Session {
                 .s64(write_index as i64)
                 .s64(read_index as i64);
             if version >= 13 {
-                writer
-                    .u64(u64::from(underruns))
-                    .u64(read_index);
+                // These are time-since-transition fields, not an event count
+                // or a byte index. This v1 does not retain either duration.
+                writer.u64(0).u64(0);
             }
         });
         Ok(())
@@ -1133,22 +1411,27 @@ impl Session {
         let index = reader.u32().map_err(Disconnect::Schema)?;
         let volumes = reader.cvolume().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
-        let Some(stream) = self.streams.get_mut(&index) else {
-            self.error(tag, error::NOENTITY);
+        if !matches!(volumes.len(), 1 | 2) {
+            self.error(tag, error::INVALID);
             return Ok(());
-        };
-        // One gain per stream: the mixer sums at one level, and picking the
-        // loudest channel is the only choice that cannot quietly attenuate
-        // audio the client asked to be loud.
-        let volume = volumes.iter().copied().max().unwrap_or(VOLUME_NORM);
-        stream.volume = volume.min(VOLUME_NORM);
-        let effective = if stream.muted { 0 } else { stream.volume };
-        if mixer.set_volume(stream.id, effective).is_err() {
+        }
+        if !self.owns_sink_input(index) {
+            self.global_requests.push(GlobalRequest::Volume {
+                tag,
+                index,
+                volumes,
+            });
+            return Ok(());
+        }
+        if !self.apply_volume(index, &volumes, mixer) {
             self.error(tag, error::NOENTITY);
             return Ok(());
         }
         self.reply(tag, |_| {});
-        self.notify(subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE, index);
+        self.announce(
+            subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+            index,
+        );
         Ok(())
     }
 
@@ -1161,49 +1444,95 @@ impl Session {
         let index = reader.u32().map_err(Disconnect::Schema)?;
         let muted = reader.boolean().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
-        let Some(stream) = self.streams.get_mut(&index) else {
-            self.error(tag, error::NOENTITY);
+        if !self.owns_sink_input(index) {
+            self.global_requests
+                .push(GlobalRequest::Mute { tag, index, muted });
             return Ok(());
-        };
-        stream.muted = muted;
-        // Mute is a separate flag, not a volume of zero: unmuting has to
-        // restore what the client set, and a server that folded the two would
-        // have to invent a level.
-        let effective = if muted { 0 } else { stream.volume };
-        if mixer.set_volume(stream.id, effective).is_err() {
+        }
+        if !self.apply_mute(index, muted, mixer) {
             self.error(tag, error::NOENTITY);
             return Ok(());
         }
         self.reply(tag, |_| {});
-        self.notify(subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE, index);
+        self.announce(
+            subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+            index,
+        );
         Ok(())
     }
 
-    fn update_proplist(
-        &mut self,
-        mut reader: tag::Reader<'_>,
-        tag: u32,
-    ) -> Result<(), Disconnect> {
+    fn update_proplist(&mut self, mut reader: tag::Reader<'_>, tag: u32) -> Result<(), Disconnect> {
         let channel = reader.u32().map_err(Disconnect::Schema)?;
-        let _mode = reader.u32().map_err(Disconnect::Schema)?;
+        let mode = reader.u32().map_err(Disconnect::Schema)?;
         let properties = reader.proplist().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
+        if mode != 2 {
+            self.error(tag, error::INVALID);
+            return Ok(());
+        }
         let Some(stream) = self.streams.get_mut(&channel) else {
             self.error(tag, error::NOENTITY);
             return Ok(());
         };
         // This is also how a modern client renames a stream — see
         // `proto::K3_AMENDMENTS`.
-        if let Some(name) = properties
+        if let Some(property) = properties
             .iter()
             .find(|property| property.key == "media.name")
-            .and_then(property_text)
         {
-            stream.name = name;
+            match property_text(property) {
+                Ok(name) => stream.name = name,
+                Err(()) => {
+                    self.error(tag, error::INVALID);
+                    return Ok(());
+                }
+            }
         }
+        let sink_input_index = stream.sink_input_index;
         self.reply(tag, |_| {});
-        self.notify(subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE, channel);
+        self.announce(
+            subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+            sink_input_index,
+        );
         Ok(())
+    }
+
+    fn apply_volume(&mut self, index: u32, volumes: &[u32], mixer: &mut Mixer) -> bool {
+        let Some(stream) = self
+            .streams
+            .values_mut()
+            .find(|stream| stream.sink_input_index == index)
+        else {
+            return false;
+        };
+        // One gain per stream: the mixer sums at one level, and picking the
+        // loudest channel is the only choice that cannot quietly attenuate
+        // audio the client asked to be loud.
+        let volume = volumes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(VOLUME_NORM)
+            .min(VOLUME_NORM);
+        stream.volume = volume;
+        let effective = if stream.muted { 0 } else { stream.volume };
+        mixer.set_volume(stream.id, effective).is_ok()
+    }
+
+    fn apply_mute(&mut self, index: u32, muted: bool, mixer: &mut Mixer) -> bool {
+        let Some(stream) = self
+            .streams
+            .values_mut()
+            .find(|stream| stream.sink_input_index == index)
+        else {
+            return false;
+        };
+        stream.muted = muted;
+        // Mute is a separate flag, not a volume of zero: unmuting has to
+        // restore what the client set, and a server that folded the two would
+        // have to invent a level.
+        let effective = if muted { 0 } else { stream.volume };
+        mixer.set_volume(stream.id, effective).is_ok()
     }
 
     fn sample_spec(&self) -> SampleSpec {
@@ -1224,7 +1553,9 @@ impl Session {
         // A word with no type bits is NEW, which is the zero value — so the
         // check is against the mask rather than against the word being
         // non-zero, or every NEW event would be silently dropped.
-        debug_assert!(event & !(subscription::EVENT_FACILITY_MASK | subscription::EVENT_TYPE_MASK) == 0);
+        if event & !(subscription::EVENT_FACILITY_MASK | subscription::EVENT_TYPE_MASK) != 0 {
+            return;
+        }
         if self.subscribed & mask == 0 {
             return;
         }
@@ -1237,34 +1568,40 @@ impl Session {
         ));
     }
 
+    fn announce(&mut self, event: u32, index: u32) {
+        self.global_events.push((event, index));
+        self.notify(event, index);
+    }
+
     fn reply(&mut self, tag: u32, body: impl FnOnce(&mut tag::Writer)) {
         self.send(&packet(command::REPLY, tag, body));
     }
 
     fn error(&mut self, tag: u32, code: u32) {
-        // Named, not numbered. A refusal a reader has to look up in a header is
-        // a refusal nobody reads. Bounded, because the client chooses how many
-        // there are: see `REFUSAL_LOG_LIMIT`.
-        if self.refusals_logged < REFUSAL_LOG_LIMIT {
-            self.refusals_logged = self.refusals_logged.saturating_add(1);
-            eprintln!(
-                "td-audio: refusing request {tag}: {} ({code})",
-                crate::proto::error_name(code).unwrap_or("an unnamed code")
-            );
-            if self.refusals_logged == REFUSAL_LOG_LIMIT {
-                eprintln!(
-                    "td-audio: this connection has been refused {REFUSAL_LOG_LIMIT} \
-                     times; further refusals are answered but not logged"
-                );
-            }
-        }
+        // The peer receives the named protocol error. Refusals are not written
+        // to stderr here: this state machine has no daemon-global rate budget,
+        // and reconnecting would otherwise reset any per-session ceiling and
+        // let a local peer block the single audio thread on diagnostic output.
+        // Never put an unnamed value on the wire: all ordinary refusal codes
+        // are rostered in `proto`, and INTERNAL is the closed fallback if a
+        // future caller gets that contract wrong.
+        let named = if crate::proto::error_name(code).is_some() {
+            code
+        } else {
+            error::INTERNAL
+        };
         self.send(&packet(command::ERROR, tag, |writer| {
-            writer.u32(code);
+            writer.u32(named);
         }));
     }
 
     fn send(&mut self, packet: &[u8]) {
-        self.out.extend_from_slice(&wire::control_frame(packet));
+        let framed = wire::control_frame(packet);
+        if framed.len() > MAX_OUTPUT_BYTES.saturating_sub(self.out.len()) {
+            self.output_overflowed = true;
+            return;
+        }
+        self.out.extend_from_slice(&framed);
     }
 }
 
@@ -1289,10 +1626,17 @@ fn packet(command: u32, tag: u32, body: impl FnOnce(&mut tag::Writer)) -> Vec<u8
     writer.into_bytes()
 }
 
-/// A proplist value is NUL-terminated bytes; this is its text without the NUL.
-fn property_text(property: &Property) -> Option<String> {
-    let bytes = property.value.strip_suffix(&[0]).unwrap_or(&property.value);
-    std::str::from_utf8(bytes).ok().map(|text| text.to_string())
+/// A Pulse text-property value is exactly one NUL-terminated bounded UTF-8
+/// string. Accepting raw or interior-NUL bytes would make the stored name
+/// differ from what the tagged reply encoder can represent.
+fn property_text(property: &Property) -> Result<String, ()> {
+    let bytes = property.value.strip_suffix(&[0]).ok_or(())?;
+    if bytes.len() > tag::STRING_MAX || bytes.contains(&0) {
+        return Err(());
+    }
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| ())
 }
 
 /// A client buffer attribute in frames. `0xFFFFFFFF` means "you choose", and
@@ -1306,9 +1650,40 @@ fn attribute_frames(requested: u32, default_ms: u64, spec: Spec, frame_bytes: u6
     }
 }
 
+/// Resolve the only sink by either of Pulse's ordinary selector forms.
+fn named_sink_matches(name: &str) -> bool {
+    matches!(name, SINK_NAME | "@DEFAULT_SINK@")
+}
+
+/// A lookup carries exactly one selector: either the sink index or its name.
+fn sink_lookup_matches(index: u32, name: Option<&str>) -> bool {
+    match (index, name) {
+        (SINK_INDEX, None) => true,
+        (tag::INVALID_INDEX, Some(name)) => named_sink_matches(name),
+        _ => false,
+    }
+}
+
+/// Stream creation additionally admits INVALID+NULL as “the default sink”.
+fn sink_create_matches(index: u32, name: Option<&str>) -> bool {
+    match (index, name) {
+        (tag::INVALID_INDEX, None) | (SINK_INDEX, None) => true,
+        (tag::INVALID_INDEX, Some(name)) => named_sink_matches(name),
+        _ => false,
+    }
+}
+
 /// The sink-info payload, shared by the single and list forms because they are
 /// the same bytes — a list of one.
-fn write_sink_info(writer: &mut tag::Writer, spec: SampleSpec, version: u32) {
+fn sink_state(mixer: &Mixer) -> u32 {
+    if mixer.sink_is_running() {
+        SINK_STATE_RUNNING
+    } else {
+        SINK_STATE_IDLE
+    }
+}
+
+fn write_sink_info(writer: &mut tag::Writer, spec: SampleSpec, version: u32, state: u32) {
     writer
         .u32(SINK_INDEX)
         .string(SINK_NAME)
@@ -1325,8 +1700,10 @@ fn write_sink_info(writer: &mut tag::Writer, spec: SampleSpec, version: u32) {
         .null_string()
         .usec(0)
         .string(DRIVER)
-        // PA_SINK_HARDWARE. The audio really does reach hardware.
-        .u32(0x0001);
+        // Device selection can explicitly name `snd-aloop` for the capture
+        // oracle, so the server cannot honestly promise PA_SINK_HARDWARE for
+        // every instance. An absent flag is conservative for physical HDA.
+        .u32(0);
     if version >= 13 {
         writer
             .proplist(&[
@@ -1338,7 +1715,7 @@ fn write_sink_info(writer: &mut tag::Writer, spec: SampleSpec, version: u32) {
     if version >= 15 {
         writer
             .volume(VOLUME_NORM)
-            .u32(SINK_STATE_RUNNING)
+            .u32(state)
             .u32(VOLUME_NORM + 1)
             .u32(tag::INVALID_INDEX);
     }
@@ -1412,6 +1789,16 @@ mod tests {
             .collect()
     }
 
+    fn error_code(session: &mut Session) -> u32 {
+        let replies = packets(session);
+        let mut reader = tag::Reader::new(replies.first().expect("an error reply"));
+        assert_eq!(reader.u32().unwrap(), command::ERROR);
+        let _tag = reader.u32().unwrap();
+        let code = reader.u32().unwrap();
+        reader.finish().unwrap();
+        code
+    }
+
     /// Drive a session to the point where it has a stream, and return its
     /// channel.
     fn with_stream(session: &mut Session, mixer: &mut Mixer, corked: bool) -> u32 {
@@ -1419,7 +1806,14 @@ mod tests {
         session
             .feed(
                 &build(command::CREATE_PLAYBACK_STREAM, 1, |writer| {
-                    write_create_request(writer, corked);
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            corked,
+                            prebuf: 0,
+                            ..CreateOptions::default()
+                        },
+                    );
                 }),
                 mixer,
             )
@@ -1439,65 +1833,194 @@ mod tests {
         0
     }
 
-    /// The same request with the two client-chosen buffer sizes spelled out.
-    fn write_create_request_sized(writer: &mut tag::Writer, maxlength: u32, tlength: u32) {
+    struct CreateOptions<'a> {
+        sample_format: u8,
+        map: &'a [u8],
+        sink_index: u32,
+        sink_name: Option<&'a str>,
+        maxlength: u32,
+        corked: bool,
+        tlength: u32,
+        prebuf: u32,
+        minreq: u32,
+        volumes: &'a [u32],
+        variable_rate: bool,
+        muted: bool,
+        volume_set: bool,
+        muted_set: bool,
+        relative_volume: bool,
+        passthrough: bool,
+        encodings: &'a [u8],
+        properties: Option<&'a [Property]>,
+    }
+
+    impl Default for CreateOptions<'static> {
+        fn default() -> Self {
+            Self {
+                sample_format: format::SAMPLE_S16LE,
+                map: &CHANNEL_MAP,
+                sink_index: tag::INVALID_INDEX,
+                sink_name: None,
+                maxlength: tag::INVALID_INDEX,
+                corked: false,
+                tlength: tag::INVALID_INDEX,
+                prebuf: tag::INVALID_INDEX,
+                minreq: tag::INVALID_INDEX,
+                volumes: &[VOLUME_NORM, VOLUME_NORM],
+                variable_rate: false,
+                muted: false,
+                volume_set: false,
+                muted_set: false,
+                relative_volume: false,
+                passthrough: false,
+                encodings: &[],
+                properties: None,
+            }
+        }
+    }
+
+    fn write_create_options(writer: &mut tag::Writer, options: &CreateOptions<'_>) {
+        let default_properties = [tag::text_property("media.name", "a tone")];
+        let properties = options.properties.unwrap_or(&default_properties);
         writer
             .sample_spec(SampleSpec {
-                format: format::SAMPLE_S16LE,
+                format: options.sample_format,
                 channels: 2,
                 rate: 48_000,
             })
-            .channel_map(&CHANNEL_MAP)
-            .u32(tag::INVALID_INDEX)
-            .null_string()
-            .u32(maxlength)
-            .boolean(false)
-            .u32(tlength)
-            .u32(tag::INVALID_INDEX)
-            .u32(tag::INVALID_INDEX)
+            .channel_map(options.map)
+            .u32(options.sink_index);
+        match options.sink_name {
+            Some(name) => writer.string(name),
+            None => writer.null_string(),
+        };
+        writer
+            .u32(options.maxlength)
+            .boolean(options.corked)
+            .u32(options.tlength)
+            .u32(options.prebuf)
+            .u32(options.minreq)
             .u32(0)
-            .cvolume(&[VOLUME_NORM, VOLUME_NORM]);
-        for _ in 0..9 {
-            writer.boolean(false);
+            .cvolume(options.volumes)
+            .boolean(false)
+            .boolean(false)
+            .boolean(false)
+            .boolean(false)
+            .boolean(false)
+            .boolean(false)
+            .boolean(options.variable_rate)
+            .boolean(options.muted)
+            .boolean(false)
+            .proplist(properties)
+            .boolean(options.volume_set)
+            .boolean(false)
+            .boolean(options.muted_set)
+            .boolean(false)
+            .boolean(false)
+            .boolean(options.relative_volume)
+            .boolean(options.passthrough)
+            .u8(options.encodings.len() as u8);
+        for encoding in options.encodings {
+            writer.format_info(*encoding, &[]);
         }
-        writer.proplist(&[tag::text_property("media.name", "a tone")]);
-        for _ in 0..7 {
-            writer.boolean(false);
-        }
-        writer.u8(0);
+    }
+
+    /// The same request with the two client-chosen buffer sizes spelled out.
+    fn write_create_request_sized(writer: &mut tag::Writer, maxlength: u32, tlength: u32) {
+        write_create_options(
+            writer,
+            &CreateOptions {
+                maxlength,
+                tlength,
+                ..CreateOptions::default()
+            },
+        );
     }
 
     /// The version-35 create request, in the exact shape the captured packet
     /// has — sixteen booleans and all.
     fn write_create_request_for_format(writer: &mut tag::Writer, corked: bool, sample_format: u8) {
-        writer
-            .sample_spec(SampleSpec {
-                format: sample_format,
-                channels: 2,
-                rate: 48_000,
-            })
-            .channel_map(&CHANNEL_MAP)
-            .u32(tag::INVALID_INDEX)
-            .null_string()
-            .u32(tag::INVALID_INDEX)
-            .boolean(corked)
-            .u32(tag::INVALID_INDEX)
-            .u32(tag::INVALID_INDEX)
-            .u32(tag::INVALID_INDEX)
-            .u32(0)
-            .cvolume(&[VOLUME_NORM, VOLUME_NORM]);
-        for _ in 0..9 {
-            writer.boolean(false);
-        }
-        writer.proplist(&[tag::text_property("media.name", "a tone")]);
-        for _ in 0..7 {
-            writer.boolean(false);
-        }
-        writer.u8(0);
+        write_create_options(
+            writer,
+            &CreateOptions {
+                sample_format,
+                corked,
+                ..CreateOptions::default()
+            },
+        );
     }
 
     fn write_create_request(writer: &mut tag::Writer, corked: bool) {
-        write_create_request_for_format(writer, corked, format::SAMPLE_S16LE);
+        write_create_options(
+            writer,
+            &CreateOptions {
+                corked,
+                ..CreateOptions::default()
+            },
+        );
+    }
+
+    fn create_error(options: &CreateOptions<'_>) -> (u32, usize, usize) {
+        let (mut session, mut mixer) = fixture();
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 8, |writer| {
+                    write_create_options(writer, options);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let replies = packets(&mut session);
+        let mut reader = tag::Reader::new(replies.first().expect("an error reply"));
+        assert_eq!(reader.u32().unwrap(), command::ERROR);
+        assert_eq!(reader.u32().unwrap(), 8);
+        let error = reader.u32().unwrap();
+        reader.finish().unwrap();
+        (error, session.stream_count(), mixer.stream_count())
+    }
+
+    /// Firefox's captured float stream asks for a 50 ms target even when the
+    /// selected HDA ring is larger. The reply raises only the working target
+    /// and its derived prebuffer to retain bounded refill headroom; it preserves
+    /// the client's larger maxlength.
+    #[test]
+    fn the_device_ring_plus_one_period_is_the_minimum_working_target() {
+        let mut session = Session::new(Spec::fixed(), 0);
+        let mut mixer = Mixer::with_target_floor(Spec::fixed(), 9_216);
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 1, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            sample_format: format::SAMPLE_FLOAT32LE,
+                            maxlength: 9_600 * 8,
+                            corked: true,
+                            tlength: 2_400 * 8,
+                            minreq: 300 * 8,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+
+        let replies = packets(&mut session);
+        let mut reader = tag::Reader::new(replies.first().expect("a create reply"));
+        assert_eq!(reader.u32().unwrap(), command::REPLY);
+        assert_eq!(reader.u32().unwrap(), 1);
+        assert_eq!(reader.u32().unwrap(), 0, "channel");
+        assert_eq!(reader.u32().unwrap(), 0, "sink-input index");
+        assert_eq!(reader.u32().unwrap(), 0, "a corked stream gets no grant");
+        assert_eq!(reader.u32().unwrap(), 9_600 * 8, "client maxlength");
+        assert_eq!(reader.u32().unwrap(), 9_216 * 8, "ring-plus-period target");
+        assert_eq!(reader.u32().unwrap(), 8_917 * 8, "derived prebuffer");
+        assert_eq!(reader.u32().unwrap(), 300 * 8, "client minreq");
     }
 
     #[test]
@@ -1538,13 +2061,25 @@ mod tests {
         assert_eq!(reader.string().unwrap().as_deref(), Some(SINK_NAME));
         assert!(!reader.boolean().unwrap());
         assert_eq!(reader.usec().unwrap(), 0);
-        assert_eq!(reader.format_info().unwrap(), (format::ENCODING_PCM, Vec::new()));
+        assert_eq!(
+            reader.format_info().unwrap(),
+            (format::ENCODING_PCM, Vec::new())
+        );
         reader.finish().unwrap();
         let stream = session.streams.get(&0).unwrap();
         assert_eq!(stream.sample_spec.format, format::SAMPLE_FLOAT32LE);
         assert_eq!(stream.frame_bytes(), 8);
 
-        let samples = [-1.0_f32, -0.5, 0.0, 0.5, 1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let samples = [
+            -1.0_f32,
+            -0.5,
+            0.0,
+            0.5,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
         let pcm = samples
             .iter()
             .flat_map(|sample| sample.to_le_bytes())
@@ -1564,14 +2099,29 @@ mod tests {
         assert_eq!(first.frames_written, 1_024);
         assert_eq!(
             sink.samples().get(..8),
-            Some([i16::MIN, -16_384, 0, 16_384, i16::MAX, 0, i16::MAX, i16::MIN].as_slice())
+            Some(
+                [
+                    i16::MIN,
+                    -16_384,
+                    0,
+                    16_384,
+                    i16::MAX,
+                    0,
+                    i16::MAX,
+                    i16::MIN
+                ]
+                .as_slice()
+            )
         );
         let timing = mixer.timing(session.stream_id(0).unwrap()).unwrap();
-        assert_eq!(timing.write_index, 38_400, "9,600 mixer frames are S16 bytes");
+        assert_eq!(
+            timing.write_index, 38_400,
+            "9,600 mixer frames are S16 bytes"
+        );
         sink.advance(first.frames_written);
         let second = mixer.pump(&mut sink).unwrap();
         assert_eq!(second.frames_written, 1_024);
-        session.service(&mixer);
+        session.service(&mut mixer);
         let mut refill = None;
         for packet in packets(&mut session) {
             let mut reader = tag::Reader::new(&packet);
@@ -1582,7 +2132,11 @@ mod tests {
                 reader.finish().unwrap();
             }
         }
-        assert_eq!(refill, Some(16_384), "2,048 played float frames are regranted");
+        assert_eq!(
+            refill,
+            Some(16_384),
+            "2,048 played float frames are regranted"
+        );
 
         session.tick(1_000_000);
         session
@@ -1605,19 +2159,31 @@ mod tests {
         assert_eq!(reader.s64().unwrap(), 76_800, "float write index");
         assert_eq!(reader.s64().unwrap(), 8_192, "nonzero float read index");
         assert_eq!(reader.u64().unwrap(), 0);
-        assert_eq!(reader.u64().unwrap(), 8_192, "v13 float read index");
+        assert_eq!(reader.u64().unwrap(), 0, "v13 duration is not a byte index");
         reader.finish().unwrap();
 
-        for _ in 0..12 {
+        for _ in 0..7 {
             sink.advance(1_024);
             let _ = mixer.pump(&mut sink).unwrap();
         }
-        assert_eq!(mixer.timing(session.stream_id(0).unwrap()).unwrap().queued_frames, 0);
+        let stream_id = session.stream_id(0).unwrap();
+        assert_eq!(
+            mixer.timing(stream_id).unwrap().queued_frames,
+            384,
+            "an ordinary sub-period remainder waits for the next client write"
+        );
+        mixer.set_prebuffer(stream_id, 0, false).unwrap();
+        let tail = mixer.pump(&mut sink).unwrap();
+        assert_eq!(tail.frames_written, 384);
+        let device_tail = sink.device_delay().unwrap();
+        sink.advance(device_tail.saturating_add(1));
+        mixer.recover(&mut sink).unwrap();
+        assert_eq!(mixer.timing(stream_id).unwrap().queued_frames, 0);
         let mut resumed = wire::Descriptor::encode(8, 0, 0, 0).to_vec();
         resumed.extend_from_slice(&0.5_f32.to_le_bytes());
         resumed.extend_from_slice(&0.5_f32.to_le_bytes());
         session.feed(&resumed, &mut mixer).unwrap();
-        session.service(&mixer);
+        session.service(&mut mixer);
         let mut underflow_index = None;
         for packet in packets(&mut session) {
             let mut reader = tag::Reader::new(&packet);
@@ -1629,6 +2195,430 @@ mod tests {
             }
         }
         assert_eq!(underflow_index, Some(76_800));
+    }
+
+    /// Protocol 23 added the read-index field to UNDERFLOW. Versions 21 and
+    /// 22 remain admitted and must receive the shorter exact event.
+    #[test]
+    fn underflow_uses_the_negotiated_event_shape() {
+        for version in [21, 22, 23, 35] {
+            let (mut session, mut mixer) = fixture();
+            session.feed(&auth_packet(version), &mut mixer).unwrap();
+            session
+                .feed(
+                    &build(command::CREATE_PLAYBACK_STREAM, 8, |writer| {
+                        write_create_request(writer, false);
+                    }),
+                    &mut mixer,
+                )
+                .unwrap();
+            let _ = session.take_output();
+            session
+                .feed(
+                    &build(command::TRIGGER_PLAYBACK_STREAM, 9, |writer| {
+                        writer.u32(0);
+                    }),
+                    &mut mixer,
+                )
+                .unwrap();
+            let _ = session.take_output();
+            let mut audio = wire::Descriptor::encode(4 * 4, 0, 0, 0).to_vec();
+            audio.extend_from_slice(&[1u8; 4 * 4]);
+            session.feed(&audio, &mut mixer).unwrap();
+
+            let mut sink = MemorySink::new(Spec::fixed(), 64, 4);
+            mixer.pump(&mut sink).unwrap();
+            sink.start().unwrap();
+            mixer.note_started();
+            sink.advance(5);
+            mixer.recover(&mut sink).unwrap();
+            session.service(&mut mixer);
+
+            let replies = packets(&mut session);
+            let packet = replies
+                .iter()
+                .find(|packet| {
+                    wire::command_and_tag(packet).is_ok_and(|(kind, _)| kind == command::UNDERFLOW)
+                })
+                .expect("an underflow event");
+            let mut reader = tag::Reader::new(packet);
+            assert_eq!(reader.u32().unwrap(), command::UNDERFLOW);
+            assert_eq!(reader.u32().unwrap(), tag::INVALID_INDEX);
+            assert_eq!(reader.u32().unwrap(), 0);
+            if version >= 23 {
+                let _ = reader.s64().unwrap();
+            }
+            reader.finish().unwrap();
+        }
+    }
+
+    /// STARTED describes a current render run, not the fact that this channel
+    /// had a positive read index at some point in its lifetime.
+    #[test]
+    fn a_run_after_underflow_emits_started_again() {
+        let (mut session, mut mixer) = fixture();
+        let channel = with_stream(&mut session, &mut mixer, false);
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 4);
+
+        let mut audio = wire::Descriptor::encode(4 * 4, channel, 0, 0).to_vec();
+        audio.extend_from_slice(&[1u8; 4 * 4]);
+        session.feed(&audio, &mut mixer).unwrap();
+        mixer.pump(&mut sink).unwrap();
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::STARTED));
+
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance(5);
+        mixer.recover(&mut sink).unwrap();
+        session.service(&mut mixer);
+        let stopped = commands(&mut session);
+        assert!(stopped.contains(&command::UNDERFLOW));
+        assert!(!stopped.contains(&command::STARTED));
+
+        session.feed(&audio, &mut mixer).unwrap();
+        mixer.pump(&mut sink).unwrap();
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::STARTED));
+    }
+
+    /// If a peer fills the shared-output gap before an older endpoint is
+    /// observed, the resumed stream still transitions through UNDERFLOW and
+    /// back to STARTED when the playhead enters its already accepted next run.
+    #[test]
+    fn a_preaccepted_run_starts_after_its_older_peer_gap_underflows() {
+        let (mut session, mut mixer) = fixture();
+        let resumed = with_stream(&mut session, &mut mixer, false);
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 3, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            prebuf: 0,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        let peer = 1;
+        let frame = |channel, frames: usize, sample: u8| {
+            let mut bytes = wire::Descriptor::encode((frames * 4) as u32, channel, 0, 0).to_vec();
+            bytes.extend(std::iter::repeat_n(sample, frames * 4));
+            bytes
+        };
+
+        session.feed(&frame(resumed, 4, 10), &mut mixer).unwrap();
+        session.feed(&frame(peer, 8, 20), &mut mixer).unwrap();
+        let mut sink = MemorySink::new(Spec::fixed(), 16, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.feed(&frame(resumed, 4, 30), &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::STARTED));
+
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance(4);
+        mixer.observe_playhead(&mut sink).unwrap();
+        session.service(&mut mixer);
+        let underflow = commands(&mut session);
+        assert!(underflow.contains(&command::UNDERFLOW));
+        assert!(!underflow.contains(&command::STARTED));
+
+        sink.advance(4);
+        mixer.observe_playhead(&mut sink).unwrap();
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::STARTED));
+    }
+
+    #[test]
+    fn a_coarse_sample_orders_underflow_before_the_preaccepted_run_starts() {
+        let (mut session, mut mixer) = fixture();
+        let resumed = with_stream(&mut session, &mut mixer, false);
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 3, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            prebuf: 0,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        let frame = |channel, frames: usize, sample: u8| {
+            let mut bytes = wire::Descriptor::encode((frames * 4) as u32, channel, 0, 0).to_vec();
+            bytes.extend(std::iter::repeat_n(sample, frames * 4));
+            bytes
+        };
+
+        session.feed(&frame(resumed, 4, 10), &mut mixer).unwrap();
+        session.feed(&frame(1, 20, 20), &mut mixer).unwrap();
+        let mut sink = MemorySink::new(Spec::fixed(), 16, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.feed(&frame(resumed, 4, 30), &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::STARTED));
+
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance(8);
+        mixer.observe_playhead(&mut sink).unwrap();
+        session.service(&mut mixer);
+        let events = commands(&mut session);
+        let underflow = events
+            .iter()
+            .position(|kind| *kind == command::UNDERFLOW)
+            .unwrap();
+        let started = events
+            .iter()
+            .position(|kind| *kind == command::STARTED)
+            .unwrap();
+        assert!(underflow < started);
+
+        // An unchanged mixer state cannot replay STARTED for this same
+        // transition on a later service pass.
+        session.service(&mut mixer);
+        assert!(!commands(&mut session).contains(&command::STARTED));
+    }
+
+    #[test]
+    fn coarse_playhead_samples_emit_each_discontinuous_underflow() {
+        let (mut session, mut mixer) = fixture();
+        let resumed = with_stream(&mut session, &mut mixer, false);
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 3, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            prebuf: 0,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        let frame = |channel, frames: usize, sample: u8| {
+            let mut bytes = wire::Descriptor::encode((frames * 4) as u32, channel, 0, 0).to_vec();
+            bytes.extend(std::iter::repeat_n(sample, frames * 4));
+            bytes
+        };
+        session.feed(&frame(resumed, 4, 10), &mut mixer).unwrap();
+        session.feed(&frame(1, 20, 20), &mut mixer).unwrap();
+        let mut sink = MemorySink::new(Spec::fixed(), 32, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.feed(&frame(resumed, 4, 30), &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.feed(&frame(resumed, 4, 40), &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.service(&mut mixer);
+        let _ = session.take_output();
+
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance(12);
+        mixer.observe_playhead(&mut sink).unwrap();
+        session.service(&mut mixer);
+        let mut indexes = Vec::new();
+        for packet in packets(&mut session) {
+            let mut reader = tag::Reader::new(&packet);
+            if reader.u32().unwrap() != command::UNDERFLOW {
+                continue;
+            }
+            assert_eq!(reader.u32().unwrap(), tag::INVALID_INDEX);
+            if reader.u32().unwrap() == resumed {
+                indexes.push(reader.s64().unwrap());
+            }
+        }
+        assert_eq!(indexes, [16, 32]);
+    }
+
+    #[test]
+    fn started_waits_for_every_batched_underflow_position() {
+        const UNDERFLOWS: usize = MAX_UNDERFLOW_EVENTS_PER_SERVICE as usize + 1;
+
+        let (mut session, mut mixer) = fixture();
+        let resumed = with_stream(&mut session, &mut mixer, false);
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 3, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            prebuf: 0,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        let frame = |channel, frames: usize, sample: u8| {
+            let mut bytes = wire::Descriptor::encode((frames * 4) as u32, channel, 0, 0).to_vec();
+            bytes.extend(std::iter::repeat_n(sample, frames * 4));
+            bytes
+        };
+        session
+            .feed(&frame(1, UNDERFLOWS * 2 + 1, 20), &mut mixer)
+            .unwrap();
+        let mut sink = MemorySink::new(Spec::fixed(), 128, 1);
+        for _ in 0..UNDERFLOWS {
+            session.feed(&frame(resumed, 1, 10), &mut mixer).unwrap();
+            assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 1);
+            assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 1);
+        }
+        session.feed(&frame(resumed, 1, 30), &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 1);
+        session.service(&mut mixer);
+        let _ = session.take_output();
+
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance((UNDERFLOWS * 2) as u64);
+        mixer.observe_playhead(&mut sink).unwrap();
+
+        session.service(&mut mixer);
+        let first = commands(&mut session);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|kind| **kind == command::UNDERFLOW)
+                .count(),
+            MAX_UNDERFLOW_EVENTS_PER_SERVICE as usize
+        );
+        assert!(!first.contains(&command::STARTED));
+
+        session.service(&mut mixer);
+        let second = commands(&mut session);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|kind| **kind == command::UNDERFLOW)
+                .count(),
+            1
+        );
+        let underflow = second
+            .iter()
+            .position(|kind| *kind == command::UNDERFLOW)
+            .unwrap();
+        let started = second
+            .iter()
+            .position(|kind| *kind == command::STARTED)
+            .unwrap();
+        assert!(underflow < started);
+    }
+
+    #[test]
+    fn drain_suppresses_only_the_endpoint_it_owns() {
+        let (mut session, mut mixer) = fixture();
+        let resumed = with_stream(&mut session, &mut mixer, false);
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 3, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            prebuf: 0,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        let frame = |channel, frames: usize, sample: u8| {
+            let mut bytes = wire::Descriptor::encode((frames * 4) as u32, channel, 0, 0).to_vec();
+            bytes.extend(std::iter::repeat_n(sample, frames * 4));
+            bytes
+        };
+        session.feed(&frame(resumed, 4, 10), &mut mixer).unwrap();
+        // Keep the peer continuous beyond this observation. The only
+        // unrelated endpoint crossing is the resumed stream's older run; the
+        // newer run is the one DRAIN owns.
+        session.feed(&frame(1, 20, 20), &mut mixer).unwrap();
+        let mut sink = MemorySink::new(Spec::fixed(), 16, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.feed(&frame(resumed, 4, 30), &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session
+            .feed(
+                &build(command::DRAIN_PLAYBACK_STREAM, 10, |writer| {
+                    writer.u32(resumed);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance(12);
+        mixer.observe_playhead(&mut sink).unwrap();
+        session.service(&mut mixer);
+        let events = commands(&mut session);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|kind| **kind == command::UNDERFLOW)
+                .count(),
+            1
+        );
+        assert!(events.contains(&command::REPLY));
+    }
+
+    /// Corking closes the current run. Uncorking an empty old stream cannot
+    /// turn its historical read index into a new STARTED event.
+    #[test]
+    fn uncorking_an_empty_stream_does_not_invent_started() {
+        let (mut session, mut mixer) = fixture();
+        let channel = with_stream(&mut session, &mut mixer, false);
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 4);
+        let mut audio = wire::Descriptor::encode(4 * 4, channel, 0, 0).to_vec();
+        audio.extend_from_slice(&[1u8; 4 * 4]);
+        session.feed(&audio, &mut mixer).unwrap();
+        mixer.pump(&mut sink).unwrap();
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::STARTED));
+
+        session
+            .feed(
+                &build(command::CORK_PLAYBACK_STREAM, 10, |writer| {
+                    writer.u32(channel).boolean(true);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        session
+            .feed(
+                &build(command::CORK_PLAYBACK_STREAM, 11, |writer| {
+                    writer.u32(channel).boolean(false);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        session.service(&mut mixer);
+        assert!(!commands(&mut session).contains(&command::STARTED));
     }
 
     #[test]
@@ -1792,7 +2782,10 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             .unwrap();
         let id = session.stream_id(0).expect("the stream was created");
         let frame_bytes = Spec::fixed().frame_bytes as u64;
-        let granted = mixer.request_frames(id).unwrap().saturating_mul(frame_bytes);
+        let granted = mixer
+            .request_frames(id)
+            .unwrap()
+            .saturating_mul(frame_bytes);
         assert!(
             granted <= MAXLENGTH_CEILING,
             "one request bought a {granted}-byte grant"
@@ -1811,6 +2804,73 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         }
         assert_eq!(session.stream_count(), MAX_STREAMS_PER_CLIENT);
         assert_eq!(mixer.stream_count(), MAX_STREAMS_PER_CLIENT);
+    }
+
+    #[test]
+    fn idle_maximum_streams_leave_shared_reservation_for_peers() {
+        let mut mixer = Mixer::new(Spec::fixed());
+        let mut owner = Session::new(Spec::fixed(), 0);
+        owner.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = owner.take_output();
+        for tag_number in 0..5 {
+            owner
+                .feed(
+                    &build(command::CREATE_PLAYBACK_STREAM, tag_number, |writer| {
+                        write_create_request_sized(writer, u32::MAX - 3, u32::MAX - 3);
+                    }),
+                    &mut mixer,
+                )
+                .unwrap();
+        }
+        assert_eq!(owner.stream_count(), 4);
+        assert_eq!(mixer.stream_count(), 4);
+        let replies = packets(&mut owner);
+        let last = replies.last().unwrap();
+        let mut reader = tag::Reader::new(last);
+        assert_eq!(reader.u32().unwrap(), command::ERROR);
+        assert_eq!(reader.u32().unwrap(), 4);
+        assert_eq!(reader.u32().unwrap(), error::TOOLARGE);
+
+        let mut peer = Session::new(Spec::fixed(), 1);
+        peer.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = peer.take_output();
+        peer.feed(
+            &build(command::CREATE_PLAYBACK_STREAM, 9, |writer| {
+                write_create_request(writer, false);
+            }),
+            &mut mixer,
+        )
+        .unwrap();
+        assert_eq!(peer.stream_count(), 1);
+        assert_eq!(mixer.stream_count(), 5);
+    }
+
+    /// The shared cap is enforced at the protocol admission point too, where
+    /// a client receives a bounded refusal instead of a generic internal one.
+    #[test]
+    fn the_daemon_wide_stream_limit_is_a_toolarge_reply() {
+        let (mut session, mut mixer) = fixture();
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        for _ in 0..crate::mixer::MAX_STREAMS {
+            mixer.open(1).unwrap();
+        }
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 9, |writer| {
+                    write_create_request(writer, false);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let replies = packets(&mut session);
+        let mut reader = tag::Reader::new(replies.first().expect("a refusal"));
+        assert_eq!(reader.u32().unwrap(), command::ERROR);
+        assert_eq!(reader.u32().unwrap(), 9);
+        assert_eq!(reader.u32().unwrap(), error::TOOLARGE);
+        reader.finish().unwrap();
+        assert_eq!(session.stream_count(), 0);
+        assert_eq!(mixer.stream_count(), crate::mixer::MAX_STREAMS);
     }
 
     /// A version this server cannot actually parse is refused AT `AUTH`, which
@@ -1885,7 +2945,11 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         let replies = packets(&mut session);
         let reply = replies.first().unwrap();
         let mut reader = tag::Reader::new(reply);
-        assert_eq!(reader.u32().unwrap(), command::REPLY, "a reply, not an error");
+        assert_eq!(
+            reader.u32().unwrap(),
+            command::REPLY,
+            "a reply, not an error"
+        );
         assert_eq!(reader.u32().unwrap(), 7);
         reader.finish().expect("and the list is empty");
     }
@@ -1947,15 +3011,23 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         assert_eq!(reader.u32().unwrap(), OWNER_MODULE);
         assert_eq!(reader.cvolume().unwrap(), vec![VOLUME_NORM, VOLUME_NORM]);
         assert!(!reader.boolean().unwrap(), "not muted");
-        assert_eq!(reader.u32().unwrap(), tag::INVALID_INDEX, "no monitor source");
+        assert_eq!(
+            reader.u32().unwrap(),
+            tag::INVALID_INDEX,
+            "no monitor source"
+        );
         assert_eq!(reader.string().unwrap(), None);
         assert_eq!(reader.usec().unwrap(), 0);
         assert_eq!(reader.string().unwrap().as_deref(), Some(DRIVER));
-        assert_eq!(reader.u32().unwrap(), 1, "PA_SINK_HARDWARE");
-        assert!(reader.proplist().unwrap().iter().any(|p| p.key == "device.description"));
+        assert_eq!(reader.u32().unwrap(), 0, "no false hardware promise");
+        assert!(reader
+            .proplist()
+            .unwrap()
+            .iter()
+            .any(|p| p.key == "device.description"));
         assert_eq!(reader.usec().unwrap(), 0);
         assert_eq!(reader.volume().unwrap(), VOLUME_NORM);
-        assert_eq!(reader.u32().unwrap(), SINK_STATE_RUNNING);
+        assert_eq!(reader.u32().unwrap(), SINK_STATE_IDLE);
         assert_eq!(reader.u32().unwrap(), VOLUME_NORM + 1);
         assert_eq!(reader.u32().unwrap(), tag::INVALID_INDEX, "no card");
         assert_eq!(reader.u32().unwrap(), 0, "no ports");
@@ -1963,6 +3035,17 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         assert_eq!(reader.u8().unwrap(), 1, "one format");
         assert_eq!(reader.format_info().unwrap().0, format::ENCODING_PCM);
         reader.finish().unwrap();
+    }
+
+    #[test]
+    fn sink_state_distinguishes_idle_from_real_playback() {
+        let mut mixer = Mixer::new(Spec::fixed());
+        assert_eq!(sink_state(&mixer), SINK_STATE_IDLE);
+        let id = mixer.open(1000).unwrap();
+        mixer.write(id, &[1u8; 4 * 4]).unwrap();
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 4);
+        mixer.pump(&mut sink).unwrap();
+        assert_eq!(sink_state(&mixer), SINK_STATE_RUNNING);
     }
 
     /// Creating a stream answers with the buffer attributes AND a first byte
@@ -1996,15 +3079,18 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         assert_eq!(u64::from(missing), expected);
         assert_eq!(reader.u32().unwrap(), expected as u32 * 4, "maxlength");
         assert_eq!(reader.u32().unwrap(), expected as u32, "tlength");
+        let prebuf = reader.u32().unwrap();
+        let minreq = reader.u32().unwrap();
         let expected_minreq = Spec::fixed().usec_to_frames(DEFAULT_MINREQ_MS * 1000)
             * Spec::fixed().frame_bytes as u64;
-        assert_eq!(
-            reader.u32().unwrap(),
-            (expected + Spec::fixed().frame_bytes as u64 - expected_minreq) as u32,
-            "prebuf"
-        );
-        let minreq = reader.u32().unwrap();
         assert_eq!(u64::from(minreq), expected_minreq);
+        assert_eq!(
+            u64::from(prebuf),
+            expected
+                .saturating_add(Spec::fixed().frame_bytes as u64)
+                .saturating_sub(expected_minreq),
+            "the server-selected prebuffer is tlength plus a frame minus minreq"
+        );
         assert_eq!(reader.sample_spec().unwrap().rate, 48_000);
         assert_eq!(reader.channel_map().unwrap(), vec![1, 2]);
         assert_eq!(reader.u32().unwrap(), SINK_INDEX);
@@ -2013,6 +3099,42 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         assert_eq!(reader.usec().unwrap(), 0);
         assert_eq!(reader.format_info().unwrap().0, format::ENCODING_PCM);
         reader.finish().unwrap();
+    }
+
+    /// An explicit prebuffer request is capped at Pulse's tlength-plus-frame
+    /// minus minreq bound, not at tlength itself and not at the client's u32.
+    #[test]
+    fn explicit_prebuffer_uses_the_protocol_maximum() {
+        let (mut session, mut mixer) = fixture();
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 8, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            tlength: 10 * 4,
+                            minreq: 4 * 4,
+                            prebuf: u32::MAX - 1,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let replies = packets(&mut session);
+        let mut reader = tag::Reader::new(replies.first().unwrap());
+        assert_eq!(reader.u32().unwrap(), command::REPLY);
+        let _tag = reader.u32().unwrap();
+        let _channel = reader.u32().unwrap();
+        let _sink_input = reader.u32().unwrap();
+        let _grant = reader.u32().unwrap();
+        let _maxlength = reader.u32().unwrap();
+        assert_eq!(reader.u32().unwrap(), 10 * 4, "tlength");
+        assert_eq!(reader.u32().unwrap(), 7 * 4, "prebuffer maximum");
+        assert_eq!(reader.u32().unwrap(), 4 * 4, "minreq");
     }
 
     /// A stream created corked gets no grant, because audio written to a corked
@@ -2038,7 +3160,7 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         reader.u32().unwrap();
         assert_eq!(reader.u32().unwrap(), 0, "no grant while corked");
         // Servicing changes nothing either.
-        session.service(&mixer);
+        session.service(&mut mixer);
         assert!(commands(&mut session).is_empty());
         // Uncorking does.
         session
@@ -2050,7 +3172,7 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             )
             .unwrap();
         let _ = session.take_output();
-        session.service(&mixer);
+        session.service(&mut mixer);
         assert_eq!(commands(&mut session), vec![command::REQUEST]);
     }
 
@@ -2065,8 +3187,11 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         // The create reply already granted a full target. Servicing repeatedly
         // must add nothing while none of it has been spent.
         for _ in 0..5 {
-            session.service(&mixer);
-            assert!(commands(&mut session).is_empty(), "re-granted unspent bytes");
+            session.service(&mut mixer);
+            assert!(
+                commands(&mut session).is_empty(),
+                "re-granted unspent bytes"
+            );
         }
         // Spending a grant is not what frees it either: the audio is still
         // queued, so the client still holds a full target. Writing half the
@@ -2078,7 +3203,7 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         audio.extend(std::iter::repeat_n(0u8, half));
         session.feed(&audio, &mut mixer).unwrap();
         let _ = session.take_output();
-        session.service(&mixer);
+        session.service(&mut mixer);
         assert!(
             commands(&mut session).is_empty(),
             "queued audio is still the client's, so nothing is freed by writing it"
@@ -2090,11 +3215,15 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         sink.start().unwrap();
         let pumped = mixer.pump(&mut sink).unwrap();
         sink.advance(pumped.frames_written);
-        session.service(&mixer);
+        session.service(&mut mixer);
         let replies = packets(&mut session);
         let mut reader = tag::Reader::new(replies.first().expect("a grant for the played audio"));
         assert_eq!(reader.u32().unwrap(), command::REQUEST);
-        assert_eq!(reader.u32().unwrap(), tag::INVALID_INDEX, "an event, not a reply");
+        assert_eq!(
+            reader.u32().unwrap(),
+            tag::INVALID_INDEX,
+            "an event, not a reply"
+        );
         assert_eq!(reader.u32().unwrap(), channel);
         let granted = u64::from(reader.u32().unwrap());
         reader.finish().unwrap();
@@ -2133,6 +3262,52 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             samples.iter().take(64).all(|sample| *sample == 1000),
             "the client's audio, at unity gain"
         );
+    }
+
+    /// A legal low-latency target may be smaller than the ALSA period. The
+    /// client can supply only the bytes REQUEST granted, so reaching that
+    /// watermark must release each transfer after the initial START too.
+    #[test]
+    fn a_below_period_target_keeps_playing_and_granting() {
+        let (mut session, mut mixer) = fixture();
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 1, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            maxlength: 1_920 * 4,
+                            tlength: 480 * 4,
+                            minreq: 480 * 4,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        let mut audio = Vec::new();
+        for _ in 0..480 * 2 {
+            audio.extend_from_slice(&700_i16.to_le_bytes());
+        }
+        let mut frame = wire::Descriptor::encode(audio.len() as u32, 0, 0, 0).to_vec();
+        frame.extend_from_slice(&audio);
+        session.feed(&frame, &mut mixer).unwrap();
+
+        let mut sink = MemorySink::new(Spec::fixed(), 8_192, 1_024);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 480);
+        assert!(mixer.ready_to_start(8_192, 1_024));
+        sink.start().unwrap();
+        mixer.note_started();
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::REQUEST));
+
+        session.feed(&frame, &mut mixer).unwrap();
+        assert!(mixer.has_device_work(sink.is_running(), sink.period_frames()));
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 480);
     }
 
     /// A data frame for a channel that does not exist is ignored, not fatal.
@@ -2178,7 +3353,10 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             !commands(&mut session).contains(&command::REPLY),
             "the drain has not completed yet"
         );
-        assert!(sink.is_running() || !sink.is_running(), "the sink is untouched");
+        assert!(
+            sink.is_running() || !sink.is_running(),
+            "the sink is untouched"
+        );
 
         // Play it out. Advancing by exactly what the device took is what a
         // real device does; advancing past it would be an underrun.
@@ -2186,20 +3364,41 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             let pumped = mixer.pump(&mut sink).unwrap();
             sink.advance(pumped.frames_written);
         }
-        session.service(&mixer);
+        session.service(&mut mixer);
         let replies = packets(&mut session);
         let drained = replies
             .iter()
             .filter_map(|packet| wire::command_and_tag(packet).ok())
             .find(|(command, _)| *command == command::REPLY);
-        assert_eq!(drained, Some((command::REPLY, 20)), "the drain reply, tagged 20");
+        assert_eq!(
+            drained,
+            Some((command::REPLY, 20)),
+            "the drain reply, tagged 20"
+        );
     }
 
-    /// A drain on an empty stream is answered at once rather than left hanging.
+    /// An empty drain answers at once and still disables prebuffering for the
+    /// following short run, as Pulse's drain operation requires.
     #[test]
-    fn draining_an_empty_stream_replies_immediately() {
+    fn draining_an_empty_stream_replies_and_releases_prebuffer() {
         let (mut session, mut mixer) = fixture();
-        let channel = with_stream(&mut session, &mut mixer, false);
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 1, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            prebuf: 8 * 4,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        let channel = 0;
         session
             .feed(
                 &build(command::DRAIN_PLAYBACK_STREAM, 21, |writer| {
@@ -2209,6 +3408,12 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             )
             .unwrap();
         assert_eq!(commands(&mut session), vec![command::REPLY]);
+
+        let mut audio = wire::Descriptor::encode(4 * 4, channel, 0, 0).to_vec();
+        audio.extend_from_slice(&[1u8; 4 * 4]);
+        session.feed(&audio, &mut mixer).unwrap();
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
     }
 
     /// PREBUF arms the negotiated threshold, TRIGGER releases it, and DRAIN
@@ -2216,7 +3421,17 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
     #[test]
     fn prebuffer_trigger_and_empty_drain_control_the_mixer() {
         let (mut session, mut mixer) = fixture();
-        let channel = with_stream(&mut session, &mut mixer, false);
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 1, |writer| {
+                    write_create_request(writer, false);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let channel = 0;
+        let _ = session.take_output();
         session
             .feed(
                 &build(command::PREBUF_PLAYBACK_STREAM, 40, |writer| {
@@ -2311,12 +3526,16 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         let sink_usec = reader.usec().unwrap();
         assert_eq!(reader.usec().unwrap(), 0, "no source latency");
         assert!(reader.boolean().unwrap(), "playing");
-        assert_eq!(reader.timeval().unwrap(), (111, 222), "the client's own stamp");
+        assert_eq!(
+            reader.timeval().unwrap(),
+            (111, 222),
+            "the client's own stamp"
+        );
         assert_eq!(reader.timeval().unwrap(), (1234, 567_890), "the server's");
         let write_index = reader.s64().unwrap();
         let read_index = reader.s64().unwrap();
-        let _underrun_for = reader.u64().unwrap();
-        let _playing_for = reader.u64().unwrap();
+        assert_eq!(reader.u64().unwrap(), 0, "no retained underrun duration");
+        assert_eq!(reader.u64().unwrap(), 0, "no retained playing duration");
         reader.finish().unwrap();
 
         assert_eq!(write_index, pcm.len() as i64, "every byte accepted");
@@ -2325,7 +3544,10 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             read_index <= write_index,
             "read {read_index} ran past write {write_index}: the clock is ahead of the sound"
         );
-        assert!(sink_usec > 0, "there is audio in flight, so there is latency");
+        assert!(
+            sink_usec > 0,
+            "there is audio in flight, so there is latency"
+        );
         // The figure is the mixer's own derived sum, not a number this module
         // made up, and not a constant. §K.3: "A constant 50 ms is not an
         // implementation."
@@ -2424,7 +3646,11 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         assert_eq!(reader.string().unwrap().as_deref(), Some("copy"));
         assert_eq!(reader.string().unwrap().as_deref(), Some(DRIVER));
         assert!(!reader.boolean().unwrap(), "unmuted");
-        assert!(reader.proplist().unwrap().iter().any(|p| p.key == "media.name"));
+        assert!(reader
+            .proplist()
+            .unwrap()
+            .iter()
+            .any(|p| p.key == "media.name"));
         assert!(!reader.boolean().unwrap(), "not corked");
         assert!(reader.boolean().unwrap(), "has volume");
         assert!(reader.boolean().unwrap(), "volume writable");
@@ -2447,7 +3673,11 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
                 &mut mixer,
             )
             .unwrap();
-        assert_eq!(commands(&mut session), vec![command::REPLY], "no subscription");
+        assert_eq!(
+            commands(&mut session),
+            vec![command::REPLY],
+            "no subscription"
+        );
 
         session
             .feed(
@@ -2481,13 +3711,20 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             .unwrap();
         let mut reader = tag::Reader::new(event);
         reader.u32().unwrap();
-        assert_eq!(reader.u32().unwrap(), tag::INVALID_INDEX, "events carry no tag");
+        assert_eq!(
+            reader.u32().unwrap(),
+            tag::INVALID_INDEX,
+            "events carry no tag"
+        );
         let word = reader.u32().unwrap();
         assert_eq!(
             word & subscription::EVENT_FACILITY_MASK,
             subscription::EVENT_SINK_INPUT
         );
-        assert_eq!(word & subscription::EVENT_TYPE_MASK, subscription::EVENT_CHANGE);
+        assert_eq!(
+            word & subscription::EVENT_TYPE_MASK,
+            subscription::EVENT_CHANGE
+        );
         assert_eq!(reader.u32().unwrap(), channel);
         reader.finish().unwrap();
     }
@@ -2551,7 +3788,9 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             audio.extend_from_slice(&pcm);
             session.feed(&audio, &mut mixer).unwrap();
         }
+        let original = session.stream_id(0).unwrap();
         let _ = session.take_output();
+        let before = mixer.timing(session.stream_id(0).unwrap()).unwrap();
         session
             .feed(
                 &build(command::FLUSH_PLAYBACK_STREAM, 60, |writer| {
@@ -2561,17 +3800,131 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             )
             .unwrap();
         assert_eq!(commands(&mut session), vec![command::REPLY]);
-        // By CHANNEL, not by position: the ids are the mixer's and flushing
-        // re-admitted channel 0 under a new one.
+        // By CHANNEL, not by position: the ids are the mixer's and a flush
+        // keeps channel 0's original admission and absolute byte clock.
         let flushed = session.stream_id(0).unwrap();
         let other = session.stream_id(1).unwrap();
+        assert_eq!(flushed, original, "flush preserves the stream identity");
         assert_ne!(flushed, other, "two clients' streams are two mixer streams");
-        assert_eq!(mixer.timing(flushed).unwrap().queued_frames, 0, "flushed");
+        let after = mixer.timing(flushed).unwrap();
+        assert_eq!(after.queued_frames, 0, "flushed");
+        assert_eq!(
+            after.write_index, before.write_index,
+            "the byte clock is stable"
+        );
+        assert_eq!(
+            after.read_index, after.write_index,
+            "flushed bytes are consumed"
+        );
         assert_eq!(
             mixer.timing(other).unwrap().queued_frames,
             480,
             "the other stream is untouched"
         );
+    }
+
+    /// Flush preserves both sides of underflow accounting. Otherwise a new
+    /// mixer counter starts below the session's reported count and later
+    /// events disappear until it catches up.
+    #[test]
+    fn flush_preserves_underflow_event_continuity() {
+        let (mut session, mut mixer) = fixture();
+        let channel = with_stream(&mut session, &mut mixer, false);
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 4);
+        let mut audio = wire::Descriptor::encode(4 * 4, channel, 0, 0).to_vec();
+        audio.extend_from_slice(&[1u8; 4 * 4]);
+
+        session.feed(&audio, &mut mixer).unwrap();
+        mixer.pump(&mut sink).unwrap();
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance(5);
+        mixer.recover(&mut sink).unwrap();
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::UNDERFLOW));
+        let id = session.stream_id(channel).unwrap();
+        let first_write_index = mixer.timing(id).unwrap().write_index;
+
+        session
+            .feed(
+                &build(command::FLUSH_PLAYBACK_STREAM, 61, |writer| {
+                    writer.u32(channel);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        assert_eq!(session.stream_id(channel), Some(id));
+        assert_eq!(mixer.timing(id).unwrap().write_index, first_write_index);
+        session
+            .feed(
+                &build(command::TRIGGER_PLAYBACK_STREAM, 62, |writer| {
+                    writer.u32(channel);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+
+        session.feed(&audio, &mut mixer).unwrap();
+        mixer.pump(&mut sink).unwrap();
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance(5);
+        mixer.recover(&mut sink).unwrap();
+        session.service(&mut mixer);
+        assert!(commands(&mut session).contains(&command::UNDERFLOW));
+        assert_eq!(mixer.underflows(id).unwrap(), 2);
+        assert!(mixer.timing(id).unwrap().write_index > first_write_index);
+    }
+
+    /// Flush begins a new run on the stream, so later playback must receive a
+    /// new STARTED event rather than inheriting the old run's notification.
+    #[test]
+    fn flush_rearms_the_started_event() {
+        let (mut session, mut mixer) = fixture();
+        let channel = with_stream(&mut session, &mut mixer, false);
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 4);
+        let mut audio = wire::Descriptor::encode(4 * 4, channel, 0, 0).to_vec();
+        audio.extend_from_slice(&[1u8; 4 * 4]);
+
+        session.feed(&audio, &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.service(&mut mixer);
+        assert_eq!(
+            commands(&mut session)
+                .into_iter()
+                .filter(|command| *command == command::STARTED)
+                .count(),
+            1
+        );
+        sink.start().unwrap();
+        sink.advance(4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+        session.service(&mut mixer);
+        let _ = session.take_output();
+
+        session
+            .feed(
+                &build(command::FLUSH_PLAYBACK_STREAM, 60, |writer| {
+                    writer.u32(channel);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert_eq!(commands(&mut session), vec![command::REPLY]);
+        session.feed(&audio, &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        session.service(&mut mixer);
+        assert_eq!(
+            commands(&mut session)
+                .into_iter()
+                .filter(|command| *command == command::STARTED)
+                .count(),
+            1
+        );
+        sink.advance(4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
     }
 
     /// A stream in a format the device does not play is refused, not accepted
@@ -2618,7 +3971,391 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         let _tag = reader.u32().unwrap();
         assert_eq!(reader.u32().unwrap(), error::NOTSUPPORTED);
         assert_eq!(session.stream_count(), 0);
-        assert_eq!(mixer.stream_count(), 0, "and no mixer stream was left behind");
+        assert_eq!(
+            mixer.stream_count(),
+            0,
+            "and no mixer stream was left behind"
+        );
+    }
+
+    /// The self-describing packet shape is only the first validation layer.
+    /// Correlated map, volume and sink fields still have to describe this one
+    /// fixed sink, and feature flags cannot request behavior v1 lacks.
+    #[test]
+    fn malformed_or_unsupported_stream_semantics_are_refused_before_admission() {
+        let cases = [
+            (
+                CreateOptions {
+                    map: &[format::FRONT_LEFT],
+                    ..CreateOptions::default()
+                },
+                error::INVALID,
+            ),
+            (
+                CreateOptions {
+                    sink_name: Some("another-sink"),
+                    ..CreateOptions::default()
+                },
+                error::NOENTITY,
+            ),
+            (
+                CreateOptions {
+                    volumes: &[VOLUME_NORM],
+                    ..CreateOptions::default()
+                },
+                error::INVALID,
+            ),
+            (
+                CreateOptions {
+                    variable_rate: true,
+                    ..CreateOptions::default()
+                },
+                error::NOTSUPPORTED,
+            ),
+            (
+                CreateOptions {
+                    relative_volume: true,
+                    ..CreateOptions::default()
+                },
+                error::NOTSUPPORTED,
+            ),
+            (
+                CreateOptions {
+                    passthrough: true,
+                    ..CreateOptions::default()
+                },
+                error::NOTSUPPORTED,
+            ),
+            (
+                CreateOptions {
+                    encodings: &[99],
+                    ..CreateOptions::default()
+                },
+                error::NOTSUPPORTED,
+            ),
+        ];
+        for (options, expected) in cases {
+            assert_eq!(create_error(&options), (expected, 0, 0));
+        }
+    }
+
+    /// `media.name` is a Pulse text property, not an arbitrary byte string.
+    /// Refusing malformed values before allocating identities also prevents an
+    /// invalid-request loop from consuming the finite channel/id spaces.
+    #[test]
+    fn malformed_media_names_are_refused_before_admission() {
+        let cases = [
+            Property {
+                key: "media.name".to_string(),
+                value: b"unterminated".to_vec(),
+            },
+            Property {
+                key: "media.name".to_string(),
+                value: b"interior\0nul\0".to_vec(),
+            },
+            Property {
+                key: "media.name".to_string(),
+                value: vec![0xff, 0],
+            },
+            Property {
+                key: "media.name".to_string(),
+                value: {
+                    let mut value = vec![b'x'; tag::STRING_MAX + 1];
+                    value.push(0);
+                    value
+                },
+            },
+        ];
+        for property in &cases {
+            let properties = [property.clone()];
+            assert_eq!(
+                create_error(&CreateOptions {
+                    properties: Some(&properties),
+                    ..CreateOptions::default()
+                }),
+                (error::INVALID, 0, 0)
+            );
+        }
+    }
+
+    /// Control requests have semantic schemas too: selector XOR, exact
+    /// subscription bits, stereo-or-scalar cvolume, and the one supported
+    /// proplist update mode. Tagged fields alone do not establish those rules.
+    #[test]
+    fn malformed_control_semantics_are_refused() {
+        let (mut session, mut mixer) = fixture();
+        let channel = with_stream(&mut session, &mut mixer, false);
+        let index = session
+            .streams
+            .get(&channel)
+            .map(|stream| stream.sink_input_index)
+            .unwrap();
+
+        session
+            .feed(
+                &build(command::GET_SINK_INFO, 20, |writer| {
+                    writer.u32(SINK_INDEX).string(SINK_NAME);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert_eq!(error_code(&mut session), error::NOENTITY);
+
+        session
+            .feed(
+                &build(command::SUBSCRIBE, 21, |writer| {
+                    writer.u32(subscription::MASK_ALL | (1 << 31));
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert_eq!(error_code(&mut session), error::INVALID);
+
+        for (tag_number, volumes) in [(22, Vec::new()), (23, vec![VOLUME_NORM; 3])] {
+            session
+                .feed(
+                    &build(command::SET_SINK_INPUT_VOLUME, tag_number, |writer| {
+                        writer.u32(index).cvolume(&volumes);
+                    }),
+                    &mut mixer,
+                )
+                .unwrap();
+            assert_eq!(error_code(&mut session), error::INVALID);
+        }
+
+        session
+            .feed(
+                &build(command::UPDATE_PLAYBACK_STREAM_PROPLIST, 25, |writer| {
+                    writer.u32(channel).u32(1).proplist(&[]);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert_eq!(error_code(&mut session), error::INVALID);
+
+        let malformed_name = [Property {
+            key: "media.name".to_string(),
+            value: b"old\0new\0".to_vec(),
+        }];
+        session
+            .feed(
+                &build(command::UPDATE_PLAYBACK_STREAM_PROPLIST, 26, |writer| {
+                    writer.u32(channel).u32(2).proplist(&malformed_name);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert_eq!(error_code(&mut session), error::INVALID);
+    }
+
+    /// Clients may restore gain above 100 percent. td's v1 policy has no
+    /// software gain above unity, so it caps the value instead of refusing an
+    /// otherwise valid stream or control request.
+    #[test]
+    fn volume_above_unity_is_capped_at_the_protocol_edge() {
+        let (mut session, mut mixer) = fixture();
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 1, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            volumes: &[VOLUME_NORM * 2, VOLUME_NORM * 2],
+                            volume_set: true,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert_eq!(commands(&mut session), vec![command::REPLY]);
+        let stream = session.streams.get(&0).unwrap();
+        assert_eq!(stream.volume, VOLUME_NORM);
+        let index = stream.sink_input_index;
+
+        session
+            .feed(
+                &build(command::SET_SINK_INPUT_VOLUME, 2, |writer| {
+                    writer.u32(index).cvolume(&[VOLUME_NORM * 2]);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert_eq!(commands(&mut session), vec![command::REPLY]);
+        assert_eq!(session.streams.get(&0).unwrap().volume, VOLUME_NORM);
+    }
+
+    /// Per-connection channels stop before Pulse's reserved INVALID value and
+    /// never reuse an identity after counter exhaustion.
+    #[test]
+    fn stream_channels_exhaust_before_the_reserved_value() {
+        let (mut session, mut mixer) = fixture();
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        session.next_channel = u64::from(u32::MAX - 1);
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 1, |writer| {
+                    write_create_request(writer, false);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 2, |writer| {
+                    write_create_request(writer, false);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let replies = packets(&mut session);
+        assert_eq!(
+            wire::command_and_tag(replies.first().unwrap()),
+            Ok((command::REPLY, 1))
+        );
+        assert_eq!(
+            wire::command_and_tag(replies.get(1).unwrap()),
+            Ok((command::ERROR, 2))
+        );
+        assert!(!session.streams.contains_key(&tag::INVALID_INDEX));
+    }
+
+    /// TRIGGER releases one sub-threshold run, an empty run re-arms the gate,
+    /// and DRAIN releases it again so the requested drain can finish.
+    #[test]
+    fn prebuffer_trigger_and_drain_control_each_run() {
+        let (mut session, mut mixer) = fixture();
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        session
+            .feed(
+                &build(command::CREATE_PLAYBACK_STREAM, 8, |writer| {
+                    write_create_options(
+                        writer,
+                        &CreateOptions {
+                            prebuf: 8 * 4,
+                            ..CreateOptions::default()
+                        },
+                    );
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        let _ = session.take_output();
+        let mut audio = wire::Descriptor::encode(4 * 4, 0, 0, 0).to_vec();
+        audio.extend_from_slice(&[1u8; 4 * 4]);
+        session.feed(&audio, &mut mixer).unwrap();
+        let mut sink = MemorySink::new(Spec::fixed(), 64, 4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+
+        session
+            .feed(
+                &build(command::TRIGGER_PLAYBACK_STREAM, 9, |writer| {
+                    writer.u32(0);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        let _ = session.take_output();
+        sink.start().unwrap();
+        sink.advance(4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+        session.service(&mut mixer);
+        assert!(packets(&mut session).iter().any(|packet| {
+            wire::command_and_tag(packet).is_ok_and(|pair| pair.0 == command::UNDERFLOW)
+        }));
+
+        // Crossing the accepted endpoint rearms prebuffering without a PREBUF
+        // command. Queue emptiness alone is not an underflow while its frames
+        // remain in the device ring.
+        session.feed(&audio, &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+        session
+            .feed(
+                &build(command::DRAIN_PLAYBACK_STREAM, 10, |writer| {
+                    writer.u32(0);
+                }),
+                &mut mixer,
+            )
+            .unwrap();
+        assert!(
+            commands(&mut session).is_empty(),
+            "the audio is still queued"
+        );
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        sink.start().unwrap();
+        sink.advance(4);
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 0);
+        session.service(&mut mixer);
+        let drain_packets = packets(&mut session);
+        assert!(drain_packets
+            .iter()
+            .any(|packet| { wire::command_and_tag(packet) == Ok((command::REPLY, 10)) }));
+        assert!(!drain_packets.iter().any(|packet| {
+            wire::command_and_tag(packet).is_ok_and(|pair| pair.0 == command::UNDERFLOW)
+        }));
+        assert_eq!(mixer.underflows(session.stream_id(0).unwrap()).unwrap(), 1);
+
+        // The earlier real starvation is still the only underflow. DRAIN's
+        // intentional endpoint did not rearm the eight-frame gate, so another
+        // four-frame tail remains runnable after the acknowledgement.
+        session.feed(&audio, &mut mixer).unwrap();
+        assert_eq!(mixer.pump(&mut sink).unwrap().frames_written, 4);
+        assert_eq!(mixer.underflows(session.stream_id(0).unwrap()).unwrap(), 1);
+        sink.start().unwrap();
+        mixer.note_started();
+        sink.advance(4);
+        mixer.observe_playhead(&mut sink).unwrap();
+        session.service(&mut mixer);
+        assert!(packets(&mut session).iter().any(|packet| {
+            wire::command_and_tag(packet).is_ok_and(|pair| pair.0 == command::UNDERFLOW)
+        }));
+        assert_eq!(mixer.underflows(session.stream_id(0).unwrap()).unwrap(), 2);
+    }
+
+    /// The only supported write position is exactly the current write index.
+    #[test]
+    fn a_nonzero_relative_seek_is_not_appended_at_the_wrong_position() {
+        let (mut session, mut mixer) = fixture();
+        let channel = with_stream(&mut session, &mut mixer, false);
+        let id = session.stream_id(channel).unwrap();
+        let mut audio = wire::Descriptor::encode(4, channel, 4, 0).to_vec();
+        audio.extend_from_slice(&[1, 2, 3, 4]);
+        let error = session.feed(&audio, &mut mixer).unwrap_err();
+        assert_eq!(
+            error,
+            Disconnect::UnsupportedWrite {
+                seek: Seek::Relative,
+                offset: 4
+            }
+        );
+        assert_eq!(mixer.timing(id).unwrap().write_index, 0);
+    }
+
+    /// Socket chunks may split anywhere, but a complete Pulse data frame must
+    /// still end on this sink's interleaved PCM frame boundary.
+    #[test]
+    fn a_partial_pcm_frame_is_refused_instead_of_dropped_as_overflow() {
+        let (mut session, mut mixer) = fixture();
+        let channel = with_stream(&mut session, &mut mixer, false);
+        let id = session.stream_id(channel).unwrap();
+        let mut audio = wire::Descriptor::encode(3, channel, 0, 0).to_vec();
+        audio.extend_from_slice(&[1, 2, 3]);
+        let error = session.feed(&audio, &mut mixer).unwrap_err();
+        assert_eq!(
+            error,
+            Disconnect::PcmAlignment {
+                bytes: 3,
+                frame_bytes: 4,
+            }
+        );
+        assert_eq!(mixer.timing(id).unwrap().write_index, 0);
+        assert!(commands(&mut session).is_empty(), "not a queue overflow");
     }
 
     /// A command with the right shape but no handler is answered
@@ -2634,7 +4371,11 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
         let replies = packets(&mut session);
         let mut reader = tag::Reader::new(replies.first().unwrap());
         assert_eq!(reader.u32().unwrap(), command::ERROR);
-        assert_eq!(reader.u32().unwrap(), 70, "answered on the client's own tag");
+        assert_eq!(
+            reader.u32().unwrap(),
+            70,
+            "answered on the client's own tag"
+        );
         assert_eq!(reader.u32().unwrap(), error::NOTIMPLEMENTED);
         reader.finish().unwrap();
     }
@@ -2674,7 +4415,10 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
                 &mut mixer,
             )
             .unwrap_err();
-        assert!(matches!(error, Disconnect::Schema(tag::Error::Trailing { .. })));
+        assert!(matches!(
+            error,
+            Disconnect::Schema(tag::Error::Trailing { .. })
+        ));
     }
 
     /// A framing refusal reaches the caller as a disconnect, with the framing
@@ -2748,9 +4492,47 @@ f53729572f29b951922476138e139f679b8032523865ed4192343b4402926780fab24837";
             .collect();
         assert_eq!(kinds.iter().filter(|c| **c == command::REPLY).count(), 7);
         assert_eq!(
-            kinds.iter().filter(|c| **c == command::SUBSCRIBE_EVENT).count(),
+            kinds
+                .iter()
+                .filter(|c| **c == command::SUBSCRIBE_EVENT)
+                .count(),
             1
         );
         assert_eq!(bulk.stream_count(), drip.stream_count());
+    }
+
+    /// One socket read can contain thousands of tiny commands. The daemon
+    /// consumes only its per-pass budget and retains complete framed input for
+    /// later passes, so control floods cannot monopolize the device thread.
+    #[test]
+    fn complete_input_frames_are_processed_in_bounded_batches() {
+        let (mut session, mut mixer) = fixture();
+        session.feed(&auth_packet(35), &mut mixer).unwrap();
+        let _ = session.take_output();
+        let mut questions = Vec::new();
+        for tag_number in 0..20 {
+            questions.extend(build(command::GET_SERVER_INFO, tag_number, |_| {}));
+        }
+
+        assert_eq!(session.feed_limited(&questions, &mut mixer, 7).unwrap(), 7);
+        assert!(session.input_deferred());
+        assert_eq!(session.feed_limited(&[], &mut mixer, 7).unwrap(), 7);
+        assert!(session.input_deferred());
+        assert_eq!(session.feed_limited(&[], &mut mixer, 7).unwrap(), 6);
+        assert!(!session.input_deferred());
+        assert_eq!(packets(&mut session).len(), 20);
+    }
+
+    /// Output admission happens before allocation. A fan-out or query flood
+    /// can mark this peer for disconnection, but cannot first grow its session
+    /// buffer beyond the advertised ceiling.
+    #[test]
+    fn session_output_refuses_growth_at_the_exact_ceiling() {
+        let mut session = Session::new(Spec::fixed(), 0);
+        session.out = vec![0; MAX_OUTPUT_BYTES - 1];
+        let before = session.out.len();
+        session.reply(1, |_| {});
+        assert_eq!(session.out.len(), before);
+        assert!(session.output_overflowed());
     }
 }

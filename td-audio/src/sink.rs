@@ -113,7 +113,8 @@ pub trait AudioSink {
     /// The ring's total size in frames, which is the most that can be in flight.
     fn buffer_frames(&self) -> u64;
 
-    /// The transfer granularity in frames.
+    /// The largest transfer the mixer prepares in one pass, in frames.
+    /// Short real tails remain short rather than being padded to this size.
     fn period_frames(&self) -> u64;
 
     /// The descriptor to poll for writability, if this sink has one.
@@ -265,6 +266,12 @@ impl AudioSink for MemorySink {
     }
 
     fn device_delay(&mut self) -> io::Result<u64> {
+        if self.gone {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "device unplugged",
+            ));
+        }
         if let Some(error) = self.delay_error {
             return Err(io::Error::from_raw_os_error(error));
         }
@@ -287,7 +294,10 @@ impl AudioSink for MemorySink {
 
     fn write(&mut self, pcm: &[u8]) -> io::Result<usize> {
         if self.gone {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "device unplugged"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "device unplugged",
+            ));
         }
         if self.underran {
             return Err(io::Error::from_raw_os_error(crate::sys::EPIPE));
@@ -299,7 +309,8 @@ impl AudioSink for MemorySink {
             .min(usize::try_from(room).unwrap_or(usize::MAX))
             .min(self.write_limit.unwrap_or(usize::MAX));
         let taken = accepted.saturating_mul(frame_bytes);
-        self.played.extend_from_slice(pcm.get(..taken).unwrap_or(pcm));
+        self.played
+            .extend_from_slice(pcm.get(..taken).unwrap_or(pcm));
         self.queued = self.queued.saturating_add(accepted as u64);
         Ok(accepted)
     }
@@ -352,7 +363,11 @@ mod tests {
         assert_eq!(spec.frames_to_usec(24000), 500_000);
         assert_eq!(spec.usec_to_frames(1_000_000), 48000);
         // A zero rate cannot divide, and answering 0 is better than dividing.
-        let broken = Spec { rate: 0, channels: 2, frame_bytes: 4 };
+        let broken = Spec {
+            rate: 0,
+            channels: 2,
+            frame_bytes: 4,
+        };
         assert_eq!(broken.frames_to_usec(48000), 0);
     }
 
@@ -416,6 +431,7 @@ mod tests {
         let mut sink = MemorySink::fixed();
         sink.unplug();
         assert_eq!(sink.wait(0).unwrap(), Wait::Gone);
+        assert!(sink.device_delay().is_err());
         assert!(sink.write(&[0u8; FRAME_BYTES]).is_err());
     }
 }

@@ -93,9 +93,17 @@ pub enum Error {
     /// The packet ended in the middle of a value.
     Truncated { at: usize, wanted: &'static str },
     /// A value was there, but not the one the schema asked for.
-    Unexpected { at: usize, wanted: &'static str, found: u8 },
+    Unexpected {
+        at: usize,
+        wanted: &'static str,
+        found: u8,
+    },
     /// A length in the packet exceeds what this decoder will allocate.
-    TooLarge { at: usize, what: &'static str, len: usize },
+    TooLarge {
+        at: usize,
+        what: &'static str,
+        len: usize,
+    },
     /// A string was not valid UTF-8, or ran past the end without a NUL.
     BadString { at: usize },
     /// The schema was satisfied but bytes remained.
@@ -114,7 +122,10 @@ impl fmt::Display for Error {
                 *found as char
             ),
             Error::TooLarge { at, what, len } => {
-                write!(f, "{what} at {at} declares {len} bytes, which is over the bound")
+                write!(
+                    f,
+                    "{what} at {at} declares {len} bytes, which is over the bound"
+                )
             }
             Error::BadString { at } => write!(f, "unterminated or non-UTF-8 string at {at}"),
             Error::Trailing { at, left } => write!(
@@ -180,10 +191,10 @@ impl<'a> Reader<'a> {
     }
 
     fn peek(&self, wanted: &'static str) -> Result<u8> {
-        self.bytes
-            .get(self.at)
-            .copied()
-            .ok_or(Error::Truncated { at: self.at, wanted })
+        self.bytes.get(self.at).copied().ok_or(Error::Truncated {
+            at: self.at,
+            wanted,
+        })
     }
 
     fn take_tag(&mut self, tag: u8, wanted: &'static str) -> Result<()> {
@@ -201,23 +212,29 @@ impl<'a> Reader<'a> {
 
     fn take(&mut self, len: usize, wanted: &'static str) -> Result<&'a [u8]> {
         let end = self.at.saturating_add(len);
-        let slice = self
-            .bytes
-            .get(self.at..end)
-            .ok_or(Error::Truncated { at: self.at, wanted })?;
+        let slice = self.bytes.get(self.at..end).ok_or(Error::Truncated {
+            at: self.at,
+            wanted,
+        })?;
         self.at = end;
         Ok(slice)
     }
 
     fn be_u32(&mut self, wanted: &'static str) -> Result<u32> {
         let bytes = self.take(4, wanted)?;
-        let array: [u8; 4] = bytes.try_into().map_err(|_| Error::Truncated { at: self.at, wanted })?;
+        let array: [u8; 4] = bytes.try_into().map_err(|_| Error::Truncated {
+            at: self.at,
+            wanted,
+        })?;
         Ok(u32::from_be_bytes(array))
     }
 
     fn be_u64(&mut self, wanted: &'static str) -> Result<u64> {
         let bytes = self.take(8, wanted)?;
-        let array: [u8; 8] = bytes.try_into().map_err(|_| Error::Truncated { at: self.at, wanted })?;
+        let array: [u8; 8] = bytes.try_into().map_err(|_| Error::Truncated {
+            at: self.at,
+            wanted,
+        })?;
         Ok(u64::from_be_bytes(array))
     }
 
@@ -229,7 +246,10 @@ impl<'a> Reader<'a> {
     pub fn u8(&mut self) -> Result<u8> {
         self.take_tag(TAG_U8, "u8")?;
         let byte = self.take(1, "u8")?;
-        byte.first().copied().ok_or(Error::Truncated { at: self.at, wanted: "u8" })
+        byte.first().copied().ok_or(Error::Truncated {
+            at: self.at,
+            wanted: "u8",
+        })
     }
 
     /// Reply-side value. This server WRITES these and never reads one, so the
@@ -366,12 +386,7 @@ impl<'a> Reader<'a> {
     pub fn channel_map(&mut self) -> Result<Vec<u8>> {
         self.take_tag(TAG_CHANNEL_MAP, "channel map")?;
         let at = self.at;
-        let count = usize::from(
-            self.take(1, "channel map")?
-                .first()
-                .copied()
-                .unwrap_or(0),
-        );
+        let count = usize::from(self.take(1, "channel map")?.first().copied().unwrap_or(0));
         if count > CHANNELS_MAX {
             return Err(Error::TooLarge {
                 at,
@@ -462,9 +477,10 @@ impl<'a> Reader<'a> {
     pub fn skip(&mut self) -> Result<()> {
         let tag = self.peek("a value")?;
         match tag {
-            TAG_U32 | TAG_VOLUME => {
-                self.u32().map(|_| ()).or_else(|_| self.volume().map(|_| ()))
-            }
+            TAG_U32 | TAG_VOLUME => self
+                .u32()
+                .map(|_| ())
+                .or_else(|_| self.volume().map(|_| ())),
             TAG_U8 => self.u8().map(|_| ()),
             TAG_U64 => self.u64().map(|_| ()),
             TAG_S64 => self.s64().map(|_| ()),
@@ -765,11 +781,19 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
         assert_eq!(reader.u32().unwrap(), 2, "tag");
         assert_eq!(
             reader.sample_spec().unwrap(),
-            SampleSpec { format: SAMPLE_S16LE, channels: 2, rate: 48000 }
+            SampleSpec {
+                format: SAMPLE_S16LE,
+                channels: 2,
+                rate: 48000
+            }
         );
         assert_eq!(reader.channel_map().unwrap(), vec![1, 2]);
         assert_eq!(reader.u32().unwrap(), INVALID_INDEX, "sink index");
-        assert_eq!(reader.string().unwrap(), None, "sink name is the NULL string");
+        assert_eq!(
+            reader.string().unwrap(),
+            None,
+            "sink name is the NULL string"
+        );
         assert_eq!(reader.u32().unwrap(), u32::MAX, "maxlength");
         assert!(!reader.boolean().unwrap(), "corked");
         assert_eq!(reader.u32().unwrap(), u32::MAX, "tlength");
@@ -779,13 +803,19 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
         assert_eq!(reader.cvolume().unwrap(), vec![0x10000, 0x10000]);
         // Nine booleans between the volume and the proplist.
         for index in 0..9 {
-            assert!(!reader.boolean().unwrap(), "boolean {index} before the proplist");
+            assert!(
+                !reader.boolean().unwrap(),
+                "boolean {index} before the proplist"
+            );
         }
         let properties = reader.proplist().unwrap();
         assert!(properties.iter().any(|p| p.key == "media.name"));
         // Seven more after it.
         for index in 0..7 {
-            assert!(!reader.boolean().unwrap(), "boolean {index} after the proplist");
+            assert!(
+                !reader.boolean().unwrap(),
+                "boolean {index} after the proplist"
+            );
         }
         assert_eq!(reader.u8().unwrap(), 0, "n_formats");
         reader.finish().unwrap();
@@ -798,10 +828,25 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
         for (name, hex, command, extra) in [
             ("GET_SERVER_INFO", captured::GET_SERVER_INFO, 20u32, 0usize),
             ("GET_SINK_INFO_LIST", captured::GET_SINK_INFO_LIST, 22, 0),
-            ("GET_SOURCE_INFO_LIST", captured::GET_SOURCE_INFO_LIST, 24, 0),
+            (
+                "GET_SOURCE_INFO_LIST",
+                captured::GET_SOURCE_INFO_LIST,
+                24,
+                0,
+            ),
             ("SUBSCRIBE", captured::SUBSCRIBE, 35, 1),
-            ("DRAIN_PLAYBACK_STREAM", captured::DRAIN_PLAYBACK_STREAM, 12, 1),
-            ("DELETE_PLAYBACK_STREAM", captured::DELETE_PLAYBACK_STREAM, 4, 1),
+            (
+                "DRAIN_PLAYBACK_STREAM",
+                captured::DRAIN_PLAYBACK_STREAM,
+                12,
+                1,
+            ),
+            (
+                "DELETE_PLAYBACK_STREAM",
+                captured::DELETE_PLAYBACK_STREAM,
+                4,
+                1,
+            ),
         ] {
             let bytes = unhex(hex);
             let mut reader = Reader::new(&bytes);
@@ -850,7 +895,11 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
             .null_string()
             .string("")
             .arbitrary(&[1, 2, 3])
-            .sample_spec(SampleSpec { format: SAMPLE_S16LE, channels: 2, rate: 48000 })
+            .sample_spec(SampleSpec {
+                format: SAMPLE_S16LE,
+                channels: 2,
+                rate: 48000,
+            })
             .channel_map(&[1, 2])
             .cvolume(&[0x10000, 0x8000])
             .proplist(&[text_property("k", "v")])
@@ -902,7 +951,10 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
         let bytes = writer.into_bytes();
         let mut reader = Reader::new(&bytes);
         let err = reader.boolean().unwrap_err();
-        assert!(matches!(err, Error::Unexpected { found: b'B', .. }), "{err:?}");
+        assert!(
+            matches!(err, Error::Unexpected { found: b'B', .. }),
+            "{err:?}"
+        );
 
         let mut writer = Writer::new();
         writer.cvolume(&[0x10000]);
@@ -939,7 +991,9 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
             ("a proplist with no terminator", vec![b'P', b't', b'k', 0]),
             (
                 "a proplist value that lies about its length",
-                vec![b'P', b't', b'k', 0, b'L', 0, 0, 0, 9, b'x', 0, 0, 0, 1, 7, b'N'],
+                vec![
+                    b'P', b't', b'k', 0, b'L', 0, 0, 0, 9, b'x', 0, 0, 0, 1, 7, b'N',
+                ],
             ),
             ("a format info with no proplist", vec![b'f', b'B', 1]),
         ];
@@ -947,9 +1001,7 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
             let mut reader = Reader::new(&bytes);
             // Whatever the schema tried first, the walk must end in an error and
             // never in a panic or a loop.
-            let outcome = reader
-                .skip()
-                .and_then(|()| reader.finish());
+            let outcome = reader.skip().and_then(|()| reader.finish());
             assert!(outcome.is_err(), "{name} was accepted: {bytes:?}");
         }
     }
@@ -964,7 +1016,10 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
         let mut reader = Reader::new(&over);
         assert!(matches!(
             reader.arbitrary().unwrap_err(),
-            Error::TooLarge { what: "an arbitrary block", .. }
+            Error::TooLarge {
+                what: "an arbitrary block",
+                ..
+            }
         ));
 
         // A proplist of many tiny entries: each value is inside its own bound,
@@ -978,16 +1033,16 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
         let mut reader = Reader::new(&bytes);
         assert!(matches!(
             reader.proplist().unwrap_err(),
-            Error::TooLarge { what: "a proplist", .. }
+            Error::TooLarge {
+                what: "a proplist",
+                ..
+            }
         ));
         // ...and exactly at the bound it is still accepted.
         let mut writer = Writer::new();
         writer.proplist(many.get(..PROPLIST_MAX).unwrap_or(&[]));
         let bytes = writer.into_bytes();
-        assert_eq!(
-            Reader::new(&bytes).proplist().unwrap().len(),
-            PROPLIST_MAX
-        );
+        assert_eq!(Reader::new(&bytes).proplist().unwrap().len(), PROPLIST_MAX);
     }
 
     /// A string longer than the bound is refused rather than allocated.
@@ -999,7 +1054,10 @@ ffffff4cffffffff4c000000007602000100000001000030303030303030303050746d656469612e
         let mut reader = Reader::new(&bytes);
         assert!(matches!(
             reader.string().unwrap_err(),
-            Error::TooLarge { what: "a string", .. }
+            Error::TooLarge {
+                what: "a string",
+                ..
+            }
         ));
     }
 

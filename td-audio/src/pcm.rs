@@ -177,7 +177,11 @@ impl Range {
         if self.empty {
             return None;
         }
-        let min = if self.openmin { self.min.checked_add(1)? } else { self.min };
+        let min = if self.openmin {
+            self.min.checked_add(1)?
+        } else {
+            self.min
+        };
         let max = self.highest()?;
         if min > max {
             None
@@ -207,7 +211,9 @@ fn short(what: &str) -> io::Error {
 }
 
 fn get_u32(bytes: &[u8], at: usize) -> io::Result<u32> {
-    let slice = bytes.get(at..at.saturating_add(4)).ok_or_else(|| short("a word"))?;
+    let slice = bytes
+        .get(at..at.saturating_add(4))
+        .ok_or_else(|| short("a word"))?;
     let array: [u8; 4] = slice.try_into().map_err(|_| short("a word"))?;
     Ok(u32::from_ne_bytes(array))
 }
@@ -221,7 +227,9 @@ fn put_u32(bytes: &mut [u8], at: usize, value: u32) -> io::Result<()> {
 }
 
 fn get_u64(bytes: &[u8], at: usize) -> io::Result<u64> {
-    let slice = bytes.get(at..at.saturating_add(8)).ok_or_else(|| short("a long"))?;
+    let slice = bytes
+        .get(at..at.saturating_add(8))
+        .ok_or_else(|| short("a long"))?;
     let array: [u8; 8] = slice.try_into().map_err(|_| short("a long"))?;
     Ok(u64::from_ne_bytes(array))
 }
@@ -286,7 +294,10 @@ impl HwParamsExt for HwParams {
             .ok()
             .filter(|word| *word < MASK_WORDS)
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "mask value is outside SNDRV_MASK_MAX")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mask value is outside SNDRV_MASK_MAX",
+                )
             })?;
         for w in 0..MASK_WORDS {
             put_u32(&mut self.0, mask.offset() + w * 4, 0)?;
@@ -589,7 +600,9 @@ mod tests {
     fn a_narrowed_mask_reads_back_as_the_one_value() {
         let mut params = HwParams::zeroed();
         params.set_any().unwrap();
-        params.set_mask(Mask::Access, ACCESS_RW_INTERLEAVED).unwrap();
+        params
+            .set_mask(Mask::Access, ACCESS_RW_INTERLEAVED)
+            .unwrap();
         params.set_mask(Mask::Format, FORMAT_S16_LE).unwrap();
         assert_eq!(params.mask_exact(Mask::Access).unwrap(), Some(3));
         assert_eq!(params.mask_exact(Mask::Format).unwrap(), Some(2));
@@ -599,7 +612,10 @@ mod tests {
         params.set_mask(Mask::Format, 40).unwrap();
         assert_eq!(params.mask_exact(Mask::Format).unwrap(), Some(40));
         assert_eq!(get_u32(&params.0, Mask::Format.offset()).unwrap(), 0);
-        assert_eq!(get_u32(&params.0, Mask::Format.offset() + 4).unwrap(), 1 << 8);
+        assert_eq!(
+            get_u32(&params.0, Mask::Format.offset() + 4).unwrap(),
+            1 << 8
+        );
         // Out of range is refused rather than silently aliased into word 0.
         assert!(params.set_mask(Mask::Format, 256).is_err());
     }
@@ -620,18 +636,46 @@ mod tests {
 
     #[test]
     fn an_open_or_empty_range_has_no_exact_value() {
-        let open = Range { min: 4, max: 4, openmin: true, openmax: false, integer: true, empty: false };
+        let open = Range {
+            min: 4,
+            max: 4,
+            openmin: true,
+            openmax: false,
+            integer: true,
+            empty: false,
+        };
         assert_eq!(open.exact(), None);
-        let empty = Range { min: 1, max: 9, openmin: false, openmax: false, integer: true, empty: true };
+        let empty = Range {
+            min: 1,
+            max: 9,
+            openmin: false,
+            openmax: false,
+            integer: true,
+            empty: true,
+        };
         assert_eq!(empty.exact(), None);
         assert_eq!(empty.lowest(), None);
         assert_eq!(empty.highest(), None);
-        let half = Range { min: 4, max: 16, openmin: true, openmax: true, integer: true, empty: false };
+        let half = Range {
+            min: 4,
+            max: 16,
+            openmin: true,
+            openmax: true,
+            integer: true,
+            empty: false,
+        };
         assert_eq!(half.lowest(), Some(5));
         assert_eq!(half.highest(), Some(15));
         // An open bound that empties the range answers None rather than
         // inverting: `(4, 5)` admits nothing.
-        let none = Range { min: 4, max: 5, openmin: true, openmax: true, integer: true, empty: false };
+        let none = Range {
+            min: 4,
+            max: 5,
+            openmin: true,
+            openmax: true,
+            integer: true,
+            empty: false,
+        };
         assert_eq!(none.lowest(), None);
     }
 
@@ -642,7 +686,10 @@ mod tests {
         for buffer in [1024u64, 4096, 48000, 65536] {
             let expected = {
                 let mut b = buffer;
-                while b.checked_mul(2).is_some_and(|d| d <= i64::MAX as u64 - buffer) {
+                while b
+                    .checked_mul(2)
+                    .is_some_and(|d| d <= i64::MAX as u64 - buffer)
+                {
                     b *= 2;
                 }
                 b

@@ -592,9 +592,12 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// Raised again when Git added a ninth, process-heavy health block. The initial
 /// profiler evidence is serialized ahead of that workload so its bounded capture
 /// stays deterministic. The host must outlast the serial identity/root checks, the
-/// slower of that 315-second service and the 700-second network service, then the
+/// slower of that 915-second service and the 700-second network service, then the
 /// clamped 760-second health loop and the diagnostic margin. The tenth Codex block
-/// restores the former 70-second host margin at the value below.
+/// restored the former 70-second host margin at that revision. Even after the
+/// profiler predecessor grew from 315 to 915 seconds, this path totals 2155 seconds
+/// and retains 590 seconds below the value here; the longer Firefox path below still
+/// governs the final host ceiling.
 ///
 /// The Firefox download proof adds a 40-second one-shot browser boundary and a
 /// separate 20-second asynchronous file-observation window. The real Firefox

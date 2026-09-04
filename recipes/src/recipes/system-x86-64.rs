@@ -197,8 +197,12 @@ const AUDIO_UID: u32 = td_engine::permissions::TD_AUDIO_UID;
 const AUDIO_GID: u32 = td_engine::permissions::TD_AUDIO_GID;
 pub(super) const AUDIO_RUNTIME: &str = td_engine::permissions::TD_AUDIO_RUNTIME_PATH;
 const PROFILER_CAPTURE_SECS: u16 = 60;
+// A failed profiler must not hold an ordinary boot's greeter for 15 minutes.
+// Only the exact attribution token selects the longer TCG report allowance.
 const PROFILER_EVIDENCE_TIMEOUT_SECS: u16 = 300;
-const PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS: u16 = 315;
+const PROFILER_ATTRIBUTION_EVIDENCE_TIMEOUT_SECS: u16 =
+    crate::td_profiler_contract::MAX_EVIDENCE_WAIT_SECS;
+const PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS: u16 = 915;
 const FIREFOX_NAME: &str = "firefox";
 const FIREFOX_APP_ID: &str = "org.mozilla.firefox";
 const SESSION_BUS_SOCKET: &str = "/run/user/1000/bus";
@@ -1228,11 +1232,12 @@ fn build_td_svc_conf() -> String {
          \n\
          # A trusted one-shot prints the shared boot marker only after one current-boot\n\
          # capture has nonzero samples, complete reports, and no loss/corruption. On\n\
-         # the exact QEMU autotest token it also supplies a deterministic CPU workload\n\
-         # and requires the persisted line report to attribute that named function.\n\
+         # the exact QEMU autotest token it also selects the longer attribution wait,\n\
+         # supplies a deterministic CPU workload and requires the persisted line report\n\
+         # to attribute that named function. Ordinary boots retain the 300-second wait.\n\
          [profiler-evidence]\n\
          type=oneshot\n\
-         exec=/bin/td-profiler evidence {profiler_capture_root} --timeout-secs {profiler_evidence_timeout_secs} --uid {profiler_uid} --gid {profiler_read_gid} --attribution-cmdline-token {profiler_attribution_cmdline_token}\n\
+         exec=/bin/td-profiler evidence {profiler_capture_root} --timeout-secs {profiler_evidence_timeout_secs} --attribution-timeout-secs {profiler_attribution_evidence_timeout_secs} --uid {profiler_uid} --gid {profiler_read_gid} --attribution-cmdline-token {profiler_attribution_cmdline_token}\n\
          after=profiler\n\
          requires=profiler\n\
          timeout={profiler_evidence_service_timeout_secs}\n\
@@ -1535,6 +1540,8 @@ fn build_td_svc_conf() -> String {
         profiler_capture_secs = PROFILER_CAPTURE_SECS,
         profiler_capture_root = PROFILER_CAPTURE_ROOT,
         profiler_evidence_timeout_secs = PROFILER_EVIDENCE_TIMEOUT_SECS,
+        profiler_attribution_evidence_timeout_secs =
+            PROFILER_ATTRIBUTION_EVIDENCE_TIMEOUT_SECS,
         profiler_evidence_service_timeout_secs = PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
         profiler_attribution_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
         autotest_cmdline_token = AUTOTEST_CMDLINE_TOKEN,
@@ -4860,6 +4867,7 @@ mod tests {
         let evidence = unit_key("profiler-evidence", "exec").unwrap_or_default();
         for required in [
             "--timeout-secs 300",
+            "--attribution-timeout-secs 900",
             "--uid 997",
             "--gid 996",
             "--attribution-cmdline-token td.autotest=1",
@@ -4872,8 +4880,17 @@ mod tests {
         );
         assert_eq!(
             PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS,
-            PROFILER_EVIDENCE_TIMEOUT_SECS + 15,
+            PROFILER_ATTRIBUTION_EVIDENCE_TIMEOUT_SECS + 15,
             "td-svc must not terminate the evidence process before its bounded wait ends"
+        );
+        assert_eq!(
+            PROFILER_ATTRIBUTION_EVIDENCE_TIMEOUT_SECS,
+            crate::td_profiler_contract::MAX_EVIDENCE_WAIT_SECS,
+            "the generated wait must use td-profiler's accepted compiled ceiling"
+        );
+        assert!(
+            u64::from(PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS) <= 3600,
+            "the evidence backstop must remain within td-svc's duration ceiling"
         );
         assert!(
             unit_after("bootsuccess").contains(&"profiler-evidence".to_string()),
