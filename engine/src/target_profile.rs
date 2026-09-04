@@ -63,7 +63,7 @@ pub fn direct_rustc_args(build_root: &str, source_root: &str) -> [String; 6] {
 /// preserve an x86-64 frame chain. Compiler-generated functions around them
 /// still use the global policy; samples entering one of these ranges are an
 /// explicit coverage boundary rather than silently trusted unwinds.
-pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 6] = [
+pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 8] = [
     (
         "codex",
         "aws-lc-sys 0.39.0, ring 0.17.14, and zstd-sys 2.0.16+zstd.1.5.7 x86_64 assembly",
@@ -82,13 +82,17 @@ pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 6] = [
         "rust-toolchain",
         "upstream LLVM and Rust compiler-runtime assembly",
     ),
+    // The two terminal applications link rustls through `ring`, whose
+    // pregenerated x86_64 assembly is compiled by its build script.
+    ("tmc", "ring 0.17.14 x86_64 assembly"),
+    ("tn", "ring 0.17.14 x86_64 assembly"),
 ];
 
 /// Recipes whose linked outputs include the Rust runtime boundary. The glibc
 /// and libgcc boundaries apply to every output passed to the target splitter;
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
 /// recipes by the catalog tests.
-pub const RUST_PROFILED_RECIPES: [&str; 23] = [
+pub const RUST_PROFILED_RECIPES: [&str; 25] = [
     "codex",
     "fd",
     "ripgrep",
@@ -111,6 +115,8 @@ pub const RUST_PROFILED_RECIPES: [&str; 23] = [
     "td-svc",
     "td-txt",
     "td-util",
+    "tmc",
+    "tn",
     "uutils",
 ];
 
@@ -129,7 +135,8 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                 || (*source == "gcc-x86-64-self"
                     && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self"))
                 || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
-                || (*source == "codex" && recipe == "codex")
+                // A package's own crate assembly reaches that package alone.
+                || (*source == recipe && matches!(recipe, "codex" | "tmc" | "tn"))
         })
         .collect()
 }
@@ -323,6 +330,8 @@ mod tests {
                     "rust-toolchain",
                     "upstream LLVM and Rust compiler-runtime assembly"
                 ),
+                ("tmc", "ring 0.17.14 x86_64 assembly"),
+                ("tn", "ring 0.17.14 x86_64 assembly"),
             ]
         );
         assert_eq!(TOOLCHAIN_DEBUG_CEILING_BYTES, 4_294_967_296);
@@ -353,6 +362,26 @@ mod tests {
                 ),
             ]
         );
+        // The terminal applications carry ring's assembly and nothing else's:
+        // their own entry, after the boundaries every Rust output has.
+        for application in ["tmc", "tn"] {
+            assert_eq!(
+                output_assembly_exceptions(application),
+                vec![
+                    ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
+                    ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+                    (
+                        "rust-toolchain",
+                        "upstream LLVM and Rust compiler-runtime assembly"
+                    ),
+                    (application, "ring 0.17.14 x86_64 assembly"),
+                ],
+                "{application}"
+            );
+        }
+        assert!(!output_assembly_exceptions("ripgrep")
+            .iter()
+            .any(|(source, _)| matches!(*source, "tmc" | "tn" | "codex")));
         assert_eq!(
             output_assembly_exceptions("glibc-x86-64"),
             vec![

@@ -2233,25 +2233,62 @@ pub fn run_rust() -> Result<(), String> {
     run_cmd(&chmod, &["-R", "u+w", build_dir], ".", &path_env, &WATCH_PHASE)?;
 
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
+    // TD_RUST_STATIC=1 ⇒ the named binaries link as static position-independent
+    // executables (`+crt-static` under the default `pic` relocation model): no
+    // PT_INTERP, no DT_NEEDED, no run-path, and ET_DYN so the kernel still
+    // randomizes the image base, which is the shape an application package's
+    // static validator later admits. The install loop asserts that shape so a
+    // link that silently fell back to dynamic, or to a fixed address, cannot
+    // ship. The flag is exact: `staticLink: true` reaches the derivation as `1`
+    // and nothing else, so any other spelling is a wrong derivation, not a
+    // dynamic one.
+    let static_link = match env::var("TD_RUST_STATIC") {
+        Ok(value) if value == "1" => true,
+        Ok(value) => {
+            return Err(format!(
+                "TD_RUST_STATIC must be `1' or unset, not `{value}'"
+            ))
+        }
+        Err(env::VarError::NotPresent) => false,
+        Err(e) => return Err(format!("TD_RUST_STATIC: {e}")),
+    };
+    // The native /td/store toolchain, when the caller links against it: the
+    // dynamic linker a dynamic output bakes, and the `-B` roots through which
+    // the native gcc finds glibc's crt objects and libraries. A static link
+    // reaches libc.a and the static-PIE start file through nothing else, so it
+    // requires them up front rather than failing inside the first crate link.
+    let store_interp = env::var("TD_RUST_STORE_INTERP")
+        .ok()
+        .filter(|interp| !interp.is_empty());
+    let store_bdirs: Vec<String> = env::var("TD_RUST_STORE_BDIR")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if static_link && (store_interp.is_none() || store_bdirs.is_empty()) {
+        return Err("a static Rust link needs the native /td/store toolchain, \
+                    but TD_RUST_STORE_INTERP or TD_RUST_STORE_BDIR is unset"
+            .into());
+    }
     if rust_workspace_needs_native_host_linker(
         &recipe_name,
         cargo_subdir.as_deref(),
         cargo_package.as_deref(),
+        static_link,
     ) {
-        if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
-            if !interp.is_empty() {
-                let shell = find_in_path(&path, "sh")
-                    .ok_or("sh not found in TD_INPUTS (native Rust host-link wrapper)")?;
-                path = install_native_rust_host_linker(
-                    &cwd,
-                    &shell,
-                    &gcc,
-                    &interp,
-                    &env::var("TD_RUST_STORE_RPATH").unwrap_or_default(),
-                    &env::var("TD_RUST_STORE_BDIR").unwrap_or_default(),
-                    &path,
-                )?;
-            }
+        if let Some(interp) = store_interp.as_deref() {
+            let shell = find_in_path(&path, "sh")
+                .ok_or("sh not found in TD_INPUTS (native Rust host-link wrapper)")?;
+            path = install_native_rust_host_linker(
+                &cwd,
+                &shell,
+                &gcc,
+                interp,
+                &env::var("TD_RUST_STORE_RPATH").unwrap_or_default(),
+                &store_bdirs.join(":"),
+                &path,
+            )?;
         }
     }
     let build_abs = cwd.join(build_dir);
@@ -2295,19 +2332,88 @@ pub fn run_rust() -> Result<(), String> {
     // linker = the /td/store ld, a RUNPATH per TD_RUST_STORE_RPATH dir so the produced binary resolves
     // its libs (glibc, libgcc_s, libz) from /td/store at run time, and -B per TD_RUST_STORE_BDIR so the
     // native gcc finds the glibc crt/lib at link time. Unset ⇒ the guix ld-wrapper path, unchanged.
-    if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
-        if !interp.is_empty() {
+    // A static link pulls libc.a through the same -B roots and bakes neither an
+    // interpreter nor a run-path: there is nothing to resolve at run time.
+    // `+crt-static` under the target's default `pic` relocation model is
+    // rustc's static-PIE link: gcc receives `-static-pie`, starts the image
+    // from glibc's `rcrt1.o`, and the output is ET_DYN with no interpreter, so
+    // the kernel randomizes its base as it does a dynamic executable's. Both
+    // applications parse what the network sends them, which is where a fixed
+    // text address would cost the most. The pinned `--target` below keeps
+    // these flags off proc macros and build scripts, which Cargo compiles for
+    // its host side and which cannot be static.
+    if static_link {
+        rustflags.push_str(" -Ctarget-feature=+crt-static");
+    }
+    if let Some(interp) = store_interp.as_deref() {
+        if !static_link {
             rustflags.push_str(&format!(" -Clink-arg=-Wl,--dynamic-linker,{interp}"));
-            // The source-built native GCC is static, and td-native Rust outputs
-            // must not acquire an undeclared shared libgcc runtime edge.
-            rustflags.push_str(" -Clink-arg=-static-libgcc");
+        }
+        // The source-built native GCC is static, and td-native Rust outputs
+        // must not acquire an undeclared shared libgcc runtime edge.
+        rustflags.push_str(" -Clink-arg=-static-libgcc");
+        if !static_link {
             for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
                 rustflags.push_str(&format!(" -Clink-arg=-Wl,-rpath,{rp}"));
             }
-            for b in env::var("TD_RUST_STORE_BDIR").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
-                rustflags.push_str(&format!(" -Clink-arg=-B{b}"));
-            }
         }
+        for b in &store_bdirs {
+            rustflags.push_str(&format!(" -Clink-arg=-B{b}"));
+        }
+    }
+    // The self toolchain folds the unwinder into libgcc.a while rustc's
+    // crt-static link still names libgcc_eh, which td-boot's and td-profiler's
+    // direct rustc links answer with the same alias. It is manufactured in the
+    // build scratch from the linker's own libgcc.a and is never installed.
+    if static_link {
+        let ranlib = find_in_path(&path, "ranlib")
+            .ok_or("ranlib not found in TD_INPUTS (a static Rust link needs libgcc_eh.a)")?;
+        // The probe sees the same `-B` roots as the link, so it names the
+        // archive `-lgcc` itself resolves to rather than one the driver would
+        // pick on a different search path.
+        let mut probe = Command::new(&gcc);
+        probe.arg("-print-libgcc-file-name");
+        for b in &store_bdirs {
+            probe.arg(format!("-B{b}"));
+        }
+        let probe = probe
+            .env_clear()
+            .envs(path_env.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .output()
+            .map_err(|e| format!("{gcc} -print-libgcc-file-name: {e}"))?;
+        if !probe.status.success() {
+            return Err(format!(
+                "{gcc} -print-libgcc-file-name failed: {}",
+                probe.status
+            ));
+        }
+        let libgcc = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+        // The alias is link input for every static output, so the archive it
+        // is made from must lie under a declared input, not wherever the driver
+        // happened to print.
+        if !inputs
+            .split(':')
+            .filter(|input| !input.is_empty())
+            .any(|input| Path::new(&libgcc).starts_with(input))
+        {
+            return Err(format!(
+                "static Rust link: {gcc} names a libgcc.a outside the declared inputs: {libgcc}"
+            ));
+        }
+        if !Path::new(&libgcc).is_file() {
+            return Err(format!("static Rust link: libgcc.a is not a file: {libgcc}"));
+        }
+        let eh_dir = cwd.join("td-rust-eh");
+        std::fs::create_dir_all(&eh_dir)
+            .map_err(|e| format!("create {}: {e}", eh_dir.display()))?;
+        let eh_dir = eh_dir
+            .to_str()
+            .ok_or("static Rust link: scratch path is not UTF-8")?
+            .to_string();
+        let libgcc_eh = format!("{eh_dir}/libgcc_eh.a");
+        run_cmd(&objcopy, &[&libgcc, &libgcc_eh], ".", &path_env, &WATCH_PHASE)?;
+        run_cmd(&ranlib, &[&libgcc_eh], ".", &path_env, &WATCH_PHASE)?;
+        rustflags.push_str(&format!(" -Clink-arg=-L{eh_dir}"));
     }
     // A crate's C build script drives the `cc` crate, whose compile+link reads LIBRARY_PATH
     // for BOTH -l libraries and the crt startfiles (crt1.o/crti.o/crtn.o) — but only the
@@ -2316,8 +2422,8 @@ pub fn run_rust() -> Result<(), String> {
     // Fold those same bdir dirs into LIBRARY_PATH so a C crypto crate (aws-lc-sys/ring) links
     // instead of redding with "cannot find crt1.o". Unset ⇒ empty ⇒ no-op (the pure-Rust and
     // self-host paths are unchanged); binutils' bin dir carries no libs so adding it is inert.
-    for b in env::var("TD_RUST_STORE_BDIR").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
-        lib.push(b.to_string());
+    for b in &store_bdirs {
+        lib.push(b.clone());
     }
     // A C build script may compile *and run* a probe executable (aws-lc-sys's memcmp_check
     // links a binary and asserts it exits 0). The native gcc bakes no interp/RUNPATH, so
@@ -2327,12 +2433,10 @@ pub fn run_rust() -> Result<(), String> {
     // for its object compiles, so this only reaches build scripts that link a runnable exe.
     // Unset TD_RUST_STORE_INTERP leaves only the deterministic build-ID policy.
     let mut ldflags = String::from("-Wl,--build-id=sha1");
-    if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
-        if !interp.is_empty() {
-            ldflags.push_str(&format!(" -Wl,--dynamic-linker,{interp}"));
-            for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
-                ldflags.push_str(&format!(" -Wl,-rpath,{rp}"));
-            }
+    if let Some(interp) = &store_interp {
+        ldflags.push_str(&format!(" -Wl,--dynamic-linker,{interp}"));
+        for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
+            ldflags.push_str(&format!(" -Wl,-rpath,{rp}"));
         }
     }
     let mut envs: Vec<(String, String)> = vec![
@@ -2476,7 +2580,7 @@ pub fn run_rust() -> Result<(), String> {
     let (selection_args, cargo_release_dir) = cargo_selection(
         &cargo_dir,
         &bins,
-        cargo_subdir.is_some(),
+        cargo_subdir.is_some() || static_link,
         cargo_package.as_deref(),
     )?;
     cargo_args.extend(selection_args);
@@ -2504,7 +2608,11 @@ pub fn run_rust() -> Result<(), String> {
             ));
         }
         let from = from.to_str().ok_or("non-utf8 Cargo binary path")?;
-        run_cmd(&cp, &["-p", from, &format!("{bindir}/{b}")], ".", &path_env, &WATCH_PHASE)?;
+        let installed = format!("{bindir}/{b}");
+        run_cmd(&cp, &["-p", from, &installed], ".", &path_env, &WATCH_PHASE)?;
+        if static_link {
+            crate::elf::assert_static_pie(Path::new(&installed))?;
+        }
     }
     split_debug_tree(Path::new(&out), Path::new(&objcopy), &recipe_name)?;
     Ok(())
@@ -2516,16 +2624,20 @@ pub fn run_rust() -> Result<(), String> {
 /// its recipe output and has no `cc` alias; install a scratch-only wrapper which
 /// gives host tools the same declared interpreter, search roots and static
 /// libgcc policy as target links. The wrapper is build machinery, never copied
-/// into the output. Codex is the reviewed caller; pinning its full selection
-/// shape keeps another selected workspace from silently acquiring the wrapper.
+/// into the output. Two callers are reviewed: Codex, pinned by its full
+/// selection shape so another selected workspace cannot silently acquire the
+/// wrapper, and every static link, which pins `--target` for the reason its
+/// flags state and therefore always has a host side to link.
 fn rust_workspace_needs_native_host_linker(
     recipe_name: &str,
     cargo_subdir: Option<&str>,
     cargo_package: Option<&str>,
+    static_link: bool,
 ) -> bool {
-    recipe_name == "codex"
-        && cargo_subdir == Some("codex-rs")
-        && cargo_package == Some("codex-cli")
+    static_link
+        || (recipe_name == "codex"
+            && cargo_subdir == Some("codex-rs")
+            && cargo_package == Some("codex-cli"))
 }
 
 fn install_native_rust_host_linker(
@@ -2762,15 +2874,20 @@ fn require_selected_cargo_workspace(
 
 const RUST_TARGET: &str = "x86_64-unknown-linux-gnu";
 
+/// Cargo's selection arguments and the release directory they produce. The
+/// target triple is pinned for a package selection, and whenever the caller
+/// asks for it (`pin_target`): a selected workspace subdirectory, whose local
+/// `.cargo/config.toml` could otherwise move the artifact, and a static link,
+/// whose flags must stay off Cargo's host side.
 fn cargo_selection(
     cargo_dir: &Path,
     bins: &[&str],
-    subdir_selected: bool,
+    pin_target: bool,
     package: Option<&str>,
 ) -> Result<(Vec<String>, PathBuf), String> {
     let mut args = Vec::new();
-    let selected = subdir_selected || package.is_some();
-    let release_dir = if selected {
+    let pinned = pin_target || package.is_some();
+    let release_dir = if pinned {
         let target_dir = cargo_dir.join("target");
         let target_arg = target_dir
             .to_str()
@@ -5716,20 +5833,46 @@ mod tests {
     }
 
     #[test]
-    fn native_host_link_wrapper_is_scoped_to_selected_workspaces() {
+    fn native_host_link_wrapper_is_scoped_to_codex_and_static_links() {
         assert!(!rust_workspace_needs_native_host_linker(
-            "ripgrep", None, None
+            "ripgrep", None, None, false
         ));
         assert!(!rust_workspace_needs_native_host_linker(
             "other-workspace",
             Some("workspace"),
-            Some("tool")
+            Some("tool"),
+            false
         ));
         assert!(rust_workspace_needs_native_host_linker(
             "codex",
             Some("codex-rs"),
-            Some("codex-cli")
+            Some("codex-cli"),
+            false
         ));
+        // A static link always pins `--target`, so its host side needs the
+        // wrapper whatever the workspace shape.
+        assert!(rust_workspace_needs_native_host_linker(
+            "tmc", None, None, true
+        ));
+    }
+
+    #[test]
+    fn a_static_link_pins_the_target_without_a_package_selection() {
+        let (args, release_dir) =
+            cargo_selection(Path::new("/build"), &["tmc"], true, None).unwrap();
+        assert_eq!(
+            args,
+            [
+                "--target-dir",
+                "/build/target",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+            ]
+        );
+        assert_eq!(
+            release_dir,
+            Path::new("/build/target/x86_64-unknown-linux-gnu/release")
+        );
     }
 
     #[test]

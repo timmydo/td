@@ -1175,6 +1175,12 @@ pub struct Recipe {
     /// workspace locks; ordinary recipes must use the upstream source's embedded lock
     /// verbatim. It does not generate a lock for source that omits one.
     pub replace_cargo_lock: Option<bool>,
+    /// Link the named binaries as fully static executables: no program
+    /// interpreter, no `DT_NEEDED`, no run-path, which is what an application
+    /// package's static validator requires of a td-built entry. The runner
+    /// then pins Cargo's explicit `--target` so `+crt-static` reaches only
+    /// target artifacts, never a proc macro or a build script.
+    pub static_link: Option<bool>,
     /// Exact Cargo Git sources admitted by explicit review. Each declaration binds
     /// lock source id + commit to a fixed-output archive input and the packages td
     /// may expose from it. The input is also added to the ordinary source/tool graph;
@@ -1251,6 +1257,7 @@ impl Recipe {
             ostree_pins: None,
             cargo_lock: None,
             replace_cargo_lock: None,
+            static_link: None,
             cargo_git_sources: None,
             cargo_source_patches: None,
             local_source: None,
@@ -1422,6 +1429,11 @@ impl Recipe {
     /// workspace. The default is stricter: require the source's lock to match it.
     pub fn replace_cargo_lock(mut self) -> Recipe {
         self.replace_cargo_lock = Some(true);
+        self
+    }
+    /// Link the named binaries fully static; see the `static_link` field.
+    pub fn static_link(mut self) -> Recipe {
+        self.static_link = Some(true);
         self
     }
     /// Admit explicitly reviewed Cargo Git dependencies through fixed-output
@@ -1655,6 +1667,9 @@ impl Recipe {
         if let Some(replace) = self.replace_cargo_lock {
             o.push(("replaceCargoLock".into(), Json::Bool(replace)));
         }
+        if let Some(static_link) = self.static_link {
+            o.push(("staticLink".into(), Json::Bool(static_link)));
+        }
         if let Some(sources) = &self.cargo_git_sources {
             o.push((
                 "cargoGitSources".into(),
@@ -1707,8 +1722,12 @@ mod tests {
             r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","version":"1.0"}"#
         );
         assert_eq!(
-            plain.replace_cargo_lock().to_json().to_canonical(),
+            plain.clone().replace_cargo_lock().to_json().to_canonical(),
             r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","replaceCargoLock":true,"version":"1.0"}"#
+        );
+        assert_eq!(
+            plain.static_link().to_json().to_canonical(),
+            r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","staticLink":true,"version":"1.0"}"#
         );
     }
 

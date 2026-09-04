@@ -2459,8 +2459,8 @@ mod tests {
                 .to_canonical()
                 .matches(stage0_token)
                 .count(),
-            2,
-            "the boundary probe may name rust-stage0 once per tested binary"
+            4,
+            "the boundary probe may name rust-stage0 once per tested binary (ripgrep, fd, tn, tmc)"
         );
 
         let commands: Vec<&str> = recipe
@@ -2477,7 +2477,7 @@ mod tests {
             .collect();
         assert_eq!(
             commands.len(),
-            2,
+            4,
             "each tested binary must keep one rust-stage0 identity read"
         );
         for command in commands {

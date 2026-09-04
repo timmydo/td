@@ -5546,6 +5546,13 @@ fn assemble_recipe_drv(
     };
     let cargo_subdir = match alist.get("cargoSubdir") {
         None => None,
+        // "." names the archive ROOT explicitly. The warm plan requires every
+        // fixed-output archive to select its Cargo workspace, so that a
+        // multi-workspace repository can never build the wrong crate by
+        // omission; a manifest at the root has nothing below the root to name.
+        // Naming it selects nothing, so from here on it is the unselected
+        // shape: no TD_CARGO_SUBDIR, no pinned `--target`, `target/release`.
+        Some(json::Json::Str(value)) if value == "." => None,
         Some(json::Json::Str(value)) if build::valid_cargo_subdir(value) => Some(value.as_str()),
         Some(json::Json::Str(_)) => {
             return Err(
@@ -5576,11 +5583,17 @@ fn assemble_recipe_drv(
         Some(value) => build::parse_cargo_source_patches(value)
             .map_err(|error| format!("recipe: {error}"))?,
     };
+    let static_link = match alist.get("staticLink") {
+        None => false,
+        Some(json::Json::Bool(value)) => *value,
+        Some(_) => return Err("recipe: `staticLink' must be a boolean".into()),
+    };
     if build_system != "rust"
-        && (cargo_subdir.is_some()
+        && (alist.get("cargoSubdir").is_some()
             || cargo_package.is_some()
             || cargo_lock.is_some()
             || alist.get("replaceCargoLock").is_some()
+            || alist.get("staticLink").is_some()
             || alist.get("cargoGitSources").is_some()
             || alist.get("cargoSourcePatches").is_some())
     {
@@ -5992,6 +6005,9 @@ fn assemble_recipe_drv(
             }
             if let Some(package) = cargo_package {
                 push_drv_env(&mut spec, "TD_CARGO_PACKAGE", package)?;
+            }
+            if static_link {
+                push_drv_env(&mut spec, "TD_RUST_STATIC", "1")?;
             }
             if cargo_lock.is_some() {
                 let policy = if replace_cargo_lock { "replace" } else { "verify" };
@@ -15824,6 +15840,31 @@ daemon build START (2/2 active)
             assemble_recipe_drv(plain_recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&plain_drv, "TD_CARGO_SUBDIR").is_none());
         assert!(env_of(&plain_drv, "TD_CARGO_PACKAGE").is_none());
+
+        // `cargoSubdir: "."` names the archive root explicitly for the warm
+        // plan's benefit and selects nothing, so the derivation is exactly the
+        // plain shape above.
+        let root_recipe =
+            r#"{"name":"tn","version":"0.1.0","buildSystem":"rust","bins":["tn"],"cargoSubdir":"."}"#;
+        let (_p, _f, root_drv, _s) =
+            assemble_recipe_drv(root_recipe, lockp, &dir, None).unwrap();
+        assert!(env_of(&root_drv, "TD_CARGO_SUBDIR").is_none());
+        assert!(env_of(&root_drv, "TD_CARGO_PACKAGE").is_none());
+        assert!(env_of(&root_drv, "TD_RUST_STATIC").is_none());
+
+        // `staticLink` reaches the runner as one exact flag and nothing else
+        // changes: the runner, not the derivation, pins the target for it.
+        let static_recipe =
+            r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"cargoSubdir":".","staticLink":true}"#;
+        let (_p, _f, static_drv, _s) =
+            assemble_recipe_drv(static_recipe, lockp, &dir, None).unwrap();
+        assert_eq!(env_of(&static_drv, "TD_RUST_STATIC").as_deref(), Some("1"));
+        assert!(env_of(&static_drv, "TD_CARGO_SUBDIR").is_none());
+        let unstatic_recipe =
+            r#"{"name":"tmc","version":"0.1.0","buildSystem":"rust","bins":["tmc"],"staticLink":false}"#;
+        let (_p, _f, unstatic_drv, _s) =
+            assemble_recipe_drv(unstatic_recipe, lockp, &dir, None).unwrap();
+        assert!(env_of(&unstatic_drv, "TD_RUST_STATIC").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15857,6 +15898,24 @@ daemon build START (2/2 active)
             (
                 r#"{"name":"x","version":"1","buildSystem":"gnu","cargoPackage":"x"}"#,
                 "cannot declare Cargo build policy",
+            ),
+            // The root spelling is Cargo policy too, even though it selects
+            // nothing: a non-Rust recipe may not carry it.
+            (
+                r#"{"name":"x","version":"1","buildSystem":"gnu","cargoSubdir":"."}"#,
+                "cannot declare Cargo build policy",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","cargoSubdir":"./x"}"#,
+                "plain relative path",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"gnu","staticLink":true}"#,
+                "cannot declare Cargo build policy",
+            ),
+            (
+                r#"{"name":"x","version":"1","buildSystem":"rust","staticLink":"yes"}"#,
+                "must be a boolean",
             ),
         ];
         for (recipe, expected) in cases {

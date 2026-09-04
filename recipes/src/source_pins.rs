@@ -636,6 +636,26 @@ const PINS: &[PinDef] = &[
         file: "tcc-0.9.27.tar.bz2",
     },
     PinDef {
+        key: "tmc-source",
+        aliases: &[],
+        // Timmy's Mail Console — the `mail` application's JMAP terminal client,
+        // pinned to one upstream commit archive. GitHub's commit archive is the
+        // only upstream-hosted source archive; the dependency closure is pinned
+        // separately by the committed recipes/locks/tmc/Cargo.lock.
+        url: "https://github.com/timmydo/tmc/archive/8f04e380bd378f735152fae18e1bd1c189b6eddf.tar.gz",
+        sha256: "a35539130a17f7a56910d7efb9ba8cc9c7eb9674c6c93a7e8ca2b0aaada9b2f0",
+        file: "tmc-8f04e380bd378f735152fae18e1bd1c189b6eddf.tar.gz",
+    },
+    PinDef {
+        key: "tn-source",
+        aliases: &[],
+        // Timmy's News — the `news` application's terminal feed reader, pinned
+        // the same way; closure in recipes/locks/tn/Cargo.lock.
+        url: "https://github.com/timmydo/news/archive/3de5c9e22b05527f9d90f9e9ae63256f24ba67b2.tar.gz",
+        sha256: "036c8606e9144679db671d30e53c56e8b558b97804f3d4f3c78655cbb37d64a7",
+        file: "news-3de5c9e22b05527f9d90f9e9ae63256f24ba67b2.tar.gz",
+    },
+    PinDef {
         key: "util-linux-libs-x86-64-source",
         aliases: &[],
         // btrfs-progs requires libuuid and libblkid. The recipe builds only
@@ -770,8 +790,9 @@ mod tests {
         // vendored Bubblewrap and five Cargo Git commit archives), libcap 2.78,
         // Protobuf 31.1 with its exact Abseil 20250127.0 source dependency, and
         // the second reviewed foreign application seed, the Claude Code 2.1.260
-        // native release.
-        assert_eq!(all().len(), 72);
+        // native release, and the two terminal applications' commit archives,
+        // tmc and tn.
+        assert_eq!(all().len(), 74);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

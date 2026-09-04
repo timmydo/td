@@ -2413,6 +2413,24 @@ pub fn assert_static(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Assert an ELF is a STATIC POSITION-INDEPENDENT executable: everything
+/// `assert_static` requires, and `ET_DYN` rather than `ET_EXEC`. The Cargo
+/// runner's static mode installs nothing else, so a link that kept its bytes
+/// static but fell back to a fixed load address is caught where the binary is
+/// installed rather than by a later recipe check.
+pub fn assert_static_pie(path: &Path) -> Result<(), String> {
+    assert_static(path)?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let kind = u16le(&bytes, 0x10)?;
+    if kind != ET_DYN {
+        return Err(format!(
+            "{}: expected a static position-independent executable (ET_DYN) but its ELF type is {kind}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -3527,6 +3545,28 @@ pub(crate) mod tests {
         // …and i686 (the class check is class-independent)
         std::fs::write(&f, synth_static_elf(false)).unwrap();
         assert!(assert_static(&f).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assert_static_pie_requires_et_dyn_on_top_of_the_static_shape() {
+        let dir = std::env::temp_dir().join(format!("elf-test-aspie-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a");
+        // A static ET_EXEC passes the static check and fails the PIE one by type.
+        std::fs::write(&f, synth_static_elf(true)).unwrap();
+        assert!(assert_static(&f).is_ok());
+        let err = assert_static_pie(&f).unwrap_err();
+        assert!(err.contains("ELF type is 2"), "{err}");
+        // The same bytes as ET_DYN are the static-PIE shape.
+        let mut pie = synth_static_elf(true);
+        pie[0x10..0x12].copy_from_slice(&ET_DYN.to_le_bytes());
+        std::fs::write(&f, pie).unwrap();
+        assert!(assert_static_pie(&f).is_ok());
+        // Dynamic linkage still fails first, whatever the type says.
+        std::fs::write(&f, synth_needed_elf(&["libc.so.6"], true)).unwrap();
+        let err = assert_static_pie(&f).unwrap_err();
+        assert!(err.contains("dynamically links"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
