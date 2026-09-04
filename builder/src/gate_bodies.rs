@@ -2524,7 +2524,14 @@ fn marker_cmdlines(marker: &str) -> Vec<String> {
 fn sweep_marker_procs(marker: &str) {
     for (pid, c) in proc_cmdlines() {
         if has_marker(&c, marker) {
-            let _ = crate::sys::kill_pid(pid, crate::sys::SIGKILL);
+            let _ = crate::sys::kill_recorded(
+                crate::sys::KillTarget::Pid(pid),
+                crate::sys::SIGKILL,
+                &format!(
+                    "its command line carries reaping-check marker {marker} after a red leg \
+                     (sandbox-reaping gate sweep)"
+                ),
+            );
         }
     }
 }
@@ -3143,7 +3150,12 @@ exit 0
         for line in marker_cmdlines(&marker) {
             println!("   up: {line}");
         }
-        let _ = crate::sys::kill_pid(top, crate::sys::SIGTERM);
+        let _ = crate::sys::kill_recorded(
+            crate::sys::KillTarget::Pid(top),
+            crate::sys::SIGTERM,
+            "the inner sandbox tree never started; ending the top td-builder \
+             (sandbox-reaping gate)",
+        );
         sweep_marker_procs(&marker);
         let _ = child.wait();
         return Err(format!(
@@ -3156,7 +3168,12 @@ exit 0
     // apply to a child we just spawned), but if it somehow does, clean up the
     // marker tree and reap the child before failing loudly — symmetric with the
     // `before < 2` path above, so no path leaves a zombie or stray marker proc.
-    if let Err(e) = crate::sys::kill_pid(top, crate::sys::SIGTERM) {
+    if let Err(e) = crate::sys::kill_recorded(
+        crate::sys::KillTarget::Pid(top),
+        crate::sys::SIGTERM,
+        "proving the PR_SET_PDEATHSIG cascade reaps the sandbox tree on a soft kill \
+         (sandbox-reaping gate, leg B)",
+    ) {
         sweep_marker_procs(&marker);
         let _ = child.wait();
         return Err(format!("FAIL: cannot SIGTERM the top td-builder ({top}): {e}"));
@@ -3180,7 +3197,11 @@ exit 0
         // `wait` has no timeout: a td-builder that ignored SIGTERM would hang
         // here for the gate's whole budget instead of failing it in ten
         // seconds, and this diagnostic would never print.
-        let _ = child.kill();
+        let _ = crate::sys::kill_child_recorded(
+            &mut child,
+            "the top td-builder was still alive 10s after SIGTERM (sandbox-reaping gate, \
+             leg B)",
+        );
         let _ = child.wait();
         sweep_marker_procs(&marker);
         return Err(format!(
@@ -3271,8 +3292,16 @@ exit 0
             // NOT a pass. Killing a tree that never began finds no survivors
             // and reports success — this leg answering a question it never
             // asked, which is the one way it can go quietly useless.
-            let _ = crate::sys::kill_pid(top, crate::sys::SIGTERM);
-            let _ = child.kill();
+            let never_started = format!(
+                "cycle {i} never saw the sandbox start constructing (sandbox-reaping \
+                 gate, leg D)"
+            );
+            let _ = crate::sys::kill_recorded(
+                crate::sys::KillTarget::Pid(top),
+                crate::sys::SIGTERM,
+                &never_started,
+            );
+            let _ = crate::sys::kill_child_recorded(&mut child, &never_started);
             let _ = child.wait();
             sweep_marker_procs(&marker);
             return Err(format!(
@@ -3280,12 +3309,22 @@ exit 0
                  marker-bearing process(es) after 2s (marker={marker})"
             ));
         }
-        if let Err(e) = crate::sys::kill_pid(top, crate::sys::SIGTERM) {
+        if let Err(e) = crate::sys::kill_recorded(
+            crate::sys::KillTarget::Pid(top),
+            crate::sys::SIGTERM,
+            &format!(
+                "proving the PR_SET_PDEATHSIG cascade reaps a sandbox mid-construction, \
+                 cycle {i} (sandbox-reaping gate, leg D)"
+            ),
+        ) {
             sweep_marker_procs(&marker);
             // Timed, for the reason leg B's `!top_exited` path is: an untimed
             // wait on a child still somehow running hangs the gate for its
             // whole budget rather than failing it here.
-            let _ = child.kill();
+            let _ = crate::sys::kill_child_recorded(
+                &mut child,
+                &format!("SIGTERM to the top td-builder failed in cycle {i}: {e}"),
+            );
             let _ = child.wait();
             return Err(format!("FAIL: cannot SIGTERM the top td-builder ({top}) in cycle {i}: {e}"));
         }
@@ -3301,7 +3340,13 @@ exit 0
             for line in marker_cmdlines(&marker) {
                 println!("   still up: {line}");
             }
-            let _ = child.kill();
+            let _ = crate::sys::kill_child_recorded(
+                &mut child,
+                &format!(
+                    "the top td-builder was still alive 10s after SIGTERM in cycle {i} \
+                     (sandbox-reaping gate, leg D)"
+                ),
+            );
             let _ = child.wait();
             sweep_marker_procs(&marker);
             return Err(format!(

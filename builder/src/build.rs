@@ -596,7 +596,11 @@ fn run_cmd(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                    let _ = crate::sys::kill_recorded(
+                        crate::sys::KillTarget::Group(pgid),
+                        crate::sys::SIGKILL,
+                        &format!("waiting for `{prog}` failed: {e} (td-build watchdog)"),
+                    );
                     let _ = child.wait();
                     return Err(format!("wait {prog}: {e}"));
                 }
@@ -616,7 +620,15 @@ fn run_cmd(
                          still holds its output pipes after {}s — killing the phase's process group",
                         watch.drain_grace.as_secs()
                     );
-                    let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                    let _ = crate::sys::kill_recorded(
+                        crate::sys::KillTarget::Group(pgid),
+                        crate::sys::SIGKILL,
+                        &format!(
+                            "`{prog}` exited but a leftover background process still held its \
+                             output pipes after {}s (td-build watchdog)",
+                            watch.drain_grace.as_secs()
+                        ),
+                    );
                     drain_killed = true;
                 } else if drain_killed && dt > watch.drain_grace.saturating_add(DRAIN_EXTRA) {
                     eprintln!(
@@ -654,8 +666,13 @@ fn run_cmd(
                         }
                     }
                 }
-                if sup.why.lock().map(|w| w.is_some()).unwrap_or(false) {
-                    let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                let why = sup.why.lock().ok().and_then(|w| w.clone());
+                if let Some(why) = why {
+                    let _ = crate::sys::kill_recorded(
+                        crate::sys::KillTarget::Group(pgid),
+                        crate::sys::SIGKILL,
+                        &format!("`{prog}`: {why} (td-build watchdog)"),
+                    );
                     killed = true;
                     killed_at = Instant::now();
                 }

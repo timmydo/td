@@ -97,6 +97,38 @@ it from `git log`; an untracked plan file cannot be the handoff.
 Never use `git stash` in this repository. `refs/stash` is repository-global,
 not worktree-local.
 
+# When something td-builder ran was killed
+
+Every signal td-builder sends to another process is recorded in one place:
+`~/.td/kill-audit/log`. One line per signal gives the time, the sending
+td-builder and its verb, the signal, the target pid or process group, the
+reason the sender had, whether the kernel accepted the signal, and the
+target's command line as it stood just before. The gate-run watchdog, the
+build watchdog, the build daemon, the per-user check host, the check-loop
+warm step and the sandbox-reaping gate all write it, so a gate, build or
+check that died looks there first. The same line goes to the sender's stderr,
+which for the check host is `check-host-v2.log` in its runtime directory,
+`/run/user/<uid>/td-builder` where that exists; each new host rotates it and
+keeps one `.prev` generation, so the audit file is the durable copy. It is
+appended to and never rotated; truncate it when it has served. It is the
+user's own file, writable by anything running as the user, gate code inside
+the check sandbox included: a record, not tamper evidence.
+
+The directory is td-builder's own and is bound read-write into the check
+sandbox, so the gate runner inside records to the host's file. td-builder
+creates `~/.td/kill-audit` but never `~/.td` itself: inside a build sandbox
+HOME is a stand-in with no `~/.td`, so the build watchdog's line reaches the
+build log through stderr and nothing is written into the build.
+
+A line there is proof; its absence is only evidence. The file cannot show a
+death td-builder did not signal: the kernel's OOM killer, a
+`PR_SET_PDEATHSIG` cascade when a supervisor dies, the `RLIMIT_DATA` ceiling
+under `run-capped` (the process fails to allocate rather than being
+signalled), a signal from a terminal or another program, or a line lost
+because `~/.td` was absent or unwritable. The one td control-plane program
+not yet covered is `td-recipe-eval`, whose QEMU and check-runner teardown
+still kill without a record.
+
 # Test binaries run under a memory ceiling
 
 `.cargo/config.toml` points cargo's `runner` at `td-builder run-capped`, so

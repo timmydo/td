@@ -878,7 +878,14 @@ fn ensure_server(runtime: &Path, socket: &Path) -> Result<(), String> {
     if !logged {
         eprintln!("{notice}");
     }
-    terminate_tree(child.id());
+    terminate_tree(
+        child.id(),
+        "server",
+        &format!(
+            "the check host did not become ready within {}s",
+            START_TIMEOUT.as_secs()
+        ),
+    );
     let _ = child.wait();
     Err(format!(
         "check host did not become ready within {}s; see {}",
@@ -1817,12 +1824,12 @@ fn run_request(
     })?;
     let pid = child.id();
     let Some(stdout) = child.stdout.take() else {
-        terminate_tree(pid);
+        terminate_tree(pid, "hosted command", "the hosted command has no stdout pipe");
         let _ = child.wait();
         return Err("hosted command has no stdout pipe".to_string());
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_tree(pid);
+        terminate_tree(pid, "hosted command", "the hosted command has no stderr pipe");
         let _ = child.wait();
         return Err("hosted command has no stderr pipe".to_string());
     };
@@ -1830,7 +1837,7 @@ fn run_request(
     let out_thread = match spawn_output_pump("stdout", stdout, FRAME_STDOUT, out_writer) {
         Ok(thread) => thread,
         Err(e) => {
-            terminate_tree(pid);
+            terminate_tree(pid, "hosted command", &format!("the stdout pump could not start: {e}"));
             let _ = child.wait();
             return Err(e);
         }
@@ -1839,7 +1846,7 @@ fn run_request(
     let err_thread = match spawn_output_pump("stderr", stderr, FRAME_STDERR, err_writer) {
         Ok(thread) => thread,
         Err(e) => {
-            terminate_tree(pid);
+            terminate_tree(pid, "hosted command", &format!("the stderr pump could not start: {e}"));
             let _ = child.wait();
             // Same reason as the cancel path: a pump parked on a stalled
             // client would otherwise hold this worker for the whole budget.
@@ -1860,7 +1867,7 @@ fn run_request(
                 // child, and the caller is about to write its own frames down
                 // the same stream. Leaving them running splices one into the
                 // other and manufactures a framing error.
-                terminate_tree(pid);
+                terminate_tree(pid, "hosted command", &format!("waiting for the hosted command failed: {e}"));
                 writer.abandon();
                 let _ = out_thread.join();
                 let _ = err_thread.join();
@@ -1901,7 +1908,7 @@ fn run_request(
             // child alive for the whole stall budget, precisely when that is
             // most expensive. The explanation is worth a few seconds, not
             // minutes, so it also carries its own short deadline.
-            terminate_tree(pid);
+            terminate_tree(pid, "hosted command", &format!("the request was cancelled: {}", causes.join(", ")));
             if pressure {
                 let _ = writer.frame_if_free(
                     FRAME_STDERR,
@@ -1989,18 +1996,29 @@ fn peer_gone(stream: &mut UnixStream) -> bool {
     }
 }
 
-fn terminate_tree(root: u32) {
+/// Kill the whole tree under `root`, a hosted command or the host's own
+/// server child at startup (`role` says which), recording `reason` against
+/// every signal sent (see `sys::kill_all_recorded`): the host is the only
+/// place that knows why a client's check died, and its stderr log rotates
+/// away with the host, so the durable audit record is what a later reader
+/// has.
+fn terminate_tree(root: u32, role: &str, reason: &str) {
     // Snapshot before killing the root. If TERM lets the root exit first, an
     // escaped descendant is reparented and vanishes from a second tree walk.
     // Cancellation is a containment path, so use uncatchable SIGKILL for the
-    // captured descendants and the ordinary process group in one pass.
+    // captured descendants and the ordinary process group in one pass, and
+    // write nothing until the last signal has gone.
     let mut descendants = descendant_pids(root);
     descendants.sort_unstable_by(|a, b| b.cmp(a));
-    let _ = crate::sys::kill_process_group(root, crate::sys::SIGKILL);
-    let _ = crate::sys::kill_pid(i64::from(root), crate::sys::SIGKILL);
-    for pid in descendants {
-        let _ = crate::sys::kill_pid(i64::from(pid), crate::sys::SIGKILL);
-    }
+    let why = format!("{reason} (check-host {role} {root})");
+    let mut kills = vec![
+        (crate::sys::KillTarget::Group(root), why.clone()),
+        (crate::sys::KillTarget::Pid(i64::from(root)), why.clone()),
+    ];
+    kills.extend(descendants.into_iter().map(|pid| {
+        (crate::sys::KillTarget::Pid(i64::from(pid)), format!("{why}; descendant"))
+    }));
+    let _ = crate::sys::kill_all_recorded(&kills, crate::sys::SIGKILL);
 }
 
 fn descendant_pids(root: u32) -> Vec<u32> {

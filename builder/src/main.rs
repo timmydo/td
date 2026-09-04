@@ -10478,7 +10478,10 @@ fn main() -> ExitCode {
                 let mut child = crate::spawn::past_a_busy_program(|| cmd.spawn())
                     .map_err(|e| format!("spawn {sub} for {drv}: {e}"))?;
                 let stdout = child.stdout.take().ok_or_else(|| {
-                    let _ = child.kill();
+                    let _ = crate::sys::kill_child_recorded(
+                        &mut child,
+                        &format!("{sub} for {drv} has no stdout pipe (build daemon)"),
+                    );
                     let _ = child.wait();
                     format!("capture bounded stdout from {sub} for {drv}")
                 })?;
@@ -10487,20 +10490,30 @@ fn main() -> ExitCode {
                     .stack_size(512 * 1024)
                     .spawn(move || read_daemon_stdout_tail(stdout))
                     .map_err(|e| {
-                        let _ = crate::sys::kill_process_group(
-                            child.id(),
+                        let _ = crate::sys::kill_recorded(
+                            crate::sys::KillTarget::Group(child.id()),
                             crate::sys::SIGKILL,
+                            &format!(
+                                "the stdout reader for {sub} for {drv} could not start: {e} \
+                                 (build daemon)"
+                            ),
                         );
                         let _ = child.wait();
                         format!("spawn bounded stdout reader for {sub} for {drv}: {e}")
                     })?;
                 let status = loop {
                     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = crate::sys::kill_process_group(
-                            child.id(),
+                        let why = format!(
+                            "the daemon requester disconnected; cancelling {sub} for {drv} \
+                             (build daemon)"
+                        );
+                        let _ = crate::sys::kill_all_recorded(
+                            &[
+                                (crate::sys::KillTarget::Group(child.id()), why.clone()),
+                                (crate::sys::KillTarget::Pid(i64::from(child.id())), why),
+                            ],
                             crate::sys::SIGKILL,
                         );
-                        let _ = child.kill();
                         let _ = child.wait();
                         let _ = reader.join();
                         return Err(format!(
@@ -10511,9 +10524,12 @@ fn main() -> ExitCode {
                         Ok(Some(status)) => break status,
                         Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
                         Err(e) => {
-                            let _ = crate::sys::kill_process_group(
-                                child.id(),
+                            let _ = crate::sys::kill_recorded(
+                                crate::sys::KillTarget::Group(child.id()),
                                 crate::sys::SIGKILL,
+                                &format!(
+                                    "waiting for {sub} for {drv} failed: {e} (build daemon)"
+                                ),
                             );
                             let _ = child.wait();
                             let _ = reader.join();
@@ -11111,6 +11127,20 @@ fn main() -> ExitCode {
                     let sources = format!("{home}/.td/sources");
                     if Path::new(&sources).is_dir() {
                         binds.push(sandbox::Bind { src: sources, dest: None, readonly: true, ro_optional: false });
+                    }
+                    // The kill audit directory (~/.td/kill-audit): the gate
+                    // runner inside this sandbox records every signal its
+                    // watchdog sends there, and HOME inside is the root
+                    // tmpfs, so without this bind the record would die with
+                    // the sandbox. RW, at the same path, only when the host
+                    // has a ~/.td to hold it (see `sys::ensure_kill_audit_dir`).
+                    if let Some(audit) = crate::sys::ensure_kill_audit_dir() {
+                        binds.push(sandbox::Bind {
+                            src: audit.to_string_lossy().into_owned(),
+                            dest: None,
+                            readonly: false,
+                            ro_optional: false,
+                        });
                     }
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;

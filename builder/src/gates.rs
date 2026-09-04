@@ -726,18 +726,25 @@ fn process_tree_rss_bytes(root: u32) -> u64 {
         .fold(0u64, |total, (_, rss)| total.saturating_add(rss))
 }
 
-fn kill_process_tree(root: u32) {
+/// SIGKILL a gate's whole tree, recording `reason` against every signal (see
+/// `sys::kill_recorded`): the gate log says a gate was killed, but a process
+/// that died under it learns why only from the audit record.
+fn kill_process_tree(root: u32, reason: &str) {
     let mut pids: Vec<u32> = process_tree_snapshot(root)
         .into_iter()
         .map(|(pid, _)| pid)
         .filter(|pid| *pid != root)
         .collect();
     pids.sort_unstable_by(|a, b| b.cmp(a));
-    let _ = crate::sys::kill_process_group(root, crate::sys::SIGKILL);
-    let _ = crate::sys::kill_pid(i64::from(root), crate::sys::SIGKILL);
-    for pid in pids {
-        let _ = crate::sys::kill_pid(i64::from(pid), crate::sys::SIGKILL);
-    }
+    // Every signal goes before anything is written: see `kill_all_recorded`.
+    let mut kills = vec![
+        (crate::sys::KillTarget::Group(root), reason.to_string()),
+        (crate::sys::KillTarget::Pid(i64::from(root)), reason.to_string()),
+    ];
+    kills.extend(pids.into_iter().map(|pid| {
+        (crate::sys::KillTarget::Pid(i64::from(pid)), format!("{reason}; descendant"))
+    }));
+    let _ = crate::sys::kill_all_recorded(&kills, crate::sys::SIGKILL);
 }
 
 /// LIVE members of process group `pgid`. Zombies are excluded: the gate's
@@ -1144,7 +1151,14 @@ fn run_gate(
                             && process_tree_rss_bytes(pgid) > budget
                         {
                             breached.store(true, std::sync::atomic::Ordering::Relaxed);
-                            kill_process_tree(pgid);
+                            kill_process_tree(
+                                pgid,
+                                &format!(
+                                    "gate {} exceeded its {tree_mem_mib} MiB tree memory budget \
+                                     (gate-run watchdog)",
+                                    g.name
+                                ),
+                            );
                             return;
                         }
                         // The TREE, not only the child: a hang is usually in a
@@ -1164,7 +1178,14 @@ fn run_gate(
                             && !stop.load(std::sync::atomic::Ordering::Relaxed)
                         {
                             timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
-                            kill_process_tree(pgid);
+                            kill_process_tree(
+                                pgid,
+                                &format!(
+                                    "gate {} exceeded its {timeout_secs}s deadline (gate-run \
+                                     watchdog)",
+                                    g.name
+                                ),
+                            );
                             return;
                         }
                         tick = tick.wrapping_add(1);
@@ -1290,7 +1311,15 @@ fn run_gate(
         let killed_group = status.is_none();
         if killed_group {
             // One process-group signal reaches the ordinary descendant tree.
-            let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+            let _ = crate::sys::kill_recorded(
+                crate::sys::KillTarget::Group(pgid),
+                crate::sys::SIGKILL,
+                &format!(
+                    "gate {} ended without an exit status; sweeping its process group \
+                     (gate-run)",
+                    g.name
+                ),
+            );
         }
         // kill(2) QUEUES a signal, it does not deliver one, so without this the
         // runner returns and starts the next gate while a survivor still holds a
@@ -2760,7 +2789,11 @@ mod tests {
         let found = process_tree_snapshot(std::process::id())
             .iter()
             .any(|(pid, _)| *pid == child_pid);
-        let _ = crate::sys::kill_process_group(child_pid, crate::sys::SIGKILL);
+        let _ = crate::sys::kill_recorded(
+            crate::sys::KillTarget::Group(child_pid),
+            crate::sys::SIGKILL,
+            "test cleanup: the sleeper stood in for a compiler phase",
+        );
         let _ = child.wait();
         assert!(
             found,
@@ -3152,7 +3185,11 @@ mod tests {
         leaked.extend(bare);
         for pid in leaked {
             if alive(pid) {
-                let _ = crate::sys::kill_pid(i64::from(pid), crate::sys::SIGKILL);
+                let _ = crate::sys::kill_recorded(
+                    crate::sys::KillTarget::Pid(i64::from(pid)),
+                    crate::sys::SIGKILL,
+                    "test cleanup: a sleeper the pdeathsig test spawned outlived it",
+                );
             }
         }
         assert!(gone, "an armed child must die with the process that spawned it");

@@ -669,13 +669,19 @@ fn wait_with_deadline(child: &mut std::process::Child, deadline: Option<Instant>
         match child.try_wait() {
             Ok(Some(st)) => return st.success(),
             Ok(None) if Instant::now() >= d => {
-                let _ = child.kill();
+                let _ = crate::sys::kill_child_recorded(
+                    child,
+                    "the warm step outlived its deadline (check-loop warm)",
+                );
                 let _ = child.wait();
                 return false;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => {
-                let _ = child.kill();
+            Err(e) => {
+                let _ = crate::sys::kill_child_recorded(
+                    child,
+                    &format!("waiting for the warm step failed: {e} (check-loop warm)"),
+                );
                 let _ = child.wait();
                 return false;
             }
