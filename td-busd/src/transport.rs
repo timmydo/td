@@ -113,6 +113,22 @@ pub const MAX_CONNECTIONS_PER_INSTANCE: usize = MAX_CONNECTIONS / 4;
 /// across the bus leaves the sockets, the listener and stdio their room.
 pub const MAX_QUEUED_FDS_TOTAL: usize = sys::MAX_FDS * 4;
 
+/// Descriptors one admission key may be HOLDING across every connection it
+/// has: a quarter of the ceiling, the share `MAX_CONNECTIONS_PER_INSTANCE`
+/// gives the connection table, and for the same reason. The holder is
+/// charged, not the sender: a key's own unclaimed freight here at the
+/// receive path, and each recipient's key as a frame with attachments is
+/// queued to it, in `registry::Outbox::push_frame`. A sender key at its share
+/// is refused as one connection's unclaimed bound refuses it; a recipient key
+/// at its share is refused the attachment with the sender told, as one
+/// recipient's own ceiling is; and only the bus's ceiling, which one key's
+/// two counts cannot reach, relieves a holder.
+pub const MAX_QUEUED_FDS_PER_INSTANCE: usize = crate::registry::MAX_QUEUED_FDS_PER_KEY;
+// The quarter the documents claim, pinned where the two constants meet:
+// they are defined apart, and a test that divides one by the other would
+// pass with any divisor.
+const _: () = assert!(MAX_QUEUED_FDS_PER_INSTANCE * 4 == MAX_QUEUED_FDS_TOTAL);
+
 /// One read's worth. Large enough that an ordinary method call arrives whole,
 /// small enough that a connection's idle cost is a page rather than a message.
 const READ_CHUNK: usize = 8192;
@@ -155,6 +171,16 @@ pub struct Quota {
     live: std::sync::Mutex<Vec<LiveAdmission>>,
     /// Descriptors queued and unclaimed across every connection.
     queued_fds: Arc<std::sync::atomic::AtomicUsize>,
+    /// The same, per admission key and in two counts: what each key's
+    /// connections hold as unclaimed freight, and what is queued to them.
+    /// Two counts rather than one because different hands fill them: what
+    /// is queued to a key is what its peers send while one of its
+    /// connections is not reading, and one count would make a sibling
+    /// connection's next descriptor, its own sending, the price of that
+    /// stall. A `Vec` scanned under its lock, like `live`: it holds one
+    /// entry per key with something held or a connection open, and the
+    /// scan happens once per accept.
+    shares: std::sync::Mutex<Vec<KeyedDescriptors>>,
     /// Consecutive admission refusals, shared because identity resolution now
     /// runs in bounded worker threads rather than on the listener thread.
     refused: std::sync::atomic::AtomicUsize,
@@ -164,6 +190,130 @@ struct LiveAdmission {
     token: Arc<()>,
     pid: i32,
     key: Option<AdmissionKey>,
+}
+
+/// One admission key's held descriptors. Every charge against the key and
+/// every outbox and connection of the key holds a clone of the counter it
+/// draws on, so an entry whose only holder is the table is a key with
+/// nothing held and no connection, and is dropped on the next scan.
+struct KeyedDescriptors {
+    key: AdmissionKey,
+    shares: KeyShares,
+}
+
+/// The counters one admission key's connections draw on: `freight` for what
+/// they have sent and the broker has not yet handed to every recipient,
+/// `queued` for what is queued to them. Each is bounded at
+/// `MAX_QUEUED_FDS_PER_INSTANCE`.
+#[derive(Clone)]
+pub(crate) struct KeyShares {
+    freight: Arc<std::sync::atomic::AtomicUsize>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Why unclaimed freight was not charged. The receive path treats the two
+/// differently: a key over its share of unclaimed freight is refused, since
+/// the pressure is its own, and only the bus's ceiling is relieved by
+/// disconnecting a holder.
+#[derive(Debug)]
+pub enum DescriptorRefusal {
+    OverShare { key: AdmissionKey, wanted: usize },
+    OverBus { wanted: usize },
+}
+
+impl std::fmt::Display for DescriptorRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OverShare { key, wanted } => write!(
+                formatter,
+                "{wanted} descriptors held as freight by {key}, over its share of {MAX_QUEUED_FDS_PER_INSTANCE}"
+            ),
+            Self::OverBus { wanted } => write!(
+                formatter,
+                "{wanted} descriptors queued across the bus, over {MAX_QUEUED_FDS_TOTAL}"
+            ),
+        }
+    }
+}
+
+/// What unclaimed freight is charged: the bus's budget and the sender key's
+/// freight share of it, together. At dispatch the bus charge goes with the
+/// descriptors into the frame, each recipient's key is charged as the frame
+/// is queued to it, and only then is the share given back — the descriptors
+/// are no longer this key's to hold, and were never in nobody's count.
+#[derive(Debug)]
+pub(crate) struct FreightCharge {
+    bus: DescriptorCharge,
+    share: DescriptorCharge,
+}
+
+impl FreightCharge {
+    /// Merge `other` into this pair, or hand it back whole when either half
+    /// was charged against a different counter: a connection's bus and key
+    /// are fixed at accept, so a mismatch is an ownership invariant broken
+    /// rather than peer input, and the pair is not split over it.
+    pub(crate) fn absorb(&mut self, other: Self) -> Result<(), Self> {
+        if !self.bus.same_counter(&other.bus) || !self.share.same_counter(&other.share) {
+            return Err(other);
+        }
+        let Self { bus, share } = other;
+        self.bus.merge(bus);
+        self.share.merge(share);
+        Ok(())
+    }
+
+    pub(crate) fn split(&mut self, count: usize) -> Option<Self> {
+        let bus = self.bus.split(count)?;
+        let Some(share) = self.share.split(count) else {
+            // Impossible after the bus half split, since the two halves are
+            // charged and split together; give the bus half back rather than
+            // leave the pair uneven.
+            self.bus.merge(bus);
+            return None;
+        };
+        Some(Self { bus, share })
+    }
+
+    /// The two halves apart: the bus half travels with the descriptors into
+    /// the frame, and the share half is the dispatch's to hold until each
+    /// recipient's key is charged for its copy or the message is dropped.
+    /// Given back here instead, several connections of one key could each
+    /// hold a batch in dispatch that no count of the key's saw, and the bus
+    /// could fill with one key's traffic.
+    pub(crate) fn into_halves(self) -> (DescriptorCharge, DescriptorCharge) {
+        let Self { bus, share } = self;
+        (bus, share)
+    }
+}
+
+/// Charge under bus pressure: relieve the largest holder and try again,
+/// until the charge is taken, nobody is left to relieve, or `MAX_CONNECTIONS`
+/// holders have gone. A retry refused OVER SHARE ends it at once, with that
+/// refusal: another connection of the same key filled the share between the
+/// relief and the retry, and that is a refusal no relief can clear, so a
+/// loop that went on would evict holder after holder for pressure that is
+/// the sender's own — the eviction the share exists to prevent, reached
+/// through a race. Returns the outcome and how many holders were relieved.
+fn charge_under_pressure(
+    mut refusal: DescriptorRefusal,
+    mut take: impl FnMut() -> Result<FreightCharge, DescriptorRefusal>,
+    mut relieve: impl FnMut() -> Option<String>,
+) -> (Result<FreightCharge, DescriptorRefusal>, usize) {
+    let mut relieved = 0usize;
+    loop {
+        if relieved >= MAX_CONNECTIONS {
+            return (Err(refusal), relieved);
+        }
+        if relieve().is_none() {
+            return (Err(refusal), relieved);
+        }
+        relieved = relieved.saturating_add(1);
+        match take() {
+            Ok(charge) => return (Ok(charge), relieved),
+            Err(again @ DescriptorRefusal::OverShare { .. }) => return (Err(again), relieved),
+            Err(again) => refusal = again,
+        }
+    }
 }
 
 /// One global place reserved cheaply before the lineage walk starts.
@@ -413,35 +563,67 @@ impl Quota {
         self.live.lock().map(|live| live.len()).unwrap_or(0)
     }
 
-    /// Charge `count` descriptors against the bus's budget, or refuse.
-    fn take_fds(&self, count: usize) -> Result<DescriptorCharge, String> {
-        use std::sync::atomic::Ordering;
-        let mut held = self.queued_fds.load(Ordering::Acquire);
-        loop {
-            let wanted = held.saturating_add(count);
-            if wanted > MAX_QUEUED_FDS_TOTAL {
-                return Err(format!(
-                    "{wanted} descriptors queued across the bus, over {MAX_QUEUED_FDS_TOTAL}"
-                ));
-            }
-            // Compare-and-swap rather than fetch_add-then-check: an add that
-            // overshoots and backs off is briefly visible to another thread as
-            // a full budget, which refuses a peer that should have been taken.
-            match self.queued_fds.compare_exchange_weak(
-                held,
-                wanted,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok(DescriptorCharge::new(
-                        Arc::clone(&self.queued_fds),
-                        count,
-                    ));
-                }
-                Err(seen) => held = seen,
-            }
+    /// `charge_freight` for a key by name, for a test that holds no
+    /// connection of it.
+    #[cfg(test)]
+    fn take_fds(
+        &self,
+        key: &AdmissionKey,
+        count: usize,
+    ) -> Result<FreightCharge, DescriptorRefusal> {
+        self.charge_freight(&self.share_of(key).freight, key, count)
+    }
+
+    /// Charge `count` descriptors against a key's freight counter and then
+    /// the bus's budget, or refuse. The share goes first, so an instance over
+    /// its own share is refused before the bus's count moves and nothing is
+    /// left to give back. The counter is in the caller's hand: a connection
+    /// keeps its key's from accept, so its reads look nothing up.
+    fn charge_freight(
+        &self,
+        freight: &Arc<std::sync::atomic::AtomicUsize>,
+        key: &AdmissionKey,
+        count: usize,
+    ) -> Result<FreightCharge, DescriptorRefusal> {
+        let share = DescriptorCharge::take(freight, count, MAX_QUEUED_FDS_PER_INSTANCE)
+            .map_err(|held| DescriptorRefusal::OverShare {
+                key: key.clone(),
+                wanted: held.saturating_add(count),
+            })?;
+        // The share was taken first, so a refusal here drops it on the way
+        // out and a refusal charges nothing anywhere.
+        let bus = DescriptorCharge::take(&self.queued_fds, count, MAX_QUEUED_FDS_TOTAL)
+            .map_err(|held| DescriptorRefusal::OverBus {
+                wanted: held.saturating_add(count),
+            })?;
+        Ok(FreightCharge { bus, share })
+    }
+
+    /// The counters for `key`'s held descriptors, made on first use. Entries
+    /// nothing holds any more are dropped on the way: a charge, a
+    /// connection or a connection's outbox keeps its key's counters alive,
+    /// so an entry whose only holder is this table counts nothing.
+    fn share_of(&self, key: &AdmissionKey) -> KeyShares {
+        let mut shares = self
+            .shares
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shares.retain(|entry| {
+            Arc::strong_count(&entry.shares.freight) > 1
+                || Arc::strong_count(&entry.shares.queued) > 1
+        });
+        if let Some(entry) = shares.iter().find(|entry| &entry.key == key) {
+            return entry.shares.clone();
         }
+        let made = KeyShares {
+            freight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        shares.push(KeyedDescriptors {
+            key: key.clone(),
+            shares: made.clone(),
+        });
+        made
     }
 }
 
@@ -580,6 +762,9 @@ pub struct Connection<'a> {
     /// this socket to a pid. Resolving later would let an application change
     /// what it is by outliving its own ancestors.
     identity: Identity,
+    /// The authority unit this connection's descriptors are charged to: the
+    /// same key admission charged, derived once from the identity above.
+    key: AdmissionKey,
     /// Where this connection's outgoing frames go. Written by a thread of its
     /// own, so a peer that will not read cannot stall whoever sent to it.
     outbox: Arc<Outbox>,
@@ -597,11 +782,16 @@ pub struct Connection<'a> {
     inbox: Vec<u8>,
     /// Descriptors received and not yet claimed by a message's `UNIX_FDS`.
     freight: Vec<OwnedFd>,
-    /// The bus-wide descriptor charge that travels with `freight`. Splitting
-    /// it when a message claims descriptors transfers the charge into that
-    /// message's outgoing frame without a moment in which open descriptors
-    /// are invisible to the quota.
-    freight_charge: DescriptorCharge,
+    /// The bus-wide descriptor charge that travels with `freight`, and this
+    /// key's share charge for it. Splitting the pair when a message claims
+    /// descriptors moves the bus charge into that message's outgoing frame
+    /// without a moment in which open descriptors are invisible to the
+    /// quota, and gives the share back, since the descriptors are the
+    /// recipient's to hold from there.
+    freight_charge: FreightCharge,
+    /// The key's freight counter, looked up once at accept; every later
+    /// charge is against it, so a descriptor-bearing read scans no table.
+    freight_share: Arc<std::sync::atomic::AtomicUsize>,
     /// One read's bytes, reused. `[0u8; READ_CHUNK]` as a local zeroes eight
     /// kilobytes of stack on EVERY read — the per-read hot loop, and a larger
     /// cost than the per-message allocation below that was fixed first.
@@ -805,7 +995,11 @@ impl<'a> Connection<'a> {
         // The writer's half of the socket. Cloned here rather than later
         // because a connection without an outbox has no way to be answered,
         // and the failure to make one belongs at accept where it can be seen.
-        let outbox = bus.outbox_for(stream.try_clone()?);
+        let key = identified.admission_key();
+        // The key's two counters, looked up once: the outbox draws on the
+        // queued count and every read on the freight count.
+        let shares = quota.share_of(&key);
+        let outbox = bus.outbox_for(stream.try_clone()?, Arc::clone(&shares.queued));
         Ok(Connection {
             stream,
             shake: Handshake::new(identified.authentication, guid),
@@ -821,8 +1015,10 @@ impl<'a> Connection<'a> {
             inbox: Vec::new(),
             freight: Vec::new(),
             freight_charge: quota
-                .take_fds(0)
-                .map_err(io::Error::other)?,
+                .charge_freight(&shares.freight, &key, 0)
+                .map_err(|refusal| io::Error::other(refusal.to_string()))?,
+            freight_share: shares.freight,
+            key,
             frame: Vec::new(),
         })
     }
@@ -991,6 +1187,62 @@ impl<'a> Connection<'a> {
         ended
     }
 
+    /// Charge `arrived` descriptors this read installed, against this
+    /// connection's unclaimed bound, its key's share and the bus's budget, in
+    /// that order, and fold the charge into the freight's. A refusal ends the
+    /// connection with the descriptors still owned by the caller's receive,
+    /// which drops them on the way out.
+    fn charge_arrivals(&mut self, arrived: usize) -> Result<(), Ended> {
+        // This connection's own unclaimed bound first: it is the narrower
+        // diagnosis, and the share below is the same size, so a single
+        // flooding connection would otherwise always be named by its share.
+        let unclaimed = self.freight.len().saturating_add(arrived);
+        if unclaimed > MAX_QUEUED_FDS {
+            return Err(Ended::Refused(format!(
+                "{unclaimed} descriptors queued and unclaimed"
+            )));
+        }
+        // Charged BEFORE they join the queue, so a refusal drops them here
+        // rather than leaving the bus's count and this connection's disagreeing.
+        let charge = match self
+            .quota
+            .charge_freight(&self.freight_share, &self.key, arrived)
+        {
+            Ok(charge) => charge,
+            // An instance over its own share is refused and nobody else
+            // pays: the pressure is its own, and relieving a holder would
+            // make another peer's connection the price of it.
+            Err(refusal @ DescriptorRefusal::OverShare { .. }) => {
+                return Err(Ended::Refused(refusal.to_string()));
+            }
+            Err(refusal) => {
+                let (charge, relieved) = charge_under_pressure(
+                    refusal,
+                    || self
+                        .quota
+                        .charge_freight(&self.freight_share, &self.key, arrived),
+                    || self.bus.relieve_largest_descriptors(),
+                );
+                if relieved != 0 {
+                    eprintln!(
+                        "td-busd: descriptor budget pressure disconnected {relieved} holders"
+                    );
+                }
+                charge.map_err(|refusal| Ended::Refused(refusal.to_string()))?
+            }
+        };
+        // `charge_freight` above and the zero charge installed by `accept`
+        // both draw on the counters this connection kept. A different Arc
+        // means an internal ownership invariant was broken; it is not peer
+        // input.
+        self.freight_charge
+            .absorb(charge)
+            .map_err(|_| {
+                Ended::Failed("descriptor charges came from different buses or keys".into())
+            })?;
+        Ok(())
+    }
+
     /// One read, and everything that read makes possible. `Ok(false)` means the
     /// peer closed its end.
     fn pump(&mut self) -> Result<bool, Ended> {
@@ -1061,46 +1313,13 @@ impl<'a> Connection<'a> {
         // be in this read or a later one, since the kernel attaches them to
         // whichever write carried them and a peer may split a message anywhere.
         let arrived = received.fds.len();
-        // Charged BEFORE they join the queue, so a refusal drops them here
-        // rather than leaving the bus's count and this connection's disagreeing.
-        let charge = match self.quota.take_fds(arrived) {
-            Ok(charge) => charge,
-            Err(mut refusal) => {
-                let mut relieved = 0usize;
-                let charge = loop {
-                    if relieved >= MAX_CONNECTIONS {
-                        break Err(refusal);
-                    }
-                    let Some(_) = self.bus.relieve_largest_descriptors() else {
-                        break Err(refusal);
-                    };
-                    relieved = relieved.saturating_add(1);
-                    match self.quota.take_fds(arrived) {
-                        Ok(charge) => break Ok(charge),
-                        Err(again) => refusal = again,
-                    }
-                };
-                if relieved != 0 {
-                    eprintln!(
-                        "td-busd: descriptor budget pressure disconnected {relieved} holders"
-                    );
-                }
-                charge.map_err(Ended::Refused)?
-            }
-        };
-        // `take_fds` above and the zero charge installed by `accept` both
-        // come from this connection's one Quota. A different Arc means an
-        // internal ownership invariant was broken; it is not peer input.
-        self.freight_charge
-            .absorb(charge)
-            .map_err(|_| Ended::Failed("descriptor charges came from different buses".into()))?;
-        self.freight.extend(received.fds);
-        if self.freight.len() > MAX_QUEUED_FDS {
-            return Err(Ended::Refused(format!(
-                "{} descriptors queued and unclaimed",
-                self.freight.len()
-            )));
+        // A read with no descriptors charges nothing: its key's counters were
+        // kept at accept, so no read scans the share table, and a zero charge
+        // would be two pointless atomics.
+        if arrived != 0 {
+            self.charge_arrivals(arrived)?;
         }
+        self.freight.extend(received.fds);
         // Disjoint fields, so this borrows `inbox` mutably and `chunk`
         // immutably without a copy in between.
         let read = received.count.min(self.chunk.len());
@@ -1185,10 +1404,11 @@ impl<'a> Connection<'a> {
         // was absorbed before its fd joined `freight`. Failure here therefore
         // names an internal ownership invariant rather than a second peer
         // input check.
-        let charge = self
+        let (charge, sender_share) = self
             .freight_charge
             .split(wanted)
-            .ok_or_else(|| Ended::Failed("descriptor freight lost its quota charge".into()))?;
+            .ok_or_else(|| Ended::Failed("descriptor freight lost its quota charge".into()))?
+            .into_halves();
         let descriptors = if wanted == 0 {
             drop(charge);
             None
@@ -1272,7 +1492,7 @@ impl<'a> Connection<'a> {
 
         // Addressed to the broker, or to a peer?
         let mut descriptors = descriptors;
-        match message.fields.destination {
+        let outcome = match message.fields.destination {
             Some(BUS_NAME) | None if is_hello => self.say_hello(&message, wants_reply),
             Some(BUS_NAME) => self.bus_method(&message, wants_reply),
             Some(destination) => {
@@ -1292,7 +1512,13 @@ impl<'a> Connection<'a> {
                 "a method call must name a destination on this bus",
             ),
             None => Ok(()),
-        }
+        };
+        // The sender's share is given back only now, with each recipient's
+        // key charged for its copy or the message dropped: given back at the
+        // split, a batch in dispatch was in nobody's count, and several
+        // connections of one key could fill the bus with such batches.
+        drop(sender_share);
+        outcome
     }
 
     /// `Hello`: the connection earns its unique name and is told what it is.
@@ -3140,6 +3366,26 @@ impl<'a> Connection<'a> {
                     Ok(())
                 }
             }
+            // The recipient's KEY is holding its share of the bus's
+            // descriptor budget across its connections, and the sender is
+            // told the same way. Nobody is disconnected: a draft charged the
+            // sender's key for what recipients held, and a recipient that
+            // stopped reading then cost an honest sender its connection.
+            Err(Overflow::Share(held)) => {
+                self.forget(recorded, message.serial);
+                if wants_reply {
+                    self.refuse(
+                        message,
+                        "org.freedesktop.DBus.Error.LimitsExceeded",
+                        &format!(
+                            "the recipient's instance is holding {held} descriptor \
+                             attachments across its connections, its share of the bus"
+                        ),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
             Err(Overflow::Bus(_)) => {
                 self.forget(recorded, message.serial);
                 if wants_reply {
@@ -3307,6 +3553,11 @@ impl<'a> Connection<'a> {
             Err(Overflow::Closed) => Err(Ended::PeerLeft),
             Err(Overflow::Connection { bytes, frames, fds }) => Err(Ended::Refused(format!(
                 "{bytes} bytes in {frames} frames with {fds} descriptor attachments queued and unread"
+            ))),
+            // A broker-originated frame carries no attachment, so its own
+            // peer's share is never what refuses it.
+            Err(Overflow::Share(held)) => Err(Ended::Failed(format!(
+                "a broker message was refused by a descriptor share holding {held}"
             ))),
             Err(Overflow::Bus(bytes)) => {
                 Err(Ended::Failed(format!("the bus is {bytes} bytes behind")))
@@ -5044,6 +5295,10 @@ mod tests {
     }
 
     fn descriptor_call(destination: &str, serial: u32) -> Vec<u8> {
+        descriptor_call_flagged(destination, serial, 0)
+    }
+
+    fn descriptor_call_flagged(destination: &str, serial: u32, flags: u8) -> Vec<u8> {
         message::Builder::method_call(
             crate::wire::Endian::Little,
             "/org/example/Thing",
@@ -5052,6 +5307,7 @@ mod tests {
         )
         .destination(destination)
         .serial(serial)
+        .flags(flags)
         .unix_fds(1)
         .body("h", |writer| {
             writer.unix_fd(0);
@@ -5060,6 +5316,11 @@ mod tests {
         .expect("descriptor body")
         .encode()
         .expect("encode a descriptor call")
+    }
+
+    /// A key share nothing else draws on, for a test outbox.
+    fn fresh_share() -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::new(std::sync::atomic::AtomicUsize::new(0))
     }
 
     fn descriptor_signal(serial: u32) -> Vec<u8> {
@@ -9852,7 +10113,7 @@ mod tests {
         for which in 0..4i32 {
             let (client, server) = UnixStream::pair().expect("socketpair");
             kept.push(client);
-            let outbox = bus.outbox_for(server);
+            let outbox = bus.outbox_for(server, fresh_share());
             bus.join(&outbox, 1000, 9100 + which).expect("join");
             outbox
                 .push(vec![0u8; crate::registry::MAX_OUTGOING_BYTES])
@@ -10367,7 +10628,7 @@ mod tests {
         let (mut peer, _) = Peer::arrive(only);
 
         let (_held, server) = UnixStream::pair().expect("socketpair");
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         let placeless = bus.join(&outbox, 1000, 0).expect("join");
 
         // The name is here.
@@ -12148,32 +12409,97 @@ mod tests {
     /// The descriptor budget is the BUS's, not a connection's. A per-connection
     /// cap of 64 across 64 connections is 4096 descriptors — past a 1024
     /// `RLIMIT_NOFILE`, and so exactly the `EMFILE` the per-connection cap was
-    /// added to prevent.
+    /// added to prevent. Four keys at their shares fill it, and a fifth is
+    /// refused by the bus with nothing charged to it.
     #[test]
     fn queued_descriptors_are_bounded_across_the_whole_bus() {
         let quota = Quota::new();
-        // One message's worth at a time, up to the bus's budget.
-        let batches = MAX_QUEUED_FDS_TOTAL / sys::MAX_FDS;
+        let keys: Vec<AdmissionKey> = (0..MAX_QUEUED_FDS_TOTAL / MAX_QUEUED_FDS_PER_INSTANCE)
+            .map(|which| AdmissionKey::Instance(format!("instance-{which}")))
+            .collect();
+        let late = AdmissionKey::Instance("instance-late".to_string());
         let mut charges = Vec::new();
-        for which in 0..batches {
-            match quota.take_fds(sys::MAX_FDS) {
+        for key in &keys {
+            match quota.take_fds(key, MAX_QUEUED_FDS_PER_INSTANCE) {
                 Ok(charge) => charges.push(charge),
-                Err(why) => panic!("batch {which} refused: {why}"),
+                Err(why) => panic!("{key} refused: {why}"),
             }
         }
-        match quota.take_fds(1) {
+        match quota.take_fds(&late, 1) {
             Ok(_) => panic!("the bus went past its descriptor budget"),
-            Err(why) => assert!(why.contains("across the bus"), "{why}"),
+            Err(why) => assert!(why.to_string().contains("across the bus"), "{why}"),
         }
-        // Ownership returning a batch returns exactly its charge.
+        // Ownership returning a batch returns exactly its charge, to the key
+        // it came from.
         drop(charges.pop());
-        charges.push(quota.take_fds(sys::MAX_FDS).expect("room after a claim"));
+        let last = keys.last().expect("a key");
+        charges.push(
+            quota
+                .take_fds(last, MAX_QUEUED_FDS_PER_INSTANCE)
+                .expect("room after a claim"),
+        );
         drop(charges);
-        let whole = quota
-            .take_fds(MAX_QUEUED_FDS_TOTAL)
-            .expect("an emptied budget is the whole budget");
-        assert!(quota.take_fds(1).is_err(), "the budget wrapped");
+        // The bus's refusal above charged nothing to the key that asked.
+        let unmarked = quota
+            .take_fds(&late, MAX_QUEUED_FDS_PER_INSTANCE)
+            .expect("a key the bus refused was charged nothing");
+        drop(unmarked);
+        let mut whole = Vec::new();
+        for key in &keys {
+            whole.push(
+                quota
+                    .take_fds(key, MAX_QUEUED_FDS_PER_INSTANCE)
+                    .expect("an emptied budget is the whole budget"),
+            );
+        }
+        assert!(quota.take_fds(&late, 1).is_err(), "the budget wrapped");
         drop(whole);
+    }
+
+    /// One admission key may hold only its share of the bus's descriptor
+    /// budget, however many connections it spreads them over; another key's
+    /// share is its own, and a returned charge frees the share it was taken
+    /// from. Keys nothing holds are forgotten.
+    #[test]
+    fn an_instance_is_held_to_its_descriptor_share() {
+        let quota = Quota::new();
+        let greedy = AdmissionKey::Instance("greedy".to_string());
+        let other = AdmissionKey::Instance("other".to_string());
+        let half = MAX_QUEUED_FDS_PER_INSTANCE / 2;
+        let first = quota.take_fds(&greedy, half).expect("half a share");
+        let second = quota
+            .take_fds(&greedy, MAX_QUEUED_FDS_PER_INSTANCE - half)
+            .expect("the rest of it");
+        match quota.take_fds(&greedy, 1) {
+            Ok(_) => panic!("an instance went past its share"),
+            Err(DescriptorRefusal::OverShare { key, wanted }) => {
+                assert_eq!(key, greedy);
+                assert_eq!(wanted, MAX_QUEUED_FDS_PER_INSTANCE + 1);
+            }
+            Err(by_bus) => panic!("refused by the bus rather than the share: {by_bus}"),
+        }
+        let theirs = quota
+            .take_fds(&other, MAX_QUEUED_FDS_PER_INSTANCE)
+            .expect("another key's share is its own");
+        drop(first);
+        let again = quota
+            .take_fds(&greedy, half)
+            .expect("a returned charge frees the share it came from");
+        drop((second, again, theirs));
+        let kept = quota.share_of(&greedy).freight;
+        let shares = quota.shares.lock().expect("the share table");
+        assert_eq!(shares.len(), 1, "keys nothing holds were kept");
+        assert!(
+            shares
+                .iter()
+                .all(|entry| entry.key == greedy && Arc::ptr_eq(&entry.shares.freight, &kept)),
+            "the key still held is not the one the table kept"
+        );
+        assert_eq!(
+            kept.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a share with every charge returned still counts something"
+        );
     }
 
     /// Outgoing writers now retain the broker's descriptor charge until the
@@ -12186,8 +12512,19 @@ mod tests {
         let bus = Bus::new();
         let mut clients = Vec::new();
         let batches = MAX_QUEUED_FDS_TOTAL / sys::MAX_FDS;
+        let probe = AdmissionKey::Instance("probe".to_string());
         for which in 0..batches {
-            let charge = quota.take_fds(sys::MAX_FDS).expect("take a batch");
+            // One key per batch: the bus fills only when several instances
+            // are at their shares, which is the case this relief is for.
+            // The batch's bus charge comes from a sender key's freight and
+            // its share half is given back at once, as dispatch does; each
+            // recipient's key is charged as the copy is queued to it.
+            let sender = AdmissionKey::Instance(format!("sender-{which}"));
+            let (charge, freight) = quota
+                .take_fds(&sender, sys::MAX_FDS)
+                .expect("take a batch")
+                .into_halves();
+            drop(freight);
             let mut fds = Vec::new();
             for _ in 0..sys::MAX_FDS {
                 let file = fs::File::open("/dev/null").expect("/dev/null");
@@ -12200,7 +12537,8 @@ mod tests {
             for (copy, descriptors) in copies.into_iter().enumerate() {
                 let (client, server) = UnixStream::pair().expect("socketpair");
                 clients.push(client);
-                let outbox = bus.outbox_for(server);
+                let key = AdmissionKey::Instance(format!("holder-{which}-{copy}"));
+                let outbox = bus.outbox_for(server, quota.share_of(&key).queued);
                 let index = which.saturating_mul(2).saturating_add(copy);
                 bus.join(
                     &outbox,
@@ -12213,12 +12551,12 @@ mod tests {
                     .expect("queue descriptor frame");
             }
         }
-        assert!(quota.take_fds(1).is_err(), "the descriptor budget was not full");
+        assert!(quota.take_fds(&probe, 1).is_err(), "the descriptor budget was not full");
         // Every underlying batch is shared by two recipients. Relieving only
         // one largest queue drops one Arc clone and returns no global charge;
         // the retry must continue until the sibling is gone too.
         let mut relieved = 0usize;
-        while quota.take_fds(1).is_err() {
+        while quota.take_fds(&probe, 1).is_err() {
             assert!(
                 bus.relieve_largest_descriptors().is_some(),
                 "no descriptor holder was relieved"
@@ -12227,8 +12565,20 @@ mod tests {
             assert!(relieved <= MAX_CONNECTIONS, "descriptor relief did not converge");
         }
         assert!(relieved >= 2, "shared ownership was not exercised");
+        // The bus has room because one batch's last clone went; the two
+        // recipient KEYS that held that batch have their shares back too, and
+        // no other key does: a recipient's share is returned with its copy,
+        // as the bus's count is with the last.
+        let freed = (0..batches)
+            .flat_map(|which| (0..2).map(move |copy| (which, copy)))
+            .filter(|(which, copy)| {
+                let key = AdmissionKey::Instance(format!("holder-{which}-{copy}"));
+                queued_share_is_free(&quota, &key)
+            })
+            .count();
+        assert_eq!(freed, 2, "relief gave {freed} keys their share back rather than two");
         let returned = quota
-            .take_fds(sys::MAX_FDS)
+            .take_fds(&probe, sys::MAX_FDS)
             .expect("relieving one holder returned its descriptor batch");
         drop(returned);
         drop(clients);
@@ -12240,7 +12590,7 @@ mod tests {
     #[test]
     fn a_connection_returns_its_freight_to_the_bus_when_it_ends() {
         let quota = Quota::new();
-        {
+        let key = {
             let (_client, server) = UnixStream::pair().expect("socketpair");
             let guid = Guid::new(GUID).expect("guid");
             let bus = Bus::new();
@@ -12249,18 +12599,618 @@ mod tests {
             let mut connection = accepted.expect("accept");
             let spare = fs::File::open("/dev/null").expect("/dev/null");
             let owned: OwnedFd = spare.into();
-            let charge = quota.take_fds(1).expect("charge the freight");
+            let charge = quota
+                .take_fds(&connection.key, 1)
+                .expect("charge the freight");
             connection
                 .freight_charge
                 .absorb(charge)
                 .expect("one quota supplies both charges");
             connection.freight.push(owned);
+            connection.key.clone()
+        };
+        // The connection is gone; what it held is back, to its key's share
+        // and to the bus: the key's whole share is free again, and four
+        // shares fill the bus exactly.
+        let mine = quota
+            .take_fds(&key, MAX_QUEUED_FDS_PER_INSTANCE)
+            .expect("the freight was returned to its share");
+        let mut rest = Vec::new();
+        for which in 1..MAX_QUEUED_FDS_TOTAL / MAX_QUEUED_FDS_PER_INSTANCE {
+            let other = AdmissionKey::Instance(format!("other-{which}"));
+            rest.push(
+                quota
+                    .take_fds(&other, MAX_QUEUED_FDS_PER_INSTANCE)
+                    .expect("the freight was returned to the bus"),
+            );
         }
-        // The connection is gone; what it held is back.
-        let whole = quota
-            .take_fds(MAX_QUEUED_FDS_TOTAL)
-            .expect("the freight was returned");
-        drop(whole);
+        drop((mine, rest));
+    }
+
+    /// Relief serves the bus's ceiling and nothing else. A retry that comes
+    /// back OVER SHARE, because another connection of the same key filled the
+    /// share between the relief and the retry, ends the loop at once with
+    /// that refusal: it is one no relief can clear, and a loop that went on
+    /// would evict holder after holder for pressure that is the sender's
+    /// own. Scripted, since the race is between two connections of one key
+    /// and a live bus cannot be made to lose it on cue.
+    #[test]
+    fn relief_stops_at_a_share_refusal_it_cannot_clear() {
+        let key = AdmissionKey::Instance("racing".to_string());
+        let mut takes = 0usize;
+        let mut reliefs = 0usize;
+        let (outcome, relieved) = charge_under_pressure(
+            DescriptorRefusal::OverBus {
+                wanted: MAX_QUEUED_FDS_TOTAL.saturating_add(1),
+            },
+            || {
+                takes = takes.saturating_add(1);
+                Err(DescriptorRefusal::OverShare {
+                    key: key.clone(),
+                    wanted: MAX_QUEUED_FDS_PER_INSTANCE.saturating_add(1),
+                })
+            },
+            || {
+                reliefs = reliefs.saturating_add(1);
+                Some(":1.7".to_string())
+            },
+        );
+        assert!(
+            matches!(outcome, Err(DescriptorRefusal::OverShare { .. })),
+            "a share refusal met during relief was not the outcome"
+        );
+        assert_eq!(
+            (relieved, reliefs, takes),
+            (1, 1, 1),
+            "relief went on past a share refusal it cannot clear"
+        );
+    }
+
+    /// The same loop goes on while the BUS alone refuses, one relief per
+    /// retry, and stops when either the charge is taken or nobody is left to
+    /// relieve; the count it reports is the holders it cost.
+    #[test]
+    fn relief_goes_on_while_the_bus_alone_refuses() {
+        let quota = Quota::new();
+        let key = AdmissionKey::Instance("patient".to_string());
+        let over = || DescriptorRefusal::OverBus {
+            wanted: MAX_QUEUED_FDS_TOTAL.saturating_add(1),
+        };
+        let mut attempts = vec![
+            Err(over()),
+            Ok(quota.take_fds(&key, 1).expect("a charge to hand back")),
+        ]
+        .into_iter();
+        let (outcome, relieved) = charge_under_pressure(
+            over(),
+            || attempts.next().expect("the script ran out"),
+            || Some(":1.7".to_string()),
+        );
+        assert!(outcome.is_ok(), "the bus made room and the charge was not taken");
+        assert_eq!(relieved, 2, "the reliefs reported are not the reliefs made");
+        drop(outcome);
+
+        let (outcome, relieved) = charge_under_pressure(over(), || Err(over()), || None);
+        assert!(
+            matches!(outcome, Err(DescriptorRefusal::OverBus { .. })),
+            "an empty bus that still refuses was not reported as the bus refusing"
+        );
+        assert_eq!(relieved, 0, "a relief was counted where nobody was relieved");
+    }
+
+    /// Whether `key`'s QUEUED share is wholly free: the count a holder's
+    /// attachments are charged to, which `take_fds` does not touch.
+    fn queued_share_is_free(quota: &Quota, key: &AdmissionKey) -> bool {
+        DescriptorCharge::take(
+            &quota.share_of(key).queued,
+            MAX_QUEUED_FDS_PER_INSTANCE,
+            MAX_QUEUED_FDS_PER_INSTANCE,
+        )
+        .is_ok()
+    }
+
+    /// A peer on `bus` whose queue holds one frame carrying a message's worth
+    /// of descriptors, held under `key`: the bus half of a freight charge
+    /// travels with them and the key's share is charged as the frame is
+    /// queued. Nothing drains the queue, so both stand until the outbox is
+    /// closed or dropped.
+    fn queued_holder(
+        quota: &Quota,
+        bus: &Bus,
+        key: &AdmissionKey,
+        pid: i32,
+    ) -> (UnixStream, Arc<crate::registry::Outbox>) {
+        let (charge, freight) = quota
+            .take_fds(key, sys::MAX_FDS)
+            .expect("charge a holder's batch")
+            .into_halves();
+        drop(freight);
+        let mut fds = Vec::new();
+        for _ in 0..sys::MAX_FDS {
+            let file = fs::File::open("/dev/null").expect("/dev/null");
+            let fd: OwnedFd = file.into();
+            fds.push(fd);
+        }
+        let descriptors = Descriptors::new(fds, charge).expect("matching descriptor charge");
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let outbox = bus.outbox_for(server, quota.share_of(key).queued);
+        bus.join(&outbox, this_uid(), pid).expect("join the holder");
+        outbox
+            .push_frame(QueuedFrame::carrying(vec![0], descriptors))
+            .expect("queue the holder's frame");
+        (client, outbox)
+    }
+
+    /// A sender whose key is at its share of UNCLAIMED freight is refused,
+    /// as one connection at its unclaimed bound is, and nobody else pays: a
+    /// holder of another key's descriptors keeps every one of them queued,
+    /// where the same descriptor arriving under bus pressure would have
+    /// relieved it (the test after this one).
+    #[test]
+    fn a_sender_over_its_share_is_refused_and_relieves_nobody() {
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let guid = Guid::new(GUID).expect("guid");
+        let mut connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        begin_fd_handshake(&mut connection, &mut client);
+        // Bounded: a mutation that stopped the refusal under test would
+        // otherwise leave the next pump in a read the peer never satisfies.
+        connection
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read timeout");
+        // Said Hello first: a call before it ends the connection for that
+        // reason, which says nothing about descriptors.
+        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        while connection.unique.is_none() {
+            assert!(
+                connection.pump().expect("say Hello"),
+                "the peer closed during Hello"
+            );
+        }
+        let other = AdmissionKey::Instance("other".to_string());
+        let (_holder, holder_outbox) = queued_holder(&quota, &bus, &other, 7001);
+        // The key's share, spent as unclaimed freight by its other
+        // connections.
+        let at_share = quota
+            .take_fds(&connection.key, MAX_QUEUED_FDS_PER_INSTANCE)
+            .expect("the sender's share, already spent");
+
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        let call = descriptor_call(":1.404", 7);
+        let sent = sys::send(&client, &call, &[spare.as_raw_fd()]).expect("send the call");
+        assert_eq!(sent, call.len());
+        loop {
+            match connection.pump() {
+                Ok(true) => {}
+                Ok(false) => panic!("the peer closed before its descriptor was judged"),
+                Err(Ended::Refused(why)) => {
+                    assert!(why.contains("over its share"), "{why}");
+                    break;
+                }
+                Err(other) => panic!("the descriptor ended the connection as {other:?}"),
+            }
+        }
+        assert_eq!(
+            holder_outbox.pending_descriptors(),
+            sys::MAX_FDS,
+            "a holder was relieved for another instance's pressure"
+        );
+        drop(at_share);
+    }
+
+    /// The same descriptor from a sender WITHIN its share, arriving when the
+    /// bus's ceiling is full of other keys' descriptors, relieves the holder
+    /// with the most queued and is then taken: the ceiling is the one
+    /// condition relief serves.
+    #[test]
+    fn bus_pressure_relieves_a_holder_for_a_sender_within_its_share() {
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let guid = Guid::new(GUID).expect("guid");
+        let mut connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        begin_fd_handshake(&mut connection, &mut client);
+        // Bounded: a mutation that stopped the refusal under test would
+        // otherwise leave the next pump in a read the peer never satisfies.
+        connection
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut holders = Vec::new();
+        for which in 0..MAX_QUEUED_FDS_TOTAL / sys::MAX_FDS {
+            let key = AdmissionKey::Instance(format!("holder-{which}"));
+            holders.push(queued_holder(&quota, &bus, &key, 7100 + i32::try_from(which).unwrap_or(0)));
+        }
+        let probe = AdmissionKey::Instance("probe".to_string());
+        assert!(quota.take_fds(&probe, 1).is_err(), "the bus was not full");
+
+        // Said Hello first: a call before it ends the connection for that
+        // reason, which says nothing about descriptors.
+        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        while connection.unique.is_none() {
+            assert!(
+                connection.pump().expect("say Hello"),
+                "the peer closed during Hello"
+            );
+        }
+        let answered = connection.outbox.pending();
+
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        let call = descriptor_call(":1.404", 7);
+        let sent = sys::send(&client, &call, &[spare.as_raw_fd()]).expect("send the call");
+        assert_eq!(sent, call.len());
+        // Pumped until the call is answered, about its absent destination.
+        // Each pump reads at most to the end of the frame in hand, so the
+        // descriptor is charged on the read that carries it and the call is
+        // dispatched on the read that completes it; the loop stops there
+        // rather than on a further read the socket would block.
+        let mut pumped = 0usize;
+        while connection.outbox.pending() == answered {
+            match connection.pump() {
+                Ok(true) => {}
+                Ok(false) => panic!("the peer closed before its descriptor was judged"),
+                Err(ended) => panic!("a sender within its share was ended: {ended:?}"),
+            }
+            pumped = pumped.saturating_add(1);
+            assert!(pumped < 64, "the descriptor was never judged");
+        }
+        assert!(
+            quota.take_fds(&probe, 1).is_ok(),
+            "the bus was not relieved for a sender within its share"
+        );
+        // And the sender's share is whole again: its descriptor reached no
+        // recipient, so the charge it carried was dropped with the call. A
+        // `split` that gave the bus its count back and kept the share would
+        // pass the probe above and fail here.
+        assert!(
+            quota
+                .take_fds(&connection.key, MAX_QUEUED_FDS_PER_INSTANCE)
+                .is_ok(),
+            "the sender's share was not given back with its dropped descriptor"
+        );
+        let relieved = holders
+            .iter()
+            .filter(|(_, outbox)| outbox.pending_descriptors() == 0)
+            .count();
+        assert_eq!(relieved, 1, "bus pressure relieved {relieved} holders rather than one");
+        // The relieved holder's key has its share back with its queue, and
+        // the others hold theirs.
+        let freed = (0..MAX_QUEUED_FDS_TOTAL / sys::MAX_FDS)
+            .filter(|which| {
+                let key = AdmissionKey::Instance(format!("holder-{which}"));
+                queued_share_is_free(&quota, &key)
+            })
+            .count();
+        assert_eq!(freed, 1, "relief gave {freed} holder keys their share back rather than one");
+    }
+
+    /// The share is the HOLDER's. A recipient key at its share, across two
+    /// connections that never read, costs the sender a `LimitsExceeded`
+    /// reply and nothing else: the sender's connection goes on, its own
+    /// share is untouched, and neither stalled recipient is relieved. A
+    /// draft charged the sender's key for what its recipients held, and a
+    /// recipient that stopped reading then ended an honest sender at
+    /// sixty-four attachments.
+    #[test]
+    fn a_stalled_recipient_costs_its_sender_a_refusal_not_its_connection() {
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let guid = Guid::new(GUID).expect("guid");
+        let mut connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        begin_fd_handshake(&mut connection, &mut client);
+        connection
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read timeout");
+        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        while connection.unique.is_none() {
+            assert!(
+                connection.pump().expect("say Hello"),
+                "the peer closed during Hello"
+            );
+        }
+
+        // Two recipients of one key, neither of which will read.
+        let stalled = AdmissionKey::Instance("stalled".to_string());
+        let mut recipients = Vec::new();
+        for which in 0..2 {
+            let (client, server) = UnixStream::pair().expect("socketpair");
+            let outbox = bus.outbox_for(server, quota.share_of(&stalled).queued);
+            outbox.set_unix_fd(true);
+            let name = bus
+                .join(&outbox, this_uid(), 7200 + which)
+                .expect("join a stalled recipient");
+            recipients.push((client, outbox, name));
+        }
+        // The sender's own outbox holds the Hello reply and its name signal;
+        // taken now, so what is queued next is what the calls below earn.
+        while connection.outbox.frames_pending() > 0 {
+            let _ = connection.outbox.take();
+        }
+
+        // Half the key's share to each, one attachment per call and none
+        // of them wanting a reply, so nothing comes back to the sender.
+        let mut serial = 2u32;
+        let mut spares = Vec::new();
+        for (which, (_, outbox, name)) in recipients.iter().enumerate() {
+            for queued in 1..=MAX_QUEUED_FDS_PER_INSTANCE / 2 {
+                let spare = fs::File::open("/dev/null").expect("/dev/null");
+                let call =
+                    descriptor_call_flagged(name, serial, message::FLAG_NO_REPLY_EXPECTED);
+                let sent = sys::send(&client, &call, &[spare.as_raw_fd()]).expect("send");
+                assert_eq!(sent, call.len());
+                spares.push(spare);
+                serial = serial.saturating_add(1);
+                let mut pumped = 0usize;
+                while outbox.pending_descriptors() < queued {
+                    match connection.pump() {
+                        Ok(true) => {}
+                        Ok(false) => panic!("the peer closed while filling recipient {which}"),
+                        Err(ended) => panic!("the sender was ended while filling: {ended:?}"),
+                    }
+                    pumped = pumped.saturating_add(1);
+                    assert!(pumped < 64, "attachment {queued} never reached recipient {which}");
+                }
+            }
+        }
+        assert!(
+            DescriptorCharge::take(&quota.share_of(&stalled).queued, 1, MAX_QUEUED_FDS_PER_INSTANCE)
+                .is_err(),
+            "the stalled key's queued share was not full"
+        );
+
+        // One more to the first recipient, whose own queue has room: the
+        // KEY refuses it, the sender is told, and the sender's next call
+        // is answered.
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        let (_, first_outbox, first_name) = recipients.first().expect("a recipient");
+        let call = descriptor_call(first_name, serial);
+        let sent = sys::send(&client, &call, &[spare.as_raw_fd()]).expect("send");
+        assert_eq!(sent, call.len());
+        let mut pumped = 0usize;
+        while connection.outbox.frames_pending() == 0 {
+            match connection.pump() {
+                Ok(true) => {}
+                Ok(false) => panic!("the peer closed before the refusal"),
+                Err(ended) => panic!("a stalled recipient ended its sender: {ended:?}"),
+            }
+            pumped = pumped.saturating_add(1);
+            assert!(pumped < 64, "the sender was never told");
+        }
+        let refusal = connection.outbox.take().expect("the refusal was queued");
+        assert_eq!(
+            error_of(&refusal.bytes).as_deref(),
+            Some("org.freedesktop.DBus.Error.LimitsExceeded"),
+            "a recipient key at its share was not answered as a limit"
+        );
+        assert_eq!(
+            first_outbox.pending_descriptors(),
+            MAX_QUEUED_FDS_PER_INSTANCE / 2,
+            "the refused attachment reached the recipient, or one was relieved"
+        );
+        assert!(
+            quota
+                .take_fds(&connection.key, MAX_QUEUED_FDS_PER_INSTANCE)
+                .is_ok(),
+            "what the recipients hold was charged to the sender"
+        );
+        client
+            .write_all(&bus_call("GetId", serial.saturating_add(1)))
+            .expect("write GetId");
+        let mut pumped = 0usize;
+        while connection.outbox.frames_pending() == 0 {
+            match connection.pump() {
+                Ok(true) => {}
+                Ok(false) => panic!("the peer closed after the refusal"),
+                Err(ended) => panic!("the sender did not survive the refusal: {ended:?}"),
+            }
+            pumped = pumped.saturating_add(1);
+            assert!(pumped < 64, "the sender's next call was not answered");
+        }
+        let answer = connection.outbox.take().expect("a reply");
+        let (reply, _) = message::decode(&answer.bytes, 0).expect("decode GetId");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        drop(spares);
+    }
+
+    /// A key's two counts are two counters, so a stall on one of its
+    /// connections, which fills the QUEUED count with what peers send it,
+    /// does not refuse a sibling connection's next descriptor: that sending
+    /// is charged to the FREIGHT count, which nothing but the key's own
+    /// sending fills. A draft kept one count per key, and the sibling was
+    /// disconnected for a stall that was not its sending.
+    #[test]
+    fn a_stalled_sibling_does_not_cost_a_key_its_next_descriptor() {
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let guid = Guid::new(GUID).expect("guid");
+        let mut connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        begin_fd_handshake(&mut connection, &mut client);
+        connection
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read timeout");
+        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        while connection.unique.is_none() {
+            assert!(
+                connection.pump().expect("say Hello"),
+                "the peer closed during Hello"
+            );
+        }
+        while connection.outbox.frames_pending() > 0 {
+            let _ = connection.outbox.take();
+        }
+        let key = connection.key.clone();
+        let shares = quota.share_of(&key);
+
+        // A sibling under the sender's own key, holding one message's worth,
+        // which is the key's whole queued share, and reading nothing.
+        let sibling = queued_holder(&quota, &bus, &key, 7300);
+        assert!(
+            DescriptorCharge::take(&shares.queued, 1, MAX_QUEUED_FDS_PER_INSTANCE).is_err(),
+            "the sibling did not fill the key's queued share"
+        );
+
+        // One descriptor to a recipient under another key: taken, and the
+        // sender keeps its connection and its whole freight share.
+        let other = AdmissionKey::Instance("other".to_string());
+        let (_reader, server) = UnixStream::pair().expect("socketpair");
+        let outbox = bus.outbox_for(server, quota.share_of(&other).queued);
+        outbox.set_unix_fd(true);
+        let name = bus
+            .join(&outbox, this_uid(), 7400)
+            .expect("join the recipient");
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        let call = descriptor_call_flagged(&name, 2, message::FLAG_NO_REPLY_EXPECTED);
+        let sent = sys::send(&client, &call, &[spare.as_raw_fd()]).expect("send");
+        assert_eq!(sent, call.len());
+        let mut pumped = 0usize;
+        while outbox.pending_descriptors() == 0 {
+            match connection.pump() {
+                Ok(true) => {}
+                Ok(false) => panic!("the peer closed while sending"),
+                Err(ended) => panic!("a stalled sibling ended the sender: {ended:?}"),
+            }
+            pumped = pumped.saturating_add(1);
+            assert!(pumped < 64, "the descriptor never reached the recipient");
+        }
+        assert_eq!(outbox.pending_descriptors(), 1);
+        assert_eq!(
+            shares.freight.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the freight was not given back after the hand-off"
+        );
+        assert!(
+            quota.take_fds(&key, MAX_QUEUED_FDS_PER_INSTANCE).is_ok(),
+            "what the sibling holds was charged to the key's freight"
+        );
+        assert!(
+            !Arc::ptr_eq(&shares.freight, &shares.queued),
+            "a key's two counts are one counter"
+        );
+        drop((sibling, spare));
+    }
+
+    /// The sender's freight charge is held until its recipient is charged,
+    /// so a batch in dispatch is always in some key's count. Given back at
+    /// the split, several connections of one key could each hold a batch in
+    /// dispatch that no count saw, and the bus could fill with one key's
+    /// traffic and relieve another key's holder for it. The recipient's
+    /// queue lock, held from another thread, is the barrier that stops
+    /// dispatch at the hand-off, where both counts are read.
+    #[test]
+    fn a_sender_holds_its_freight_share_until_its_recipient_is_charged() {
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let quota = Quota::new();
+        let bus = Bus::new();
+        let instances = Instances::new();
+        let guid = Guid::new(GUID).expect("guid");
+        let mut connection =
+            Connection::accept(server, guid, &quota, &bus, &instances).expect("accept");
+        begin_fd_handshake(&mut connection, &mut client);
+        connection
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read timeout");
+        client.write_all(&bus_call("Hello", 1)).expect("write Hello");
+        while connection.unique.is_none() {
+            assert!(
+                connection.pump().expect("say Hello"),
+                "the peer closed during Hello"
+            );
+        }
+        while connection.outbox.frames_pending() > 0 {
+            let _ = connection.outbox.take();
+        }
+        let freight = quota.share_of(&connection.key).freight;
+        let other = AdmissionKey::Instance("other".to_string());
+        let queued = quota.share_of(&other).queued;
+        let (_reader, server) = UnixStream::pair().expect("socketpair");
+        let outbox = bus.outbox_for(server, Arc::clone(&queued));
+        outbox.set_unix_fd(true);
+        let name = bus
+            .join(&outbox, this_uid(), 7500)
+            .expect("join the recipient");
+        let spare = fs::File::open("/dev/null").expect("/dev/null");
+        let call = descriptor_call_flagged(&name, 2, message::FLAG_NO_REPLY_EXPECTED);
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let outcome = std::thread::scope(|scope| {
+            let barrier = scope.spawn(|| {
+                let hold = outbox.hold_queue();
+                held_tx
+                    .send(())
+                    .map_err(|_| "the test went away".to_string())?;
+                // The descriptor arrives and is charged to the bus on the
+                // sender's thread, which then runs into the held lock.
+                let mut waited = 0u32;
+                while quota.queued_fds.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    waited = waited.saturating_add(1);
+                    if waited >= 10_000 {
+                        return Err("the descriptor was never charged".to_string());
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let freight_held = freight.load(std::sync::atomic::Ordering::Acquire);
+                let queued_held = queued.load(std::sync::atomic::Ordering::Acquire);
+                drop(hold);
+                if freight_held != 1 {
+                    return Err(format!(
+                        "the sender's freight share held {freight_held} mid-dispatch: \
+                         given back before its recipient was charged"
+                    ));
+                }
+                if queued_held != 0 {
+                    return Err(format!(
+                        "the recipient's key held {queued_held} before its queue took the frame"
+                    ));
+                }
+                Ok(())
+            });
+            held_rx.recv().expect("the barrier is up");
+            let sent = sys::send(&client, &call, &[spare.as_raw_fd()]).expect("send");
+            assert_eq!(sent, call.len());
+            // The descriptor arrives with the header's read, one pump before
+            // the frame is complete and dispatched, so nothing between pumps
+            // may touch the recipient's queue lock: the recipient's count,
+            // charged under that lock, is the signal that dispatch is through.
+            let mut pumped = 0usize;
+            loop {
+                match connection.pump() {
+                    Ok(true) => {}
+                    Ok(false) => panic!("the peer closed while sending"),
+                    Err(ended) => panic!("the sender was ended at the hand-off: {ended:?}"),
+                }
+                if queued.load(std::sync::atomic::Ordering::Acquire) == 1 {
+                    break;
+                }
+                pumped = pumped.saturating_add(1);
+                assert!(pumped < 64, "the descriptor never reached the recipient");
+            }
+            barrier.join().expect("the barrier thread")
+        });
+        outcome.expect("the hand-off");
+        assert_eq!(
+            freight.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the sender's share was not given back after the hand-off"
+        );
+        assert_eq!(queued.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(outbox.pending_descriptors(), 1);
+        drop(spare);
     }
 
     /// §D asks for the socket at 0600 as well as the parent at 0700. A bind

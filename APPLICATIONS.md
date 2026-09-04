@@ -1803,14 +1803,15 @@ supervised portal activation. The first bullet above is therefore discharged
 for connection admission and routing: a
 confined connection is resolved to its instance and answered accordingly, so
 all of that instance's processes share one admission key and it cannot see or
-ADDRESS the fixture or another application's peers. Not "reach": the shared
-descriptor budget below is still a way to affect a peer this filter will not
-name. It can
+ADDRESS the fixture or another application's peers. Not "reach": the bus's
+descriptor ceiling below is still a way to affect a peer this filter will
+not name, though only with several keys' shares held at once. It can
 see and reach the portal namespace, which is the grant that bullet exists to
 scope rather than something withheld.
 
-What remains of the quota issue is descriptor attribution, described below;
-the connection table no longer grants one share per process.
+The quota issue is closed on both counts: the connection table no longer
+grants one share per process, and the descriptor budget is charged to the
+admission key holding each attachment, described below.
 
 The ordering constraint this paragraph carried has been DISCHARGED rather
 than deleted, and it is worth keeping the record of why it was here. The
@@ -4043,7 +4044,7 @@ exactly the `EMFILE` it was added to prevent. The queue is therefore
 charged against a BUS-wide budget of four messages' worth, which leaves
 the connection sockets, the listener and stdio their room.
 
-**Three bounds this landing does NOT have, named so they are not
+**Four bounds this landing does NOT have, named so they are not
 rediscovered.** A served connection has no idle or authentication timeout,
 so a peer that connects and never writes holds its slot until it leaves.
 That is bounded rather than open-ended — the per-instance share above means one
@@ -4056,6 +4057,12 @@ than to the app cgroup; the descriptor budget above is the pattern a byte
 budget would follow. Third, the socket is umask-wide between `bind` and the
 `chmod` that makes it 0600 — a window the 0700 parent covers, and one that
 `umask(2)` would close at the cost of a syscall this roster does not have.
+Fourth, the descriptor budget charges a receive after `recvmsg` has
+installed its descriptors, so one message's worth per connection sits
+outside every count for the length of one pump; across every connection
+receiving at once that is the per-message cap times the connection ceiling,
+and reserving before the receive is the bound that would close it, not a
+wider budget.
 
 **The stale-socket check is narrowed, not atomic.** `bind` refuses a path
 whose socket still has a listener, which is what stops a second broker
@@ -4108,9 +4115,49 @@ or add an undeclared descriptor to this one.
 The broker-wide 256-descriptor budget includes outbound queues now that
 ownership follows a forwarded frame. If stalled recipient writers fill it,
 the receive path disconnects the connection holding the most queued
-descriptor attachments and retries once, mirroring the broker-wide byte
-remedy. It does not make the next unrelated sender the victim of pressure it
-merely observed.
+descriptor attachments and retries, up to `MAX_CONNECTIONS` times, mirroring
+the broker-wide byte remedy. It does not make the next unrelated sender the
+victim of pressure it merely observed. Each attachment is also charged to
+the admission key of the connection HOLDING it, in two counts per key with a
+quarter of the ceiling each: the sender's key's FREIGHT count while the
+descriptors are unclaimed or in dispatch across that key's connections, and
+each recipient's key's QUEUED count once a frame carrying them is queued to
+it, with no empty-queue exception, since every connection of a key holds
+nothing at some moment. The two are counted apart because different hands
+fill them: what is queued to a key is what its peers send while one of its
+connections is not reading, and one count would make a sibling connection's
+next descriptor, its own sending, the price of that stall. A recipient key
+at its queued share refuses the attachment with `LimitsExceeded` to the
+sender, as one recipient's own ceiling does, and nobody is disconnected for
+it; a sender key at its freight share is refused at the receive path, as one
+connection's unclaimed bound is, since nothing but that key's own sending
+fills the count. The sender's freight charge is held until every recipient's
+key has been charged for its copy or the message is dropped, so a batch in
+dispatch is never in nobody's count. One key's two full counts reach half
+the ceiling and cannot fill it, so relief of the largest holder needs
+several keys holding at once — several KEYS, and the bullet under "Every one
+of those was a problem between PEERS" says why one application can be more
+than one. The holder it removes is the connection holding the most queued
+attachments, a backlog that is its own to read: the shares bound what one
+key can bring to the ceiling, not which connection the remedy picks, and a
+connection below its key's share can be the largest. An unidentified peer is
+bucketed under the one unknown key for descriptors as for connections, so
+unidentified peers share one pair of counts and one of them at the freight
+share is refused for all of them; what makes a peer more than unknown is the
+lineage walk, not the broker. Two drafts are worth recording. One charged
+the SENDER's key for what recipients held, and a recipient that stopped
+reading then cost an honest sender its connection at sixty-four attachments,
+where the ceiling's remedy had cost the recipient its own; the charge
+follows the holder because the holder is what keeps the broker's descriptor
+open. The other kept one count per key for both kinds and gave the freight
+share back at dispatch, before the recipients were charged: a stall on one
+of a key's connections then refused its siblings' sending, and several
+connections of one key could each hold a batch in dispatch that no count
+saw. A share refusal met partway through relief, because another connection
+of the same key filled the freight share between one relief and the retry,
+ends relief there with that refusal: no relief can clear it, and a loop that
+went on would evict holder after holder for pressure that is the sender's
+own.
 
 ### What is landed of the bus interface
 
@@ -5449,32 +5496,37 @@ policy. Admission now resolves that identity before taking a place and keys
 the share on the registered instance, so one application's children do not
 each receive another quarter of the table.
 
-One more belongs on that list. Descriptors cross between negotiated peers,
-but the global open-descriptor budget is still shared rather than charged
-to an application instance. A jailed peer can drive that shared budget to
-its relief path and lose the connection holding the most attachments: safer
-than evicting the unrelated peer that observes the pressure, but still the
-same attribution gap as the connection table, through a different door. The
-read-only bind does not reach it because `SCM_RIGHTS` is socket-layer. The
-pid disclosure that used to stand beside it is closed: `SO_PEERCRED` gives
-the broker a pid in the INIT namespace, and a jailed or unproved caller is
-now told none, its own included, by either credentials method (rung 32).
+That last surface is closed too. Descriptors cross between negotiated peers,
+and each queued attachment is now charged to the admission key HOLDING it
+beside the bus's ceiling, in two counts a quarter of the ceiling each: the
+sender's FREIGHT count while an attachment is unclaimed or in dispatch, each
+recipient's QUEUED count once a frame carrying it is queued there. A
+recipient key at its queued share costs the sender a `LimitsExceeded` and
+nobody a connection; a sender key at its freight share is refused, since
+nothing but its own sending fills that count. Only the bus's ceiling, which
+one key's two counts cannot reach, relieves the connection holding the most
+queued attachments — bounded by the shares and reachable only with several
+keys holding at once. The read-only bind never reached this because
+`SCM_RIGHTS` is socket-layer; the charge does. The pid disclosure that used
+to stand beside it is closed the same way: `SO_PEERCRED` gives the broker a
+pid in the INIT namespace, and a jailed or unproved caller is now told none,
+its own included, by either credentials method (rung 32).
 
-Every one of those is a problem between PEERS. Firefox is the one selected
-application that holds a bus name; the first-window oracle does not drive the
-traffic needed to close the remaining availability question. The terminal
-applications `mail` and `news` ship beside it with NO
-bus policy: static td-owned programs on the empty runtime with no D-Bus client
-in them, each started by td-term at boot under the `devices=tty` grant. Step
-12 still binds the socket into their jails, so a compromised one could connect,
-and the broker would admit it as a peer that sees and addresses only the
-portal and itself. What it could then reach is the one gap above: drive the
-shared descriptor budget to its relief path. That residual is accepted for a
-terminal application and named here; it is not counted away. What can be
-machine-checked today is
-narrower: the system recipe asserts that exactly one shipped application's
-permission file carries a `[Session Bus Policy]` entry, and a second such
-entry breaks the build with a diagnostic naming what has to land with it.
+Every one of those was a problem between PEERS, and each now has a test that
+drives it through the broker. Firefox is the one selected application that
+holds a bus name; the first-window oracle drives one peer, not two
+applications' traffic on one live bus. The terminal applications `mail` and
+`news` ship beside it with NO bus policy: static td-owned programs on the
+empty runtime with no D-Bus client in them, each started by td-term at boot
+under the `devices=tty` grant. Step 12 still binds the socket into their
+jails, so a compromised one could connect, and the broker would admit it as a
+peer that sees and addresses only the portal and itself — but the two
+surfaces it could once reach, the shared descriptor budget and its own
+init-namespace pid, are the closed gaps above. What can be machine-checked
+today is narrower: the system recipe asserts that exactly one shipped
+application's permission file carries a `[Session Bus Policy]` entry, and a
+second such entry breaks the build with a diagnostic naming what has to land
+with it.
 
 Be exact about what that tripwire does NOT cover, because a gate believed
 to cover more than it does is worse than no gate. It counts
@@ -5492,11 +5544,11 @@ APPLICATIONS; the exposures are about PEERS.
   another jail with the same policy and persistent profile.
 
 The per-caller filter and per-instance admission key are now landed, so the
-connection-table condition this paragraph used to defer is discharged. The
-remaining shared descriptor budget is named above rather than hidden by that
-statement. The Settings service and its independent live Settings/Request
-client now make routed replies and a directed signal observable; a second
-bus-holding application remains a separate multi-peer expansion.
+connection-table condition this paragraph used to defer is discharged, and
+the descriptor budget is charged to the same key. The Settings service and
+its independent live Settings/Request client now make routed replies and a
+directed signal observable; a second bus-holding application remains a
+separate multi-peer expansion.
 
 ---
 
@@ -7136,7 +7188,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
 | 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
 | 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the empty runtime, `/bin/mail` and `/bin/news` launchers, and two td-svc units that run each as td-term's `--command` in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
-| 32 | **a second bus-holding application's peer attribution** — the pid half LANDED: a jailed or unproved caller is told no host pid, about itself or the broker; `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` and `GetConnectionCredentials` carries the uid without `ProcessID`, and only a caller the lineage walk proved unconfined gets one. The descriptor half, charging queued descriptors to the admission key with relief inside the instance that exceeded its share, is next, and the roster tripwire stays at one bus-holding application until it lands | a second bus-holding application shares the broker without reading a host pid through it, and without starving the first of descriptors |
+| 32 | **a second bus-holding application's peer attribution — LANDED** in the broker, in two halves. A jailed or unproved caller is told no host pid, about itself or the broker: `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` and `GetConnectionCredentials` carries the uid without `ProcessID`, and only a caller the lineage walk proved unconfined gets one. Queued descriptors are charged to the admission key HOLDING them beside the bus's ceiling, in two counts per key with a quarter of it each: the sender's freight count until every recipient is charged, each recipient's queued count once a frame is queued to it, apart so a stall on one of a key's connections does not refuse its siblings. A recipient key at its queued share costs the sender a `LimitsExceeded` reply and nobody a connection; a sender key at its freight share is refused; only the ceiling, which one key's two counts cannot reach, relieves a holder. Both halves have tests that drive them through the broker. The roster tripwire stays at one bus-holding application until the entry that lifts it brings the first two-application boot oracle | a second bus-holding application shares the broker without reading a host pid through it, and without starving the first of descriptors |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support

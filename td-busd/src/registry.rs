@@ -86,6 +86,15 @@ pub const MAX_PENDING_REPLIES: usize = 128;
 /// stalled recipient needs an explicit attachment ceiling as well.
 pub const MAX_OUTGOING_FDS: usize = 64;
 
+/// Descriptor attachments one admission key may hold queued across every
+/// connection it has, and separately may hold as unclaimed freight: the
+/// same as one connection's ceiling, so a key with sixteen connections
+/// holds what one holds, and a quarter of the bus's budget for each count,
+/// so one key's two counts reach half the ceiling and cannot fill it. The
+/// transport's `MAX_QUEUED_FDS_PER_INSTANCE` is this number, and a
+/// compile-time assertion there pins the quarter.
+pub const MAX_QUEUED_FDS_PER_KEY: usize = MAX_OUTGOING_FDS;
+
 /// How long the bus's remedy waits for a relieved connection's writer to let
 /// go of the frame it is holding. Short because `shutdown` is what releases
 /// it: a `sendmsg` on a shut-down socket returns at once, so this is a bound
@@ -118,39 +127,79 @@ pub enum Overflow {
         frames: usize,
         fds: usize,
     },
+    /// The recipient's admission key is at its share of the bus's descriptor
+    /// budget across every connection it has, so this attachment is refused
+    /// and the SENDER is told, as for one connection's own ceiling: a key's
+    /// connections together may hold what one of them may, and nobody is
+    /// disconnected for a recipient that is slow to read.
+    Share(usize),
     /// The bus's ceiling. §D calls this a broker-level condition: the fault is
     /// a policy elsewhere, so it is logged apart from an ordinary refusal.
     Bus(usize),
 }
 
-/// One charge against the broker's open-descriptor budget.
+/// One charge against one descriptor counter: the broker's open-descriptor
+/// budget, or an admission key's share of it.
 ///
-/// The charge follows ownership from the receive-side freight queue into one
-/// or more outgoing frames. Cloned broadcasts share the same descriptor
+/// A BUS charge follows ownership from the receive-side freight queue into
+/// one or more outgoing frames. Cloned broadcasts share the same descriptor
 /// owner, so the broker counts the open file description once while each
-/// recipient queue separately counts its attachment.
+/// recipient queue separately counts its attachment. A SHARE charge is the
+/// holder's and does not follow the owner: the sender's key holds it while
+/// the descriptors are unclaimed freight, and each recipient's key holds
+/// its own once a frame carrying them is queued to it, because what a key's
+/// share bounds is what that key's connections are keeping open.
 #[derive(Debug)]
 pub(crate) struct DescriptorCharge {
-    total: Arc<AtomicUsize>,
+    counter: Arc<AtomicUsize>,
     count: usize,
 }
 
 impl DescriptorCharge {
-    pub(crate) fn new(total: Arc<AtomicUsize>, count: usize) -> Self {
-        Self { total, count }
+    pub(crate) fn new(counter: Arc<AtomicUsize>, count: usize) -> Self {
+        Self { counter, count }
+    }
+
+    /// Charge `count` against `counter` up to `ceiling`, or report what it
+    /// holds. Compare-and-swap rather than fetch_add-then-check: an add that
+    /// overshoots and backs off is briefly visible to another thread as a
+    /// full counter, which refuses a peer that should have been taken.
+    pub(crate) fn take(
+        counter: &Arc<AtomicUsize>,
+        count: usize,
+        ceiling: usize,
+    ) -> Result<Self, usize> {
+        let mut held = counter.load(Ordering::Acquire);
+        loop {
+            let wanted = held.saturating_add(count);
+            if wanted > ceiling {
+                return Err(held);
+            }
+            match counter.compare_exchange_weak(held, wanted, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(Self::new(Arc::clone(counter), count)),
+                Err(seen) => held = seen,
+            }
+        }
     }
 
     pub(crate) fn count(&self) -> usize {
         self.count
     }
 
-    pub(crate) fn absorb(&mut self, mut other: Self) -> Result<(), Self> {
-        if !Arc::ptr_eq(&self.total, &other.total) {
-            return Err(other);
-        }
+    /// Whether `other` was charged against this charge's counter.
+    pub(crate) fn same_counter(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.counter, &other.counter)
+    }
+
+    /// Merge `other` into this charge. The caller has checked
+    /// `same_counter` first: a connection's bus and key are fixed at accept,
+    /// so a mismatch is an ownership invariant broken rather than peer
+    /// input, and the freight pair refuses it whole before either half is
+    /// merged.
+    pub(crate) fn merge(&mut self, mut other: Self) {
         self.count = self.count.saturating_add(other.count);
         other.count = 0;
-        Ok(())
     }
 
     pub(crate) fn split(&mut self, count: usize) -> Option<Self> {
@@ -158,14 +207,14 @@ impl DescriptorCharge {
             return None;
         }
         self.count = self.count.saturating_sub(count);
-        Some(Self::new(Arc::clone(&self.total), count))
+        Some(Self::new(Arc::clone(&self.counter), count))
     }
 }
 
 impl Drop for DescriptorCharge {
     fn drop(&mut self) {
         let _ = self
-            .total
+            .counter
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(self.count))
             });
@@ -225,6 +274,11 @@ impl Descriptors {
 pub struct QueuedFrame {
     pub bytes: Vec<u8>,
     pub descriptors: Option<Descriptors>,
+    /// The recipient key's share charge for `descriptors`, taken as the frame
+    /// joins a queue and given back when the frame is dropped: written,
+    /// cleared by `close`, or refused. Kept on the frame so its lifetime is
+    /// the attachment's and nothing has to remember to return it.
+    share: Option<DescriptorCharge>,
 }
 
 impl QueuedFrame {
@@ -232,6 +286,7 @@ impl QueuedFrame {
         Self {
             bytes,
             descriptors: None,
+            share: None,
         }
     }
 
@@ -239,6 +294,7 @@ impl QueuedFrame {
         Self {
             bytes,
             descriptors: Some(descriptors),
+            share: None,
         }
     }
 
@@ -310,6 +366,10 @@ pub struct Outbox {
     /// before the socket goes down.
     written: Condvar,
     total: Arc<AtomicUsize>,
+    /// The admission key's descriptor share this connection draws on when a
+    /// frame with attachments is queued to it, shared with every other
+    /// connection of the same key.
+    share: Arc<AtomicUsize>,
     /// The serial the broker stamps on the next message it ORIGINATES to this
     /// connection.
     ///
@@ -326,8 +386,16 @@ pub struct Outbox {
     unix_fd: AtomicBool,
 }
 
+/// A test's hold on an outbox's queue lock, as a barrier: `push_frame`
+/// stops at the lock before it charges the recipient, so the sender's side
+/// of the hand-off can be seen mid-dispatch.
+#[cfg(test)]
+pub(crate) struct QueueHold<'a> {
+    _held: std::sync::MutexGuard<'a, Queue>,
+}
+
 impl Outbox {
-    fn new(stream: UnixStream, total: Arc<AtomicUsize>) -> Self {
+    fn new(stream: UnixStream, total: Arc<AtomicUsize>, share: Arc<AtomicUsize>) -> Self {
         Self {
             stream,
             queue: Mutex::new(Queue {
@@ -343,6 +411,7 @@ impl Outbox {
             ready: Condvar::new(),
             written: Condvar::new(),
             total,
+            share,
             next_serial: AtomicU32::new(1),
             unix_fd: AtomicBool::new(false),
         }
@@ -373,7 +442,7 @@ impl Outbox {
     }
 
     /// Append bytes and their descriptor ownership for the writer thread.
-    pub fn push_frame(&self, frame: QueuedFrame) -> Result<(), Rejected> {
+    pub fn push_frame(&self, mut frame: QueuedFrame) -> Result<(), Rejected> {
         let mut queue = match self.queue.lock() {
             Ok(queue) => queue,
             // A poisoned queue belongs to a connection whose thread died
@@ -406,8 +475,27 @@ impl Outbox {
                 frame,
             });
         }
+        // The recipient KEY's descriptor share, with no empty-queue exception
+        // either: every connection of a key holds nothing at some moment, so
+        // the exception applied here would be a multiplier of sixteen. A key
+        // at its share is refused the attachment as one connection at its own
+        // ceiling is, and the SENDER is told; nothing is disconnected for it.
+        let share = if fds == 0 {
+            None
+        } else {
+            match DescriptorCharge::take(&self.share, fds, MAX_QUEUED_FDS_PER_KEY) {
+                Ok(charge) => Some(charge),
+                Err(held) => {
+                    return Err(Rejected {
+                        why: Overflow::Share(held),
+                        frame,
+                    })
+                }
+            }
+        };
         // The bus's budget, taken before the frame joins the queue so the two
-        // counts cannot disagree.
+        // counts cannot disagree. A refusal below drops `share` on the way
+        // out, so a refused frame is charged to nobody.
         //
         // NO empty-queue exception here, and that asymmetry is the point. The
         // exception exists so one legal message is always deliverable to one
@@ -439,6 +527,7 @@ impl Outbox {
         }
         queue.bytes = queue.bytes.saturating_add(size);
         queue.fds = queue.fds.saturating_add(fds);
+        frame.share = share;
         queue.frames.push_back(frame);
         drop(queue);
         self.ready.notify_one();
@@ -452,6 +541,21 @@ impl Outbox {
     /// disconnects an innocent peer instead.
     pub fn pending(&self) -> usize {
         self.queue.lock().map(|queue| queue.held()).unwrap_or(0)
+    }
+
+    /// Frames in the deque and not yet taken by a writer, for a test that
+    /// reads a queue nothing drains.
+    #[cfg(test)]
+    pub(crate) fn frames_pending(&self) -> usize {
+        self.queue.lock().map(|queue| queue.frames.len()).unwrap_or(0)
+    }
+
+    /// The queue's lock, for a test to hold as a barrier at the hand-off.
+    #[cfg(test)]
+    pub(crate) fn hold_queue(&self) -> QueueHold<'_> {
+        QueueHold {
+            _held: self.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
     }
 
     /// Descriptor attachments this connection is holding, queued or in the
@@ -1073,8 +1177,8 @@ impl Bus {
     /// Make an outbox for a connection, before it has a name. A connection has
     /// a socket and a queue from the moment it is accepted; what `Hello` adds
     /// is the NAME, and until then nothing can address it.
-    pub fn outbox_for(&self, stream: UnixStream) -> Arc<Outbox> {
-        Arc::new(Outbox::new(stream, Arc::clone(&self.total_outgoing)))
+    pub fn outbox_for(&self, stream: UnixStream, share: Arc<AtomicUsize>) -> Arc<Outbox> {
+        Arc::new(Outbox::new(stream, Arc::clone(&self.total_outgoing), share))
     }
 
     /// `Hello`: assign this connection its unique name and publish it.
@@ -2081,6 +2185,11 @@ mod tests {
         UnixStream::pair().expect("socketpair")
     }
 
+    /// A key share nothing else draws on.
+    fn fresh_share() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
     /// Names are handed out in order and never reused. A recycled name would
     /// let a message addressed to one connection arrive at whoever took its
     /// place — the exact confusion a unique name exists to prevent.
@@ -2089,8 +2198,8 @@ mod tests {
         let bus = Bus::new();
         let (_a, sa) = pair();
         let (_b, sb) = pair();
-        let first = bus.outbox_for(sa);
-        let second = bus.outbox_for(sb);
+        let first = bus.outbox_for(sa, fresh_share());
+        let second = bus.outbox_for(sb, fresh_share());
         assert_eq!(bus.join(&first, 1000, 4001).expect("join"), ":1.1");
         assert_eq!(bus.join(&second, 1000, 4002).expect("join"), ":1.2");
         assert_eq!(bus.names(), vec![":1.1".to_string(), ":1.2".to_string()]);
@@ -2103,7 +2212,7 @@ mod tests {
         assert!(bus.route(":1.1").is_none(), "a departed name still routes");
 
         let (_c, sc) = pair();
-        let third = bus.outbox_for(sc);
+        let third = bus.outbox_for(sc, fresh_share());
         assert_eq!(
             bus.join(&third, 1000, 4003).expect("join"),
             ":1.3",
@@ -2241,7 +2350,7 @@ mod tests {
     fn one_connection_queues_to_its_ceiling_and_no_further() {
         let bus = Bus::new();
         let (_client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         // An empty queue takes anything, however large.
         outbox
             .push(vec![0u8; MAX_OUTGOING_BYTES + 1])
@@ -2259,7 +2368,7 @@ mod tests {
     fn a_flood_of_tiny_messages_is_bounded_by_count() {
         let bus = Bus::new();
         let (_client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         for which in 0..MAX_OUTGOING_MESSAGES {
             if let Err(why) = outbox.offer(vec![0u8; 1]) {
                 panic!("frame {which} refused: {why:?}");
@@ -2291,16 +2400,13 @@ mod tests {
     fn descriptor_attachments_are_bounded_per_recipient() {
         let bus = Bus::new();
         let (_client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         for which in 0..MAX_OUTGOING_FDS {
             let file = std::fs::File::open("/dev/null").expect("/dev/null");
             let fd: OwnedFd = file.into();
             let total = Arc::new(AtomicUsize::new(1));
-            let descriptors = Descriptors::new(
-                vec![fd],
-                DescriptorCharge::new(total, 1),
-            )
-            .expect("one descriptor and one charge");
+            let descriptors = Descriptors::new(vec![fd], DescriptorCharge::new(total, 1))
+                .expect("one descriptor and one charge");
             if let Err(rejected) = outbox.push_frame(QueuedFrame::carrying(vec![0], descriptors)) {
                 panic!("descriptor frame {which} refused: {:?}", rejected.why);
             }
@@ -2325,6 +2431,67 @@ mod tests {
         }
     }
 
+    /// One frame carrying one descriptor, charged to a bus counter that is
+    /// not under test.
+    fn one_attachment() -> QueuedFrame {
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let fd: OwnedFd = file.into();
+        let descriptors = Descriptors::new(
+            vec![fd],
+            DescriptorCharge::new(Arc::new(AtomicUsize::new(1)), 1),
+        )
+        .expect("one descriptor and one charge");
+        QueuedFrame::carrying(vec![0], descriptors)
+    }
+
+    /// The attachment ceiling is also a KEY's, across every connection of
+    /// it: two recipients drawing on one share hold one connection's worth
+    /// between them, the refusal names the share rather than either queue,
+    /// a frame written or dropped gives the share back, and no empty-queue
+    /// exception lets a second connection of the key start over.
+    #[test]
+    fn descriptor_attachments_are_bounded_per_key_across_recipients() {
+        let bus = Bus::new();
+        let share = fresh_share();
+        let (_first_client, first_server) = pair();
+        let (_second_client, second_server) = pair();
+        let first = bus.outbox_for(first_server, Arc::clone(&share));
+        let second = bus.outbox_for(second_server, Arc::clone(&share));
+        for which in 0..MAX_QUEUED_FDS_PER_KEY {
+            let outbox = if which % 2 == 0 { &first } else { &second };
+            if let Err(rejected) = outbox.push_frame(one_attachment()) {
+                panic!("attachment {which} refused: {:?}", rejected.why);
+            }
+        }
+        assert_eq!(share.load(Ordering::Acquire), MAX_QUEUED_FDS_PER_KEY);
+        for outbox in [&first, &second] {
+            match outbox.push_frame(one_attachment()) {
+                Err(Rejected {
+                    why: Overflow::Share(held),
+                    ..
+                }) => assert_eq!(held, MAX_QUEUED_FDS_PER_KEY),
+                other => panic!("the key's share did not refuse: {other:?}"),
+            }
+        }
+        // A refused frame charged nothing.
+        assert_eq!(share.load(Ordering::Acquire), MAX_QUEUED_FDS_PER_KEY);
+        // Written from one connection, room for one on the other.
+        let written = first.take().expect("a frame to write");
+        assert_eq!(share.load(Ordering::Acquire), MAX_QUEUED_FDS_PER_KEY);
+        drop(written);
+        assert_eq!(share.load(Ordering::Acquire), MAX_QUEUED_FDS_PER_KEY - 1);
+        second
+            .push_frame(one_attachment())
+            .expect("a written attachment made room on the key");
+        // Closing one connection gives back everything it was holding.
+        second.close();
+        assert_eq!(
+            share.load(Ordering::Acquire),
+            MAX_QUEUED_FDS_PER_KEY / 2 - 1,
+            "a closed queue kept its attachments on the key's share"
+        );
+    }
+
     /// The COUNT ceiling counts the writer's frame too.
     ///
     /// A draft counted `frames.len()` alone, so taking one frame off the deque
@@ -2334,7 +2501,7 @@ mod tests {
     fn the_count_ceiling_counts_the_frame_in_the_writers_hands() {
         let bus = Bus::new();
         let (_client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         for which in 0..MAX_OUTGOING_MESSAGES {
             if let Err(why) = outbox.offer(vec![0u8; 1]) {
                 panic!("frame {which} refused: {why:?}");
@@ -2365,7 +2532,7 @@ mod tests {
         for _ in 0..8 {
             let (client, server) = pair();
             held.push(client);
-            boxes.push(bus.outbox_for(server));
+            boxes.push(bus.outbox_for(server, fresh_share()));
         }
         // Each takes one whole message, which its OWN ceiling allows. The
         // bus's does not, and it is the bus's that has to bind.
@@ -2412,7 +2579,7 @@ mod tests {
         for which in 0..3usize {
             let (client, server) = pair();
             kept.push(client);
-            let outbox = bus.outbox_for(server);
+            let outbox = bus.outbox_for(server, fresh_share());
             let name = bus
                 .join(&outbox, 1000, 5000 + which as i32)
                 .expect("join");
@@ -2462,7 +2629,7 @@ mod tests {
 
         let bus = Bus::new();
         let (client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         let writing = Arc::clone(&outbox);
         let writer = std::thread::spawn(move || {
             while let Some(frame) = writing.take() {
@@ -2533,13 +2700,13 @@ mod tests {
         // A bystander holding a frame, so the count has somewhere to fall to
         // that is not zero.
         let (_watching, watched) = pair();
-        let bystander = bus.outbox_for(watched);
+        let bystander = bus.outbox_for(watched, fresh_share());
         bystander
             .push(vec![0u8; MAX_OUTGOING_BYTES])
             .expect("the bystander's frame");
 
         let (client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         let writing = Arc::clone(&outbox);
         let writer = std::thread::spawn(move || {
             while let Some(frame) = writing.take() {
@@ -2589,7 +2756,7 @@ mod tests {
     fn closing_does_not_free_bytes_the_writer_still_holds() {
         let bus = Bus::new();
         let (_client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         outbox.push(vec![0u8; 4096]).expect("push");
 
         let frame = outbox.take().expect("a frame to write");
@@ -2617,7 +2784,7 @@ mod tests {
         for which in 0..3usize {
             let (client, server) = pair();
             kept.push(client);
-            let outbox = bus.outbox_for(server);
+            let outbox = bus.outbox_for(server, fresh_share());
             bus.join(&outbox, 1000, 9300 + which as i32).expect("join");
         }
         assert_eq!(bus.queued_bytes(), 0);
@@ -2645,7 +2812,7 @@ mod tests {
         for which in 0..4usize {
             let (client, server) = pair();
             kept.push(client);
-            let outbox = bus.outbox_for(server);
+            let outbox = bus.outbox_for(server, fresh_share());
             bus.join(&outbox, 1000, 9200 + which as i32).expect("join");
             outbox.push(vec![0u8; MAX_OUTGOING_BYTES]).expect("push");
             let writing = Arc::clone(&outbox);
@@ -2672,7 +2839,7 @@ mod tests {
 
         let (client, server) = pair();
         kept.push(client);
-        let latecomer = bus.outbox_for(server);
+        let latecomer = bus.outbox_for(server, fresh_share());
         assert!(matches!(
             latecomer.offer(vec![0u8; 8]),
             Err(Overflow::Bus(_))
@@ -2701,7 +2868,7 @@ mod tests {
         for which in 0..4usize {
             let (client, server) = pair();
             kept.push(client);
-            let outbox = bus.outbox_for(server);
+            let outbox = bus.outbox_for(server, fresh_share());
             bus.join(&outbox, 1000, 9000 + which as i32).expect("join");
             outbox.push(vec![0u8; MAX_OUTGOING_BYTES]).expect("push");
             boxes.push(outbox);
@@ -2711,7 +2878,7 @@ mod tests {
         // One more byte does not fit anywhere.
         let (client, server) = pair();
         kept.push(client);
-        let latecomer = bus.outbox_for(server);
+        let latecomer = bus.outbox_for(server, fresh_share());
         assert!(matches!(
             latecomer.offer(vec![0u8; 8]),
             Err(Overflow::Bus(_))
@@ -2731,7 +2898,7 @@ mod tests {
     fn closing_a_connection_returns_its_queue_to_the_bus() {
         let bus = Bus::new();
         let (_client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         outbox.offer(vec![0u8; 4096]).expect("push");
         assert_eq!(bus.queued_bytes(), 4096);
         outbox.close();
@@ -2757,7 +2924,7 @@ mod tests {
 
         let bus = Bus::new();
         let (mut client, server) = pair();
-        let outbox = bus.outbox_for(server);
+        let outbox = bus.outbox_for(server, fresh_share());
         let writing = Arc::clone(&outbox);
         let writer = std::thread::spawn(move || {
             while let Some(frame) = writing.take() {
