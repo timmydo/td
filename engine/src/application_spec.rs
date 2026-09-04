@@ -105,6 +105,13 @@ const PINNED_ENVIRONMENT: &[&str] = &[
     "XDG_RUNTIME_DIR",
 ];
 
+/// Supplied by the launcher under `devices=tty`, not by a manifest: td-jail
+/// forwards the terminal name it was started on and binds that one terminal
+/// description at the path it names. A manifest value would be refused at
+/// launch, which is the compiles-and-cannot-start shape the list above exists
+/// to prevent, so it is refused here, where the packager has the manifest.
+const TERMINAL_ENVIRONMENT: &[&str] = &["TERM", "TERMINFO"];
+
 const BASE_ENVIRONMENT: &[(&str, &str)] = &[
     ("GDK_BACKEND", "wayland"),
     ("GTK_A11Y", "none"),
@@ -181,6 +188,11 @@ impl ApplicationSpec {
             if PINNED_ENVIRONMENT.contains(&name) {
                 return Err(format!(
                     "application environment {name:?} is fixed by the jail contract and cannot be set by a manifest"
+                ));
+            }
+            if permissions.terminal() && TERMINAL_ENVIRONMENT.contains(&name) {
+                return Err(format!(
+                    "application environment {name:?} is supplied by the devices=tty grant and cannot be set by a manifest"
                 ));
             }
             environment.insert(name.to_string(), value.to_string());
@@ -699,6 +711,32 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.contains("fixed by the jail contract"), "{name}: {error}");
+        }
+    }
+
+    /// `TERM` and `TERMINFO` are the terminal grant's to supply. Without the
+    /// grant a manifest may still set them: there is no terminal for the
+    /// value to misdescribe.
+    #[test]
+    fn terminal_environment_is_refused_only_under_the_terminal_grant() {
+        for name in ["TERM", "TERMINFO"] {
+            let manifest = ApplicationDeclaration::new("empty-runtime", "/app/bin/rg")
+                .unwrap()
+                .with_environment(name, "dumb")
+                .unwrap()
+                .manifest("ripgrep-seed", "15.2.0", ApplicationProvenance::Foreign)
+                .unwrap();
+            let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1";
+            let error = ApplicationSpec::compile(
+                &manifest,
+                runtime,
+                PermissionPolicy::new().with_terminal().unwrap(),
+            )
+            .unwrap_err();
+            assert!(error.contains("supplied by the devices=tty grant"), "{name}: {error}");
+            let spec = ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new())
+                .unwrap();
+            assert_eq!(spec.environment.get(name).map(String::as_str), Some("dumb"));
         }
     }
 

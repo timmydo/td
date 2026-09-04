@@ -58,6 +58,24 @@ pub(crate) const MAX_APPLICATION_NAME_BYTES: usize = 32;
 pub(crate) const MAX_ENVIRONMENT_ENTRIES: usize = 256;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4096;
+/// terminfo names are short; 64 bytes covers every real one with room.
+const MAX_TERMINAL_NAME_BYTES: usize = 64;
+/// The image's terminal description database, a store symlink like the CA
+/// bundle, and the path the jail binds one entry of it at. Only product mode
+/// has one; host mode refuses the terminal grant.
+const TERMINFO_PATH: &str = "/etc/terminfo";
+pub(crate) const APPLICATION_TERMINFO_PATH: &str = "/etc/terminfo";
+const MAX_TERMINFO_ENTRY_BYTES: u64 = 64 * 1024;
+/// `TERM` and `TERMINFO`, which the grant derives beyond the compiled spec's
+/// own entries. The spec's ceilings are the compiler's; these two are the
+/// launcher's, bounded here so each side keeps one number.
+pub(crate) const TERMINAL_ENVIRONMENT_ENTRIES: usize = 2;
+const TERMINAL_ENVIRONMENT_BYTES: usize = "TERM".len()
+    + MAX_TERMINAL_NAME_BYTES
+    + 2
+    + "TERMINFO".len()
+    + APPLICATION_TERMINFO_PATH.len()
+    + 2;
 const MAX_ENTRY_BYTES: usize = 4096;
 const MAX_APPLICATION_ARGUMENTS: usize = 256;
 const MAX_APPLICATION_ARGUMENT_BYTES: usize = 64 * 1024;
@@ -125,6 +143,11 @@ pub(crate) struct LaunchPlan {
     pub(crate) environment: Vec<(OsString, OsString)>,
     pub(crate) loader_library_path: Option<String>,
     pub(crate) arguments: Vec<OsString>,
+    /// `devices=tty`: stage 1 acquires the launcher's fresh terminal as the
+    /// session's controlling terminal and stage 2 hands it to the entry.
+    pub(crate) terminal: bool,
+    /// Present exactly when `terminal` is: the description stage 1 binds.
+    pub(crate) terminfo: Option<ResolvedTerminfo>,
     pub(crate) outside_uid: u32,
     pub(crate) outside_gid: u32,
     pub(crate) inside_uid: u32,
@@ -146,6 +169,10 @@ struct ProductConfig {
     /// `/etc/timezone` would both break the fixture-owned-input contract and
     /// refuse every empty-runtime fixture on a machine that names a zone.
     timezone: Option<PathBuf>,
+    /// The terminal description database the `devices=tty` grant binds one
+    /// entry of, or `None` for host mode, which refuses the grant for the
+    /// same fixture-owned-input reason as the zone.
+    terminfo: Option<PathBuf>,
     real_home: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
     enforce_cgroup: bool,
@@ -237,6 +264,15 @@ pub(crate) struct ResolvedFile {
 /// only inside a jail, which is where this resolves it.
 #[derive(Debug)]
 pub(crate) struct ResolvedTimezone {
+    pub(crate) name: String,
+    pub(crate) file: ResolvedFile,
+}
+
+/// The launcher's terminal name and the one description the image's database
+/// holds for it, bound at `/etc/terminfo/<c>/<name>` so a terminfo reader in
+/// the jail describes the terminal it was actually given.
+#[derive(Debug)]
+pub(crate) struct ResolvedTerminfo {
     pub(crate) name: String,
     pub(crate) file: ResolvedFile,
 }
@@ -377,11 +413,22 @@ where
         )));
     }
 
-    let environment = spec
+    let terminal = spec.permissions.terminal();
+    let terminfo = if terminal {
+        let name = terminal_name(std::env::var_os("TERM"))?;
+        let file = resolve_terminfo_entry(config.terminfo.as_deref(), &name)?;
+        Some(ResolvedTerminfo { name, file })
+    } else {
+        None
+    };
+    let mut environment = spec
         .environment
         .iter()
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect::<Vec<_>>();
+    if let Some(terminfo) = &terminfo {
+        environment = with_terminal_environment(environment, &terminfo.name)?;
+    }
     let pulse_requested = spec
         .permissions
         .sockets()
@@ -391,6 +438,7 @@ where
         inside_identity.0,
         spec.loader_library_path.as_deref(),
         pulse_requested,
+        terminal,
     )?;
     let (wayland_socket, bus_socket, runtime_root) = if config.host_mode {
         host_session_sockets(outside_identity, config.runtime_root.as_deref())?
@@ -545,6 +593,8 @@ where
         environment,
         loader_library_path: spec.loader_library_path,
         arguments,
+        terminal,
+        terminfo,
         outside_uid: outside_identity.0,
         outside_gid: outside_identity.1,
         inside_uid: inside_identity.0,
@@ -592,6 +642,7 @@ fn target_config() -> io::Result<ProductConfig> {
         ca_bundle,
         resolv_conf: PathBuf::from(RESOLV_CONF_PATH),
         timezone: Some(PathBuf::from(TIMEZONE_PATH)),
+        terminfo: Some(PathBuf::from(TERMINFO_PATH)),
         real_home: None,
         runtime_root: None,
         enforce_cgroup: true,
@@ -725,6 +776,7 @@ fn host_config(path: &Path, identity: (u32, u32)) -> io::Result<ProductConfig> {
         ca_bundle,
         resolv_conf,
         timezone: None,
+        terminfo: None,
         real_home: Some(real_home),
         runtime_root: Some(runtime_root),
         enforce_cgroup: false,
@@ -818,11 +870,23 @@ pub(crate) fn validate_environment_list(
     uid: u32,
     loader_library_path: Option<&str>,
     pulse_requested: bool,
+    terminal: bool,
 ) -> io::Result<()> {
     validate_stage2_loader_library_path(loader_library_path)?;
-    if environment.len() > MAX_ENVIRONMENT_ENTRIES {
+    // The grant's two derived entries sit outside the compiled spec's
+    // ceilings, so a spec the compiler admitted is never refused here for
+    // the launcher's own additions.
+    let (max_entries, max_bytes) = if terminal {
+        (
+            MAX_ENVIRONMENT_ENTRIES + TERMINAL_ENVIRONMENT_ENTRIES,
+            MAX_APPLICATION_SPEC_BYTES + TERMINAL_ENVIRONMENT_BYTES,
+        )
+    } else {
+        (MAX_ENVIRONMENT_ENTRIES, MAX_APPLICATION_SPEC_BYTES)
+    };
+    if environment.len() > max_entries {
         return Err(invalid(format!(
-            "application environment exceeds {MAX_ENVIRONMENT_ENTRIES} entries"
+            "application environment exceeds {max_entries} entries"
         )));
     }
     let mut bytes = 0usize;
@@ -843,9 +907,9 @@ pub(crate) fn validate_environment_list(
             .and_then(|size| size.checked_add(value.len()))
             .and_then(|size| size.checked_add(2))
             .ok_or_else(|| invalid("application environment size overflow"))?;
-        if bytes > MAX_APPLICATION_SPEC_BYTES {
+        if bytes > max_bytes {
             return Err(invalid(format!(
-                "application environment exceeds {MAX_APPLICATION_SPEC_BYTES} bytes"
+                "application environment exceeds {max_bytes} bytes"
             )));
         }
         previous = Some(key);
@@ -882,6 +946,24 @@ pub(crate) fn validate_environment_list(
         .any(|(key, value)| key == "FLATPAK_ID" && !value.is_empty())
     {
         return Err(invalid("application environment lacks FLATPAK_ID"));
+    }
+    if terminal {
+        let term = environment.iter().find_map(|(key, value)| {
+            (key == "TERM").then(|| value.to_string_lossy().into_owned())
+        });
+        if !term.as_deref().is_some_and(valid_terminal_name) {
+            return Err(invalid(format!(
+                "application environment TERM is {term:?}, expected the terminal grant's name"
+            )));
+        }
+        let terminfo = environment.iter().find_map(|(key, value)| {
+            (key == "TERMINFO").then(|| value.to_string_lossy().into_owned())
+        });
+        if terminfo.as_deref() != Some(APPLICATION_TERMINFO_PATH) {
+            return Err(invalid(format!(
+                "application environment TERMINFO is {terminfo:?}, expected {APPLICATION_TERMINFO_PATH:?}"
+            )));
+        }
     }
     let actual_loader_library_path = environment.iter().find_map(|(key, value)| {
         (key == "LD_LIBRARY_PATH").then(|| value.to_string_lossy().into_owned())
@@ -2050,6 +2132,107 @@ pub(crate) fn validate_entry(entry: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The `TERM` a terminal grant forwards is the launcher's own: the terminal
+/// it hands over is the launcher's stdio, and nothing else describes it. The
+/// spec may not carry one, an absent one is refused rather than defaulted,
+/// and the value must fit the closed terminal-name grammar
+/// `[A-Za-z0-9._+-]{1,64}` rather than pass through as arbitrary bytes.
+pub(crate) fn terminal_name(launcher_term: Option<OsString>) -> io::Result<String> {
+    let value = launcher_term
+        .ok_or_else(|| invalid("terminal grant requires TERM in the launcher environment"))?;
+    let name = value
+        .to_str()
+        .ok_or_else(|| invalid("launcher TERM is not UTF-8"))?;
+    if !valid_terminal_name(name) {
+        return Err(invalid(format!(
+            "launcher TERM {name:?} is outside the terminal-name grammar"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+/// `[A-Za-z0-9._+-]{1,64}`: a terminfo name, and by the same grammar a
+/// single plain path component when it is joined onto the database.
+pub(crate) fn valid_terminal_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TERMINAL_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+/// `<c>/<name>` under a terminfo root, the layout every terminfo reader
+/// expects: the first byte of the name is the directory.
+pub(crate) fn terminfo_entry_relative(name: &str) -> io::Result<String> {
+    if !valid_terminal_name(name) {
+        return Err(invalid(
+            "terminal name is outside the terminal-name grammar",
+        ));
+    }
+    let first = name
+        .get(..1)
+        .ok_or_else(|| invalid("terminal name is empty"))?;
+    Ok(format!("{first}/{name}"))
+}
+
+/// Under `devices=tty` the spec's environment gains `TERM`, the launcher's
+/// name, and `TERMINFO`, the jail path of the one description stage 1 binds.
+/// A spec that sets either is refused: the compiler refuses them first, and
+/// this is the launcher's half of that agreement. Each is inserted where the
+/// strict order the validator requires puts it.
+pub(crate) fn with_terminal_environment(
+    mut environment: Vec<(OsString, OsString)>,
+    name: &str,
+) -> io::Result<Vec<(OsString, OsString)>> {
+    for (key, value) in [("TERM", name), ("TERMINFO", APPLICATION_TERMINFO_PATH)] {
+        if environment.iter().any(|(candidate, _)| candidate == key) {
+            return Err(invalid(format!(
+                "application spec sets {key}, which the terminal grant supplies"
+            )));
+        }
+        let position = environment.partition_point(|(candidate, _)| candidate.as_os_str() < key);
+        environment.insert(position, (OsString::from(key), OsString::from(value)));
+    }
+    Ok(environment)
+}
+
+/// The description of the launcher's terminal: through the image's database
+/// symlink, one bounded regular file that resolves inside the database. The
+/// rest of the database never reaches the jail; an application is told about
+/// the terminal it holds, not about every terminal the image knows.
+fn resolve_terminfo_entry(root: Option<&Path>, name: &str) -> io::Result<ResolvedFile> {
+    let root = root.ok_or_else(|| {
+        invalid(
+            "terminal grant needs the image's terminal description database, which host mode has none of",
+        )
+    })?;
+    // Through the image's store symlink, like the CA bundle, to the
+    // directory it names.
+    let database = fs::canonicalize(root).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "resolve terminal description database {}: {error}",
+                root.display()
+            ),
+        )
+    })?;
+    require_directory(&database, "terminal description database")?;
+    let relative = terminfo_entry_relative(name)?;
+    let entry = fs::canonicalize(database.join(&relative)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("terminal grant: no description for TERM {name:?}: {error}"),
+        )
+    })?;
+    if !entry.starts_with(&database) {
+        return Err(invalid(format!(
+            "terminal description for TERM {name:?} resolves outside the terminal description database"
+        )));
+    }
+    resolved_regular(entry, "terminal description", MAX_TERMINFO_ENTRY_BYTES)
+}
+
 fn validate_environment_entry(key: &str, value: &str) -> io::Result<()> {
     let mut bytes = key.bytes();
     let valid_first = bytes
@@ -3138,6 +3321,7 @@ pub(crate) fn test_validate_spec_environment(text: &str, uid: u32) -> io::Result
         uid,
         spec.loader_library_path.as_deref(),
         pulse_requested,
+        false,
     )
 }
 
@@ -4231,6 +4415,182 @@ mod tests {
     }
 
     #[test]
+    fn the_terminal_grant_forwards_the_launcher_term_under_a_closed_grammar() {
+        let base = || {
+            vec![
+                (OsString::from("HOME"), OsString::from("/home/td")),
+                (OsString::from("XDG_RUNTIME_DIR"), OsString::from("/run/user/1000")),
+            ]
+        };
+        let name = terminal_name(Some(OsString::from("td-term"))).unwrap();
+        let forwarded = with_terminal_environment(base(), &name).unwrap();
+        assert_eq!(
+            forwarded
+                .iter()
+                .map(|(key, value)| (key.to_str().unwrap(), value.to_str().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                ("HOME", "/home/td"),
+                ("TERM", "td-term"),
+                ("TERMINFO", "/etc/terminfo"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ]
+        );
+        // Sorted where the strict-order validator expects them, whatever the
+        // neighbours are.
+        let late = with_terminal_environment(
+            vec![(OsString::from("A"), OsString::from("1"))],
+            "xterm-256color",
+        )
+        .unwrap();
+        assert_eq!(
+            late.iter().map(|(key, _)| key.as_os_str()).collect::<Vec<_>>(),
+            ["A", "TERM", "TERMINFO"]
+        );
+        let early = with_terminal_environment(
+            vec![(OsString::from("ZZ"), OsString::from("1"))],
+            "vt100",
+        )
+        .unwrap();
+        assert_eq!(
+            early.iter().map(|(key, _)| key.as_os_str()).collect::<Vec<_>>(),
+            ["TERM", "TERMINFO", "ZZ"]
+        );
+        for (term, reason) in [
+            (None, "requires TERM"),
+            (Some(OsString::from("")), "terminal-name grammar"),
+            (Some(OsString::from("a".repeat(65))), "terminal-name grammar"),
+            (Some(OsString::from("td term")), "terminal-name grammar"),
+            (Some(OsString::from("xterm;id")), "terminal-name grammar"),
+            (Some(OsString::from("../vt100")), "terminal-name grammar"),
+            (Some(OsString::from_vec(vec![b'v', 0xff])), "not UTF-8"),
+        ] {
+            let error = terminal_name(term.clone()).unwrap_err();
+            assert!(error.to_string().contains(reason), "{term:?}: {error}");
+        }
+        assert!(terminal_name(Some(OsString::from("a".repeat(64)))).is_ok());
+        assert_eq!(terminfo_entry_relative("td-term").unwrap(), "t/td-term");
+        assert_eq!(terminfo_entry_relative("xterm").unwrap(), "x/xterm");
+        assert!(terminfo_entry_relative("").is_err());
+        assert!(terminfo_entry_relative("../t").is_err());
+        for preset_key in ["TERM", "TERMINFO"] {
+            let mut preset = base();
+            preset.push((OsString::from(preset_key), OsString::from("dumb")));
+            let error = with_terminal_environment(preset, "td-term").unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("spec sets {preset_key}")),
+                "{error}"
+            );
+        }
+    }
+
+    /// The grant's entries are the launcher's: outside the compiled spec's
+    /// ceilings, and required exactly when the grant is present.
+    #[test]
+    fn the_terminal_grant_requires_its_entries_beyond_the_spec_ceilings() {
+        let required = |term: Option<&str>, terminfo: Option<&str>| {
+            let mut environment = vec![
+                (
+                    OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                    OsString::from("unix:path=/run/user/1000/bus"),
+                ),
+                (OsString::from("FLATPAK_ID"), OsString::from("org.td.Fixture")),
+                (OsString::from("HOME"), OsString::from("/home/td")),
+            ];
+            if let Some(term) = term {
+                environment.push((OsString::from("TERM"), OsString::from(term)));
+            }
+            if let Some(terminfo) = terminfo {
+                environment.push((OsString::from("TERMINFO"), OsString::from(terminfo)));
+            }
+            environment.push((OsString::from("WAYLAND_DISPLAY"), OsString::from("wayland-0")));
+            environment.push((OsString::from("XDG_RUNTIME_DIR"), OsString::from("/run/user/1000")));
+            environment
+        };
+        let granted = required(Some("td-term"), Some("/etc/terminfo"));
+        assert!(validate_environment_list(&granted, 1000, None, false, true).is_ok());
+        // Without the grant the same two names are a spec's own business.
+        assert!(validate_environment_list(&granted, 1000, None, false, false).is_ok());
+        for (term, terminfo) in [
+            (None, Some("/etc/terminfo")),
+            (Some("td-term"), None),
+            (Some("td term"), Some("/etc/terminfo")),
+            (Some("td-term"), Some("/usr/share/terminfo")),
+        ] {
+            let short = required(term, terminfo);
+            assert!(
+                validate_environment_list(&short, 1000, None, false, true).is_err(),
+                "{term:?} {terminfo:?}"
+            );
+            assert!(validate_environment_list(&short, 1000, None, false, false).is_ok());
+        }
+        // A spec at the entry ceiling still admits the two derived entries,
+        // and only those two.
+        let mut full = required(None, None);
+        let fillers = MAX_ENVIRONMENT_ENTRIES - full.len();
+        for index in 0..fillers {
+            full.push((OsString::from(format!("E{index:03}")), OsString::from("1")));
+        }
+        full.sort();
+        assert_eq!(full.len(), MAX_ENVIRONMENT_ENTRIES);
+        assert!(validate_environment_list(&full, 1000, None, false, false).is_ok());
+        let derived = with_terminal_environment(full.clone(), "td-term").unwrap();
+        assert_eq!(derived.len(), MAX_ENVIRONMENT_ENTRIES + TERMINAL_ENVIRONMENT_ENTRIES);
+        assert!(validate_environment_list(&derived, 1000, None, false, true).is_ok());
+        assert!(validate_environment_list(&derived, 1000, None, false, false).is_err());
+        let mut over = derived.clone();
+        over.push((OsString::from("ZZZ"), OsString::from("1")));
+        assert!(validate_environment_list(&over, 1000, None, false, true).is_err());
+    }
+
+    /// One bounded regular file, reached through the image's symlink and
+    /// resolving inside the database, or no grant.
+    #[test]
+    fn the_terminal_description_is_one_bounded_entry_of_the_image_database() {
+        let root = std::env::temp_dir().join(format!(
+            "td-jail-authority-terminfo-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("database/t")).unwrap();
+        fs::write(root.join("database/t/td-term"), b"td-term|td terminal,\n").unwrap();
+        fs::create_dir_all(root.join("database/e")).unwrap();
+        std::os::unix::fs::symlink("../t/td-term", root.join("database/e/echo")).unwrap();
+        fs::create_dir_all(root.join("database/o")).unwrap();
+        fs::write(root.join("outside"), b"x").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("database/o/outside"))
+            .unwrap();
+        fs::write(
+            root.join("database/t/tall"),
+            vec![b'x'; usize::try_from(MAX_TERMINFO_ENTRY_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("database", root.join("etc-terminfo")).unwrap();
+        let database = Some(root.join("etc-terminfo"));
+
+        let entry = resolve_terminfo_entry(database.as_deref(), "td-term").unwrap();
+        assert_eq!(
+            entry.path,
+            fs::canonicalize(root.join("database/t/td-term")).unwrap()
+        );
+        // An alias that resolves inside the database is that entry; one that
+        // resolves outside is refused however it is spelled.
+        assert_eq!(
+            resolve_terminfo_entry(database.as_deref(), "echo").unwrap().path,
+            entry.path
+        );
+        let error = resolve_terminfo_entry(database.as_deref(), "outside").unwrap_err();
+        assert!(error.to_string().contains("outside the terminal description database"), "{error}");
+        let error = resolve_terminfo_entry(database.as_deref(), "vt100").unwrap_err();
+        assert!(error.to_string().contains("no description for TERM \"vt100\""), "{error}");
+        assert!(resolve_terminfo_entry(database.as_deref(), "tall").is_err());
+        assert!(resolve_terminfo_entry(database.as_deref(), "../t/td-term").is_err());
+        let error = resolve_terminfo_entry(None, "td-term").unwrap_err();
+        assert!(error.to_string().contains("host mode"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn required_environment_is_exact_for_the_effective_uid() {
         let environment = [
             (
@@ -4251,12 +4611,12 @@ mod tests {
                 OsString::from("/run/user/1000"),
             ),
         ];
-        assert!(validate_environment_list(&environment, 1000, None, false).is_ok());
+        assert!(validate_environment_list(&environment, 1000, None, false, false).is_ok());
         // A DIFFERENT uid fails on every uid-derived value at once, the bus
         // address among them: an app told to reach /run/user/1000/bus while
         // running as 1001 would find a socket it cannot use, or somebody
         // else's.
-        assert!(validate_environment_list(&environment, 1001, None, false).is_err());
+        assert!(validate_environment_list(&environment, 1001, None, false, false).is_err());
         // Each required name is required ON ITS OWN. A draft sliced the front
         // of the array instead, which drops one name and then two, so the
         // second assertion passed for the first one's reason and no name after
@@ -4275,7 +4635,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(without.len(), environment.len() - 1, "{dropped} was not there");
             assert!(
-                validate_environment_list(&without, 1000, None, false).is_err(),
+                validate_environment_list(&without, 1000, None, false, false).is_err(),
                 "a spec missing {dropped} was accepted"
             );
         }
@@ -4298,7 +4658,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            validate_environment_list(&elsewhere, 1000, None, false).is_err(),
+            validate_environment_list(&elsewhere, 1000, None, false, false).is_err(),
             "a spec may not point the app at a bus this jail does not mount"
         );
 
@@ -4309,7 +4669,7 @@ mod tests {
             ),
             (OsString::from("HOME"), OsString::from("/home/td")),
         ];
-        assert!(validate_environment_list(&unsorted, 1000, None, false).is_err());
+        assert!(validate_environment_list(&unsorted, 1000, None, false, false).is_err());
     }
 
     #[test]
@@ -4341,10 +4701,10 @@ mod tests {
                 OsString::from("/run/user/1000"),
             ),
         ];
-        assert!(validate_environment_list(&environment, 1000, None, true).is_ok());
-        assert!(validate_environment_list(&environment, 1000, None, false).is_err());
+        assert!(validate_environment_list(&environment, 1000, None, true, false).is_ok());
+        assert!(validate_environment_list(&environment, 1000, None, false, false).is_err());
         environment.retain(|(key, _)| key != "PULSE_SERVER");
-        assert!(validate_environment_list(&environment, 1000, None, true).is_err());
+        assert!(validate_environment_list(&environment, 1000, None, true, false).is_err());
     }
 
     #[test]

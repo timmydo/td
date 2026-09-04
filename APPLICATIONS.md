@@ -1069,10 +1069,11 @@ Empty sections disappear. A compact boundary input whose normalized rendering
 would cross the same cap is refused rather than producing an oversized policy.
 
 `shared` admits only `network`; `sockets` admits `wayland` and `pulseaudio`;
-and `features` admits only `allow-devel`. `devices=dri` is recognized but
-refused until §M's hardware-rendering policy lands, while `devices=tty` names
-the missing fresh-terminal acquisition policy. This makes both future changes
-a policy-table decision rather than an unknown key becoming active by accident.
+and `features` admits only `allow-devel`. `devices=tty` grants the
+fresh-terminal acquisition §C specifies; `devices=dri` is recognized but
+refused until §M's hardware-rendering policy lands, which keeps that future
+change a policy-table decision rather than an unknown key becoming active by
+accident.
 
 Filesystem keys are exactly the six `xdg-*` names §C lists, a lexical `~/`
 subpath of the launching user's real home, or an absolute path. `~/` never
@@ -2762,8 +2763,8 @@ on a load-bearing bind is fatal, never degraded:
         cases, so it is the only form used.
 10  /dev   tmpfs 0755, nosuid/noexec, containing ONLY bind-mounted host
         nodes:
-        null zero full random urandom.  NO /dev/tty unless a policy
-        explicitly asks for it — see "descriptors and the terminal"
+        null zero full random urandom, plus tty (5,0) under `devices=tty`
+        ONLY — see "descriptors and the terminal"
         /dev/pts  devpts newinstance,ptmxmode=0666,mode=0620,gid=1000
         /dev/ptmx -> pts/ptmx
         /dev/shm  tmpfs rw, 512 MiB ceiling
@@ -2898,11 +2899,62 @@ already-selected signal, and the parent-death/cleanup path handles it.
 `CommandExt`'s stable `process_group` is only `setpgid` and would not provide
 the terminal boundary.
 
-**`devices=tty` remains refused.** The containment bootstrap prevents
-accidental access; it does not define how a terminal application deliberately
-acquires a fresh controlling terminal. That policy still needs a documented
-`TIOCSCTTY` request, a device grant and readback rather than binding the
-operator's terminal.
+**`devices=tty` — the fresh-terminal grant.** The containment bootstrap
+prevents accidental access; this grant defines deliberate acquisition, and
+what is acquired is a fresh terminal, never the operator's. Stage 1, which
+the bootstrap has already made the leader of a detached no-terminal
+session, requires its own stdin, stdout and stderr to be one open Unix98
+pseudo-terminal slave (major 136–143; a console or serial line is refused;
+and the same filesystem and inode, since two devpts instances can number a
+slave alike), asserts that it leads its session, issues exactly one
+`TIOCSCTTY` with argument 0 on stdin, and reads back from
+`/proc/self/stat` that its session and process group are unchanged and its
+controlling-terminal field decodes to that device. What the kernel enforces
+for the zero argument is exact: a terminal *some session owns* is refused,
+and stage 1 never steals. A shell's terminal is owned because td-term's
+default child is `cttyhack`, which takes it; so `mail` typed at a td-term
+prompt fails with a diagnostic naming td-term's `--command`, the path that
+produces a session-less pty for exactly this purpose
+(`td-compositor/DESIGN.md` §12). "Never the operator's" therefore rests on
+that wrapper: a shell started with `--command /bin/sh` leads no session,
+its pty is unowned, and an application launched from it would acquire and
+share that terminal. The supervised-group path, which is no session leader,
+is refused the same way. It happens before registration, namespaces and
+the cgroup, so a refusal costs nothing to unwind, and the cgroup cleanup
+tree, which outlives the jail, gets no duplicate of the terminal. The
+terminal reaches stage 2 as its stdout, a clone of the stdin `TIOCSCTTY`
+acted on taken after the descriptor sweep so the sweep exempts nothing;
+stage 2, in the same session, proves before it mounts anything that this
+descriptor is the pseudo-terminal slave its own procfs field names, binds
+`/dev/tty` (5,0) read-only beside the five fixed nodes, and gives the entry
+three clones as stdin, stdout and stderr. Without the grant a launch's
+stage 2 proves the field is zero and its stdout is the null device, and
+`/dev/tty` is absent; the transition probe, which runs in its caller's
+session, asserts nothing about terminals. Stage 1, stage 2 and the entry
+share one process group, which is the terminal's foreground group by
+construction: `SIGWINCH` reaches the application, and a `^C` or hangup
+reaches stage 1 too, whose default disposition tears the jail down through
+the parent-death protocol, whatever the application's own handler did. A
+terminal application that handles `^C` itself must therefore disable `ISIG`,
+as every raw-mode program does; cooked-mode `SIGINT` handling waits on stage
+1 being able to ignore terminal signals, which needs a signal-disposition
+syscall this crate does not confine yet. `TIOCSPGRP` is not issued and job
+control inside the jail is not a goal. The launcher's `TERM` is forwarded
+under the closed grammar `[A-Za-z0-9._+-]{1,64}` beside
+`TERMINFO=/etc/terminfo`, and the one description the image's database holds
+for that name is bound read-only at `/etc/terminfo/<c>/<name>`, which stage
+2 proves is the database's only entry; an absent or ill-formed name, or one
+the database does not describe, refuses the launch. A spec that sets `TERM`
+or `TERMINFO` is refused by the compiler and again by the launcher, and the
+two derived entries sit outside the compiled spec's ceilings. Host mode has
+no database and refuses the grant. The seccomp filter is unchanged:
+`TIOCSTI` and `TIOCLINUX`, the requests that reach another terminal, stay
+denied. The tty-driver requests an application may issue on a terminal of
+its own — `TIOCSETD`, `TCSETS`, `TIOCSWINSZ` and the rest — were reachable
+before the grant through the `/dev/ptmx` every jail binds, so the grant
+adds a descriptor on td-term's pty and no new kernel surface. A terminal
+application still declares `sockets=wayland`, which the launch requires of
+every application and which it may leave unused.
 
 *A read-only bind is not recursive, and neither is a read-only remount.*
 Binding a granted directory `:ro` makes that mount read-only and says
@@ -3380,15 +3432,17 @@ The quoted block is the completed target mirrored by the implemented roster in
 > design, a jail more privileged than its caller being the thing user
 > namespaces exist to not need); `setns(2)` (the constructor never joins
 > a namespace a caller supplied); `sethostname(2)` (the UTS namespace is
-> unshared and the name inherited); `TIOCSCTTY` — **excluded for a corrected
-> reason**: the earlier draft said an app gets no
-> controlling terminal, which was false before the application bootstrap
-> established containment. It remains excluded because no terminal policy
-> exists: the jail removes `/dev/tty` and inherited terminal descriptors, and
-> the bootstrap either proves a dedicated no-terminal supervisor group or
-> creates a new session; both paths prove `tty_nr=0`. A real terminal policy
-> would need a
-> documented ioctl-request amendment rather than an assumption; `statfs(2)`
+> unshared and the name inherited); `TIOCSCTTY` — **admitted for one case,
+> after two corrections**: the first draft excluded it because an app
+> supposedly got no controlling terminal, which was false before the
+> application bootstrap established containment; the second because no
+> terminal policy existed. The policy now exists: under `devices=tty` stage
+> 1 issues exactly one non-stealing `TIOCSCTTY` on its own stdin, a fresh
+> pseudo-terminal slave, from the session the bootstrap proved, and reads
+> the result back — the documented ioctl-request amendment `UNSAFE.md` §9
+> records. Without the grant nothing changed: the jail removes `/dev/tty`
+> and inherited terminal descriptors, and both bootstrap paths still prove
+> `tty_nr=0`; `statfs(2)`
 > (nothing in this design issues it — with packages in the image,
 > nothing writes gigabytes at launch); `mmap(2)` (nothing here maps anything —
 > but see §M, which anticipates that the GPU path WILL need a
@@ -6968,6 +7022,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 27k | **Firefox outer-seccomp denial audit — LANDED**; a dedicated physical-input variant alone enables the target kernel audit path and asks the standard outer filter to log non-allow decisions without changing their actions. A root-owned, executable-only bind of the existing non-shipped helper makes all 17 blocked calls under that installed filter, then replaces itself with Firefox in the same pid. After the full input workload and five-minute soak, a bounded root parser requires every helper denial, rejects loss, suppression, malformed ABI/uid/action data and any unrostered denial, and emits one exact host-required result. The variant retains all real input, browser, bus and compositor continuity evidence but uses the host-silent audio backend because kernel audit work measurably perturbs the separate TCG HDA waveform oracle | the shipped Firefox path proves its outer deny filter blocks the rostered probes while completing its real workload without an unrostered denial |
 | 28 | the remaining §H proof run to green; `AGENTS.md` trust-zone section; **all four** application-path `UNSAFE.md` entries audited against shipped code | **Firefox portals, isolation, soak and sound are all proved** |
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
+| 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; the acquisition itself is not yet proved end to end — that is the first terminal application's boot oracle, a later rung | a terminal application runs in the jail with a terminal of its own, and never the operator's |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support

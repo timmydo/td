@@ -357,6 +357,9 @@ pub struct PermissionPolicy {
     network: bool,
     sockets: BTreeSet<PermissionSocket>,
     allow_devel: bool,
+    /// `devices=tty`: the launch acquires the launcher's fresh terminal as
+    /// the application's controlling terminal (APPLICATIONS.md §C).
+    terminal: bool,
     filesystems: BTreeMap<String, FilesystemPermission>,
     session_bus: BTreeMap<String, BusAccess>,
     resources: ResourceLimits,
@@ -396,6 +399,15 @@ impl PermissionPolicy {
             return Err("duplicate allow-devel feature".into());
         }
         self.allow_devel = true;
+        self.ensure_size()?;
+        Ok(self)
+    }
+
+    pub fn with_terminal(mut self) -> Result<PermissionPolicy, String> {
+        if self.terminal {
+            return Err("duplicate tty device".into());
+        }
+        self.terminal = true;
         self.ensure_size()?;
         Ok(self)
     }
@@ -497,6 +509,10 @@ impl PermissionPolicy {
         self.allow_devel
     }
 
+    pub fn terminal(&self) -> bool {
+        self.terminal
+    }
+
     pub fn filesystems(&self) -> impl Iterator<Item = (&str, FilesystemPermission)> {
         self.filesystems
             .iter()
@@ -537,6 +553,9 @@ impl PermissionPolicy {
             network: _,
             sockets,
             allow_devel,
+            // Honoured: stage 1 acquires the fresh terminal and reads it
+            // back, or refuses the launch (APPLICATIONS.md §C).
+            terminal: _,
             filesystems: _,
             session_bus,
             resources: _,
@@ -582,7 +601,7 @@ impl PermissionPolicy {
             "1"
         };
         let mut out = format!("format={format}\n");
-        if self.network || !self.sockets.is_empty() || self.allow_devel {
+        if self.network || !self.sockets.is_empty() || self.allow_devel || self.terminal {
             out.push_str("\n[Context]\n");
             if self.network {
                 out.push_str("shared=network\n");
@@ -594,6 +613,9 @@ impl PermissionPolicy {
             }
             if self.allow_devel {
                 out.push_str("features=allow-devel\n");
+            }
+            if self.terminal {
+                out.push_str("devices=tty\n");
             }
         }
         if !self.filesystems.is_empty() {
@@ -657,6 +679,7 @@ struct ParseState {
     shared_seen: bool,
     sockets_seen: bool,
     features_seen: bool,
+    devices_seen: bool,
 }
 
 fn parse_permission_policy(text: &str) -> Result<PermissionPolicy, String> {
@@ -798,18 +821,20 @@ fn apply_context(state: &mut ParseState, key: &str, value: &str) -> Result<(), S
             state.policy.allow_devel = true;
         }
         "devices" => {
+            mark_once(&mut state.devices_seen, "devices")?;
             let devices = parse_list("devices", value)?;
             for device in &devices {
                 if !matches!(*device, "dri" | "tty") {
                     return Err(format!("unknown application device {device:?}"));
                 }
             }
-            let unavailable = if devices.contains(&"dri") {
-                "devices=dri is recognized but unavailable until the hardware-rendering policy lands"
-            } else {
-                "devices=tty is unavailable until the fresh-terminal acquisition policy lands"
-            };
-            return Err(unavailable.into());
+            if devices.contains(&"dri") {
+                return Err(
+                    "devices=dri is recognized but unavailable until the hardware-rendering policy lands"
+                        .into(),
+                );
+            }
+            state.policy.terminal = devices.contains(&"tty");
         }
         _ => return Err(format!("unknown [Context] key {key:?}")),
     }
@@ -1446,24 +1471,55 @@ mod tests {
             ("features=devel", "only `allow-devel'"),
             ("devices=dri", "recognized but unavailable"),
             ("devices=dri;unknown", "unknown application device"),
-            ("devices=tty", "fresh-terminal acquisition"),
+            ("devices=tty;dri", "recognized but unavailable"),
+            ("devices=tty;tty", "duplicate value"),
             ("devices=all", "unknown application device"),
         ] {
             let text = format!("format=1\n[Context]\n{line}\n");
             let got = error(&text);
             assert!(got.contains(reason), "{line:?}: {got}");
         }
-        for key in ["shared", "sockets", "features"] {
+        for key in ["shared", "sockets", "features", "devices"] {
             let value = match key {
                 "shared" => "network",
                 "sockets" => "wayland",
                 "features" => "allow-devel",
+                "devices" => "tty",
                 _ => "",
             };
             let text = format!("format=1\n[Context]\n{key}={value}\n{key}={value}\n");
             let got = error(&text);
             assert!(got.contains("duplicate [Context]"), "{key}: {got}");
         }
+    }
+
+    #[test]
+    fn the_terminal_device_is_admitted_and_canonical() {
+        let parsed = PermissionPolicy::parse("format=1\n[Context]\ndevices=tty\n").unwrap();
+        assert!(parsed.terminal());
+        assert!(!PermissionPolicy::new().terminal());
+        assert_eq!(parsed.to_keyfile(), "format=1\n\n[Context]\ndevices=tty\n");
+        let built = PermissionPolicy::new().with_terminal().unwrap();
+        assert_eq!(built, parsed);
+        assert!(built
+            .clone()
+            .with_terminal()
+            .unwrap_err()
+            .contains("duplicate tty device"));
+        // The writer fixes the key order; a shuffled input lands canonical
+        // and reparses to the same policy.
+        let shuffled = PermissionPolicy::parse(
+            "format=1\n[Context]\ndevices=tty\nfeatures=allow-devel\nshared=network\n",
+        )
+        .unwrap();
+        assert_eq!(
+            shuffled.to_keyfile(),
+            "format=1\n\n[Context]\nshared=network\nfeatures=allow-devel\ndevices=tty\n"
+        );
+        assert_eq!(
+            PermissionPolicy::parse(&shuffled.to_keyfile()).unwrap(),
+            shuffled
+        );
     }
 
     #[test]

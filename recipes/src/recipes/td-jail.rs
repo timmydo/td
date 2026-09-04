@@ -445,9 +445,15 @@ mod tests {
             "Stage2Action::Probe => {\n            probe_pid1_lifecycle()?;"
         ));
         assert_eq!(transition.matches("probe_pid1_lifecycle()?").count(), 1);
-        assert!(transition.contains(".stdin(Stdio::from(null_input))"));
-        assert!(transition.contains(".stdout(Stdio::from(null_output))"));
-        assert!(transition.contains(".stderr(Stdio::from(null_error))"));
+        // The entry's stdio is three null devices, or under `devices=tty`
+        // three clones of the terminal stage 2 proved; never anything else.
+        assert!(transition.contains("let (input, output, error) = if terminal {"));
+        assert!(transition.contains("Stdio::from(terminal.try_clone_to_owned()?),"));
+        assert!(transition.contains("Stdio::from(fs::File::open(\"/dev/null\")?),"));
+        assert!(transition.contains(
+            "Stdio::from(OpenOptions::new().write(true).open(\"/dev/null\")?),"
+        ));
+        assert!(transition.contains(".stdin(input)\n        .stdout(output)\n        .stderr(error);"));
         assert!(transition.contains("let (mut stage2_error, stage2_error_writer) = io::pipe()?;"));
         assert!(transition.contains("let mut child = command.spawn()?;\n        drop(command);"));
         assert!(transition.contains("sys::set_dumpable(false)?;"));

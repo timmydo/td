@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd};
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt;
@@ -44,6 +44,7 @@ const STAGE2_FIREFOX_AUTOTEST_POLICY_ARG: &str =
 const STAGE2_FIREFOX_SECCOMP_PROBE_ARG: &str =
     "--firefox-seccomp-probe";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
+const STAGE2_TERMINAL_ARG: &str = "--terminal";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
 const STAGE2_RESOURCES_ARG: &str = "--resources";
@@ -191,6 +192,15 @@ const DEVICE_NODES: &[(&str, u64, u64)] = &[
     ("random", 1, 8),
     ("urandom", 1, 9),
 ];
+
+/// Bound into `/dev` only under `devices=tty`. Inside the jail it resolves,
+/// as everywhere, to the opener's controlling terminal, which stage 1
+/// acquired and read back before stage 2 existed.
+const TERMINAL_NODE: (&str, u64, u64) = ("tty", 5, 0);
+
+/// Unix98 pseudo-terminal slaves are the only terminal class the grant
+/// accepts: a fresh pty such as td-term's, never a console or serial line.
+const PTY_SLAVE_MAJORS: std::ops::RangeInclusive<u64> = 136..=143;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Identity {
@@ -347,6 +357,9 @@ pub struct Stage2Launch {
     firefox_autotest_policy: bool,
     firefox_seccomp_probe: bool,
     runtime_aliases: bool,
+    /// Stage 1 acquired the session's controlling terminal and passed it as
+    /// this process's stdout; the entry gets it as all three stdio.
+    terminal: bool,
     environment: Vec<(OsString, OsString)>,
     filesystems: Vec<Stage2Filesystem>,
     resources: ResolvedResourceLimits,
@@ -385,6 +398,8 @@ struct EtcBinding<'a> {
     timezone: Option<&'a str>,
     firefox_autotest_policy: bool,
     machine_id: Option<&'a str>,
+    /// The forwarded `TERM` under the grant, whose one description is bound.
+    terminal: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -396,6 +411,7 @@ struct Stage2MountBinding<'a> {
     firefox_autotest_policy: bool,
     firefox_seccomp_probe: bool,
     loader_library_path: Option<&'a str>,
+    terminal: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -698,11 +714,25 @@ where
             _ => return Err(usage_error()),
         };
         authority::validate_stage2_loader_library_path(loader_library_path.as_deref())?;
+        if args.next().as_deref() != Some(STAGE2_TERMINAL_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let terminal = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("present") => true,
+            Some("absent") => false,
+            _ => return Err(usage_error()),
+        };
         if args.next().as_deref() != Some(STAGE2_ENVIRONMENT_ARG.as_ref()) {
             return Err(usage_error());
         }
         let count = parse_count(args.next(), "environment count")?;
-        if count > authority::MAX_ENVIRONMENT_ENTRIES {
+        let max_entries = authority::MAX_ENVIRONMENT_ENTRIES
+            + if terminal {
+                authority::TERMINAL_ENVIRONMENT_ENTRIES
+            } else {
+                0
+            };
+        if count > max_entries {
             return Err(usage_error());
         }
         let mut environment = Vec::with_capacity(count);
@@ -720,6 +750,7 @@ where
             // the stage-2 wire format, so this proves only that its Pulse
             // pair remains internally complete and exact.
             environment.iter().any(|(key, _)| key == "PULSE_SERVER"),
+            terminal,
         )?;
         if args.next().as_deref() != Some(STAGE2_FILESYSTEMS_ARG.as_ref()) {
             return Err(usage_error());
@@ -796,6 +827,7 @@ where
             firefox_autotest_policy,
             firefox_seccomp_probe,
             runtime_aliases: loader_library_path.is_some(),
+            terminal,
             environment,
             filesystems,
             resources,
@@ -862,7 +894,7 @@ fn stage2_launch_arguments(
     arguments: &[OsString],
 ) -> Vec<OsString> {
     let mut stage2 = Vec::with_capacity(
-        24usize
+        26usize
             .saturating_add(environment.len().saturating_mul(2))
             .saturating_add(mounts.filesystems.len().saturating_mul(2))
             .saturating_add(arguments.len()),
@@ -908,6 +940,8 @@ fn stage2_launch_arguments(
         None => stage2.push(OsString::from("absent")),
     }
     stage2.extend([
+        OsString::from(STAGE2_TERMINAL_ARG),
+        OsString::from(if mounts.terminal { "present" } else { "absent" }),
         OsString::from(STAGE2_ENVIRONMENT_ARG),
         OsString::from(environment.len().to_string()),
     ]);
@@ -1934,6 +1968,19 @@ fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
             "application timezone",
         )?;
     }
+    // One description, at the path the forwarded `TERMINFO` names: the
+    // application learns about the terminal it holds and no other.
+    if let Some(terminfo) = &application.terminfo {
+        let relative = authority::terminfo_entry_relative(&terminfo.name)?;
+        create_dir(&format!("{etc_text}/terminfo"), 0o555)?;
+        let entry = etc.join("terminfo").join(&relative);
+        let letter = entry
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or_else(|| io::Error::other("terminal description path has no letter"))?;
+        create_dir(letter, 0o555)?;
+        mount_resolved_file(&terminfo.file, &entry, "terminal description")?;
+    }
     if let Some(firefox) = &application.firefox_autotest_policy {
         create_dir(&format!("{etc_text}/firefox"), 0o555)?;
         create_dir(&format!("{etc_text}/firefox/policies"), 0o555)?;
@@ -2001,7 +2048,8 @@ fn prepare_mount_plan(
     mount_tmpfs(&dev, sys::MS_NOSUID | sys::MS_NOEXEC, "mode=0755")?;
     create_dir(&format!("{dev}/pts"), 0o755)?;
     create_dir(&format!("{dev}/shm"), 0o1777)?;
-    for (name, _, _) in DEVICE_NODES {
+    let terminal = application.is_some_and(|plan| plan.terminal);
+    for (name, _, _) in device_nodes(terminal) {
         let target = format!("{dev}/{name}");
         OpenOptions::new()
             .write(true)
@@ -2506,15 +2554,26 @@ fn device_numbers(raw: u64) -> (u64, u64) {
     (major, minor)
 }
 
-fn require_devices() -> io::Result<()> {
-    require_names(
-        "/dev",
-        &[
-            "fd", "full", "null", "ptmx", "pts", "random", "shm", "stderr", "stdin", "stdout",
-            "urandom", "zero",
-        ],
-    )?;
-    for (name, expected_major, expected_minor) in DEVICE_NODES {
+/// The device nodes a plan binds: the fixed five, plus `/dev/tty` under the
+/// terminal grant. One function feeds the mount, the readback and the
+/// mountinfo check so the three cannot disagree about the sixth node.
+fn device_nodes(terminal: bool) -> impl Iterator<Item = (&'static str, u64, u64)> {
+    DEVICE_NODES
+        .iter()
+        .copied()
+        .chain(terminal.then_some(TERMINAL_NODE))
+}
+
+fn require_devices(terminal: bool) -> io::Result<()> {
+    let mut names = vec![
+        "fd", "full", "null", "ptmx", "pts", "random", "shm", "stderr", "stdin", "stdout",
+        "urandom", "zero",
+    ];
+    if terminal {
+        names.push(TERMINAL_NODE.0);
+    }
+    require_names("/dev", &names)?;
+    for (name, expected_major, expected_minor) in device_nodes(terminal) {
         let path = format!("/dev/{name}");
         let metadata = fs::metadata(&path)?;
         if !metadata.file_type().is_char_device() {
@@ -2523,7 +2582,7 @@ fn require_devices() -> io::Result<()> {
             )));
         }
         let (major, minor) = device_numbers(metadata.rdev());
-        if (major, minor) != (*expected_major, *expected_minor) {
+        if (major, minor) != (expected_major, expected_minor) {
             return Err(io::Error::other(format!(
                 "{path} is device {major}:{minor}, expected {expected_major}:{expected_minor}"
             )));
@@ -2806,6 +2865,11 @@ fn expected_etc_names(
             "Firefox autotest policy collides with selective /etc",
         ));
     }
+    if etc.terminal.is_some() && !expected.insert("terminfo".to_string()) {
+        return Err(io::Error::other(
+            "terminal description collides with selective /etc",
+        ));
+    }
     for entry in runtime_etc {
         if !RUNTIME_ETC_ALLOWLIST.contains(&entry.name) || !expected.insert(entry.name.to_string())
         {
@@ -2831,6 +2895,38 @@ fn expected_etc_names(
 /// the failure it guards has no symptom other than a wrong clock.
 fn require_bound_zone(zone: &str) -> io::Result<()> {
     require_bound_zone_at(Path::new(LOCALTIME_PATH), Path::new(RUNTIME_ROOT), zone)
+}
+
+/// The grant's one description, exactly where `TERMINFO` says: the database
+/// holds one letter, the letter holds one name, and the name is a bound
+/// read-only nonempty regular file. More would be a database the application
+/// was not granted; less is a `TERM` it cannot look up.
+fn require_bound_terminfo(mountinfo: &str, name: &str) -> io::Result<()> {
+    let relative = authority::terminfo_entry_relative(name)?;
+    let (letter, _) = relative
+        .split_once('/')
+        .ok_or_else(|| io::Error::other("terminal description path has no letter"))?;
+    let database = authority::APPLICATION_TERMINFO_PATH;
+    let letter_directory = format!("{database}/{letter}");
+    let entry = format!("{database}/{relative}");
+    require_names(database, &[letter])?;
+    require_names(&letter_directory, &[name])?;
+    require_mode(database, 0o555)?;
+    require_mode(&letter_directory, 0o555)?;
+    require_mode(&entry, 0o444)?;
+    let bound = fs::symlink_metadata(&entry)?;
+    if !bound.file_type().is_file() || bound.len() == 0 {
+        return Err(io::Error::other(
+            "selective /etc terminal description is not a nonempty regular file",
+        ));
+    }
+    require_mount(
+        mountinfo,
+        &entry,
+        None,
+        &["ro", "nosuid", "nodev", "noexec"],
+        &["rw"],
+    )
 }
 
 /// The readback's rules, over paths a test can build.
@@ -2933,6 +3029,7 @@ fn require_etc_plan(
         timezone,
         firefox_autotest_policy,
         machine_id,
+        terminal,
     } = etc;
     let expected_machine_id = machine_id
         .ok_or_else(|| io::Error::other("application mount plan has no machine id"))?;
@@ -3084,6 +3181,9 @@ fn require_etc_plan(
             &["rw"],
         )?;
     }
+    if let Some(name) = terminal {
+        require_bound_terminfo(mountinfo, name)?;
+    }
     for entry in runtime_etc {
         require_runtime_etc_source_identity(&entry)?;
         let target = PathBuf::from("/etc").join(entry.name);
@@ -3120,6 +3220,7 @@ struct Stage2MountExpectation<'a> {
     pulse: bool,
     pulse_socket_mode: Option<u32>,
     firefox_seccomp_probe: bool,
+    terminal: bool,
 }
 
 fn require_mount_plan(
@@ -3134,6 +3235,7 @@ fn require_mount_plan(
         pulse,
         pulse_socket_mode,
         firefox_seccomp_probe,
+        terminal,
     } = expected;
     let application = filesystems.is_some();
     if fs::symlink_metadata(OLD_ROOT).is_ok()
@@ -3164,7 +3266,7 @@ fn require_mount_plan(
     require_mode("/dev/shm", 0o1777)?;
     require_mode("/tmp", 0o1777)?;
     require_mode("/var/tmp", 0o1777)?;
-    require_devices()?;
+    require_devices(terminal)?;
 
     let numeric = read_dir_names("/proc")?
         .into_iter()
@@ -3229,7 +3331,7 @@ fn require_mount_plan(
         &["rw", "nosuid", "noexec"],
         &["ro", "nodev"],
     )?;
-    for (name, _, _) in DEVICE_NODES {
+    for (name, _, _) in device_nodes(terminal) {
         require_mount(
             &mountinfo,
             &format!("/dev/{name}"),
@@ -4806,6 +4908,8 @@ pub fn run_stage2(
     drop(stdin);
     sys::set_parent_death_signal()?;
     require_only_stdio_descriptors()?;
+    let terminal = matches!(&action, Stage2Action::Launch(launch) if launch.terminal);
+    require_stage2_terminal(terminal, matches!(&action, Stage2Action::Launch(_)))?;
 
     let status = fs::read_to_string("/proc/self/status")?;
     let identity = Identity {
@@ -4849,6 +4953,7 @@ pub fn run_stage2(
                 timezone: None,
                 firefox_autotest_policy: false,
                 machine_id: None,
+                terminal: None,
             },
             false,
             false,
@@ -4861,6 +4966,12 @@ pub fn run_stage2(
                 timezone: launch.timezone.as_deref(),
                 firefox_autotest_policy: launch.firefox_autotest_policy,
                 machine_id: Some(launch.machine_id.as_str()),
+                // The wire-format validator required this name under the
+                // grant, so its absence here is the grant's absence.
+                terminal: launch
+                    .terminal
+                    .then(|| environment_value(&launch.environment, "TERM"))
+                    .flatten(),
             },
             launch.runtime_aliases,
             // Stage 1 already authenticated the permission-to-environment
@@ -4881,6 +4992,7 @@ pub fn run_stage2(
             pulse,
             pulse_socket_mode: pulse_socket_mode(pulse, host_mode),
             firefox_seccomp_probe,
+            terminal,
         },
         &mount_probe_token,
         identity,
@@ -4916,6 +5028,7 @@ pub fn run_stage2(
                 firefox_autotest_policy: _,
                 firefox_seccomp_probe,
                 runtime_aliases: _,
+                terminal,
                 environment,
                 filesystems: _,
                 resources,
@@ -4936,9 +5049,192 @@ pub fn run_stage2(
                 &environment,
                 &arguments,
                 firefox_seccomp_probe,
+                terminal,
             )
         }
     }
+}
+
+/// One open terminal: its device numbers, and the filesystem and inode that
+/// say WHICH devpts instance's terminal that is. Instances number their
+/// slaves independently, so two of them can hand out the same `136:N`, and
+/// a check on numbers alone would let a launcher pair a fresh slave on stdin
+/// with somebody else's on stdout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalDescriptor {
+    device: (u64, u64),
+    filesystem: u64,
+    inode: u64,
+}
+
+/// The character device behind a descriptor, refusing anything else. A clone
+/// is fstat'ed so no raw descriptor is adopted.
+fn descriptor_terminal(descriptor: BorrowedFd<'_>) -> io::Result<TerminalDescriptor> {
+    let metadata = fs::File::from(descriptor.try_clone_to_owned()?).metadata()?;
+    if !metadata.file_type().is_char_device() {
+        return Err(io::Error::other("not a character device"));
+    }
+    Ok(TerminalDescriptor {
+        device: device_numbers(metadata.rdev()),
+        filesystem: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn environment_value<'a>(environment: &'a [(OsString, OsString)], key: &str) -> Option<&'a str> {
+    environment
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .and_then(|(_, value)| value.to_str())
+}
+
+/// procfs reports the controlling terminal in the old `dev_t` encoding. For
+/// the pseudo-terminal majors that encoding and `st_rdev`'s decode to the
+/// same pair, so one decoder serves both and a mismatch is a real one.
+/// procfs's controlling-terminal field as `major:minor` for a diagnostic;
+/// a negative field, which no pseudo-terminal produces, is shown as is.
+fn terminal_field(tty_nr: i64) -> String {
+    match u64::try_from(tty_nr) {
+        Ok(raw) => {
+            let (major, minor) = device_numbers(raw);
+            format!("{major}:{minor}")
+        }
+        Err(_) => tty_nr.to_string(),
+    }
+}
+
+fn require_terminal_numbers(what: &str, device: (u64, u64), tty_nr: i64) -> io::Result<()> {
+    let raw = u64::try_from(tty_nr)
+        .map_err(|_| io::Error::other("procfs controlling-terminal field is negative"))?;
+    let (major, minor) = device;
+    if !PTY_SLAVE_MAJORS.contains(&major) {
+        return Err(io::Error::other(format!(
+            "{what} is device {major}:{minor}, not a pseudo-terminal slave"
+        )));
+    }
+    if raw == 0 {
+        return Err(io::Error::other(format!(
+            "{what} is device {major}:{minor} but the session has no controlling terminal"
+        )));
+    }
+    let (read_major, read_minor) = device_numbers(raw);
+    if (read_major, read_minor) != device {
+        return Err(io::Error::other(format!(
+            "{what} is device {major}:{minor} but the session's controlling terminal \
+             read back as {read_major}:{read_minor}"
+        )));
+    }
+    Ok(())
+}
+
+/// Stage 2 inherits stage 1's session, so its controlling terminal is the one
+/// stage 1 acquired, or none. Under the grant, stdout must be that very
+/// device. A launch without the grant must show no terminal, and its stdout
+/// is the null device stage 1 gave it. The transition probe asserts nothing
+/// here: it runs in its caller's session, terminal and all, and its stdout is
+/// its result pipe.
+fn require_stage2_terminal(terminal: bool, launch: bool) -> io::Result<()> {
+    if !terminal && !launch {
+        return Ok(());
+    }
+    let containment = process_containment(&fs::read_to_string("/proc/self/stat")?)?;
+    if terminal {
+        let device = descriptor_terminal(io::stdout().as_fd())
+            .map_err(|error| io::Error::other(format!("stage 2 stdout: {error}")))?
+            .device;
+        return require_terminal_numbers("stage 2 stdout", device, containment.terminal);
+    }
+    if containment.terminal != 0 {
+        return Err(io::Error::other(format!(
+            "stage 2 has controlling terminal {} without a terminal grant",
+            terminal_field(containment.terminal)
+        )));
+    }
+    let device = descriptor_terminal(io::stdout().as_fd())
+        .map_err(|error| io::Error::other(format!("stage 2 stdout: {error}")))?
+        .device;
+    if device != (1, 3) {
+        return Err(io::Error::other(format!(
+            "stage 2 stdout is device {}:{}, expected the null device",
+            device.0, device.1
+        )));
+    }
+    Ok(())
+}
+
+/// A fresh descriptor on the acquired terminal for stage 2's stdout: stage
+/// 1's stdin, the very descriptor `TIOCSCTTY` acted on, so the terminal the
+/// entry writes is the one the session owns and not a neighbour with the
+/// same numbers.
+fn clone_terminal_descriptor() -> io::Result<std::os::fd::OwnedFd> {
+    io::stdin().as_fd().try_clone_to_owned()
+}
+
+/// The `devices=tty` grant, stage 1 side. The launcher's three stdio
+/// descriptors must be one pseudo-terminal slave; stage 1, already the leader
+/// of the detached session the containment bootstrap proved, makes it that
+/// session's controlling terminal and reads the result back from procfs. The
+/// kernel refuses a terminal another session already owns, which is the
+/// operator's-terminal case §C excludes, and it refuses a caller that is not
+/// a session leader, which is the supervised-group path; both are named in
+/// the diagnostic rather than worked around.
+fn acquire_fresh_terminal() -> io::Result<()> {
+    let stdin = descriptor_terminal(io::stdin().as_fd())
+        .map_err(|error| io::Error::other(format!("terminal grant: launcher stdin: {error}")))?;
+    for (name, descriptor) in [("stdout", io::stdout().as_fd()), ("stderr", io::stderr().as_fd())] {
+        let terminal = descriptor_terminal(descriptor).map_err(|error| {
+            io::Error::other(format!("terminal grant: launcher {name}: {error}"))
+        })?;
+        if terminal != stdin {
+            return Err(io::Error::other(format!(
+                "terminal grant: launcher {name} is device {}:{} (inode {} on filesystem {}) \
+                 but stdin is {}:{} (inode {} on filesystem {})",
+                terminal.device.0,
+                terminal.device.1,
+                terminal.inode,
+                terminal.filesystem,
+                stdin.device.0,
+                stdin.device.1,
+                stdin.inode,
+                stdin.filesystem
+            )));
+        }
+    }
+    if !PTY_SLAVE_MAJORS.contains(&stdin.device.0) {
+        return Err(io::Error::other(format!(
+            "terminal grant: launcher stdio is device {}:{}, not a pseudo-terminal slave",
+            stdin.device.0, stdin.device.1
+        )));
+    }
+    let before = process_containment(&fs::read_to_string("/proc/self/stat")?)?;
+    if before.terminal != 0 {
+        return Err(io::Error::other(format!(
+            "terminal grant: stage 1 already has controlling terminal {}",
+            terminal_field(before.terminal)
+        )));
+    }
+    // The bootstrap's precondition, asserted rather than left to the
+    // kernel's EPERM: only a session leader may acquire.
+    if before.session != std::process::id() {
+        return Err(io::Error::other(format!(
+            "terminal grant: stage 1 is in session {} and does not lead it",
+            before.session
+        )));
+    }
+    sys::acquire_controlling_terminal().map_err(|error| {
+        io::Error::other(format!(
+            "terminal grant: acquire controlling terminal: {error}; a jailed terminal \
+             application needs a fresh terminal such as td-term --command, not one a \
+             shell's session already owns"
+        ))
+    })?;
+    let after = process_containment(&fs::read_to_string("/proc/self/stat")?)?;
+    if after.session != before.session || after.process_group != before.process_group {
+        return Err(io::Error::other(
+            "terminal grant: session or process group changed while acquiring the terminal",
+        ));
+    }
+    require_terminal_numbers("launcher stdin", stdin.device, after.terminal)
 }
 
 fn start_stage1_liveness_watcher() -> io::Result<()> {
@@ -4967,17 +5263,33 @@ fn run_application(
     environment: &[(OsString, OsString)],
     arguments: &[OsString],
     firefox_seccomp_probe: bool,
+    terminal: bool,
 ) -> io::Result<()> {
-    let null_input = fs::File::open("/dev/null")?;
-    let null_output = OpenOptions::new().write(true).open("/dev/null")?;
-    let null_error = OpenOptions::new().write(true).open("/dev/null")?;
+    // Under the grant, stage 2's stdout IS the controlling terminal
+    // (`require_stage2_terminal` proved it), and the entry gets three
+    // clones of it; otherwise three null devices, as before.
+    let (input, output, error) = if terminal {
+        let stdout = io::stdout();
+        let terminal = stdout.as_fd();
+        (
+            Stdio::from(terminal.try_clone_to_owned()?),
+            Stdio::from(terminal.try_clone_to_owned()?),
+            Stdio::from(terminal.try_clone_to_owned()?),
+        )
+    } else {
+        (
+            Stdio::from(fs::File::open("/dev/null")?),
+            Stdio::from(OpenOptions::new().write(true).open("/dev/null")?),
+            Stdio::from(OpenOptions::new().write(true).open("/dev/null")?),
+        )
+    };
     let mut command = application_command(entry, arguments, firefox_seccomp_probe);
     command
         .env_clear()
         .envs(environment.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::from(null_input))
-        .stdout(Stdio::from(null_output))
-        .stderr(Stdio::from(null_error));
+        .stdin(input)
+        .stdout(output)
+        .stderr(error);
     let child = command.spawn();
     drop(command);
     let child = child
@@ -5099,10 +5411,19 @@ fn reap_survivors_until(
 }
 
 impl CgroupCleanup {
-    fn spawn(executable: &Path, membership: &str) -> io::Result<Self> {
+    fn spawn(executable: &Path, membership: &str, terminal: bool) -> io::Result<Self> {
         let (reader, writer) = io::pipe()?;
         let (mut ready_reader, ready_writer) = io::pipe()?;
         let mut command = Command::new(executable);
+        // Under the grant stage 1's stderr IS the application's terminal.
+        // The cleanup tree outlives the jail, so a duplicate there would
+        // hold the slave open past the application's exit and put cleanup
+        // diagnostics on a screen a full-screen program is drawing.
+        let diagnostics = if terminal {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        };
         command
             .arg(CGROUP_CLEANUP_ARG)
             .arg(membership)
@@ -5110,7 +5431,7 @@ impl CgroupCleanup {
             .current_dir("/")
             .stdin(Stdio::from(reader))
             .stdout(Stdio::from(ready_writer))
-            .stderr(Stdio::inherit());
+            .stderr(diagnostics);
         let mut child = command
             .spawn()
             .map_err(|error| io::Error::other(format!("spawn cgroup cleanup helper: {error}")))?;
@@ -5198,9 +5519,10 @@ impl ManagedCgroup {
         instance: &str,
         limits: ResolvedResourceLimits,
         identity: Identity,
+        terminal: bool,
     ) -> io::Result<Self> {
         let membership = cgroup::membership_for_instance(instance)?;
-        let cleanup = CgroupCleanup::spawn(executable, &membership)?;
+        let cleanup = CgroupCleanup::spawn(executable, &membership, terminal)?;
         match cgroup::Instance::create(instance, limits, identity.uid, identity.gid) {
             Ok(instance) => Ok(Self {
                 instance: Some(instance),
@@ -5292,6 +5614,12 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             "td-jail launch identity changed after authority resolution",
         ));
     }
+    // Before any namespace, registration or cgroup exists: a refused
+    // terminal then costs nothing to unwind, and the readback below is the
+    // only proof stage 2 will inherit.
+    if application.terminal {
+        acquire_fresh_terminal()?;
+    }
     if let Some(socket) = &application.pulse_socket {
         let what = if application.host_mode {
             "host PulseAudio authority"
@@ -5315,6 +5643,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             &instance,
             application.resources,
             outside_identity,
+            application.terminal,
         )?
     } else {
         ManagedCgroup::disabled()
@@ -5417,6 +5746,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                     .firefox_seccomp_probe
                     .is_some(),
                 loader_library_path: application.loader_library_path.as_deref(),
+                terminal: application.terminal,
             },
             Stage2ResourceBinding {
                 limits: application.resources,
@@ -5424,12 +5754,20 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             },
             &application.arguments,
         );
+        // The acquired terminal travels as stage 2's stdout, cloned only
+        // now, after the descriptor sweep, so the sweep has nothing to
+        // exempt and stage 2 still sees exactly three descriptors.
+        let stage2_output = if application.terminal {
+            Stdio::from(clone_terminal_descriptor()?)
+        } else {
+            Stdio::null()
+        };
         let mut command = Command::new(executable);
         command
             .args(&stage2_arguments)
             .env_clear()
             .stdin(Stdio::from(proof_reader))
-            .stdout(Stdio::null())
+            .stdout(stage2_output)
             .stderr(Stdio::from(stage2_error_writer));
         let mut child = command.spawn()?;
         drop(command);
@@ -6010,6 +6348,8 @@ mod tests {
                 "present",
                 STAGE2_LOADER_LIBRARY_PATH_ARG,
                 "absent",
+                STAGE2_TERMINAL_ARG,
+                "absent",
                 STAGE2_ENVIRONMENT_ARG,
                 "6",
                 "DBUS_SESSION_BUS_ADDRESS",
@@ -6050,6 +6390,7 @@ mod tests {
                 firefox_autotest_policy: true,
                 firefox_seccomp_probe: true,
                 runtime_aliases: false,
+                terminal: false,
                 environment: [
                     ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
                     ("FLATPAK_ID", "org.td.App"),
@@ -6218,6 +6559,7 @@ mod tests {
                 firefox_autotest_policy: true,
                 firefox_seccomp_probe: true,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
+                terminal: false,
             },
             Stage2ResourceBinding {
                 limits: resources,
@@ -6255,6 +6597,81 @@ mod tests {
         mismatched[loader_index + 1] = OsString::from("absent");
         mismatched.remove(loader_index + 2);
         assert!(parse_mode(mismatched.into_iter()).is_err());
+        // The terminal grant travels right after the loader path, as one
+        // of exactly two words; a launch without it says so rather than
+        // omitting the flag, and stage 2 refuses anything else.
+        let terminal_index = emitted
+            .iter()
+            .position(|argument| argument == STAGE2_TERMINAL_ARG)
+            .unwrap();
+        assert_eq!(terminal_index, loader_index + 3);
+        assert_eq!(emitted[terminal_index + 1], "absent");
+        let mut granted = emitted.clone();
+        granted[terminal_index + 1] = OsString::from("present");
+        // The grant's two derived entries travel in the environment, and
+        // the wire-format validator requires them exactly when the flag
+        // says `present`: the flag alone is refused.
+        assert!(parse_mode(granted.clone().into_iter()).is_err());
+        let environment_index = granted
+            .iter()
+            .position(|argument| argument == STAGE2_ENVIRONMENT_ARG)
+            .unwrap();
+        let count: usize = granted[environment_index + 1]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        granted[environment_index + 1] = OsString::from((count + 2).to_string());
+        let wayland_index = granted
+            .iter()
+            .position(|argument| argument == "WAYLAND_DISPLAY")
+            .unwrap();
+        for (offset, word) in ["TERM", "td-term", "TERMINFO", "/etc/terminfo"]
+            .iter()
+            .enumerate()
+        {
+            granted.insert(wayland_index + offset, OsString::from(*word));
+        }
+        assert!(matches!(
+            parse_mode(granted.into_iter()).unwrap(),
+            Mode::Stage2 {
+                action: Stage2Action::Launch(launch),
+                ..
+            } if launch.terminal
+        ));
+        let mut bogus = emitted.clone();
+        bogus[terminal_index + 1] = OsString::from("maybe");
+        assert!(parse_mode(bogus.into_iter()).is_err());
+        let mut unstated = emitted.clone();
+        unstated.remove(terminal_index);
+        unstated.remove(terminal_index);
+        assert!(parse_mode(unstated.into_iter()).is_err());
+        let granted_emission = stage2_launch_arguments(
+            &token,
+            LaunchIdentityMap {
+                inside: identity,
+                outside: outside_identity,
+            },
+            "/app/bin/app",
+            &environment,
+            Stage2MountBinding {
+                filesystems: &filesystems,
+                resolv_conf: false,
+                machine_id,
+                timezone: Some("Europe/Berlin"),
+                firefox_autotest_policy: true,
+                firefox_seccomp_probe: false,
+                loader_library_path: Some("/app/lib:/app/lib/firefox"),
+                terminal: true,
+            },
+            Stage2ResourceBinding {
+                limits: resources,
+                membership,
+            },
+            &arguments,
+        );
+        assert_eq!(granted_emission[terminal_index], STAGE2_TERMINAL_ARG);
+        assert_eq!(granted_emission[terminal_index + 1], "present");
         assert_eq!(
             parse_mode(emitted.into_iter()).unwrap(),
             Mode::Stage2 {
@@ -6269,6 +6686,7 @@ mod tests {
                     firefox_autotest_policy: true,
                     firefox_seccomp_probe: true,
                     runtime_aliases: true,
+                    terminal: false,
                     environment,
                     filesystems: vec![Stage2Filesystem {
                         target: PathBuf::from("/home/td/Downloads"),
@@ -6374,6 +6792,35 @@ mod tests {
         let ordinary = application_command("/app/bin/app", &arguments, false);
         assert_eq!(ordinary.get_program(), OsStr::new("/app/bin/app"));
         assert_eq!(ordinary.get_args().collect::<Vec<_>>(), arguments);
+    }
+
+    #[test]
+    fn terminal_readback_decodes_procfs_like_the_pty_slave_rdev() {
+        // /dev/pts/3 as procfs's old encoding writes it: major 136 in bits
+        // 8-15, minor 3 in bits 0-7; a minor above 255 carries its high
+        // bits at 20-31. Both decode through `device_numbers` exactly as
+        // `st_rdev` does for these majors.
+        assert_eq!(device_numbers(0x8803), (136, 3));
+        assert_eq!(device_numbers((136 << 8) | 0x11 | (0x3 << 20)), (136, 0x311));
+        assert!(require_terminal_numbers("x", (136, 3), 0x8803).is_ok());
+        assert!(require_terminal_numbers("x", (143, 0x311), (143 << 8) | 0x11 | (0x3 << 20)).is_ok());
+        // No terminal, a different terminal, a console, a serial line, and
+        // a negative field are each refused.
+        assert!(require_terminal_numbers("x", (136, 3), 0).is_err());
+        assert!(require_terminal_numbers("x", (136, 4), 0x8803).is_err());
+        assert!(require_terminal_numbers("x", (4, 1), 0x0401).is_err());
+        assert!(require_terminal_numbers("x", (4, 64), 0x0440).is_err());
+        assert!(require_terminal_numbers("x", (136, 3), -1).is_err());
+        // The sixth node exists only under the grant, and it is /dev/tty.
+        assert_eq!(device_nodes(false).count(), DEVICE_NODES.len());
+        assert_eq!(device_nodes(true).count(), DEVICE_NODES.len() + 1);
+        assert_eq!(device_nodes(true).last(), Some(("tty", 5, 0)));
+        assert!(device_nodes(false).all(|node| node != TERMINAL_NODE));
+        // This test process has no controlling terminal of its own to read
+        // back, so the acquisition itself is proved by the image oracle;
+        // what is pinned here is that stage 2's readback refuses the null
+        // device it would otherwise be handed.
+        assert!(require_terminal_numbers("x", (1, 3), 0).is_err());
     }
 
     #[test]
@@ -7875,10 +8322,22 @@ mod tests {
             timezone,
             firefox_autotest_policy,
             machine_id: Some("0123456789abcdef0123456789abcdef\n"),
+            terminal: None,
         };
         assert!(!expected_etc_names(&selected, binding(None, false))
             .unwrap()
             .contains("firefox"));
+        // The grant adds exactly `terminfo`, conditional like `localtime`.
+        let granted = EtcBinding {
+            terminal: Some("td-term"),
+            ..binding(None, false)
+        };
+        assert!(expected_etc_names(&selected, granted)
+            .unwrap()
+            .contains("terminfo"));
+        assert!(!expected_etc_names(&selected, binding(None, false))
+            .unwrap()
+            .contains("terminfo"));
         // A launch with no zone expects no `localtime`, and one with a zone
         // expects exactly one more name — the entry is conditional the way
         // `resolv.conf` is, not unconditional the way `machine-id` is.

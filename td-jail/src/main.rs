@@ -685,6 +685,97 @@ mod confinement {
         assert_eq!(TRANSITION.matches("sys::start_new_session()?").count(), 3);
     }
 
+    /// The terminal grant's order: acquired and read back before any
+    /// registration, namespace or cgroup exists; cloned for stage 2 only
+    /// after the descriptor sweep; proved again by stage 2 before it mounts
+    /// anything and before the entry is given it.
+    #[test]
+    fn the_terminal_grant_is_acquired_first_and_read_back_in_stage_2() {
+        let launch = TRANSITION
+            .split_once("pub fn launch_application")
+            .unwrap()
+            .1;
+        let at = |needle: &str| {
+            launch
+                .find(needle)
+                .unwrap_or_else(|| panic!("launch_application no longer contains {needle}"))
+        };
+        assert!(
+            at("td-jail launch identity changed after authority resolution")
+                < at("acquire_fresh_terminal()?")
+        );
+        assert!(at("acquire_fresh_terminal()?") < at("crate::bus::register("));
+        assert!(at("acquire_fresh_terminal()?") < at("sys::unshare_namespaces("));
+        assert!(
+            at("close_inherited_descriptors(cleanup_descriptor)?")
+                < at("stage2_output = if application.terminal")
+        );
+        assert!(at("stage2_output = if application.terminal") < at(".stdout(stage2_output)"));
+        assert_eq!(TRANSITION.matches("acquire_fresh_terminal()?").count(), 1);
+        assert_eq!(TRANSITION.matches("sys::acquire_controlling_terminal()").count(), 1);
+
+        let acquire = TRANSITION
+            .split_once("fn acquire_fresh_terminal()")
+            .unwrap()
+            .1;
+        let at = |needle: &str| {
+            acquire
+                .find(needle)
+                .unwrap_or_else(|| panic!("acquire_fresh_terminal no longer contains {needle}"))
+        };
+        assert!(at("PTY_SLAVE_MAJORS.contains(&stdin.device.0)") < at("sys::acquire_controlling_terminal()"));
+        assert!(at("before.session != std::process::id()") < at("sys::acquire_controlling_terminal()"));
+        assert!(
+            at("sys::acquire_controlling_terminal()")
+                < at("require_terminal_numbers(\"launcher stdin\"")
+        );
+
+        let stage2 = TRANSITION.split_once("pub fn run_stage2(").unwrap().1;
+        let at = |needle: &str| {
+            stage2
+                .find(needle)
+                .unwrap_or_else(|| panic!("run_stage2 no longer contains {needle}"))
+        };
+        assert!(at("require_only_stdio_descriptors()?") < at("require_stage2_terminal(terminal"));
+        assert!(at("require_stage2_terminal(terminal") < at("enter_mount_plan()?"));
+        assert!(
+            at("require_stage2_terminal(terminal")
+                < at("run_application(\n                &entry,")
+        );
+        assert!(TRANSITION.contains("const PTY_SLAVE_MAJORS: std::ops::RangeInclusive<u64> = 136..=143;"));
+        assert!(TRANSITION.contains("const TERMINAL_NODE: (&str, u64, u64) = (\"tty\", 5, 0);"));
+
+        // One open terminal is device, filesystem AND inode: two devpts
+        // instances can number a slave alike. The descriptor stage 2 writes
+        // is the one `TIOCSCTTY` acted on.
+        assert!(TRANSITION.contains("filesystem: metadata.dev(),"));
+        assert!(TRANSITION.contains("inode: metadata.ino(),"));
+        let clone = TRANSITION
+            .split_once("fn clone_terminal_descriptor()")
+            .unwrap()
+            .1;
+        assert!(
+            clone.find("io::stdin().as_fd().try_clone_to_owned()").unwrap()
+                < clone.find('}').unwrap()
+        );
+        // The transition probe runs in its caller's session and asserts
+        // nothing about terminals; only a launch does.
+        let readback = TRANSITION
+            .split_once("fn require_stage2_terminal(")
+            .unwrap()
+            .1;
+        assert!(
+            readback.find("if !terminal && !launch {").unwrap()
+                < readback.find("process_containment(").unwrap()
+        );
+        // The one description is proved bound where `TERMINFO` says, and the
+        // cleanup tree gets no duplicate of the terminal.
+        let etc = TRANSITION.split_once("fn require_etc_plan(").unwrap().1;
+        assert!(etc.contains("require_bound_terminfo(mountinfo, name)?"));
+        let cleanup = TRANSITION.split_once("fn spawn(executable: &Path, membership: &str, terminal: bool)").unwrap().1;
+        assert!(cleanup.find("Stdio::null()").unwrap() < cleanup.find(".stderr(diagnostics)").unwrap());
+    }
+
     #[test]
     fn syscall_and_argument_rosters_are_pinned() {
         let shipped_sys = SYS.split_once("#[cfg(test)]").unwrap().0;
@@ -756,7 +847,10 @@ mod confinement {
         assert!(SYS.contains("const SIOCGIFFLAGS: usize = 0x8913;"));
         assert!(SYS.contains("const SIOCSIFFLAGS: usize = 0x8914;"));
         assert!(SYS.contains("const IFF_UP: i16 = 0x1;"));
-        assert_eq!(shipped_sys.matches("SYS_IOCTL,").count(), 2);
+        assert_eq!(shipped_sys.matches("SYS_IOCTL,").count(), 3);
+        assert!(SYS.contains("const TIOCSCTTY: usize = 0x540e;"));
+        assert!(SYS.contains("check(syscall5(SYS_IOCTL, 0, TIOCSCTTY, 0, 0, 0))"));
+        assert_eq!(shipped_sys.matches("TIOCSCTTY,").count(), 1);
         assert_eq!(shipped_sys.matches("SYS_SETSID,").count(), 1);
         assert_eq!(shipped_sys.matches("SIOCGIFFLAGS,").count(), 1);
         assert_eq!(shipped_sys.matches("SIOCSIFFLAGS,").count(), 1);

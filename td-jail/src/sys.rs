@@ -72,6 +72,7 @@ pub(crate) const SECCOMP_MAX_FILTER_INSNS: usize = 4096;
 const SIOCGIFFLAGS: usize = 0x8913;
 const SIOCSIFFLAGS: usize = 0x8914;
 const IFF_UP: i16 = 0x1;
+const TIOCSCTTY: usize = 0x540e;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilitySets {
@@ -324,6 +325,16 @@ pub fn bring_up_loopback() -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Make stage 1's stdin the controlling terminal of the session it created.
+///
+/// The descriptor is pinned to 0 and the argument to 0: the kernel then
+/// refuses a terminal that is already another session's, which is the
+/// operator's-terminal case §C excludes, and a steal is never requested.
+/// The caller reads the result back from procfs; this is the request only.
+pub fn acquire_controlling_terminal() -> io::Result<()> {
+    check(syscall5(SYS_IOCTL, 0, TIOCSCTTY, 0, 0, 0))
 }
 
 pub fn mount(
@@ -646,6 +657,7 @@ mod tests {
         assert_eq!(SYS_PRLIMIT64, 302);
         assert_eq!(SIOCGIFFLAGS, 0x8913);
         assert_eq!(SIOCSIFFLAGS, 0x8914);
+        assert_eq!(TIOCSCTTY, 0x540e);
         assert_eq!(IFF_UP, 1);
         assert_eq!(RLIMIT_DATA, 2);
         assert_eq!(std::mem::size_of::<Rlimit64>(), 16);

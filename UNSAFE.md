@@ -61,7 +61,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)`; plus one scoped client-side clipboard descriptor adoption |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
-| 9 | `td-jail` | `close(2)`, `ioctl(2)` with two value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
+| 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the private Wayland client's bounded descriptor transfer |
@@ -1151,11 +1151,29 @@ application design permits:
 `CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUTS`, with
 `CLONE_NEWNET` either absent for a declared shared network or present for
 an isolated one. There is no caller-provided flags word.
-The ioctl wrapper accepts no caller-provided request or interface. It uses
-only `SIOCGIFFLAGS`=0x8913 and `SIOCSIFFLAGS`=0x8914 over a pinned 40-byte
-`ifreq` naming `lo`, preserves the kernel-returned flags while adding `IFF_UP`,
-and reads `IFF_UP` back. A safe `std` UDP socket is only the ioctl carrier and
-is dropped before inherited descriptors are swept.
+The ioctl wrapper accepts no caller-provided request, descriptor or
+interface. Two requests serve loopback: `SIOCGIFFLAGS`=0x8913 and
+`SIOCSIFFLAGS`=0x8914 over a pinned 40-byte `ifreq` naming `lo`, preserving
+the kernel-returned flags while adding `IFF_UP`, and reading `IFF_UP` back. A
+safe `std` UDP socket is only the ioctl carrier and is dropped before
+inherited descriptors are swept. The third is `TIOCSCTTY`=0x540e on
+descriptor 0 with argument 0, issued once, by stage 1 alone, only under an
+authenticated `devices=tty` grant (APPLICATIONS.md §C). Before the request
+the launcher's three stdio descriptors must be one open Unix98 pseudo-terminal
+slave, by device, filesystem and inode, and stage 1 must already lead the
+detached no-terminal session the containment bootstrap proved, which it
+asserts from procfs; after the request, procfs's controlling-terminal field
+must decode to that device with session and process group unchanged. The
+zero argument never steals: a terminal another session owns is refused by
+the kernel and the launch fails with that reason, before any registration,
+namespace or cgroup exists. Stage 2 receives the terminal as its stdout, a
+clone of that same descriptor 0 taken after the descriptor sweep, re-reads
+the same procfs field against that descriptor before it mounts anything, and
+hands the entry three clones of it; a launch without the grant proves the
+field is zero and the descriptor is the null device, and the transition
+probe asserts nothing. The device, filesystem and inode readback is safe
+`std` `fstat` on a cloned
+descriptor, not a fourth request.
 
 The argv0-selected launch parent first spawns and waits on a later-born stage
 1, because that child cannot already be a process-group leader. Stage 1 sets
@@ -1169,7 +1187,9 @@ authority resolution, registration, cgroup creation or namespace work. Parent
 death therefore still kills stage 1, whose existing proof-pipe and cleanup
 protocols tear down stage 2 and its cgroup. The new `setsid(2)` caller and use
 of the existing parent-death operation are the application-session amendment;
-no syscall or operation was added.
+no syscall or operation was added. The terminal grant's `TIOCSCTTY` is the
+one later amendment to this surface: a third value-pinned ioctl request,
+still no new syscall.
 
 Stage 1 is single-threaded when it issues the unshare call, writes `setgroups`
 deny before the identity gid map, reads both maps back, and checks that
