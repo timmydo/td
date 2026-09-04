@@ -454,7 +454,8 @@ const SYSTEM: SystemDef = SystemDef {
 const UI_USER: &str = "tester";
 const UI_UID: u32 = td_engine::application_spec::APPLICATION_UID;
 const UI_GID: u32 = 1000;
-#[cfg(test)]
+/// The autologin account's home as the users table names it, and the home
+/// td-firstboot is handed for the terminal applications' first configuration.
 const UI_HOME: &str = "/home/tester";
 const TD_PORTAL_SETTINGS_PATH: &str = "/etc/td-portal-settings";
 const TD_PORTAL_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
@@ -1190,7 +1191,9 @@ mod svc_timeouts {
 ///   td-firstboot mints the per-machine identity, so it precedes everything that reads
 ///     or checks it — rootcheck (asserts it is READABLE through the MUTABLE_ETC
 ///     symlinks on a still-read-only /etc), and OpenSSH (whose immutable config
-///     names those mutable paths).
+///     names those mutable paths). It also provisions the terminal applications'
+///     first configuration into the login user's home, which stage-1 init created
+///     and handed to that user before sysinit began.
 ///   rootcheck precedes netup: the read-only-root self-check before networking.
 ///   netup brings the link up — loopback 127.0.0.1/8, so sshd's own loopback bind and
 ///     the boot self-test route work, plus any NIC.
@@ -1225,9 +1228,12 @@ fn build_td_svc_conf() -> String {
          # reads the hostname (this writes /var/lib/td alone), but a cutover that\n\
          # silently made two jobs concurrent would be a behaviour change wearing a\n\
          # migration's clothes. Relaxing this edge is a separate, argued landing.\n\
+         # The application pair adds a first configuration for the terminal\n\
+         # applications (mail, news) under the login user's jail state: created\n\
+         # once, owned by that user, never rewritten, and no first-boot decision.\n\
          [td-firstboot]\n\
          type=oneshot\n\
-         exec=/bin/td-firstboot provision\n\
+         exec=/bin/td-firstboot provision --application-home {ui_home} --application-owner {ui_uid}:{ui_gid}\n\
          after=hostname\n\
          timeout={firstboot}\n\
          \n\
@@ -1548,6 +1554,7 @@ fn build_td_svc_conf() -> String {
         bootfail = svc_timeouts::BOOTFAIL,
         ui_user = UI_USER,
         ui_uid = UI_UID,
+        ui_home = UI_HOME,
         audio_uid = AUDIO_UID,
         audio_gid = AUDIO_GID,
         audio_user = AUDIO_USER,
@@ -1710,11 +1717,15 @@ fn build_deployment_init(sys: &SystemDef) -> String {
          /bin/td-util chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
          /bin/td-util chmod 0700 /sysroot/var/root\n"
     ));
+    // Each persistent home is its user's from the moment it exists: td-firstboot
+    // provisions the terminal applications' configuration into it at sysinit,
+    // before rootcheck, and refuses a home the user does not own.
     for user in sys.users {
         if gets_generic_persistent_home_setup(user) {
             init.push_str(&format!(
-                "/bin/td-util chmod 0700 /sysroot/var{}\n",
-                user.home
+                "/bin/td-util chown {}:{} /sysroot/var{}\n\
+                 /bin/td-util chmod 0700 /sysroot/var{}\n",
+                user.uid, user.gid, user.home, user.home
             ));
         }
     }
@@ -1819,9 +1830,10 @@ fn build_autologin(sys: &SystemDef) -> String {
 }
 
 /// The boot self-check run once at sysinit AS ROOT on the REAL (post-switch_root) root
-/// (re #550). It gives each non-root user ownership of its `/var`-backed home and
-/// prints the diagnostic markers the headless oracle asserts: `/` and `/etc` remain
-/// immutable, while the direct state and volatile mounts accept writes.
+/// (re #550). It prints the diagnostic markers the headless oracle asserts: `/` and
+/// `/etc` remain immutable, while the direct state and volatile mounts accept writes.
+/// Each non-root user's `/var`-backed home is already its own: stage-1 init hands it
+/// over when it creates it, because td-firstboot provisions into it before this runs.
 fn build_rootcheck(sys: &SystemDef) -> String {
     let mut s = String::new();
     s.push_str("#!/bin/sh\nok=1\n");
@@ -1834,16 +1846,6 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          /bin/chown 0:0 {SSHD_PRIVSEP_PATH} || ok=0\n\
          /bin/chmod 0755 {SSHD_PRIVSEP_PATH} || ok=0\n"
     ));
-    // Persistent home ownership below /var. The audio account's home is the
-    // volatile runtime that td-seatd creates after this check.
-    for u in sys.users {
-        if gets_generic_persistent_home_setup(u) {
-            s.push_str(&format!(
-                "/bin/td-util chown {}:{} {} 2>/dev/null || ok=0\n",
-                u.uid, u.gid, u.home
-            ));
-        }
-    }
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         if user.uid != 0 {
             let (name, home) = (user.name, user.home);
@@ -6897,6 +6899,15 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             )),
             "the seat service must create both compiled runtime identities"
         );
+        assert_eq!(
+            unit_key("td-firstboot", "exec"),
+            Some(format!(
+                "/bin/td-firstboot provision --application-home {UI_HOME} \
+                 --application-owner {UI_UID}:{UI_GID}"
+            )),
+            "td-firstboot must be handed the login user's home and identity for the \
+             terminal applications' first configuration"
+        );
         // td-login refuses `login -f` for a LOCKED account — stricter than busybox, whose
         // `-f` skips the account database entirely (td-login/THREAT-MODEL.md section 3). So a
         // `passwordless: false` auto-login user is an image that boots to a getty respawn
@@ -8870,9 +8881,23 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                     init.contains(&path),
                     "stage-1 init must create state directory {path} before switch_root"
                 );
+                // Whole lines: the Downloads lines beneath the home start with
+                // the same words and must not answer for it.
+                let chmod = format!("chmod 0700 {path}\n");
                 assert!(
-                    init.contains(&format!("chmod 0700 {path}")),
+                    init.contains(&chmod),
                     "stage-1 init must make application home {path} private"
+                );
+                // The home is the user's before sysinit: td-firstboot provisions
+                // into it and refuses one the user does not own.
+                let chown = format!("chown {}:{} {path}\n", user.uid, user.gid);
+                assert!(
+                    init.contains(&chown),
+                    "stage-1 init must hand application home {path} to its user"
+                );
+                assert!(
+                    init.find(&chown) < init.find(&chmod),
+                    "the hand-over precedes the mode, as the Downloads setup does"
                 );
             } else if user.uid == 0 {
                 assert!(init.contains("/sysroot/var/root"));
@@ -9588,13 +9613,15 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             )),
             "the immutable root must pack td-boot and expose /bin/td-boot for transactions"
         );
-        // Persistent home ownership is fixed for every applicable user below
-        // /var. Audio's home is the volatile runtime created by td-seatd.
+        // Persistent home ownership is stage-1 init's, at creation, so that
+        // td-firstboot finds the home owned before rootcheck runs; rootcheck
+        // no longer chowns it. Audio's home is the volatile runtime created
+        // by td-seatd.
         for u in SYSTEM.users {
             if gets_generic_persistent_home_setup(u) {
                 assert!(
-                    rootcheck.contains(&format!("chown {}:{} {}", u.uid, u.gid, u.home)),
-                    "rootcheck must chown {}'s /var-backed home",
+                    !rootcheck.contains(&format!("chown {}:{} {}", u.uid, u.gid, u.home)),
+                    "rootcheck must not chown {}'s /var-backed home: init owns that",
                     u.name
                 );
             }

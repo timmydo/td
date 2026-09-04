@@ -1921,7 +1921,14 @@ launcher-table=/etc/td-launcher.tsv
 
 The relative state root is resolved beneath the real user's home. Rung 7
 does not create that writable directory; `td-jail` does so on first launch
-once the ownership and confinement boundary exists.
+once the ownership and confinement boundary exists. One exception is
+deliberate: for a program that cannot start without a configuration (the
+terminal applications, §D), `td-firstboot` creates the application's
+`config` directory ahead of its first launch, at sysinit, in exactly the
+shape the jail requires — 0700 directories and 0600 files owned by the
+user, handed over through their own descriptors, written once and never
+rewritten. The jail's ownership rules are unchanged: it still refuses state
+that is not the user's.
 
 
 ### B.5 Activation and state — there is no install
@@ -1936,7 +1943,7 @@ an installer for now happens in two other places:
 | identity allocation | build time, in the recipe |
 | the permission defaults | build time — part of the jail spec (§A.0) |
 | the launcher and resolver tables | build time, compiled from every shipped package's builder-authenticated metadata |
-| the state directory `~/.td/app/<name>/` | first launch, by `td-jail` |
+| the state directory `~/.td/app/<name>/` | first launch, by `td-jail`; or at sysinit, by `td-firstboot`, for a program that needs a first configuration before it can start (§B.4) |
 | the per-user permission *override* | on demand, at first edit — a separate file, so the default stays immutable |
 
 **Widening a grant must stay visible.** A default that is immutable does
@@ -7776,7 +7783,7 @@ middle.
 | `td-compositor` | 1000 | owns the session |
 | `td-busd` | 1000 | **required**, see below |
 | `td-portal` | 1000 | reads the user's files in order to show them |
-| `td-jail` (stage 0/1) | 1000 | fully unprivileged — resolve, register, unshare. It writes only under `~/.td/app` (§B.4); packages are read-only store paths (§B.1) |
+| `td-jail` (stage 0/1) | 1000 | fully unprivileged — resolve, register, unshare. It writes only under `~/.td/app` (§B.4), where `td-firstboot` may already have placed a first configuration as the user's own files; packages are read-only store paths (§B.1) |
 | `td-authd` | root | §L.1 — elevation, and the ONLY component that grants it |
 | `td-jail` | 1000 | it *is* the boundary; it holds nothing |
 | `td-audio` | **`audio`** | §K.5 — the one dedicated uid |

@@ -35,6 +35,11 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let post_bootstrap_shebang = format!("#!{POST_BOOTSTRAP_SH}");
     let bin = "{in:td-firstboot}/bin/td-firstboot";
+    // The two programs the provisioned configurations are for, pinned at the
+    // commits the image ships: the proof that a template parses is the
+    // program's own parser, not a second reading of its format.
+    let tmc = "{in:tmc}/bin/tmc";
+    let tn = "{in:tn}/bin/tn";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
     let mut steps = Vec::new();
 
@@ -196,6 +201,77 @@ pub fn recipe() -> Recipe {
         .env("PATH", &post_bootstrap_path()),
     );
 
+    // The terminal applications' first configuration. The flag pair adds the
+    // mail and news configurations under the login user's td-jail state: once,
+    // owned by that user, in the modes the jail insists on, and without turning
+    // a stable identity into a first boot. The sandbox user's own uid is the
+    // owner td-firstboot is given, so the chown root performs at boot runs here
+    // as the permitted no-op rather than being skipped; the hand-over to a
+    // different identity is what the boot oracle's application markers prove.
+    // Then the pinned programs read what was provisioned: tmc starts offline
+    // in its CLI mode and exits cleanly at end of input, and tn loads the feed
+    // list and reaches for the feeds, which either answer or fail to, both of
+    // which mean the configuration parsed (a parse failure is its own
+    // message). Each finds its file as it does inside the jail: tmc through
+    // the configuration home, tn through an explicit path.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "state='{{root}}/state'; stub='{{root}}/keygen-stub'; err=\"{{root}}/apps.err\"; \
+                     home='{{root}}/home'; mkdir -p \"$home\" && chmod 700 \"$home\" || exit 1; \
+                     set -- $(ls -lnd \"$home\"); owner=\"$3:$4\"; \
+                     out=$('{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"$home\" --application-owner \"$owner\" 2>\"$err\") || \
+                       {{ echo 'provision with the application pair failed; its own diagnostic:' >&2; cat \"$err\" >&2; exit 1; }}; \
+                     printf '%s\\n' \"$out\" | grep -q -x -F TD-FIRSTBOOT-STABLE-OK || \
+                       {{ echo \"provisioning the applications turned a stable identity into something else: $out\" >&2; exit 1; }}; \
+                     for f in mail/config/tmc/config.toml mail/config/tmc/password news/config/tn/config.toml; do \
+                       [ -f \"$home/.td/app/$f\" ] || {{ echo \"td-firstboot did not provision $f\" >&2; exit 1; }}; \
+                       got=$(ls -l \"$home/.td/app/$f\" | cut -c1-10); \
+                       [ \"$got\" = -rw------- ] || {{ echo \"$f has mode $got, expected -rw------- - the jail binds only private state\" >&2; exit 1; }}; \
+                       set -- $(ls -ln \"$home/.td/app/$f\"); [ \"$3:$4\" = \"$owner\" ] || {{ echo \"$f is owned by $3:$4, not $owner\" >&2; exit 1; }}; \
+                     done; \
+                     for d in .td .td/app .td/app/mail .td/app/mail/config .td/app/mail/config/tmc .td/app/news .td/app/news/config .td/app/news/config/tn; do \
+                       got=$(ls -ld \"$home/$d\" | cut -c1-10); \
+                       [ \"$got\" = drwx------ ] || {{ echo \"$d has mode $got, expected drwx------\" >&2; exit 1; }}; \
+                       set -- $(ls -lnd \"$home/$d\"); [ \"$3:$4\" = \"$owner\" ] || {{ echo \"$d is owned by $3:$4, not $owner\" >&2; exit 1; }}; \
+                     done; \
+                     grep -q -F 'password_file = \"/home/td/.config/tmc/password\"' \"$home/.td/app/mail/config/tmc/config.toml\" || \
+                       {{ echo 'the mail configuration does not name the password file at its jail-side path' >&2; exit 1; }}; \
+                     grep -q -x -F '[[feed]]' \"$home/.td/app/news/config/tn/config.toml\" || \
+                       {{ echo 'the news configuration has no feed, and tn refuses to start without one' >&2; exit 1; }}; \
+                     HOME=\"$home\" XDG_CONFIG_HOME=\"$home/.td/app/mail/config\" '{tmc}' --offline --cli < /dev/null > '{{root}}/tmc.out' 2> '{{root}}/tmc.err' || \
+                       {{ echo 'the provisioned mail configuration does not start tmc offline; its own diagnostic:' >&2; cat '{{root}}/tmc.err' >&2; exit 1; }}; \
+                     HOME=\"$home\" '{tn}' --config \"$home/.td/app/news/config/tn/config.toml\" --cache '{{root}}/tn-cache' --fetch-and-quit > '{{root}}/tn.out' 2> '{{root}}/tn.err'; \
+                     grep -q 'Error loading config' '{{root}}/tn.err' && \
+                       {{ echo 'the provisioned news configuration does not load in tn; its own diagnostic:' >&2; cat '{{root}}/tn.err' >&2; exit 1; }}; \
+                     grep -Eq 'Fetch error|^Fetched ' '{{root}}/tn.err' || \
+                       {{ echo 'tn did not reach for its feeds from the provisioned configuration; its own diagnostic:' >&2; cat '{{root}}/tn.err' >&2; exit 1; }}; \
+                     printf 'edited\\n' > \"$home/.td/app/mail/config/tmc/config.toml\"; \
+                     rm \"$home/.td/app/mail/config/tmc/password\"; \
+                     out=$('{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"$home\" --application-owner \"$owner\" 2>\"$err\") || \
+                       {{ echo 'a later provision over edited application state failed; its own diagnostic:' >&2; cat \"$err\" >&2; exit 1; }}; \
+                     [ \"$(cat \"$home/.td/app/mail/config/tmc/config.toml\")\" = edited ] || \
+                       {{ echo 'a later provision rewrote an operator-edited application configuration' >&2; exit 1; }}; \
+                     [ -f \"$home/.td/app/mail/config/tmc/password\" ] || \
+                       {{ echo 'a later provision did not restore a missing sibling file' >&2; exit 1; }}; \
+                     '{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"$home\" >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'td-firstboot must exit 2 (usage) when --application-home comes without --application-owner' >&2; exit 1; }}; \
+                     '{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"$home\" --application-owner 0:0 >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'td-firstboot must exit 2 (usage) for a root application owner' >&2; exit 1; }}; \
+                     out=$('{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"{{root}}/nobody\" --application-owner \"$owner\" 2>\"$err\") || \
+                       {{ echo 'an absent application home must be skipped with a diagnostic, not failed: the identity does not depend on a mail client' >&2; exit 1; }}; \
+                     grep -q 'is absent' \"$err\" || {{ echo 'the skipped application home was not reported' >&2; exit 1; }}; \
+                     [ ! -e '{{root}}/nobody' ] || {{ echo 'td-firstboot created an application home it was not given' >&2; exit 1; }}"
+                ),
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+
     // The refusals. A machine that believes it has an identity it does not have is
     // worse than one that fails to provision, so each of these must exit non-zero
     // and emit NO marker.
@@ -267,7 +343,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-firstboot is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; a first provision mints a 32-hex machine-id, an SSH host key pair, and a deny-all authorized_keys, reporting TD-FIRSTBOOT-NEW-OK; a second provision over the same state reports TD-FIRSTBOOT-STABLE-OK with an unchanged machine-id and host-key fingerprint; and it refuses (non-zero, no marker) a keygen that fails, writes nothing, or reports a malformed fingerprint, an unknown argument, a malformed machine-id, incomplete keypairs, and malformed, wrong-type, or mismatched complete host-key pairs\n".into(),
+        content: "PASS: td-firstboot is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; a first provision mints a 32-hex machine-id, an SSH host key pair, and a deny-all authorized_keys, reporting TD-FIRSTBOOT-NEW-OK; a second provision over the same state reports TD-FIRSTBOOT-STABLE-OK with an unchanged machine-id and host-key fingerprint; and it refuses (non-zero, no marker) a keygen that fails, writes nothing, or reports a malformed fingerprint, an unknown argument, a malformed machine-id, incomplete keypairs, and malformed, wrong-type, or mismatched complete host-key pairs; and with --application-home/--application-owner it provisions the mail (tmc) and news (tn) configurations once under HOME/.td/app as 0700 directories and 0600 files owned by that user, reports the identity STABLE rather than NEW, never rewrites an edited file and restores a missing one, refuses half the pair or a root owner (exit 2), skips an absent home with a diagnostic, and starts the pinned tmc (offline, CLI mode) and tn (feed load) from the provisioned files\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -280,11 +356,13 @@ pub fn recipe() -> Recipe {
             "td-firstboot",
             "binutils-x86-64-self",
             "busybox-x86-64",
+            "tmc",
+            "tn",
         ])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-firstboot-test: build-plan --auto builds td-firstboot (td's static per-machine identity provisioner: machine-id, SSH host key, deny-all authorized_keys under /var/lib/td, which the image's /etc reaches through reviewed per-file symlinks), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises provisioning twice to prove it mints an identity once and never re-mints it, plus its refusals"
+echo ">> recipe-check td-firstboot-test: build-plan --auto builds td-firstboot (td's static per-machine identity provisioner: machine-id, SSH host key, deny-all authorized_keys under /var/lib/td, which the image's /etc reaches through reviewed per-file symlinks), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises provisioning twice to prove it mints an identity once and never re-mints it, plus its refusals; then proves the application pair provisions the mail and news configurations once, privately, under the login user's jail state, and that the pinned tmc and tn start from them"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-firstboot-test 1
 "#,

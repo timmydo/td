@@ -19,7 +19,7 @@ mod machineid;
 mod mounts;
 
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -47,6 +47,75 @@ const HOST_KEY: &str = "ssh/ssh_host_ed25519_key";
 const HOST_KEY_PUB: &str = "ssh/ssh_host_ed25519_key.pub";
 const AUTHORIZED_KEYS: &str = "ssh/authorized_keys";
 
+/// td-jail's per-application state root under the login user's home
+/// (`td-jail/src/authority.rs` `STATE_ROOT`): `<home>/.td/app/<name>` holds
+/// `config`, which the jail binds at `/home/td/.config`. A file written at
+/// `config/<program>/config.toml` here is `$XDG_CONFIG_HOME/<program>/config.toml`
+/// inside the jail, which is where each terminal application looks.
+const APPLICATION_STATE_ROOT: &str = ".td/app";
+
+/// One terminal application's first configuration: enough for the program to
+/// start and show the operator what to edit, never a credential that works.
+struct ApplicationConfig {
+    /// The application name, which is the `/bin` entry and the state directory.
+    application: &'static str,
+    /// The program inside the jail, which names the XDG configuration directory.
+    program: &'static str,
+    /// `(file name, contents)` under `config/<program>/`, every one mode 0600.
+    files: &'static [(&'static str, &'static str)],
+}
+
+const APPLICATION_CONFIGS: &[ApplicationConfig] = &[
+    ApplicationConfig {
+        application: "mail",
+        program: "tmc",
+        files: &[("config.toml", TMC_CONFIG), ("password", TMC_PASSWORD)],
+    },
+    ApplicationConfig {
+        application: "news",
+        program: "tn",
+        files: &[("config.toml", TN_CONFIG)],
+    },
+];
+
+/// tmc starts offline from this and says so; the operator replaces the three
+/// placeholders and the password file, and the client reads them when it next
+/// starts. The comments name no way to start it: a user-level relaunch of a
+/// terminal window is deferred work the applications' commit plans, and the
+/// administrative escape hatch is not a flow a shipped file may depend on
+/// (AGENTS.md).
+const TMC_CONFIG: &str = "\
+# td mail (tmc). Provisioned on first boot; edit freely, it is never rewritten.
+# Paths are as the application sees them inside its jail. The client reads
+# this file when it starts.
+
+[account.main]
+well_known_url = \"https://mail.example.com/.well-known/jmap\"
+username = \"you@example.com\"
+password_file = \"/home/td/.config/tmc/password\"
+";
+
+const TMC_PASSWORD: &str = "replace-me\n";
+
+/// tn needs at least one feed to start. These two public feeds are shipped
+/// so the first window shows something rather than an error; tn fetches them
+/// on its first start, which is the one outbound request the image makes on a
+/// user's behalf without being asked, and the comment says how to stop it.
+const TN_CONFIG: &str = "\
+# td news (tn). Provisioned on first boot; edit freely, it is never rewritten.
+# The client reads this file when it starts. The feeds below are public
+# starting points: replace or delete them, and nothing is fetched until you
+# name a feed of your own.
+
+[[feed]]
+name = \"LWN\"
+url = \"https://lwn.net/headlines/rss\"
+
+[[feed]]
+name = \"Rust Blog\"
+url = \"https://blog.rust-lang.org/feed.xml\"
+";
+
 /// Shipped into a fresh `authorized_keys` so the file exists (the daemon reads it
 /// on every connection) while authorizing nobody.
 const AUTHORIZED_KEYS_HEADER: &str = "\
@@ -57,7 +126,7 @@ const AUTHORIZED_KEYS_HEADER: &str = "\
 
 /// Did this boot have to create the thing, or was it already there? One `Created`
 /// anywhere makes the whole run a first boot.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     Created,
     Present,
@@ -79,6 +148,19 @@ struct Config {
     /// filesystem. On by default; `--state-dir` turns it off because an
     /// operator-named directory carries no implied mount to check.
     require_persistent: bool,
+    /// The login user whose terminal applications get a first configuration,
+    /// or `None` when the invocation names none.
+    applications: Option<ApplicationHome>,
+}
+
+/// Where the terminal applications' state lives and who owns it. The
+/// provisioner runs as root at sysinit, so everything it creates here is
+/// handed to this identity; the jail refuses state it does not own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApplicationHome {
+    home: PathBuf,
+    uid: u32,
+    gid: u32,
 }
 
 fn main() -> ExitCode {
@@ -105,9 +187,11 @@ enum Failure {
 
 fn usage() -> String {
     format!(
-        "usage: td-firstboot [provision] [--state-dir DIR] [--keygen PROGRAM]\n  \
+        "usage: td-firstboot [provision] [--state-dir DIR] [--keygen PROGRAM] \
+         [--application-home DIR --application-owner UID:GID]\n  \
          provisions this machine's identity under {DEFAULT_STATE_DIR}: {MACHINE_ID}, \
-         {HOST_KEY}(.pub), {AUTHORIZED_KEYS}\n"
+         {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with the application pair, a first \
+         configuration for each terminal application under DIR/{APPLICATION_STATE_ROOT}\n"
     )
 }
 
@@ -172,7 +256,30 @@ fn run(args: &[String]) -> Result<(), Failure> {
             STABLE_MARKER
         }
     ))
-    .map_err(Failure::Failed)
+    .map_err(Failure::Failed)?;
+
+    // After the identity has been reported, and outside the first-boot
+    // decision: an application added by a later image gets its configuration
+    // on the next boot without that boot reporting a re-minted identity, and
+    // nothing under the login user's own home can withhold that report or
+    // fail this unit. The home is the user's to break; what breaks there is
+    // said on the console and shows up as the application's own failure.
+    if let Some(applications) = &config.applications {
+        match provision_applications(applications) {
+            Ok(outcomes) => {
+                for (application, outcome) in outcomes {
+                    emit_err(&format!(
+                        "td-firstboot: application {application} configuration {}\n",
+                        outcome.name()
+                    ));
+                }
+            }
+            Err(Failure::Failed(reason) | Failure::Usage(reason)) => emit_err(&format!(
+                "td-firstboot: application configuration not provisioned: {reason}\n"
+            )),
+        }
+    }
+    Ok(())
 }
 
 /// What an argv asked for.
@@ -184,6 +291,8 @@ enum Invocation {
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
     let mut state: Option<PathBuf> = None;
     let mut keygen = DEFAULT_KEYGEN.to_string();
+    let mut application_home: Option<PathBuf> = None;
+    let mut application_owner: Option<(u32, u32)> = None;
     let mut rest = args;
     // `provision` is accepted (and is the default) so the inittab line can name
     // what it does, and so a second mode could be added without changing it.
@@ -197,14 +306,16 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
         match flag.as_str() {
             // Every flag that does not end the parse takes a value, so the stride
             // below is unconditional.
-            "--state-dir" | "--keygen" => {
+            "--state-dir" | "--keygen" | "--application-home" | "--application-owner" => {
                 let Some(value) = rest.get(index + 1) else {
                     return Err(Failure::Usage(format!("flag `{flag}` needs a value")));
                 };
-                if flag == "--state-dir" {
-                    state = Some(PathBuf::from(value));
-                } else {
-                    keygen = value.clone();
+                match flag.as_str() {
+                    "--state-dir" => state = Some(PathBuf::from(value)),
+                    "--keygen" => keygen = value.clone(),
+                    "--application-home" => application_home = Some(PathBuf::from(value)),
+                    "--application-owner" => application_owner = Some(parse_owner(value)?),
+                    other => return Err(Failure::Usage(format!("unknown argument `{other}`"))),
                 }
             }
             "-h" | "--help" => return Ok(Invocation::Help),
@@ -212,11 +323,245 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
         }
         index += 2;
     }
+    // The pair is one fact — whose applications, and where — so half of it is
+    // a usage error rather than a default the other half silently supplies.
+    let applications = match (application_home, application_owner) {
+        // Absolute, as the jail requires of its own state root: sysinit's
+        // working directory is not somewhere to provision by accident.
+        (Some(home), Some(_)) if !home.is_absolute() => {
+            return Err(Failure::Usage(format!(
+                "--application-home must be absolute, not `{}`",
+                home.display()
+            )))
+        }
+        // A trailing slash, `.` or `..` makes the kernel resolve the last
+        // name as a directory, following a link there past `O_NOFOLLOW`; the
+        // open below refuses a link only if the path ends in the name itself.
+        (Some(home), Some(_)) if ends_past_its_last_name(&home) => {
+            return Err(Failure::Usage(format!(
+                "--application-home must end in its last name, not `/`, `.` or `..`: `{}`",
+                home.display()
+            )))
+        }
+        (Some(home), Some((uid, gid))) => Some(ApplicationHome { home, uid, gid }),
+        (None, None) => None,
+        _ => {
+            return Err(Failure::Usage(
+                "--application-home and --application-owner come together".to_string(),
+            ))
+        }
+    };
     Ok(Invocation::Provision(Config {
         require_persistent: state.is_none(),
         state: state.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
         keygen,
+        applications,
     }))
+}
+
+/// Whether a path's last component is not its last name: a trailing `/`,
+/// `/.` or `/..` has the kernel resolve the name before it as a directory,
+/// following a link there, which `O_NOFOLLOW` only refuses of the final
+/// component. `Path::components` cannot answer this: it drops a `.` that is
+/// not the first component.
+fn ends_past_its_last_name(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    bytes.ends_with(b"/") || bytes.ends_with(b"/.") || bytes.ends_with(b"/..")
+}
+
+/// `UID:GID`, both decimal, neither root: the applications belong to the
+/// login user, and a root-owned state tree is one the jail refuses anyway.
+fn parse_owner(value: &str) -> Result<(u32, u32), Failure> {
+    let usage = || Failure::Usage(format!("--application-owner takes UID:GID, not `{value}`"));
+    let (uid, gid) = value.split_once(':').ok_or_else(usage)?;
+    let uid: u32 = uid.parse().map_err(|_| usage())?;
+    let gid: u32 = gid.parse().map_err(|_| usage())?;
+    if uid == 0 || gid == 0 {
+        return Err(Failure::Usage(
+            "--application-owner must name an unprivileged identity".to_string(),
+        ));
+    }
+    // `(uid_t)-1` tells chown to leave that id as it is: a directory handed
+    // to it would stay root's, and nothing after would say so.
+    if uid == u32::MAX || gid == u32::MAX {
+        return Err(Failure::Usage(
+            "--application-owner must name an identity, not the leave-unchanged sentinel"
+                .to_string(),
+        ));
+    }
+    Ok((uid, gid))
+}
+
+/// A first configuration for each terminal application, under the login
+/// user's td-jail state root, created once and owned by the user.
+///
+/// Every directory is 0700 and every file 0600, the shape td-jail requires of
+/// state it binds. This runs as root, so ownership is handed over through
+/// each directory's and file's own descriptor before anything is published
+/// under a pathname the user could swap: a file is chowned before the rename
+/// that makes it visible, and a directory through a descriptor opened without
+/// following a link. A file that exists is left exactly as it is, whatever it
+/// says: the operator's edits are the point, and "provision" must never mean
+/// "reset". A home that is absent, a link, not a directory, or not the user's
+/// is reported and skipped, never failed: the identity does not depend on a
+/// mail client, and the home is the user's to break.
+fn provision_applications(
+    owner: &ApplicationHome,
+) -> Result<Vec<(&'static str, Outcome)>, Failure> {
+    let home = match open_directory(&owner.home) {
+        Ok(home) => home,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            emit_err(&format!(
+                "td-firstboot: application home {} is absent; no application configuration provisioned\n",
+                owner.home.display()
+            ));
+            return Ok(Vec::new());
+        }
+        Err(e) if matches!(e.raw_os_error(), Some(ENOTDIR | ELOOP)) => {
+            emit_err(&format!(
+                "td-firstboot: application home {} is a link or not a directory ({e}); no application configuration provisioned\n",
+                owner.home.display()
+            ));
+            return Ok(Vec::new());
+        }
+        Err(e) => {
+            return Err(Failure::Failed(format!(
+                "open application home {}: {e}",
+                owner.home.display()
+            )))
+        }
+    };
+    let metadata = home.metadata().map_err(|e| {
+        Failure::Failed(format!(
+            "stat application home {}: {e}",
+            owner.home.display()
+        ))
+    })?;
+    if (metadata.uid(), metadata.gid()) != (owner.uid, owner.gid) {
+        emit_err(&format!(
+            "td-firstboot: application home {} is owned by {}:{}, not {}:{}; no application configuration provisioned\n",
+            owner.home.display(),
+            metadata.uid(),
+            metadata.gid(),
+            owner.uid,
+            owner.gid
+        ));
+        return Ok(Vec::new());
+    }
+    let mut applications = owner.home.clone();
+    let mut parent = home;
+    for component in APPLICATION_STATE_ROOT.split('/') {
+        applications.push(component);
+        parent = owned_dir(&applications, owner, &parent)?;
+    }
+    let root = parent;
+    let mut outcomes = Vec::with_capacity(APPLICATION_CONFIGS.len());
+    for config in APPLICATION_CONFIGS {
+        let mut directory = applications.join(config.application);
+        let application = owned_dir(&directory, owner, &root)?;
+        directory.push("config");
+        let configuration = owned_dir(&directory, owner, &application)?;
+        directory.push(config.program);
+        owned_dir(&directory, owner, &configuration)?;
+        let mut outcome = Outcome::Present;
+        for (name, contents) in config.files {
+            let path = directory.join(name);
+            if path_exists(&path)? {
+                continue;
+            }
+            write_durably_owned(&path, contents.as_bytes(), 0o600, Some(owner))?;
+            outcome = Outcome::Created;
+        }
+        outcomes.push((config.application, outcome));
+    }
+    Ok(outcomes)
+}
+
+/// Linux `open(2)` flags std does not name: refuse anything but a directory,
+/// and refuse to follow a link at the final component. td targets x86-64,
+/// where these are the generic values. The two errno values are what those
+/// refusals come back as: not a directory, and a link where none may stand.
+const O_DIRECTORY: i32 = 0o200000;
+const O_NOFOLLOW: i32 = 0o400000;
+const ENOTDIR: i32 = 20;
+const ELOOP: i32 = 40;
+
+/// Open `path` as a directory, refusing a link standing in for one.
+fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+        .open(path)
+}
+
+/// A 0700 directory owned by the login user, created if absent, returned open
+/// so its children can be persisted through it. Ownership and mode are applied
+/// through the directory's own descriptor, so nothing a pathname could be
+/// swapped for is ever chowned. An existing directory the user owns is left
+/// exactly as it is, mode included: the jail, not this program, is its
+/// authority once it exists. One owned 0:0 is this run's creation a moment
+/// ago, or an earlier run's interrupted before the hand-over, and is handed
+/// over now; any other owner, a link, or a non-directory is refused.
+/// A created entry is fsynced through `parent`: `write_durably` persists a
+/// file's own directory, but the tree above it would otherwise stay in page
+/// cache.
+fn owned_dir(
+    path: &Path,
+    owner: &ApplicationHome,
+    parent: &std::fs::File,
+) -> Result<std::fs::File, Failure> {
+    let created = match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            return Err(Failure::Failed(format!(
+                "create {} (mode 700): {e}",
+                path.display()
+            )))
+        }
+    };
+    let directory = open_directory(path).map_err(|e| {
+        Failure::Failed(format!(
+            "open {} as a directory without following a link: {e}",
+            path.display()
+        ))
+    })?;
+    let metadata = directory
+        .metadata()
+        .map_err(|e| Failure::Failed(format!("stat {}: {e}", path.display())))?;
+    let (uid, gid) = (metadata.uid(), metadata.gid());
+    if !created && (uid, gid) == (owner.uid, owner.gid) {
+        return Ok(directory);
+    }
+    if !created && (uid, gid) != (0, 0) {
+        return Err(Failure::Failed(format!(
+            "{} is owned by {uid}:{gid}, neither {}:{} nor 0:0",
+            path.display(),
+            owner.uid,
+            owner.gid
+        )));
+    }
+    std::os::unix::fs::fchown(&directory, Some(owner.uid), Some(owner.gid)).map_err(|e| {
+        Failure::Failed(format!(
+            "chown {} to {}:{}: {e}",
+            path.display(),
+            owner.uid,
+            owner.gid
+        ))
+    })?;
+    // `DirBuilder::mode` is modulated by the umask; the jail insists on 0700.
+    directory
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| Failure::Failed(format!("chmod {} to 700: {e}", path.display())))?;
+    if created {
+        parent.sync_all().map_err(|e| {
+            Failure::Failed(format!(
+                "fsync the directory holding {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(directory)
 }
 
 /// Every path this program manages, derived once.
@@ -643,6 +988,20 @@ fn enforce_mode(path: &Path, metadata: &std::fs::Metadata, mode: u32) -> Result<
 /// both the file and its directory are fsync'd: the boot that generated an
 /// identity must not continue as if it had one that is still only in page cache.
 fn write_durably(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Failure> {
+    write_durably_owned(path, bytes, mode, None)
+}
+
+/// `write_durably`, with the file handed to `owner` before the rename
+/// publishes it. Ownership and mode are set through the open descriptor, so
+/// no reader ever sees the file under the writer's identity, nothing a
+/// pathname could be swapped for is ever chowned, and an interrupted run
+/// leaves no root-owned file for a later run to leave alone.
+fn write_durably_owned(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    owner: Option<&ApplicationHome>,
+) -> Result<(), Failure> {
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -670,6 +1029,15 @@ fn write_durably(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Failure> {
             .create_new(true)
             .mode(mode)
             .open(&temporary)?;
+        // `OpenOptions::mode` is modulated by the umask, which can only make the
+        // file STRICTER — harmless for a private key, but machine-id must stay
+        // world-readable to serve its purpose, and a restrictive inherited umask
+        // would quietly make it root-only. Set the mode through the descriptor
+        // so none of these files depend on what umask PID 1 handed this job.
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        if let Some(owner) = owner {
+            std::os::unix::fs::fchown(&file, Some(owner.uid), Some(owner.gid))?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -682,15 +1050,7 @@ fn write_durably(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Failure> {
             path.display(),
             temporary.display()
         ))
-    })?;
-    // `OpenOptions::mode` is modulated by the umask, which can only make the file
-    // STRICTER — harmless for a private key, but machine-id must stay world-readable
-    // to serve its purpose, and a restrictive inherited umask would quietly make it
-    // root-only. Set the mode explicitly so none of these files depend on what umask
-    // PID 1 happened to hand this job.
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| Failure::Failed(format!("stat {}: {e}", path.display())))?;
-    enforce_mode(path, &metadata, mode)
+    })
 }
 
 /// Markers to stdout. A closed reader is a clean exit, not a panic: `println!`
@@ -785,6 +1145,217 @@ mod tests {
             let argv: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
             assert!(matches!(parse(&argv), Ok(Invocation::Help)));
         }
+    }
+
+    #[test]
+    fn the_application_flags_come_as_a_pair() {
+        let paired = config(&[
+            "provision",
+            "--application-home",
+            "/home/tester",
+            "--application-owner",
+            "1000:1000",
+        ])
+        .unwrap();
+        assert_eq!(
+            paired.applications,
+            Some(ApplicationHome {
+                home: PathBuf::from("/home/tester"),
+                uid: 1000,
+                gid: 1000,
+            })
+        );
+        assert!(
+            paired.require_persistent,
+            "the pair does not relax the mount check"
+        );
+        assert_eq!(config(&[]).unwrap().applications, None);
+        for argv in [
+            vec!["--application-home", "/home/tester"],
+            vec!["--application-owner", "1000:1000"],
+            vec![
+                "--application-home",
+                "/home/tester",
+                "--application-owner",
+                "1000",
+            ],
+            vec![
+                "--application-home",
+                "/home/tester",
+                "--application-owner",
+                "a:b",
+            ],
+            // The leave-unchanged sentinel, and a home whose last name a
+            // trailing slash, `.` or `..` would resolve through a link.
+            vec![
+                "--application-home",
+                "/home/tester",
+                "--application-owner",
+                "4294967295:1000",
+            ],
+            vec![
+                "--application-home",
+                "/home/tester",
+                "--application-owner",
+                "1000:4294967295",
+            ],
+            vec![
+                "--application-home",
+                "/home/tester/",
+                "--application-owner",
+                "1000:1000",
+            ],
+            vec![
+                "--application-home",
+                "/home/tester/.",
+                "--application-owner",
+                "1000:1000",
+            ],
+            vec![
+                "--application-home",
+                "/home/tester/..",
+                "--application-owner",
+                "1000:1000",
+            ],
+            vec![
+                "--application-home",
+                "/home/tester",
+                "--application-owner",
+                "0:0",
+            ],
+            vec![
+                "--application-home",
+                "/home/tester",
+                "--application-owner",
+                "1000:0",
+            ],
+            vec![
+                "--application-home",
+                "home/tester",
+                "--application-owner",
+                "1000:1000",
+            ],
+            vec!["--application-home"],
+        ] {
+            assert!(
+                matches!(config(&argv), Err(Failure::Usage(_))),
+                "`td-firstboot {argv:?}` must be a usage error"
+            );
+        }
+    }
+
+    /// The tree td-jail expects, owned by the user, written once. Run as the
+    /// current user: `chown` to one's own identity is permitted unprivileged,
+    /// which is what lets the ownership path execute here at all.
+    #[test]
+    fn application_configurations_are_provisioned_once_into_the_jail_state_tree() {
+        let root =
+            std::env::temp_dir().join(format!("td-firstboot-applications-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let metadata = std::fs::metadata(&home).unwrap();
+        let owner = ApplicationHome {
+            home: home.clone(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+
+        let first = provision_applications(&owner).unwrap();
+        assert_eq!(
+            first,
+            vec![("mail", Outcome::Created), ("news", Outcome::Created)]
+        );
+        let mail = home.join(".td/app/mail/config/tmc/config.toml");
+        let password = home.join(".td/app/mail/config/tmc/password");
+        let news = home.join(".td/app/news/config/tn/config.toml");
+        for path in [&mail, &password, &news] {
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!(
+                metadata.permissions().mode() & 0o7777,
+                0o600,
+                "{}",
+                path.display()
+            );
+            assert_eq!((metadata.uid(), metadata.gid()), (owner.uid, owner.gid));
+        }
+        for directory in [
+            ".td",
+            ".td/app",
+            ".td/app/mail",
+            ".td/app/mail/config",
+            ".td/app/mail/config/tmc",
+            ".td/app/news",
+            ".td/app/news/config",
+            ".td/app/news/config/tn",
+        ] {
+            let metadata = std::fs::metadata(home.join(directory)).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o700, "{directory}");
+            assert_eq!((metadata.uid(), metadata.gid()), (owner.uid, owner.gid));
+        }
+        assert_eq!(std::fs::read_to_string(&mail).unwrap(), TMC_CONFIG);
+        assert_eq!(std::fs::read_to_string(&password).unwrap(), TMC_PASSWORD);
+        assert_eq!(std::fs::read_to_string(&news).unwrap(), TN_CONFIG);
+
+        // The operator's edit survives every later boot; a missing sibling
+        // is created without touching it.
+        std::fs::write(&mail, "edited\n").unwrap();
+        std::fs::remove_file(&password).unwrap();
+        let second = provision_applications(&owner).unwrap();
+        assert_eq!(
+            second,
+            vec![("mail", Outcome::Created), ("news", Outcome::Present)]
+        );
+        assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
+        assert_eq!(std::fs::read_to_string(&password).unwrap(), TMC_PASSWORD);
+        let third = provision_applications(&owner).unwrap();
+        assert_eq!(
+            third,
+            vec![("mail", Outcome::Present), ("news", Outcome::Present)]
+        );
+
+        // Somebody else's home, or none, is skipped and said, not failed.
+        let foreign = ApplicationHome {
+            uid: owner.uid.wrapping_add(1),
+            ..owner.clone()
+        };
+        assert_eq!(provision_applications(&foreign).unwrap(), Vec::new());
+        let absent = ApplicationHome {
+            home: root.join("nobody"),
+            ..owner.clone()
+        };
+        assert_eq!(provision_applications(&absent).unwrap(), Vec::new());
+        // A symlink where a state directory should be is refused outright.
+        let linked_home = root.join("linked");
+        std::fs::create_dir_all(&linked_home).unwrap();
+        std::os::unix::fs::symlink(&root, linked_home.join(".td")).unwrap();
+        let linked = ApplicationHome {
+            home: linked_home,
+            ..owner.clone()
+        };
+        assert!(provision_applications(&linked).is_err());
+        // So is a file, or anything else that is not a directory.
+        let filed_home = root.join("filed");
+        std::fs::create_dir_all(filed_home.join(".td")).unwrap();
+        std::fs::write(filed_home.join(".td/app"), "").unwrap();
+        let filed = ApplicationHome {
+            home: filed_home,
+            ..owner.clone()
+        };
+        assert!(provision_applications(&filed).is_err());
+        // A home that is itself a link, or a file, is skipped like an absent
+        // one: the jail resolves a home through its own rules, not this one.
+        std::os::unix::fs::symlink(&home, root.join("home-link")).unwrap();
+        std::fs::write(root.join("home-file"), "").unwrap();
+        for odd in ["home-link", "home-file"] {
+            let odd = ApplicationHome {
+                home: root.join(odd),
+                ..owner.clone()
+            };
+            assert_eq!(provision_applications(&odd).unwrap(), Vec::new());
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

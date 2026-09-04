@@ -182,6 +182,24 @@ mod tests {
         }
     }
 
+    /// The application state root is a contract between td-jail's own constant,
+    /// the jail configuration text every image compiles, and the separate
+    /// td-firstboot crate that provisions beneath it. The third is read back
+    /// out of the embedded source the way the markers are.
+    #[test]
+    fn the_shipped_binary_provisions_under_the_state_root_the_ladder_declares() {
+        let state_root = crate::ladder::TD_APPLICATION_CONFIG_TEXT
+            .lines()
+            .find_map(|line| line.strip_prefix("state-root="))
+            .expect("the jail configuration text names a state root");
+        assert_eq!(
+            source_const(MAIN_RS, "APPLICATION_STATE_ROOT"),
+            Some(state_root),
+            "td-firstboot's `APPLICATION_STATE_ROOT` and the jail's state root have drifted; \
+             the first configuration would land where no jail looks"
+        );
+    }
+
     /// `mod NAME;` and the files written beside `main.rs` must be the same set: a
     /// module declared but not written fails the build with a confusing rustc
     /// "file not found", and a file written but not declared is dead weight in the
