@@ -730,7 +730,14 @@ mod tests {
         let runner = include_str!("check_runner.rs");
         let wiring =
             "crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Explicit)";
-        assert_eq!(runner.matches(wiring).count(), 1);
+        // Two call sites, and both are commands whose operator asked for the
+        // fetch: `warm` itself, and `bundle`, which is built to run unattended
+        // and so cannot lean on the terminal-gated automatic warm — a
+        // backgrounded bundle on a cold checkout climbed the whole ladder
+        // before dying on an unvendored crate directory. Any further Explicit
+        // caller should be a deliberate decision, which is what this count
+        // keeps it.
+        assert_eq!(runner.matches(wiring).count(), 2);
     }
 
     #[test]

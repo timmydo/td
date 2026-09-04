@@ -34,9 +34,9 @@ use std::process::Command;
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::qemu_boot::{
     build_btrfs_tools, create_persistent_volume, drive_arg, find_qemu, provision_selector,
-    verify_deployment, verify_selector, RunTrust, QEMU_USER_NETDEV, QEMU_USER_NET_DEVICE,
-    SYSTEM_GUEST_MEMORY_MIB,
+    verify_deployment, verify_selector, RunTrust, VolumePurpose,
 };
+use crate::checks::vm_profile;
 
 /// The distro image recipe this runner boots; its recipe closure pulls in the
 /// `linux-x86-64` kernel that supplies the bzImage.
@@ -327,7 +327,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     let trust = RunTrust::generate()?;
     let boot_init = provision_selector(&selector, &images.dir, &trust)?;
     let boot_disk = images.dir.join("system.btrfs");
-    create_persistent_volume(&deployment, &mkfs, &btrfs, &boot_disk, &trust)?;
+    create_persistent_volume(
+        &deployment,
+        &mkfs,
+        &btrfs,
+        &boot_disk,
+        &trust,
+        VolumePurpose::Fixture,
+    )?;
 
     // The build is done and every verified payload is staged out.
     // Release the ladder lock now, BEFORE the unbounded interactive boot: this process
@@ -434,9 +441,11 @@ fn interactive_command(
     disk: &Path,
     display_available: bool,
 ) -> Command {
-    let append = "console=ttyS0 rdinit=/init";
+    let append = vm_profile::APPEND;
     let mut command = Command::new(qemu);
-    command.arg("-M").arg("pc");
+    // The machine is `checks/vm_profile.rs`'s, not this function's, so the
+    // `start` script a release bundle ships boots the guest this boots.
+    command.args(vm_profile::MACHINE);
     // No `-cpu host`: the guest CPU MODEL stays qemu's default, the one the gate's TCG
     // boots also see. Not the same as "only the speed changes" — KVM additionally exposes
     // its paravirt CPUID leaves (kvmclock, PV EOI) and masks features against the host,
@@ -444,21 +453,9 @@ fn interactive_command(
     for name in accel.names {
         command.args(["-accel", name]);
     }
-    command
-        .args(["-m", SYSTEM_GUEST_MEMORY_MIB, "-no-reboot"])
-        .args(["-no-user-config", "-vga", "none"])
-        .args(["-netdev", QEMU_USER_NETDEV])
-        .args(["-device", QEMU_USER_NET_DEVICE])
-        .args(["-device", "virtio-vga"])
-        .args(["-audiodev", "none,id=audio0"])
-        .args(["-device", "intel-hda"])
-        .args(["-device", "hda-output,audiodev=audio0"])
-        // An ABSOLUTE pointer, and here it is the point rather than a proof: an
-        // operator sitting in front of this one has a host cursor, and QEMU's
-        // PS/2 mouse gives the guest deltas it accumulates — which leaves the
-        // right and bottom edges of the screen unreachable no matter how far
-        // the mouse is pushed. The tablet reports where the cursor IS.
-        .args(["-device", "virtio-tablet-pci"]);
+    // Guest RAM, networking, graphics, audio, and an ABSOLUTE pointer — see
+    // `vm_profile::platform`, which is also what the shipped launcher renders.
+    command.args(vm_profile::platform());
     if !display_available {
         command.args(["-display", "none"]);
     }
@@ -472,7 +469,7 @@ fn interactive_command(
         // The writable persistent Btrfs volume over virtio-blk (/dev/vda).
         .arg("-drive")
         .arg(drive_arg(disk, false))
-        .args(["-device", "virtio-blk-pci,drive=disk0"]);
+        .args(["-device", vm_profile::DISK_DEVICE]);
     command
 }
 
@@ -499,6 +496,97 @@ mod tests {
 
     use std::cell::Cell;
     use std::os::unix::ffi::OsStrExt;
+
+    use crate::checks::qemu_boot::{
+        QEMU_USER_NETDEV, QEMU_USER_NET_DEVICE, SYSTEM_GUEST_MEMORY_MIB,
+    };
+
+    /// A fixture accelerator plan. Two names, because the launcher collapses a
+    /// whole `-accel` list into one `$accel` word and a one-element list would
+    /// not show that.
+    const FIXTURE_ACCEL: AccelPlan = AccelPlan {
+        names: &["kvm", "tcg"],
+        label: "KVM, TCG fallback",
+        hint: None,
+        forced: false,
+    };
+
+    /// The load-bearing test for release bundles: the `start` script a bundle
+    /// ships must exec the invocation this runner execs.
+    ///
+    /// Not a spot-check on a few tokens — an exact, ordered comparison of the
+    /// whole argument vector, with only the pieces a shell has to supply for
+    /// itself substituted. Anything added to `vm_profile::platform()` reaches
+    /// both sides or neither, and anything added HERE that the renderer does
+    /// not know about reds immediately. Without it, a device added to the
+    /// runner would quietly ship bundles that boot a different machine, and
+    /// nothing downstream would report it.
+    #[test]
+    fn the_shipped_launcher_execs_this_exact_invocation() {
+        let command = interactive_command(
+            "qemu-system-x86_64",
+            &FIXTURE_ACCEL,
+            Path::new("bzImage"),
+            Path::new("init.cpio"),
+            Path::new("system.btrfs"),
+            // No host display, so the runner emits `-display none` — the arm
+            // the launcher renders as its `$display` word.
+            false,
+        );
+
+        // What the runner will exec, with each caller-supplied value folded
+        // into the shell word the launcher uses in its place.
+        let mut expected: Vec<String> = Vec::new();
+        let mut arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned());
+        while let Some(argument) = arguments.next() {
+            let substitute = |name: &str| Some(format!("\"${name}\""));
+            let (keep_flag, replacement) = match argument.as_str() {
+                // A repeated flag on one side, a single word on the other.
+                "-accel" => (false, Some("$accel".to_string())),
+                "-display" => (false, Some("$display".to_string())),
+                "-m" => (true, substitute("memory")),
+                "-kernel" => (true, substitute("kernel")),
+                "-initrd" => (true, substitute("initrd")),
+                "-append" => (true, substitute("append")),
+                "-drive" => (true, substitute("drive")),
+                _ => (true, None),
+            };
+            let Some(replacement) = replacement else {
+                expected.push(argument);
+                continue;
+            };
+            // Every branch above consumes the value that follows its flag.
+            assert!(
+                arguments.next().is_some(),
+                "{argument} was passed with no value"
+            );
+            if keep_flag {
+                expected.push(argument);
+                expected.push(replacement);
+            } else if expected.last() != Some(&replacement) {
+                expected.push(replacement);
+            }
+        }
+
+        let script = vm_profile::launcher_script(vm_profile::DiskFormat::Qcow2(
+            vm_profile::Compression::Zstd,
+        ));
+        let (_, exec_line) = script
+            .split_once("exec \"$qemu\"")
+            .expect("the launcher execs qemu");
+        let rendered: Vec<String> = exec_line
+            .split_whitespace()
+            .filter(|word| *word != "\\")
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(
+            rendered, expected,
+            "the shipped launcher and this runner boot different machines"
+        );
+    }
 
     #[test]
     fn interactive_network_and_audio_devices_are_explicit() {

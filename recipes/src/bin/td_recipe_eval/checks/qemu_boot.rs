@@ -629,6 +629,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         true,
         &trust,
         Some(&seccomp_probe),
+        VolumePurpose::Fixture,
     )?;
     if fixture.initial_id == fixture.alternate_id {
         return Err("transaction fixture candidate did not change the deployment id".to_string());
@@ -837,6 +838,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         true,
         &trust,
         Some(&seccomp_probe),
+        VolumePurpose::Fixture,
     )?;
     if failure_fixture.initial_id != fixture.initial_id
         || failure_fixture.alternate_id != fixture.alternate_id
@@ -1019,6 +1021,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         true,
         &trust,
         Some(&seccomp_probe),
+        VolumePurpose::Fixture,
     )?;
     if fallback_fixture.initial_id != failure_fixture.initial_id
         || fallback_fixture.alternate_id == fallback_fixture.initial_id
@@ -2546,6 +2549,7 @@ fn build_persistent_system(
         true,
         &trust,
         Some(&seccomp_probe),
+        VolumePurpose::Fixture,
     )?;
     Ok((bzimage, initramfs, volume, btrfs))
 }
@@ -2586,12 +2590,30 @@ pub(crate) fn build_btrfs_tools(runner: &RecipeCheckRunner) -> Result<(PathBuf, 
 /// an empty @var subvolume. This is a disposable host-side test fixture; PID 1
 /// normalizes @var ownership and modes before exposing it to userspace. The
 /// deployment tree's host ownership is inert on its read-only guest mount.
+/// Who a volume is for.
+///
+/// An ENUM rather than another `bool` beside `system_runtime_fixtures`:
+/// adjacent same-typed arguments at a call site are the transposition no
+/// callee-side test can see, which is the reason the layout binding above is
+/// taken whole.
+///
+/// The distinction is real, not stylistic. A `Fixture` volume is a disposable
+/// oracle input on the build host and may carry whatever scaffolding makes an
+/// assertion mean something. A `Published` one is handed to strangers, so it
+/// carries no scaffolding and leaks nothing about the machine that built it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumePurpose {
+    Fixture,
+    Published,
+}
+
 pub(crate) fn create_persistent_volume(
     deployment: &Path,
     mkfs: &Path,
     btrfs: &Path,
     output: &Path,
     trust: &RunTrust,
+    purpose: VolumePurpose,
 ) -> Result<(), String> {
     create_persistent_volume_layout(
         deployment,
@@ -2602,6 +2624,7 @@ pub(crate) fn create_persistent_volume(
         false,
         trust,
         None,
+        purpose,
     )
     .map(|_| ())
 }
@@ -2655,6 +2678,7 @@ fn create_persistent_volume_layout(
     system_runtime_fixtures: bool,
     trust: &RunTrust,
     seccomp_probe: Option<&Path>,
+    purpose: VolumePurpose,
 ) -> Result<VolumeFixture, String> {
     let manifest = deployment.join("manifest");
     let deployment_id = crate::sha256::sha256_file(&manifest)
@@ -2692,7 +2716,7 @@ fn create_persistent_volume_layout(
     }
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
-    populate_persistent_seed(deployment, &seed, &deployment_id, trust)?;
+    populate_persistent_seed(deployment, &seed, &deployment_id, trust, purpose)?;
     if system_runtime_fixtures {
         stage_openssh_admin_fixture(&seed)?;
     }
@@ -2736,10 +2760,24 @@ fn create_persistent_volume_layout(
     // first keeps path and permission failures in this control plane.
     File::create(output)
         .map_err(|e| format!("create persistent volume {}: {e}", output.display()))?;
-    static UUID_SEQ: AtomicU64 = AtomicU64::new(0);
-    let sequence = UUID_SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff;
-    let fixture_id = (u64::from(std::process::id()) << 16) | sequence;
-    let fixture_uuid = format!("12345678-1234-4234-8234-{fixture_id:012x}");
+    // A fixture's UUID must differ between concurrent volumes on one host, so
+    // it mixes in the pid. A PUBLISHED volume must not: the pid is recoverable
+    // with a `>> 16` and says which process on whose machine built the
+    // download. Deriving it from the deployment id instead keeps distinct
+    // deployments distinct — which is all the uniqueness a shipped volume
+    // needs, since only one is ever mounted — and leaks nothing.
+    let fixture_uuid = match purpose {
+        VolumePurpose::Fixture => {
+            static UUID_SEQ: AtomicU64 = AtomicU64::new(0);
+            let sequence = UUID_SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff;
+            let fixture_id = (u64::from(std::process::id()) << 16) | sequence;
+            format!("12345678-1234-4234-8234-{fixture_id:012x}")
+        }
+        VolumePurpose::Published => {
+            let digits: String = deployment_id.chars().take(12).collect();
+            format!("12345678-1234-4234-8234-{digits}")
+        }
+    };
     let status = Command::new(mkfs)
         .args(["--rootdir"])
         .arg(&seed)
@@ -3126,6 +3164,7 @@ fn populate_persistent_seed(
     seed: &Path,
     deployment_id: &str,
     trust: &RunTrust,
+    purpose: VolumePurpose,
 ) -> Result<(), String> {
     let installed = seed
         .join(td_boot_protocol::DEPLOYMENTS_DIR)
@@ -3144,7 +3183,7 @@ fn populate_persistent_seed(
     // read-only store path, and `link_or_copy` hard-links when it can, so a
     // signature written through it would land in the store.
     trust.sign_deployment(&installed)?;
-    stage_volume_trust_roots(seed, trust)?;
+    stage_volume_trust_roots(seed, trust, purpose)?;
     for slot in ["current", "previous"] {
         let link = seed.join(td_boot_protocol::BOOT_DIR).join(slot);
         symlink(
@@ -3170,7 +3209,11 @@ fn populate_persistent_seed(
 /// Mode 0644 explicitly: `mkfs.btrfs --rootdir` copies a mode in verbatim, so
 /// an ambient umask would otherwise decide what the fixture's trust root looks
 /// like — the pin `td-install` makes for the same reason.
-fn stage_volume_trust_roots(seed: &Path, trust: &RunTrust) -> Result<(), String> {
+fn stage_volume_trust_roots(
+    seed: &Path,
+    trust: &RunTrust,
+    purpose: VolumePurpose,
+) -> Result<(), String> {
     let decoy = RunTrust::generate()?;
     if decoy.trusted_key_line() == trust.trusted_key_line() {
         return Err("the decoy trust root matched the run key".to_string());
@@ -3179,21 +3222,34 @@ fn stage_volume_trust_roots(seed: &Path, trust: &RunTrust) -> Result<(), String>
     // nothing to do rather than as a fault. Its mode is pinned for the trust
     // roots' reason below — `--rootdir` copies one in verbatim — and to 0755
     // because that is what `td-install` gives the real channel.
-    let idle = seed.join(td_recipe::ladder::DEPLOY_IDLE_CHANNEL);
-    fs::create_dir_all(&idle)
-        .map_err(|e| format!("create fixture idle channel {}: {e}", idle.display()))?;
-    fs::set_permissions(&idle, fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod fixture idle channel {}: {e}", idle.display()))?;
-    for (relative, line) in [
-        (
-            td_boot_protocol::VOLUME_TRUSTED_KEY,
-            trust.trusted_key_line(),
-        ),
-        (
+    //
+    // Fixture-only, like the decoy. `td/incoming-idle` is not a path any real
+    // deployment has: only the boot oracle names it, to prove `td-boot update`
+    // reads an empty channel as nothing to do. A published volume carrying it
+    // would be shipping the test's furniture to strangers.
+    if purpose == VolumePurpose::Fixture {
+        let idle = seed.join(td_recipe::ladder::DEPLOY_IDLE_CHANNEL);
+        fs::create_dir_all(&idle)
+            .map_err(|e| format!("create fixture idle channel {}: {e}", idle.display()))?;
+        fs::set_permissions(&idle, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod fixture idle channel {}: {e}", idle.display()))?;
+    }
+    // The decoy is oracle scaffolding: it exists so an ignored `--trusted-key`
+    // cannot leave the update assertions green. A published volume gets only
+    // the real root — shipping a deliberately-wrong trust root to strangers
+    // invites exactly the misreading the README works to avoid, and proves
+    // nothing to anyone who is not running the oracle.
+    let mut roots = vec![(
+        td_boot_protocol::VOLUME_TRUSTED_KEY,
+        trust.trusted_key_line(),
+    )];
+    if purpose == VolumePurpose::Fixture {
+        roots.push((
             td_recipe::ladder::DEPLOY_WRONG_KEY,
             decoy.trusted_key_line(),
-        ),
-    ] {
+        ));
+    }
+    for (relative, line) in roots {
         let path = seed.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -3286,11 +3342,28 @@ fn build_probe_image(runner: &RecipeCheckRunner) -> Result<PathBuf, String> {
 /// the tool is known to require it rather than green-washing the boot.
 pub(crate) fn find_qemu() -> Result<String, String> {
     const NAME: &str = "qemu-system-x86_64";
+    find_qemu_tool(NAME).ok_or_else(|| {
+        format!(
+            "{NAME} not found on PATH or the standard host locations — the linux-x86-64 qemu boot \
+             tool requires host qemu as a control-plane test tool (run outside the sandbox)"
+        )
+    })
+}
+
+/// Locate one program from the host qemu installation: `PATH` first, then the
+/// standard host locations for a bare `PATH`.
+///
+/// `Option`, not `Result`, because the two callers disagree about what absence
+/// MEANS. A missing `qemu-system-x86_64` ends a boot, and `find_qemu` turns
+/// this into that error. A missing `qemu-img` only costs a bundle its qcow2
+/// compression, so `checks/bundle.rs` reports the fallback and carries on —
+/// an error string here would have to be discarded to do that.
+pub(crate) fn find_qemu_tool(name: &str) -> Option<String> {
     if let Ok(path) = env::var("PATH") {
         for dir in path.split(':').filter(|d| !d.is_empty()) {
-            let cand = Path::new(dir).join(NAME);
+            let cand = Path::new(dir).join(name);
             if is_executable(&cand) {
-                return Ok(cand.to_string_lossy().into_owned());
+                return Some(cand.to_string_lossy().into_owned());
             }
         }
     }
@@ -3300,15 +3373,12 @@ pub(crate) fn find_qemu() -> Result<String, String> {
         "/usr/local/bin",
         "/bin",
     ] {
-        let cand = Path::new(dir).join(NAME);
+        let cand = Path::new(dir).join(name);
         if is_executable(&cand) {
-            return Ok(cand.to_string_lossy().into_owned());
+            return Some(cand.to_string_lossy().into_owned());
         }
     }
-    Err(format!(
-        "{NAME} not found on PATH or the standard host locations — the linux-x86-64 qemu boot \
-         tool requires host qemu as a control-plane test tool (run outside the sandbox)"
-    ))
+    None
 }
 
 /// Wall-clock ceiling, overridable via `TD_QEMU_BOOT_TIMEOUT_SECS` (a positive
@@ -3506,7 +3576,7 @@ fn boot(
     // its path can't be misparsed as an extra -drive key=value pair.
     if let Some(disk) = plan.disk {
         cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
-        cmd.args(["-device", "virtio-blk-pci,drive=disk0"]);
+        cmd.args(["-device", crate::checks::vm_profile::DISK_DEVICE]);
     }
     let mut child = cmd
         .stdin(Stdio::null())
@@ -5186,7 +5256,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// survives without a lossy round-trip. Shared with the interactive `run` tool
 /// (checks/run.rs), which attaches the same persistent volume over virtio-blk.
 pub(crate) fn drive_arg(disk: &Path, read_only: bool) -> OsString {
-    let mut out = OsString::from("if=none,format=raw,id=disk0");
+    let mut out = OsString::from(format!(
+        "if=none,format=raw,id={}",
+        crate::checks::vm_profile::DRIVE_ID
+    ));
     if read_only {
         out.push(",readonly=on");
     }
@@ -6931,6 +7004,34 @@ mod tests {
     /// `#[path]`-includes and a DIFFERENT module from the `ed25519_sign` that
     /// signed. So this checks the mechanism rather than the signer agreeing
     /// with itself.
+    /// The decoy trust root is oracle scaffolding and must never reach an
+    /// artifact handed to strangers: a published volume carrying a
+    /// deliberately-wrong trust root invites exactly the misreading the
+    /// bundle README works to prevent, and proves nothing outside the oracle.
+    #[test]
+    fn a_published_volume_carries_only_the_real_trust_root() {
+        let seq = AtomicU64::new(9310);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let trust = RunTrust::generate().unwrap();
+        let seed = dir.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        stage_volume_trust_roots(&seed, &trust, VolumePurpose::Published).unwrap();
+        assert!(seed.join(td_boot_protocol::VOLUME_TRUSTED_KEY).is_file());
+        assert!(
+            !seed.join(td_recipe::ladder::DEPLOY_WRONG_KEY).exists(),
+            "a published volume shipped the oracle's decoy trust root"
+        );
+
+        let fixture_seed = dir.join("fixture-seed");
+        fs::create_dir_all(&fixture_seed).unwrap();
+        stage_volume_trust_roots(&fixture_seed, &trust, VolumePurpose::Fixture).unwrap();
+        assert!(
+            fixture_seed.join(td_recipe::ladder::DEPLOY_WRONG_KEY).is_file(),
+            "the oracle still needs its decoy"
+        );
+    }
+
     #[test]
     fn every_staged_deployment_is_signed_by_the_runs_key() {
         let seq = AtomicU64::new(2060);
@@ -6955,7 +7056,7 @@ mod tests {
 
         let trust = RunTrust::generate().unwrap();
         let seed = dir.join("seed");
-        populate_persistent_seed(&deployment, &seed, &id, &trust).unwrap();
+        populate_persistent_seed(&deployment, &seed, &id, &trust, VolumePurpose::Fixture).unwrap();
 
         // The SEED deployment, not just a candidate: this is what current and
         // previous point at and what every mode but the transactional ones
@@ -7291,7 +7392,14 @@ mod tests {
         }
         let id = "a".repeat(64);
         let seed = dir.join("seed");
-        populate_persistent_seed(&deployment, &seed, &id, &RunTrust::generate().unwrap()).unwrap();
+        populate_persistent_seed(
+            &deployment,
+            &seed,
+            &id,
+            &RunTrust::generate().unwrap(),
+            VolumePurpose::Fixture,
+        )
+        .unwrap();
 
         let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
         assert_eq!(fs::read(installed.join("manifest")).unwrap(), b"manifest");

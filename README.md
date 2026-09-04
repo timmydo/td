@@ -74,6 +74,24 @@ sequence, and proves automatic rollback on the next boot. An explicitly
 read-only disk pass exercises selector-side bookkeeping recovery; a separate
 fixture proves corrupted-current fallback.
 
+### Hand it to somebody who has not built td
+
+```sh
+./build-qcow
+```
+
+`./build-qcow` is the wrapper for `td-recipe-eval bundle`. It builds the same
+system `./start` boots and writes `dist/td-vm-x86-64/`: the kernel, the
+selector initramfs, a qcow2 Btrfs volume holding the signed deployment, a
+`SHA256SUMS`, a README, and a POSIX-sh `start` launcher rendered from the very
+QEMU profile `./start` uses. Someone with QEMU and no checkout unpacks it and
+runs `./start`, and the guest writes go to a throwaway overlay so the image
+keeps matching its checksum.
+
+The bundle is a convenience for people evaluating td, not a distribution
+channel: nothing in the recipe graph names it, no build fetches it, and td
+updates remain a `git pull` and a rebuild.
+
 ## Filesystem layout
 
 ```

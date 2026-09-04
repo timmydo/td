@@ -512,6 +512,124 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     crate::checks::run::run(&runner, lock)
 }
 
+/// `td-recipe-eval bundle [--out DIR] [--raw] [--zlib] [--force]` — build the
+/// distro and write a redistributable demo VM: the boot payloads plus a
+/// POSIX-sh `start`
+/// launcher, so somebody with qemu and no td checkout can boot the system
+/// without climbing the bootstrap ladder first.
+///
+/// Sibling of `run_cli`, and deliberately NOT terminal-gated: `run` needs a
+/// terminal because it hands the guest one, and this boots nothing. It is the
+/// entry a release is cut from, which is exactly the case where an operator
+/// wants to background it or drive it from a script.
+pub fn bundle_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    let options = parse_bundle_args(args)?;
+
+    // Provenance planning FIRST — before the runner exists, so a rejected graph
+    // spawns no subprocess at all (re #469), matching every other host command.
+    let targets = [STEM, "btrfs-progs-x86-64"];
+    ensure_targets_provenance(&targets)?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let scratch_name = scratch_name("bundle", &[STEM]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    // Settle the destination before the warm, for the same reason the warm
+    // itself moved ahead of the build: `--out` naming an existing file, a
+    // directory holding somebody else's files, or a path that cannot be
+    // created at all is knowable in microseconds and was being reported only
+    // after a multi-minute fetch and setup. This creates `out` — that is how
+    // an uncreatable one is detected — but never clears it: an early clear
+    // would delete a good previous bundle and then spend the build
+    // discovering the replacement is impossible, leaving the operator with
+    // neither.
+    crate::checks::bundle::ensure_out_dir(&runner, &options)?;
+    // Warm UNCONDITIONALLY, not through `warm_operator_inputs`, and treat a
+    // failure as this command's failure.
+    //
+    // `warm_operator_inputs` warms only from a terminal, which is right for the
+    // interactive commands: an operator watching a prompt consented to the
+    // fetch by being there. This one is built to run unattended, and inheriting
+    // that gate makes the cold-cache case fail LATE and obscurely — a
+    // backgrounded run on a fresh checkout climbed the whole ladder before
+    // dying inside `build-plan` on an absent vendored crate directory, with a
+    // message about a `td-builder check` the operator never asked for.
+    //
+    // Asking for a bundle IS the consent, exactly as `warm_cli` argues for
+    // asking to warm, so this uses the same explicit mode. Fatal rather than
+    // advisory because a cold declared input is not something the offline build
+    // below can recover from: reporting it here costs seconds, and reporting it
+    // there costs the climb.
+    crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Explicit)?;
+    let lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
+    runner.setup()?;
+    // The lock goes to the callee: it releases it once the volume is built and
+    // before the qcow2 conversion, which reads only the bundle directory.
+    crate::checks::bundle::run(&runner, lock, &options)
+}
+
+fn bundle_usage() -> String {
+    format!(
+        "usage: bundle [--out DIR] [--raw] [--zlib] [--force]\n       \
+         --out DIR   where to write the bundle (default {})\n       \
+         --raw       ship the raw volume instead of converting it to qcow2\n       \
+         --zlib      compress with zlib, not zstd: ~14% larger, but readable\n       \
+         \x20           by any qemu rather than 5.1 and newer\n       \
+         --force     replace a bundle already in DIR\n       \
+         \n       \
+         Needs several GiB free in TMPDIR: the volume is built there in full\n       \
+         and only the finished files are moved into DIR.",
+        crate::checks::bundle::DEFAULT_OUT
+    )
+}
+
+/// Parse `bundle`'s flags.
+///
+/// Split out and pure so the argument handling is testable without a ladder:
+/// otherwise every one of these errors costs a full distro build to reach.
+fn parse_bundle_args(args: &[String]) -> Result<crate::checks::bundle::BundleOptions, String> {
+    let mut out: Option<PathBuf> = None;
+    let mut raw = false;
+    let mut zlib = false;
+    let mut force = false;
+    let mut rest = args.iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--raw" => raw = true,
+            "--zlib" => zlib = true,
+            "--force" => force = true,
+            "--out" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| format!("--out needs a directory\n{}", bundle_usage()))?;
+                if out.replace(PathBuf::from(value)).is_some() {
+                    return Err(format!("--out given twice\n{}", bundle_usage()));
+                }
+            }
+            // A bare path would be ambiguous with the recipe stem every other
+            // subcommand takes in that position, and this builds exactly one.
+            other => return Err(format!("unknown argument '{other}'\n{}", bundle_usage())),
+        }
+    }
+    // `--raw` and `--zlib` are not contradictory so much as one subsuming the
+    // other: a raw volume has no qcow2 to compress. Refused rather than
+    // silently ignored, because an operator who passed both believes the
+    // bundle is compressed.
+    if raw && zlib {
+        return Err(format!(
+            "--raw ships an uncompressed volume, so --zlib has nothing to compress; \
+             pass one or the other\n{}",
+            bundle_usage()
+        ));
+    }
+    Ok(crate::checks::bundle::BundleOptions {
+        out: out.unwrap_or_else(|| PathBuf::from(crate::checks::bundle::DEFAULT_OUT)),
+        raw,
+        zlib,
+        force,
+    })
+}
+
 /// `td-recipe-eval warm [TARGET]` — fetch missing declared inputs, then
 /// reauthenticate every selected exact OSTree graph, and build nothing. The
 /// same prep the operator commands now do for themselves, as a standalone step:
@@ -5024,6 +5142,74 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--out` is how an operator sends a multi-hundred-MiB bundle somewhere
+    /// other than the default, so a swallowed or duplicated one writes a large
+    /// artifact to the wrong place after a long build.
+    #[test]
+    fn bundle_arguments_parse_into_the_documented_options() {
+        let parse = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            parse_bundle_args(&owned)
+        };
+
+        let default = parse(&[]).expect("no arguments is the ordinary invocation");
+        assert_eq!(default.out, PathBuf::from(crate::checks::bundle::DEFAULT_OUT));
+        assert!(!default.raw);
+        assert!(!default.force);
+
+        assert!(!default.zlib, "zstd is the default: it is 12% smaller");
+
+        let full = parse(&["--out", "/tmp/td-vm", "--raw", "--force"]).expect("all three");
+        assert_eq!(full.out, PathBuf::from("/tmp/td-vm"));
+        assert!(full.raw);
+        assert!(full.force);
+
+        let compat = parse(&["--zlib"]).expect("the compatibility codec");
+        assert!(compat.zlib);
+        assert!(!compat.raw);
+
+        // Order must not matter; nothing here is positional.
+        let reordered = parse(&["--force", "--raw", "--out", "/tmp/td-vm"]).expect("reordered");
+        assert_eq!(reordered.out, full.out);
+        assert_eq!(reordered.raw, full.raw);
+        assert_eq!(reordered.force, full.force);
+    }
+
+    /// Every rejection names the usage, because the alternative to reading it
+    /// is starting a build that only fails once it reaches the destination.
+    #[test]
+    fn bundle_rejects_malformed_arguments_before_any_build() {
+        let parse = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            parse_bundle_args(&owned)
+        };
+
+        // A missing value would otherwise silently take the default and write
+        // the bundle somewhere the operator did not ask for.
+        let error = parse(&["--out"]).expect_err("--out with no directory");
+        assert!(error.contains("--out needs a directory"), "{error}");
+
+        // Two of them is an operator who believes one of the two took effect.
+        let error = parse(&["--out", "a", "--out", "b"]).expect_err("--out twice");
+        assert!(error.contains("given twice"), "{error}");
+
+        // No positional argument: every other subcommand takes a recipe stem
+        // there, and silently ignoring one here would build the default target
+        // while looking like it built the named one.
+        let error = parse(&["system-x86-64"]).expect_err("a bare stem");
+        assert!(error.contains("unknown argument"), "{error}");
+
+        // A raw volume has no qcow2 to compress, so asking for both is an
+        // operator who thinks one of them took effect.
+        let error = parse(&["--raw", "--zlib"]).expect_err("both volume choices");
+        assert!(error.contains("nothing to compress"), "{error}");
+
+        for bad in ["-o", "--raws", "--Force", ""] {
+            let error = parse(&[bad]).expect_err(bad);
+            assert!(error.contains("usage: bundle"), "{bad}: {error}");
+        }
+    }
 
     #[test]
     fn materializer_accounting_is_exact_typed_and_duplicate_free() {

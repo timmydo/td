@@ -18,6 +18,11 @@
 //!   clear-store           reset the ladder work dir (seed store/db + shared
 //!                         build-cache); the next build re-derives seeds and
 //!                         cold-climbs. The only path that clears persisted state
+//!   bundle [--out DIR] [--raw] [--zlib] [--force]
+//!                         build system-x86-64 and write a redistributable demo
+//!                         VM — the boot payloads plus a POSIX-sh `start`
+//!                         launcher — so the system can be tried on a machine
+//!                         that has qemu and has never built td
 //!   warm [TARGET]         fetch missing declared inputs and reauthenticate every
 //!                         selected exact OSTree graph (default system-x86-64),
 //!                         building nothing. The host-side operator commands
@@ -319,6 +324,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("bundle") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::bundle_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("warm") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::warm_cli(rest) {
@@ -397,7 +408,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
     }
 }
 

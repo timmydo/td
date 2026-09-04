@@ -102,3 +102,7 @@ td-portal/target/
 # cargo-test preflight and during host validation of the PCM back end; keep
 # those local Cargo artifacts out of selection.
 td-audio/target/
+
+# Release bundles from `./build-qcow` — host-local build output, several hundred
+# MiB of images, never versioned. Upload them to a release page instead.
+/dist/

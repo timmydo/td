@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) start_dir=${0%/*} ;;
+    *) start_dir=. ;;
+esac
+cd "$start_dir"
+
+# The same preflight ./start runs. A bundle is a far longer build than a boot,
+# so learning that the host toolchain is unsupported — or that cargo put the
+# runner somewhere the recipes cannot find it — at the end of one is the
+# expensive way to learn it.
+. ./host-preflight.sh
+
+exec cargo run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- bundle "$@"

@@ -1012,7 +1012,16 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    if p == "start" || p == "tests/start.sh" {
+    // The repository-root entry points and the preflight fragment they both
+    // source, plus the test that drives all three. `build-qcow` and
+    // `host-preflight.sh` route here rather than to the generic shell arm
+    // because `start-bootstrap` is what actually proves them: bash -n would
+    // accept a `build-qcow` that had quietly stopped running the preflight.
+    if p == "start"
+        || p == "build-qcow"
+        || p == "host-preflight.sh"
+        || p == "tests/start.sh"
+    {
         sel.add_preflight("shell-syntax");
         sel.add_preflight("start-bootstrap");
         return;
@@ -1454,7 +1463,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 
 fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> {
     match name {
-        "shell-syntax" => Some("  bash -n start tests/*.sh ci/*.sh tools/*.sh".to_string()),
+        "shell-syntax" => Some("  bash -n start build-qcow host-preflight.sh tests/*.sh ci/*.sh tools/*.sh".to_string()),
         "start-bootstrap" => Some("  bash tests/start.sh".to_string()),
         "heal-revert" => Some("  bash tests/heal-revert.sh".to_string()),
         // Rendered from the SAME list that runs, so a scoped run cannot print a
@@ -2393,6 +2402,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("start", "start-bootstrap");
     assert_preflight!("tests/start.sh", "shell-syntax");
     assert_preflight!("tests/start.sh", "start-bootstrap");
+    assert_preflight!("build-qcow", "shell-syntax");
+    assert_preflight!("build-qcow", "start-bootstrap");
+    assert_preflight!("host-preflight.sh", "shell-syntax");
+    assert_preflight!("host-preflight.sh", "start-bootstrap");
     // td-netd/src is include_str!'d into the target artifact (its recipe AND packed
     // into system-x86-64), so a helper-source edit rides the host cargo preflight
     // AND is recorded against recipe-checks, which statically links + shape-asserts
@@ -3198,7 +3211,7 @@ pub(crate) fn gate_crate_names(root: &Path) -> Result<Vec<String>, String> {
 
 fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
     match name {
-        "shell-syntax" => run_shell(root, "bash -n start tests/*.sh ci/*.sh tools/*.sh"),
+        "shell-syntax" => run_shell(root, "bash -n start build-qcow host-preflight.sh tests/*.sh ci/*.sh tools/*.sh"),
         "start-bootstrap" => run_shell(root, "bash tests/start.sh"),
         "heal-revert" => run_shell(root, "bash tests/heal-revert.sh"),
         // BOTH engine crates, tests AND clippy: the AGENTS.md deny-lints only
@@ -5859,7 +5872,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  bash -n start tests/*.sh ci/*.sh tools/*.sh",
+                "  bash -n start build-qcow host-preflight.sh tests/*.sh ci/*.sh tools/*.sh",
                 &full_cargo,
                 "  td-builder check check",
                 "",
