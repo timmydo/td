@@ -14,6 +14,7 @@ bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source
 btrfs-progs-x86-64-source vzy2jr0gnwlzczsxpsy80mr0k26v2jjv-btrfs-progs-x86-64-source
 busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
 ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
+claude-code-source 38p8258xch0p61w26g2k7h6in56jzyh9-claude-code-source
 cmake-x86-64-source arcs0qgnqjhfljjd69mpgnjnanpcrlid-cmake-x86-64-source
 codex-cargo-crossterm-source dfz77cl236snh28p9nfc2zvxvr0hgd1f-codex-cargo-crossterm-source
 codex-cargo-nucleo-source f4zayri9kd3iafnq7w5zfjz8sz0ikm06-codex-cargo-nucleo-source

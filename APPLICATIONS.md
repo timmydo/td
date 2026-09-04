@@ -2060,10 +2060,11 @@ The roster was empty until the first application landed, which was exactly the
 condition under which every test over it passed with the rule inverted. The
 decision functions therefore still take their roster as an argument and are
 driven with fixtures, including through the production lookup over a real pin
-key. The real roster now contains exactly `ripgrep-seed-source`; tests assert
-both the count and that this is the sole marked pin. The wiring that supplies
-that roster remains pinned in source, so replacing `FOREIGN` with an empty slice
-cannot silently return the seed to the ordinary trust class.
+key. The real roster now contains exactly `ripgrep-seed-source` and
+`claude-code-source`; tests assert both the count and that these are the only
+marked pins. The wiring that supplies that roster remains pinned in source, so
+replacing `FOREIGN` with an empty slice cannot silently return the seed to the
+ordinary trust class.
 
 The planning-time refusal that reads this mark landed after it, and the
 containment edge and closure query after that; both are described below.

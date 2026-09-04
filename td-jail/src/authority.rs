@@ -3901,6 +3901,26 @@ mod tests {
         assert!(validate_stage2_loader_library_path(Some("/app/lib")).is_err());
     }
 
+    /// An application with no reviewed loader path is held to carrying NONE:
+    /// the compiler omits the variable for such a policy, and an empty
+    /// `LD_LIBRARY_PATH=` is refused here exactly as a borrowed one is.
+    #[test]
+    fn an_application_without_a_reviewed_loader_path_carries_none() {
+        let text = "format=1\nname=claude\nruntime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08\nentry=/app/bin/claude\n\n[Environment]\nDISABLE_UPDATES=1\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n\n[Filesystem]\n~/src=rw:create\n";
+        let spec = parse_spec(text).unwrap();
+        assert_eq!(spec.loader_library_path, None);
+        for altered in [
+            text.replace("DISABLE_UPDATES=1\n", "DISABLE_UPDATES=1\nLD_LIBRARY_PATH=\n"),
+            text.replace(
+                "DISABLE_UPDATES=1\n",
+                "DISABLE_UPDATES=1\nLD_LIBRARY_PATH=/app/lib\n",
+            ),
+        ] {
+            assert_ne!(altered, text);
+            assert!(parse_spec(&altered).is_err(), "accepted {altered:?}");
+        }
+    }
+
     #[test]
     fn filesystem_grants_resolve_create_merge_deny_and_reserved_aliases() {
         use std::os::unix::fs::symlink;

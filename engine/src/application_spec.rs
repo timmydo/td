@@ -40,18 +40,41 @@ impl DynamicApplicationPolicy {
     }
 }
 
+/// The closed table of reviewed `(application, runtime)` loader policies.
+/// Enumerable so a test can hold td-jail's own copy of the loader-path
+/// answer to it: td-jail is a standalone crate and cannot read this table.
+pub const DYNAMIC_APPLICATION_POLICIES: &[(&str, &str, DynamicApplicationPolicy)] = &[
+    (
+        "firefox",
+        "freedesktop-platform-25-08",
+        DynamicApplicationPolicy {
+            library_paths: FIREFOX_LIBRARY_PATHS,
+            optional_targets: FIREFOX_OPTIONAL_TARGETS,
+            optional_links: FIREFOX_OPTIONAL_LINKS,
+        },
+    ),
+    // One glibc-dynamic ELF whose every needed library is the runtime's: no
+    // package library root, no omitted extension links, and so no loader
+    // variable in its spec.
+    (
+        "claude",
+        "freedesktop-platform-25-08",
+        DynamicApplicationPolicy {
+            library_paths: &[],
+            optional_targets: &[],
+            optional_links: 0,
+        },
+    ),
+];
+
 pub fn dynamic_application_policy(
     name: &str,
     runtime: &str,
 ) -> Option<DynamicApplicationPolicy> {
-    match (name, runtime) {
-        ("firefox", "freedesktop-platform-25-08") => Some(DynamicApplicationPolicy {
-            library_paths: FIREFOX_LIBRARY_PATHS,
-            optional_targets: FIREFOX_OPTIONAL_TARGETS,
-            optional_links: FIREFOX_OPTIONAL_LINKS,
-        }),
-        _ => None,
-    }
+    DYNAMIC_APPLICATION_POLICIES
+        .iter()
+        .find(|(policy_name, policy_runtime, _)| *policy_name == name && *policy_runtime == runtime)
+        .map(|(_, _, policy)| *policy)
 }
 
 /// Variables `td-jail` holds a spec to EXACTLY, and which a manifest may
@@ -184,8 +207,14 @@ impl ApplicationSpec {
                 ));
             }
         }
+        // A reviewed policy with no package library root is the ABSENCE of the
+        // variable: td-jail holds every application without one to exactly
+        // that, and `LD_LIBRARY_PATH=` would compile here and be refused there.
         if let Some(policy) = dynamic_application_policy(manifest.name(), manifest.runtime()) {
-            environment.insert("LD_LIBRARY_PATH".into(), policy.library_paths().join(":"));
+            let loader_path = policy.library_paths().join(":");
+            if !loader_path.is_empty() {
+                environment.insert("LD_LIBRARY_PATH".into(), loader_path);
+            }
         }
         let spec = ApplicationSpec {
             name: manifest.name().to_string(),
@@ -412,13 +441,17 @@ impl ApplicationSpec {
                 "application Pulse environment does not match its pulseaudio socket grant".into(),
             );
         }
-        let loader_policy = runtime_recipe_name(&self.runtime)
-            .and_then(|runtime| dynamic_application_policy(&self.name, runtime));
+        // The reviewed loader path, or None where the policy names no package
+        // library root: that application is held to carrying no variable.
+        let loader_path = runtime_recipe_name(&self.runtime)
+            .and_then(|runtime| dynamic_application_policy(&self.name, runtime))
+            .map(|policy| policy.library_paths().join(":"))
+            .filter(|path| !path.is_empty());
         match (
-            loader_policy,
+            loader_path,
             self.environment.get("LD_LIBRARY_PATH").map(String::as_str),
         ) {
-            (Some(policy), Some(value)) if value == policy.library_paths().join(":") => {}
+            (Some(expected), Some(value)) if value == expected => {}
             (Some(_), _) => {
                 return Err(
                     "application spec does not carry its exact reviewed loader path".into(),
@@ -729,6 +762,85 @@ mod tests {
         let error =
             ApplicationSpec::compile(&overridden, runtime, PermissionPolicy::new()).unwrap_err();
         assert!(error.contains("Freedesktop 25.08 runtime policy"), "{error}");
+    }
+
+    /// A reviewed policy without a package library root compiles to NO loader
+    /// variable, which is what td-jail holds every non-Firefox application to;
+    /// an empty `LD_LIBRARY_PATH=` would compile and be refused at launch.
+    #[test]
+    fn a_policy_without_library_roots_carries_no_loader_path() {
+        let manifest = ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/claude")
+            .unwrap()
+            .with_environment("DISABLE_UPDATES", "1")
+            .unwrap()
+            .manifest("claude", "2.1.260", ApplicationProvenance::Foreign)
+            .unwrap();
+        let runtime =
+            "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08";
+        let spec =
+            ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
+        let environment = spec.environment().collect::<BTreeMap<_, _>>();
+        assert_eq!(environment.get("LD_LIBRARY_PATH"), None);
+        assert_eq!(environment.get("LIBGL_ALWAYS_SOFTWARE"), Some(&"1"));
+        let text = spec.to_keyfile();
+        assert!(!text.contains("LD_LIBRARY_PATH"), "{text}");
+        assert_eq!(ApplicationSpec::parse(&text).unwrap(), spec);
+        let emptied = text.replacen(
+            "DISABLE_UPDATES=1\n",
+            "DISABLE_UPDATES=1\nLD_LIBRARY_PATH=\n",
+            1,
+        );
+        assert_ne!(emptied, text);
+        let error = ApplicationSpec::parse(&emptied).unwrap_err();
+        assert!(error.contains("unreviewed LD_LIBRARY_PATH"), "{error}");
+    }
+
+    /// td-jail keeps its own copy of the loader-path answer, because it is a
+    /// standalone crate that cannot read this table. Two tables that agree
+    /// only by convention drift the first time one gains an entry, so this
+    /// holds td-jail's `reviewed_loader_library_path` to every entry here: an
+    /// application with library roots has an arm returning a constant whose
+    /// definition is exactly that joined path, and one without is not named
+    /// in the function at all, which td-jail reads as "no variable". The
+    /// runtime is held only as a literal the crate names somewhere; td-jail
+    /// matches it through a boolean this test does not model.
+    #[test]
+    fn td_jail_answers_every_policy_entry_the_same_way() {
+        let jail = include_str!("../../td-jail/src/authority.rs");
+        let start = jail
+            .find("fn reviewed_loader_library_path(")
+            .expect("td-jail's loader-path function");
+        let body = &jail[start..];
+        let body = &body[..body.find("\n}\n").expect("the function's end")];
+        for (name, runtime, policy) in DYNAMIC_APPLICATION_POLICIES {
+            if policy.library_paths().is_empty() {
+                assert!(
+                    !body.contains(&format!("\"{name}\"")),
+                    "td-jail names {name} in its loader-path answer; the engine names no path"
+                );
+                continue;
+            }
+            let arm = format!("(\"{name}\", true) => Some(");
+            let at = body
+                .find(&arm)
+                .unwrap_or_else(|| panic!("td-jail has no loader-path arm for {name}"));
+            let constant = body[at + arm.len()..]
+                .split(')')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            let definition =
+                format!("const {constant}: &str = \"{}\";", policy.library_paths().join(":"));
+            assert!(
+                jail.contains(&definition),
+                "td-jail's arm for {name} returns {constant}, which is not defined as this \
+                 table's path: expected `{definition}`"
+            );
+            assert!(
+                jail.contains(&format!("\"{runtime}\"")),
+                "td-jail does not name the runtime {runtime} for {name}"
+            );
+        }
     }
 
     #[test]

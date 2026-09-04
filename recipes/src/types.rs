@@ -1947,7 +1947,7 @@ mod tests {
         for (stem, recipe) in crate::catalog::all() {
             if matches!(
                 stem,
-                "ripgrep-seed" | "firefox" | "freedesktop-platform-25-08"
+                "ripgrep-seed" | "firefox" | "freedesktop-platform-25-08" | "claude"
             ) {
                 assert!(recipe.to_json().get("foreign").is_some());
                 assert!(recipe.to_json().get("foreignSource").is_some());

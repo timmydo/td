@@ -89,6 +89,20 @@ const PINS: &[PinDef] = &[
         file: "cacert-2026-08-13.pem",
     },
     PinDef {
+        key: "claude-code-source",
+        aliases: &[],
+        // The Claude Code 2.1.260 native Linux x86-64 release: one glibc-dynamic
+        // ELF, published beside a manifest whose `platforms["linux-x64"].checksum`
+        // is this SHA-256. It is a marked sandboxed-application payload
+        // (APPLICATIONS.md §B.8): its own recipe consumes it as typed data,
+        // and it is never a tool, compilation input, or execution input to a
+        // source-built output. The vendor ships no source, so unlike Codex it
+        // is a prebuilt payload whose supported run path is td-jail.
+        url: "https://downloads.claude.ai/claude-code-releases/2.1.260/linux-x64/claude",
+        sha256: "7a2fdc74b6836ea3d183f665b869f0ee3baebc9713cbebffe5838da4ea7bd82e",
+        file: "claude-2.1.260-linux-x64",
+    },
+    PinDef {
         key: "cmake-x86-64-source",
         aliases: &[],
         // CMake is the one explicitly approved new build-only dependency for the
@@ -662,7 +676,7 @@ const PINS: &[PinDef] = &[
 ///
 /// Adding an entry is a reviewed pin; adding a CLASS of foreign output is an
 /// AGENTS.md amendment.
-const FOREIGN: &[&str] = &["ripgrep-seed-source"];
+const FOREIGN: &[&str] = &["claude-code-source", "ripgrep-seed-source"];
 
 pub fn all() -> Vec<SourcePin> {
     all_with(FOREIGN)
@@ -754,8 +768,10 @@ mod tests {
         // curl's dated Mozilla CA extract, OpenSSH Portable 10.5p1, OpenAI Codex
         // 0.148.0 (including its
         // vendored Bubblewrap and five Cargo Git commit archives), libcap 2.78,
-        // and Protobuf 31.1 with its exact Abseil 20250127.0 source dependency.
-        assert_eq!(all().len(), 71);
+        // Protobuf 31.1 with its exact Abseil 20250127.0 source dependency, and
+        // the second reviewed foreign application seed, the Claude Code 2.1.260
+        // native release.
+        assert_eq!(all().len(), 72);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
@@ -800,7 +816,11 @@ mod tests {
         );
         // The count is the reviewable artifact, so it is asserted rather than
         // left to be read. Adding an application changes this number.
-        assert_eq!(FOREIGN.len(), 1, "exactly one application seed is admitted");
+        assert_eq!(
+            FOREIGN.len(),
+            2,
+            "exactly two application seeds are admitted: ripgrep and Claude Code"
+        );
     }
 
     /// The mark is a property of the PIN, so it must answer the same however the
@@ -830,7 +850,13 @@ mod tests {
             .filter(|pin| pin.foreign())
             .map(|pin| pin.key)
             .collect();
-        assert_eq!(marked, vec!["ripgrep-seed-source".to_string()]);
+        assert_eq!(
+            marked,
+            vec![
+                "claude-code-source".to_string(),
+                "ripgrep-seed-source".to_string()
+            ]
+        );
     }
 
     /// The PRODUCTION lookup, over a REAL pin key, which is the route every
@@ -872,7 +898,7 @@ mod tests {
         assert_eq!(
             reads,
             vec![
-                "const FOREIGN: &[&str] = &[\"ripgrep-seed-source\"];",
+                "const FOREIGN: &[&str] = &[\"claude-code-source\", \"ripgrep-seed-source\"];",
                 "all_with(FOREIGN)",
                 "by_key_with(key, FOREIGN)",
                 "foreign_names_with(FOREIGN)",

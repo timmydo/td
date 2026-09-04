@@ -511,12 +511,14 @@ mod tests {
         // libraries) + the ripgrep 15.2.0 static application seed + curl's
         // dated Mozilla CA extract + OpenAI Codex 0.148.0, its five exact Cargo
         // Git commit archives, libcap 2.78, Protobuf 31.1 with its exact Abseil
-        // 20250127.0 source dependency, and OpenSSH Portable 10.5p1.
-        assert_eq!(pins.len(), 71);
+        // 20250127.0 source dependency, OpenSSH Portable 10.5p1, and the
+        // Claude Code 2.1.260 native Linux x86-64 binary.
+        assert_eq!(pins.len(), 72);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
         assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "codex-source"));
+        assert!(pins.iter().any(|pin| pin.key == "claude-code-source"));
         assert!(pins
             .iter()
             .any(|pin| pin.key == "abseil-cpp-x86-64-source"));
