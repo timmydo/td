@@ -6,6 +6,7 @@ mod client;
 mod client_resources;
 mod configure;
 mod conn;
+mod control;
 mod filter;
 mod font;
 mod font_data;
@@ -53,7 +54,7 @@ const MAX_HELD_KEYS: usize = 256;
 
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
-     --portal-socket PATH \
+     --portal-socket PATH [--control-socket PATH] \
      (--launcher-client PATH | --launcher-application NAME \
      --application-ready-socket PATH --application-app-id ID \
      --application-content-rgb-a RGB --application-content-rgb-b RGB) \
@@ -85,6 +86,11 @@ enum Personality {
     Compositor,
     Demo,
     Term,
+    /// The control client: not a Wayland client at all, which is why it is a
+    /// name of this artifact rather than a program of its own — the request
+    /// vocabulary and the compositor that answers it are one module, and two
+    /// binaries built from it could not disagree about the wire.
+    Control,
 }
 
 impl Personality {
@@ -98,6 +104,7 @@ impl Personality {
         match name {
             Some("td-ui-demo") => Personality::Demo,
             Some("td-term") => Personality::Term,
+            Some("td-ctl") => Personality::Control,
             _ => Personality::Compositor,
         }
     }
@@ -107,6 +114,7 @@ impl Personality {
             Personality::Compositor => "td-compositor",
             Personality::Demo => "td-ui-demo",
             Personality::Term => "td-term",
+            Personality::Control => "td-ctl",
         }
     }
 }
@@ -161,6 +169,10 @@ struct RunOptions {
     launcher_client: Option<PathBuf>,
     launcher_application: Option<String>,
     terminal_client: PathBuf,
+    /// Absent by DEFAULT, and absent means there is no control socket to
+    /// reach: a session that was not asked for one exposes none, so the way
+    /// to turn the surface off is not to configure it.
+    control_socket: Option<PathBuf>,
     application_ready_socket: Option<PathBuf>,
     application_app_id: Option<String>,
     application_content_rgb_a: Option<String>,
@@ -175,6 +187,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut launcher_client = None;
     let mut launcher_application = None;
     let mut terminal_client = None;
+    let mut control_socket = None;
     let mut application_ready_socket = None;
     let mut application_app_id = None;
     let mut application_content_rgb_a = None;
@@ -203,6 +216,9 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--terminal-client" if terminal_client.is_none() => {
                 terminal_client = Some(PathBuf::from(value))
             }
+            "--control-socket" if control_socket.is_none() => {
+                control_socket = Some(PathBuf::from(value))
+            }
             "--application-ready-socket" if application_ready_socket.is_none() => {
                 application_ready_socket = Some(PathBuf::from(value))
             }
@@ -216,7 +232,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
                 application_content_rgb_b = Some(value.clone())
             }
             "--framebuffer" | "--input" | "--socket" | "--portal-socket" | "--launcher-client"
-            | "--launcher-application" | "--terminal-client"
+            | "--launcher-application" | "--terminal-client" | "--control-socket"
             | "--application-ready-socket" | "--application-app-id"
             | "--application-content-rgb-a" | "--application-content-rgb-b" => {
                 return Err(format!("duplicate flag '{flag}'"));
@@ -251,22 +267,39 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         &portal_socket.ok_or_else(|| "--portal-socket is required".to_string())?,
         "private portal Wayland",
     )?;
-    if portal_socket == socket {
-        return Err("private portal Wayland must not alias the public Wayland socket".into());
-    }
-    if let Some(ready) = application_ready_socket.as_mut() {
-        let resolved_ready = resolve_socket_endpoint(ready, "application-window readiness")?;
-        if resolved_ready == socket {
-            return Err("application-window readiness must not alias the Wayland socket".into());
+    // Retain the RESOLVED endpoints, not a symlink spelling that could name a
+    // different parent between this check and the bind.
+    let control_socket = control_socket
+        .as_deref()
+        .map(|path| resolve_socket_endpoint(path, "control"))
+        .transpose()?;
+    let application_ready_socket = application_ready_socket
+        .as_deref()
+        .map(|path| resolve_socket_endpoint(path, "application-window readiness"))
+        .transpose()?;
+    // Every endpoint against every other. Written as one walk rather than a
+    // comparison per pair, because four endpoints are six pairs and the pair
+    // nobody remembers to add is two services quietly sharing one socket —
+    // where the failure is not a refusal but a compositor answering the
+    // wrong protocol on a path something else believes it owns.
+    let endpoints: [(&str, Option<&Path>); 4] = [
+        ("the Wayland socket", Some(socket.as_path())),
+        ("private portal Wayland", Some(portal_socket.as_path())),
+        ("the control socket", control_socket.as_deref()),
+        (
+            "application-window readiness",
+            application_ready_socket.as_deref(),
+        ),
+    ];
+    for (index, (label, endpoint)) in endpoints.iter().enumerate() {
+        let Some(endpoint) = endpoint else {
+            continue;
+        };
+        for (other_label, other) in endpoints.iter().skip(index.saturating_add(1)) {
+            if *other == Some(*endpoint) {
+                return Err(format!("{other_label} must not alias {label}"));
+            }
         }
-        if resolved_ready == portal_socket {
-            return Err(
-                "application-window readiness must not alias private portal Wayland".into(),
-            );
-        }
-        // Retain the resolved endpoints, not a mutable symlink spelling that
-        // could name a different parent between this check and either bind.
-        *ready = resolved_ready;
     }
     Ok(RunOptions {
         framebuffer: framebuffer.ok_or_else(|| "--framebuffer is required".to_string())?,
@@ -280,6 +313,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         // is worse than one that never appeared.
         terminal_client: terminal_client
             .ok_or_else(|| "--terminal-client is required".to_string())?,
+        control_socket,
         application_ready_socket,
         application_app_id,
         application_content_rgb_a,
@@ -358,6 +392,18 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
                 .map(|name| launcher::ApplicationLaunch { name }),
         },
     )?;
+    // FATAL, like the Wayland listeners and unlike the status bar below. An
+    // earlier draft reasoned from the bar — a session you can see beats one
+    // that refused to start — and it was the wrong analogy: the bar is a
+    // decoration, and this is an endpoint whose NAME the session hands to
+    // every program it starts. `remove_stale` already clears a socket nobody
+    // is answering, so the only way past it is a path something LIVE owns,
+    // and carrying on there would advertise that path while somebody else
+    // answered on it. A caller was then told, with authority, whatever the
+    // incumbent said.
+    if let Some(path) = options.control_socket.as_deref() {
+        control::serve(path, Arc::clone(&runtime))?;
+    }
     // Reported, never fatal: a compositor without a clock is worth more
     // than no compositor.
     if let Err(error) = bar::start(
@@ -517,6 +563,67 @@ fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
     })
 }
 
+/// Where `td-ctl` looks for the session it is driving. An environment
+/// variable rather than a fixed path, for the reason `WAYLAND_DISPLAY` is
+/// one: the socket belongs to a session, and a machine can have a session
+/// whose runtime directory is not the one a constant would name.
+const CONTROL_SOCKET_ENV: &str = "TD_CONTROL_SOCKET";
+
+/// `td-ctl`: one request, one answer, exit.
+///
+/// The request is parsed HERE as well as by the compositor. Not a duplicate
+/// check — it is the same parser — but it is what lets a typo be answered
+/// without a session to answer it, which is the difference between `td-ctl`
+/// being usable over ssh into a machine whose compositor has died and it
+/// being a program that reports a socket error for a misspelt verb.
+fn run_control(args: &[String]) -> Result<(), control::ControlFailure> {
+    let mut request_words = args;
+    let mut socket = None;
+    if args.first().is_some_and(|flag| flag == "--socket") {
+        let value = args.get(1).ok_or_else(|| {
+            control::ControlFailure::Refused("--socket requires a value".to_string())
+        })?;
+        socket = Some(PathBuf::from(value));
+        request_words = args.get(2..).unwrap_or_default();
+    }
+    let line = request_words.join(" ");
+    if line.is_empty() || line == "help" || line == "--help" {
+        return say(&control::help());
+    }
+    // Refused rather than unreachable: the request is wrong wherever it was
+    // read, and a script branching on the status wants "fix the command"
+    // separated from "there is no compositor".
+    let request =
+        control::Request::parse(&line).map_err(control::ControlFailure::Refused)?;
+    let socket = match socket {
+        Some(socket) => socket,
+        None => env::var_os(CONTROL_SOCKET_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                control::ControlFailure::Unreachable(format!(
+                    "no control socket: set {CONTROL_SOCKET_ENV} or pass --socket"
+                ))
+            })?,
+    };
+    let body = control::ask(&socket, request)?;
+    say(&body)
+}
+
+/// Write to stdout without panicking. `print!` panics when the write fails and
+/// this crate is `panic = "abort"` in release, so `td-ctl layout | head -1`
+/// would abort rather than report — and a control client that dies on a closed
+/// pipe is worse than one that says it could not write. The failure is
+/// UNREACHABLE rather than a refusal: the compositor answered, and what went
+/// wrong is on this side of it.
+fn say(text: &str) -> Result<(), control::ControlFailure> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| {
+            control::ControlFailure::Unreachable(format!("write control output: {error}"))
+        })
+}
+
 fn run_client(args: &[String]) -> Result<(), client::ClientRunFailure> {
     let command = args.first().ok_or_else(client_usage)?;
     match command.as_str() {
@@ -557,6 +664,13 @@ fn main() {
             }
         },
         Personality::Term => run_term(&args),
+        Personality::Control => match run_control(&args) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("{}: {}", personality.program(), error.message());
+                process::exit(error.exit_code());
+            }
+        },
     };
     if let Err(error) = result {
         eprintln!("{}: {error}", personality.program());
@@ -569,9 +683,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_three_names_pick_the_three_programs() {
+    fn the_four_names_pick_the_four_programs() {
         // Installed symlinks select by basename; only the exact fixture entry
         // also uses its authenticated application identity.
+        for (name, personality) in [
+            ("td-compositor", Personality::Compositor),
+            ("td-ui-demo", Personality::Demo),
+            ("td-term", Personality::Term),
+            ("td-ctl", Personality::Control),
+        ] {
+            // The name a personality PRINTS itself as has to be the name that
+            // selects it, or a diagnostic names a program the reader cannot
+            // run. Every one of the four, since the loop is the check.
+            assert_eq!(personality.program(), name);
+            assert!(Personality::of(&format!("/bin/{name}"), false) == personality);
+        }
+        assert!(Personality::of("/bin/td-ctl", false) == Personality::Control);
+        assert!(Personality::of("td-ctl", false) == Personality::Control);
+        assert!(Personality::of("/td/store/x-td-compositor/bin/td-ctl", false) == Personality::Control);
+        assert!(Personality::of("/bin/td-ctl", true) == Personality::Control);
+        // A name that merely contains one is not that one, here as elsewhere:
+        // the control client must not be selected by `td-ctlx` or by a
+        // `td-ctl` that is only the tail of a longer name.
+        assert!(Personality::of("/bin/td-ctlx", false) == Personality::Compositor);
+        assert!(Personality::of("/bin/xtd-ctl", false) == Personality::Compositor);
         assert!(Personality::of("/bin/td-term", false) == Personality::Term);
         assert!(Personality::of("td-term", false) == Personality::Term);
         assert!(Personality::of("/td/store/x-td-compositor/bin/td-term", false) == Personality::Term);
@@ -683,6 +818,7 @@ mod confinement {
         ("client_resources.rs", include_str!("client_resources.rs")),
         ("configure.rs", include_str!("configure.rs")),
         ("conn.rs", include_str!("conn.rs")),
+        ("control.rs", include_str!("control.rs")),
         ("filter.rs", include_str!("filter.rs")),
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
@@ -1205,6 +1341,16 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         let server = include_str!("server.rs");
         let pty = include_str!("pty.rs");
         let input = include_str!("input.rs");
+        // The control listener is STARTED, and by the compositor's own run
+        // path. Nothing else can see this: `td-ctl help` needs no session, the
+        // recipe compares an `exec=` string, and the crate's socket tests
+        // build their own listener — so deleting this call left the whole
+        // feature dead in the image with every test green. Pinned in the
+        // source, as this crate pins the terminal's selftest layers.
+        assert!(
+            production(MAIN).contains("control::serve(path, Arc::clone(&runtime))?"),
+            "run_compositor no longer starts the control listener"
+        );
         assert_eq!(
             occurrences(production(server), "sys::peer_uid(&stream)"),
             1,
@@ -1342,6 +1488,96 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
     #[test]
     fn the_selftest_subcommand_passes() {
         super::selftest().unwrap();
+    }
+
+    #[test]
+    fn the_control_socket_is_a_boundary_like_the_other_three() {
+        // The flag and the alias walk, neither of which anything else reaches:
+        // `td-ctl help` needs no session, the recipe compares an `exec=`
+        // string, and the crate's socket tests build their own listener. With
+        // the endpoint dropped from the walk, or the flag storing a path of
+        // its own, every other test in this crate stayed green.
+        use std::os::unix::fs::symlink;
+        use std::path::Path;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "td-compositor-control-parser-{}-{nonce}",
+            std::process::id()
+        ));
+        let actual = root.join("actual");
+        let alias = root.join("alias");
+        std::fs::create_dir_all(&actual).unwrap();
+        symlink(&actual, &alias).unwrap();
+        let wayland = actual.join("wayland-0");
+        let portal = actual.join("td-portal-wayland-0");
+        let ready = actual.join("firefox-window-ready");
+        let control = actual.join("td-control");
+        let valid = |control: &Path| {
+            vec![
+                "--framebuffer".into(),
+                "/dev/fb0".into(),
+                "--input".into(),
+                "/dev/input".into(),
+                "--socket".into(),
+                wayland.to_string_lossy().into_owned(),
+                "--portal-socket".into(),
+                portal.to_string_lossy().into_owned(),
+                "--control-socket".into(),
+                control.to_string_lossy().into_owned(),
+                "--launcher-application".into(),
+                "td-jail-fixture".into(),
+                "--terminal-client".into(),
+                "/bin/td-term".into(),
+                "--application-ready-socket".into(),
+                ready.to_string_lossy().into_owned(),
+                "--application-app-id".into(),
+                "org.mozilla.firefox".into(),
+                "--application-content-rgb-a".into(),
+                "ff00ff".into(),
+                "--application-content-rgb-b".into(),
+                "00ff00".into(),
+            ]
+        };
+
+        // The flag's value reaches the option, resolved — a compositor that
+        // bound somewhere else would advertise a path nothing answers on.
+        let options = super::parse_run(&valid(&control)).unwrap();
+        let resolved_parent = std::fs::canonicalize(&actual).unwrap();
+        assert_eq!(
+            options.control_socket,
+            Some(resolved_parent.join("td-control"))
+        );
+        // Absent means absent: no socket bound and nothing to reach.
+        let mut without = valid(&control);
+        let at = without
+            .iter()
+            .position(|argument| argument == "--control-socket")
+            .expect("the flag this test is about");
+        without.drain(at..at.saturating_add(2));
+        assert_eq!(super::parse_run(&without).unwrap().control_socket, None);
+
+        // All three of its pairs. Four endpoints are six pairs and these are
+        // the three the fourth added.
+        assert!(super::parse_run(&valid(&wayland)).is_err());
+        assert!(super::parse_run(&valid(&portal)).is_err());
+        assert!(super::parse_run(&valid(&ready)).is_err());
+        // Including under a spelling that resolves onto one of them, which is
+        // why the walk compares resolved endpoints rather than argv strings.
+        assert!(super::parse_run(&valid(&alias.join("wayland-0"))).is_err());
+        assert!(super::parse_run(&valid(&actual.join(".").join("wayland-0"))).is_err());
+
+        // And named twice is a mistake, not a last-one-wins.
+        let mut twice = valid(&control);
+        twice.push("--control-socket".into());
+        twice.push(control.to_string_lossy().into_owned());
+        assert!(super::parse_run(&twice).is_err());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

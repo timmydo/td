@@ -41,10 +41,14 @@ syscall surface.
 `td-compositor` runs as uid 1000. It opens only the assigned framebuffer and
 evdev nodes. It renders XRGB8888 pixels in software, reads Linux input events,
 and owns the public and private-portal Wayland sockets below the user's
-mode-0700 runtime directory. It does not run as root and has no device-broker
-protocol. Readiness is not announced until the framebuffer has accepted an
-initial paint, every enumerated input node has been opened, and both listeners
-have been bound.
+mode-0700 runtime directory. It owns a third socket there when asked for one:
+the CONTROL channel of section 15, which is not Wayland, is bound only when
+`--control-socket` names a path, and is what `td-ctl` talks to. It does not
+run as root and has no device-broker protocol. Readiness is not announced
+until the framebuffer has accepted an initial paint, every enumerated input
+node has been opened, and both Wayland listeners have been bound. The control
+socket is bound before that marker too, when one was asked for, and a bind
+that fails is fatal exactly as a Wayland one is (§15).
 
 All target-side UI code is dependency-free Rust built by td's source-built
 stage2 toolchain. The target closure contains no Mesa, libdrm userspace,
@@ -887,17 +891,22 @@ the reader active so the launcher can be closed or retried.
 The server accepts local Unix-stream clients at
 `/run/user/1000/wayland-0` and the trusted portal at
 `/run/user/1000/td-portal-wayland-0`. Both socket endpoints are resolved once,
-must be distinct from each other and from application readiness, are mode
-0600 below the uid-1000 mode-0700 runtime directory, and are bound before the
-ordinary readiness marker is emitted. The private endpoint is bound first,
-then the public endpoint and private accept loop become live before that
-marker. Public clients have 30 slots and private portal clients have two
-reserved slots, retaining the previous 32-client total while preventing public
-load from starving the portal. `td-jail` exposes only the first socket to
-applications. After authentication, private sockets have 30-second read and
-write inactivity timeouts, so idle or backpressured peers release the two
-reserved slots. An active unconfined uid-1000 peer can keep a slot live; the
-private path and application jail remain the isolation boundary.
+are mode 0600 below the uid-1000 mode-0700 runtime directory, and are bound
+before the ordinary readiness marker is emitted. Distinctness is checked over
+every endpoint the compositor takes, not just these two: the pair above,
+application readiness, and the control socket of section 15 are compared each
+against each, so no two of the four may name one path. It is one walk rather
+than a comparison per pair because four endpoints are six pairs, and the pair
+nobody remembers to add is two services sharing a socket. The private endpoint
+is bound first, then the public endpoint and private accept loop become live
+before that marker. Public clients have 30 slots and private portal clients
+have two reserved slots, retaining the previous 32-client total while
+preventing public load from starving the portal. `td-jail` exposes only the
+first socket to applications. After authentication, private sockets have
+30-second read and write inactivity timeouts, so idle or backpressured peers
+release the two reserved slots. An active unconfined uid-1000 peer can keep a
+slot live; the private path and application jail remain the isolation
+boundary.
 
 The first protocol surface is:
 
@@ -5309,4 +5318,253 @@ The complete terminal landing must prove:
   starts td-term as uid 1000, passes the readiness-socket probe, and observes
   the matching `TD-TERM-READY` diagnostic; and
 - graphical failure leaves the serial recovery path and existing compositor
-  readiness proof intact.
+  readiness proof intact;
+- the control channel is proved through a real socket and a real runtime, not
+  a parser and a mock: a request crosses the kernel, moves the session, and is
+  read back through the same socket that ordered it, since what a caller can
+  SEE is the whole of what this surface promises. The accept loop outlives the
+  connection, so one caller's answer is not the end of the listener; a refusal
+  crosses as a refusal and leaves the session where it was; a request with no
+  terminating newline is one request; a flood longer than the limit is refused
+  rather than buffered; and the socket is mode 0600, which is the whole of its
+  access control and therefore the whole of what there is to prove about it;
+- every request the parser takes, the help text names, and every request the
+  client can spell parses back to what wrote it — one list, walked in both
+  directions, so the two halves of the protocol cannot drift;
+- a client's own title cannot write a record of its own: the report's one
+  attacker-chosen field is stripped of control characters, and the proof is
+  that a title containing a newline and a well-formed `window` record leaves
+  exactly one `window` line;
+- the fourth name dispatches in the BUILT artifact, proved on the target by an
+  argv no other personality accepts — unlike the terminal's selftest, which
+  proves the name exists and executes but would exit zero if it fell through
+  to the compositor;
+- the compositor STARTS the listener. Nothing else can see that: `td-ctl help`
+  needs no session, the recipe compares an `exec=` string, and the crate's own
+  socket tests build their own listener, so deleting the call left the feature
+  dead in the image with every test green. It is pinned in the source, as the
+  terminal's selftest layers are;
+- the socket's mode is asserted against the LITERAL 0600 and not against the
+  constant under test, which passes for whatever the constant says — a socket
+  changed to 0666 shipped green before this;
+- the conversation's deadline ends a read that a partial line would not, and
+  the same read waits when the deadline has time left, so what ended it was
+  the bound and not the shape of the request;
+- a run of failed accepts one under the bound is survived and one over it
+  retires the listener, which is reachable at all because `accept` takes the
+  connections rather than the listener;
+- a title cannot forge a record for a reader that is not Rust: the line and
+  paragraph separators, the bidirectional overrides and isolates, and the
+  zero-width characters are each refused by name, while ordinary text in other
+  scripts is not touched;
+- the compositor's own failure crosses as `unavailable` and exits 1, an
+  answer with no terminating newline is refused rather than read as a success,
+  and an over-long request is answered with the limit it broke rather than
+  dropped;
+- every verb the PARSER takes is named by `USAGE`, read out of the parser's own
+  source, since one list feeding the help text says nothing about the other
+  direction — a verb added to the match and not to `USAGE` shipped
+  undocumented before this;
+- the shell is told where the socket is, which takes the `[wayland]` unit, the
+  `[terminal]` unit beside it, and `pty::environment` — `pty::spawn` clears
+  the environment, so the child gets exactly the list it is given and nothing
+  inherited;
+- `--control-socket` reaches the option it names, and the control socket is
+  one of the four in the alias walk. Nothing else reaches either: dropping the
+  endpoint from the walk, and storing a path the flag did not give, both left
+  every other test in the crate green;
+- the ANSWER is written under the deadline as well as the request read under
+  it. The read half's absence hangs; the write half's was silent, and
+  replacing the bounded loop with `write_all` passed;
+- an answer already received survives the error that follows it, asked of the
+  read directly because `td-ctl` renders its own request and so cannot send
+  one that provokes the close; and
+- a report body that stops mid-record is refused rather than read as a
+  shorter report, which either the deadline or the socket's write timeout
+  can leave behind.
+
+## 15. Control channel
+
+A keyboard and a pointer are how a person drives this compositor. Section 15
+is how a PROGRAM does. `td-ctl` is a fourth name for the compositor artifact,
+selected by argv[0] beside `td-ui-demo` and `td-term`, and what it does is
+write one line to a Unix socket and print what comes back.
+
+### Why a socket and not a protocol
+
+A caller here has no surface, no buffer and no registry. It is a one-shot that
+asks a question or gives one order and exits, so a Wayland extension would be
+a protocol binding for a client that does not otherwise exist, plus a registry
+global, plus a version negotiation, to carry a line of text.
+
+The separate socket also decides WHO can reach it, which an extension could
+not. `td-jail` names the authorities it passes into a confined application one
+at a time — Wayland, the session bus, PulseAudio — and this socket is not
+among them, so an application cannot drive the session that confines it. An
+extension on the public Wayland socket would be reachable by everything that
+can open a window, and a confined Firefox could then read every window title
+on the machine and move the windows of every other program.
+
+### Off unless asked for
+
+`--control-socket` is optional, and absent means no socket is bound and there
+is nothing to reach. The way to turn the surface off is not to configure it,
+which is the only kind of off that cannot be got wrong.
+
+The shipped image asks for it, and reaching the SHELL takes three steps rather
+than one, because inheritance does not do it. The `[wayland]` unit passes the
+flag and exports `TD_CONTROL_SOCKET`; the `[terminal]` unit exports it too,
+being a sibling service rather than a child of the compositor and so
+inheriting nothing from it; and `pty::environment` carries it into the child,
+since `pty::spawn` CLEARS the environment and sets exactly the list it is
+given. Miss any one and `td-ctl` needs `--socket` on a machine that already
+knows the path. All three name the same recipe constant, so a session cannot
+advertise a socket it did not bind.
+
+A bind that fails is FATAL, like the Wayland listeners and unlike the status
+bar. The first draft reasoned from the bar — a session you can see beats one
+that refused to start — and that was the wrong analogy: the bar is a
+decoration, and this is an endpoint whose name the session hands to every
+program it starts. `remove_stale` already clears a socket nobody answers, so
+the only way past it is a path something LIVE owns; carrying on there would
+advertise that path while somebody else answered on it, and a caller would be
+told, with the session's authority, whatever the incumbent said.
+
+### Access control
+
+The socket is mode 0600 under the mode-0700 runtime directory. That is the
+whole of the access control and it is enough: `connect(2)` requires write
+permission on the socket inode, so the kernel refuses every other uid before
+any code here runs.
+
+The private portal listener additionally asks `SO_PEERCRED`, and this one
+deliberately does not. That query answers the question the mode has already
+answered, and asking it would put a sixth module on the audited caller list of
+section 4 to buy nothing. What the mode does not cover is the instant between
+`bind` and `chmod`, and what covers that is the mode-0700 directory both
+sockets sit in — the same window the Wayland listeners already have.
+
+### One line in, one answer out
+
+One connection carries one request and one answer, then closes. The request is
+a line, bounded, ending at the first newline OR at end of input, so a caller
+that writes and shuts down is answered exactly like one that terminates its
+line. The answer is a status line followed by a body only a question has, and
+the newline that ends it is REQUIRED: without that rule a truncated `ok` — a
+compositor killed mid-write, or something else entirely on the path — reads as
+a success carrying no report.
+
+The BODY is terminated on the same argument, one level down. Every record the
+report writes ends in a newline, so a body that does not is one the compositor
+abandoned part way through — which either the deadline or the socket's write
+timeout can leave behind. A client that read it anyway would print a shorter
+report and exit 0, with the missing windows indistinguishable from windows
+that are not there. A truncation landing exactly on a record boundary still
+reads as a shorter report; bounding that needs a length this protocol does not
+carry, and it is named here rather than left to be rediscovered. Its
+degenerate case is an `ok` abandoned before its first record, which reads as a
+successful report of nothing — an ordering request answers with an empty body
+legitimately, and `split_answer` reads the answer WITHOUT the request beside
+it, so it cannot tell the two apart. That is a choice and not a limit of the
+protocol: `layout` is the only request with a body and `report` always writes
+an `output` and a `workspace` record, so a request-aware client could refuse
+an empty one. Keeping the answer readable on its own is worth more than
+closing the narrowest case of a bound already named.
+
+THREE statuses, not two. `ok`, then `error <text>` for a request that was
+wrong and `unavailable <text>` for a compositor that could not. They are apart
+because the fixes are: one says correct the command, the other says look at
+the session. A poisoned runtime and a paint that failed are the compositor's,
+and reporting them as refusals sent a script to check its own spelling. The
+status is a line of its own so a script can branch on it without reading the
+report, and `td-ctl` turns it into an exit code: 0, 2 for a refusal, 1 for
+`unavailable` and for never reaching a compositor at all.
+
+Callers are answered one at a time. A control request is a line and an answer,
+and the alternative is a thread per caller whose only purpose is to let two
+callers reorder each other's orders. The runtime lock is taken for the command
+and the report and released before the answer is written, so a caller that
+stops reading cannot hold the session still.
+
+Serial makes the BOUND load-bearing, and the bound is on the conversation, not
+on a syscall. A socket timeout restarts with every `read`, so a caller
+trickling one byte just inside it holds the thread for the request limit times
+the timeout — with this loop serial, that is every other caller's wait as
+well. An absolute deadline covers the read and the write together; the socket
+timeouts stay, because they are what unblocks a single stalled syscall, and
+the deadline is what bounds a caller whose every syscall returns promptly and
+slowly. The answer is written by a loop of its own for the same reason:
+`write_all` retries partial writes without a bound, so a caller reading one
+byte at a time would keep every write fast and the whole answer endless.
+
+### The vocabulary is the keyboard's
+
+Every ordering request is one `layout::Command` the keyboard already sends:
+`workspace` and `send` are `SwitchWorkspace` and `MoveToWorkspace`, `focus`
+and `move` are `Focus` and `Move`, and `fullscreen`, `present` and `group` are
+`ToggleFullscreen`, `SetPresentation` and `ToggleGrouped`. They go through
+`Runtime::command`, the keyboard's own path, whole-output damage and all: a
+scripted tiling command is the same gesture as the typed one and must not
+repair the screen a different amount.
+
+This is a way to SAY what the keyboard says, not a second vocabulary of things
+to say. A control channel that could do what no key can would be a second
+implementation of the layout to keep in step with the first.
+
+`send` moves the focused window and leaves the view where it was, which is
+what the keyboard's `MoveToWorkspace` has always done. It is the one answer in
+the vocabulary a caller might expect the other way round, so the help text
+says which it is and a test pins it.
+
+### The report
+
+`layout` is the only question. It answers with one record per line and
+`key=value` fields in a fixed order: an `output` line, a `workspace` line
+naming the active workspace and the occupied ones, and a `window` line each.
+Occupancy is derived where the on-screen strip derives it, so the numbers a
+person reads off the bar and the numbers a program reads off this cannot
+disagree.
+
+Every window carries a rectangle, including one on a workspace nobody is
+looking at, where it is where the window WOULD be: a hidden workspace is laid
+out for the same output as the shown one, so the answer exists and refusing to
+give it would be a second rule to explain. `visible` is what says which.
+
+`fullscreen` is asked of the LAYOUT and not of `ViewLayout`, whose own flag
+means "draw this undecorated now" and is therefore false for every window
+nobody is looking at. Reported from that one, a hidden fullscreen window came
+back as an ordinary tile whose rectangle covered its whole workspace and
+overlapped its neighbours' with nothing in the record to explain it.
+
+`title` is last on its line and runs to the end of it, because a title has
+spaces in it and a field that could eat the next one would have to be quoted.
+It is also the one field a CLIENT chooses, and therefore the only way into
+this report from outside: a title carrying a newline would otherwise print a
+`window` record of the client's own writing. Control characters are replaced
+rather than dropped — a title of nothing but tabs is still a title that is
+there, which is not the same answer as a client that set none — and the length
+is bounded.
+
+Control characters are not the whole of it, which the first draft assumed.
+`char::is_control` is category Cc and stops there, and two more kinds matter.
+U+2028 and U+2029 END A LINE for readers that are not `str::lines` — Python's
+`splitlines` among them, and a program in Python is exactly the reader this
+report is for — so a title carrying one forges a record there while looking
+harmless here. And the bidirectional controls and zero-width characters change
+how a line READS without changing what it holds, which is the objection the
+carriage return already answers. Those are named as a list rather than a
+category test: this crate has no Unicode tables and will not grow one for a
+label field, and ordinary text in every script has to survive, so an ASCII
+allowlist would be a worse answer than a named set. No app id is reported: the
+compositor keeps one only for the application it is watching for, so the field
+would be empty for every other window and look like an answer.
+
+### What it deliberately is not
+
+It does not subscribe, so there is no event stream to keep in sync and no
+second consumer of layout changes to keep the first honest about. It does not
+create, close or kill windows: a control channel that could remove a client's
+window would be an authority over other programs rather than over the
+arrangement of them. It does not name windows by anything a caller chose,
+because nothing here lets a caller choose one — the orders act on the focused
+window, exactly as the keyboard's do.

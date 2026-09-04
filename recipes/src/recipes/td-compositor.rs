@@ -25,6 +25,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/configure.rs"),
     ),
     ("conn", include_str!("../../../td-compositor/src/conn.rs")),
+    ("control", include_str!("../../../td-compositor/src/control.rs")),
     ("filter", include_str!("../../../td-compositor/src/filter.rs")),
     ("font", include_str!("../../../td-compositor/src/font.rs")),
     (
@@ -180,11 +181,20 @@ pub fn recipe() -> Recipe {
             target: "td-compositor".into(),
             link: "{out}/bin/td-term".into(),
         },
+        // And the control client under a fourth. It shares the artifact for a
+        // reason of its own: the request vocabulary and the compositor that
+        // answers it are one module, so two binaries built from one source
+        // cannot drift apart on the wire.
+        Step::Symlink {
+            target: "td-compositor".into(),
+            link: "{out}/bin/td-ctl".into(),
+        },
         Step::Require {
             paths: vec![
                 "{out}/bin/td-compositor".into(),
                 "{out}/bin/td-ui-demo".into(),
                 "{out}/bin/td-term".into(),
+                "{out}/bin/td-ctl".into(),
             ],
             exec: true,
         },
@@ -213,6 +223,7 @@ pub fn recipe() -> Recipe {
             "{out}/bin/td-compositor",
             "{out}/bin/td-ui-demo",
             "{out}/bin/td-term",
+            "{out}/bin/td-ctl",
         ]),
     ]);
 

@@ -238,6 +238,10 @@ const FIREFOX_TLS_POLICY: &str = concat!(
 );
 const FIREFOX_WINDOW_READY_SOCKET: &str = "/run/user/1000/td-firefox-window-ready";
 const PORTAL_WAYLAND_SOCKET: &str = "/run/user/1000/td-portal-wayland-0";
+/// Where the compositor answers `td-ctl`. One constant for the flag the
+/// compositor binds and the variable its children inherit, so a session
+/// cannot advertise a socket it did not bind.
+const CONTROL_SOCKET: &str = "/run/user/1000/td-control";
 const PORTAL_SERVICE_LOG: &str = "/run/td-portal.log";
 const PORTAL_FILE_CHOOSER_COMPLETED: &str =
     "TD-PORTAL-FILE-CHOOSER-COMPLETED";
@@ -1325,7 +1329,7 @@ fn build_td_svc_conf() -> String {
          [wayland]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --portal-socket {portal_wayland_socket} --launcher-application {firefox_name} --terminal-client /bin/td-term --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --portal-socket {portal_wayland_socket} --control-socket {control_socket} --launcher-application {firefox_name} --terminal-client /bin/td-term --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}'\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor probe /run/user/{ui_uid}/wayland-0'\n\
@@ -1357,7 +1361,7 @@ fn build_td_svc_conf() -> String {
          [terminal]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-term-ready'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-term-ready'\n\
          after=wayland\n\
          requires=wayland\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-term-ready'\n\
@@ -1522,6 +1526,7 @@ fn build_td_svc_conf() -> String {
         portal_unavailable_runtime_marker = TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER,
         portal_channel_runtime_marker = TD_PORTAL_CHANNEL_RUNTIME_MARKER,
         portal_wayland_socket = PORTAL_WAYLAND_SOCKET,
+        control_socket = CONTROL_SOCKET,
         portal_service_log = PORTAL_SERVICE_LOG,
         portal_file_chooser_completed = PORTAL_FILE_CHOOSER_COMPLETED,
         ui_gid = UI_GID,
@@ -3771,6 +3776,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-compositor}/bin/td-term".into(),
         link: "{root}/real-root/bin/td-term".into(),
     });
+    // /bin/td-ctl — the control client. A name in `/bin` because a person in a
+    // terminal is who runs it, and the session hands it its socket through the
+    // environment the compositor was started with.
+    steps.push(Step::Symlink {
+        target: "{in:td-compositor}/bin/td-ctl".into(),
+        link: "{root}/real-root/bin/td-ctl".into(),
+    });
     // /bin/td-busd — the session bus. Named in full by the busd unit's exec and
     // ready lines; no basename dispatch and no applet farm.
     steps.push(Step::Symlink {
@@ -4077,6 +4089,8 @@ fn shape_check() -> String {
      compositor=\"{root}/real-root{in:td-compositor}/bin/td-compositor\"; { [ -f \"$compositor\" ] && [ -x \"$compositor\" ]; } || { echo 'root tree: td-compositor is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-term\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-term\" ] || { echo 'root tree: /bin/td-term is not a symlink to the staged terminal' >&2; exit 1; }; \
      tdterm=\"{root}/real-root{in:td-compositor}/bin/td-term\"; { [ -f \"$tdterm\" ] && [ -x \"$tdterm\" ]; } || { echo 'root tree: td-term is not packed/executable at real-root{in:td-compositor}/bin/td-term - the /bin/td-term symlink would dangle' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-ctl\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-ctl\" ] || { echo 'root tree: /bin/td-ctl is not a symlink to the staged control client' >&2; exit 1; }; \
+     tdctl=\"{root}/real-root{in:td-compositor}/bin/td-ctl\"; { [ -f \"$tdctl\" ] && [ -x \"$tdctl\" ]; } || { echo 'root tree: td-ctl is not packed/executable at real-root{in:td-compositor}/bin/td-ctl - the /bin/td-ctl symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-busd\" 2>/dev/null)\" = \"{in:td-busd}/bin/td-busd\" ] || { echo 'root tree: /bin/td-busd is not a symlink to the staged session bus broker - the busd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
      tdbusd=\"{root}/real-root{in:td-busd}/bin/td-busd\"; { [ -f \"$tdbusd\" ] && [ -x \"$tdbusd\" ]; } || { echo 'root tree: td-busd is not packed/executable at real-root{in:td-busd}/bin/td-busd - the /bin/td-busd symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
@@ -5031,6 +5045,15 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             "the terminal publishes {published} but its probe dials {dialled}"
         );
         assert_eq!(unit_key("terminal", "requires").as_deref(), Some("wayland"));
+        // The terminal is a SIBLING of the compositor, not a child of it, so
+        // it inherits nothing from the compositor's exec line — and the shell
+        // it starts is where a person actually types `td-ctl`. Its own unit
+        // has to carry the socket, from the same constant the compositor
+        // binds, or the documented no-flag invocation is documentation only.
+        assert!(
+            exec.contains(&format!("TD_CONTROL_SOCKET={CONTROL_SOCKET} ")),
+            "the terminal's shell is not told where the control socket is: {exec}"
+        );
         // bootsuccess turns on it, so a boot that reaches no terminal is not a
         // success — which is what makes the oracle's wait a proof and not a
         // hopeful grep.
@@ -5647,11 +5670,20 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
 
     #[test]
     fn wayland_service_uses_activation_only_firefox_and_a_native_terminal() {
+        // The control socket is named TWICE and must be the same path both
+        // times: the flag is what the compositor binds, and the variable is
+        // what every program it launches finds. A session that advertised one
+        // socket and bound another would be a `td-ctl` that reports no
+        // compositor on a machine running one. Moving the constant moves both
+        // and this follows it, which is the point of there being a constant;
+        // what this catches is one of the two spellings edited by hand.
         let expected = format!(
-            "/bin/su -s /bin/sh tester -c '/bin/td-compositor run \
+            "/bin/su -s /bin/sh tester -c 'TD_CONTROL_SOCKET={CONTROL_SOCKET} \
+             /bin/td-compositor run \
              --framebuffer /dev/fb0 --input /dev/input \
              --socket /run/user/1000/wayland-0 \
              --portal-socket {PORTAL_WAYLAND_SOCKET} \
+             --control-socket {CONTROL_SOCKET} \
              --launcher-application {FIREFOX_NAME} \
              --terminal-client /bin/td-term \
              --application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
@@ -6063,10 +6095,12 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         assert_eq!(
             unit_key("wayland", "exec"),
             Some(format!(
-                "/bin/su -s /bin/sh {UI_USER} -c '/bin/td-compositor run \
+                "/bin/su -s /bin/sh {UI_USER} -c 'TD_CONTROL_SOCKET={CONTROL_SOCKET} \
+                 /bin/td-compositor run \
                  --framebuffer /dev/fb0 --input /dev/input \
                  --socket /run/user/{UI_UID}/wayland-0 \
                  --portal-socket {PORTAL_WAYLAND_SOCKET} \
+                 --control-socket {CONTROL_SOCKET} \
                  --launcher-application {FIREFOX_NAME} --terminal-client /bin/td-term \
                  --application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
                  --application-app-id {FIREFOX_APP_ID} \

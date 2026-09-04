@@ -1,6 +1,7 @@
 use crate::buffer::{BufferCharge, Surface};
 use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::ConfigureTracker;
+use crate::control::ControlSnapshot;
 use crate::framebuffer::Framebuffer;
 use crate::help::HelpAction;
 use crate::keyboard::{
@@ -2349,6 +2350,12 @@ impl Runtime {
 
     pub fn layout_snapshot(&self) -> Arc<BTreeMap<SurfaceKey, ViewLayout>> {
         Arc::clone(&self.layout)
+    }
+
+    /// Everything the control channel reports, sampled here so that one
+    /// answer describes one instant.
+    pub fn control_snapshot(&self) -> ControlSnapshot {
+        self.scene.control_snapshot(self.width(), self.height())
     }
 
     #[cfg(test)]

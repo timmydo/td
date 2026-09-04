@@ -280,8 +280,17 @@ pub fn current_account(status: &Path, passwd: &Path) -> Result<Account, String> 
 /// The child's complete environment. It is constructed, never inherited: an
 /// outer `TERM` describes the parent terminal and would be a false capability
 /// claim for this one.
-pub fn environment(account: &Account) -> Vec<(String, String)> {
-    vec![
+/// The child's whole environment: `spawn` clears and sets exactly this, so a
+/// variable absent here is absent from the shell whatever the terminal was
+/// started with.
+///
+/// `control_socket` is the one value that is not a constant or a property of
+/// the account. It is threaded in rather than read from this process, so the
+/// list stays a pure function of its arguments and a test cannot be changed by
+/// the environment that runs it; the production caller reads it from its own
+/// environment, where the session's own unit put it.
+pub fn environment(account: &Account, control_socket: Option<&str>) -> Vec<(String, String)> {
+    let mut environment = vec![
         ("COLORTERM".into(), "truecolor".into()),
         ("HOME".into(), account.home.clone()),
         ("LOGNAME".into(), account.name.clone()),
@@ -295,7 +304,14 @@ pub fn environment(account: &Account) -> Vec<(String, String)> {
             "XDG_RUNTIME_DIR".into(),
             format!("/run/user/{}", account.uid),
         ),
-    ]
+    ];
+    // Last, and only when there is one: a shell in this terminal is where a
+    // person runs `td-ctl`, and without this they would have to name the
+    // socket by hand on a machine that already knows it.
+    if let Some(socket) = control_socket {
+        environment.push(("TD_CONTROL_SOCKET".into(), socket.into()));
+    }
+    environment
 }
 
 /// What td-term execs: literal argv values, no shell, no PATH search.
@@ -741,7 +757,7 @@ pub fn selftest() -> Result<(), String> {
     if effective_uid("Name:\tsh\nUid:\t1000\t1000\t1000\t1000\n")? != 1000 {
         return Err("PTY selftest misread its own uid".into());
     }
-    let environment = environment(&account);
+    let environment = environment(&account, None);
     let named = |name: &str| {
         let mut value = None;
         for (key, candidate) in &environment {
@@ -783,6 +799,35 @@ pub fn selftest() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_child_is_told_where_the_control_socket_is() {
+        // `spawn` clears the environment and sets exactly what this returns,
+        // so a variable missing here is missing from the shell — which is how
+        // `td-ctl` came to need `--socket` on a machine that already knew the
+        // path. Absent when there is none, so a session without a control
+        // socket does not advertise one.
+        let account = Account {
+            name: "tester".into(),
+            uid: 1000,
+            home: "/var/home/tester".into(),
+        };
+        let without = environment(&account, None);
+        assert!(
+            !without.iter().any(|(name, _)| name == "TD_CONTROL_SOCKET"),
+            "a session with no control socket advertised one"
+        );
+        let with = environment(&account, Some("/run/user/1000/td-control"));
+        assert_eq!(
+            with.iter()
+                .find(|(name, _)| name == "TD_CONTROL_SOCKET")
+                .map(|(_, value)| value.as_str()),
+            Some("/run/user/1000/td-control"),
+            "the shell was not told where the control socket is"
+        );
+        // And it is the only difference, so nothing else changed shape.
+        assert_eq!(with.len(), without.len() + 1);
+    }
     use super::*;
     use std::io::Read;
     use std::time::Duration;
@@ -866,7 +911,7 @@ mod tests {
     #[test]
     fn the_child_environment_is_constructed_rather_than_inherited() {
         let account = account(PASSWD, 1000).unwrap();
-        let environment = environment(&account);
+        let environment = environment(&account, None);
         let names: Vec<&str> = environment.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
@@ -1038,7 +1083,7 @@ mod tests {
             ],
         };
         let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account);
+        let mut environment = environment(&account, None);
         environment.push((FIXTURE.into(), "1".into()));
         let home = std::env::temp_dir();
         let mut child = spawn(&command, &environment, &home, slave).unwrap();
@@ -1195,7 +1240,7 @@ mod tests {
             ],
         };
         let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account);
+        let mut environment = environment(&account, None);
         environment.push((SILENT_FIXTURE.into(), "1500".into()));
         // `spawn` consumes the slave and both clones into the child's stdio,
         // so the child is the only holder and its exit is the last close.
@@ -1482,7 +1527,7 @@ mod tests {
             ],
         };
         let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account);
+        let mut environment = environment(&account, None);
         environment.push((FIXTURE.into(), "1".into()));
         let child = spawn(&command, &environment, &std::env::temp_dir(), slave).unwrap();
 
@@ -1534,7 +1579,7 @@ mod tests {
             ],
         };
         let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account);
+        let mut environment = environment(&account, None);
         // A child that outlives this test by a wide margin, because the kill
         // is the half a self-exiting fixture cannot prove: reaping one that
         // was never signalled would simply wait for it and still pass. In

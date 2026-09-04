@@ -2203,7 +2203,13 @@ fn start_child(
     let slave = pty.peer()?;
     let child = pty::spawn(
         command,
-        &pty::environment(account),
+        // From this process's own environment, which the session's unit set
+        // from the same recipe constant the compositor binds. Read here rather
+        // than inside `environment` so that one stays a pure function.
+        &pty::environment(
+            account,
+            std::env::var("TD_CONTROL_SOCKET").ok().as_deref(),
+        ),
         Path::new(&account.home),
         slave,
     )?;

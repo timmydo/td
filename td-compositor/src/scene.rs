@@ -1,5 +1,6 @@
 use crate::bar::{self, BAR_HEIGHT};
 use crate::buffer::{BufferCeiling, BufferCharge, Surface};
+use crate::control::{ControlSnapshot, ControlWindow};
 use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
 use crate::layout::{
@@ -1900,9 +1901,9 @@ impl Scene {
         self.geometries.get(&key).copied()
     }
 
-    /// Test-only: the renderer reads the map directly, inside this type, so a
-    /// non-test accessor would still have no caller.
-    #[cfg(test)]
+    /// The client's own title. The renderer reads the map directly, inside
+    /// this type; this is for the CONTROL report, which names a window by
+    /// what the person looking at the screen would call it.
     pub fn title(&self, key: SurfaceKey) -> Option<&str> {
         self.titles.get(&key).map(String::as_str)
     }
@@ -2261,6 +2262,47 @@ impl Scene {
         (self.pointer_x, self.pointer_y)
     }
 
+    /// Everything the control report says about the arrangement, built here
+    /// because this is where the layout and the titles both live. Computed
+    /// from the tree rather than read off the runtime's published map: that
+    /// one is refreshed by a settle, and an answer is worth more when it
+    /// cannot be a frame behind the question that asked it.
+    pub(crate) fn control_snapshot(&self, width: usize, height: usize) -> ControlSnapshot {
+        let windows = self
+            .views(width, height)
+            .into_iter()
+            .filter_map(|view| {
+                // A view whose leaf the layout does not place is a window that
+                // left the tree between the walk and this line, which cannot
+                // happen inside one borrow — and a made-up number would be
+                // worse than the window going unreported.
+                let workspace = self.layout.workspace_of(view.key)?;
+                Some(ControlWindow {
+                    key: view.key,
+                    workspace,
+                    rect: view.rect,
+                    visible: view.visible,
+                    focused: view.activated,
+                    // The layout's own answer, not the renderer's gated one:
+                    // `view.fullscreen` is false for every window on a
+                    // workspace nobody is looking at, which would report a
+                    // hidden fullscreen window as an ordinary tile whose
+                    // rectangle overlaps its neighbours' with nothing saying
+                    // why.
+                    fullscreen: self.layout.is_fullscreen(view.key),
+                    title: self.title(view.key).map(str::to_string),
+                })
+            })
+            .collect();
+        ControlSnapshot {
+            width,
+            height,
+            active_workspace: self.layout.active_workspace(),
+            occupied: self.workspace_records().0,
+            windows,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn layout(&self) -> &Layout {
         &self.layout
@@ -2361,16 +2403,25 @@ impl Scene {
     /// agree on. Small enough that recomputing it per pointer frame during a
     /// drag costs nothing worth caching: nine numbers and a `Vec` of them.
     pub(crate) fn desks(&self) -> Vec<u8> {
-        let (occupied, spare) = self.layout.workspace_bar(
-            self.portal_dialogs
-                .iter()
-                .copied()
-                .filter(|key| self.is_mapped(*key)),
-        );
+        let (occupied, spare) = self.workspace_records();
         bar::desks(
             occupied,
             self.layout.active_workspace(),
             spare,
+        )
+    }
+
+    /// Which workspaces are in use, and the lowest free one. One derivation,
+    /// so the strip an operator reads and the report a program reads cannot
+    /// disagree about which workspaces exist: a mapped window presented
+    /// outside the tiling roots still holds the workspace it came from, and
+    /// the two answers would differ for exactly that window otherwise.
+    fn workspace_records(&self) -> (Vec<u8>, Option<u8>) {
+        self.layout.workspace_bar(
+            self.portal_dialogs
+                .iter()
+                .copied()
+                .filter(|key| self.is_mapped(*key)),
         )
     }
 

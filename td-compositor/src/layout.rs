@@ -1,8 +1,8 @@
 use crate::scene::SurfaceKey;
 use std::collections::{BTreeMap, BTreeSet};
 
-const INITIAL_WORKSPACE: u8 = 1;
-const FINAL_WORKSPACE: u8 = 9;
+pub(crate) const INITIAL_WORKSPACE: u8 = 1;
+pub(crate) const FINAL_WORKSPACE: u8 = 9;
 const VIRTUAL_EXTENT: usize = 65_536;
 
 /// Which way the FIRST split on a workspace goes — the only insertion a tree
@@ -784,6 +784,21 @@ impl Layout {
     /// already is.
     pub fn workspace_of(&self, key: SurfaceKey) -> Option<u8> {
         self.homes.get(&key).copied()
+    }
+
+    /// Whether this window is its workspace's fullscreen one, whether or not
+    /// that workspace is in view.
+    ///
+    /// `ViewLayout::fullscreen` is a different question and deliberately so:
+    /// the RENDERER wants "draw this undecorated now", which is false for a
+    /// window nobody is looking at. A report is not a renderer — a caller
+    /// asking what the arrangement IS wants the arrangement, and a window
+    /// that reports `fullscreen=false` while covering its own workspace has
+    /// answered a question nobody asked.
+    pub fn is_fullscreen(&self, key: SurfaceKey) -> bool {
+        self.workspace_of(key)
+            .and_then(|number| self.workspaces.get(&number))
+            .is_some_and(|workspace| workspace.fullscreen == Some(key))
     }
 
     /// Send ONE window to a workspace, which is what a drop on the strip does.
