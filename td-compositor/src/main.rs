@@ -38,6 +38,7 @@ use framebuffer::Framebuffer;
 use output::OutputBackend;
 use runtime::Runtime;
 use std::env;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -73,9 +74,49 @@ fn client_usage() -> String {
 }
 
 fn term_usage() -> String {
-    "usage: td-term run --socket PATH --ready-socket PATH \
+    "usage: td-term run --socket PATH --ready-socket PATH [--command PROGRAM [ARG...]] \
 | td-term probe READY_SOCKET | td-term selftest"
         .into()
+}
+
+/// `--command` ends td-term's own flags: everything after it is the child's
+/// literal argv, so a program's flags can never collide with the terminal's.
+/// Literal means bytes — a filename argument is whatever the filesystem
+/// holds — so the tail stays `OsString` while td-term's own flags, which are
+/// paths it spells itself, must be UTF-8. An empty command is refused rather
+/// than silently meaning the shell: an operator who wrote `--command` and
+/// nothing else did not ask for `/bin/sh`. A relative program is refused
+/// HERE, before td-term dials the compositor: `pty::child_command` checks it
+/// again at spawn, but a typo in a unit file should fail at parse time rather
+/// than paint a window and then die.
+fn split_term_command(args: &[OsString]) -> Result<(Vec<String>, Vec<OsString>), String> {
+    let Some(index) = args.iter().position(|argument| argument == "--command") else {
+        return Ok((utf8_args(args)?, Vec::new()));
+    };
+    let flags = utf8_args(args.get(..index).ok_or_else(term_usage)?)?;
+    let command = args.get(index + 1..).ok_or_else(term_usage)?;
+    let Some(program) = command.first() else {
+        return Err("--command requires a program".to_string());
+    };
+    if !Path::new(program).is_absolute() {
+        return Err(format!(
+            "terminal command '{}' is not absolute",
+            program.to_string_lossy()
+        ));
+    }
+    Ok((flags, command.to_vec()))
+}
+
+/// td's own flags are text; only a child's argv is bytes. Refusing is what
+/// `env::args()` did by panicking, said in words.
+fn utf8_args(args: &[OsString]) -> Result<Vec<String>, String> {
+    args.iter()
+        .map(|argument| {
+            argument.clone().into_string().map_err(|raw| {
+                format!("argument '{}' is not UTF-8", raw.to_string_lossy())
+            })
+        })
+        .collect()
 }
 
 /// Which program this binary was invoked as. Three installed names share one
@@ -133,15 +174,20 @@ fn term_selftest(out: &mut impl std::io::Write) -> Result<(), String> {
 /// The terminal's own entry point. `run` is the Wayland client; the other two
 /// need no surface — the readiness probe td-svc calls, and the packaged
 /// binary's self-check.
-fn run_term(args: &[String]) -> Result<(), String> {
-    let command = args.first().ok_or_else(term_usage)?;
-    match command.as_str() {
+fn run_term(args: &[OsString]) -> Result<(), String> {
+    let command = args
+        .first()
+        .and_then(|word| word.to_str())
+        .ok_or_else(term_usage)?;
+    match command {
         "run" => {
             let args = args.get(1..).ok_or_else(term_usage)?;
-            let (socket, ready_socket) = parse_run_flags(args)?;
+            let (flags, command) = split_term_command(args)?;
+            let (socket, ready_socket) = parse_run_flags(&flags)?;
             term_client::run(&term_client::Options {
                 socket,
                 ready_socket,
+                command,
             })
         }
         "probe" => {
@@ -648,20 +694,29 @@ fn run_client(args: &[String]) -> Result<(), client::ClientRunFailure> {
 }
 
 fn main() {
-    let mut argv = env::args();
-    let executable = argv.next().unwrap_or_default();
-    let args: Vec<String> = argv.collect();
+    // Bytes, not text: `env::args()` panics on a non-UTF-8 argument, and the
+    // terminal's child argv may legitimately carry one. Each personality
+    // decides what must be UTF-8.
+    let mut argv = env::args_os();
+    let executable = argv
+        .next()
+        .map(|word| word.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let args: Vec<OsString> = argv.collect();
     let jail_fixture =
         env::var_os("FLATPAK_ID").as_deref() == Some(client::JAIL_FIXTURE_ID.as_ref());
     let personality = Personality::of(&executable, jail_fixture);
     let result = match personality {
-        Personality::Compositor => run(&args),
-        Personality::Demo => match run_client(&args) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                eprintln!("{}: {}", personality.program(), error.message());
-                process::exit(error.exit_code());
-            }
+        Personality::Compositor => utf8_args(&args).and_then(|args| run(&args)),
+        Personality::Demo => match utf8_args(&args) {
+            Err(error) => Err(error),
+            Ok(args) => match run_client(&args) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    eprintln!("{}: {}", personality.program(), error.message());
+                    process::exit(error.exit_code());
+                }
+            },
         },
         Personality::Term => run_term(&args),
         Personality::Control => match run_control(&args) {
@@ -746,6 +801,59 @@ mod tests {
         let mut printed = Vec::new();
         term_selftest(&mut printed).unwrap();
         assert_eq!(printed, b"TD-TERM-SELFTEST-OK\n");
+    }
+
+    #[test]
+    fn a_command_ends_the_terminal_flags_and_is_carried_literally() {
+        use std::os::unix::ffi::OsStringExt;
+        let args = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        let text = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
+        let plain = args(&["--socket", "/s"]);
+        let (flags, command) = split_term_command(&plain).unwrap();
+        assert_eq!(flags, text(&["--socket", "/s"]));
+        assert!(command.is_empty());
+        // Everything after `--command` belongs to the child, including words
+        // that spell td-term's own flags.
+        let full = args(&[
+            "--socket",
+            "/s",
+            "--ready-socket",
+            "/r",
+            "--command",
+            "/bin/mail",
+            "--socket",
+            "--command",
+        ]);
+        let (flags, command) = split_term_command(&full).unwrap();
+        assert_eq!(flags, text(&["--socket", "/s", "--ready-socket", "/r"]));
+        assert_eq!(command, args(&["/bin/mail", "--socket", "--command"]));
+        // The child's argv is bytes; td-term's own flags are text.
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0x2f, 0xff]);
+        let mut bytes = args(&["--socket", "/s", "--command", "/bin/mail"]);
+        bytes.push(raw.clone());
+        let (flags, command) = split_term_command(&bytes).unwrap();
+        assert_eq!(flags, text(&["--socket", "/s"]));
+        assert_eq!(command, vec![OsString::from("/bin/mail"), raw.clone()]);
+        let mut raw_flag = vec![OsString::from("--socket"), raw];
+        raw_flag.extend(args(&["--command", "/bin/mail"]));
+        let error = split_term_command(&raw_flag).unwrap_err();
+        assert!(error.contains("is not UTF-8"), "{error}");
+        let bare = args(&["--socket", "/s", "--command"]);
+        assert!(split_term_command(&bare).is_err());
+        let relative = args(&["--socket", "/s", "--command", "mail"]);
+        let error = split_term_command(&relative).unwrap_err();
+        assert!(error.contains("'mail' is not absolute"), "{error}");
+        // `run` refuses a bare `--command` and a relative program at parse
+        // time, before it would dial the socket; neither error mentions the
+        // socket, which is how the test knows nothing was dialed.
+        for tail in [vec!["--command"], vec!["--command", "mail"]] {
+            let mut invocation = args(&["run", "--socket", "/s", "--ready-socket", "/r"]);
+            invocation.extend(tail.iter().map(OsString::from));
+            let error = run_term(&invocation).unwrap_err();
+            assert!(!error.contains("/s"), "{error}");
+            assert!(error.contains("--command") || error.contains("not absolute"), "{error}");
+        }
+        assert!(term_usage().contains("[--command PROGRAM [ARG...]]"));
     }
 
     #[test]

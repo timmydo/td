@@ -321,27 +321,44 @@ pub struct ChildCommand {
     pub arguments: Vec<OsString>,
 }
 
-/// `/bin/cttyhack --stdin /bin/sh`, or the command supplied on td-term's own
-/// command line. Both paths must be absolute: a relative program would be
-/// resolved against an ambient PATH this adapter deliberately does not have.
-pub fn child_command(wrapper: &Path, command: &[String]) -> Result<ChildCommand, String> {
+/// `/bin/cttyhack --stdin /bin/sh` by default, or exactly the command supplied
+/// on td-term's own command line.
+///
+/// The default shell is wrapped because a shell expects a controlling terminal
+/// it does not create, and safe `Command` cannot make one. An explicit command
+/// is NOT wrapped: it is exec'd as given, with the slave on its stdio and no
+/// session or controlling terminal of its own. A program that wants cttyhack's
+/// behaviour names the wrapper itself; td-jail's terminal grant (its own
+/// increment, `devices=tty` in APPLICATIONS.md) instead acquires the terminal
+/// inside its own detached session, which the kernel refuses for a terminal
+/// the wrapper has already made the launcher's. Both paths must be absolute:
+/// a relative program would be resolved against an ambient PATH this adapter
+/// deliberately does not have.
+pub fn child_command(wrapper: &Path, command: &[OsString]) -> Result<ChildCommand, String> {
     if !wrapper.is_absolute() {
         return Err(format!(
             "terminal session wrapper '{}' is not absolute",
             wrapper.display()
         ));
     }
-    let program = command.first().map_or(DEFAULT_SHELL, String::as_str);
+    let Some(program) = command.first() else {
+        return Ok(ChildCommand {
+            program: wrapper.to_path_buf(),
+            arguments: vec![
+                OsString::from(CTTYHACK_STDIN),
+                OsString::from(DEFAULT_SHELL),
+            ],
+        });
+    };
     if !Path::new(program).is_absolute() {
-        return Err(format!("terminal command '{program}' is not absolute"));
-    }
-    let mut arguments = vec![OsString::from(CTTYHACK_STDIN), OsString::from(program)];
-    for argument in command.iter().skip(1) {
-        arguments.push(OsString::from(argument));
+        return Err(format!(
+            "terminal command '{}' is not absolute",
+            program.to_string_lossy()
+        ));
     }
     Ok(ChildCommand {
-        program: wrapper.to_path_buf(),
-        arguments,
+        program: PathBuf::from(program),
+        arguments: command.iter().skip(1).cloned().collect(),
     })
 }
 
@@ -406,11 +423,15 @@ pub fn output_channel<T>() -> (SyncSender<T>, Receiver<T>) {
 ///
 /// That is sound only because td-term is one process per terminal (§9): closing
 /// "the terminal" IS exiting, process exit closes this descriptor, and the
-/// kernel then sends the child `SIGHUP` for its controlling terminal. The
-/// caller must therefore NOT join this handle on a teardown path — a detached
-/// thread cannot delay process exit, but a join would wait for a read that
-/// never returns. Interrupting the reader for any other reason needs a
-/// separately reviewed wakeup surface.
+/// kernel then sends `SIGHUP` to the session that holds the slave as its
+/// controlling terminal — the default shell's, through cttyhack, or the one a
+/// td-jail terminal application acquires for itself. A bare `--command` child
+/// holds no such session and learns of the hangup only as `EIO` on its next
+/// read or write of the slave, so its retirement is its own exit. The caller
+/// must therefore NOT join this handle on a teardown path — a detached thread
+/// cannot delay process exit, but a join would wait for a read that never
+/// returns. Interrupting the reader for any other reason needs a separately
+/// reviewed wakeup surface.
 pub fn spawn_reader<T: Send + 'static>(
     mut master: File,
     sender: SyncSender<T>,
@@ -947,25 +968,39 @@ mod tests {
     }
 
     #[test]
-    fn the_child_command_is_literal_argv_through_cttyhack() {
+    fn the_default_child_is_the_shell_through_cttyhack() {
         let default = child_command(Path::new(CTTYHACK), &[]).unwrap();
         assert_eq!(default.program, PathBuf::from("/bin/cttyhack"));
         assert_eq!(default.arguments, vec!["--stdin", "/bin/sh"]);
-        let explicit = child_command(
+        assert!(child_command(Path::new("cttyhack"), &[]).is_err());
+    }
+
+    #[test]
+    fn an_explicit_command_is_literal_argv_without_the_wrapper() {
+        use std::os::unix::ffi::OsStringExt;
+        let words = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        let explicit =
+            child_command(Path::new(CTTYHACK), &words(&["/bin/mail", "--cli", "echo hi"]))
+                .unwrap();
+        assert_eq!(explicit.program, PathBuf::from("/bin/mail"));
+        assert_eq!(explicit.arguments, vec!["--cli", "echo hi"]);
+        // A caller that wants the wrapper spells it out and gets exactly that.
+        let wrapped =
+            child_command(Path::new(CTTYHACK), &words(&[CTTYHACK, CTTYHACK_STDIN, "/bin/sh"]))
+                .unwrap();
+        assert_eq!(wrapped.program, PathBuf::from(CTTYHACK));
+        assert_eq!(wrapped.arguments, vec!["--stdin", "/bin/sh"]);
+        // Literal means bytes: an argument that is not UTF-8 is carried as-is.
+        let raw = OsString::from_vec(vec![0x2f, 0x74, 0x6d, 0x70, 0x2f, 0xff]);
+        let bytes = child_command(
             Path::new(CTTYHACK),
-            &[
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "echo hi".to_string(),
-            ],
+            &[OsString::from("/bin/mail"), raw.clone()],
         )
         .unwrap();
-        assert_eq!(
-            explicit.arguments,
-            vec!["--stdin", "/bin/sh", "-c", "echo hi"]
-        );
-        assert!(child_command(Path::new("cttyhack"), &[]).is_err());
-        assert!(child_command(Path::new(CTTYHACK), &["sh".to_string()]).is_err());
+        assert_eq!(bytes.arguments, vec![raw]);
+        assert!(child_command(Path::new(CTTYHACK), &words(&["sh"])).is_err());
+        // The wrapper's own path is checked even when the command does not use it.
+        assert!(child_command(Path::new("cttyhack"), &words(&["/bin/mail"])).is_err());
     }
 
     #[test]

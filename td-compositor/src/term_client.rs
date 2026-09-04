@@ -20,6 +20,7 @@ use crate::{
     MAX_UI_FRAME_BYTES,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -32,6 +33,10 @@ use std::time::{Duration, Instant};
 pub struct Options {
     pub socket: PathBuf,
     pub ready_socket: PathBuf,
+    /// The child's literal argv, or empty for the default shell. See
+    /// `pty::child_command` for what each means. Bytes rather than text: a
+    /// filename argument is whatever the filesystem holds.
+    pub command: Vec<OsString>,
 }
 
 /// Bound on reaching a presented frame. Past this the compositor is not
@@ -2269,18 +2274,25 @@ type Running = (
 fn start(
     pty: &Pty,
     events: &SyncSender<Event>,
-    status: &Path,
-    passwd: &Path,
-    ready_socket: &Path,
+    inputs: &StartInputs<'_>,
     cells: (u16, u16),
     input: Arc<pty::Input>,
 ) -> Result<Running, String> {
-    let account = pty::current_account(status, passwd)?;
-    let command = pty::child_command(Path::new(pty::CTTYHACK), &[])?;
+    let account = pty::current_account(inputs.status, inputs.passwd)?;
+    let command = pty::child_command(Path::new(pty::CTTYHACK), inputs.command)?;
     let (children, child) = start_child(pty, events, &command, &account, input)?;
     let (rows, columns) = cells;
-    let published = ready::publish(ready_socket, rows, columns)?;
+    let published = ready::publish(inputs.ready_socket, rows, columns)?;
     Ok((children, child, published))
+}
+
+/// What `start` reads and runs: the account files, where readiness is
+/// published, and the child's literal argv (empty for the default shell).
+struct StartInputs<'a> {
+    status: &'a Path,
+    passwd: &'a Path,
+    ready_socket: &'a Path,
+    command: &'a [OsString],
 }
 
 /// A child ending ends the session: a terminal outliving its shell is a
@@ -2506,9 +2518,12 @@ pub fn run(options: &Options) -> Result<(), String> {
     let (_children, mut child, _ready) = start(
         &pty,
         &sender,
-        Path::new(PROC_STATUS),
-        Path::new(ETC_PASSWD),
-        &options.ready_socket,
+        &StartInputs {
+            status: Path::new(PROC_STATUS),
+            passwd: Path::new(ETC_PASSWD),
+            ready_socket: &options.ready_socket,
+            command: &options.command,
+        },
         (rows, columns),
         input,
     )?;
@@ -4917,9 +4932,12 @@ mod tests {
         let error = start(
             &pty,
             &sender,
-            Path::new(PROC_STATUS),
-            &missing,
-            &ready_socket,
+            &StartInputs {
+                status: Path::new(PROC_STATUS),
+                passwd: &missing,
+                ready_socket: &ready_socket,
+                command: &[],
+            },
             (22, 74),
             pty::Input::new(),
         )
@@ -4929,6 +4947,56 @@ mod tests {
         assert!(
             !ready_socket.exists(),
             "readiness was published for a terminal with no child"
+        );
+    }
+
+    /// The one link `main`'s parser tests cannot see: the command carried in
+    /// `StartInputs` is what `start` hands to `pty::child_command`. A start
+    /// wired to an empty command would pass every other test and run the
+    /// shell; a relative program is the cheapest input that proves the
+    /// command reached the check, and it fails before anything is spawned or
+    /// advertised.
+    #[test]
+    fn the_command_in_the_start_inputs_reaches_the_child_command() {
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let (sender, _events) = sync_channel(MAX_PENDING_EVENTS);
+        let directory = std::env::temp_dir();
+        let unique = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+        let ready_socket = directory.join(format!("td-term-relative-command-{unique}"));
+        // A passwd fixture naming THIS process's uid, so the account resolves
+        // on any host and the failure asserted is the command's, not the account's.
+        let status = std::fs::read_to_string(PROC_STATUS).unwrap();
+        let uid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().nth(1))
+            .unwrap();
+        let passwd = directory.join(format!("td-term-relative-command-passwd-{unique}"));
+        std::fs::write(
+            &passwd,
+            format!("td:x:{uid}:{uid}::{}:/bin/sh\n", directory.display()),
+        )
+        .unwrap();
+
+        let error = start(
+            &pty,
+            &sender,
+            &StartInputs {
+                status: Path::new(PROC_STATUS),
+                passwd: &passwd,
+                ready_socket: &ready_socket,
+                command: &[OsString::from("mail")],
+            },
+            (22, 74),
+            pty::Input::new(),
+        )
+        .err()
+        .unwrap();
+        std::fs::remove_file(&passwd).unwrap();
+        assert!(error.contains("'mail' is not absolute"), "{error}");
+        assert!(
+            !ready_socket.exists(),
+            "readiness was published for a terminal whose command was refused"
         );
     }
 

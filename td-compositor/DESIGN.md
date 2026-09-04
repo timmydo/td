@@ -4248,8 +4248,9 @@ Of that contract these are built: the parser and terminal model, the native
 corpus including its `key` operations, the keyboard adapter of section 11
 (translation, autorepeat, the bounded input queue, and the scrollback
 viewport it selects), and from section 12 the PTY open/unlock/peer/winsize
-operations, the account and environment policy, the child argv through
-`cttyhack --stdin`, and the PTY reader thread.
+operations, the account and environment policy, the child argv (the default
+shell through `cttyhack --stdin`, or a literal `--command`), and the PTY
+reader thread.
 
 Section 11's pinned font is landed: the committed Unifont face, its licenses
 and provenance record, the importer that derives it reproducibly, and the PSF2
@@ -5011,13 +5012,34 @@ an explicit `--stdin` mode. That mode always creates a new session and claims
 descriptor zero without stealing a terminal, even when the wrapper inherited
 an outer controlling terminal. Unlike rescue mode, `--stdin` exits nonzero if
 `setsid(2)` or `TIOCSCTTY` fails. td-term invokes
-`/bin/cttyhack --stdin /bin/sh`, or the command supplied on its own command
-line. The td-term recipe and system integration tests assert that the staged
-td-init advertises and exercises this exact flag, tying the absolute path to
-the declared runtime input. Ordinary rescue-console behavior remains
-unchanged. The child starts in the verified account home: setting `HOME` does
-not move a process, so without an explicit working directory the shell would
-start wherever td-svc left the graphical service and disagree with its own
+`/bin/cttyhack --stdin /bin/sh` by default. A `--command PROGRAM [ARG...]` on
+its own command line ends td-term's flags and is exec'd exactly as given,
+WITHOUT the wrapper: the slave is its stdio, and it starts in td-term's
+session with no controlling terminal. The wrapper exists for a shell, which
+expects a controlling terminal it does not create; a program that wants that
+behaviour names `/bin/cttyhack --stdin` itself, and a td-jail terminal
+application must not, because the jail's terminal grant (`devices=tty`, its
+own increment in APPLICATIONS.md §C) acquires the terminal inside stage 1's
+detached session, and the kernel refuses `TIOCSCTTY` for a terminal the
+wrapper has already made the launcher's. The consequence for a child that
+never acquires the slave is stated here because a unit author would
+otherwise discover it: the slave then belongs to no session and has no
+foreground process group, so the kernel generates NO terminal signals for
+it — no `SIGWINCH` when td-term resizes it, no `SIGINT` for `^C`, no
+`SIGHUP` when the terminal closes. Such a child must read its window size
+itself and notices the hangup only as `EIO` on the slave. A jailed terminal
+application is unaffected, which is the case `--command` exists for; an
+unjailed program that wants those signals names the wrapper. An explicit
+program is an absolute path, refused at argument parsing before td-term
+dials the compositor; the constant wrapper path is checked when the child
+command is assembled. td-term has no PATH to search. The td-term recipe and
+system integration tests assert that the staged td-init advertises and
+exercises this exact flag, tying the absolute path to the declared runtime
+input. Ordinary rescue-console behavior remains unchanged.
+
+The child starts in the verified account home: setting `HOME` does not move a
+process, so without an explicit working directory the shell would start
+wherever td-svc left the graphical service and disagree with its own
 environment. A home the child cannot enter fails the spawn rather than silently
 landing in `/`. Immediately after a successful spawn, td-term drops the original
 slave and all three parent-side `Stdio` clones, retaining only the master.
@@ -5030,10 +5052,13 @@ timeout, and closing a descriptor another thread is reading is not something
 this crate may express. Its only retirement is the child's exit closing the last
 slave. That is sound because td-term is one process per terminal: closing the
 terminal IS exiting, process exit closes the descriptor, and the kernel then
-sends the child `SIGHUP` for its controlling terminal. The consequence is a
-contract rather than a mechanism — a teardown path must not join that thread —
-and interrupting the reader for any other reason requires a separately reviewed
-wakeup surface.
+sends `SIGHUP` to the session holding the slave as its controlling terminal —
+the default shell's, or the one a td-jail terminal application acquires. A
+bare `--command` child holds no such session and sees the hangup only as
+`EIO` on the slave, so its retirement is its own exit, which is the same path
+one step later. The consequence is a contract rather than a mechanism — a
+teardown path must not join that thread — and interrupting the reader for any
+other reason requires a separately reviewed wakeup surface.
 
 The writer differs, but less than it first appears: it parks in a
 condition-variable wait rather than in a syscall, so closing the keyboard queue

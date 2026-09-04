@@ -413,8 +413,10 @@ byte I/O (`std`), mmap (wl_shm
 pixels are copied with `FileExt`; the mapping hardware rendering will need is
 anticipated below rather than present), device ownership (safe `td-seatd`), or
 anything else the PTY needs — no termios call (the slave's kernel defaults
-ARE the canonical-input policy), no `setsid(2)` or `TIOCSCTTY` (the child
-gets its session from the declared `td-init` input's `cttyhack --stdin`),
+ARE the canonical-input policy), no `setsid(2)` or `TIOCSCTTY` (the default
+child gets its session from the declared `td-init` input's `cttyhack
+--stdin`; an explicit `--command` child gets none from td-term, and a td-jail
+terminal application acquires its own under surface #9),
 and no `fork`/`execve`/`dup2` (`Command` plus `Stdio::from(File)` cover
 all three). Nor, on the evdev side: `EVIOCGABS` for any axis but X and Y
 (a pressure or tilt axis is not a place on a screen, and the request number
