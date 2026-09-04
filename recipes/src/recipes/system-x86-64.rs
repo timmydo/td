@@ -6708,12 +6708,12 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     ///
     /// td-jail binds `/run/user/1000/bus` into every jail because the broker is
     /// the policy boundary. Well-known names, match rules, per-caller filtering
-    /// and per-instance admission have landed. Two shared surfaces remain: the
-    /// global descriptor budget is not charged per instance, and
-    /// `GetConnectionCredentials` reports init-namespace pids. The terminal
+    /// and per-instance admission have landed, and a jailed caller is told no
+    /// host pid. One shared surface remains: the global descriptor budget is
+    /// not charged per instance. The terminal
     /// applications ship with no bus policy at all: a static td-owned program
     /// with no D-Bus client, which the broker would admit as a peer that sees
-    /// and addresses only the portal and itself, so those two surfaces are
+    /// and addresses only the portal and itself, so that surface is
     /// what a compromised one could reach. APPLICATIONS.md §D names that
     /// residual rather than counting it away.
     ///
@@ -6743,10 +6743,9 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             bus_holders,
             vec![FIREFOX_NAME],
             "a second application holding a bus name would bring a policy of \
-             its own to td-busd's shared descriptor budget and could observe \
-             init-namespace pids through GetConnectionCredentials. See \
-             APPLICATIONS.md §D for these remaining peer-attribution gaps and \
-             the limits of this tripwire"
+             its own to td-busd's shared descriptor budget, which is not yet \
+             charged per instance. See APPLICATIONS.md §D for this remaining \
+             peer-attribution gap and the limits of this tripwire"
         );
         // Every other shipped application is the shape §D admits beside it: a
         // static terminal program on the empty runtime with no bus name.

@@ -1617,19 +1617,20 @@ impl<'a> Connection<'a> {
                 };
                 match self.credentials_for(&asked) {
                     None => self.no_such_owner(message),
-                    Some((_, pid)) => match usable_pid(pid) {
+                    Some((_, pid)) => match self.pid_to_tell(pid) {
                         Some(pid) => self.answer(message, "u", move |writer| {
                             writer.uint32(pid);
                             Ok(())
                         }),
-                        // The name IS here; its pid is not knowable. A draft
-                        // answered `NameHasNoOwner`, which `ListNames` and
+                        // The name IS here; its pid is not knowable, or not
+                        // this caller's to know. A draft answered
+                        // `NameHasNoOwner`, which `ListNames` and
                         // `GetNameOwner` contradict one call later. The
                         // specification has an error for exactly this case.
                         None => self.refuse(
                             message,
                             "org.freedesktop.DBus.Error.UnixProcessIdUnknown",
-                            "the kernel did not report a pid for that connection",
+                            "no pid is reported for that connection to this caller",
                         ),
                     },
                 }
@@ -1646,7 +1647,7 @@ impl<'a> Connection<'a> {
                 // that is absent says "not known"; a zero says "pid zero".
                 match self.about(&asked) {
                     Some((uid, pid, app_id)) => {
-                        let pid = usable_pid(pid);
+                        let pid = self.pid_to_tell(pid);
                         self.answer(message, "a{sv}", move |writer| {
                             writer.array("{sv}", |array| {
                                 array.dict_entry(|entry| {
@@ -1817,6 +1818,19 @@ impl<'a> Connection<'a> {
             return Some((uid, pid));
         }
         self.bus.credentials(name)
+    }
+
+    /// The pid a reply to this caller may carry: the kernel's, when it
+    /// reported one and the caller is one that may learn host pids
+    /// (`policy::may_learn_pid`). `None` reads the same as an unknowable pid
+    /// at every caller, which is what makes a withheld pid indistinguishable
+    /// from one the kernel could not report.
+    fn pid_to_tell(&self, pid: i32) -> Option<u32> {
+        if policy::may_learn_pid(&self.identity) {
+            usable_pid(pid)
+        } else {
+            None
+        }
     }
 
     /// The one refusal every name lookup shares.
@@ -5871,7 +5885,10 @@ mod tests {
                 .expect("the production probe parses the broker's reply")
                 .expect("the connection remains live");
             assert_eq!(parsed.uid, this_uid());
-            assert_eq!(parsed.pid, Some(std::process::id()));
+            // A confined caller is told no host pid, its own included; see
+            // `a_confined_caller_is_told_no_host_pid`.
+            let pid_told = if expected.is_some() { None } else { Some(std::process::id()) };
+            assert_eq!(parsed.pid, pid_told, "as {expected:?}");
             assert_eq!(parsed.app_id.as_deref(), expected);
             let entries = reply
                 .args()
@@ -5898,6 +5915,39 @@ mod tests {
                     .map(str::to_string);
             }
             assert_eq!(app_id.as_deref(), expected, "td.AppId was {app_id:?}");
+        }
+    }
+
+    /// A confined caller is told no host pid, about itself or the broker:
+    /// the number is one in the broker's PID namespace, which the caller's
+    /// own closes, and the only use it has there is `/proc` spelunking
+    /// outside the jail. `GetConnectionUnixProcessID` says the pid is
+    /// unknown, as it does for a pid the kernel could not report, and
+    /// `GetConnectionCredentials` still carries the uid.
+    #[test]
+    fn a_confined_caller_is_told_no_host_pid() {
+        if !pidfd_available() {
+            return;
+        }
+        let (client, _hear) = serving_as("fixture");
+        let (mut peer, me) = Peer::arrive(client);
+
+        for (serial, about) in [(2, me.as_str()), (3, BUS_NAME)] {
+            peer.send(&name_query("GetConnectionUnixProcessID", about, serial));
+            assert_eq!(
+                error_of(&peer.frame()).as_deref(),
+                Some("org.freedesktop.DBus.Error.UnixProcessIdUnknown"),
+                "asked about {about}"
+            );
+        }
+        for (serial, about) in [(4, me.as_str()), (5, BUS_NAME)] {
+            peer.send(&name_query("GetConnectionCredentials", about, serial));
+            let frame = peer.frame();
+            let parsed = probe_credentials_reply(&frame, serial, &me)
+                .expect("the production probe parses the broker's reply")
+                .expect("the connection remains live");
+            assert_eq!(parsed.uid, this_uid(), "asked about {about}");
+            assert_eq!(parsed.pid, None, "asked about {about}");
         }
     }
 
@@ -7038,15 +7088,32 @@ mod tests {
                 .expect("a dict entry")
                 .values(2)
                 .expect("read the entry");
+            let key = pair.first().and_then(crate::wire::Value::as_str);
             assert_ne!(
-                pair.first().and_then(crate::wire::Value::as_str),
+                key,
                 Some("td.AppId"),
                 "an unplaceable peer was reported as a confined application"
+            );
+            // And not told its host pid either: `may_learn_pid`'s `Unknown`
+            // arm, driven end to end. Unplaceable is treated as confined
+            // here, since a disclosure that fails open is privilege up.
+            assert_ne!(
+                key,
+                Some("ProcessID"),
+                "an unplaceable peer was told its host pid"
+            );
+        }
+        for (serial, about) in [(6, name_one.as_str()), (7, BUS_NAME)] {
+            one.send(&name_query("GetConnectionUnixProcessID", about, serial));
+            assert_eq!(
+                error_of(&one.frame()).as_deref(),
+                Some("org.freedesktop.DBus.Error.UnixProcessIdUnknown"),
+                "an unplaceable peer asked about {about}"
             );
         }
 
         // And ListNames shows it the broker and itself, and no one else.
-        one.send(&bus_call("ListNames", 6));
+        one.send(&bus_call("ListNames", 8));
         let frame = one.frame();
         let (reply, _) = message::decode(&frame, 0).expect("decode ListNames");
         let listed: Vec<String> = reply
@@ -9378,17 +9445,25 @@ mod tests {
         );
 
         let mut serial = 4u32;
-        for query in [
-            "GetConnectionUnixUser",
-            "GetConnectionUnixProcessID",
-            "GetConnectionCredentials",
+        for (query, expected) in [
+            ("GetConnectionUnixUser", None),
+            // The name is answered about; what is withheld from a confined
+            // caller is the pid, which is a different refusal from "no
+            // owner" and the one `a_confined_caller_is_told_no_host_pid`
+            // pins.
+            (
+                "GetConnectionUnixProcessID",
+                Some("org.freedesktop.DBus.Error.UnixProcessIdUnknown"),
+            ),
+            ("GetConnectionCredentials", None),
         ] {
             holder.send(&name_query(query, "org.mozilla.firefox", serial));
             let frame = holder.answer();
             let (reply, _) = message::decode(&frame, 0).expect("decode");
             assert_eq!(
-                reply.fields.error_name, None,
-                "{query} told a peer its OWN held name has no owner"
+                reply.fields.error_name, expected,
+                "{query} answered a holder about its OWN held name with the \
+                 wrong refusal, or with one where none is due"
             );
             serial = serial.saturating_add(1);
         }

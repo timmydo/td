@@ -189,17 +189,17 @@ pub fn may_hold_portal_service(caller: &Identity) -> bool {
 /// be told about the process behind a name is `may_ask_credentials`, and it
 /// was deliberately left where it was when this function widened.
 ///
-/// The OWN-NAME exemption does carry the caller's own credentials, including
-/// its host pid — which a process inside a pid namespace has no other way to
-/// learn. It is deliberate and it is narrower than it looks: the reason to
-/// withhold a host pid is that another instance's is an identifier for
-/// spelunking outside the jail and an input to the lineage walk, and neither
-/// argument reaches a peer's own number, which buys it no ancestry it does
-/// not already have. A rule that hid it would also have `GetNameOwner` and
-/// `GetConnectionCredentials` disagree about the same name — which is not a
-/// hypothetical: the narrower gate did exactly that to a peer asking about a
-/// well-known name it was HOLDING, until `Peer::askable` sent that question
-/// to the caller's own unique name.
+/// The OWN-NAME exemption carries the caller's own credentials with one
+/// entry left out: its host pid, which `may_learn_pid` withholds from every
+/// caller not proved unconfined, own name or not. The number is one in the
+/// broker's PID namespace, which the caller's own closes, and a process has
+/// no other way to learn it — which is the reason to withhold it, not to
+/// give it. Since that rule is the CALLER's rather than the name's, every
+/// name a caller may ask about is answered in the same shape, and
+/// `GetNameOwner` and `GetConnectionCredentials` keep agreeing about a name
+/// — which is not a hypothetical: the narrower gate had them disagree for a
+/// peer asking about a well-known name it was HOLDING, until `Peer::askable`
+/// sent that question to the caller's own unique name.
 pub fn may_see(caller: &Identity, own: Option<&str>, target: &str) -> bool {
     // The broker and the caller's own name are not a grant. They are the two
     // facts every connection has already been told: it is talking to the
@@ -251,6 +251,24 @@ pub fn may_ask_credentials(caller: &Identity, own: Option<&str>, target: &str) -
         Identity::Unconfined => true,
         Identity::Unknown(_) => told_already,
         Identity::Jailed { .. } => told_already,
+    }
+}
+
+/// Whether `caller` may be told a host pid at all.
+///
+/// `may_ask_credentials` narrows WHOM a caller asks about; this narrows WHAT
+/// the answer carries. The pid the kernel reported at accept is a number in
+/// the broker's PID namespace. A jailed caller lives in a nested one, where
+/// that number has no legitimate use and one illegitimate one: `/proc`
+/// spelunking outside the jail, the channel its namespace otherwise closes.
+/// So the two peers a jailed caller may ask about, itself and the broker,
+/// are answered without a pid; its own host pid is the one it has least
+/// business learning. An unproved caller is treated as jailed, because a
+/// disclosure that fails open is privilege up.
+pub fn may_learn_pid(caller: &Identity) -> bool {
+    match caller {
+        Identity::Unconfined => true,
+        Identity::Unknown(_) | Identity::Jailed { .. } => false,
     }
 }
 
@@ -635,5 +653,18 @@ mod tests {
         assert!(may_see(&app, None, BUS_NAME));
         assert!(may_see(&app, None, "org.freedesktop.portal.Desktop"));
         assert!(!may_see(&app, None, ":1.4"));
+    }
+
+    /// A host pid is told to an unconfined caller and to nobody else: a
+    /// confined caller's own namespace closes the number, and an unplaceable
+    /// caller is treated as confined, because a disclosure that fails open
+    /// is privilege up. Pinned over all three identities so the `Unknown`
+    /// arm cannot drift to `true` behind the two arms the transport tests
+    /// drive most.
+    #[test]
+    fn only_an_unconfined_caller_is_told_a_host_pid() {
+        assert!(may_learn_pid(&Identity::Unconfined));
+        assert!(!may_learn_pid(&granted(&["org.mozilla.firefox"])));
+        assert!(!may_learn_pid(&Identity::Unknown("no pidfd".to_string())));
     }
 }

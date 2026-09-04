@@ -928,6 +928,41 @@ mod tests {
         );
     }
 
+    /// A host pid leaves the broker through `usable_pid`, and its one call
+    /// site outside the tests is `pid_to_tell`, which asks `may_learn_pid`
+    /// first. A handler that read the credential's pid directly would pass
+    /// every test that drives a confined caller, since those ask through the
+    /// two handlers that already go by `pid_to_tell`; this pins that there
+    /// is no third way out.
+    #[test]
+    fn a_host_pid_leaves_only_through_pid_to_tell() {
+        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let production = transport.split("\nmod tests {").next().unwrap_or("");
+        let Some(from) = production.find("fn pid_to_tell(") else {
+            panic!("pid_to_tell is gone, so the pid rule moved somewhere this \
+                    test does not watch");
+        };
+        let body = production.get(from..).unwrap_or("");
+        let Some(span) = body.find("\n    }") else {
+            panic!("pid_to_tell no longer ends where this test slices it");
+        };
+        let body = body.get(..span).unwrap_or("");
+        assert!(
+            body.contains("may_learn_pid(") && body.contains("usable_pid("),
+            "pid_to_tell no longer asks the policy before it reads the pid: {body}"
+        );
+        let calls = production
+            .matches("usable_pid(")
+            .count()
+            .saturating_sub(production.matches("fn usable_pid(").count());
+        assert_eq!(
+            calls,
+            1,
+            "a host pid is read somewhere other than pid_to_tell, which the \
+             policy does not guard"
+        );
+    }
+
     /// Comments out, so that commenting a check out is not a way to pass the
     /// test that pins it. Lifted from `td-jail/src/main.rs`, which arrived at
     /// it the same way; the two crates are separate dependency-free locks and

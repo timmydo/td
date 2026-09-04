@@ -3686,7 +3686,16 @@ learning another instance's host pid, which is both an identifier for
 `/proc` spelunking outside the jail and the input to the lineage walk
 this broker's whole identity story rests on. A draft listed the methods
 as permitted and said nothing about their answers, which would have made
-the `see` policy a filter on calls the caller never needed to make.
+the `see` policy a filter on calls the caller never needed to make. And
+the two peers a jailed caller may ask about, itself and the broker, are
+answered with **no pid**: `GetConnectionUnixProcessID` reports it unknown
+and `GetConnectionCredentials` carries the uid without a `ProcessID`
+entry, the same shape as a pid the kernel could not report. The number
+is one in the broker's PID namespace, which the caller's own closes, and
+its own host pid is the one a jail has least business learning. Only a
+caller the lineage walk proved unconfined is told a pid; an unproved one
+is treated as jailed, because a disclosure that fails open is privilege
+up.
 
 Match rules parse `type`, `sender`, `interface`, `member`, `path`,
 `path_namespace`, `destination`, `arg0`…`arg63`, `arg0path`…`arg63path`, and
@@ -4253,11 +4262,18 @@ routed to. That table is landed — see the pending-reply paragraphs later in
 this section — and it closes what this passage used to record as a residual,
 that a confined peer could address a forged reply anywhere.
 
-A peer's own credentials, host pid included, are exempt with its own name.
-The reason to withhold a host pid is that ANOTHER instance's is an
-identifier for spelunking outside the jail and an input to the lineage
-walk; neither argument reaches a peer's own number, and hiding it would
-have two lookups disagree about one name.
+A peer's own credentials are exempt with its own name, and its host pid is
+the one entry that exemption does not carry (the no-pid rule above): a
+confined peer asking about itself is told its uid and its app-id, and
+`GetConnectionUnixProcessID` on its own name is `UnixProcessIdUnknown`. An
+earlier draft of this passage argued the other way, that a peer's own
+number buys it no ancestry it does not have and that hiding it would have
+two lookups disagree about one name. The first is true and beside the
+point: the number is an INIT-namespace identifier that the caller's own
+namespace closes, useful for spelunking outside the jail whoever it
+names, and its own is the one a jail has least business learning. The
+second is met by withholding it from both lookups, since the rule is the
+caller's rather than the name's.
 
 §D asks for `AccessDenied` for what the default policy does not permit and
 separately that an unseeable name be reported absent "rather than as an
@@ -5186,7 +5202,9 @@ to how it relays.
 
 **A pid the kernel cannot report is not a name that has no owner.**
 `SO_PEERCRED` answers 0 for a pid that does not exist in the reader's
-namespace, which is the case td's own jails will produce.
+namespace. That is what a jailed peer reading the BROKER's credentials
+sees; the broker, in the init namespace, is told every peer's number, so
+on its side the case is defended rather than expected.
 `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` for it and
 `GetConnectionCredentials` returns the entries it can fill — `UnixUserID`
 without `ProcessID` — because an absent entry says "not known" where a
@@ -5431,30 +5449,29 @@ policy. Admission now resolves that identity before taking a place and keys
 the share on the registered instance, so one application's children do not
 each receive another quarter of the table.
 
-Two more belong on that list. Descriptors cross between negotiated peers,
+One more belongs on that list. Descriptors cross between negotiated peers,
 but the global open-descriptor budget is still shared rather than charged
 to an application instance. A jailed peer can drive that shared budget to
 its relief path and lose the connection holding the most attachments: safer
 than evicting the unrelated peer that observes the pressure, but still the
 same attribution gap as the connection table, through a different door. The
-read-only bind does not reach it because `SCM_RIGHTS` is socket-layer. And
-`GetConnectionCredentials` reports the pid `SO_PEERCRED` gave the broker,
-which is a pid in the INIT namespace, so a jailed caller reads host
-pids — its own included — through a channel its PID namespace otherwise
-closes.
+read-only bind does not reach it because `SCM_RIGHTS` is socket-layer. The
+pid disclosure that used to stand beside it is closed: `SO_PEERCRED` gives
+the broker a pid in the INIT namespace, and a jailed or unproved caller is
+now told none, its own included, by either credentials method (rung 32).
 
 Every one of those is a problem between PEERS. Firefox is the one selected
 application that holds a bus name; the first-window oracle does not drive the
-traffic needed to close these remaining availability and pid-disclosure
-questions. The terminal applications `mail` and `news` ship beside it with NO
+traffic needed to close the remaining availability question. The terminal
+applications `mail` and `news` ship beside it with NO
 bus policy: static td-owned programs on the empty runtime with no D-Bus client
 in them, each started by td-term at boot under the `devices=tty` grant. Step
 12 still binds the socket into their jails, so a compromised one could connect,
 and the broker would admit it as a peer that sees and addresses only the
-portal and itself. What it could then reach is exactly the two gaps above:
-drive the shared descriptor budget to its relief path, and read its own
-init-namespace pid. That residual is accepted for a terminal application and
-named here; it is not counted away. What can be machine-checked today is
+portal and itself. What it could then reach is the one gap above: drive the
+shared descriptor budget to its relief path. That residual is accepted for a
+terminal application and named here; it is not counted away. What can be
+machine-checked today is
 narrower: the system recipe asserts that exactly one shipped application's
 permission file carries a `[Session Bus Policy]` entry, and a second such
 entry breaks the build with a diagnostic naming what has to land with it.
@@ -7119,6 +7136,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
 | 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
 | 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the empty runtime, `/bin/mail` and `/bin/news` launchers, and two td-svc units that run each as td-term's `--command` in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
+| 32 | **a second bus-holding application's peer attribution** — the pid half LANDED: a jailed or unproved caller is told no host pid, about itself or the broker; `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` and `GetConnectionCredentials` carries the uid without `ProcessID`, and only a caller the lineage walk proved unconfined gets one. The descriptor half, charging queued descriptors to the admission key with relief inside the instance that exceeded its share, is next, and the roster tripwire stays at one bus-holding application until it lands | a second bus-holding application shares the broker without reading a host pid through it, and without starving the first of descriptors |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
