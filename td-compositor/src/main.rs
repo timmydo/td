@@ -615,6 +615,15 @@ fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
 /// whose runtime directory is not the one a constant would name.
 const CONTROL_SOCKET_ENV: &str = "TD_CONTROL_SOCKET";
 
+/// `td-ctl`'s outcome for one argument vector. An argument that is not
+/// UTF-8 is the caller's mistake, so it is a refusal (exit 2) like any other
+/// wrong request, not the "session unavailable" status (exit 1) that the
+/// shared handler in `main` gives the other personalities' failures.
+fn control_outcome(args: &[OsString]) -> Result<(), control::ControlFailure> {
+    let args = utf8_args(args).map_err(control::ControlFailure::Refused)?;
+    run_control(&args)
+}
+
 /// `td-ctl`: one request, one answer, exit.
 ///
 /// The request is parsed HERE as well as by the compositor. Not a duplicate
@@ -719,20 +728,17 @@ fn main() {
             },
         },
         Personality::Term => run_term(&args),
-        // Shaped like `Demo` above rather than calling straight through: `args`
-        // is `OsString` since td-term gained a child argv that may legitimately
-        // not be UTF-8, and td-ctl's vocabulary is text. Each personality
-        // decides that for itself, which is what the comment on `args` says and
-        // what this arm had stopped doing.
-        Personality::Control => match utf8_args(&args) {
-            Err(error) => Err(error),
-            Ok(args) => match run_control(&args) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    eprintln!("{}: {}", personality.program(), error.message());
-                    process::exit(error.exit_code());
-                }
-            },
+        // `args` is `OsString` since td-term gained a child argv that may
+        // legitimately not be UTF-8, and td-ctl's vocabulary is text. Each
+        // personality decides that for itself; `control_outcome` decides it
+        // for this one, and a word that cannot be a request is refused the
+        // way any wrong request is.
+        Personality::Control => match control_outcome(&args) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("{}: {}", personality.program(), error.message());
+                process::exit(error.exit_code());
+            }
         },
     };
     if let Err(error) = result {
@@ -744,6 +750,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_utf8_control_argument_is_a_refusal_not_an_unavailable_session() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![b'w', b'i', b'n', 0xff]);
+        let error = control_outcome(&[raw]).expect_err("a non-UTF-8 word is no request");
+        assert_eq!(error.exit_code(), 2, "{}", error.message());
+        assert!(error.message().contains("not UTF-8"), "{}", error.message());
+    }
 
     #[test]
     fn the_four_names_pick_the_four_programs() {
