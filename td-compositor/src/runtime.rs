@@ -8,7 +8,7 @@ use crate::keyboard::{
     KeyInput, KeyboardSnapshot, KeyboardState, ModifierState, RoutedKeyboardEvent, MOD_ALT,
 };
 use crate::launcher::{LaunchRequest, LauncherAction};
-use crate::layout::{Command, ViewLayout};
+use crate::layout::{Command, Direction, ViewLayout};
 use crate::output::{Damage, Output, OutputBackend, Submission};
 use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerScroll, PointerSnapshot, PointerState,
@@ -145,6 +145,17 @@ pub struct ForeignImportIdentity {
     pub client: u64,
     pub object: u32,
     pub generation: u64,
+}
+
+/// What became of an addressed `send`. Three outcomes rather than a bool,
+/// because "the window did not move" has two causes a caller has to tell
+/// apart: an id naming nothing, which is a spelling to fix, and a window that
+/// is family, where the thing to move is the parent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Sent {
+    Done,
+    NoWindow,
+    FollowsParent(SurfaceKey),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1221,11 +1232,24 @@ impl Runtime {
         Ok(())
     }
 
-    /// Compare an xdg_toplevel app id with the configured boot oracle without
-    /// retaining client text. The match must precede the observed commit, so a
-    /// failed paint cannot later be mistaken for a presented window merely
-    /// because the surface remains mapped in the scene model.
+    /// Retain an xdg_toplevel app id, and compare it with the configured boot
+    /// oracle. The match must precede the observed commit, so a failed paint
+    /// cannot later be mistaken for a presented window merely because the
+    /// surface remains mapped in the scene model.
+    ///
+    /// The retention is newer than the comparison and they are independent:
+    /// this used to keep no client text of this kind at all, and the control
+    /// report now needs a name a caller can predict. The oracle reads the
+    /// ARGUMENT rather than what is stored, so bounding the stored copy
+    /// cannot change which app ids match.
     pub fn set_application_id(&mut self, key: SurfaceKey, app_id: &str) -> Result<(), String> {
+        // Retained BEFORE the oracle, and deliberately: the oracle returns
+        // early when no application is configured, which is every ordinary
+        // session, so retaining below it would store an app id only on the
+        // boot-observer path and leave the control report empty exactly where
+        // a caller uses it. The oracle's own comparison is untouched — it
+        // reads the argument, not what is stored.
+        self.scene.set_app_id(key, app_id);
         let mapped = self.scene.is_mapped(key);
         let matched = {
             let Some(ready) = self.application_ready.as_mut() else {
@@ -2305,6 +2329,116 @@ impl Runtime {
         self.settle(true)
     }
 
+    /// Reveal a NAMED window: its workspace into view, that exact leaf
+    /// focused, WITHOUT settling — every caller below settles once itself.
+    ///
+    /// `Layout::activate_key`, which is the launcher's own path and not a
+    /// second one. The first draft of this composed a workspace switch with
+    /// `focus_key` by hand and got it wrong in the way that mistake is always
+    /// wrong: `focus_key` refuses a leaf on a workspace where a DIFFERENT
+    /// window is fullscreen, so a named window behind one was left neither
+    /// focused nor visible while the view had already moved — and the caller
+    /// was told `ok`. `activate_key` answers that case because the launcher
+    /// had it first: revealing a named window is an explicit request to see
+    /// it, so an unrelated fullscreen leaf that would hide it gives way.
+    ///
+    /// It also subsumes the addressability check — `None` when the key names
+    /// no leaf of its own workspace — so there is one question asked once.
+    fn reveal(&mut self, key: SurfaceKey) -> Option<bool> {
+        let key = self.topmost_parented(key);
+        self.scene.activate_key(key)
+    }
+
+    /// Whether a named window is on screen but outside the tiling tree, which
+    /// is what tells a refusal about a portal dialog from one about a window
+    /// that is not there at all.
+    pub fn is_floating(&self, key: SurfaceKey) -> bool {
+        self.scene.is_floating(key)
+    }
+
+    /// `td-ctl focus <id>`. Answers whether the window was there to focus.
+    ///
+    /// The PAINT is the pointer's, not the keyboard's: `Runtime::command` owes
+    /// the output whole damage because a tiling command is the repair gesture
+    /// reached for when the screen looks wrong, and naming a window to focus
+    /// is a click, not that. Taking the keyboard's path here would repair the
+    /// screen a different amount than the gesture it imitates.
+    pub fn control_focus(&mut self, key: SurfaceKey) -> Result<bool, String> {
+        let Some(changed) = self.reveal(key) else {
+            return Ok(false);
+        };
+        if changed {
+            self.settle(true)?;
+        }
+        Ok(true)
+    }
+
+    /// `td-ctl send <id> <n>`. Answers what became of the request.
+    ///
+    /// The view does not move, which is `MoveToWorkspace`'s own rule and the
+    /// reason this does not go through `reveal`: sending a window somewhere
+    /// is not a request to look at where it went.
+    pub fn control_send(&mut self, key: SurfaceKey, number: u8) -> Result<Sent, String> {
+        if !self.scene.is_arranged(key) {
+            return Ok(Sent::NoWindow);
+        }
+        // Already there is not a failure — a caller asked for a state and it
+        // holds — but nothing moved, so nothing is owed a configure either.
+        //
+        // BEFORE the family check, because a family shares a workspace: asked
+        // the other way round, sending a child to where its family already is
+        // was refused, and a script that reaches a state and then confirms it
+        // would be told its own success was an error.
+        if self.scene.workspace_of(key) == Some(number) {
+            return Ok(Sent::Done);
+        }
+        // A window with a parent cannot go alone. `enforce_parent_layout` runs
+        // inside the `settle` below and puts a child back on its parent's
+        // workspace, so the move would be made and unmade within this call and
+        // the caller would be told `ok` for a window that did not go anywhere.
+        // Refusing says which window has to move instead — sending the ROOT of
+        // the family takes all of it, because the same repair follows it.
+        //
+        // A retained parent is a MAPPED one and this does not re-check it:
+        // `set_toplevel_parent` and `set_portal_parent` both normalise an
+        // unmapped parent away, and every unmap path runs a reparent pass
+        // first, so a relation outliving its parent's pixels does not exist.
+        if self.toplevel_parent(key).is_some() {
+            return Ok(Sent::FollowsParent(self.family_root(key)));
+        }
+        if !self.scene.send_key_to_workspace(key, number) {
+            // Not "no such window": `is_arranged` established that the window
+            // is a leaf of its own workspace, and the check above that it is
+            // not already on `number`. What is left is an out-of-range
+            // workspace, which the parser bounds to 1-9 before this — so a
+            // refusal HERE is the layout disagreeing with what it just said,
+            // and that is the compositor's problem to report rather than the
+            // caller's to fix.
+            return Err(format!(
+                "layout refused to send window {}:{} to workspace {number}",
+                key.client, key.object
+            ));
+        }
+        self.settle(true)?;
+        Ok(Sent::Done)
+    }
+
+    /// `td-ctl move <id> <direction>`. Answers whether the window was there.
+    ///
+    /// This one DOES show the window's workspace first, unlike `send`: a
+    /// directional move is defined against the arrangement on screen, and one
+    /// applied to a workspace nobody is looking at would be a rearrangement
+    /// the caller cannot see and did not ask to be hidden from.
+    pub fn control_move(&mut self, key: SurfaceKey, direction: Direction) -> Result<bool, String> {
+        if self.reveal(key).is_none() {
+            return Ok(false);
+        }
+        // The keyboard's own path from here, whole-output damage and all: the
+        // window is focused and this is now exactly the typed gesture.
+        self.command(Command::Move(direction))?;
+        Ok(true)
+    }
+
     fn focus_surface(&mut self, key: SurfaceKey) -> Result<(), String> {
         let key = self.topmost_parented(key);
         if !self.scene.focus_key(key) {
@@ -2354,8 +2488,18 @@ impl Runtime {
 
     /// Everything the control channel reports, sampled here so that one
     /// answer describes one instant.
+    ///
+    /// The parent of each window is added on the way out. It lives here rather
+    /// than in the scene because the relationships do — the scene knows how
+    /// windows are arranged and this knows which of them are family — and the
+    /// whole snapshot is still taken under one lock, so the two halves cannot
+    /// describe different instants.
     pub fn control_snapshot(&self) -> ControlSnapshot {
-        self.scene.control_snapshot(self.width(), self.height())
+        let mut snapshot = self.scene.control_snapshot(self.width(), self.height());
+        for window in &mut snapshot.windows {
+            window.parent = self.toplevel_parent(window.key);
+        }
+        snapshot
     }
 
     #[cfg(test)]
@@ -2685,6 +2829,26 @@ impl Runtime {
             at = relation.parent;
         }
         true
+    }
+
+    /// The ancestor at the top of a window's parent chain, or the window
+    /// itself when it has none.
+    ///
+    /// What an addressed `send` names when it refuses: the immediate parent
+    /// of a child two deep is refused for the same reason the child was, so
+    /// naming it hands the caller a second dead end. Bounded by the retained
+    /// relationship count, which `parent_would_cycle` already keeps acyclic —
+    /// the bound is belt to that brace, since a cycle here would hang the
+    /// compositor's control thread rather than answer.
+    fn family_root(&self, key: SurfaceKey) -> SurfaceKey {
+        let mut at = key;
+        for _ in 0..=self.toplevel_parents.len() {
+            let Some(parent) = self.toplevel_parent(at) else {
+                return at;
+            };
+            at = parent;
+        }
+        at
     }
 
     fn toplevel_parent(&self, child: SurfaceKey) -> Option<SurfaceKey> {

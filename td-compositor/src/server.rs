@@ -6756,7 +6756,9 @@ impl Client {
                     self.set_local_parent(message.object, xdg_surface, parent)
                 }
                 // set_title. The title is retained for decoration; app_id
-                // below is compared only with the configured readiness oracle.
+                // below is retained too, for the control report to address
+                // windows by, and separately compared with the configured
+                // readiness oracle.
                 2 => {
                     let title = args.string()?;
                     args.finish()?;

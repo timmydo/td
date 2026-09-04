@@ -816,6 +816,12 @@ pub struct Scene {
     portal_dialogs: BTreeSet<SurfaceKey>,
     portal_dialog_order: Vec<SurfaceKey>,
     titles: BTreeMap<SurfaceKey, String>,
+    /// The client's `xdg_toplevel.set_app_id`, kept for the same lifetime and
+    /// on the same terms as `titles`. Retained at all only because the control
+    /// report needs a name a CALLER can predict: a surface key is stable while
+    /// the window lives but says nothing about what the window is, and an
+    /// agent asked to put "the browser" somewhere has to be able to find it.
+    app_ids: BTreeMap<SurfaceKey, String>,
     layout: Layout,
     pointer_x: i32,
     pointer_y: i32,
@@ -861,6 +867,7 @@ impl Scene {
             portal_dialogs: BTreeSet::new(),
             portal_dialog_order: Vec::new(),
             titles: BTreeMap::new(),
+            app_ids: BTreeMap::new(),
             layout: Layout::new(),
             pointer_x: 0,
             pointer_y: 0,
@@ -1891,7 +1898,38 @@ impl Scene {
     /// wl_surface alive, and a toplevel created on that surface next would
     /// otherwise inherit the dead one's name until it set its own.
     pub fn forget_title(&mut self, key: SurfaceKey) -> bool {
-        self.titles.remove(&key).is_some()
+        // The app id goes with it. Both are the role object's, and a toplevel
+        // created next on the same wl_surface would otherwise inherit the dead
+        // one's name — the exact confusion `forget_title` exists to prevent,
+        // and worse for a field a caller ADDRESSES windows by.
+        //
+        // So the answer is "something was forgotten", not "a title was". A
+        // client may set an app id and no title, which is ordinary, and
+        // answering `false` there would call a real teardown a no-op.
+        let had_app_id = self.app_ids.remove(&key).is_some();
+        self.titles.remove(&key).is_some() || had_app_id
+    }
+
+    /// The toplevel's app id, as `xdg_toplevel.set_app_id` gave it, bounded
+    /// and stored on `set_title`'s terms. Empty is absent, so a reader has one
+    /// absent case rather than two that look alike.
+    pub fn set_app_id(&mut self, key: SurfaceKey, app_id: &str) -> bool {
+        let app_id = match app_id.char_indices().nth(MAX_TITLE_CHARS) {
+            Some((offset, _)) => app_id.get(..offset).unwrap_or_default(),
+            None => app_id,
+        };
+        if app_id.is_empty() {
+            return self.app_ids.remove(&key).is_some();
+        }
+        if self.app_ids.get(&key).map(String::as_str) == Some(app_id) {
+            return false;
+        }
+        self.app_ids.insert(key, app_id.to_string());
+        true
+    }
+
+    pub fn app_id(&self, key: SurfaceKey) -> Option<&str> {
+        self.app_ids.get(&key).map(String::as_str)
     }
 
     /// Test-only, for `title`'s reason: what a geometry DOES is read inside
@@ -1964,6 +2002,7 @@ impl Scene {
         // than merely dropped.
         let dropped = self.drop_popups_of(key);
         self.titles.remove(&key);
+        self.app_ids.remove(&key);
         self.layout.forget(key);
         self.clear_hint();
         self.forget_cursor_surface(key);
@@ -2018,6 +2057,7 @@ impl Scene {
         self.portal_dialog_order
             .retain(|key| key.client != client);
         self.titles.retain(|key, _| key.client != client);
+        self.app_ids.retain(|key, _| key.client != client);
         self.surface_charge = self.surface_charge.saturating_sub(removed);
         // Cursor surfaces are not in `surfaces`, so the sweep above misses
         // them: a departing client's retained cursor pixels would be held
@@ -2046,6 +2086,38 @@ impl Scene {
     pub fn command(&mut self, command: Command) {
         self.layout.apply(command);
         self.hint = None;
+    }
+
+    /// Which workspace a window is on, and whether it is one the arrangement
+    /// can act on at all. Both for the control channel, which is the only
+    /// caller that names a window it did not just receive an event about.
+    pub fn workspace_of(&self, key: SurfaceKey) -> Option<u8> {
+        self.layout.workspace_of(key)
+    }
+
+    pub fn is_arranged(&self, key: SurfaceKey) -> bool {
+        self.layout.is_arranged(key)
+    }
+
+    /// Whether this window is OUTSIDE the tiling tree while still on screen.
+    ///
+    /// A portal dialog is the only one: `Layout::float` unmaps it from its
+    /// workspace and keeps its home, so it is drawn and reported but is not a
+    /// leaf anything can tile. Asked so the report can say so, rather than
+    /// leaving a caller to discover it by being refused.
+    ///
+    /// STILL ON SCREEN is half the question. `unmap` leaves portal membership
+    /// alone, so a dismissed dialog stays in the set — and answering from
+    /// membership alone told a caller that a window absent from the report was
+    /// floating, when the truth is that it is gone.
+    pub fn is_floating(&self, key: SurfaceKey) -> bool {
+        self.portal_dialogs.contains(&key) && self.is_mapped(key)
+    }
+
+    /// Send a NAMED window to a workspace, which is the strip drop's move
+    /// reached by a caller that has no pointer.
+    pub fn send_key_to_workspace(&mut self, key: SurfaceKey, number: u8) -> bool {
+        self.layout.move_key_to_workspace(key, number)
     }
 
     pub fn focus_key(&mut self, key: SurfaceKey) -> bool {
@@ -2290,6 +2362,11 @@ impl Scene {
                     // rectangle overlaps its neighbours' with nothing saying
                     // why.
                     fullscreen: self.layout.is_fullscreen(view.key),
+                    floating: self.portal_dialogs.contains(&view.key),
+                    // Filled by `Runtime::control_snapshot`: the scene holds
+                    // the arrangement and the runtime holds the relationships.
+                    parent: None,
+                    app_id: self.app_id(view.key).map(str::to_string),
                     title: self.title(view.key).map(str::to_string),
                 })
             })
@@ -3875,6 +3952,75 @@ mod tests {
         // Gone with the surface, or a re-used key inherits a stale name.
         scene.remove(key);
         assert_eq!(scene.title(key), None);
+    }
+
+    #[test]
+    fn forgetting_a_toplevel_that_set_only_an_app_id_is_not_a_no_op() {
+        // The answer is "something was forgotten", not "a title was". Setting
+        // an app id and no title is ordinary — a terminal does it — and a
+        // `false` there calls a real teardown a no-op for a caller that reads
+        // the answer.
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let mut scene = Scene::new();
+        assert!(scene.set_app_id(key, "org.td.terminal"));
+        assert_eq!(scene.title(key), None, "the fixture set a title");
+        assert!(
+            scene.forget_title(key),
+            "forgetting an app id answered that nothing was forgotten"
+        );
+        assert_eq!(scene.app_id(key), None);
+        assert!(!scene.forget_title(key), "already gone");
+    }
+
+    #[test]
+    fn an_app_id_lives_and_dies_exactly_as_a_title_does() {
+        // It is stored for the same reason and on the same terms, so it has
+        // to go at the same three moments. An app id outliving its window
+        // would NAME a window that is gone — worse than naming none, because
+        // the control report addresses windows by it.
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let other = SurfaceKey {
+            client: 2,
+            object: 1,
+        };
+
+        assert!(scene.set_app_id(key, "org.mozilla.firefox"));
+        assert_eq!(scene.app_id(key), Some("org.mozilla.firefox"));
+        assert!(
+            !scene.set_app_id(key, "org.mozilla.firefox"),
+            "an unchanged app id is not a change"
+        );
+        // Empty is absent, as it is for a title: one absent case, not two.
+        assert!(scene.set_app_id(key, ""));
+        assert_eq!(scene.app_id(key), None);
+
+        // 1. the role object goes, leaving the wl_surface alive.
+        assert!(scene.set_app_id(key, "org.td.term"));
+        scene.forget_title(key);
+        assert_eq!(scene.app_id(key), None, "a destroyed toplevel kept its name");
+
+        // 2. the surface goes.
+        assert!(scene.set_app_id(key, "org.td.term"));
+        scene.remove(key);
+        assert_eq!(scene.app_id(key), None, "a removed surface kept its name");
+
+        // 3. the client goes, taking every surface of its own and no others.
+        assert!(scene.set_app_id(key, "org.td.term"));
+        assert!(scene.set_app_id(other, "org.td.other"));
+        scene.remove_client(1);
+        assert_eq!(scene.app_id(key), None, "a departed client kept its name");
+        assert_eq!(
+            scene.app_id(other),
+            Some("org.td.other"),
+            "another client's name went with it"
+        );
     }
 
     #[test]

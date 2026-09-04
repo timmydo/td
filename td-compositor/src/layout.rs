@@ -801,6 +801,20 @@ impl Layout {
             .is_some_and(|workspace| workspace.fullscreen == Some(key))
     }
 
+    /// Whether this key names a window the arrangement can act on.
+    ///
+    /// `workspace_of` alone is the wrong question and `move_key_to_workspace`
+    /// says why: `homes` deliberately REMEMBERS an unmapped window so a client
+    /// that maps again lands where it was, so it answers for windows that are
+    /// not in any tree. A caller naming one of those has named a window that
+    /// is not there, and is owed that answer rather than a silent no-op.
+    pub fn is_arranged(&self, key: SurfaceKey) -> bool {
+        self.workspace_of(key)
+            .and_then(|number| self.workspaces.get(&number))
+            .and_then(|workspace| workspace.root.as_ref())
+            .is_some_and(|root| root.contains(key))
+    }
+
     /// Send ONE window to a workspace, which is what a drop on the strip does.
     ///
     /// `move_to_workspace` moves whatever is focused, because a keyboard

@@ -2607,9 +2607,13 @@ CHARACTERS — a client's string in a map that outlives the request, and counted
 in characters rather than bytes so truncation cannot split a UTF-8 sequence.
 An empty title is stored as NO title, so what draws one has a single absent
 case rather than two that look identical on screen. `set_app_id` does not name
-or decorate a window. When the compositor is given one expected application
-id and a readiness-socket path, the request is compared at the wire boundary
-without retaining client text. A matching surface key is held only until the
+or decorate a window, but it IS retained, on exactly the terms above and for
+exactly the lifetime below: the control channel addresses windows by it, which
+§15 argues for at length. That reverses this paragraph's older rule, which was
+that the app id is compared without retaining client text at all. Only the
+retention is new — the comparison still reads the request rather than what is
+stored. When the compositor is given one expected application id and a
+readiness-socket path, the request is compared at the wire boundary. A matching surface key is held only until the
 configured application's first successfully painted mapped toplevel wakes a
 capacity-one channel. A dedicated thread then publishes the mode-0600 socket;
 before that commit the path does not exist. The match must precede the commit;
@@ -2627,7 +2631,11 @@ A title's lifetime is its xdg_toplevel OBJECT's, not its mapped pixels'. It
 survives every unmap, because a null-buffer attach is both the transient unmap
 AND the opening of the initial handshake, so dropping it there would lose the
 name of a window before its first buffer ever arrived. It is dropped when the
-toplevel is destroyed, when the wl_surface is, and with the client. An input
+toplevel is destroyed, when the wl_surface is, and with the client. The app id
+has exactly this lifetime, dropped by the same three teardowns in the same
+places: a toplevel created next on the same `wl_surface` must not inherit the
+dead one's name, which matters more for the field a caller ADDRESSES windows
+by than for the one it only reads. An input
 region can be dropped with the pixels only because the client re-supplies one
 on every commit; nothing re-supplies a title.
 
@@ -5406,7 +5414,47 @@ The complete terminal landing must prove:
   one that provokes the close; and
 - a report body that stops mid-record is refused rather than read as a
   shorter report, which either the deadline or the socket's write timeout
-  can leave behind.
+  can leave behind;
+- the `output` line's `windows=<n>` agrees with the records under it, which
+  is what catches a body abandoned cleanly BETWEEN records — the case the
+  terminator cannot see;
+- an order aimed at a NAMED window moves that window and not the focused one,
+  proved with two windows because with one they are the same act; an
+  addressed `focus` shows the workspace the window is on, and an addressed
+  `send` does not;
+- an addressed `focus` on the workspace ALREADY in view moves the focus,
+  which the first version of that test did not prove: it sent the window to
+  an empty workspace first, and `Layout::map` focuses what it maps, so a bare
+  workspace switch satisfied it and deleting the focus call left the suite
+  green;
+- a named window behind a FULLSCREEN one is revealed, not reported focused
+  while it stays hidden — the refusal `Layout::focus_key` raises, discarded
+  by a hand-composed focus that moved the view and answered `ok`;
+- a window on screen that cannot be tiled is refused by name rather than
+  called nonexistent, and is reported as `floating` before the caller asks,
+  while a dialog that has been dismissed is absent rather than floating;
+- a grouped parent's addressed `focus` reaches the child constrained above it,
+  as a click on it does, and a split tile beside its child does not;
+- an addressed `send` of a window with a parent is refused and names the
+  family's ROOT, rather than answering `ok` for a move the family repair undid
+  inside the same request; sending that window takes the family, and naming
+  the immediate parent of a child two deep would hand back a second refusal;
+- a family whose root is itself floating is refused in ONE answer that says
+  so, rather than pointing at a window refused on other grounds;
+- an addressed `send` to the workspace a window is already on is `ok`,
+  including for a window that is family, where the refusal would otherwise
+  answer first and call a state that holds an error;
+- an addressed `move` on a family moves the window a pointer CLICK would have
+  moved, which is the case that tells `reveal`'s choice apart from the focus
+  the settle would have imposed anyway;
+- a `layout` answer cut to its status line is refused, which the count alone
+  cannot catch: it is byte for byte a successful order's answer, so the check
+  is told which request was sent. An order carrying a report is refused the
+  same way, and so is a report missing its workspace line;
+- an app id carrying the text `title=` does not capture the title field from
+  a reader that splits on the separator the record is written with; and
+- an app id lives and dies exactly as a title does, across all three
+  teardowns and across a second client that keeps its own.
 
 ## 15. Control channel
 
@@ -5536,6 +5584,108 @@ This is a way to SAY what the keyboard says, not a second vocabulary of things
 to say. A control channel that could do what no key can would be a second
 implementation of the layout to keep in step with the first.
 
+### Naming a window
+
+`focus`, `send` and `move` each take a second form that NAMES the window to
+act on: `focus 3:12`, `send 3:12 4`, `move 3:12 left`. The id is the one
+`layout` prints, so a caller feeds the report straight back in without
+transforming it.
+
+This is the half the first increment left out, and it made the report half
+useless. `layout` handed out an id per window and nothing consumed one, so a
+program could read the whole arrangement and then still only act on whichever
+window happened to be focused. "Put the browser on 3" meant counting `focus
+right` presses off the report and hoping nothing moved in between — a race
+against the person at the keyboard, in a channel built for programs.
+
+It does not break the rule above, once the rule is read correctly. The claim
+was never that a caller may only do what a KEY can do; it is that the channel
+adds no arrangement behaviour of its own. Naming a window is the POINTER's
+gesture — clicking one is exactly "focus this one" — so both halves already
+exist and neither is reimplemented here. What no key can do is spell which
+window it means, which is a limitation of the keyboard, not a property of the
+layout.
+
+An addressed `focus` or `move` SHOWS the window's workspace first.
+`Layout::focus_key` only accepts a leaf of the shown workspace, so the
+alternative is not "focus it where it is" but "refuse", and focus that leaves
+the window invisible is not focus. A directional `move` goes the same way for
+its own reason: a direction is defined against the arrangement on screen, and
+applying one to a workspace nobody is looking at would rearrange what the
+caller cannot see.
+
+An addressed `send` does NOT move the view, which is the same rule the
+unaddressed one already follows: sending a window somewhere is not a request
+to look at where it went. It reaches `Layout::move_key_to_workspace`, which
+the workspace strip's drag already uses, so a window can be moved off a
+workspace nobody is looking at without that workspace being left inconsistent
+— `unmap` clears its fullscreen and hands focus on.
+
+A window the caller names that is not there is an `error` and not an
+`unavailable`: a stale id is the caller's to fix, and reporting it as the
+compositor's failure would send a script to inspect a session that is working.
+`Layout::is_arranged` is what answers, rather than `workspace_of` alone —
+`homes` deliberately remembers an unmapped window so a client that maps again
+lands where it was, so it answers for windows that are in no tree.
+
+A window that IS there and cannot be arranged gets its own refusal, naming the
+reason: a portal dialog is drawn, routed input and listed by `layout`, and
+`Layout::float` takes it out of the tiling tree, so every addressed order
+refuses it. Answered as "no window", the caller was told an id the report had
+just handed it was imaginary — the one refusal it cannot act on, because there
+is nothing to spell differently. Which windows those are is in the report as
+well, so a caller can see it coming rather than discover it by being refused.
+
+An order aimed at a window that is FAMILY reaches the family, and the report
+says which windows those are. The compositor keeps a parent and its
+constrained children on one workspace, and keeps the topmost overlapping child
+above the ancestor it shares, and those two rules are older than this channel:
+`focus_surface`, where a pointer click lands, follows the same chain through
+`topmost_parented`, and `enforce_parent_layout` runs inside every `settle`. So
+naming a grouped parent focuses the child on top of it, exactly as clicking
+the parent does — and where the two do not overlap, which is every ordinary
+split tile, nothing is followed and the window named is the window focused.
+
+`send` is the one that had to change rather than be documented. The repair
+puts a mapped child back on its parent's workspace, so an addressed `send` of
+a child made the move and unmade it inside one request while answering `ok`.
+It is refused now, and the refusal names the family's ROOT, because that is
+the window the caller should move: sending it takes the family, by the same
+repair. The root rather than the immediate parent, because the parent of a
+child two deep is refused for the same reason its child was, and a remedy
+that hands back a second dead end is not one. A root that is ITSELF
+unarrangeable gets its own answer for the same reason: a portal dialog can be
+a parent, and pointing at one would send the caller to a window refused on
+different grounds, so the refusal says the family cannot move at all. The alternative — moving the
+family when the caller named one member — does more than was asked, and the
+alternative to that, letting the child go alone, is a compositor rule this
+channel does not get to suspend.
+
+Asking for the workspace a window is already on is answered before any of
+that, and is `ok`. A caller that asks for a state and finds it has succeeded,
+and a family shares a workspace, so asked the other way round a script that
+reached a state and then confirmed it was told its own success was an error.
+
+`parent=<client:object>` is in the report for that reason, empty when there is
+none. Without it a caller could see neither the relationship nor a reason for
+the answer it got, which is the same argument `floating` is here on. It is
+filled by `Runtime::control_snapshot` rather than the scene's, because the
+scene holds the arrangement and the runtime holds the relationships — under
+one lock, so the two halves still describe one instant.
+
+The id is unique among the windows alive at the moment the report was
+written, and no longer than that. `object` is a Wayland object id, which a
+client may reuse once it has destroyed the surface holding it, so an id read
+from an old report can in principle name a DIFFERENT window of the same
+client. Nothing here detects that: the pair is what the compositor keys its
+own scene by, and it has no birth serial to compare. The exposure is bounded
+by how these ids are meant to be used — read the report, act, and read it
+again — and a caller that caches one across a client's window churn is
+outside that. A name that survives the window it named is what the launcher
+increment needs anyway, since a caller that asks for a window to be created
+has no id to be told until it exists; it is deferred to there rather than
+half-answered here.
+
 `send` moves the focused window and leaves the view where it was, which is
 what the keyboard's `MoveToWorkspace` has always done. It is the one answer in
 the vocabulary a caller might expect the other way round, so the help text
@@ -5550,6 +5700,43 @@ Occupancy is derived where the on-screen strip derives it, so the numbers a
 person reads off the bar and the numbers a program reads off this cannot
 disagree.
 
+The `output` line carries `windows=<n>`, the number of `window` records below
+it. That closes the truncation limit the first increment named and left
+standing: the status line's terminator catches an answer that stops
+mid-record, but one abandoned cleanly BETWEEN records read as a complete,
+shorter report, with the missing windows indistinguishable from windows that
+are not there. The degenerate case was an `ok` with no records at all. A count
+leading the body is what a reader checks it against, and it costs one field.
+
+`td-ctl` checks it, which is what makes it load-bearing rather than
+decorative: `split_answer` refuses an `ok` body whose `windows=` disagrees
+with the `window` lines under it, and refuses one that carries no count at
+all. Emitting a number nobody reads would have left the hole open while the
+design recorded it as closed. It is read off the `output` line rather than
+recounted from the records for the obvious reason — a count derived from what
+arrived agrees with what arrived however much was lost.
+
+The check is told WHICH REQUEST was sent, which the count cannot supply for
+itself. A `layout` truncated to its status line is `ok\n` — byte for byte what
+a successful order answers — so judged on shape alone the emptiest truncation
+of all passed as a working compositor with nothing on screen. `ask` knows what
+it asked, so it says; a question's answer must carry a report and an order's
+must not, and each is refused when it carries the other.
+
+A report owes all three of its record kinds, in order: the `output` line
+first, because it carries the count everything else is checked against, then
+the `workspace` line, then the windows. The bar's line is derived from the
+same arrangement the windows are, so a body without it is not a shorter
+report but a broken one, and it is the record the count is structurally unable
+to notice missing.
+
+The cost is that a `td-ctl` carrying these checks refuses a `layout` from a
+compositor older than the count. They are one binary, so that pairing takes a
+session still running an executable the store has replaced, and the refusal
+says the body declares no window count rather than failing quietly. Worth
+naming because it is the first time the two halves of this protocol can
+disagree about what an answer looks like.
+
 Every window carries a rectangle, including one on a workspace nobody is
 looking at, where it is where the window WOULD be: a hidden workspace is laid
 out for the same output as the shown one, so the answer exists and refusing to
@@ -5560,6 +5747,17 @@ means "draw this undecorated now" and is therefore false for every window
 nobody is looking at. Reported from that one, a hidden fullscreen window came
 back as an ordinary tile whose rectangle covered its whole workspace and
 overlapped its neighbours' with nothing in the record to explain it.
+
+`floating` says the window is ON SCREEN and outside the tiling tree, which
+today means exactly a portal dialog. Both halves are asked: `unmap` leaves
+portal membership alone, so answering from membership said "floating" about a
+dismissed dialog that is in no report and on no screen, sending a caller to
+look for a window to close. It is here because the addressed orders
+refuse one, and a report that lists a window while every order aimed at it is
+refused owes the caller the reason. It is a property of the arrangement, not
+of the client: `Layout::float` is what put the window there, and the report
+answers from the same set the refusal does, so the two cannot drift into
+disagreeing about which windows are arrangeable.
 
 `title` is last on its line and runs to the end of it, because a title has
 spaces in it and a field that could eat the next one would have to be quoted.
@@ -5580,16 +5778,61 @@ how a line READS without changing what it holds, which is the objection the
 carriage return already answers. Those are named as a list rather than a
 category test: this crate has no Unicode tables and will not grow one for a
 label field, and ordinary text in every script has to survive, so an ASCII
-allowlist would be a worse answer than a named set. No app id is reported: the
-compositor keeps one only for the application it is watching for, so the field
-would be empty for every other window and look like an answer.
+allowlist would be a worse answer than a named set.
+
+`app_id` IS reported, which is a change: the compositor used to keep a
+client's app id only long enough to compare it with the boot observer's
+expected one, deliberately retaining no client text of that kind. It is
+retained now, on exactly `title`'s terms and for exactly `title`'s lifetime —
+bounded on arrival, dropped by the same three teardowns, and empty meaning
+absent.
+
+The reason is addressing. An id is stable while a window lives, but it is a
+Wayland object number: it means nothing to a person and differs every boot, so
+a caller told to move "the browser" has nothing to match on. `app_id` is the
+only name a client offers that a caller could know in advance. Retaining it is
+a real widening — a second client-chosen string held for the life of the
+window — and it is worth it because without one the addressed forms above can
+only be used on windows the caller already watched appear.
+
+It is sanitised harder than `title`, for a reason of position rather than of
+content. A title is LAST on its line and runs to the end of it, so it may keep
+its spaces; every field before it has to be a single token or the fields after
+it stop being where a reader expects. So whitespace is replaced as well as
+everything `reportable` refuses. A real app id is reverse-DNS and has none;
+this is for the client that sends one anyway.
+
+What sanitising deliberately does NOT do is forbid `=`. It is ordinary in no
+app id and harmful in none, and refusing it would mangle a legitimate value to
+protect a reader that is reading wrong. A record's fields are separated by
+spaces, so a reader takes `" title="`, with its leading space, exactly as the
+line is written; one that hunts for the first `title=` anywhere finds a value
+a client put inside its own field. That is a reader bug and not a hole — the
+client can only write within the field it owns, which is the guarantee the
+sanitising actually makes — but the trap is easy enough to fall into that a
+test pins the honest reader's answer rather than leaving it to this
+paragraph.
+
+Retention does NOT change what the boot observer does: that comparison reads
+the argument rather than what is stored, and is untouched. The one ordering
+subtlety is that retention happens BEFORE the observer's early return. The
+observer returns immediately when no application is configured, which is every
+ordinary session, so retaining below it would have stored an app id only on
+the boot-observer path and left the report empty exactly where a caller uses
+it.
 
 ### What it deliberately is not
 
 It does not subscribe, so there is no event stream to keep in sync and no
-second consumer of layout changes to keep the first honest about. It does not
-create, close or kill windows: a control channel that could remove a client's
-window would be an authority over other programs rather than over the
-arrangement of them. It does not name windows by anything a caller chose,
-because nothing here lets a caller choose one — the orders act on the focused
-window, exactly as the keyboard's do.
+second consumer of layout changes to keep the first honest about; a caller
+that wants to know when something changed asks again. It does not create,
+close or kill windows: a control channel that could remove a client's window
+would be an authority over other programs rather than over the arrangement of
+them.
+
+It does not let a caller name a window by anything the CALLER chose. The two
+names it accepts are the compositor's own object id and, for matching, the id
+the client gave itself; there is no label a caller can attach to a window and
+use later. That matters for the one case this channel is worst at — launching
+several identical terminals and telling them apart afterwards — which no field
+in the report answers today.
