@@ -5157,9 +5157,9 @@ fn validate_application_step_contract(
         };
         let permitted = match marker_operation {
             "validateStaticApplication" => {
-                matches!(operation, "unpack" | "mkDir" | "copyFiles")
+                matches!(operation, "unpack" | "mkDir" | "copyFiles" | "copyFile")
             }
-            "validateDynamicApplication" => operation == "copyTree",
+            "validateDynamicApplication" => matches!(operation, "copyTree" | "copyFile"),
             _ => false,
         };
         if !permitted {
@@ -14985,6 +14985,10 @@ daemon build START (2/2 active)
         };
 
         assert!(assemble(&format!("{native},{marker}")).is_ok());
+        // A bare-file seed materializes through copyFile before the same static
+        // validator.
+        let bare = r#"{"unpack":{"input":"{in:fixture-source}","dest":"{root}/seed","keepTop":false}},{"copyFile":{"file":"{root}/seed/app","to":"{out}/files/bin/app","exec":true}}"#;
+        assert!(assemble(&format!("{bare},{marker}")).is_ok());
         for (steps, reason) in [
             (
                 format!(
@@ -15052,6 +15056,13 @@ daemon build START (2/2 active)
         )
         .unwrap();
         validate_application_step_contract("firefox", &good, Some(&declaration), true).unwrap();
+        // A payload published as a bare executable materializes through copyFile,
+        // which is as native and non-spawning as copyTree.
+        let bare = json::parse(
+            r#"{"steps":[{"copyFile":{"file":"{payload:firefox-source}","to":"{out}/files/bin/firefox","exec":true}},{"validateDynamicApplication":{"entry":"/app/bin/firefox","runtime":"freedesktop-platform-25-08","libraryPaths":["/app/lib","/app/lib/firefox"],"optionalTargets":["/app/share/runtime/langpack"],"optionalLinks":102}}]}"#,
+        )
+        .unwrap();
+        validate_application_step_contract("firefox", &bare, Some(&declaration), true).unwrap();
 
         for (text, reason) in [
             (

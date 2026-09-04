@@ -3427,8 +3427,9 @@ fn check_payload_template(
                     name,
                     open,
                     "`{in:NAME}' is the tool channel; use `{payload:NAME}' only in \
-                     unpack's `input', copyTree's `from', stageRuntimeClosure's `roots', \
-                     or compileApplicationTables' `packages' or `runtimes'",
+                     unpack's `input', copyTree's `from', copyFile's `file', \
+                     stageRuntimeClosure's `roots', or compileApplicationTables' \
+                     `packages' or `runtimes'",
                 ));
             }
         } else if let Some(name) = token.strip_prefix("payload:") {
@@ -3437,7 +3438,7 @@ fn check_payload_template(
                     name,
                     open,
                     "`{payload:NAME}' is visible only in unpack's `input', copyTree's \
-                     `from', stageRuntimeClosure's `roots', or \
+                     `from', copyFile's `file', stageRuntimeClosure's `roots', or \
                      compileApplicationTables' `packages' or `runtimes'",
                 ));
             }
@@ -3509,6 +3510,10 @@ fn visit_step_templates(
         Step::CopyTree { from, dest } => {
             visit("copyTree.from", from, true)?;
             visit("copyTree.dest", dest, false)?;
+        }
+        Step::CopyFile { file, to, exec: _ } => {
+            visit("copyFile.file", file, true)?;
+            visit("copyFile.to", to, false)?;
         }
         Step::SplitDebugTree { root, objcopy } => {
             visit("splitDebugTree.root", root, false)?;
@@ -5373,6 +5378,7 @@ mod tests {
             ("copyFiles.files", Step::CopyFiles { files: vec![bad(BAD)], dest: "{root}".into() }),
             ("copyFiles.dest", Step::CopyFiles { files: vec!["{src}/x".into()], dest: bad(BAD) }),
             ("copyTree.dest", Step::CopyTree { from: "{src}".into(), dest: bad(BAD) }),
+            ("copyFile.to", Step::CopyFile { file: "{src}/x".into(), to: bad(BAD), exec: true }),
             ("splitDebugTree.root", Step::SplitDebugTree { root: bad(BAD), objcopy: "{in:binutils}/bin/objcopy".into() }),
             ("splitDebugTree.objcopy", Step::SplitDebugTree { root: "{out}".into(), objcopy: bad(BAD) }),
             ("assertDebugSize.root", Step::AssertDebugSize { root: bad(BAD), report: "{out}/debug-size".into(), scope: "fixture".into(), ceiling: 1 }),
@@ -5398,12 +5404,13 @@ mod tests {
             ("substituteText.file", Step::SubstituteText { file: bad(BAD), edits: Vec::new() }),
             ("assertStatic.paths", Step::AssertStatic { paths: vec![bad(BAD)] }),
         ];
-        assert_eq!(cases.len(), 37, "every expanded, non-data field is listed");
+        assert_eq!(cases.len(), 38, "every expanded, non-data field is listed");
         let mut expected: HashSet<(&'static str, bool)> =
             cases.iter().map(|(field, _)| (*field, false)).collect();
         assert_eq!(expected.len(), cases.len(), "field labels must be distinct");
         assert!(expected.insert(("unpack.input", true)));
         assert!(expected.insert(("copyTree.from", true)));
+        assert!(expected.insert(("copyFile.file", true)));
         assert!(expected.insert(("stageRuntimeClosure.roots", true)));
         assert!(expected.insert(("compileApplicationTables.packages", true)));
         assert!(expected.insert(("compileApplicationTables.runtimes", true)));
@@ -5459,6 +5466,7 @@ mod tests {
         for site in [
             "ctx.expand_data(&field(o,\"input\")?)",
             "ctx.expand_data(&field(o,\"from\")?)",
+            "ctx.expand_data(&field(o,\"file\")?)",
             "ctx.expand_data_all(&string_array(o,\"roots\").map_err(err)?)",
             "ctx.expand_data_all(&string_array(o,\"packages\").map_err(err)?)",
             "ctx.expand_data_all(&string_array(o,\"runtimes\").map_err(err)?)",
@@ -5466,6 +5474,22 @@ mod tests {
             assert!(
                 compact_dispatch.contains(site),
                 "missing builder data site {site:?}"
+            );
+        }
+        // The builder's own refusals name the same six fields, or an author
+        // refused at the enforcement tier is told a supported field is not.
+        // The second pin runs through the production diagnostic's own line:
+        // the builder's data-site test repeats the sentence, broken elsewhere,
+        // so a shorter pin would survive the diagnostic alone dropping the
+        // field.
+        let compact_builder: String = builder.split_whitespace().collect();
+        for advertised in [
+            "unpack/copyTree/copyFile/stageRuntimeClosure/compileApplicationTables",
+            "copyFile's`file',stageRuntimeClosure's`roots',and",
+        ] {
+            assert!(
+                compact_builder.contains(advertised),
+                "builder diagnostics omit {advertised:?}"
             );
         }
         for (field, step) in cases {
@@ -5477,13 +5501,14 @@ mod tests {
         }
     }
 
-    /// The five data fields see `{payload:NAME}`. They still refuse the
+    /// The six data fields see `{payload:NAME}`. They still refuse the
     /// tool-channel spelling and a name the recipe did not declare.
     #[test]
     fn only_typed_data_sources_see_payload_templates() {
         for step in [
             Step::Unpack { input: "{payload:firefox}".into(), dest: "{src}".into(), keep_top: false },
             Step::CopyTree { from: "{payload:firefox}".into(), dest: "{out}/app".into() },
+            Step::CopyFile { file: "{payload:firefox}".into(), to: "{out}/app/bin/x".into(), exec: true },
             Step::StageRuntimeClosure { roots: vec!["{payload:firefox}".into()], dest: "{out}/root".into() },
             Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{payload:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry".into(), launcher: "{out}/launcher".into() },
         ] {
@@ -5492,6 +5517,7 @@ mod tests {
         for step in [
             Step::Unpack { input: "{in:firefox}".into(), dest: "{src}".into(), keep_top: false },
             Step::CopyTree { from: "{in:firefox}".into(), dest: "{out}/app".into() },
+            Step::CopyFile { file: "{in:firefox}".into(), to: "{out}/app/bin/x".into(), exec: true },
             Step::StageRuntimeClosure { roots: vec!["{in:firefox}".into()], dest: "{out}/root".into() },
             Step::CompileApplicationTables { names: vec!["firefox".into()], packages: vec!["{in:firefox}".into()], runtimes: vec!["{payload:runtime}".into()], registry: "{out}/registry".into(), launcher: "{out}/launcher".into() },
         ] {

@@ -124,6 +124,16 @@ pub enum Step {
         from: String,
         dest: String,
     },
+    /// Copy one regular file to an exact destination path. `file` is the DATA
+    /// side and may name a payload; `to` is inside this build's own output. A
+    /// marked payload that upstream publishes as a bare executable rather than
+    /// an archive reaches its `/app` entry name only through this step, and the
+    /// mode comes from `exec` rather than from the fetched bytes.
+    CopyFile {
+        file: String,
+        to: String,
+        exec: bool,
+    },
     /// Create and verify deterministic debug companions for every ET_EXEC and
     /// ET_DYN below `root`. `objcopy` is an explicitly declared target tool;
     /// the engine walks the tree and validates GNU build IDs, symbols and line
@@ -431,6 +441,14 @@ impl Step {
                 Json::Obj(vec![
                     ("from".into(), Json::Str(from.clone())),
                     ("dest".into(), Json::Str(dest.clone())),
+                ]),
+            )]),
+            Step::CopyFile { file, to, exec } => Json::Obj(vec![(
+                "copyFile".into(),
+                Json::Obj(vec![
+                    ("file".into(), Json::Str(file.clone())),
+                    ("to".into(), Json::Str(to.clone())),
+                    ("exec".into(), Json::Bool(*exec)),
                 ]),
             )]),
             Step::SplitDebugTree { root, objcopy } => Json::Obj(vec![(
@@ -1279,7 +1297,7 @@ impl Recipe {
         self
     }
     /// Declare DATA inputs — see `Recipe::payload_inputs`. A path named here is
-    /// staged for `Unpack`, `CopyTree`, `StageRuntimeClosure`, or
+    /// staged for `Unpack`, `CopyTree`, `CopyFile`, `StageRuntimeClosure`, or
     /// `CompileApplicationTables` to read and has no name in command-step
     /// template expansion.
     pub fn payload_inputs(mut self, xs: &[&str]) -> Recipe {

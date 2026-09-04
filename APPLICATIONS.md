@@ -1488,11 +1488,11 @@ first-window bring-up; later tuning requires measured jailed-browser evidence
 rather than an unreviewed package guess.
 
 The terminal `validateDynamicApplication` step runs only after native
-`CopyTree` and never executes imported code. It accepts the bounded
-`#!/bin/bash` launcher only because `/bin/bash` resolves through the modeled
-`/bin -> /usr/bin` alias in the selected runtime, then closes Bash's own ELF
-graph. Other package scripts are inert data during admission. A direct entry
-must instead be an executable x86-64 ELF. It walks all
+`CopyTree` or `CopyFile` and never executes imported code. It accepts the
+bounded `#!/bin/bash` launcher only because `/bin/bash` resolves through the
+modeled `/bin -> /usr/bin` alias in the selected runtime, then closes Bash's
+own ELF graph. Other package scripts are inert data during admission. A direct
+entry must instead be an executable x86-64 ELF. It walks all
 regular files in the authenticated application tree, parses every ELF
 interpreter, `DT_NEEDED` and run path, and recursively admits regular x86-64
 ELF providers only after their resolved paths remain below the reviewed
@@ -2267,7 +2267,7 @@ one of those satisfies the scanner.
 
 **What actually enforces it is visibility: a marked payload is never
 staged into a `Step::Run` sandbox at all.** Payload data resolve only for
-the typed data operations — `Unpack`, `CopyTree`,
+the typed data operations — `Unpack`, `CopyTree`, `CopyFile`,
 `StageRuntimeClosure`, and whatever spells a runtime path into a spec —
 which are performed by the builder itself rather than by a program the
 recipe chose. A step that
@@ -2307,8 +2307,8 @@ a scan:
   that runtime payload and no extra; mesboot reaches other payload data by a
   template token of its
   own, `{payload:NAME}`, which resolves ONLY in `Unpack`'s `input`,
-  `CopyTree`'s `from`, `StageRuntimeClosure`'s `roots`, and
-  `CompileApplicationTables`' `packages` and `runtimes`. A
+  `CopyTree`'s `from`, `CopyFile`'s `file`, `StageRuntimeClosure`'s
+  `roots`, and `CompileApplicationTables`' `packages` and `runtimes`. A
   command-bearing step has no name
   for a payload — `{payload:…}` there is an error, not a miss, and
   `{in:PAYLOAD}` is an error naming the rule rather than the ordinary
@@ -2392,7 +2392,7 @@ Instead an exhaustive match visits every field the builder's template
 expander visits, including environment values, and deliberately skips
 literal labels and `SubstituteText` edit text that the builder does not
 expand. `{payload:NAME}` is admitted only in `Unpack.input`,
-`CopyTree.from`, `StageRuntimeClosure.roots`, and
+`CopyTree.from`, `CopyFile.file`, `StageRuntimeClosure.roots`, and
 `CompileApplicationTables.packages` and `runtimes`; `{in:NAME}` cannot
 launder a declared
 payload through those fields either. That exhaustiveness makes a new

@@ -3169,7 +3169,7 @@ mod tests {
     /// once a build is attempted. `Recipe::gnu("x", "1").payload_inputs(&["y"])`
     /// otherwise compiles, emits, round-trips and passes every check in this crate,
     /// so the author learns at build time about a mistake visible at eval time.
-    /// `mesboot` has the typed data steps (`unpack`, `copyTree`, and
+    /// `mesboot` has the typed data steps (`unpack`, `copyTree`, `copyFile`, and
     /// `stageRuntimeClosure`) that resolve `{payload:NAME}`. Every application
     /// build system also has the outer spec compiler as one typed consumer.
     fn payload_is_misplaced(recipe: &crate::types::Recipe) -> bool {

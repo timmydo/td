@@ -3317,7 +3317,7 @@ struct StepCtx {
 }
 
 impl StepCtx {
-    /// The COMMAND expander: every step's templates but the five data fields. A
+    /// The COMMAND expander: every step's templates but the six data fields. A
     /// `{payload:…}` here is an error rather than a miss, and `{in:…}` cannot name
     /// a payload because assembly withheld it from TD_INPUT_MAP.
     fn expand(&self, s: &str) -> Result<String, String> {
@@ -3356,8 +3356,8 @@ impl StepCtx {
 
     /// The DATA expander: the same tokens plus `{payload:NAME}`, and used ONLY by
     /// the operations the builder performs itself — `Unpack`'s input,
-    /// `CopyTree`'s source, `StageRuntimeClosure`'s roots, and
-    /// `CompileApplicationTables`' package/runtime pairs. This is the resolution
+    /// `CopyTree`'s source, `CopyFile`'s file, `StageRuntimeClosure`'s roots,
+    /// and `CompileApplicationTables`' package/runtime pairs. This is the resolution
     /// half of §B.8's channel: a step that runs a program the recipe chose has
     /// no name for a payload at all. That is a property, not a scan for one.
     fn expand_data(&self, s: &str) -> Result<String, String> {
@@ -3393,7 +3393,7 @@ impl StepCtx {
                                     return Err(format!(
                                         "mesboot step template: `{name}' is a payloadInput \
                                          and is not reachable through {{in:}} — it is staged \
-                                         as data for unpack/copyTree/stageRuntimeClosure/compileApplicationTables only \
+                                         as data for unpack/copyTree/copyFile/stageRuntimeClosure/compileApplicationTables only \
                                          (APPLICATIONS.md section B.8)"
                                     ));
                                 }
@@ -3411,7 +3411,7 @@ impl StepCtx {
                                     return Err(format!(
                                         "mesboot step template: {{payload:{name}}} resolves \
                                          only in unpack's `input', copyTree's `from', \
-                                         stageRuntimeClosure's `roots', and \
+                                         copyFile's `file', stageRuntimeClosure's `roots', and \
                                          compileApplicationTables' `packages' or `runtimes' — a payload is never \
                                          named by a step that \
                                          runs a command (APPLICATIONS.md section B.8)"
@@ -3665,7 +3665,10 @@ fn glob_one_star(pat: &str) -> Result<Vec<String>, String> {
     Ok(hits)
 }
 
-fn regular_file_without_symlink_components(path: &Path) -> Result<fs::Metadata, String> {
+fn regular_file_without_symlink_components(
+    operation: &str,
+    path: &Path,
+) -> Result<fs::Metadata, String> {
     let mut current = PathBuf::new();
     let mut final_metadata = None;
     for component in path.components() {
@@ -3675,13 +3678,13 @@ fn regular_file_without_symlink_components(path: &Path) -> Result<fs::Metadata, 
             std::path::Component::Normal(name) => current.push(name),
             std::path::Component::ParentDir => {
                 return Err(format!(
-                    "copyFiles: {} contains a parent-directory component",
+                    "{operation}: {} contains a parent-directory component",
                     path.display()
                 ));
             }
             std::path::Component::Prefix(_) => {
                 return Err(format!(
-                    "copyFiles: {} contains an unsupported path prefix",
+                    "{operation}: {} contains an unsupported path prefix",
                     path.display()
                 ));
             }
@@ -3690,7 +3693,7 @@ fn regular_file_without_symlink_components(path: &Path) -> Result<fs::Metadata, 
             .map_err(|e| format!("lstat {}: {e}", current.display()))?;
         if metadata.file_type().is_symlink() {
             return Err(format!(
-                "copyFiles: {} traverses symlink {}; symlinks are refused",
+                "{operation}: {} traverses symlink {}; symlinks are refused",
                 path.display(),
                 current.display()
             ));
@@ -3699,13 +3702,13 @@ fn regular_file_without_symlink_components(path: &Path) -> Result<fs::Metadata, 
     }
     let metadata = final_metadata.ok_or_else(|| {
         format!(
-            "copyFiles: {} has no regular file component",
+            "{operation}: {} has no regular file component",
             path.display()
         )
     })?;
     if !metadata.file_type().is_file() {
         return Err(format!(
-            "copyFiles: {} is not a regular file; special files are refused",
+            "{operation}: {} is not a regular file; special files are refused",
             path.display()
         ));
     }
@@ -3718,13 +3721,115 @@ fn copy_file_writable(from: &Path, dest_dir: &Path) -> Result<(), String> {
     let base = from
         .file_name()
         .ok_or_else(|| format!("copyFiles: {} has no basename", from.display()))?;
-    let metadata = regular_file_without_symlink_components(from)?;
+    let metadata = regular_file_without_symlink_components("copyFiles", from)?;
     fs::create_dir_all(dest_dir).map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
     let to = dest_dir.join(base);
     fs::copy(from, &to)
         .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
     let mode = metadata.permissions().mode();
     fs::set_permissions(&to, fs::Permissions::from_mode((mode & 0o777) | 0o200))
+        .map_err(|e| format!("chmod {}: {e}", to.display()))
+}
+
+/// `copyFile`'s destination must be an exact absolute path strictly inside the
+/// build's own output, with no `..` component, whose existing components below
+/// that root are directories rather than links. The command expander already
+/// keeps a payload template out of `to`; this keeps the DESTINATION out of
+/// `{root}`, `{tools}` and every other tree, because a data step that could
+/// place an executable copy of a payload where a later `run` names it would
+/// hand the recipe exactly the tool §B.8's `ro,noexec` bind withholds.
+fn confined_destination(out: &Path, to: &Path) -> Result<(), String> {
+    let plain = to.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    });
+    let Some(below) = to.strip_prefix(out).ok().filter(|_| plain && !to.is_relative()) else {
+        return Err(format!(
+            "copyFile: destination {} is not a plain path inside the build output {} \
+             (APPLICATIONS.md section B.8)",
+            to.display(),
+            out.display()
+        ));
+    };
+    if below.as_os_str().is_empty() {
+        return Err(format!(
+            "copyFile: destination {} is the build output itself",
+            to.display()
+        ));
+    }
+    let mut current = out.to_path_buf();
+    for component in below.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "copyFile: destination {} traverses symlink {}; symlinks are refused",
+                    to.display(),
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("lstat {}: {error}", current.display())),
+        }
+    }
+    Ok(())
+}
+
+/// `copyFile`: one regular file to an exact destination path. The source may be
+/// a payload (APPLICATIONS.md §B.8) — a marked payload that upstream publishes
+/// as a bare executable rather than an archive has no other way to reach its
+/// `/app` entry name — so the copy is at least as strict as the tree copy: no
+/// symlink or parent component in the source, a destination confined to the
+/// build output and never overwritten, and a mode taken from the recipe's
+/// `exec` rather than from the fetched bytes. That last point is a widening
+/// the tree copy does not have — it can only preserve a mode — and is why the
+/// destination is confined: an execute bit may be minted only under `{out}`,
+/// which is writable and executable for a build's own products already.
+fn copy_single_file(out: &Path, file: &Path, to: &Path, exec: bool) -> Result<(), String> {
+    regular_file_without_symlink_components("copyFile", file)?;
+    confined_destination(out, to)?;
+    let parent = to
+        .parent()
+        .ok_or_else(|| format!("copyFile: {} has no parent directory", to.display()))?;
+    // Every directory this step creates is normalized to 0755 the way the tree
+    // copy normalizes its own: `create_dir` obeys the caller's umask, and a
+    // 0700 `files/bin` would fail the validator's world-traversable rule. The
+    // walk stops at `{out}`, which the build created before its first step and
+    // the confinement above put `to` strictly inside; a missing `{out}` is an
+    // error at the first `mkdir`, not something this step creates.
+    let mut missing = Vec::new();
+    let mut ancestor = Some(parent);
+    while let Some(dir) = ancestor.filter(|dir| *dir != out) {
+        match fs::symlink_metadata(dir) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(dir.to_path_buf())
+            }
+            Err(e) => return Err(format!("stat {}: {e}", dir.display())),
+        }
+        ancestor = dir.parent();
+    }
+    for dir in missing.iter().rev() {
+        fs::create_dir(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", dir.display()))?;
+    }
+    // `create_new` makes "never overwritten" the kernel's promise rather than a
+    // preceding stat's: an existing file, or a link of any kind, fails the open.
+    let mut source = fs::File::open(file)
+        .map_err(|e| format!("copyFile: open {}: {e}", file.display()))?;
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .map_err(|e| format!("copyFile: create {}: {e}", to.display()))?;
+    std::io::copy(&mut source, &mut destination)
+        .map_err(|e| format!("copy {} -> {}: {e}", file.display(), to.display()))?;
+    let mode = if exec { 0o755 } else { 0o644 };
+    fs::set_permissions(to, fs::Permissions::from_mode(mode))
         .map_err(|e| format!("chmod {}: {e}", to.display()))
 }
 
@@ -5188,6 +5293,14 @@ pub fn run_mesboot() -> Result<(), String> {
             let from = ctx.expand_data(&field(o, "from")?).map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             copy_tree_writable(Path::new(&from), Path::new(&dest)).map_err(err)?;
+        } else if let Some(o) = step.get("copyFile") {
+            // `file` is the DATA side and may name a payload; `to` is an exact
+            // path inside this build's own output and may not.
+            let file = ctx.expand_data(&field(o, "file")?).map_err(err)?;
+            let to = ctx.expand(&field(o, "to")?).map_err(err)?;
+            let exec = o.get("exec").is_some_and(Json::is_true);
+            copy_single_file(Path::new(&ctx.out), Path::new(&file), Path::new(&to), exec)
+                .map_err(err)?;
         } else if let Some(o) = step.get("splitDebugTree") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
             let objcopy = ctx.expand(&field(o, "objcopy")?).map_err(err)?;
@@ -5462,6 +5575,90 @@ mod tests {
         let error = cargo_git_package_root(&root, "linked").unwrap_err();
         assert!(error.contains("symlink"), "{error}");
         assert!(cargo_git_package_root(&root, "../outside").is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// `copyFile` places one payload byte-for-byte under a reviewed name with a
+    /// recipe-chosen mode, and refuses what a data copy must: a symlink source,
+    /// an occupied destination, and any destination that is not a plain
+    /// absolute path strictly inside the build output — outside it, `..`
+    /// through it, the output itself, a relative spelling, or a symlinked
+    /// component below it.
+    #[test]
+    fn copy_file_places_one_regular_file_strictly() {
+        let base = std::env::temp_dir().join(format!("td-copy-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("store")).unwrap();
+        fs::create_dir_all(base.join("tools")).unwrap();
+        // `{out}` exists before a build's first step; the step never creates it.
+        let out = base.join("out");
+        fs::create_dir(&out).unwrap();
+        let payload = base.join("store/abc-claude-code-source");
+        fs::write(&payload, b"\x7fELF-bytes").unwrap();
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let absent = base.join("absent");
+        let unbounded =
+            copy_single_file(&absent, &payload, &absent.join("files/x"), true).unwrap_err();
+        assert!(unbounded.contains("mkdir"), "{unbounded}");
+        assert!(!absent.exists());
+
+        let entry = out.join("files/bin/claude");
+        copy_single_file(&out, &payload, &entry, true).unwrap();
+        assert_eq!(fs::read(&entry).unwrap(), b"\x7fELF-bytes");
+        assert_eq!(fs::metadata(&entry).unwrap().permissions().mode() & 0o7777, 0o755);
+        // Every directory the step created is world-traversable whatever the
+        // umask, which the application validators require of a package tree.
+        for dir in ["out/files", "out/files/bin"] {
+            assert_eq!(
+                fs::metadata(base.join(dir)).unwrap().permissions().mode() & 0o7777,
+                0o755,
+                "{dir}"
+            );
+        }
+
+        let data = out.join("files/share/notes");
+        copy_single_file(&out, &payload, &data, false).unwrap();
+        assert_eq!(fs::metadata(&data).unwrap().permissions().mode() & 0o7777, 0o644);
+
+        let occupied = copy_single_file(&out, &payload, &entry, true).unwrap_err();
+        assert!(occupied.contains("create") && occupied.contains("exists"), "{occupied}");
+        // A regular file where a parent should be is refused by the confinement
+        // walk's own stat of the path beneath it (ENOTDIR is not NotFound), so
+        // nothing is created beside it and no `mkdir` is attempted.
+        fs::write(out.join("files/plain"), b"").unwrap();
+        let blocked =
+            copy_single_file(&out, &payload, &out.join("files/plain/x"), true).unwrap_err();
+        assert!(blocked.contains("lstat"), "{blocked}");
+
+        let link = base.join("store/link");
+        std::os::unix::fs::symlink(&payload, &link).unwrap();
+        let linked =
+            copy_single_file(&out, &link, &out.join("files/bin/other"), true).unwrap_err();
+        assert!(linked.contains("symlink"), "{linked}");
+
+        // The destination side: the three spellings that would let a data step
+        // mint an executable outside the build's own output. A `.` component
+        // is not among them: `Path::components` drops it, and it cannot escape.
+        for outside in [
+            base.join("tools/cc"),
+            out.join("../tools/cc"),
+            PathBuf::from("files/bin/cc"),
+        ] {
+            let refused = copy_single_file(&out, &payload, &outside, true).unwrap_err();
+            assert!(
+                refused.contains("not a plain path inside the build output"),
+                "{}: {refused}",
+                outside.display()
+            );
+            assert!(!base.join("tools/cc").exists());
+        }
+        let itself = copy_single_file(&out, &payload, &out, true).unwrap_err();
+        assert!(itself.contains("build output itself"), "{itself}");
+        std::os::unix::fs::symlink(base.join("tools"), out.join("escape")).unwrap();
+        let through = copy_single_file(&out, &payload, &out.join("escape/cc"), true).unwrap_err();
+        assert!(through.contains("traverses symlink"), "{through}");
+        assert!(!base.join("tools/cc").exists());
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -6863,25 +7060,26 @@ mod tests {
     /// `expand_data` resolving `{payload:}` is the whole permission §B.8 grants,
     /// and the compiler has nothing to say about which expander a step picked — a
     /// new step that reached for it, or an existing one changed to, would widen
-    /// the channel with every other test in this file still green. Five sites, and
-    /// which FIELD each serves, since `copyTree`'s `dest` taking it would put a
-    /// payload path on the writable side of a copy.
+    /// the channel with every other test in this file still green. Six sites, and
+    /// which FIELD each serves, since `copyTree`'s `dest` or `copyFile`'s `to`
+    /// taking it would put a payload path on the writable side of a copy.
     #[test]
-    fn only_the_five_typed_data_fields_use_the_data_expander() {
+    fn only_the_six_typed_data_fields_use_the_data_expander() {
         let compact = compact_mesboot_dispatch();
         let sites = [
             "ctx.expand_data(&field(o,\"input\")?)",
             "ctx.expand_data(&field(o,\"from\")?)",
+            "ctx.expand_data(&field(o,\"file\")?)",
             "ctx.expand_data_all(&string_array(o,\"roots\").map_err(err)?)",
             "ctx.expand_data_all(&string_array(o,\"packages\").map_err(err)?)",
             "ctx.expand_data_all(&string_array(o,\"runtimes\").map_err(err)?)",
         ];
         assert_eq!(
             compact.match_indices("ctx.expand_data").count(),
-            5,
-            "only unpack's `input', copyTree's `from', stageRuntimeClosure's `roots', \
-             and compileApplicationTables' `packages' and `runtimes' may resolve a payload \
-             (APPLICATIONS.md section B.8)"
+            6,
+            "only unpack's `input', copyTree's `from', copyFile's `file', \
+             stageRuntimeClosure's `roots', and compileApplicationTables' `packages' and \
+             `runtimes' may resolve a payload (APPLICATIONS.md section B.8)"
         );
         let positions: Vec<usize> = sites
             .iter()
@@ -6893,7 +7091,7 @@ mod tests {
             .collect();
         assert!(
             positions.windows(2).all(|pair| pair.first() < pair.get(1)),
-            "the five data-expander fields changed order: {positions:?}"
+            "the six data-expander fields changed order: {positions:?}"
         );
     }
 
