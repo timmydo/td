@@ -719,12 +719,20 @@ fn main() {
             },
         },
         Personality::Term => run_term(&args),
-        Personality::Control => match run_control(&args) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                eprintln!("{}: {}", personality.program(), error.message());
-                process::exit(error.exit_code());
-            }
+        // Shaped like `Demo` above rather than calling straight through: `args`
+        // is `OsString` since td-term gained a child argv that may legitimately
+        // not be UTF-8, and td-ctl's vocabulary is text. Each personality
+        // decides that for itself, which is what the comment on `args` says and
+        // what this arm had stopped doing.
+        Personality::Control => match utf8_args(&args) {
+            Err(error) => Err(error),
+            Ok(args) => match run_control(&args) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    eprintln!("{}: {}", personality.program(), error.message());
+                    process::exit(error.exit_code());
+                }
+            },
         },
     };
     if let Err(error) = result {
