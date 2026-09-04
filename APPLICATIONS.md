@@ -8252,6 +8252,55 @@ needs a renderer that scales and rotates. Naming the two apart is what this
 row buys; moving callers to the logical one is the KMS landing's.
 `td-compositor/DESIGN.md` carries why each caller reads what it reads.
 
+Row 1's DISCOVERY half has landed, and it is worth being exact about which
+half. `td-compositor/src/drm.rs` opens a card node, asks which driver is behind
+it, enumerates connectors, encoders and CRTCs, and chooses the connector to
+drive, the mode to ask for, and a CRTC that can drive it. The kernel ABI —
+four value-pinned `ioctl` requests and their `#[repr(C)]` structs — is in
+`sys.rs` with the rest of the crate's syscalls; what is in `drm.rs` is policy,
+which is what makes the selection testable against recorded connector shapes
+rather than against a card. `UNSAFE.md` §6 carries the amendment.
+
+Nothing in it modesets, allocates a buffer or maps memory, and the confinement
+test names the six write-side requests as ABSENT so the backend adds each by
+amendment rather than arriving with a module that already has them.
+
+It does, however, take DRM mastership, and saying otherwise was this
+increment's one real defect. Opening a PRIMARY node makes the opener master
+whenever `dev->master` is NULL, which is exactly the state fbcon leaves it in,
+so `SET_MASTER` never being issued proves nothing — the `open` is the
+acquisition, and while it is held the fbdev damage the running compositor
+depends on is refused with `-EBUSY`. `open_card` therefore drops mastership
+immediately, and the confinement test pins that release rather than the
+absence of `SET_MASTER`. What lets this probe run beside the compositor
+driving the same card is the drop, not an absence.
+
+The same correction applies to how the connector is read. `count_modes = 0` is
+the kernel's FORCE-PROBE request, which its own header says "can be slow,
+might cause flickering and the ioctl will block"; the counting form the UAPI
+documents is `count_modes = 1` with room for one mode, and that is what this
+now sends.
+
+It also states its own limit, because the limit is load-bearing.
+`DRM_IOCTL_MODE_GETCONNECTOR` re-probes a connector only for the current DRM
+master and demotes everyone else to a read-only probe, so what discovery reads
+is the mode list the kernel already had. On a td image that list is the one
+`fbcon` produced, which is exactly the list a backend would inherit — but a
+connector reporting no modes here is as much a statement about mastership as
+about the sink, and the diagnostic says so rather than calling the screen
+absent.
+
+Two things it does NOT settle, recorded because assuming otherwise is the
+expensive mistake. The card node is `root:root` mode 0600 under devtmpfs, and
+td has no udev, so the ui user CANNOT open it: the probe runs as root on the
+health leg, and granting the compositor's own account a card is `td-seatd`'s
+to do — it already assigns `/dev/fb0`, `/dev/input` and `/dev/snd`, and a DRM
+node is a row there rather than a new mechanism. And `possible_crtcs` is a
+bitmask over INDEXES into the resources' CRTC list, not over CRTC ids; reading
+it as ids is the classic way to modeset onto a pipe an encoder cannot drive,
+and it is silent, because ids are small integers too. A test pins the
+distinction on a list whose ids and indexes deliberately disagree.
+
 Row 2 has NOT landed: there are no leases and no completion, and td still
 gives a buffer back the moment it stops needing the bytes — because it copied
 them, because it declined to keep them, because a newer commit replaced them,

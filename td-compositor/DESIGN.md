@@ -3769,9 +3769,42 @@ the kernel's conforming ancillary framing.
   listener;
 - fcntl(2), with only `F_GETFL` and `F_SETFL`, to add `O_NONBLOCK` while one
   clipboard source writes and restore the destination's prior status; and
-- ioctl(2), for the four pinned terminal-control requests in section 12 and
-  the two pinned `EVIOCGABS` requests that read an absolute pointer's
-  declared axis range.
+- ioctl(2), for the four pinned terminal-control requests in section 12, the
+  two pinned `EVIOCGABS` requests that read an absolute pointer's declared
+  axis range, and the four pinned DRM requests below that read a card.
+
+The DRM five are reached only from `drm.rs`. Four READ — `DRM_IOCTL_VERSION`,
+`MODE_GETRESOURCES`, `MODE_GETCONNECTOR` and `MODE_GETENCODER`. Nothing in this
+crate modesets, allocates a buffer or maps memory; the confinement test names
+the six write-side requests as absent so that `APPLICATIONS.md` §M's backend
+adds each by amendment.
+
+The fifth, `DROP_MASTER`, is on the roster because opening a primary node
+GRANTS mastership: `drm_master_open` makes the first opener master when
+`dev->master` is NULL, and fbcon never sets it. So `open_card` releases it
+immediately; while it is held the fbdev damage this compositor depends on
+would be refused with `-EBUSY`. The confinement test pins the release rather
+than the absence of `SET_MASTER`, which an earlier revision mistook for proof
+of the same thing. They are issued
+through a second entry point, `drm_ioctl`, which retries `EINTR`/`EAGAIN` a
+bounded number of times because the kernel's own `drm_ioctl` takes the
+mode-config lock interruptibly — that entry point shares the one allow-list, so
+the roster stays a single list. Each request number's `_IOC` size field is
+tested against `size_of` of the struct it carries, and `DrmModeInfo` is pinned
+at 68 bytes separately because it is not an argument but the ELEMENT of the
+array `modes_ptr` points at, making its size the kernel's copy stride.
+
+That the compositor cannot yet OPEN a card as its own user is a fact about the
+image rather than about this surface: devtmpfs creates `/dev/dri/card0`
+root-owned at mode 0600 and td runs no udev, so the boot probe runs as root and
+granting the ui account a card belongs to `td-seatd` beside `/dev/fb0`.
+
+Discovery does not gate boot success. The probe prints its report and a
+failure prints a diagnostic, but neither moves `healthy`: every other leg of
+that verdict is hardware-independent, and making a deployment mark itself bad
+because no connector reported a mode would put a machine with no monitor into
+a rollback loop. The proof that discovery works lives in the QEMU check, which
+requires the marker, the `virtio_gpu` driver and a non-zero scanout size.
 
 No framebuffer, socket, allocation, process, or filesystem operation passes
 through that surface, and no input REPORT: every evdev record td acts on is

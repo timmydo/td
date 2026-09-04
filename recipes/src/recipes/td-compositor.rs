@@ -26,6 +26,7 @@ const MODULES: &[(&str, &str)] = &[
     ),
     ("conn", include_str!("../../../td-compositor/src/conn.rs")),
     ("control", include_str!("../../../td-compositor/src/control.rs")),
+    ("drm", include_str!("../../../td-compositor/src/drm.rs")),
     ("filter", include_str!("../../../td-compositor/src/filter.rs")),
     ("font", include_str!("../../../td-compositor/src/font.rs")),
     (
@@ -240,6 +241,7 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ladder::TD_COMPOSITOR_DRM_PROBE_MARKER;
     use super::super::system_x86_64::{ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME};
     use crate::ladder::{
         TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
@@ -525,5 +527,24 @@ mod tests {
         // `/bin/cttyhack` is td-init's own symlink name in the image roster.
         const INIT_MAIN: &str = include_str!("../../../td-init/src/main.rs");
         assert!(INIT_MAIN.contains(r#"("cttyhack", cttyhack::run)"#));
+    }
+
+    /// The ladder's marker and the string the compositor actually prints are
+    /// two copies of one fact in two crates that cannot import each other, so
+    /// the only thing that can hold them together is a test that reads both.
+    ///
+    /// The boot check greps for this marker at the START of a line and then
+    /// believes the fields after it. A compositor that printed a different
+    /// string would fail the boot with "the marker was absent", which reads as
+    /// a broken card rather than as a renamed constant.
+    #[test]
+    fn the_drm_probe_marker_is_the_one_the_compositor_prints() {
+        assert!(
+            MAIN_RS.contains(&format!("\"{TD_COMPOSITOR_DRM_PROBE_MARKER} {{}} output={{}}x{{}}\"")),
+            "td-compositor no longer prints {TD_COMPOSITOR_DRM_PROBE_MARKER} in the shape the boot check greps for"
+        );
+        // And the subcommand that prints it is reachable by the name the image
+        // invokes.
+        assert!(MAIN_RS.contains("\"probe-drm\" => {"));
     }
 }

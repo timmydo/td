@@ -58,7 +58,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)`; plus one scoped client-side clipboard descriptor adoption |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with eleven value-pinned requests; plus one scoped client-side clipboard descriptor adoption |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -382,9 +382,72 @@ more sharply — `value`, `minimum` and `maximum` are three ADJACENT words of
 the same type, so an index off by one is a well-formed position and range
 that maps every report to the wrong part of the screen, with nothing
 observable to say so.
+Five more requests joined that roster for DRM/KMS DISCOVERY, reached only
+from `drm.rs` — a FOURTH disjoint module on this surface, and, like the
+pointer's, not a widening of any existing one. `DRM_IOCTL_VERSION`
+(0xc0406400) asks which driver is behind a card node;
+`DRM_IOCTL_MODE_GETRESOURCES` (0xc04064a0) asks what it has;
+`DRM_IOCTL_MODE_GETCONNECTOR` (0xc05064a7) and `DRM_IOCTL_MODE_GETENCODER`
+(0xc01464a6) ask about one connector and one encoder. `APPLICATIONS.md` §M's
+first row is a DRM/KMS output backend, and this is the half of it that only
+READS: nothing here modesets, allocates a buffer or maps memory.
+
+The fifth exists because "reads only" was not true of the OPEN.
+`DRM_IOCTL_DROP_MASTER` (0x641f) writes nothing to a display; it gives back
+authority this process is handed without asking for it. `drm_master_open` in
+`drivers/gpu/drm/drm_auth.c` makes the first opener of a PRIMARY node the DRM
+master whenever `dev->master` is NULL, and an in-kernel client — fbcon, fbdev
+emulation — never sets it, so on a td image the plain `open` of
+`/dev/dri/card0` IS the acquisition. While it is held,
+`drm_fb_helper_damage_work`'s `drm_master_internal_acquire` answers `-EBUSY`
+and the running compositor's damage is dropped until the descriptor closes.
+An earlier revision of this section reasoned from the absence of
+`SET_MASTER` and concluded the probe took no mastership; that was exactly
+backwards, and two reviewers caught it. Dropping the mastership on the one
+path that opens a card is what makes the claim a property of the code, and
+the confinement test now pins the DROP rather than the absence of the SET.
+`SET_MASTER` remains off the roster, and that asymmetry is the point: giving
+authority back is this increment's, taking it is the backend's.
+
+`MODE_SETCRTC`, `MODE_CREATE_DUMB`, `MODE_MAP_DUMB`, `MODE_ADDFB2`,
+`MODE_PAGE_FLIP` and `MODE_ATOMIC` are named in the confinement test as ABSENT
+rather than left unmentioned, so the backend landing adds each by amendment
+instead of arriving with a module that already has them.
+
+Those four are pinned for `EVIOCGABS`'s reason, arriving at it a third way.
+`_IOC` packs the argument's SIZE into bits 16..30 of a request number, and the
+kernel copies exactly that many bytes through the pointer, so each number
+states the layout of the struct it is issued with: a Rust `#[repr(C)]` that
+drifts from its request is an out-of-bounds kernel write through code the
+compiler reads as safe. A test extracts that size field from each of the four
+and compares it to `size_of` of the struct, and a second test writes out the
+kernel's own byte counts — 64, 64, 80 and 20 for Linux 7.1.4 on x86-64 —
+rather than deriving them from the request numbers, because deriving them
+would let both sides move together. `DrmModeInfo` is pinned at 68 bytes in
+that second test for a reason no request number can express: it is never an
+ioctl argument but the ELEMENT of the array `modes_ptr` points at, so its size
+is the kernel's copy STRIDE, and a drift there walks a 68-byte record across a
+differently-sized slot.
+
+Two properties of these four are unlike the other six. They are issued through
+a SECOND entry point, `drm_ioctl`, which retries `EINTR` and `EAGAIN` up to a
+bounded count: `drm_ioctl` in the kernel takes the mode-config lock with
+`mutex_lock_interruptible`, so a restart is an ordinary answer rather than a
+failure, which is why libdrm's own `drmIoctl` is a loop. Bounded rather than
+unbounded, because a device answering `EAGAIN` forever is a broken device and a
+compositor that hangs in discovery never gets to say so. That second entry
+point shares the ONE allow-list — it calls the same `ioctl_checked` — so the
+roster remains one list rather than two. And three of the four are two-call
+requests, where the first asks a COUNT and the second offers buffers sized from
+it: a count read from the device is then used as an allocation length, so each
+is checked against a ceiling (64 objects of a kind, 256 modes) before anything
+is allocated from it, and a fill reporting more than it was given is retried
+rather than believed, since the kernel copies a connector's mode and encoder
+arrays all-or-nothing.
+
 The request roster is enforced in code, not only in a test — one
-`ioctl` entry point refuses anything outside the six before issuing the
-syscall — and the winsize argument is an `[u16; 4]` rather than a
+allow-list refuses anything outside the eleven before either entry point
+issues the syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.
 `TIOCGPTPEER`'s returned number is adopted through the SAME

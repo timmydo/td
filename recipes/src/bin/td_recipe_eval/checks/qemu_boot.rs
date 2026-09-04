@@ -133,6 +133,22 @@ const TD_PORTAL_CHANNEL_CONSOLE_MARKER: &str =
 /// the resolved `.config`; this is what makes a kernel regression red the IMAGE
 /// rather than the first application to be jailed.
 const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
+const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_DRM_PROBE_MARKER;
+
+/// The longest DRM report this will read back, past which the line is not one
+/// this check understands.
+///
+/// It exists to bound the rescan overlap: `drain_console` re-presents the tail
+/// of the previous read so a marker split across two reads is still seen, and
+/// an unbounded line would make that overlap unbounded too.
+///
+/// The headroom is real but not generous, and an earlier comment here claimed
+/// it was: a virtio-gpu line is about 146 bytes of the 256, and a driver with a
+/// long name and a long mode name could exceed it. Past the bound the line is
+/// SKIPPED, and the boot then fails with "the marker was absent", which reads
+/// as a broken card rather than as a report nobody would print. That is the
+/// known unhelpful failure of this bound rather than a residual risk.
+const DRM_REPORT_MAX: usize = 256;
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
 /// APPLICATIONS.md §H item 12. What it attests is stated once, on
@@ -422,6 +438,12 @@ struct ConsoleEvidence {
     td_sandbox_kernel: bool,
     td_jail_transition: bool,
     td_jail_seccomp: bool,
+    /// The whole DRM discovery line, not a flag. What a KMS backend will
+    /// be built on is the driver, the connector's status and the mode's
+    /// size, and an image that still has a card but has stopped offering
+    /// a usable mode would satisfy a boolean while failing the thing the
+    /// marker is for.
+    td_compositor_drm: Option<String>,
     td_jail_kill_reaps: bool,
     td_firefox: bool,
     td_firefox_content: bool,
@@ -1951,6 +1973,58 @@ fn validate_system_boot(
              authoritative target-kernel result. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
+    }
+    match result.evidence.td_compositor_drm.as_deref() {
+        None => {
+            return Err(format!(
+                "td-compositor's DRM discovery marker ({TD_COMPOSITOR_DRM_PROBE_MARKER:?}) was \
+                 absent. The kernel pins CONFIG_DRM, CONFIG_DRM_VIRTIO_GPU and \
+                 CONFIG_DRM_VIRTIO_GPU_KMS and QEMU attaches a virtio-vga, so /dev/dri/card0 \
+                 exists on every boot of this image and enumerating it is not conditional on \
+                 anything. An absent marker is therefore one of: the node was not created, the \
+                 card refused a read that the driver is supposed to answer, or no connector \
+                 offered a mode a backend could drive — and §M's first row is built on all \
+                 three being true. Last serial output:\n{}",
+                tail(&result.console, 80)
+            ));
+        }
+        Some(report) => {
+            // The line is the evidence, so the line is what is checked. A card
+            // that still enumerates but has stopped offering a driveable mode
+            // would print a marker and satisfy anything weaker than this.
+            let driver = report
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("driver="))
+                .unwrap_or_default();
+            if driver != "virtio_gpu" {
+                return Err(format!(
+                    "td-compositor enumerated a DRM device, but the driver behind /dev/dri/card0 \
+                     is {driver:?} rather than \"virtio_gpu\". QEMU is started with \
+                     `-vga none -device virtio-vga`, so anything else means the image booted \
+                     against a different display device than the one its kernel config pins \
+                     for. Report was: {report}"
+                ));
+            }
+            let output = report
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("output="))
+                .unwrap_or_default();
+            let dimensions = output
+                .split_once('x')
+                .and_then(|(width, height)| Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?)));
+            match dimensions {
+                Some((width, height)) if width > 0 && height > 0 => {}
+                _ => {
+                    return Err(format!(
+                        "td-compositor enumerated /dev/dri/card0 but reported no usable scanout \
+                         size ({output:?}). A mode with a zero axis is refused where it is read \
+                         rather than dividing by zero in a backend later, so this is the \
+                         connector offering nothing a frame could be allocated against. \
+                         Report was: {report}"
+                    ));
+                }
+            }
+        }
     }
     if !result.evidence.td_jail_seccomp {
         return Err(format!(
@@ -4774,6 +4848,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_INIT_RUNTIME_MARKER.len(),
         TD_LOGIN_RUNTIME_MARKER.len(),
         TD_BUSD_RUNTIME_MARKER.len(),
+        TD_COMPOSITOR_DRM_PROBE_MARKER.len() + 1 + DRM_REPORT_MAX,
         exact_line_window(TD_PORTAL_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_REQUEST_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_CHANNEL_CONSOLE_MARKER),
@@ -5017,6 +5092,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_jail_seccomp,
         buf,
         TD_JAIL_SECCOMP_PROBE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_reported_line(
+        &mut evidence.td_compositor_drm,
+        buf,
+        TD_COMPOSITOR_DRM_PROBE_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -5320,6 +5401,66 @@ fn latch_prefixed_line_marker(
             *found = true;
             return;
         }
+    }
+}
+
+/// Latch a whole line that follows a marker, rather than the fact of one.
+///
+/// Modelled on `latch_prefixed_line_marker`: the marker must begin a line. What
+/// differs is that the rest of the line is kept, because for this marker the
+/// rest of the line IS the evidence.
+///
+/// That rule stops a marker printed MID-LINE and nothing more. It is not an
+/// anti-forgery property and an earlier comment here said it was: anything that
+/// can write to this console can write a newline followed by the marker. What
+/// actually makes the genuine report the one that is read is that this latches
+/// the FIRST match and the probe runs before anything a client could drive --
+/// the same standing of every boolean marker beside it, no weaker and no
+/// stronger.
+///
+/// A line longer than `DRM_REPORT_MAX` is skipped rather than truncated. A
+/// truncated report would be read as a shorter, well-formed one, and the
+/// fields the check goes on to assert would come from a line nobody wrote.
+fn latch_reported_line(
+    found: &mut Option<String>,
+    haystack: &[u8],
+    marker: &[u8],
+    starts_at_stream_boundary: bool,
+) {
+    if found.is_some() {
+        return;
+    }
+    for start in 0..haystack.len() {
+        if (start != 0 || !starts_at_stream_boundary)
+            && haystack.get(start.wrapping_sub(1)) != Some(&b'\n')
+        {
+            continue;
+        }
+        let Some(after) = start.checked_add(marker.len()) else {
+            return;
+        };
+        if haystack.get(start..after) != Some(marker) {
+            continue;
+        }
+        let Some(rest) = haystack.get(after..) else {
+            continue;
+        };
+        // No terminator yet: this is the end of what has been read, not a
+        // malformed line. The rescan will present it again once the rest
+        // arrives, which is what the overlap above is sized for.
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        if end > DRM_REPORT_MAX {
+            continue;
+        }
+        let body = rest.get(..end).unwrap_or_default();
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let Ok(body) = std::str::from_utf8(body) else {
+            continue;
+        };
+        *found = Some(body.trim().to_string());
+        return;
     }
 }
 
@@ -8608,6 +8749,64 @@ mod tests {
         assert!(evidence.td_jail_seccomp);
     }
 
+    /// A boot whose every latched marker is present.
+    ///
+    /// Shared by the rows that assert WHICH marker a complaint names. Each
+    /// such test clears exactly one field, so the fixture has to set every
+    /// other one -- a row added without a line here makes its own test pass
+    /// (the field is absent, so the walk complains) while silently breaking
+    /// every row after it, whose complaint becomes the new row's instead.
+    ///
+    /// Not latched from the marker roster: that sets fields to a combination
+    /// no real boot produces -- every selection outcome at once -- which the
+    /// selection check rightly refuses.
+    fn healthy_evidence() -> ConsoleEvidence {
+    let mut evidence = ConsoleEvidence::default();
+    evidence.boot_success = true;
+    evidence.codex_runtime = true;
+    evidence.etc_mutable = true;
+    evidence.etc_read_only = true;
+    evidence.firstboot_new = true;
+    evidence.git_runtime = true;
+    evidence.host_key = Some("ssh-ed25519 AAAA".to_string());
+    evidence.persist_read = true;
+    evidence.persist_write = true;
+    evidence.ripgrep_fd_runtime = true;
+    evidence.root_read_only = true;
+    evidence.selected_current = true;
+    evidence.sshd = true;
+    evidence.state_owner = true;
+    evidence.state_writable = true;
+    evidence.target = true;
+    evidence.td_busd_runtime = true;
+    evidence.td_firefox = true;
+    evidence.td_firefox_content = true;
+    evidence.td_firefox_support = true;
+    evidence.td_init_runtime = true;
+    evidence.td_compositor_drm = Some(
+        "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 \
+         mode=1280x800@60 name=1280x800 preferred=true mm=0x0 output=1280x800"
+            .to_string(),
+    );
+    evidence.td_jail_kill_reaps = true;
+    evidence.td_jail_seccomp = true;
+    evidence.td_jail_transition = true;
+    evidence.td_login_runtime = true;
+    evidence.td_pointer_absolute = true;
+    evidence.td_portal_channel_runtime = true;
+    evidence.td_portal_request_runtime = true;
+    evidence.td_portal_runtime = true;
+    evidence.td_portal_unavailable_runtime = true;
+    evidence.td_profiler_attribution = true;
+    evidence.td_sandbox_kernel = true;
+    evidence.td_term_runtime = true;
+    evidence.td_txt_runtime = true;
+    evidence.td_util_runtime = true;
+    evidence.td_wayland_runtime = true;
+    evidence.uutils_runtime = true;
+        evidence
+    }
+
     /// The boot-validation row itself, not merely the latch that feeds it.
     ///
     /// The first version of this commit argued that no `validate_system_boot`
@@ -8634,44 +8833,7 @@ mod tests {
         // persistent-shutdown row and complains about that instead, which
         // is why the assertions below are about WHICH marker the complaint
         // names rather than about there being no complaint.
-        let mut evidence = ConsoleEvidence::default();
-        evidence.boot_success = true;
-        evidence.codex_runtime = true;
-        evidence.etc_mutable = true;
-        evidence.etc_read_only = true;
-        evidence.firstboot_new = true;
-        evidence.git_runtime = true;
-        evidence.host_key = Some("ssh-ed25519 AAAA".to_string());
-        evidence.persist_read = true;
-        evidence.persist_write = true;
-        evidence.ripgrep_fd_runtime = true;
-        evidence.root_read_only = true;
-        evidence.selected_current = true;
-        evidence.sshd = true;
-        evidence.state_owner = true;
-        evidence.state_writable = true;
-        evidence.target = true;
-        evidence.td_busd_runtime = true;
-        evidence.td_firefox = true;
-        evidence.td_firefox_content = true;
-        evidence.td_firefox_support = true;
-        evidence.td_init_runtime = true;
-        evidence.td_jail_kill_reaps = true;
-        evidence.td_jail_seccomp = true;
-        evidence.td_jail_transition = true;
-        evidence.td_login_runtime = true;
-        evidence.td_pointer_absolute = true;
-        evidence.td_portal_channel_runtime = true;
-        evidence.td_portal_request_runtime = true;
-        evidence.td_portal_runtime = true;
-        evidence.td_portal_unavailable_runtime = true;
-        evidence.td_profiler_attribution = true;
-        evidence.td_sandbox_kernel = true;
-        evidence.td_term_runtime = true;
-        evidence.td_txt_runtime = true;
-        evidence.td_util_runtime = true;
-        evidence.td_wayland_runtime = true;
-        evidence.uutils_runtime = true;
+        let evidence = healthy_evidence();
 
         // The console is left EMPTY even though the markers were latched
         // from it. Every complaint echoes a serial tail, and a tail holding
@@ -8713,6 +8875,221 @@ mod tests {
             complaint.contains(TD_JAIL_KILL_REAPS_MARKER),
             "the rejection must name the marker that was absent: {complaint}"
         );
+    }
+
+    /// The whole report is read back off its own line.
+    #[test]
+    fn a_drm_report_is_read_off_its_own_line() {
+        let mut found = None;
+        let line = format!(
+            "{TD_COMPOSITOR_DRM_PROBE_MARKER} driver=virtio_gpu output=1280x800\n"
+        );
+        latch_reported_line(
+            &mut found,
+            format!("boot noise\n{line}").as_bytes(),
+            TD_COMPOSITOR_DRM_PROBE_MARKER.as_bytes(),
+            true,
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some("driver=virtio_gpu output=1280x800")
+        );
+    }
+
+    /// A process that merely prints the marker mid-line supplies no evidence.
+    ///
+    /// This is the same rule the boolean markers get, and it matters more here:
+    /// the fields after the marker are read and believed, so a line a jailed
+    /// application could compose would be a line it could put a driver name in.
+    #[test]
+    fn a_marker_that_does_not_begin_a_line_is_not_a_drm_report() {
+        let mut found = None;
+        latch_reported_line(
+            &mut found,
+            format!("look: {TD_COMPOSITOR_DRM_PROBE_MARKER} driver=evil output=1x1\n").as_bytes(),
+            TD_COMPOSITOR_DRM_PROBE_MARKER.as_bytes(),
+            true,
+        );
+        assert_eq!(found, None);
+    }
+
+    /// A line still arriving is not a malformed one: it waits for the rescan.
+    #[test]
+    fn a_drm_report_split_across_two_reads_arrives_on_the_rescan() {
+        let whole = format!(
+            "{TD_COMPOSITOR_DRM_PROBE_MARKER} driver=virtio_gpu output=1280x800\n"
+        );
+        let cut = whole.len() - 8;
+        let mut found = None;
+        latch_reported_line(
+            &mut found,
+            whole.get(..cut).unwrap_or_default().as_bytes(),
+            TD_COMPOSITOR_DRM_PROBE_MARKER.as_bytes(),
+            true,
+        );
+        assert_eq!(found, None, "half a line is not a report");
+        latch_reported_line(
+            &mut found,
+            whole.as_bytes(),
+            TD_COMPOSITOR_DRM_PROBE_MARKER.as_bytes(),
+            true,
+        );
+        assert!(found.is_some(), "the rescan presents the whole line");
+    }
+
+    /// The rescan overlap really does carry a maximum-length report across a
+    /// read boundary.
+    ///
+    /// Driven through `drain_console_to_eof` on a real file, the way
+    /// `drain_console_latches_a_marker_split_across_a_read_boundary` is. An
+    /// earlier version of this test compared `evidence_marker_max_len` against
+    /// the same expression it is built from -- `M >= M`, true however the
+    /// retained tail is computed -- so it could not have failed for the
+    /// off-by-one it existed to catch.
+    ///
+    /// The seam is placed so that the ENTIRE report except its terminating
+    /// newline lands in the first read. That is the worst case: the retained
+    /// tail has to carry the leading newline, the marker and a full
+    /// `DRM_REPORT_MAX` of body.
+    ///
+    /// What this pins is the REQUIREMENT, not the entry that satisfies it, and
+    /// the difference is worth stating because it was measured rather than
+    /// assumed. `evidence_marker_max_len` currently answers 297 while a
+    /// longest DRM report needs 283, so the entry added for this marker is not
+    /// today's maximum and deleting it alone leaves this green -- an unrelated
+    /// marker is carrying it. The entry stays because that slack belongs to a
+    /// constant nothing here controls, and this test stays because it is what
+    /// fails if the overlap ever drops below what a full report needs, whoever
+    /// was providing it. Verified by construction: with the overlap forced
+    /// short this test goes red.
+    #[test]
+    fn drain_console_carries_a_longest_drm_report_across_a_read_boundary() {
+        const CHUNK: usize = 8192;
+        let prefix = " driver=virtio_gpu output=1280x800 pad=";
+        let field = format!(
+            "{prefix}{}",
+            "y".repeat(DRM_REPORT_MAX.saturating_sub(prefix.len()))
+        );
+        assert_eq!(field.len(), DRM_REPORT_MAX, "the widest report the latch takes");
+        let line = format!("{TD_COMPOSITOR_DRM_PROBE_MARKER}{field}");
+
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+
+        // Everything up to and including the last body byte is in read 1; the
+        // terminating newline is the first byte of read 2.
+        let pad = CHUNK.saturating_sub(line.len() + 1);
+        let mut bytes = vec![b'x'; pad];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(line.as_bytes());
+        assert_eq!(bytes.len(), CHUNK, "the newline must land on the seam");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[b'z'; 128]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            &mut evidence,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.td_compositor_drm.as_deref(),
+            Some(field.trim()),
+            "the retained tail did not carry a maximum-length report - the rescan overlap \
+             regressed"
+        );
+    }
+
+    /// Past the bound the line is skipped, not truncated: a truncated report
+    /// reads as a shorter well-formed one, and its fields are then asserted.
+    #[test]
+    fn a_drm_report_past_the_bound_is_skipped_rather_than_truncated() {
+        let mut found = None;
+        let padding = "x".repeat(DRM_REPORT_MAX + 1);
+        latch_reported_line(
+            &mut found,
+            format!("{TD_COMPOSITOR_DRM_PROBE_MARKER} {padding}\n").as_bytes(),
+            TD_COMPOSITOR_DRM_PROBE_MARKER.as_bytes(),
+            true,
+        );
+        assert_eq!(found, None);
+    }
+
+    /// The row rejects a boot that never enumerated a card.
+    #[test]
+    fn the_drm_row_is_what_rejects_a_boot_missing_its_marker() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_drm = None;
+        let complaint = drm_complaint(evidence);
+        assert!(
+            complaint.contains(TD_COMPOSITOR_DRM_PROBE_MARKER),
+            "the rejection must name the marker that was absent: {complaint}"
+        );
+    }
+
+    /// Enumerating SOMETHING is not enumerating the pinned device.
+    #[test]
+    fn a_card_behind_another_driver_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_drm =
+            Some("driver=bochs-drm output=1280x800".to_string());
+        let complaint = drm_complaint(evidence);
+        assert!(complaint.contains("bochs-drm"), "{complaint}");
+        assert!(complaint.contains("virtio_gpu"), "{complaint}");
+    }
+
+    /// A card that still enumerates but offers nothing driveable is the state
+    /// a bare "the marker was present" check would call healthy.
+    #[test]
+    fn a_report_without_a_usable_scanout_size_is_rejected() {
+        for output in ["output=0x800", "output=1280x0", "output=", "output=x"] {
+            let mut evidence = healthy_evidence();
+            evidence.td_compositor_drm =
+                Some(format!("driver=virtio_gpu {output}"));
+            let complaint = drm_complaint(evidence);
+            assert!(
+                complaint.contains("no usable scanout size"),
+                "{output} was accepted: {complaint}"
+            );
+        }
+    }
+
+    /// The healthy report passes this row and the walk moves on.
+    #[test]
+    fn a_virtio_gpu_report_with_a_mode_passes_this_row() {
+        let complaint = drm_complaint(healthy_evidence());
+        assert!(
+            !complaint.contains("DRM"),
+            "the DRM row must not be the complaint for a healthy report: {complaint}"
+        );
+    }
+
+    fn drm_complaint(evidence: ConsoleEvidence) -> String {
+        let result = BootResult {
+            evidence,
+            exited_clean: true,
+            reason: String::new(),
+            console: String::new(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        validate_system_boot(
+            &result,
+            PersistencePhase::None,
+            IdentityPhase::Fresh,
+            "first",
+            SelectionExpectation::Current,
+        )
+        .err()
+        .unwrap_or_default()
     }
 
     #[test]

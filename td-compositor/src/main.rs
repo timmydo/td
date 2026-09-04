@@ -7,6 +7,7 @@ mod client_resources;
 mod configure;
 mod conn;
 mod control;
+mod drm;
 mod filter;
 mod font;
 mod font_data;
@@ -62,6 +63,7 @@ fn usage() -> String {
      --terminal-client PATH | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
+     td-compositor probe-drm DEVICE | \
      td-compositor terminfo PATH | \
      td-compositor selftest"
         .into()
@@ -509,10 +511,45 @@ fn selftest() -> Result<(), String> {
     Ok(())
 }
 
+/// §M row 1's discovery half, printed.
+///
+/// Reads a card and reports what a KMS backend would be built on. It takes no
+/// DRM mastership and issues no modeset, which is what lets it run on a booted
+/// image WHILE `fbcon` and the fbdev compositor are driving that same card —
+/// the only way any of this can be proven before the backend that would
+/// replace them exists.
+fn probe_drm(device: &Path) -> Result<(), String> {
+    let card = drm::open_card(device)?;
+    let discovery = drm::discover(&card)?;
+    let output = discovery.scanout.output()?;
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "TD-COMPOSITOR-DRM-PROBE-OK {} output={}x{}",
+        discovery.describe(),
+        output.dimensions.width,
+        output.dimensions.height
+    )
+    .map_err(|error| format!("write DRM probe marker: {error}"))?;
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let command = args.first().ok_or_else(usage)?;
     match command.as_str() {
         "run" => run_compositor(parse_run(args.get(1..).ok_or_else(usage)?)?),
+        // §M row 1's discovery half, as a subcommand rather than as something
+        // the compositor does on the way up: it reads a card and takes no
+        // mastership, so it can run on a booted image beside the fbdev
+        // compositor that is currently driving that same card, and prove what
+        // the KMS backend will be built on before there is a backend.
+        "probe-drm" => {
+            let device = args.get(1).ok_or_else(usage)?;
+            if args.get(2).is_some() {
+                return Err(usage());
+            }
+            probe_drm(Path::new(device))
+        }
         "probe" => {
             let socket = args.get(1).ok_or_else(usage)?;
             if args.get(2).is_some() {
@@ -942,6 +979,7 @@ mod confinement {
     const MAIN: &str = include_str!("main.rs");
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
+    const DRM: &str = include_str!("drm.rs");
     const OTHER: &[(&str, &str)] = &[
         ("bar.rs", include_str!("bar.rs")),
         ("buffer.rs", include_str!("buffer.rs")),
@@ -950,6 +988,7 @@ mod confinement {
         ("configure.rs", include_str!("configure.rs")),
         ("conn.rs", include_str!("conn.rs")),
         ("control.rs", include_str!("control.rs")),
+        ("drm.rs", include_str!("drm.rs")),
         ("filter.rs", include_str!("filter.rs")),
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
@@ -1220,9 +1259,16 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
     }
 
     /// `ioctl(2)`'s request number chooses the operation, so the roster is the
-    /// confinement: these six values, one entry point, and five callers.
+    /// confinement: these eleven values, one allow-list, and ten callers.
+    ///
+    /// Four DRM numbers READ a card. The fifth, `DROP_MASTER`, writes nothing
+    /// to the display -- it RELEASES authority that opening a primary node
+    /// granted without being asked. `MODE_SETCRTC`, `MODE_CREATE_DUMB` and the
+    /// page flip are deliberately absent: §M's backend needs them and this
+    /// increment does not, and a request that modesets must not become
+    /// reachable merely by sharing a module with five that do not.
     #[test]
-    fn the_ioctl_surface_is_six_pinned_requests_and_five_wrappers() {
+    fn the_ioctl_surface_is_eleven_pinned_requests_and_ten_wrappers() {
         for request in [
             "const TIOCSPTLCK: usize = 0x4004_5431;",
             "const TIOCGPTPEER: usize = 0x5441;",
@@ -1230,11 +1276,51 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
             "const TIOCGWINSZ: usize = 0x5413;",
             "const EVIOCGABS_X: usize = 0x8018_4540;",
             "const EVIOCGABS_Y: usize = 0x8018_4541;",
+            "const DRM_IOCTL_VERSION: usize = 0xc040_6400;",
+            "const DRM_IOCTL_MODE_GETRESOURCES: usize = 0xc040_64a0;",
+            "const DRM_IOCTL_MODE_GETENCODER: usize = 0xc014_64a6;",
+            "const DRM_IOCTL_MODE_GETCONNECTOR: usize = 0xc050_64a7;",
+            "const DRM_IOCTL_DROP_MASTER: usize = 0x0000_641f;",
         ] {
             assert!(SYS.contains(request), "{request}");
         }
         assert_eq!(occurrences(SYS, "const TIOC"), 4);
         assert_eq!(occurrences(SYS, "const EVIOCGABS"), 2);
+        assert_eq!(occurrences(SYS, "const DRM_IOCTL_"), 5);
+        // No write-side DRM request is DECLARED, and none of their numbers
+        // appears at all. The declaration is the thing to forbid rather than
+        // the name: `DrmModeInfo`'s own doc says a mode is what `SETCRTC` takes
+        // back, which is why it carries the whole 68-byte layout instead of the
+        // two fields read today, and a scan that tripped over saying so would
+        // be a reason to stop explaining rather than a reason to stop.
+        //
+        // Listed individually rather than by prefix: the claim is that each of
+        // these is absent, and a prefix count of zero would also pass if the
+        // naming convention changed. Over the SHIPPED half, because `sys.rs`'s
+        // own test issues `SETCRTC` to prove the allow-list refuses it — a pin
+        // that moved whenever a test did would pin nothing.
+        for absent in [
+            "const DRM_IOCTL_MODE_SETCRTC",
+            "const DRM_IOCTL_MODE_CREATE_DUMB",
+            "const DRM_IOCTL_MODE_MAP_DUMB",
+            "const DRM_IOCTL_MODE_ADDFB2",
+            "const DRM_IOCTL_MODE_PAGE_FLIP",
+            "const DRM_IOCTL_MODE_ATOMIC",
+            // Dropping mastership is rostered; TAKING it back is not, and
+            // that asymmetry is the claim. `DROP_MASTER` gives back what the
+            // open took; `SET_MASTER` would re-acquire it, which is the
+            // backend's decision to make and not this increment's.
+            "const DRM_IOCTL_SET_MASTER",
+            "0xc068_64a2",
+            "0xc020_64b2",
+            "0xc010_64b3",
+            "0xc018_64b0",
+        ] {
+            assert!(
+                !production(SYS).contains(absent),
+                "{absent} is not this increment's"
+            );
+        }
         // The two evdev requests differ in ONE nibble, and the size field of
         // each has to be the 24 bytes `ABSINFO_WORDS` declares — so the axis
         // is chosen by an enum ARM rather than by a number at a call site.
@@ -1249,21 +1335,42 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         // wrapper passing it to the one entry point.
         let guard = r#"    if !matches!(
         request,
-        TIOCSPTLCK | TIOCGPTPEER | TIOCSWINSZ | TIOCGWINSZ | EVIOCGABS_X | EVIOCGABS_Y
+        TIOCSPTLCK
+            | TIOCGPTPEER
+            | TIOCSWINSZ
+            | TIOCGWINSZ
+            | EVIOCGABS_X
+            | EVIOCGABS_Y
+            | DRM_IOCTL_VERSION
+            | DRM_IOCTL_MODE_GETRESOURCES
+            | DRM_IOCTL_MODE_GETENCODER
+            | DRM_IOCTL_MODE_GETCONNECTOR
+            | DRM_IOCTL_DROP_MASTER
     ) {"#;
         assert_eq!(occurrences(SYS, guard), 1);
-        let entry = r#"    errno_result(
-        syscall5(SYS_IOCTL, fd as usize, request, argument, 0, 0),
-        operation,
-    )"#;
+        let entry = r#"    Ok(syscall5(SYS_IOCTL, fd as usize, request, argument, 0, 0))"#;
         assert_eq!(occurrences(SYS, entry), 1);
         assert_eq!(occurrences(SYS, "fn ioctl("), 1);
-        // One definition plus exactly five call sites: a SIXTH wrapper reusing
-        // a pinned request would satisfy every other assertion here.
+        assert_eq!(occurrences(SYS, "fn ioctl_checked("), 1);
+        assert_eq!(occurrences(SYS, "fn drm_ioctl("), 1);
         let production_sys = production(SYS);
-        let mentions = occurrences(production_sys, "ioctl(");
         let prose = occurrences(production_sys, "ioctl(2)");
-        assert_eq!(mentions - prose, 6);
+        let every = occurrences(production_sys, "ioctl(") - prose;
+        let drm = occurrences(production_sys, "drm_ioctl(");
+        // One definition plus exactly five call sites for the terminal and
+        // evdev entry point: a SIXTH wrapper reusing a pinned request would
+        // satisfy every other assertion here.
+        assert_eq!(every - drm, 6);
+        // One definition plus the eight requests the five DRM wrappers issue:
+        // two each for the three that ask a count before they ask for data,
+        // one for the encoder, whose answer is a fixed-size struct, and one to
+        // give back mastership.
+        assert_eq!(drm, 9);
+        // Both entry points reach the SAME allow-list, and it is defined once.
+        // This is the assertion that stops a second `syscall5(SYS_IOCTL, ..)`
+        // growing beside the roster instead of behind it.
+        assert_eq!(occurrences(production_sys, "ioctl_checked("), 3);
+        assert_eq!(occurrences(production_sys, "syscall5(SYS_IOCTL"), 1);
         // The four wrappers, each reaching that entry point exactly once with
         // its own request and its own operand.
         for (wrapper, call) in [
@@ -1309,6 +1416,51 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         assert_eq!(occurrences(SYS, "as *mut [u16; 4]"), 1);
         assert_eq!(occurrences(SYS, "as *mut [i32; ABSINFO_WORDS]"), 1);
         assert!(SYS.contains("fn absinfo(words: [i32; ABSINFO_WORDS]) -> AbsInfo {"));
+        // The four DRM wrappers, each reaching its own request.
+        for (wrapper, request) in [
+            ("pub fn drm_driver_name(", "DRM_IOCTL_VERSION"),
+            ("pub fn drm_resources(", "DRM_IOCTL_MODE_GETRESOURCES"),
+            ("pub fn drm_connector(", "DRM_IOCTL_MODE_GETCONNECTOR"),
+            ("pub fn drm_encoder(", "DRM_IOCTL_MODE_GETENCODER"),
+            ("pub fn drm_drop_master(", "DRM_IOCTL_DROP_MASTER"),
+        ] {
+            assert!(SYS.contains(wrapper), "{wrapper}");
+            // The declaration, the guard arm, and the call that issues it.
+            // Counted over the shipped half, as the rosters above are.
+            assert!(
+                occurrences(production(SYS), request) >= 3,
+                "{request} is not reached from {wrapper}"
+            );
+        }
+        // Discovery takes no mastership, and the absence IS the claim: a
+        // process that became DRM master would take the console away from
+        // fbcon, which is precisely what makes this probe runnable on a live
+        // image beside the compositor already driving that card.
+        // Mastership is RELEASED on the way in, and the release is on the one
+        // path that opens a card, so no descriptor this module hands out is
+        // ever the DRM master for longer than the two syscalls between them.
+        // An earlier revision asserted the ABSENCE of `DROP_MASTER` as proof of
+        // not being master; that had it backwards -- `drm_master_open` grants
+        // mastership on the open itself, so the absence pinned that the code
+        // could not give back what it had already taken.
+        assert!(production(DRM).contains("sys::drm_drop_master(&card)"));
+        // The COUNTING call must not be the kernel's force-probe request.
+        // `count_modes == 0` re-reads EDID and, in the UAPI header's own words,
+        // "can be slow, might cause flickering and the ioctl will block"; the
+        // documented counting form is one mode with room for one mode.
+        assert!(production(SYS).contains("probe.count_modes = 1;"));
+        assert!(production(SYS).contains("probe.modes_ptr = address_of(&mut one_mode);"));
+        assert_eq!(occurrences(production(DRM), "OpenOptions::new()"), 1);
+        // And the policy module DECLARES no request of its own: the ABI lives
+        // in `sys.rs`, so the only requests `drm.rs` can cause are the five the
+        // allow-list admits, reached through the calls pinned above. It may
+        // still NAME one in prose, so the claim is about a declaration.
+        assert!(!production(DRM).contains("const DRM_IOCTL"));
+        // No raw syscall of its own: named as the two forms that would be one,
+        // rather than as the word, which this module's own prose uses to say
+        // how briefly it holds mastership.
+        assert!(!production(DRM).contains("syscall5("));
+        assert!(!production(DRM).contains("asm!"));
     }
 
     #[test]
@@ -1405,6 +1557,26 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         ] {
             assert!(input.contains(call), "input.rs no longer spells `{call}`");
         }
+        // The card is asked four questions and no others, each through the
+        // wrapper that owns its request. Pinned as call sites and not merely as
+        // a count, for `absolute_info`'s reason one module over: `drm_connector`
+        // and `drm_encoder` both take a bare `u32` id, so handing a connector's
+        // id to the encoder wrapper type-checks and asks the kernel about
+        // whichever object happens to hold that number.
+        let drm = production(DRM);
+        for call in [
+            "let driver = sys::drm_driver_name(card)?;",
+            "let resources = sys::drm_resources(card)",
+            "let Ok(connector) = sys::drm_connector(card, *connector_id) else {",
+            "if let Ok(encoder) = sys::drm_encoder(card, connector.encoder_id) {",
+            "let Ok(encoder) = sys::drm_encoder(card, *encoder_id) else {",
+            "sys::drm_drop_master(&card)",
+        ] {
+            assert!(drm.contains(call), "drm.rs no longer spells `{call}`");
+        }
+        // Five calls and no sixth: every reach into the syscall module from
+        // here is one of the five above.
+        assert_eq!(occurrences(drm, "sys::drm_"), 6);
         let production_main = production(MAIN);
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())
@@ -1412,7 +1584,7 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         {
             if matches!(
                 name,
-                "client.rs" | "conn.rs" | "server.rs" | "pty.rs" | "input.rs"
+                "client.rs" | "conn.rs" | "server.rs" | "pty.rs" | "input.rs" | "drm.rs"
             ) {
                 continue;
             }

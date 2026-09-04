@@ -896,6 +896,24 @@ pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 /// td-jail's exported filter and observes the compiled errno and kill actions.
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 
+/// APPLICATIONS.md §M row 1, the DISCOVERY half: td-compositor opened the card,
+/// asked the kernel which driver is behind it, enumerated its connectors,
+/// encoders and CRTCs, and chose the connector, mode and CRTC a KMS backend
+/// would drive.
+///
+/// The line carries what it found, not just that it found something, because
+/// the numbers are the evidence: an image whose virtio-gpu stopped offering a
+/// preferred mode, or whose connector went to `disconnected`, still has a card
+/// and would still satisfy a bare "it worked". The check asserts the driver and
+/// a non-zero mode out of this line for that reason.
+///
+/// It takes NO DRM mastership and issues no modeset, which is what lets it run
+/// on the ordinary boot beside the fbdev compositor already driving that same
+/// card. That is also its limit: `DRM_IOCTL_MODE_GETCONNECTOR` re-probes only
+/// for the current master, so this reads the mode list the kernel already had
+/// rather than forcing a fresh probe.
+pub const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = "TD-COMPOSITOR-DRM-PROBE-OK";
+
 /// APPLICATIONS.md §H item 12: `kill -KILL` of stage 1 reaped the whole
 /// instance.
 ///

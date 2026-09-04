@@ -19,7 +19,8 @@ use crate::ladder::{
     TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
     TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
     TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
-    TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_COMPOSITOR_DRM_PROBE_MARKER, TD_JAIL_KILL_REAPS_MARKER,
+    TD_JAIL_SECCOMP_PROBE_MARKER,
     TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_CHANNEL_RUNTIME_MARKER,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
@@ -2552,6 +2553,11 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /bin/grep -q -x -F {TD_JAIL_KILL_REAPS_MARKER} || \
          {{ echo \"td-jail: kill-reaps returned unexpected output: $k\"; \
          exit 1; }}'; then echo {TD_JAIL_KILL_REAPS_MARKER}; mtk=1; fi\n\
+         if d=$(/bin/td-compositor probe-drm /dev/dri/card0 2>&1) && \
+         /bin/td-util printf \"%s\\n\" \"$d\" | \
+         /bin/grep -q \"^{TD_COMPOSITOR_DRM_PROBE_MARKER} driver=\"; then \
+         /bin/td-util printf \"%s\\n\" \"$d\"; \
+         else echo \"td-compositor: DRM discovery failed: $d\"; fi\n\
          if [ -e /var/lib/td-test/td-jail-seccomp-probe ]; then \
          mts=0; /bin/rm -rf /run/td-jail-seccomp-probe; \
          if [ -f /var/lib/td-test/td-jail-seccomp-probe ] \
