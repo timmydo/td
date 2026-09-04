@@ -74,6 +74,22 @@ impl PointerScroll {
         self.vertical == 0 && self.horizontal == 0
     }
 
+    /// One signed count of notches in the direction td's OWN gestures read,
+    /// which is the direction a strip drawn left to right runs: rightward and
+    /// toward the operator are positive. evdev counts a wheel pushed away as
+    /// positive, so the vertical term is subtracted rather than added — the
+    /// same sign flip `steps` makes for the protocol, and made here rather
+    /// than read back off a converted step so a compositor gesture never
+    /// depends on the unit a client happens to be handed.
+    ///
+    /// A wheel that TILTS as it turns reports both axes in one report, and the
+    /// two combine: they name one direction along one strip, so dropping
+    /// either would lose part of what the operator did, and a tilt that
+    /// exactly opposes the turn is a still wheel by the same arithmetic.
+    pub fn notches(self) -> i32 {
+        self.horizontal.saturating_sub(self.vertical)
+    }
+
     /// The axes that moved, in the PROTOCOL's units and signs, vertical first.
     ///
     /// Both conversions happen here, and the SIGN one is why `detents` comes
@@ -193,14 +209,38 @@ pub struct RoutedPointerFrame {
 
 /// What one report produced: the routed events, and — separately — the surface
 /// a press in it established a grab on, which is what the click half of the
-/// focus policy needs and what the events alone do not say, and whether a
-/// press in it was CLAIMED by
-/// the compositor rather than delivered.
+/// focus policy needs and what the events alone do not say.
+///
+/// `owners` says who each transition belonged to, one entry per button in the
+/// report and in the order they were given, which is the question a caller
+/// taking a press for a gesture of its own has to ask. Sampling the grab after
+/// the report cannot answer it: a grab that both held a press and ENDED later
+/// in the same report leaves nothing behind to say the press was somebody's,
+/// and one button must never be both a client's click and td's.
+///
+/// Per TRANSITION and not per button code, because one report can carry the
+/// same button twice — a press the grab took, the release that ends it, and a
+/// press that is then nobody's — and a set keyed by the code would call that
+/// last one the client's and refuse a gesture nobody was given.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PointerFrameResult {
     pub frames: Vec<RoutedPointerFrame>,
     pub pressed_on: Option<SurfaceKey>,
-    pub claimed: bool,
+    pub owners: Vec<PressOwner>,
+}
+
+/// Who one button transition belonged to. A release is always `Free`: the
+/// model sends one only for a press it accepted, so there is no gesture to
+/// take from anybody, and the caller's own state is what says whether a
+/// release ends one of its gestures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PressOwner {
+    /// Nobody's. The compositor may spend it.
+    Free,
+    /// Routed to a client, which owns it until it lets go.
+    Client,
+    /// Taken by the compositor's own claim, which is the Alt gesture.
+    Claimed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,21 +313,23 @@ impl PointerState {
         };
         next.transition(target, time, &mut events);
         let mut pressed_on = None;
-        let mut claimed = false;
+        let mut owners = Vec::with_capacity(buttons.len());
         for input in buttons {
             // A claimed press enters neither `pressed` nor `delivered`, so
             // its release stops at the `changed` check below and is inert.
             if input.state == PointerButtonState::Pressed && next.grab.is_none() && claim(*input) {
-                claimed = true;
+                owners.push(PressOwner::Claimed);
                 continue;
             }
             // Every establishing press in one frame names the SAME surface: a
             // press establishes only when no grab is held, and with no grab
             // held `transition` has already pointed focus at `hover`. So which
             // of them is recorded cannot differ.
-            if let Some(surface) = next.button(*input, &mut events) {
+            let mut owner = PressOwner::Free;
+            if let Some(surface) = next.button(*input, &mut events, &mut owner) {
                 pressed_on = Some(surface);
             }
+            owners.push(owner);
             if next.grab.is_none() {
                 next.transition(next.hover, time, &mut events);
             }
@@ -320,7 +362,7 @@ impl PointerState {
         Ok(PointerFrameResult {
             frames,
             pressed_on,
-            claimed,
+            owners,
         })
     }
 
@@ -389,10 +431,16 @@ impl PointerState {
     /// this button event was routed to. Sampling `grab` before and after a
     /// frame cannot ask that: a press and release together end with no grab,
     /// and a release-then-press replaces one grab with another.
+    /// `owner` is set to `Client` where this routes a press to one. Written
+    /// here rather than derived by the caller from `focus`, which is only half
+    /// the condition: a duplicate press of a held button routes nothing, and a
+    /// caller that read the focus beside it would call that press the client's
+    /// and refuse a gesture nobody was given.
     fn button(
         &mut self,
         input: PointerButtonInput,
         events: &mut Vec<PointerEvent>,
+        owner: &mut PressOwner,
     ) -> Option<SurfaceKey> {
         let changed = match input.state {
             PointerButtonState::Pressed => self.pressed.insert(input.button),
@@ -406,6 +454,7 @@ impl PointerState {
             PointerButtonState::Pressed => {
                 if let Some(target) = self.focus {
                     self.delivered.insert(input.button);
+                    *owner = PressOwner::Client;
                     events.push(PointerEvent::Button {
                         surface: target.surface,
                         input,
@@ -756,6 +805,88 @@ mod tests {
     }
 
     #[test]
+    fn a_report_names_the_owner_of_every_transition_it_carries() {
+        // What a compositor gesture asks before spending a press. The case it
+        // exists for is a grab that ends in the SAME report as a new press:
+        // the grab is gone by the time the report returns, so nothing in the
+        // state afterwards says the press was ever anybody's.
+        let mut state = PointerState::default();
+        let focus = target(1, 10, 0, 0);
+        state.frames(1, Some(focus), None, &[]).unwrap();
+        let right = button(2, 273, PointerButtonState::Pressed);
+        let held = state.unclaimed(2, Some(focus), None, &[right]).unwrap();
+        assert_eq!(held.owners, [PressOwner::Client]);
+        assert_eq!(state.grab_surface(), Some(focus.surface));
+
+        // The report the whole field is for, and the reason the answer is per
+        // TRANSITION: a left press the grab takes, both releases, and a second
+        // left press that is nobody's — the same button code twice, owned by
+        // two different people. A set keyed by the code would refuse the last
+        // one, which is the press a gesture on td's own chrome is made of.
+        let result = state
+            .unclaimed(
+                3,
+                None,
+                Some(focus),
+                &[
+                    button(3, 272, PointerButtonState::Pressed),
+                    button(3, 273, PointerButtonState::Released),
+                    button(3, 272, PointerButtonState::Released),
+                    button(3, 272, PointerButtonState::Pressed),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            result.owners,
+            [
+                PressOwner::Client,
+                PressOwner::Free,
+                PressOwner::Free,
+                PressOwner::Free,
+            ]
+        );
+        assert_eq!(state.grab_surface(), None);
+
+        // A duplicate press of a held button routed nothing, so it is not the
+        // client's either — the half a caller reading the focus beside it
+        // would get wrong.
+        state.frames(4, Some(focus), None, &[]).unwrap();
+        let press = button(5, 272, PointerButtonState::Pressed);
+        assert_eq!(
+            state.unclaimed(5, Some(focus), None, &[press]).unwrap().owners,
+            [PressOwner::Free],
+            "a press already held routed a second event"
+        );
+        state
+            .unclaimed(6, None, None, &[button(6, 272, PointerButtonState::Released)])
+            .unwrap();
+
+        // And a CLAIM is its own answer, named per transition for the same
+        // reason: ONE report can hand one press to a client and claim
+        // another, once the grab the first established has ended inside it. A
+        // report-wide bool would let the claimed gesture spend the press that
+        // was handed over.
+        let claimed = state
+            .frame(
+                7,
+                Some(focus),
+                None,
+                &[
+                    button(7, 272, PointerButtonState::Pressed),
+                    button(7, 272, PointerButtonState::Released),
+                    button(7, 273, PointerButtonState::Pressed),
+                ],
+                PointerScroll::default(),
+                |input| input.button == 273,
+            )
+            .unwrap();
+        assert_eq!(
+            claimed.owners,
+            [PressOwner::Client, PressOwner::Free, PressOwner::Claimed]
+        );
+    }
+
+    #[test]
     fn a_release_then_press_in_one_frame_retargets_after_the_grab() {
         let mut state = PointerState::default();
         let first = target(1, 10, 4, 5);
@@ -925,6 +1056,36 @@ mod tests {
     fn the_axis_numbers_are_the_protocols_and_not_each_others() {
         assert_eq!(PointerAxis::Vertical.wire(), 0);
         assert_eq!(PointerAxis::Horizontal.wire(), 1);
+    }
+
+    #[test]
+    fn the_wheel_answers_one_signed_count_in_the_compositors_own_direction() {
+        // evdev counts a wheel pushed away from the operator as positive, and
+        // that is the direction the strip's LOWER numbers are in — so the
+        // vertical term arrives negated, exactly as `steps` negates it for the
+        // protocol, whose positive is downward too.
+        let notches = |vertical, horizontal| {
+            PointerScroll {
+                vertical,
+                horizontal,
+            }
+            .notches()
+        };
+        assert_eq!(notches(1, 0), -1);
+        assert_eq!(notches(-3, 0), 3);
+        // Horizontal is already the direction the strip is drawn in.
+        assert_eq!(notches(0, 2), 2);
+        assert_eq!(notches(0, -2), -2);
+        // A wheel that tilts as it turns is ONE gesture along one strip, so
+        // the two combine — and halves that oppose each other cancel, which is
+        // the same answer a still wheel gives.
+        assert_eq!(notches(-1, 1), 2);
+        assert_eq!(notches(1, 1), 0);
+        assert_eq!(PointerScroll::default().notches(), 0);
+        // Detents are summed straight off the device, so the count saturates
+        // rather than wrapping into the opposite direction.
+        assert_eq!(notches(i32::MIN, i32::MAX), i32::MAX);
+        assert_eq!(notches(i32::MAX, i32::MIN), i32::MIN);
     }
 
     #[test]

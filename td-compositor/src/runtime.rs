@@ -11,7 +11,7 @@ use crate::layout::{Command, ViewLayout};
 use crate::output::{Damage, Output, OutputBackend, Submission};
 use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerScroll, PointerSnapshot, PointerState,
-    PointerTarget, RoutedPointerFrame,
+    PointerTarget, PressOwner, RoutedPointerFrame,
 };
 use crate::scene::{
     BandPress, CursorRequest, Fraction, PopupConstraint, PopupPlacement, Scene, SharedInputRegion,
@@ -1948,7 +1948,6 @@ impl Runtime {
             .frame(time, hover, grab, buttons, scroll, |input| {
                 alt && input.button == POINTER_BUTTON_LEFT
             })?;
-        let alt_press = result.claimed;
         self.publish_pointer(result.frames);
         // A cursor belongs to the client the pointer is focused on, so a
         // report that moved focus takes the cursor with it — including to
@@ -2024,8 +2023,61 @@ impl Runtime {
                 failures.push(error);
             }
         }
-        if let Err(error) = self.drag(input_modal, moved, alt_press, buttons) {
-            failures.push(error);
+        // The strip's other gesture, and the notch after it: a report can
+        // carry both — a wheel and a button reach one `SYN_REPORT` together —
+        // and a switch applied first would move the cells out from under the
+        // press, which hit-tests the strip as it stands. `drag` answers
+        // whether it named a workspace, and an error is answered the same way:
+        // a report whose buttons did not replay cleanly is no report to spend
+        // a gesture of td's own on.
+        let named_workspace = match self.drag(input_modal, moved, buttons, &result.owners) {
+            Ok(named) => named,
+            Err(error) => {
+                failures.push(error);
+                true
+            }
+        };
+        // THE BAR TAKES THE WHEEL: a notch over it walks the workspaces, which
+        // is the pointer's answer to `Super+N` and the gesture an operator
+        // reaches for having just seen the numbers there.
+        //
+        // It takes exactly the notch the model DROPPED, which is what makes
+        // one notch a switch or a client's scroll and never both. The model
+        // sends the wheel to its focus and drops it where there is none, so
+        // asking whether anything has focus is asking the model's own question
+        // rather than forming a second opinion about grabs.
+        //
+        // Asked HERE, after the buttons this report carried have been
+        // replayed, because every question below is about the state the report
+        // LEAVES rather than the one it found — the same ordering the model
+        // itself keeps by routing axes after buttons. A report carrying the
+        // last release of a grab, or of td's own drag, ends with neither
+        // holding the wheel, and the notch is the strip's.
+        //
+        // One report is one switch: a gesture that already named a workspace
+        // outright — a press on a cell, or a drop onto one — is the more
+        // deliberate half, so a notch beside it is spent rather than applied
+        // on top. Refused while anything is MODAL, the gate `drag` puts in
+        // front of the press — a sheet is answered by the swallowed scroll
+        // above, but a portal dialog holding no grab is not, and the wheel
+        // must not be the one gesture that reaches past a dialog the click
+        // beside it cannot. Refused too while a drag is still live,
+        // that gesture being aimed at a cell and answering with a block which
+        // switching underneath would move.
+        let desk_scroll = if scroll.is_still()
+            || input_modal
+            || self.dragging.is_some()
+            || named_workspace
+            || self.pointer.snapshot().focus.is_some()
+        {
+            None
+        } else {
+            self.scene.desk_scrolled(scroll.notches())
+        };
+        if let Some(number) = desk_scroll {
+            if let Err(error) = self.switch_workspace(number) {
+                failures.push(error);
+            }
         }
         // LAST, and after the drag rather than before it: the press that
         // closes a menu was taken out of `buttons` above, so nothing here
@@ -2055,16 +2107,27 @@ impl Runtime {
     /// A modal surface owns every new button while it is up, so nothing is
     /// picked up under one — and anything already held is dropped, since the
     /// operator can no longer see where it would land.
+    /// `owners` is the report's own answer for each transition in `buttons`,
+    /// in the same order, and a gesture here spends only a press that belongs
+    /// to nobody.
+    ///
+    /// Answers whether this report NAMED a workspace — a press on a cell, or a
+    /// drop onto one — which is what spends a notch that arrived beside it
+    /// (§1). Said outright rather than read back off the active workspace
+    /// afterwards: a drop names a workspace without leaving it, so the number
+    /// in view is the same before and after and there is nothing there to see.
     fn drag(
         &mut self,
         modal: bool,
         moved: bool,
-        alt_press: bool,
         buttons: &[PointerButtonInput],
-    ) -> Result<(), String> {
+        owners: &[PressOwner],
+    ) -> Result<bool, String> {
         if modal {
-            return self.cancel_drag();
+            self.cancel_drag()?;
+            return Ok(false);
         }
+        let mut named_workspace = false;
         let size = self.framebuffer.dimensions();
         let (width, height) = (size.width, size.height);
         // One pass, in the order the transitions happened. A frame can carry
@@ -2073,10 +2136,15 @@ impl Runtime {
         // picked up in one batch. Handling all the presses first would let the
         // new drag consume the old one's release: the old drop lost and the
         // new drag ended where it started.
-        for input in buttons {
+        for (at, input) in buttons.iter().enumerate() {
             if input.button != POINTER_BUTTON_LEFT {
                 continue;
             }
+            // Missing is impossible — the model answers one owner per
+            // transition — and `Client` is what an impossible answer reads as,
+            // since refusing a gesture is the failure that cannot take a
+            // press away from somebody who was given it.
+            let owner = owners.get(at).copied().unwrap_or(PressOwner::Client);
             match input.state {
                 PointerButtonState::Pressed => {
                     // An ALT press takes the whole window; it is the press the
@@ -2093,9 +2161,37 @@ impl Runtime {
                     // handle that never fires. ALT never reaches that question:
                     // that gesture takes the whole window, buttons and all,
                     // because it exists for moving a window from anywhere in it.
-                    let picked = if alt_press {
+                    let picked = if owner == PressOwner::Claimed {
                         self.scene.draggable_at_pointer(width, height)
-                    } else if self.pointer.grab_surface().is_some() {
+                    } else if owner == PressOwner::Client {
+                        // This press was handed to a CLIENT, so it is not td's
+                        // to spend: taking it would make one button both the
+                        // window's click and the compositor's gesture. Asked
+                        // of the report rather than of the grab afterwards,
+                        // which cannot answer it — a report carrying a new
+                        // press and then the releases that end an older grab
+                        // leaves no grab behind, and the press it delivered
+                        // would look free.
+                        continue;
+                    } else if let Some(number) = self.scene.desk_pressed() {
+                        // A press on a workspace CELL switches to it. Asked
+                        // before the bands and after the ownership check for
+                        // the reasons either side of it: no band reaches the
+                        // bar's rows, so the order is documentation rather than
+                        // a tie-break, and a press a client already has cannot
+                        // be spent here whatever it landed on.
+                        //
+                        // Nothing is picked up: the strip is a label, and the
+                        // gesture is over when the press lands. Alt makes no
+                        // difference — that gesture is CLAIMED only where it
+                        // could pick a window up, and over the bar there is
+                        // none, so an Alt-held press falls through to here and
+                        // switches like any other. Which is the answer to
+                        // want: a modifier held for another gesture entirely
+                        // should not make a number on the bar stop working.
+                        self.cancel_drag()?;
+                        self.switch_workspace(number)?;
+                        named_workspace = true;
                         continue;
                     } else {
                         match self.scene.band_press_at_pointer(width, height) {
@@ -2132,7 +2228,7 @@ impl Runtime {
                             self.cancel_drag()?;
                             self.dragging = Some(Drag {
                                 key,
-                                held_by_alt: alt_press,
+                                held_by_alt: owner == PressOwner::Claimed,
                                 press: self.scene.pointer_at(),
                                 escaped: false,
                             });
@@ -2166,7 +2262,10 @@ impl Runtime {
                         // which is why this answers those separately. A drop
                         // that lands where the window already was is the
                         // commonest gesture there is.
+                        // Asked before the commit, which takes the hint.
+                        let onto_cell = self.scene.hint_names_workspace();
                         if let Some(moved) = self.scene.commit_drop(dragged) {
+                            named_workspace |= onto_cell;
                             self.settle(moved)?;
                             continue;
                         }
@@ -2189,7 +2288,20 @@ impl Runtime {
                 self.settle(false)?;
             }
         }
-        Ok(())
+        Ok(named_workspace)
+    }
+
+    /// Switch to `number`, as a pointer gesture on the bar does.
+    ///
+    /// Not `Runtime::command`, which owes the output WHOLE damage: that is the
+    /// repair for pixels the compositor did not write, reached for when the
+    /// screen looks wrong, and a press on a label is not that gesture — the
+    /// line the band's own buttons already draw. The paint is the ordinary
+    /// one, and the arrangement moved, so the clients are owed their
+    /// configures.
+    fn switch_workspace(&mut self, number: u8) -> Result<(), String> {
+        self.scene.command(Command::SwitchWorkspace(number));
+        self.settle(true)
     }
 
     fn focus_surface(&mut self, key: SurfaceKey) -> Result<(), String> {
@@ -5408,6 +5520,706 @@ mod tests {
             .collect();
         assert_eq!(visible, [2]);
         assert!(!runtime.scene.hint_is_live(), "the block was stranded");
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn pressing_and_scrolling_the_strip_switches_the_workspace_in_view() {
+        // Proved through the real driver, as the drop above is: what an
+        // operator does is move a pointer onto a number and click it, and
+        // between that and the switch lie the hit test, the bar's own rows
+        // being reachable at all, and the press not being taken for a drag.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-strip-switch-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+
+        let goto = |runtime: &mut Runtime,
+                    x: usize,
+                    y: usize,
+                    buttons: &[PointerButtonInput],
+                    scroll: PointerScroll| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons, scroll).unwrap()
+        };
+        let cell = |runtime: &Runtime, number: u8| {
+            let desks = runtime.scene.desks();
+            let (left, width) = crate::bar::desk_cell(&desks, number)
+                .unwrap_or_else(|| panic!("the strip is not showing workspace {number}: {desks:?}"));
+            (left + width / 2, crate::bar::BAR_HEIGHT / 2)
+        };
+        let on_screen = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(240, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let still = PointerScroll::default();
+
+        assert_eq!(runtime.scene.desks(), [1, 2], "no spare workspace to click");
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+
+        // THE CLICK. The pointer starts at the output's corner, which is
+        // inside the first cell, so this is a journey to the second one.
+        let (x, y) = cell(&runtime, 2);
+        let before = runtime.pointer_snapshot().revision;
+        goto(&mut runtime, x, y, &[press(1)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+        assert_eq!(on_screen(&runtime), Vec::<u32>::new(), "workspace 2 is empty");
+        // The WINDOW stayed where it was: a press on a cell switches, and only
+        // a drag onto one moves anything.
+        assert_eq!(runtime.scene.layout().workspace_of(key), Some(1));
+        assert!(
+            runtime.dragging.is_none(),
+            "the press on the strip picked something up"
+        );
+        assert_eq!(
+            runtime.pointer_snapshot().revision,
+            before,
+            "the press on the bar reached a client"
+        );
+        // The release ends a gesture that was over when the press landed.
+        goto(&mut runtime, x, y, &[release(2)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+
+        // Pressing the cell an operator is standing on switches nothing. The
+        // workspace afterwards cannot say so on its own — switching to the
+        // one already active is a no-op — so the refusal itself is what is
+        // read, with the pointer where the press would land.
+        let (x, y) = cell(&runtime, 2);
+        goto(&mut runtime, x, y, &[], still);
+        assert_eq!(runtime.scene.desk_pressed(), None);
+        goto(&mut runtime, x, y, &[press(3)], still);
+        goto(&mut runtime, x, y, &[release(4)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+
+        // THE WHEEL, over the status line rather than a cell: a notch names a
+        // direction, so the whole bar answers it. Away from the operator is
+        // evdev's positive, and it walks toward the lower numbers.
+        let far_right = 240 - 4;
+        goto(
+            &mut runtime,
+            far_right,
+            crate::bar::BAR_HEIGHT / 2,
+            &[],
+            PointerScroll {
+                vertical: 1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        assert_eq!(on_screen(&runtime), [1], "the window did not come back");
+        // The end of the RANGE is where it stops: a spin that overshoots
+        // stays, rather than wrapping round to the other end.
+        goto(
+            &mut runtime,
+            far_right,
+            crate::bar::BAR_HEIGHT / 2,
+            &[],
+            PointerScroll {
+                vertical: 3,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        // And back the other way, a notch toward the operator.
+        goto(
+            &mut runtime,
+            far_right,
+            crate::bar::BAR_HEIGHT / 2,
+            &[],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+
+        // A notch over a WINDOW is the client's, which is what says the two
+        // assertions above are about the bar and not about a compositor that
+        // took every wheel report there is. Turned the way that WOULD switch
+        // — away from the end of the range, where a notch answers nothing
+        // wherever the pointer is and the control would prove nothing.
+        goto(
+            &mut runtime,
+            far_right,
+            crate::bar::BAR_HEIGHT / 2,
+            &[],
+            PointerScroll {
+                vertical: 1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        let (inside_x, inside_y) = (rect.x + 2, rect.y + 2);
+        goto(&mut runtime, inside_x, inside_y, &[], still);
+        let before = runtime.pointer_snapshot().revision;
+        goto(
+            &mut runtime,
+            inside_x,
+            inside_y,
+            &[],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            1,
+            "a notch over a window switched the workspace"
+        );
+        assert!(
+            runtime.pointer_snapshot().revision > before,
+            "the notch over the window reached nobody"
+        );
+
+        // And a notch over the bar while a CLIENT holds the pointer belongs to
+        // that client, wherever the cursor has got to: the surface being
+        // dragged owns the wheel until the button comes up.
+        goto(&mut runtime, inside_x, inside_y, &[press(5)], still);
+        let (x, y) = cell(&runtime, 2);
+        goto(&mut runtime, x, y, &[], still);
+        let before = runtime.pointer_snapshot().revision;
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            1,
+            "the strip took a notch owed to a grabbing client"
+        );
+        assert!(
+            runtime.pointer_snapshot().revision > before,
+            "the notch never reached the client holding the pointer"
+        );
+        goto(&mut runtime, x, y, &[release(6)], still);
+
+        // The same notch, in the report that ENDS that grab. The model routes
+        // axes after buttons, so by the time the wheel is answered the grab is
+        // gone and the pointer is over the bar with nothing focused — the
+        // strip's notch, not a lost one. Sampling the grab before the report
+        // instead would drop it on the floor.
+        goto(&mut runtime, inside_x, inside_y, &[press(7)], still);
+        let (x, y) = cell(&runtime, 2);
+        goto(&mut runtime, x, y, &[], still);
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[release(8)],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            2,
+            "the notch arriving with the grab's last release reached nobody"
+        );
+
+        // Back onto the workspace the window is on, which the case below
+        // needs: a client can only hold a grab where there is a client.
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[],
+            PointerScroll {
+                vertical: 1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+
+        // A press is the client's or td's and never both. A client holding a
+        // grab by ANOTHER button, and one report carrying a left press over a
+        // cell followed by both releases: the report ends with no grab, so the
+        // grab alone cannot say the left press was already handed over — and
+        // the strip must not spend it.
+        let secondary = |time, state| PointerButtonInput {
+            time,
+            button: 273,
+            state,
+        };
+        goto(&mut runtime, inside_x, inside_y, &[], still);
+        goto(
+            &mut runtime,
+            inside_x,
+            inside_y,
+            &[secondary(9, PointerButtonState::Pressed)],
+            still,
+        );
+        let (x, y) = cell(&runtime, 2);
+        goto(&mut runtime, x, y, &[], still);
+        let before = runtime.pointer_snapshot().revision;
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[
+                press(10),
+                secondary(10, PointerButtonState::Released),
+                release(10),
+            ],
+            still,
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            1,
+            "the strip spent a press the client had already been given"
+        );
+        assert!(
+            runtime.pointer_snapshot().revision > before,
+            "the press never reached the client holding the grab"
+        );
+        // The same button twice in ONE report, which is why ownership is
+        // recorded per transition and not per button code: a left press the
+        // grab takes, both releases, and a left press that is then nobody's.
+        // Keyed by the code, that last press would wear the first one's owner
+        // and the strip would refuse a press it was given outright.
+        goto(&mut runtime, inside_x, inside_y, &[], still);
+        goto(
+            &mut runtime,
+            inside_x,
+            inside_y,
+            &[secondary(11, PointerButtonState::Pressed)],
+            still,
+        );
+        let (x, y) = cell(&runtime, 2);
+        goto(&mut runtime, x, y, &[], still);
+        let before = runtime.pointer_snapshot().revision;
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[
+                press(12),
+                secondary(12, PointerButtonState::Released),
+                release(12),
+                press(12),
+            ],
+            still,
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            2,
+            "the strip refused a press that was nobody's"
+        );
+        assert!(
+            runtime.pointer_snapshot().revision > before,
+            "the press the grab took never reached the client"
+        );
+        goto(&mut runtime, x, y, &[release(13)], still);
+        let (x, y) = cell(&runtime, 1);
+        goto(&mut runtime, x, y, &[press(14)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        goto(&mut runtime, x, y, &[release(15)], still);
+
+        // The same press on the same cell with nothing holding it IS the
+        // strip's, which is the control saying the assertion above is about
+        // ownership rather than about a cell that stopped answering.
+        let (x, y) = cell(&runtime, 2);
+        goto(&mut runtime, x, y, &[press(16)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+        goto(&mut runtime, x, y, &[release(17)], still);
+        let (x, y) = cell(&runtime, 1);
+        goto(&mut runtime, x, y, &[press(18)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        goto(&mut runtime, x, y, &[release(19)], still);
+
+        // The notch that arrives with the release ending TD'S OWN drag is the
+        // strip's too, for the reason the client's grab was: what the report
+        // leaves behind is what owns the wheel. Released over the status line,
+        // which names no cell, so the drag lands nothing and the notch is the
+        // only thing in the report that does anything.
+        let handle = runtime
+            .scene
+            .tiled_placements(240, height)
+            .first()
+            .map(|placement| placement.band)
+            .unwrap();
+        goto(
+            &mut runtime,
+            handle.x + 2,
+            handle.y + 2,
+            &[press(20)],
+            still,
+        );
+        assert!(runtime.dragging.is_some(), "the band press picked nothing up");
+        goto(&mut runtime, far_right, crate::bar::BAR_HEIGHT / 2, &[], still);
+        goto(
+            &mut runtime,
+            far_right,
+            crate::bar::BAR_HEIGHT / 2,
+            &[release(21)],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert!(runtime.dragging.is_none(), "the drag outlived its release");
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            2,
+            "the notch arriving with the drag's last release reached nobody"
+        );
+        assert_eq!(
+            runtime.scene.layout().workspace_of(key),
+            Some(1),
+            "the release over the status line moved the window"
+        );
+        let (x, y) = cell(&runtime, 1);
+        goto(&mut runtime, x, y, &[press(22)], still);
+        goto(&mut runtime, x, y, &[release(23)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+
+        // A DROP THAT LANDS ON A CELL is the other half of that pair, and it
+        // SPENDS the notch beside it for the reason a press does: the gesture
+        // named a workspace outright and the wheel did not. The release above
+        // named no cell, so nothing in the report but the notch did anything;
+        // this one puts the window on the number it was aimed at and leaves
+        // the view where the operator left it.
+        goto(
+            &mut runtime,
+            handle.x + 2,
+            handle.y + 2,
+            &[press(24)],
+            still,
+        );
+        assert!(runtime.dragging.is_some(), "the band press picked nothing up");
+        let (x, y) = cell(&runtime, 2);
+        // The motion, the release and the notch in ONE report, which the
+        // reader's batching makes the common shape and the only one that can
+        // tell a hint read after the re-aim from one read before it: the press
+        // left NO hint, a drag not aiming until it has left its own press
+        // point, so an early read names no workspace and the notch is spent on
+        // nothing. The restore below walks the other shape, the block already
+        // standing when the release arrives.
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[release(25)],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(
+            runtime.scene.layout().workspace_of(key),
+            Some(2),
+            "the drop never put the window on the cell it was aimed at"
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            1,
+            "the notch beside a drop that named a workspace switched the view"
+        );
+        // Put it back by hand, which restores what the blocks below expect
+        // and walks the drop the other way with nothing in the report but the
+        // gesture itself.
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+        goto(
+            &mut runtime,
+            handle.x + 2,
+            handle.y + 2,
+            &[press(26)],
+            still,
+        );
+        assert!(runtime.dragging.is_some(), "the band press picked nothing up");
+        let (x, y) = cell(&runtime, 1);
+        goto(&mut runtime, x, y, &[], still);
+        goto(&mut runtime, x, y, &[release(27)], still);
+        assert_eq!(runtime.scene.layout().workspace_of(key), Some(1));
+        goto(&mut runtime, x, y, &[press(28)], still);
+        goto(&mut runtime, x, y, &[release(29)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+
+        // ALT changes nothing here, which two readings of `alt_press` have now
+        // disagreed about. It is not "Alt is down": it is the compositor
+        // CLAIMING a press, which it does only where the press could pick a
+        // window up — and over the bar it could not, so the claim is never
+        // made and the press arrives as any other.
+        let alt = |runtime: &mut Runtime, down: bool| {
+            runtime
+                .modifiers(ModifierState {
+                    depressed: if down { TEST_MOD_ALT } else { 0 },
+                    ..ModifierState::default()
+                })
+                .unwrap()
+        };
+        let (x, y) = cell(&runtime, 2);
+        alt(&mut runtime, true);
+        goto(&mut runtime, x, y, &[press(30)], still);
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            2,
+            "an Alt-held press on a cell switched nothing"
+        );
+        assert!(
+            runtime.dragging.is_none(),
+            "an Alt press over the bar picked something up"
+        );
+        goto(&mut runtime, x, y, &[release(31)], still);
+        alt(&mut runtime, false);
+        let (x, y) = cell(&runtime, 1);
+        goto(&mut runtime, x, y, &[press(32)], still);
+        goto(&mut runtime, x, y, &[release(33)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+
+        // ONE REPORT IS ONE SWITCH, and the press is the half that names a
+        // workspace outright. A wheel and a button reach one `SYN_REPORT`
+        // together, and the cells the press hit-tests are the ones the
+        // operator was pointing at — not the ones a notch in the same report
+        // would have redrawn. The two are made to DISAGREE here: from
+        // workspace 2 the strip is 1, 2 and the spare 3, and a two-notch spin
+        // would land on 4, which redraws that third cell as a 4 under the
+        // very pixel the press is on.
+        let (x, y) = cell(&runtime, 2);
+        goto(&mut runtime, x, y, &[press(34)], still);
+        goto(&mut runtime, x, y, &[release(35)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+        assert_eq!(runtime.scene.desks(), [1, 2, 3]);
+        let (x, y) = cell(&runtime, 3);
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[press(36)],
+            PointerScroll {
+                vertical: -2,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            3,
+            "the notch beside the press moved the cell it landed on"
+        );
+        goto(&mut runtime, x, y, &[release(37)], still);
+        let (x, y) = cell(&runtime, 1);
+        goto(&mut runtime, x, y, &[press(38)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        goto(&mut runtime, x, y, &[release(39)], still);
+
+        // A portal dialog is modal to the pointer, and the strip is no
+        // exception: the press is refused by the gate that refuses one on a
+        // tile, and the wheel is refused beside it rather than being the one
+        // gesture that reaches past a dialog the operator has to answer. The
+        // notch here is the one that switched a moment ago, so what changed is
+        // the dialog and not the gesture.
+        let dialog = SurfaceKey {
+            client: 2,
+            object: 6,
+        };
+        runtime.commit(dialog, surface([7, 8, 9, 0])).unwrap();
+        runtime
+            .export_foreign_toplevel(key, "strip-switch-parent".to_string())
+            .unwrap();
+        assert_eq!(
+            runtime.set_portal_parent(
+                dialog,
+                "strip-switch-parent",
+                PortalManagerIdentity {
+                    client: 2,
+                    object: 20,
+                    generation: 1,
+                },
+                1,
+            ),
+            Ok(Some(key))
+        );
+        let (x, y) = cell(&runtime, 2);
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            1,
+            "a notch reached the strip past a modal portal dialog"
+        );
+        goto(&mut runtime, x, y, &[press(40)], still);
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            1,
+            "a press reached the strip past a modal portal dialog"
+        );
+        goto(&mut runtime, x, y, &[release(41)], still);
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_menu_over_the_bar_takes_the_press_and_leaves_the_notch() {
+        // Two claims §1 makes about the strip and a menu, each a consequence
+        // of code elsewhere — the press of the dismissal filter, the notch of
+        // the model having no focus over the bar — and neither visible from
+        // the strip's own tests. A change to either would flip them silently.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-strip-menu-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let window = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let first = SurfaceKey {
+            client: 1,
+            object: 20,
+        };
+        let second = SurfaceKey {
+            client: 1,
+            object: 21,
+        };
+        let _registrations = lend_popups(&mut runtime, 1, &[first.object, second.object]);
+        runtime.commit(window, surface([1, 2, 3, 0])).unwrap();
+        let placement = PopupPlacement {
+            parent: window,
+            x: 5,
+            y: 7,
+            width: 10,
+            height: 10,
+        };
+        let paint = || {
+            Surface::from_shm_pixels(10, 10, [7u8, 8, 9, 0].repeat(100), SHM_XRGB8888).unwrap()
+        };
+        let open = |runtime: &mut Runtime, menu: SurfaceKey| {
+            runtime.grab_popup(menu).unwrap();
+            runtime
+                .commit_popup(menu, Some(paint()), placement, None, None)
+                .unwrap();
+            assert!(
+                runtime.popup_placement(menu).is_some(),
+                "the menu never went up, so this proves nothing"
+            );
+        };
+        let goto = |runtime: &mut Runtime,
+                    x: usize,
+                    y: usize,
+                    buttons: &[PointerButtonInput],
+                    scroll: PointerScroll| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons, scroll).unwrap()
+        };
+        let cell = |runtime: &Runtime, number: u8| {
+            let desks = runtime.scene.desks();
+            let (left, width) = crate::bar::desk_cell(&desks, number)
+                .unwrap_or_else(|| panic!("the strip is not showing workspace {number}"));
+            (left + width / 2, crate::bar::BAR_HEIGHT / 2)
+        };
+        let still = PointerScroll::default();
+
+        // THE PRESS is spent closing the menu, here as anywhere else on
+        // screen, so the cell it landed on switches nothing.
+        open(&mut runtime, first);
+        let (x, y) = cell(&runtime, 2);
+        goto(&mut runtime, x, y, &[], still);
+        goto(&mut runtime, x, y, &[press(1)], still);
+        assert!(
+            runtime.popup_placement(first).is_none(),
+            "the press did not close the menu"
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            1,
+            "the press both closed the menu and switched the workspace"
+        );
+        // And the NEXT press is the strip's, so the assertion above is about
+        // the menu rather than about a cell that stopped answering.
+        goto(&mut runtime, x, y, &[release(2)], still);
+        goto(&mut runtime, x, y, &[press(3)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
+        goto(&mut runtime, x, y, &[release(4)], still);
+        let (x, y) = cell(&runtime, 1);
+        goto(&mut runtime, x, y, &[press(5)], still);
+        goto(&mut runtime, x, y, &[release(6)], still);
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+
+        // THE NOTCH dismisses nothing — a menu no more stops it than it stops
+        // `Super+2` — and the menu is still there on the way back, its window
+        // having gone with the workspace and come back with it.
+        open(&mut runtime, second);
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[],
+            PointerScroll {
+                vertical: -1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(
+            runtime.scene.layout().active_workspace(),
+            2,
+            "the menu swallowed a notch that was the strip's"
+        );
+        goto(
+            &mut runtime,
+            x,
+            y,
+            &[],
+            PointerScroll {
+                vertical: 1,
+                horizontal: 0,
+            },
+        );
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        assert!(
+            runtime.popup_placement(second).is_some(),
+            "the notch closed the menu"
+        );
         runtime.scene.layout().check_invariants().unwrap();
     }
 

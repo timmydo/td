@@ -2779,6 +2779,7 @@ mod tests {
         Focus,
         Move,
         Send,
+        Switch,
     }
 
     impl Bound {
@@ -2795,7 +2796,12 @@ mod tests {
                 Bound::Command(Command::Move(_)) | Bound::Pointer(_, Pointing::Move) => {
                     "MOVE A TILE / SPLIT OUT"
                 }
-                Bound::Command(Command::SwitchWorkspace(_)) => "SWITCH WORKSPACE",
+                // Same effect from the strip, so the same words: the chord
+                // names a NUMBER and the pointer names a cell or a direction,
+                // and the card would otherwise carry two vocabularies for one
+                // object — the line `Send` already draws below.
+                Bound::Command(Command::SwitchWorkspace(_))
+                | Bound::Pointer(_, Pointing::Switch) => "SWITCH WORKSPACE",
                 // The pointer reaches the same effect by a different route:
                 // `Super+Shift+N` names a NUMBER, a drop names wherever it
                 // landed. One effect, so one wording — the card would
@@ -2910,6 +2916,8 @@ mod tests {
             (&[], 0, Bound::Pointer("CLICK", Pointing::Focus)),
             (&[], 0, Bound::Pointer("DRAG A TITLE", Pointing::Move)),
             (&[], 0, Bound::Pointer("DRAG TO THE BAR", Pointing::Send)),
+            (&[], 0, Bound::Pointer("CLICK THE BAR", Pointing::Switch)),
+            (&[], 0, Bound::Pointer("SCROLL THE BAR", Pointing::Switch)),
         ];
         assert_eq!(
             probes.len(),

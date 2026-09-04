@@ -1643,6 +1643,30 @@ fn valid_workspace(number: u8) -> bool {
     (INITIAL_WORKSPACE..=FINAL_WORKSPACE).contains(&number)
 }
 
+/// The workspace `notches` along from `active`, clamped to the range that
+/// exists. `None` where the walk arrives where it started, which is a still
+/// wheel and either end of the range: neither is a switch.
+///
+/// The WORKSPACES and not the bar's cells, which an earlier draft of the
+/// pointer gesture walked. The cells look like the right list — they are what
+/// the operator is pointing at — but they are not a list a wheel can walk:
+/// the strip carries one SPARE, the lowest free number, so arriving on the
+/// spare moves the spare somewhere else. Walking it could not reach past the
+/// second empty workspace on an idle machine, and a notch back did not undo a
+/// notch forward once the numbers had gaps in them, because the cell just
+/// left stopped being a cell. Nine numbers are a list that holds still: every
+/// workspace is reachable, a notch is exactly reversible, and the one the
+/// walk lands on is a cell by the time the bar is next painted, since the
+/// active workspace is always named.
+pub fn workspace_step(active: u8, notches: i32) -> Option<u8> {
+    let from = i64::from(active);
+    let to = from
+        .saturating_add(i64::from(notches))
+        .clamp(i64::from(INITIAL_WORKSPACE), i64::from(FINAL_WORKSPACE));
+    let number = u8::try_from(to).ok()?;
+    (number != active).then_some(number)
+}
+
 /// The two-child container a drop makes when the target's own runs the other
 /// way, with `before` choosing which of them comes first.
 fn split_of(axis: Axis, key: SurfaceKey, target: SurfaceKey, before: bool) -> Node {
@@ -2107,6 +2131,39 @@ fn interval_gap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wheel_walks_the_workspaces_one_at_a_time_and_stops_at_the_ends() {
+        // One notch is one workspace, whichever way it turns, and a notch
+        // back exactly undoes a notch forward — the property walking the
+        // BAR's cells could not have, since the spare cell moves when it is
+        // stood on.
+        assert_eq!(workspace_step(1, 1), Some(2));
+        assert_eq!(workspace_step(2, -1), Some(1));
+        assert_eq!(workspace_step(4, 3), Some(7));
+        assert_eq!(workspace_step(7, -3), Some(4));
+        // Every workspace is reachable from every other, which is the whole
+        // reason this walks numbers rather than cells.
+        for from in INITIAL_WORKSPACE..=FINAL_WORKSPACE {
+            for to in INITIAL_WORKSPACE..=FINAL_WORKSPACE {
+                let notches = i32::from(to) - i32::from(from);
+                let expected = (to != from).then_some(to);
+                assert_eq!(workspace_step(from, notches), expected, "{from} -> {to}");
+            }
+        }
+        // A spin stops at the end rather than wrapping to the other one,
+        // however far it overshoots: the count comes off a device, so the
+        // extremes are ordinary input.
+        assert_eq!(workspace_step(1, 20), Some(FINAL_WORKSPACE));
+        assert_eq!(workspace_step(9, -20), Some(INITIAL_WORKSPACE));
+        assert_eq!(workspace_step(1, i32::MAX), Some(FINAL_WORKSPACE));
+        assert_eq!(workspace_step(9, i32::MIN), Some(INITIAL_WORKSPACE));
+        // Nothing to switch to: a still wheel, and a wheel at the end it is
+        // turning toward.
+        assert_eq!(workspace_step(3, 0), None);
+        assert_eq!(workspace_step(FINAL_WORKSPACE, 1), None);
+        assert_eq!(workspace_step(INITIAL_WORKSPACE, -1), None);
+    }
 
     /// Every placement literal below asks for band height 0, so a band is
     /// the tile's top edge with no height. Spelled once rather than five

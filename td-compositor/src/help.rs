@@ -90,6 +90,20 @@ pub const ROWS: &[Row] = &[
         keys: "DRAG TO THE BAR",
         action: "MOVE TO WORKSPACE",
     },
+    // The bar's own two gestures, and the reason they are here is the reason
+    // the drop above is: a control nothing points at is invisible in a way a
+    // key chord is not. Two rows for one effect, as HOVER and CLICK already
+    // are — the strip answers a press on a NUMBER and a notch anywhere on the
+    // bar, which is one sentence too long for one row and two gestures an
+    // operator reaches for at different moments.
+    Row {
+        keys: "CLICK THE BAR",
+        action: "SWITCH WORKSPACE",
+    },
+    Row {
+        keys: "SCROLL THE BAR",
+        action: "SWITCH WORKSPACE",
+    },
 ];
 
 /// What the input layer asks of the sheet. `Close` is what a key press while

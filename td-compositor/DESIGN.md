@@ -142,15 +142,106 @@ operator standing on an empty workspace with no way to reach a new one. There is
 no spare only when every workspace in 1..=9 holds something except the active
 one, and the strip says so by not growing.
 
-They are not CLICKABLE, and that is still true: the strip answers no press
-(§3's hit test stops at the tiling area), so nothing starts there and a click
-on a number switches nothing. What they now answer is a RELEASE — the end of a
-drag that began on a title band, which is a different gesture with a window
-already in hand. Making a region of the bar answer a PRESS would be a pointer
-surface of its own rather than a label; answering a drop adds no such surface,
-because the drag is already in flight and the strip is only being asked where
-it ends. The keys reach every workspace meanwhile, and `Super+Shift+N` remains
-the way to send a window to one without the mouse.
+The strip answers three pointer gestures: a DROP, a PRESS, and the WHEEL. It
+used to answer only the drop, on the argument that a region of the bar taking a
+press would be a pointer surface of its own rather than a label. That argument
+was wrong about which way the surprise runs. A number an operator can see, can
+drop a window onto, and watches change as they press `Super+2` is already a
+control; refusing its click makes the bar a display that lies about what it is,
+and the operator who tries it learns nothing from the nothing that happens. The
+keys still reach every workspace, and `Super+Shift+N` is still the way to send
+a window to one without the mouse — but they are no longer the only way, which
+is what "not clickable" cost.
+
+A PRESS on a cell switches to that workspace, and that is the whole gesture:
+nothing is picked up, and the release that follows has nothing left to do. It
+is a press rather than a release because that is when a button acts — the same
+answer the title band's own presentation buttons give, and the same code path,
+which asks the strip before the bands and after the grab. Before the bands
+because no band reaches the bar's rows, so the order is documentation rather
+than a tie-break; after the grab because a press made while a client holds one
+was DELIVERED to that client, and taking it would make one button both the
+window's and the compositor's. Over the bar there is no client to take it from:
+every tile is offset below it and a popup takes no clicks there (§3), so this
+is the compositor's press to answer — the same seam that makes a band draggable
+without a client seeing it. The cell an operator is already standing on
+switches nothing, exactly as a drop on it moves nothing.
+
+Alt makes no difference to a press on a cell. The Alt gesture is CLAIMED from
+its client only where it could pick a window up, and over the bar there is no
+window, so an Alt-held press is an ordinary one and switches. That is the
+answer to want either way: a modifier held for a gesture the bar has no part
+in should not make a number on it stop working.
+
+A press that closes a MENU is not also a switch. A press outside the popups
+holding the seat is spent dismissing them, everywhere on screen and here too,
+so the strip answers the next one; that is the rule for a click on a window
+and there is no reason the bar should be the exception. The wheel is not
+spent that way, a notch dismissing nothing — a menu no more stops it than it
+stops `Super+2`, and its window taking the workspace with it is what an
+operator asked for either way.
+
+The WHEEL over the bar walks the WORKSPACES one at a time, toward the higher
+numbers when it turns toward the operator. Two things distinguish it from the
+press. The WHOLE BAR answers it, cells and status line alike: a notch names a
+direction rather than a target, so the line beside the cells has an answer for
+one and not for the other, and the row a hand flicks the wheel over is the bar
+rather than a twenty-pixel cell within it. And it reads the ACTIVE workspace
+rather than the cell under the pointer, being a relative gesture.
+
+It walks `1..=9` and not the strip, which is the correction of a draft that
+walked the cells. Walking what the operator can SEE is the obvious reading of
+a gesture made on the bar, and it does not survive the spare. The spare is the
+lowest free number, so ARRIVING on it moves it: from one workspace in use the
+cells reach 3 and stop, 4..=9 being unreachable by wheel on a machine that has
+never been to them, and with gaps in the numbers a notch back does not undo a
+notch forward — 1, 2, 3, 5 walks rightward to 5, whose own strip is 1, 2, 5,
+so the notch back lands on 2. A gesture whose inverse is not its opposite is
+not a walk. Nine numbers hold still: every workspace is reachable, a notch is
+exactly reversible, and nothing invisible is being counted after all, because
+the workspace the walk lands on is a cell by the time the frame is painted —
+the strip always names the active one, which is the property this whole
+section opens with.
+
+The workspaces are a list and not a ring. A notch at either end stays where it
+is rather than arriving at the other, which is a switch the operator did not
+aim at; a spin carries as far as it turned, and stops.
+
+The strip takes exactly the notch the pointer model DROPPED, which is what
+makes one notch a switch or a client's scroll and never both. The model sends
+the wheel to its focus and drops it where there is none (§3), so the strip
+asks whether anything has focus rather than forming a second opinion about
+grabs.
+
+It asks AFTER the report's buttons have been replayed, and so does every other
+question the notch turns on. What the report LEAVES is what owns the wheel,
+which is the same ordering the model itself keeps by routing axes after
+buttons. A report carrying a notch and the last release of a grab — a client's,
+or td's own drag — ends with neither holding it, and the notch is the strip's;
+asked beforehand, that notch reached nobody at all, the model having dropped it
+for want of a focus and the strip having refused it for a gesture that was over
+by the time it was asked.
+
+One report is also one SWITCH. A gesture that named a workspace outright is
+the more deliberate half, so a notch beside it is spent rather than applied on
+top — and it is answered first for a second reason: applying the notch would
+move the cells out from under a press that hit-tests the strip as it stands.
+
+A DROP onto a cell names one as outright as a press does, and spends the notch
+the same way; a release that named no cell spends nothing, and the notch beside
+it is the strip's as any other would be. `drag` says which it was rather than
+the caller reading the active workspace back afterwards, since a drop names a
+workspace WITHOUT leaving for it — the number in view is the same before and
+after, so there is nothing there to see. An error from `drag` is answered as a
+naming too: a report whose buttons did not replay cleanly is no report to spend
+a gesture of td's own on.
+
+Two things refuse the notch outright. A drag still in flight: that gesture is
+aimed at a cell and answers with a block, which switching underneath would
+move. And anything MODAL, the gate the press already passes through — a sheet
+is answered by the swallowed scroll above, but a portal dialog holding no grab
+is not, and the wheel must not be the one gesture that reaches past a dialog
+the click beside it cannot.
 
 A drop on a cell moves the DRAGGED window rather than the focused one. A press
 on a band focuses it, so the two name the same window today; they are separate
@@ -350,9 +441,10 @@ pressed, the action from the effect it produced — and it counts the rows, so
 one added without a probe fails rather than going unchecked. A binding that
 changes without this table changing is therefore a failing test rather than
 a screen that lies, which is the only guarantee available for painted text.
-Three rows no chord can drive — `HOVER`, `CLICK`, and `DRAG A TITLE` — are
-pinned by name and by an EFFECT that same table turns into words, so a mouse
-row cannot invent words of its own. The limit of THAT is worth stating beside
+Six rows no chord can drive — `HOVER`, `CLICK`, `DRAG A TITLE`, `DRAG TO THE
+BAR`, `CLICK THE BAR` and `SCROLL THE BAR` — are pinned by name and by an
+EFFECT that same table turns into words, so a mouse row cannot invent words of
+its own. The limit of THAT is worth stating beside
 the keymap one: a keyboard row derives its effect from the dispatch that just
 ran, and a mouse row has none to derive from, so a row and its probe changed
 together would agree about something untrue. What each gesture actually does
@@ -2844,6 +2936,30 @@ which is a rule about the grab AT THE PRESS, not for the length of a
 gesture: a second button pressed during a live drag is still the client's
 and still establishes one.
 
+Which presses those were is the REPORT's answer and not the grab's, for the
+reason `pressed_on` is (§3): the model names an OWNER for each transition it
+carries — the client it was routed to, the compositor's own claim, or nobody —
+and every compositor gesture, a band handle, a band button, a workspace cell,
+spends only a press that belongs to nobody. Comparing the grab around the
+report cannot express the rule above. A report carrying a new press and then
+the releases that end an older grab leaves no grab behind at all, so the press
+the client was given looks free; the shape is reachable because a mouse reports
+its whole button bitmap per poll, and rolling off one button onto another
+arrives as one report.
+
+Per TRANSITION, not per button code, and not one answer for the whole report.
+One report can carry the same button twice — a press the grab took, the
+release that ends it, and a press that is then nobody's — so an answer keyed
+by the code would refuse that last press, which is a whole gesture lost to a
+button pressed earlier in the same poll. The CLAIM is named the same way for
+the same reason: a claim is refused while a grab is held, so a report can hand
+one press over and claim another once the grab has ended inside it, and a
+report-wide flag would let the claimed gesture spend the press that was handed
+over. The owner is written where the press is routed, so it cannot drift from
+the routing: a duplicate press of a held button routes nothing and is nobody's,
+where a caller reading the focus beside it would have called it the client's
+and refused a gesture never given away.
+
 A drag is also forgotten when the window it names goes away — on a single
 toplevel's removal, on a whole client's, and on an unmap. Object ids are
 recycled per client, so a stale one does not merely name nothing: it can come
@@ -3421,9 +3537,20 @@ A notch goes to the pointer FOCUS, as a button does, so a wheel turned during
 a drag belongs to the surface being dragged rather than to whatever the cursor
 has moved over. A notch over nothing is DROPPED rather than queued: there is
 no surface to owe it to, and delivering it with the next enter would scroll a
-window the operator never scrolled over. A modal overlay swallows it outright
-where it lets a RELEASE through — a release is owed to a client already
-holding the button, and a notch is a whole gesture rather than half of one.
+window the operator never scrolled over. Over the BAR it is not nothing: the
+strip takes it and walks the workspaces (§1). That is a gesture of td's own
+rather than an exception to the rule above, and it is defined BY the rule —
+the strip takes exactly the notch this paragraph drops, asked after the report
+rather than before it, so one notch is never both a switch and a client's
+scroll. It is often NEITHER, which is ordinary rather than a gap: §1 carries
+two cases that refuse it outright, a modal and a drag in flight, and the walk
+itself answers nothing at either end of the range or for a tilt that cancels
+its own turn. What the rule forbids is one notch counted twice, not a notch
+that lands nowhere.
+
+A modal overlay swallows it outright where it lets a RELEASE through — a
+release is owed to a client already holding the button, and a notch is a whole
+gesture rather than half of one.
 
 Version 5 and newer also receive `axis_source` naming the wheel and
 `axis_discrete` carrying the notch count. Version 4 and below receive the axis
@@ -3890,7 +4017,10 @@ The landing must prove:
   locks, key releases, registration cutoffs, and queue saturation;
 - pointer model tests cover enter, leave, motion, cross-client routing,
   duplicate buttons, mid-frame re-grabs, implicit grabs, surface removal,
-  workspace cancellation, snapshots, and revision exhaustion;
+  workspace cancellation, snapshots, and revision exhaustion; and the presses
+  a report handed to a client are pinned in the three shapes a compositor
+  gesture turns on — a press taken by a grab that ENDS later in the same
+  report, a press over nothing, and a duplicate press that routed nothing;
 - every painted help row is driven through the dispatch, both columns
   derived from the result, with the row count pinned; the mouse rows name an
   EFFECT rather than words of their own, though nothing there ties a GESTURE
@@ -3904,7 +4034,8 @@ The landing must prove:
   the host's own `/proc`, its calendar is walked day by day across a leap
   year, its strip is proved to paint only its own rows and to clip on an
   output shorter than itself, the layout/render/hit-test agreement is
-  checked at several output sizes with the bar's rows proved unclickable,
+  checked at several output sizes with the bar's rows proved to reach no
+  client — which is what leaves a press there for the strip to answer —
   and the runtime is held to repainting only on a changed line and to
   restoring the previous one when that paint fails; the workspace strip is
   proved as its own list — every occupied workspace plus the active one,
@@ -3913,6 +4044,35 @@ The landing must prove:
   exchanged, the status line starts after the cells and leaves their pixels
   exactly as no status line would, and the mark is driven through the scene
   across two switches to prove it follows the layout rather than a constant;
+- the strip's pointer gestures are proved where the drop onto it is, through
+  the real driver: a press on a cell switches to it and picks nothing up and
+  reaches no client, a press on the active cell is refused where the state
+  afterwards could not tell, a notch over the status line walks either way
+  and stops at the end of the range, and each refusal carries the control
+  that says it is about the bar rather than about a compositor that swallowed
+  every report — a notch over a window, a notch while a client holds a grab,
+  and a press and a notch both reaching past a modal portal dialog, with the
+  first two proved to have reached the client instead. Ownership is proved in
+  the shapes a grab cannot express: a left press rolled onto a button another
+  already holds is the client's even though the report ends with no grab, the
+  same button pressed AGAIN later in that report is nobody's and does switch,
+  and the notch arriving with a last release — a client's grab or td's own
+  drag — is the strip's. The model's own answer is pinned per transition
+  beside them, claims and duplicate presses included. An Alt-held press on a
+  cell switches, since Alt is claimed only where it could pick a window up.
+  A report carrying both a press and a notch makes them DISAGREE and lands the
+  press, the notch it spends being the one that would have moved the cell under
+  it; a report carrying a DROP onto a cell and a notch lands the drop and spends
+  the notch, against the release over the status line that names no cell and
+  leaves it. That drop carries its own last motion, which is what separates the
+  hint read after the re-aim from the one read before it. The walk itself is a
+  range test: every workspace reaches every other, a notch back undoes a notch
+  forward, and an overshoot clamps rather than wraps. The wheel's own sign is
+  pinned beside the protocol conversion it agrees with, tilt included. A menu
+  open over the bar takes the press and leaves the notch, which §1 claims and
+  neither the strip's tests nor the menus' would otherwise reach: both follow
+  from code elsewhere — the dismissal filter and the model's focus — so a change
+  to either would flip them silently;
 - the focus policy is proved end to end through the runtime in both its
   halves — a hover focuses, and does so over a band and over a tile its
   client does not fill; a still pointer, a delta clamped away at the edge,

@@ -2,7 +2,9 @@ use crate::bar::{self, BAR_HEIGHT};
 use crate::buffer::{BufferCeiling, BufferCharge, Surface};
 use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
-use crate::layout::{Axis, Command, DropKind, Layout, Placement, Presentation, Rect, ViewLayout};
+use crate::layout::{
+    self, Axis, Command, DropKind, Layout, Placement, Presentation, Rect, ViewLayout,
+};
 use crate::ui;
 use crate::MAX_UI_DIMENSION;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2372,6 +2374,44 @@ impl Scene {
         )
     }
 
+    /// The workspace a PRESS on the strip switches to: the cell under the
+    /// pointer, and only when it is not the one already active — pressing the
+    /// cell an operator is standing on switches nothing, exactly as a drop on
+    /// it moves nothing. Only the CELLS answer, as a drop does: the status
+    /// line beside them names no workspace, so a press there is a press on the
+    /// bar rather than on whichever number was drawn last.
+    ///
+    /// A press over the bar reaches no client — every tile is offset below it
+    /// and a popup takes no clicks there — so this is the compositor's to
+    /// answer, the same seam that makes a title band draggable.
+    pub fn desk_pressed(&self) -> Option<u8> {
+        let (x, y) = self.pointer_at_usize()?;
+        // The bar's own rows first, so the press every ordinary click makes on
+        // a tile does not walk the strip and allocate for it.
+        if y >= BAR_HEIGHT {
+            return None;
+        }
+        let number = bar::desk_at(&self.desks(), x, y)?;
+        (number != self.layout.active_workspace()).then_some(number)
+    }
+
+    /// The workspace a WHEEL turned over the bar switches to, `notches` along
+    /// from the active one.
+    ///
+    /// The whole bar answers this and not just the cells, which is where it
+    /// parts company with a press: a notch names a DIRECTION rather than a
+    /// target, so the status line has an answer for one and not for the other,
+    /// and the row an operator flicks the wheel over is the bar rather than a
+    /// twenty-pixel cell within it. Which is also why the strip is not what it
+    /// walks — `layout::workspace_step` says what it walks instead, and why.
+    pub fn desk_scrolled(&self, notches: i32) -> Option<u8> {
+        let (_, y) = self.pointer_at_usize()?;
+        if y >= BAR_HEIGHT {
+            return None;
+        }
+        layout::workspace_step(self.layout.active_workspace(), notches)
+    }
+
     #[cfg(test)]
     pub fn hint_is_live(&self) -> bool {
         self.hint.is_some()
@@ -2401,6 +2441,19 @@ impl Scene {
                 self.layout.move_key_to_workspace(dragged, number)
             }
         })
+    }
+
+    /// Whether the block standing NOW names a workspace rather than a tile.
+    /// Asked of a release before `commit_drop` takes the hint, because a drop
+    /// onto a cell names a workspace as outright as a press on one does and
+    /// spends the same report's notch (§1). The destination rather than the
+    /// answer `commit_drop` gives: what matters is what the gesture NAMED, and
+    /// a drop that moved nothing named it just the same.
+    pub fn hint_names_workspace(&self) -> bool {
+        matches!(
+            self.hint.map(|hint| hint.destination),
+            Some(DropDestination::Workspace(_))
+        )
     }
 
     /// Take the block down. Answers whether the screen moves, which it does
@@ -6688,6 +6741,54 @@ mod tests {
             .unwrap_or_else(|| panic!("the strip is not showing workspace {number}: {desks:?}"));
         scene.pointer_x = i32::try_from(left + width / 2).unwrap();
         scene.pointer_y = i32::try_from(BAR_HEIGHT / 2).unwrap();
+    }
+
+    #[test]
+    fn the_strip_answers_a_press_on_a_cell_and_a_wheel_anywhere_on_the_bar() {
+        // One workspace in use, so the strip is the number in use and the
+        // spare beside it — the machine an operator switching by pointer for
+        // the first time is sitting at.
+        let mut scene = a_window_beside_a_column();
+        assert_eq!(scene.desks(), [1, 2]);
+
+        aim_at_desk(&mut scene, 2);
+        assert_eq!(scene.desk_pressed(), Some(2));
+        // A notch either way from the same spot, which is the wheel's whole
+        // asymmetry with the press: it reads the ACTIVE workspace rather than
+        // the cell under the pointer, so it answers 2 from a cell naming 2,
+        // and nothing at the end of the range it is turning toward.
+        assert_eq!(scene.desk_scrolled(1), Some(2));
+        assert_eq!(scene.desk_scrolled(-1), None);
+        // Past the cells the strip is showing, which the wheel walks and the
+        // strip does not bound: nine workspaces exist whether or not the bar
+        // is naming them, and the one this lands on is a cell as soon as it
+        // is active.
+        assert_eq!(scene.desk_scrolled(4), Some(5));
+        assert_eq!(scene.desk_scrolled(20), Some(9));
+
+        // The cell an operator is already standing on switches nothing, for
+        // the reason a drop on it moves nothing: there is no switch to make.
+        aim_at_desk(&mut scene, 1);
+        assert_eq!(scene.desk_pressed(), None);
+        assert_eq!(scene.desk_scrolled(1), Some(2));
+
+        // Past the last cell is the status line. It names no workspace, so a
+        // press there is a press on the bar; a notch names a direction rather
+        // than a target, so the whole row answers one.
+        let (left, width) = bar::desk_cell(&scene.desks(), 2)
+            .unwrap_or_else(|| panic!("the strip is not showing workspace 2"));
+        scene.pointer_x = i32::try_from(left + width + 4).unwrap();
+        scene.pointer_y = i32::try_from(BAR_HEIGHT / 2).unwrap();
+        assert_eq!(scene.desk_pressed(), None);
+        assert_eq!(scene.desk_scrolled(1), Some(2));
+
+        // Below the bar is a window, and neither gesture belongs to the strip
+        // there — the wheel is the client's.
+        aim_at_desk(&mut scene, 2);
+        scene.pointer_y = i32::try_from(BAR_HEIGHT).unwrap();
+        assert_eq!(scene.desk_pressed(), None);
+        assert_eq!(scene.desk_scrolled(1), None);
+        assert_eq!(scene.desk_scrolled(-1), None);
     }
 
     #[test]
