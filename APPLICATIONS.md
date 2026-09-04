@@ -5317,11 +5317,26 @@ path-independent as required by the standard interface.
 
 The values come from the exact regular immutable
 `/etc/td-portal-settings`. Its closed, 4-KiB-bounded LF keyfile has two
-namespaces and ten typed values: appearance color scheme, accent and contrast,
-and the GNOME-compatible theme, icon, cursor, cursor-size, font,
-document-font, and monospace-font keys. Missing, duplicate, unknown,
-mistyped, out-of-range, non-UTF-8, or CR-containing input stops
-the service rather than inventing a desktop preference.
+namespaces and eleven typed values: appearance color scheme, accent and
+contrast, and the GNOME-compatible theme, icon, cursor, cursor-size, font,
+document-font, monospace-font, and text-scaling-factor keys. Missing,
+duplicate, unknown, mistyped, out-of-range, non-UTF-8, or CR-containing input
+stops the service rather than inventing a desktop preference.
+
+`text-scaling-factor` is not decoration. GDK's portal-mode Xft path derives
+its DPI from that key alone: the Xft DPI value that path publishes is
+`96 * text-scaling-factor * 1024` (Xft carries dots per inch in 1/1024
+units, so 98304 at 1.0), the screen resolution it sets from that is
+`96 * text-scaling-factor` (96 at 1.0), and when the portal never sends the
+key the computed value is zero, the resolution is never set, and it stays
+at GDK's default of -1 rather than 96 (`gdk/wayland/gdkscreen-wayland.c`,
+`update_xft_settings`).
+Firefox reads that raw resolution as its system-font scale factor, so an
+application launched with `GTK_USE_PORTAL=1` against a portal without the key
+sizes every chrome font at or below zero: no tab titles, no URL bar text,
+while page content, which never consults it, renders normally. The default
+is `1.0`, served as a plain D-Bus `d`, and the bounds are the GNOME schema's
+own 0.5 to 3.0.
 
 The service compiles td-busd's canonical bounded message, name, and wire
 modules directly rather than growing a second D-Bus codec. One decoded frame
@@ -5342,7 +5357,7 @@ synchronous `Settings.ReadAll` through td-busd, and byte-compares both replies
 to the compiled file. It then pre-subscribes to its exact caller-derived
 Request path, calls the Background interface described below, checks that the
 method reply carries that path, and byte-compares the directed `Response`.
-Only then does it emit `TD-PORTAL-READY namespaces=2 settings=10 version=1`
+Only then does it emit `TD-PORTAL-READY namespaces=2 settings=11 version=1`
 and `TD-PORTAL-REQUEST-READY response=2`.
 
 The same client proves five capability-bearing interfaces unavailable:
@@ -5435,7 +5450,7 @@ not for a persistent Session lifecycle.
 
 | # | interface | needs | decision |
 |---|---|---|---|
-| 1 | `.Settings` | nothing | **LANDED** as the version-1 synchronous service above: `org.freedesktop.appearance` `color-scheme`/`accent-color`/`contrast` plus the `org.gnome.desktop.interface` font/theme/cursor keys, from one immutable td session config file — never inferred from absent GNOME services. Removes GTK's startup portal probe as an unknown. |
+| 1 | `.Settings` | nothing | **LANDED** as the version-1 synchronous service above: `org.freedesktop.appearance` `color-scheme`/`accent-color`/`contrast` plus the `org.gnome.desktop.interface` font/theme/cursor keys and the `text-scaling-factor` GDK needs to compute a DPI at all, from one immutable td session config file — never inferred from absent GNOME services. Removes GTK's startup portal probe as an unknown. |
 | 1a | `.Background` | nothing | **LANDED as an explicit denial**: version 1 `RequestBackground` exercises the real bounded Request lifecycle and returns response 2 with false `background`/`autostart`. Persistent background execution and version-2 `SetStatus` remain unsupported. |
 | 2 | `.Account` | a consent dialog | uid 1000's passwd entry, empty image URI. |
 | 3 | `.FileChooser` | a surface | **`OpenFile` v3 LANDED for the authenticated Firefox Downloads grant** with modal keyboard-driven open-file, multiple-file, and directory modes. Standard `SaveFile` and `SaveFiles` are advertised but explicitly `NotSupported`; `choices`, selecting a non-all-files filter, and selection outside an existing grant are likewise refused. A bounded accept label and Firefox's selected all-files filter are rendered; `current_folder` remains a bounded hint rather than an access control. |
@@ -6417,7 +6432,7 @@ packaged selftest, boot oracle — with **network never in the gate**.
    working perfectly; an earlier draft said exactly that, and it is the
    kind of error that presents as "the portal is broken". It byte-compares the
    replies to `/etc/td-portal-settings` and emits the
-   exact `portal-evidence: TD-PORTAL-READY namespaces=2 settings=10 version=1`
+   exact `portal-evidence: TD-PORTAL-READY namespaces=2 settings=11 version=1`
    console line. It separately pre-subscribes to a caller-derived path, calls
    version-1 `Background.RequestBackground`, requires the method reply before
    the directed denial signal, byte-compares response 2 and its false results,
@@ -6795,7 +6810,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 13 | `td-busd` codec, auth, surface #10 | none |
 | 14 | names, routing, match rules, descriptor passing | none |
 | 15 | per-app policy, lineage identity, in-jail activation | none |
-| 16 | **`td-portal` static service, Settings and Request core LANDED**: broker activation, immutable two-namespace/ten-key policy, version-1 `ReadAll`/`Read`/Properties, a 64-entry caller-owned handle table, owner departure cleanup, and Background v1's exact response-2 denial. QEMU proves the Settings direct reply and a pre-subscribed method-reply/directed-`Response` sequence. Session machinery is staged but no public interface creates one; Account remains behind consent UI | GTK's Settings call has a real routed answer and portal handle routing is live without inventing background permission |
+| 16 | **`td-portal` static service, Settings and Request core LANDED**: broker activation, immutable two-namespace/eleven-key policy, version-1 `ReadAll`/`Read`/Properties, a 64-entry caller-owned handle table, owner departure cleanup, and Background v1's exact response-2 denial. QEMU proves the Settings direct reply and a pre-subscribed method-reply/directed-`Response` sequence. Session machinery is staged but no public interface creates one; Account remains behind consent UI | GTK's Settings call has a real routed answer and portal handle routing is live without inventing background permission |
 | 17 | Wayland A: `set_window_geometry`, decoration manager, ARGB golden, single-pixel-buffer; **E2's GDK, llvmpipe, and Firefox presentation answers are recorded in §F and `td-compositor/DESIGN.md`** | none |
 | 18 | Wayland B: `wl_subcompositor` — **LANDED** | a compound window renders and receives input in client-defined subsurface order, with synchronized frames applied on the parent commit |
 | 19 | Wayland C: `xdg_positioner`/`xdg_popup`, click-outside dismissal and edge constraint solving LANDED | a menu appears where its client asked, takes the keyboard while it is up, closes when the operator presses outside it, and is flipped, slid or resized clear of an output edge as its positioner permits |

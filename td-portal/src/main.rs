@@ -136,7 +136,7 @@ const FIREFOX_HOST_DOWNLOADS: &str = "/var/home/tester/Downloads";
 const FIREFOX_GUEST_DOWNLOADS: &str = "/home/td/Downloads";
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const OWNER_MATCH: &str = "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged'";
-pub const READY_MARKER: &str = "TD-PORTAL-READY namespaces=2 settings=10 version=1";
+pub const READY_MARKER: &str = "TD-PORTAL-READY namespaces=2 settings=11 version=1";
 pub const REQUEST_READY_MARKER: &str = "TD-PORTAL-REQUEST-READY response=2";
 pub const UNAVAILABLE_READY_MARKER: &str =
     "TD-PORTAL-UNAVAILABLE-READY interfaces=5 error=UnknownInterface";

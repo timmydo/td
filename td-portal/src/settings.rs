@@ -10,9 +10,12 @@ use crate::wire::{WireError, Writer};
 pub const APPEARANCE: &str = "org.freedesktop.appearance";
 pub const GNOME_INTERFACE: &str = "org.gnome.desktop.interface";
 pub const NAMESPACE_COUNT: usize = 2;
-pub const SETTING_COUNT: usize = 10;
+pub const SETTING_COUNT: usize = 11;
 pub const MAX_CONFIG_BYTES: u64 = 4 * 1024;
 const MAX_TEXT_BYTES: usize = 64;
+// The GNOME schema's own range for text-scaling-factor.
+const MIN_TEXT_SCALING_FACTOR: f64 = 0.5;
+const MAX_TEXT_SCALING_FACTOR: f64 = 3.0;
 
 pub const DEFAULT_CONFIG: &str = include_str!("../default-settings.conf");
 
@@ -28,6 +31,7 @@ const KEYS: [&str; SETTING_COUNT + 1] = [
     "font-name",
     "document-font-name",
     "monospace-font-name",
+    "text-scaling-factor",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +46,15 @@ pub struct Settings {
     font_name: String,
     document_font_name: String,
     monospace_font_name: String,
+    // Served because GDK's portal path derives its Xft DPI from this key
+    // alone (`96 * text-scaling-factor * 1024` in Xft's 1/1024-dpi units)
+    // and sets the screen resolution to `96 * text-scaling-factor` from it;
+    // absent the key it never sets a resolution at all
+    // (gdkscreen-wayland.c `update_xft_settings`). Firefox reads that raw
+    // resolution as its system-font scale, so without this key every chrome
+    // font is sized at or below zero and the tab strip and URL bar draw no
+    // text while page content, which never consults it, renders normally.
+    text_scaling_factor: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +63,7 @@ pub(crate) enum Setting<'a> {
     Int(i32),
     Text(&'a str),
     Rgb(f64, f64, f64),
+    Double(f64),
 }
 
 impl Setting<'_> {
@@ -59,6 +73,7 @@ impl Setting<'_> {
             Self::Int(_) => "i",
             Self::Text(_) => "s",
             Self::Rgb(_, _, _) => "(ddd)",
+            Self::Double(_) => "d",
         }
     }
 
@@ -73,6 +88,7 @@ impl Setting<'_> {
                 writer.double(blue);
                 Ok(())
             })?,
+            Self::Double(value) => writer.double(value),
         }
         Ok(())
     }
@@ -150,6 +166,7 @@ impl Settings {
         let contrast = small_u32(&values, "contrast", 1)?;
         let cursor_size = positive_i32(&values, "cursor-size", 256)?;
         let accent_color = rgb(&values, "accent-color")?;
+        let text_scaling_factor = scaling_factor(&values, "text-scaling-factor")?;
         Ok(Self {
             color_scheme,
             accent_color,
@@ -161,6 +178,7 @@ impl Settings {
             font_name: text_value(&values, "font-name")?,
             document_font_name: text_value(&values, "document-font-name")?,
             monospace_font_name: text_value(&values, "monospace-font-name")?,
+            text_scaling_factor,
         })
     }
 
@@ -180,6 +198,7 @@ impl Settings {
             (GNOME_INTERFACE, "font-name") => Setting::Text(&self.font_name),
             (GNOME_INTERFACE, "document-font-name") => Setting::Text(&self.document_font_name),
             (GNOME_INTERFACE, "monospace-font-name") => Setting::Text(&self.monospace_font_name),
+            (GNOME_INTERFACE, "text-scaling-factor") => Setting::Double(self.text_scaling_factor),
             _ => return None,
         })
     }
@@ -209,7 +228,6 @@ impl Settings {
             Ok(())
         })
     }
-
 }
 
 fn namespace_keys(namespace: &str) -> &'static [&'static str] {
@@ -223,6 +241,7 @@ fn namespace_keys(namespace: &str) -> &'static [&'static str] {
             "font-name",
             "document-font-name",
             "monospace-font-name",
+            "text-scaling-factor",
         ],
         _ => &[],
     }
@@ -287,6 +306,22 @@ fn text_value(values: &BTreeMap<&str, &str>, key: &str) -> Result<String, String
     Ok(value.to_string())
 }
 
+fn scaling_factor(values: &BTreeMap<&str, &str>, key: &str) -> Result<f64, String> {
+    let text = required(values, key)?;
+    let value = text
+        .parse::<f64>()
+        .map_err(|_| format!("setting {key:?} is not a number"))?;
+    if !value.is_finite() {
+        return Err(format!("setting {key:?} is not a finite number"));
+    }
+    if !(MIN_TEXT_SCALING_FACTOR..=MAX_TEXT_SCALING_FACTOR).contains(&value) {
+        return Err(format!(
+            "setting {key:?} is outside {MIN_TEXT_SCALING_FACTOR:.1}..={MAX_TEXT_SCALING_FACTOR:.1}"
+        ));
+    }
+    Ok(value)
+}
+
 fn rgb(values: &BTreeMap<&str, &str>, key: &str) -> Result<(f64, f64, f64), String> {
     let value = required(values, key)?;
     let mut components = value.split(',');
@@ -323,6 +358,7 @@ mod tests {
         assert_eq!(settings.color_scheme, 1);
         assert_eq!(settings.cursor_size, 24);
         assert_eq!(settings.accent_color, (0.125, 0.375, 0.75));
+        assert_eq!(settings.text_scaling_factor, 1.0);
         for broken in [
             DEFAULT_CONFIG.replace("format=1\n", ""),
             DEFAULT_CONFIG.replace("format=1\n", "format=2\n"),
@@ -343,8 +379,43 @@ mod tests {
             DEFAULT_CONFIG.replace("0.125,0.375,0.75", "nan,0.375,0.75"),
             DEFAULT_CONFIG.replace("0.125,0.375,0.75", "1.1,0.375,0.75"),
             DEFAULT_CONFIG.replace("gtk-theme=Adwaita", "gtk-theme=bad\tvalue"),
+            DEFAULT_CONFIG.replace("text-scaling-factor=1.0", "text-scaling-factor=0.4"),
+            DEFAULT_CONFIG.replace("text-scaling-factor=1.0", "text-scaling-factor=3.5"),
+            DEFAULT_CONFIG.replace("text-scaling-factor=1.0", "text-scaling-factor=nan"),
+            DEFAULT_CONFIG.replace("text-scaling-factor=1.0", "text-scaling-factor=inf"),
+            DEFAULT_CONFIG.replace("text-scaling-factor=1.0", "text-scaling-factor=-1"),
+            DEFAULT_CONFIG.replace("text-scaling-factor=1.0", "text-scaling-factor=one"),
         ] {
             assert!(Settings::parse(&broken).is_err(), "accepted {broken:?}");
+        }
+        // Each scaling-factor rejection names its own reason.
+        for (value, reason) in [
+            ("one", "is not a number"),
+            ("nan", "is not a finite number"),
+            ("3.5", "is outside 0.5..=3.0"),
+        ] {
+            let broken = DEFAULT_CONFIG.replace(
+                "text-scaling-factor=1.0",
+                &format!("text-scaling-factor={value}"),
+            );
+            let error = Settings::parse(&broken).err();
+            assert!(
+                error.as_deref().is_some_and(|error| error.contains(reason)),
+                "{value}: {error:?}"
+            );
+        }
+        // Both ends of the GNOME range are inside it.
+        for (edge, expected) in [("0.5", 0.5), ("3.0", 3.0), ("3", 3.0)] {
+            let accepted = DEFAULT_CONFIG.replace(
+                "text-scaling-factor=1.0",
+                &format!("text-scaling-factor={edge}"),
+            );
+            let settings = Settings::parse(&accepted);
+            assert!(settings.is_ok(), "rejected {edge}: {settings:?}");
+            assert_eq!(
+                settings.map(|settings| settings.text_scaling_factor),
+                Ok(expected)
+            );
         }
     }
 
@@ -379,6 +450,61 @@ mod tests {
                 .len();
         }
         assert_eq!(total, SETTING_COUNT);
+    }
+
+    /// GDK only computes a usable Xft DPI from this key, and it wants a
+    /// plain `d`, which `apply_portal_setting` reads with
+    /// `g_variant_get_double`.
+    #[test]
+    fn the_text_scaling_factor_is_published_to_gdk_as_a_unit_double() {
+        let settings = Settings::parse(DEFAULT_CONFIG).unwrap();
+        let mut writer = Writer::new(Endian::Little);
+        settings
+            .write_read_all(&mut writer, &["org.gnome.*"])
+            .unwrap();
+        let values = wire::read_body(
+            writer.as_bytes(),
+            "a{sa{sv}}",
+            Endian::Little,
+            Limits::NO_FDS,
+        )
+        .unwrap();
+        // `org.gnome.*` selects exactly the one namespace GTK reads.
+        let namespaces = values
+            .first()
+            .and_then(Value::as_seq)
+            .unwrap()
+            .values(1)
+            .unwrap();
+        assert_eq!(namespaces.len(), 1);
+        let pair = namespaces
+            .first()
+            .and_then(Value::as_seq)
+            .unwrap()
+            .values(2)
+            .unwrap();
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair.first().and_then(Value::as_str), Some(GNOME_INTERFACE));
+        // Every org.gnome.desktop.interface key, pinned as a literal.
+        let expected_entries = 8;
+        let entries = pair
+            .get(1)
+            .and_then(Value::as_seq)
+            .unwrap()
+            .values(expected_entries)
+            .unwrap();
+        assert_eq!(entries.len(), expected_entries);
+        let mut published = None;
+        for entry in &entries {
+            let entry = entry.as_seq().unwrap().values(2).unwrap();
+            assert_eq!(entry.len(), 2);
+            if entry.first().and_then(Value::as_str) == Some("text-scaling-factor") {
+                let variant = entry.get(1).and_then(Value::as_seq).unwrap();
+                assert_eq!(variant.signature(), "d");
+                published = Some(variant.values(1).unwrap());
+            }
+        }
+        assert_eq!(published, Some(vec![Value::Double(1.0)]));
     }
 
     #[test]

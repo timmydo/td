@@ -767,7 +767,7 @@ pub const TD_BUSD_RUNTIME_MARKER: &str = "TD-BUSD-RUN-OK";
 /// `portal-evidence: <marker>` line after td-svc applies its trusted service
 /// prefix, not this unframed substring.
 pub const TD_PORTAL_RUNTIME_MARKER: &str =
-    "TD-PORTAL-READY namespaces=2 settings=10 version=1";
+    "TD-PORTAL-READY namespaces=2 settings=11 version=1";
 
 /// Printed by that same live client only after it pre-subscribes to the exact
 /// caller-derived path, receives the Background method reply carrying that

@@ -115,7 +115,7 @@ const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
 /// and Settings.ReadAll return the exact immutable session policy.
 const TD_PORTAL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_RUNTIME_MARKER;
 const TD_PORTAL_CONSOLE_MARKER: &str =
-    "portal-evidence: TD-PORTAL-READY namespaces=2 settings=10 version=1";
+    "portal-evidence: TD-PORTAL-READY namespaces=2 settings=11 version=1";
 const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_REQUEST_RUNTIME_MARKER;
 const TD_PORTAL_REQUEST_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-REQUEST-READY response=2";
