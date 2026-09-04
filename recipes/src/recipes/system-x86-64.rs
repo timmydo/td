@@ -1,5 +1,6 @@
 use crate::ladder::{
-    post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
+    entry_program, post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN,
+    BOOT_FAIL_TARGET_CMDLINE_TOKEN,
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, CODEX_BWRAP_VERSION_OUTPUT, CODEX_RUNTIME_MARKER,
     CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN,
     FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN, FIREFOX_AUDIT_CMDLINE_TOKEN,
@@ -19,9 +20,11 @@ use crate::ladder::{
     TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
     TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
     TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
-    TD_COMPOSITOR_DRM_PROBE_MARKER, TD_JAIL_KILL_REAPS_MARKER,
-    TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_PORTAL_CHANNEL_RUNTIME_MARKER,
+    TD_APPLICATIONS_PLACED_MARKER, TD_COMPOSITOR_DRM_PROBE_MARKER,
+    TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER,
+    TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
+    TD_PORTAL_CHANNEL_RUNTIME_MARKER,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
     TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
@@ -340,13 +343,43 @@ const FIREFOX_GREETER_WAIT_ITERATIONS: u16 =
         + FIREFOX_SOAK_BRACKET_MARGIN_SECS
         + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS;
 
-const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[ShippedApplication {
-    name: FIREFOX_NAME,
-    package: FIREFOX_NAME,
-    package_recipe: super::firefox::recipe,
-    runtime: "freedesktop-platform-25-08",
-    runtime_recipe: super::freedesktop_platform_25_08::recipe,
-}];
+/// Seconds a terminal application's window must stay up after td-term
+/// reported it ready before the evidence unit reads its jail instance: long
+/// enough for a program that exits on its configuration to have done so.
+const APPLICATION_SETTLE_SECS: u32 = 5;
+
+/// The workspace the terminal applications' windows map on: the control
+/// channel makes it active before they start. Not the first: that one is the
+/// shell's and Firefox's, whose tiles the physical-input oracle binds at
+/// fixed coordinates.
+const TERMINAL_APPLICATION_WORKSPACE: u8 = 2;
+
+const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
+    ShippedApplication {
+        name: FIREFOX_NAME,
+        package: FIREFOX_NAME,
+        package_recipe: super::firefox::recipe,
+        runtime: "freedesktop-platform-25-08",
+        runtime_recipe: super::freedesktop_platform_25_08::recipe,
+    },
+    // The terminal applications: td-owned static programs on the empty
+    // runtime, each a td-term window at boot. Neither holds a bus name; the
+    // tripwire below counts the applications that do.
+    ShippedApplication {
+        name: TD_MAIL_NAME,
+        package: TD_MAIL_NAME,
+        package_recipe: super::mail::recipe,
+        runtime: "empty-runtime",
+        runtime_recipe: super::empty_runtime::recipe,
+    },
+    ShippedApplication {
+        name: TD_NEWS_NAME,
+        package: TD_NEWS_NAME,
+        package_recipe: super::news::recipe,
+        runtime: "empty-runtime",
+        runtime_recipe: super::empty_runtime::recipe,
+    },
+];
 
 /// Account names are embedded UNQUOTED in generated root shell — `/bin/su -s /bin/sh
 /// <name> -c …` in rootcheck and every health leg, and `/bin/login -f <name>` in
@@ -1091,7 +1124,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 25] = [
+const TD_SVC_UNITS: [&str; 32] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -1106,6 +1139,13 @@ const TD_SVC_UNITS: [&str; 25] = [
     "wayland",
     "portal-channel-evidence",
     "terminal",
+    "applications-workspace",
+    "mail",
+    "mail-evidence",
+    "news",
+    "news-evidence",
+    "shell-workspace",
+    "placement-evidence",
     "firefox-tls-setup",
     "firefox-tls-origin",
     "firefox-autotest",
@@ -1145,6 +1185,10 @@ mod svc_timeouts {
     pub const NETUP: u32 = 700;
     /// Mints one RSA test authority and one server identity in the slow VM.
     pub const FIREFOX_TLS_SETUP: u32 = 120;
+    /// One bounded sleep, then one cgroup read through td-jail's probe.
+    pub const APPLICATION_EVIDENCE: u32 = 60;
+    /// One control-channel request: a line in, and a line or a short report out.
+    pub const APPLICATION_PLACE: u32 = 30;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
     /// but each runs a large probe farm (ten `su` blocks) and can run four
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
@@ -1404,6 +1448,98 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
+         # The terminal applications, one td-term window each, whose child is\n\
+         # the application's /bin launcher: the program runs in its own jail\n\
+         # under the terminal grant, and the window is ready once td-term has\n\
+         # spawned that child. restart=never: a client that exits is restarted\n\
+         # by the operator (a reboot today; a user-level relaunch is\n\
+         # APPLICATIONS.md §W.7), not by a loop that would hide a broken\n\
+         # configuration behind a flickering window, and a broker that failed\n\
+         # is a session they are skipped in rather than launched into. The\n\
+         # compositor tiles a new window into the active workspace, so the\n\
+         # control channel makes workspace {application_workspace} active before\n\
+         # either starts and returns to the first once both are decided: the\n\
+         # first stays the shell's and Firefox's, whose tiles the physical-input\n\
+         # oracle binds, and Firefox maps only after the return. The switch is\n\
+         # an ordering, not a requirement: a channel that failed loses the\n\
+         # placement, not the applications, and the placement evidence below\n\
+         # says so.\n\
+         [applications-workspace]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-ctl workspace {application_workspace}'\n\
+         after=terminal\n\
+         requires=wayland\n\
+         timeout={application_place}\n\
+         \n\
+         [mail]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-mail-ready --command /bin/{mail_name}'\n\
+         after=terminal,busd,netup,applications-workspace\n\
+         requires=wayland,busd\n\
+         ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-mail-ready'\n\
+         ready-timeout=30\n\
+         restart=never\n\
+         \n\
+         # Boot evidence under the autotest token only: the client itself, by\n\
+         # the program its entry runs as, is still in the jail instance\n\
+         # {application_settle} seconds after the window reported ready, so it started on\n\
+         # the configuration td-firstboot provisioned and did not exit on it.\n\
+         # requires= keeps a window whose readiness failed from being probed\n\
+         # at all. The marker is one exact console line, so the probe waits for\n\
+         # TLS setup as the portal evidence does: its progress dots would\n\
+         # otherwise prefix it. Mutable user state cannot block bootsuccess.\n\
+         [mail-evidence]\n\
+         type=oneshot\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {mail_name} {mail_program} && /bin/echo {mail_marker}'\n\
+         after=mail,firefox-tls-setup\n\
+         requires=mail\n\
+         timeout={application_evidence}\n\
+         \n\
+         # The second terminal application: as mail, in a window of its own.\n\
+         [news]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-news-ready --command /bin/{news_name}'\n\
+         after=terminal,busd,netup,applications-workspace\n\
+         requires=wayland,busd\n\
+         ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-news-ready'\n\
+         ready-timeout=30\n\
+         restart=never\n\
+         \n\
+         # As mail-evidence, for news.\n\
+         [news-evidence]\n\
+         type=oneshot\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {news_name} {news_program} && /bin/echo {news_marker}'\n\
+         after=news,firefox-tls-setup\n\
+         requires=news\n\
+         timeout={application_evidence}\n\
+         \n\
+         # The view returns to the first workspace once both applications are\n\
+         # decided, ready or not, so Firefox maps beside the shell.\n\
+         [shell-workspace]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-ctl workspace 1'\n\
+         after=mail,news\n\
+         requires=wayland\n\
+         timeout={application_place}\n\
+         \n\
+         # Boot evidence under the autotest token only: the compositor's own\n\
+         # report shows the first workspace active, the first and the\n\
+         # applications' occupied and no other, and one window on the first,\n\
+         # the shell's, where the physical-input oracle expects it alone; every\n\
+         # other window is then on the applications' workspace. Firefox waits\n\
+         # for this, so the count is taken before its window maps, and the\n\
+         # marker waits for TLS setup like the other exact lines.\n\
+         [placement-evidence]\n\
+         type=oneshot\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-as {ui_user} -- /bin/td-ctl --socket {control_socket} layout) || exit 1; /bin/echo \"$layout\" | /bin/grep -qxF \"workspace active=1 occupied=1,{application_workspace}\" && /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \"^window id=[^ ]* object=[^ ]* workspace=1 \")\" -eq 1 && /bin/echo {placed_marker}'\n\
+         after=shell-workspace,firefox-tls-setup\n\
+         requires=shell-workspace\n\
+         timeout={application_place}\n\
+         \n\
          # The HTTPS origin uses a source-built TLS implementation. Setup mints\n\
          # an ephemeral CA plus localhost identity under /run; the root-owned CA\n\
          # and exact policy are the only two extra files td-jail will admit into\n\
@@ -1442,11 +1578,14 @@ fn build_td_svc_conf() -> String {
          # autotest only, Firefox receives the volatile profile, verified URL,\n\
          # and loopback-only Marionette server used by the support oracle;\n\
          # ordinary boots retain Firefox's own first-run and default-profile flow.\n\
+         # placement-evidence: Firefox's window maps only once the view is back\n\
+         # on the first workspace and its count is taken, so the tile beside\n\
+         # the shell is its.\n\
          [firefox]\n\
          type=daemon\n\
          cgroup=session\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name} --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-login exec-as {ui_user} -- /bin/{firefox_name};; esac'\n\
-         after=audio,busd,portal,wayland,firefox-autotest,firefox-tls-origin\n\
+         after=audio,busd,portal,wayland,firefox-autotest,firefox-tls-origin,placement-evidence\n\
          requires=wayland,firefox-autotest,firefox-tls-origin\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
@@ -1595,6 +1734,17 @@ fn build_td_svc_conf() -> String {
         firefox_tls_url = FIREFOX_TLS_URL,
         firefox_window_ready_socket = FIREFOX_WINDOW_READY_SOCKET,
         firefox_marker = TD_FIREFOX_BOOT_MARKER,
+        mail_name = TD_MAIL_NAME,
+        news_name = TD_NEWS_NAME,
+        mail_program = entry_program(TD_MAIL_ENTRY),
+        news_program = entry_program(TD_NEWS_ENTRY),
+        mail_marker = TD_MAIL_BOOT_MARKER,
+        news_marker = TD_NEWS_BOOT_MARKER,
+        application_settle = APPLICATION_SETTLE_SECS,
+        application_workspace = TERMINAL_APPLICATION_WORKSPACE,
+        application_evidence = svc_timeouts::APPLICATION_EVIDENCE,
+        application_place = svc_timeouts::APPLICATION_PLACE,
+        placed_marker = TD_APPLICATIONS_PLACED_MARKER,
         firefox_content_marker = TD_FIREFOX_CONTENT_MARKER,
         firefox_support_marker = TD_FIREFOX_SUPPORT_MARKER,
         firefox_network_marker = FIREFOX_NETWORK_RUNTIME_MARKER,
@@ -5004,7 +5154,9 @@ mod tests {
             Step::WriteFile { path, content, exec: false }
                 if path == "{root}/real-root/etc/td-profiler-application-roots.tsv"
                     && content == "td-profiler-application-roots-v1\n\
-firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
+firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
+mail\tmail-0.1\tsource\tempty-runtime-1\tsource\n\
+news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         )));
         assert!(steps.iter().any(|step| matches!(
             step,
@@ -5864,6 +6016,153 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         );
     }
 
+    /// Each terminal application is one td-term window whose `--command` is
+    /// the application's `/bin` launcher: started after the first terminal,
+    /// probed through a ready socket of its own, handed to the session cgroup
+    /// like every `su` unit, ordered behind the broker every jail registers
+    /// with, and never restarted by td-svc. Its evidence oneshot requires the
+    /// window, runs under the autotest token alone, and prints the marker
+    /// only after td-jail finds the client itself, by the program its entry
+    /// runs as, still in the instance. Placement is the compositor's own map
+    /// rule: the applications' workspace is made active before either starts,
+    /// the view returns to the first once both are decided, and Firefox maps
+    /// only after the placement evidence has read the compositor's report
+    /// with the shell alone on the first workspace.
+    #[test]
+    fn the_terminal_applications_are_td_term_windows_of_their_launchers() {
+        assert_eq!(entry_program(TD_MAIL_ENTRY), "tmc");
+        assert_eq!(entry_program(TD_NEWS_ENTRY), "tn");
+        assert_eq!(entry_program("tn"), "tn");
+        assert!(
+            (2..=9).contains(&TERMINAL_APPLICATION_WORKSPACE),
+            "the control channel's vocabulary is the keyboard's nine workspaces, and the \
+             first is the shell's and Firefox's, whose tiles the physical-input oracle binds"
+        );
+        for (unit, workspace, after) in [
+            ("applications-workspace", TERMINAL_APPLICATION_WORKSPACE, vec!["terminal"]),
+            ("shell-workspace", 1, vec!["mail", "news"]),
+        ] {
+            let switch = format!(
+                "/bin/su -s /bin/sh {UI_USER} -c 'TD_CONTROL_SOCKET={CONTROL_SOCKET} \
+                 /bin/td-ctl workspace {workspace}'"
+            );
+            assert_eq!(unit_key(unit, "exec").as_deref(), Some(switch.as_str()), "{unit}");
+            assert_eq!(unit_key(unit, "type").as_deref(), Some("oneshot"), "{unit}");
+            assert_eq!(unit_key(unit, "cgroup").as_deref(), Some("session"), "{unit}");
+            assert_eq!(unit_key(unit, "requires").as_deref(), Some("wayland"), "{unit}");
+            assert_eq!(
+                unit_key(unit, "timeout").as_deref(),
+                Some(svc_timeouts::APPLICATION_PLACE.to_string().as_str()),
+                "{unit}"
+            );
+            assert_eq!(unit_after(unit), after, "{unit}");
+        }
+        for (unit, name, entry, marker) in [
+            ("mail", TD_MAIL_NAME, TD_MAIL_ENTRY, TD_MAIL_BOOT_MARKER),
+            ("news", TD_NEWS_NAME, TD_NEWS_ENTRY, TD_NEWS_BOOT_MARKER),
+        ] {
+            assert_eq!(unit, name, "the unit is named by the launcher");
+            let program = entry_program(entry);
+            let exec = unit_key(unit, "exec").unwrap_or_default();
+            assert!(exec.contains("/bin/td-term run "), "{exec}");
+            assert!(exec.ends_with(&format!("--command /bin/{name}'")), "{exec}");
+            assert!(
+                exec.contains(&format!("--ready-socket /run/user/{UI_UID}/td-{name}-ready ")),
+                "{exec}"
+            );
+            let ready = unit_key(unit, "ready").unwrap_or_default();
+            assert!(
+                ready.contains(&format!("/bin/td-term probe /run/user/{UI_UID}/td-{name}-ready")),
+                "{ready}"
+            );
+            assert_eq!(unit_key(unit, "type").as_deref(), Some("daemon"), "{unit}");
+            assert_eq!(unit_key(unit, "restart").as_deref(), Some("never"), "{unit}");
+            assert_eq!(unit_key(unit, "cgroup").as_deref(), Some("session"), "{unit}");
+            assert_eq!(unit_key(unit, "requires").as_deref(), Some("wayland,busd"), "{unit}");
+            // The switch is an ordering, not a requirement: a channel that
+            // failed loses the placement, not the applications.
+            assert_eq!(
+                unit_after(unit),
+                vec!["terminal", "busd", "netup", "applications-workspace"],
+                "{unit}"
+            );
+            let evidence = format!("{unit}-evidence");
+            let exec = unit_key(&evidence, "exec").unwrap_or_default();
+            assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
+            assert!(
+                exec.contains(&format!(
+                    "/bin/td-jail --probe-process-token {name} {program} && /bin/echo {marker}'"
+                )),
+                "{exec}"
+            );
+            assert_eq!(unit_key(&evidence, "requires").as_deref(), Some(unit), "{evidence}");
+            assert!(exec.contains(&format!("/bin/td-util sleep {APPLICATION_SETTLE_SECS};")), "{exec}");
+            assert_eq!(unit_key(&evidence, "type").as_deref(), Some("oneshot"), "{evidence}");
+            assert_eq!(
+                unit_key(&evidence, "timeout").as_deref(),
+                Some(svc_timeouts::APPLICATION_EVIDENCE.to_string().as_str()),
+                "{evidence}"
+            );
+            // The marker is one exact console line; TLS setup's progress dots
+            // would prefix it, so the probe waits for that unit's decision.
+            assert_eq!(unit_after(&evidence), vec![unit, "firefox-tls-setup"], "{evidence}");
+        }
+        let exec = unit_key("placement-evidence", "exec").unwrap_or_default();
+        assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
+        assert!(
+            exec.contains(&format!(
+                "/bin/td-login exec-as {UI_USER} -- /bin/td-ctl --socket {CONTROL_SOCKET} layout"
+            )),
+            "{exec}"
+        );
+        // The occupied set is matched as a whole line: `1,2,3` would mean a
+        // keystroke inside the bracket put a window elsewhere.
+        assert!(
+            exec.contains(&format!(
+                "/bin/grep -qxF \"workspace active=1 occupied=1,{TERMINAL_APPLICATION_WORKSPACE}\" &&"
+            )),
+            "{exec}"
+        );
+        // The count is anchored to the record's own fields: a title, which is
+        // last on the line and the client's, cannot inflate it.
+        assert!(
+            exec.contains("/bin/grep -c \"^window id=[^ ]* object=[^ ]* workspace=1 \")\" -eq 1"),
+            "{exec}"
+        );
+        assert!(exec.ends_with(&format!("&& /bin/echo {TD_APPLICATIONS_PLACED_MARKER}'")), "{exec}");
+        assert_eq!(unit_key("placement-evidence", "type").as_deref(), Some("oneshot"));
+        assert_eq!(unit_key("placement-evidence", "requires").as_deref(), Some("shell-workspace"));
+        assert_eq!(
+            unit_key("placement-evidence", "timeout").as_deref(),
+            Some(svc_timeouts::APPLICATION_PLACE.to_string().as_str())
+        );
+        assert_eq!(
+            unit_after("placement-evidence"),
+            vec!["shell-workspace", "firefox-tls-setup"],
+            "its marker is an exact line too"
+        );
+        assert!(
+            unit_after("firefox").contains(&"placement-evidence".to_string()),
+            "Firefox's window maps only once the first workspace is the shell's alone again"
+        );
+    }
+
+    /// The placement evidence parses the compositor's own report, so the
+    /// syntax it matches is pinned to the source that writes it, and the
+    /// range the workspace constant is pinned to is the layout's.
+    #[test]
+    fn the_placement_evidence_reads_the_report_the_compositor_writes() {
+        let control = include_str!("../../../td-compositor/src/control.rs");
+        assert!(control.contains("\"workspace active={} occupied={}\\n\","));
+        assert!(control.contains("occupied.join(\",\")"));
+        assert!(control.contains(
+            "\"window id={} object={}:{} workspace={} x={} y={} width={} \\"
+        ));
+        let layout = include_str!("../../../td-compositor/src/layout.rs");
+        assert!(layout.contains("pub(crate) const INITIAL_WORKSPACE: u8 = 1;"));
+        assert!(layout.contains("pub(crate) const FINAL_WORKSPACE: u8 = 9;"));
+    }
+
     #[test]
     fn seccomp_audit_wire_markers_are_bound_across_components() {
         const TD_UTIL_DMESG: &str =
@@ -6130,7 +6429,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         // Verified red at NETUP=31 — which cleared the old raw 26s and still failed here.
         const HEADROOM: u32 = 2;
         // (value, worst case in seconds, what that worst case is)
-        let floors: [(u32, u32, &str); 7] = [
+        let floors: [(u32, u32, &str); 9] = [
             (svc_timeouts::HOSTNAME, 1, "one file read plus sethostname(2)"),
             (svc_timeouts::FIRSTBOOT, 60, "ed25519 keygen, writes to /var, then sync"),
             (svc_timeouts::ROOTCHECK, 50, "~50 process spawns incl. su, plus a sync"),
@@ -6157,6 +6456,16 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 svc_timeouts::BOOTFAIL,
                 BOOT_FAIL_PARK_WAIT_SECS as u32,
                 "clamped iterations of a grep and a 1s sleep",
+            ),
+            (
+                svc_timeouts::APPLICATION_PLACE,
+                5,
+                "one control-channel request, a line in and a report out",
+            ),
+            (
+                svc_timeouts::APPLICATION_EVIDENCE,
+                APPLICATION_SETTLE_SECS.saturating_add(5),
+                "the settle sleep, then one cgroup read through td-jail's probe",
             ),
         ];
         for (value, worst, why) in floors {
@@ -6209,6 +6518,19 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                 vec!["wayland", "firefox-tls-setup"],
             ),
             ("terminal", vec!["wayland"]),
+            ("applications-workspace", vec!["terminal"]),
+            (
+                "mail",
+                vec!["terminal", "busd", "netup", "applications-workspace"],
+            ),
+            ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
+            (
+                "news",
+                vec!["terminal", "busd", "netup", "applications-workspace"],
+            ),
+            ("news-evidence", vec!["news", "firefox-tls-setup"]),
+            ("shell-workspace", vec!["mail", "news"]),
+            ("placement-evidence", vec!["shell-workspace", "firefox-tls-setup"]),
             ("firefox-tls-setup", vec!["seat"]),
             ("firefox-tls-origin", vec!["firefox-tls-setup"]),
             ("firefox-autotest", vec!["seat"]),
@@ -6221,6 +6543,7 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                     "wayland",
                     "firefox-autotest",
                     "firefox-tls-origin",
+                    "placement-evidence",
                 ],
             ),
             ("firefox-evidence", vec!["firefox", "netup"]),
@@ -6253,14 +6576,20 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
         }
     }
 
-    /// The image ships exactly ONE application. This is a review tripwire on a
-    /// second packaged policy surface, not a proof that the bus has one peer.
+    /// The image ships exactly ONE application that holds a bus name. This is a
+    /// review tripwire on a second packaged bus-policy surface, not a proof
+    /// that the bus has one peer.
     ///
     /// td-jail binds `/run/user/1000/bus` into every jail because the broker is
     /// the policy boundary. Well-known names, match rules, per-caller filtering
     /// and per-instance admission have landed. Two shared surfaces remain: the
     /// global descriptor budget is not charged per instance, and
-    /// `GetConnectionCredentials` reports init-namespace pids.
+    /// `GetConnectionCredentials` reports init-namespace pids. The terminal
+    /// applications ship with no bus policy at all: a static td-owned program
+    /// with no D-Bus client, which the broker would admit as a peer that sees
+    /// and addresses only the portal and itself, so those two surfaces are
+    /// what a compromised one could reach. APPLICATIONS.md §D names that
+    /// residual rather than counting it away.
     ///
     /// Which is NOT what this counts, and the gap is stated here rather than
     /// left for a reader to assume away. A package count does not bound peers:
@@ -6273,16 +6602,41 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
     /// would not have to read. APPLICATIONS.md §D carries the rest of the
     /// sentence, including what the tripwire does not cover.
     #[test]
-    fn the_image_stays_single_application_until_remaining_bus_sharing_gaps_land() {
+    fn the_image_ships_one_bus_holding_application_until_remaining_bus_sharing_gaps_land() {
+        let bus_holders: Vec<&str> = SHIPPED_APPLICATIONS
+            .iter()
+            .filter(|application| {
+                (application.package_recipe)()
+                    .application_permissions
+                    .as_ref()
+                    .is_some_and(|permissions| permissions.session_bus().next().is_some())
+            })
+            .map(|application| application.name)
+            .collect();
         assert_eq!(
-            SHIPPED_APPLICATIONS.len(),
-            1,
-            "a second application would share td-busd's global descriptor \
-             budget and could observe init-namespace pids through \
-             GetConnectionCredentials. See APPLICATIONS.md §D for these \
-             remaining peer-attribution gaps and the limits of this package \
-             count tripwire"
+            bus_holders,
+            vec![FIREFOX_NAME],
+            "a second application holding a bus name would bring a policy of \
+             its own to td-busd's shared descriptor budget and could observe \
+             init-namespace pids through GetConnectionCredentials. See \
+             APPLICATIONS.md §D for these remaining peer-attribution gaps and \
+             the limits of this tripwire"
         );
+        // Every other shipped application is the shape §D admits beside it: a
+        // static terminal program on the empty runtime with no bus name.
+        for application in SHIPPED_APPLICATIONS
+            .iter()
+            .filter(|application| application.name != FIREFOX_NAME)
+        {
+            let recipe = (application.package_recipe)();
+            let permissions = recipe
+                .application_permissions
+                .as_ref()
+                .expect("a shipped application declares its permissions");
+            assert_eq!(permissions.session_bus().count(), 0, "{}", application.name);
+            assert!(permissions.terminal(), "{} is a terminal application", application.name);
+            assert_eq!(application.runtime, "empty-runtime", "{}", application.name);
+        }
     }
 
     /// The session bus is a unit, runs as the UI user, and binds where the seat
@@ -6636,8 +6990,11 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
             "{in:codex}".to_string(),
+            "{payload:empty-runtime}".to_string(),
             format!("{{payload:{FIREFOX_NAME}}}"),
             "{payload:freedesktop-platform-25-08}".to_string(),
+            format!("{{payload:{TD_MAIL_NAME}}}"),
+            format!("{{payload:{TD_NEWS_NAME}}}"),
         ];
         assert_eq!(
             roots.as_slice(),
@@ -7320,22 +7677,39 @@ firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n"
                     && link == "{root}/real-root/bin/fixture"
         )));
 
-        assert_eq!(SYSTEM.applications.len(), 1);
+        assert_eq!(SYSTEM.applications.len(), 3);
         let shipped = SYSTEM
             .applications
             .first()
-            .expect("one shipped application");
+            .expect("the first shipped application");
         assert_eq!(
             (shipped.name, shipped.package, shipped.runtime),
             (FIREFOX_NAME, FIREFOX_NAME, "freedesktop-platform-25-08"),
             "the system image must pair the reviewed Firefox package and runtime"
         );
+        let terminal: Vec<(&str, &str, &str)> = SYSTEM
+            .applications
+            .iter()
+            .skip(1)
+            .map(|application| (application.name, application.package, application.runtime))
+            .collect();
+        assert_eq!(
+            terminal,
+            vec![
+                (TD_MAIL_NAME, TD_MAIL_NAME, "empty-runtime"),
+                (TD_NEWS_NAME, TD_NEWS_NAME, "empty-runtime"),
+            ],
+            "the terminal applications are their own packages on the empty runtime"
+        );
         let system_recipe = recipe();
         assert_eq!(
             system_recipe.payload_inputs,
             Some(vec![
+                "empty-runtime".into(),
                 FIREFOX_NAME.into(),
-                "freedesktop-platform-25-08".into()
+                "freedesktop-platform-25-08".into(),
+                TD_MAIL_NAME.into(),
+                TD_NEWS_NAME.into(),
             ])
         );
     }

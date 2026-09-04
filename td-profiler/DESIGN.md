@@ -135,6 +135,13 @@ garbage collection, deployment selection, and rollback cannot separate code
 from its symbols. Debug files are not separate downloads and require no
 td-operated server.
 
+A package that copies a source-built runtime out of the output that built it,
+as the terminal application packages copy `tmc` and `tn` into `files/bin`,
+carries the companion at the copied runtime's own path below its `lib/debug`
+and the producing output's `.td-assembly-exception` marker at that tree's root:
+the producing output is not in the image's closure, so nothing else would put
+them where the object index looks.
+
 Stripping removes the full ordinary symbol table and non-allocated debug
 payload from the runtime after both have been copied to the companion. Dynamic
 symbols and allocated sections remain available to the loader. An allocated

@@ -236,6 +236,14 @@ const TD_POINTER_ABSOLUTE_MARKER: &str = td_recipe::ladder::TD_POINTER_ABSOLUTE_
 /// Printed by the FIRST client the machine now starts: the terminal, after a frame
 /// at a compositor-chosen size and a PTY the kernel agrees is that grid.
 const TD_TERM_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TERM_RUNTIME_MARKER;
+// Printed by the `mail-evidence` and `news-evidence` units under the autotest
+// token: td-jail found the client itself, by the program its entry runs as,
+// still in its jail instance a few seconds after its td-term window reported
+// ready, so the program started on the configuration td-firstboot provisioned
+// and did not exit on it.
+const TD_MAIL_BOOT_MARKER: &str = td_recipe::ladder::TD_MAIL_BOOT_MARKER;
+const TD_NEWS_BOOT_MARKER: &str = td_recipe::ladder::TD_NEWS_BOOT_MARKER;
+const TD_APPLICATIONS_PLACED_MARKER: &str = td_recipe::ladder::TD_APPLICATIONS_PLACED_MARKER;
 
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
@@ -484,6 +492,9 @@ struct ConsoleEvidence {
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
     td_term_runtime: bool,
+    td_mail_running: bool,
+    td_news_running: bool,
+    td_applications_placed: bool,
     persist_write: bool,
     persist_read: bool,
     boot_success: bool,
@@ -2124,6 +2135,31 @@ fn validate_system_boot(
              booted to a compositor with nothing on it. The serial greeter remains the \
              recovery path. \
              Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_mail_running || !result.evidence.td_news_running {
+        return Err(format!(
+            "the terminal became ready, but a terminal application's running marker was \
+             absent ({TD_MAIL_BOOT_MARKER:?} {}, {TD_NEWS_BOOT_MARKER:?} {}) — the /bin \
+             launcher, the static package on the empty runtime, the fresh-terminal grant, \
+             td-firstboot's provisioned configuration, or the program itself failed within \
+             the settle window, or its td-term window never reported ready. \
+             Last serial output:\n{}",
+            if result.evidence.td_mail_running { "seen" } else { "absent" },
+            if result.evidence.td_news_running { "seen" } else { "absent" },
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_applications_placed {
+        return Err(format!(
+            "the terminal applications ran, but the placement marker was absent \
+             ({TD_APPLICATIONS_PLACED_MARKER:?}) — once both had mapped and the view \
+             returned, the compositor's report did not show the first workspace \
+             active, the first and the applications' workspace occupied and no \
+             other, and the shell's window alone on the first, so the tiles the \
+             physical-input oracle binds are not where it clicks. Last serial \
+             output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -4919,6 +4955,9 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
+        exact_line_window(TD_MAIL_BOOT_MARKER),
+        exact_line_window(TD_NEWS_BOOT_MARKER),
+        exact_line_window(TD_APPLICATIONS_PLACED_MARKER),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
         SYSTEM_BOOT_SUCCESS_MARKER.len(),
@@ -5383,6 +5422,24 @@ fn latch_console_evidence_from(
         &mut evidence.td_term_runtime,
         buf,
         TD_TERM_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.td_mail_running,
+        buf,
+        TD_MAIL_BOOT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_news_running,
+        buf,
+        TD_NEWS_BOOT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_applications_placed,
+        buf,
+        TD_APPLICATIONS_PLACED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_marker(
         &mut evidence.persist_write,
@@ -8640,7 +8697,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 77] {
+    fn all_console_markers() -> [&'static str; 80] {
         [
             MARKER,
             EROFS_MARKER,
@@ -8719,6 +8776,9 @@ mod tests {
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
+            TD_MAIL_BOOT_MARKER,
+            TD_NEWS_BOOT_MARKER,
+            TD_APPLICATIONS_PLACED_MARKER,
         ]
     }
 
@@ -9058,6 +9118,9 @@ mod tests {
     evidence.td_profiler_attribution = true;
     evidence.td_sandbox_kernel = true;
     evidence.td_term_runtime = true;
+    evidence.td_mail_running = true;
+    evidence.td_news_running = true;
+    evidence.td_applications_placed = true;
     evidence.td_txt_runtime = true;
     evidence.td_util_runtime = true;
     evidence.td_wayland_runtime = true;
@@ -9348,6 +9411,111 @@ mod tests {
         )
         .err()
         .unwrap_or_default()
+    }
+
+    /// The three terminal-application rows reject a boot missing any marker
+    /// and name the one that was absent; with all three latched, a complaint,
+    /// if any, is a later row's.
+    #[test]
+    fn the_terminal_application_rows_are_what_reject_a_boot_missing_a_marker() {
+        let boot = |evidence: ConsoleEvidence| BootResult {
+            evidence,
+            exited_clean: true,
+            reason: String::new(),
+            console: String::new(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        let validate = |result: &BootResult| {
+            validate_system_boot(
+                result,
+                PersistencePhase::None,
+                IdentityPhase::Fresh,
+                "first",
+                SelectionExpectation::Current,
+            )
+        };
+        let with_markers = validate(&boot(healthy_evidence()))
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !with_markers.contains("running marker was absent")
+                && !with_markers.contains("placement marker was absent"),
+            "with all three markers latched these rows must not be the complaint: \
+             {with_markers}"
+        );
+
+        let mut without_mail = healthy_evidence();
+        without_mail.td_mail_running = false;
+        let complaint = validate(&boot(without_mail))
+            .expect_err("a boot missing the mail marker must be rejected");
+        assert!(
+            complaint.contains(&format!("{TD_MAIL_BOOT_MARKER:?} absent"))
+                && complaint.contains(&format!("{TD_NEWS_BOOT_MARKER:?} seen")),
+            "the rejection must name the marker that was absent: {complaint}"
+        );
+
+        let mut without_news = healthy_evidence();
+        without_news.td_news_running = false;
+        let complaint = validate(&boot(without_news))
+            .expect_err("a boot missing the news marker must be rejected");
+        assert!(
+            complaint.contains(&format!("{TD_NEWS_BOOT_MARKER:?} absent"))
+                && complaint.contains(&format!("{TD_MAIL_BOOT_MARKER:?} seen")),
+            "the rejection must name the marker that was absent: {complaint}"
+        );
+
+        let mut without_placement = healthy_evidence();
+        without_placement.td_applications_placed = false;
+        let complaint = validate(&boot(without_placement))
+            .expect_err("a boot missing the placement marker must be rejected");
+        assert!(
+            complaint.contains("placement marker was absent")
+                && complaint.contains(&format!("({TD_APPLICATIONS_PLACED_MARKER:?})")),
+            "the rejection must name the placement marker: {complaint}"
+        );
+    }
+
+    #[test]
+    fn terminal_application_evidence_requires_one_exact_line() {
+        let latched = |evidence: &ConsoleEvidence| {
+            [
+                evidence.td_mail_running,
+                evidence.td_news_running,
+                evidence.td_applications_placed,
+            ]
+        };
+        for (index, marker) in [
+            TD_MAIL_BOOT_MARKER,
+            TD_NEWS_BOOT_MARKER,
+            TD_APPLICATIONS_PLACED_MARKER,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut evidence = ConsoleEvidence::default();
+            for noise in [
+                format!("\ntd-svc: {marker} trailing\n"),
+                format!("\nnoise {marker}\n"),
+                format!("\n{marker}-not\n"),
+                format!("\n..{marker}\n"),
+            ] {
+                latch_console_evidence(&mut evidence, noise.as_bytes(), b"target");
+                assert_eq!(latched(&evidence), [false; 3], "accepted {noise:?}");
+            }
+            // Both line endings the console can carry.
+            let terminator = if index == 1 { "\n" } else { "\r\n" };
+            latch_console_evidence(
+                &mut evidence,
+                format!("\n{marker}{terminator}").as_bytes(),
+                b"target",
+            );
+            let mut expected = [false; 3];
+            if let Some(slot) = expected.get_mut(index) {
+                *slot = true;
+            }
+            assert_eq!(latched(&evidence), expected, "one marker is not another's");
+        }
     }
 
     #[test]

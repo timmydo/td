@@ -2399,55 +2399,57 @@ compositor makes the client exit and permits `restart=always` to retry.
 
 The launcher is a compositor-owned overlay, so opening it never depends on an
 already-running client. Its registry has a terminal entry that starts a
-`td-term`, one application entry when the image supplies an admitted
-application (otherwise an input-monitor entry that starts `td-ui-demo`), and
-an explicit close entry. The application entry's uppercase label and
-lowercase search term are derived from the exact bounded application name;
-the compositor does not carry a fixture- or Firefox-specific card. The
-terminal is FIRST, so it is what an unfiltered Enter opens. Three entries is
-what the card currently holds: a fourth overflows `CARD_HEIGHT`, which
+`td-term`, one application entry for the admitted application the image names
+with `--launcher-application` (otherwise an input-monitor entry that starts
+`td-ui-demo`), and an explicit close entry. The terminal applications carry
+launcher declarations of their own, but the image names Firefox alone, so the
+card does not show them; showing them is the relaunch work APPLICATIONS.md §W.7
+defers, and it grows the card. The application entry's uppercase label and
+lowercase search term are derived from the exact bounded application name; the
+compositor does not carry a fixture- or Firefox-specific card. The terminal is
+FIRST, so it is what an unfiltered Enter opens. Three entries is what the card
+currently holds: a fourth overflows `CARD_HEIGHT`, which
 `registry_entries_are_searchable_and_fit_the_card` reds rather than clipping
 silently, so adding one means growing the card in the same landing. Each entry
 owns a label, lowercase search terms, and a typed launch request. The pure
-launcher model stores a bounded 64-byte ASCII filter, requires every whitespace-
-separated term to occur in an entry's search text, and resets selection to the
-first match after an edit. An empty result is explicit and Enter leaves it
-open; Backspace can recover it. Opening clears the previous filter. While the
-overlay is open, all non-modifier keys are consumed by the compositor, and
-modified keys that are not launcher commands do not become text. Activation
-with a match closes the overlay before native process creation or application
-surface activation; activation with no matches keeps both the overlay and
-input capture active. The input adapter
-updates its capture state from the model's post-action visibility instead of
-guessing which action opened or closed it. It never enables capture before a
-successful open. An overlay action is transactional with its framebuffer
-paint: a failed paint restores the complete prior launcher model, so another
-input device cannot observe model state with stale capture.
-The compositor requires an explicit absolute `--terminal-client` and exactly
-one UI mode. A standalone compositor supplies an absolute `--launcher-client`
-for direct `td-ui-demo`; the image instead supplies a
-`--launcher-application` with its paired app-id observer and no launcher
-client or application-runtime path. An application name must use the image
-grammar. The supervised service owns the boot-started application instance:
-the application card activates a retained matching mapped surface, switching
-workspaces and leaving an unrelated fullscreen view if necessary. It reports
-a missing mapped surface and never starts another process. A direct
+launcher model stores a bounded 64-byte ASCII filter, requires every
+whitespace-separated term to occur in an entry's search text, and resets
+selection to the first match after an edit. An empty result is explicit and
+Enter leaves it open; Backspace can recover it. Opening clears the previous
+filter. While the overlay is open, all non-modifier keys are consumed by the
+compositor, and modified keys that are not launcher commands do not become
+text. Activation with a match closes the overlay before native process creation
+or application surface activation; activation with no matches keeps both the
+overlay and input capture active. The input adapter updates its capture state
+from the model's post-action visibility instead of guessing which action opened
+or closed it. It never enables capture before a successful open. An overlay
+action is transactional with its framebuffer paint: a failed paint restores the
+complete prior launcher model, so another input device cannot observe model
+state with stale capture. The compositor requires an explicit absolute
+`--terminal-client` and exactly one UI mode. A standalone compositor supplies
+an absolute `--launcher-client` for direct `td-ui-demo`; the image instead
+supplies a `--launcher-application` with its paired app-id observer and no
+launcher client or application-runtime path. An application name must use the
+image grammar. The supervised service owns the boot-started application
+instance: the application card activates a retained matching mapped surface,
+switching workspaces and leaving an unrelated fullscreen view if necessary. It
+reports a missing mapped surface and never starts another process. A direct
 `/bin/<application>` request remains a separate supported route and no
 single-instance lock has landed. Direct `td-ui-demo` and `td-term` requests
-select their program and take the same two run flags. The compositor
-derives a unique readiness-socket name beside the socket and passes both paths
-as literal argv values without a shell. It reaps exited native children before
-each launch and retains at most 16 live launched clients. A native launch or
-reap failure is reported without terminating the evdev reader. Application
-activation is a scene mutation, so its paint or focus failure propagates like
-any other input-driven scene failure. Reaping also removes a dead child's private
+select their program and take the same two run flags. The compositor derives a
+unique readiness-socket name beside the socket and passes both paths as literal
+argv values without a shell. It reaps exited native children before each launch
+and retains at most 16 live launched clients. A native launch or reap failure
+is reported without terminating the evdev reader. Application activation is a
+scene mutation, so its paint or focus failure propagates like any other
+input-driven scene failure. Reaping also removes a dead child's private
 readiness socket and reports any path that cannot be safely removed. Opening
 the modal overlay immediately withdraws ungrabbed pointer focus; closing it
 immediately restores focus under the stationary cursor. An existing implicit
 grab remains routed through the overlay until release, but unmapping its
 surface clears the grab and sends leave before object deletion. If the
-compositor exits while a launched child is still live, its readiness socket
-may remain until logout clears the runtime-directory tmpfs. Names carry the
+compositor exits while a launched child is still live, its readiness socket may
+remain until logout clears the runtime-directory tmpfs. Names carry the
 compositor pid, so that residual path cannot block a later compositor.
 
 The application-window observer and configured launcher application require
@@ -5842,6 +5844,25 @@ without a race against whatever the client did to its object ids in between.
 what the keyboard's `MoveToWorkspace` has always done. It is the one answer in
 the vocabulary a caller might expect the other way round, so the help text
 says which it is and a test pins it.
+
+The image's first scripted callers use that vocabulary and nothing finer. The
+`[applications-workspace]` unit switches to the terminal applications' workspace
+before either of them starts, `[shell-workspace]` switches back to the first
+once both are decided, and Firefox maps only after that: a new window goes to
+the active workspace, so the two applications share the second and the first
+stays the shell's and Firefox's, whose tiles the physical-input oracle binds.
+This is placement by the map rule, not by focus or identity: the windows do not
+exist when `[applications-workspace]` runs, so there is no id yet to address a
+`send` to, and naming them afterwards would mean a unit's shell parsing the
+`layout` report for ids, which is exactly the finer vocabulary this paragraph
+opens by keeping out; the unaddressed `send` would have moved whichever window
+was focused when the unit ran, the shell's if the client had just exited; and a
+switch moves nothing. What remains is a keystroke at the console inside that
+bracket, which would switch the view and land a window elsewhere; the autotest's
+`[placement-evidence]` unit reads the `layout` report (the first workspace
+active, the first and the applications' occupied and no other, one window record
+on the first by its own fields) and reports that itself rather than leaving it
+to a later phase's geometry.
 
 ### The report
 

@@ -81,7 +81,7 @@ const APPLICATION_CONFIGS: &[ApplicationConfig] = &[
 /// tmc starts offline from this and says so; the operator replaces the three
 /// placeholders and the password file, and the client reads them when it next
 /// starts. The comments name no way to start it: a user-level relaunch of a
-/// terminal window is deferred work the applications' commit plans, and the
+/// terminal window is deferred (APPLICATIONS.md §W.7), and the
 /// administrative escape hatch is not a flow a shipped file may depend on
 /// (AGENTS.md).
 const TMC_CONFIG: &str = "\

@@ -42,6 +42,25 @@ pub const TD_JAIL_FIXTURE_GRANT_FILE: &str = "/var/td-jail-fixture-file";
 pub const TD_JAIL_FIXTURE_GRANT_ROOT: &str = "/mnt/td-jail-fixture-pictures";
 pub const TD_JAIL_FIXTURE_SEARCH_TERMS: &[&str] =
     &["jail", "fixture", "sandbox", "wayland"];
+// The two terminal applications: td-owned static programs on the empty
+// runtime, each a `/bin` launcher that td-term runs as its `--command` in
+// a window of its own at boot. `mail` is tmc, `news` is tn; the launcher
+// keys are the words a person types, the entries are the upstream binary
+// names.
+pub const TD_MAIL_NAME: &str = "mail";
+pub const TD_MAIL_ENTRY: &str = "/app/bin/tmc";
+pub const TD_MAIL_DISPLAY_NAME: &str = "Mail";
+pub const TD_MAIL_SEARCH_TERMS: &[&str] = &["mail", "email", "jmap", "tmc"];
+pub const TD_NEWS_NAME: &str = "news";
+pub const TD_NEWS_ENTRY: &str = "/app/bin/tn";
+pub const TD_NEWS_DISPLAY_NAME: &str = "News";
+pub const TD_NEWS_SEARCH_TERMS: &[&str] = &["news", "rss", "feeds", "tn"];
+/// The program a jailed entry runs as: the final component of its `/app`
+/// path, which `td-jail --probe-process-token` matches and the boot
+/// evidence names.
+pub fn entry_program(entry: &str) -> &str {
+    entry.rsplit('/').next().unwrap_or(entry)
+}
 pub const TD_APPLICATION_CONFIG_TEXT: &str = concat!(
     "format=1\n",
     "package-root=/td/store\n",
@@ -973,24 +992,32 @@ pub const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = "TD-COMPOSITOR-DRM-PROBE-OK";
 /// host pid. So the descendant's disappearance is evidence about namespace
 /// teardown.
 ///
-/// What this marker does NOT attest is §C's other sentence — that the
-/// independent cgroup watcher drains the leaf. The probe's instance has no
-/// cgroup, because the only shipped application is Firefox and a second
-/// `firefox-` leaf would break the one-active-instance rule
-/// `--probe-resource-caps` depends on.
-///
-/// That half is UNPROVEN. It is argued in §C and wired in `cgroup.rs`, but
-/// nothing exercises it: `remove_abandoned` has source-text pins on its
-/// ordering rather than a test that drains a populated leaf, and
-/// `--probe-resource-caps` reads a leaf while it is still populated, which
-/// is the opposite end of the lifecycle. Proving it needs a jailed instance
-/// with a cgroup that a probe may kill, which the single-application rule
-/// currently denies.
+/// The marker also attests §C's other sentence, that the independent cgroup
+/// watcher drains the leaf: the probe's instance runs in a dedicated
+/// `td-jail-cleanup-<random>` leaf through the production cleanup path, a
+/// prefix of its own so that Firefox's one-active-instance rule holds, stage
+/// 2 and its descendant are observed in that leaf before the kill, and the
+/// marker is withheld until the driver sees the watcher remove the populated
+/// leaf under a separate deadline. The terminal applications' instances run
+/// in leaves of their own and are not drained by this probe.
 pub const TD_JAIL_KILL_REAPS_MARKER: &str = "TD-JAIL-KILL-REAPS-OK";
 
 /// Compatibility marker emitted by the trusted Firefox-evidence unit after
 /// the stronger HTTPS-content, live-process and resource-cap proof below.
 pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";
+// Printed by the `mail-evidence` and `news-evidence` units under the autotest
+// token once td-jail has found the client itself, by the program its entry
+// runs as, still in its jail instance a few seconds after its td-term window
+// reported ready: the program started on the configuration td-firstboot
+// provisioned and did not exit on it.
+pub const TD_MAIL_BOOT_MARKER: &str = "TD-MAIL-RUNNING";
+pub const TD_NEWS_BOOT_MARKER: &str = "TD-NEWS-RUNNING";
+// Printed by the `placement-evidence` unit under the autotest token once the
+// view is back on the first workspace and the compositor's own report shows
+// it active, the applications' workspace occupied, and one window on the
+// first, the shell's: the tiles the physical-input oracle binds are where
+// it clicks.
+pub const TD_APPLICATIONS_PLACED_MARKER: &str = "TD-APPLICATIONS-PLACED";
 
 /// Emitted by the trusted Firefox-evidence unit only after the compositor has
 /// observed the verified in-guest HTTPS document's exact content-pixel region

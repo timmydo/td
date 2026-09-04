@@ -1822,11 +1822,12 @@ are now closed in §D: pending-reply ownership makes a reply's origin
 enforceable, and message-type policy refuses a confined peer's directed
 signals. `RequestName` is no longer blocked on them.
 
-The image's assertion of exactly one shipped application no longer rests on
-missing broker substrate: the filter, names, match rules and portal routing
-are all per-caller now. A second real application still needs reviewed service
-decisions and exact grants from the remaining bullets; it must not weaken the
-assertion merely because the broker mechanisms exist.
+The image's assertion of exactly one bus-holding application no longer rests
+on missing broker substrate: the filter, names, match rules and portal routing
+are all per-caller now. A second application with a bus name still needs
+reviewed service decisions and exact grants from the remaining bullets; it
+must not weaken the assertion merely because the broker mechanisms exist. The
+terminal applications hold no name and did not (§D).
 
 For `td-compositor`, the minimum useful Firefox target is Software WebRender
 over `wl_shm`; dmabuf must remain unadvertised until it works. The platform
@@ -4564,8 +4565,8 @@ of the registrant's own children. The worst available is mislabelling a
 process it already owns, which is the v1 app-id exposure recorded above,
 rather than a reach into somebody else's.
 
-**td-jail performs this protocol, and the image's one application does
-it at boot.** Every jailed application is a registered instance and
+**td-jail performs this protocol, and every application the image starts
+at boot does it.** Every jailed application is a registered instance and
 reports `td.AppId`; everything else on the session bus still resolves
 `Unconfined`, which is right — the compositor and the terminal are not
 in jails. The app-id caveat below is unchanged and is the reason the
@@ -5402,12 +5403,21 @@ which is a pid in the INIT namespace, so a jailed caller reads host
 pids — its own included — through a channel its PID namespace otherwise
 closes.
 
-Every one of those is a problem between PEERS. Firefox is now the one selected
-application and may open the bus; the first-window oracle does not drive the
+Every one of those is a problem between PEERS. Firefox is the one selected
+application that holds a bus name; the first-window oracle does not drive the
 traffic needed to close these remaining availability and pid-disclosure
-questions. What can be machine-checked today is narrower: the system recipe
-asserts `SHIPPED_APPLICATIONS.len() == 1`, and a second entry breaks the build
-with a diagnostic naming what has to land with it.
+questions. The terminal applications `mail` and `news` ship beside it with NO
+bus policy: static td-owned programs on the empty runtime with no D-Bus client
+in them, each started by td-term at boot under the `devices=tty` grant. Step
+12 still binds the socket into their jails, so a compromised one could connect,
+and the broker would admit it as a peer that sees and addresses only the
+portal and itself. What it could then reach is exactly the two gaps above:
+drive the shared descriptor budget to its relief path, and read its own
+init-namespace pid. That residual is accepted for a terminal application and
+named here; it is not counted away. What can be machine-checked today is
+narrower: the system recipe asserts that exactly one shipped application's
+permission file carries a `[Session Bus Policy]` entry, and a second such
+entry breaks the build with a diagnostic naming what has to land with it.
 
 Be exact about what that tripwire does NOT cover, because a gate believed
 to cover more than it does is worse than no gate. It counts
@@ -5429,7 +5439,7 @@ connection-table condition this paragraph used to defer is discharged. The
 remaining shared descriptor budget is named above rather than hidden by that
 statement. The Settings service and its independent live Settings/Request
 client now make routed replies and a directed signal observable; a second
-application remains a separate multi-peer expansion.
+bus-holding application remains a separate multi-peer expansion.
 
 ---
 
@@ -7067,7 +7077,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 27k | **Firefox outer-seccomp denial audit — LANDED**; a dedicated physical-input variant alone enables the target kernel audit path and asks the standard outer filter to log non-allow decisions without changing their actions. A root-owned, executable-only bind of the existing non-shipped helper makes all 17 blocked calls under that installed filter, then replaces itself with Firefox in the same pid. After the full input workload and five-minute soak, a bounded root parser requires every helper denial, rejects loss, suppression, malformed ABI/uid/action data and any unrostered denial, and emits one exact host-required result. The variant retains all real input, browser, bus and compositor continuity evidence but uses the host-silent audio backend because kernel audit work measurably perturbs the separate TCG HDA waveform oracle | the shipped Firefox path proves its outer deny filter blocks the rostered probes while completing its real workload without an unrostered denial |
 | 28 | **Firefox proof closure — LANDED**; §H's every-boot kill-reaps leg now creates a dedicated application cgroup through the production detached watcher, proves stage 2 and its descendant occupy it before killing only stage 1, and accepts only after PID-namespace teardown empties the leaf and the watcher removes it. The previously deferred real target-kernel `mount(2)` refusal is supplied by the landed 17-call outer-filter audit. `AGENTS.md` names the source graph, host control plane, and marked foreign payload as three distinct trust zones. The complete shipped source and confinement regressions were reconciled against application-path `UNSAFE.md` surfaces #9 (`td-jail`), #10 (`td-busd`), #12 (`td-portal`), and #13 (`td-audio`); their syscall, operation, flag, ancillary-data, pointer-provenance, and scoped-allow rosters remain exact and require no roster amendment | **Firefox portals, isolation, soak and sound are all proved without manual testing** |
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
-| 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; the acquisition itself is not yet proved end to end — that is the first terminal application's boot oracle, a later rung | a terminal application runs in the jail with a terminal of its own, and never the operator's |
+| 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
+| 31 | **terminal applications — LANDED**: `mail` (tmc) and `news` (tn) are source-built static packages on the empty runtime, `/bin/mail` and `/bin/news` launchers, and two td-svc units that run each as td-term's `--command` in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
@@ -8896,6 +8907,34 @@ Two things it does not merge. Deduplicating *storage* does nothing for
 *build time*, which is the cost a source-built runtime actually has. And
 it does nothing for the **reboot**, which is a property of where the
 package lives rather than of how many copies of it exist.
+
+### W.7 Relaunching a terminal application without root
+
+**Diagnosis.** `mail` and `news` are started once at boot by td-svc
+units with `restart=never`, so a client that exits stays gone until the
+operator starts it again. Today the two ways to do that are a reboot
+and `td-svc restart` from the `su` escape hatch, and AGENTS.md forbids
+making a user-facing flow depend on the latter. Running `mail` from a
+shell in the terminal window does not work either: td-jail's
+`devices=tty` grant makes the entry a session leader on a fresh pty
+and acquires that pty with `TIOCSCTTY`, which fails when the pty is
+already the shell's controlling terminal. The grant is right to insist
+on a fresh terminal; what is missing is a user-level way to get one
+with a program in it.
+
+**Plan.** (1) The compositor's launcher already builds `td-term run`
+for a new terminal window on a key chord; it gains a request that adds
+`--command /bin/<name>` for a shipped terminal application, so a chord
+opens a fresh `mail` or `news` window, and the running td-svc window is
+not involved. The launcher, not the shell, chooses the command, so the
+set of programs a chord can start is the launcher table's and nothing
+the user typed. (2) The same request is exposed through the compositor
+control socket the `[applications-workspace]` and `[shell-workspace]`
+units already drive, so a later settings surface can offer "open mail"
+without a key chord. (3) Until (1) lands, the provisioned configuration
+files name no restart path at all, and the two units keep
+`restart=never`: a client that exits because its configuration is wrong
+must not be restarted into the same failure behind a flickering window.
 
 ## X. Host mode — development only
 
