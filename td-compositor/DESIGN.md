@@ -5485,9 +5485,26 @@ The complete terminal landing must prove:
   is told which request was sent. An order carrying a report is refused the
   same way, and so is a report missing its workspace line;
 - an app id carrying the text `title=` does not capture the title field from
-  a reader that splits on the separator the record is written with; and
+  a reader that splits on the separator the record is written with;
 - an app id lives and dies exactly as a title does, across all three
-  teardowns and across a second client that keeps its own.
+  teardowns and across a second client that keeps its own;
+- a handle lives and dies exactly as a title does, across all three teardowns
+  and across a second client that keeps its own, and survives BOTH an unmap
+  and an ordinary repaint — the two commits that look new to the surface map
+  and are the same window to a caller holding its name;
+- a retired handle names neither the window it named nor the one that took
+  the same Wayland key afterwards, for every addressed verb, with the
+  replacement and a bystander left where they were;
+- a commit the scene refuses mints nothing and spends nothing, so a name
+  belongs to a window that took pixels and not to one that tried;
+- an exhausted counter stops naming rather than repeat a name, and the
+  unnamed window is left out of the report rather than reported under one;
+- an id has ONE spelling: a leading `@`, digits, no sign, no padding, no
+  second sigil, and no `@` that is not the first character; and
+- the address this channel retired is refused as retired where an address
+  could have been written, and nowhere else — a second argument, a
+  `workspace` number, and a word that never looked like one keep their own
+  complaints.
 
 ## 15. Control channel
 
@@ -5620,9 +5637,33 @@ implementation of the layout to keep in step with the first.
 ### Naming a window
 
 `focus`, `send` and `move` each take a second form that NAMES the window to
-act on: `focus 3:12`, `send 3:12 4`, `move 3:12 left`. The id is the one
-`layout` prints, so a caller feeds the report straight back in without
-transforming it.
+act on: `focus @12`, `send @12 4`, `move @12 left`. The id is the one `layout`
+prints, so a caller feeds the report straight back in without transforming it.
+
+The `@` is load-bearing, not decoration. `send <1-9>` already means "send the
+FOCUSED window there", so a bare number would leave `send 7` ambiguous between
+that and "send window 7", and resolving it by counting arguments would pick
+one reading of a request the caller could not have known was ambiguous. With
+the sigil the two forms are told apart by SHAPE, and a word that begins `@`
+and is not a well-formed id is refused as a bad id rather than falling through
+to the other form — otherwise `send @x 3` would complain about a workspace
+number. The `@` must LEAD: a word holding one somewhere else is not an attempt
+to name a window, so `move 1@2 left` is answered about the direction it fails
+to be rather than about an id nobody wrote.
+
+One spelling per window, which needs more than `u64::from_str` gives. That
+accepts a leading `+` and any number of leading zeros, so `@5`, `@+5` and
+`@005` would be three names for one window, each reached silently; `@@5` would
+be a fourth. All of them are refused, and `@0` with them, since 0 names no
+window and a malformed-id answer beats telling a caller its window is gone.
+A caller assembling an id by pasting `@` onto a number is told, rather than
+quietly agreeing to something it did not mean — and two callers comparing
+notes cannot disagree about what they addressed.
+
+The address this replaced answers for itself. `send 1:5 3` is refused as the
+retired `client:object` form, naming the form and the shape that took over,
+rather than as an unreadable workspace number — which would send a caller to
+correct the one word in the line that was right.
 
 This is the half the first increment left out, and it made the report half
 useless. `layout` handed out an id per window and nothing consumed one, so a
@@ -5689,35 +5730,79 @@ child two deep is refused for the same reason its child was, and a remedy
 that hands back a second dead end is not one. A root that is ITSELF
 unarrangeable gets its own answer for the same reason: a portal dialog can be
 a parent, and pointing at one would send the caller to a window refused on
-different grounds, so the refusal says the family cannot move at all. The alternative — moving the
-family when the caller named one member — does more than was asked, and the
-alternative to that, letting the child go alone, is a compositor rule this
-channel does not get to suspend.
+different grounds, so the refusal says the family cannot move at all. A root
+the report could not NAME is neither refusal but an `unavailable`: a retained
+relation's parent is a mapped toplevel and every mapped toplevel has a handle,
+so reaching that arm means those two records disagree, which is the
+compositor's to report and not the caller's to respell.
+
+The alternative — moving the family when the caller named one member — does
+more than was asked, and the alternative to that, letting the child go alone,
+is a compositor rule this channel does not get to suspend.
 
 Asking for the workspace a window is already on is answered before any of
 that, and is `ok`. A caller that asks for a state and finds it has succeeded,
 and a family shares a workspace, so asked the other way round a script that
 reached a state and then confirmed it was told its own success was an error.
 
-`parent=<client:object>` is in the report for that reason, empty when there is
+`parent=<@id>` is in the report for that reason, empty when there is
 none. Without it a caller could see neither the relationship nor a reason for
 the answer it got, which is the same argument `floating` is here on. It is
 filled by `Runtime::control_snapshot` rather than the scene's, because the
 scene holds the arrangement and the runtime holds the relationships — under
 one lock, so the two halves still describe one instant.
 
-The id is unique among the windows alive at the moment the report was
-written, and no longer than that. `object` is a Wayland object id, which a
-client may reuse once it has destroyed the surface holding it, so an id read
-from an old report can in principle name a DIFFERENT window of the same
-client. Nothing here detects that: the pair is what the compositor keys its
-own scene by, and it has no birth serial to compare. The exposure is bounded
-by how these ids are meant to be used — read the report, act, and read it
-again — and a caller that caches one across a client's window churn is
-outside that. A name that survives the window it named is what the launcher
-increment needs anyway, since a caller that asks for a window to be created
-has no id to be told until it exists; it is deferred to there rather than
-half-answered here.
+The id is a HANDLE the compositor mints, not the window's Wayland identity.
+It is minted the first time a toplevel takes pixels, counts up from 1, and is
+never reissued, so a handle whose window is gone resolves to nothing rather
+than to whatever came after it. A number nobody has been given yet is a
+different thing from a number given back: `@99` in a session that has minted
+twelve windows is refused today and may name a window later, and that is the
+promise kept rather than broken — a handle never comes BACK.
+
+The counter is checked, not saturating, and that choice is the guarantee.
+Saturating at `u64::MAX` would hand one name to every window minted after it,
+so two live windows would answer to one address and a stale one would reach
+whichever the map ordered first. Running out mints NOTHING instead: the window
+is unnamed, the report leaves it out, and no caller can address it. That is
+the same trade this channel makes everywhere else — a missing record beats a
+wrong one — and it is why `Scene::control_snapshot` omits a window it cannot
+name rather than reporting it under an invented number.
+
+That closes the residual the first increment recorded and could not. `object`
+is a Wayland object id, and a client may reuse one once it has destroyed the
+surface holding it, so an id read from an old report could in principle come
+to name a DIFFERENT window of the same client — undetectable from inside the
+compositor, which keys its own scene by that pair and has no birth serial to
+compare. A handle has no such case to detect. Addressing was cut over rather
+than extended: there is one way to name a window, and the recycling-prone one
+is not it.
+
+A handle survives what the WINDOW survives, which is not what the surface
+entry survives. An unmap drops the scene's entry while the window goes on
+existing — it is remembered by `homes` so a client that maps again lands where
+it was — so minting on "the scene had not seen this key" would rename a window
+behind a caller holding its name, which is the exact failure the scheme exists
+to prevent. It is minted on first sight of the key instead, and a hidden
+window that comes back is still `@12`.
+
+It dies with the window, at the same three moments a title does: the toplevel
+is destroyed, the surface is destroyed, or the client departs. The first is
+the one that matters most and the one an unmap alone must not trigger — a
+second toplevel created on the same `wl_surface` is a different window, and
+inheriting the dead one's name would be the recycled-id confusion one level
+up. Zero is never minted, so a reader that defaults an absent number gets one
+that resolves to nothing rather than to the first window of the session.
+
+The Wayland pair is still reported, as `object=<client>:<object>`, and is not
+an address — nothing accepts it. It is there for a person correlating this
+report with a protocol log or with a client's own view of itself, which is
+what it was good for once addressing stopped using it.
+
+A name that survives its window is also what the launcher increment needs: a
+caller that asks for a window to be CREATED has no id to be told until it
+exists, and a name minted once is one that can be handed back afterwards
+without a race against whatever the client did to its object ids in between.
 
 `send` moves the focused window and leaves the view where it was, which is
 what the keyboard's `MoveToWorkspace` has always done. It is the one answer in
@@ -5820,10 +5905,12 @@ retained now, on exactly `title`'s terms and for exactly `title`'s lifetime —
 bounded on arrival, dropped by the same three teardowns, and empty meaning
 absent.
 
-The reason is addressing. An id is stable while a window lives, but it is a
-Wayland object number: it means nothing to a person and differs every boot, so
-a caller told to move "the browser" has nothing to match on. `app_id` is the
-only name a client offers that a caller could know in advance. Retaining it is
+The reason is addressing. An id is stable while a window lives, and since
+handles it is stable for longer than that, but it is still a number the
+compositor made up: it means nothing to a person, differs every boot, and
+differs between two runs of the same session, so a caller told to move "the
+browser" has nothing to match on. `app_id` is the only name a client offers
+that a caller could know in advance. Retaining it is
 a real widening — a second client-chosen string held for the life of the
 window — and it is worth it because without one the addressed forms above can
 only be used on windows the caller already watched appear.
@@ -5864,8 +5951,8 @@ would be an authority over other programs rather than over the arrangement of
 them.
 
 It does not let a caller name a window by anything the CALLER chose. The two
-names it accepts are the compositor's own object id and, for matching, the id
-the client gave itself; there is no label a caller can attach to a window and
-use later. That matters for the one case this channel is worst at — launching
+names it accepts are the compositor's own handle and, for matching, the id the
+client gave itself; there is no label a caller can attach to a window and use
+later. That matters for the one case this channel is worst at — launching
 several identical terminals and telling them apart afterwards — which no field
 in the report answers today.

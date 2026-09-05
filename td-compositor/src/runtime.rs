@@ -155,7 +155,11 @@ pub struct ForeignImportIdentity {
 pub enum Sent {
     Done,
     NoWindow,
-    FollowsParent(SurfaceKey),
+    /// The family's root, as the layout knows it and as the caller can say it.
+    /// Both, because the refusal has to ask about one and print the other, and
+    /// resolving the name here rather than at the answer keeps `apply` from
+    /// having to invent one for a window the scene no longer names.
+    FollowsParent { root: SurfaceKey, named: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2349,6 +2353,11 @@ impl Runtime {
         self.scene.activate_key(key)
     }
 
+    /// The window a control caller's handle names, if it still names one.
+    pub fn window_for_handle(&self, handle: u64) -> Option<SurfaceKey> {
+        self.scene.key_for_handle(handle)
+    }
+
     /// Whether a named window is on screen but outside the tiling tree, which
     /// is what tells a refusal about a portal dialog from one about a window
     /// that is not there at all.
@@ -2404,7 +2413,22 @@ impl Runtime {
         // unmapped parent away, and every unmap path runs a reparent pass
         // first, so a relation outliving its parent's pixels does not exist.
         if self.toplevel_parent(key).is_some() {
-            return Ok(Sent::FollowsParent(self.family_root(key)));
+            let root = self.family_root(key);
+            // A root the control surface cannot NAME is the same kind of
+            // disagreement as the layout refusal below, and gets the same
+            // status: a retained relation's parent is a mapped toplevel, and
+            // every mapped toplevel was minted a handle, so arriving here
+            // means those two records no longer agree. Saying so beats
+            // inventing a name and telling the caller to send a window it has
+            // no way to address.
+            let Some(named) = self.scene.handle(root) else {
+                return Err(format!(
+                    "window object {}:{} follows a parent the scene cannot \
+                     name",
+                    key.client, key.object
+                ));
+            };
+            return Ok(Sent::FollowsParent { root, named });
         }
         if !self.scene.send_key_to_workspace(key, number) {
             // Not "no such window": `is_arranged` established that the window
@@ -2414,8 +2438,12 @@ impl Runtime {
             // refusal HERE is the layout disagreeing with what it just said,
             // and that is the compositor's problem to report rather than the
             // caller's to fix.
+            // `object`, matching the report's own demoted field: the bare
+            // pair is the spelling this channel retires, and handing a person
+            // one to paste back would earn them the retired-address refusal.
             return Err(format!(
-                "layout refused to send window {}:{} to workspace {number}",
+                "layout refused to send window object {}:{} to workspace \
+                 {number}",
                 key.client, key.object
             ));
         }
@@ -2497,7 +2525,13 @@ impl Runtime {
     pub fn control_snapshot(&self) -> ControlSnapshot {
         let mut snapshot = self.scene.control_snapshot(self.width(), self.height());
         for window in &mut snapshot.windows {
-            window.parent = self.toplevel_parent(window.key);
+            // A parent that has no handle has never taken pixels, which for a
+            // retained relationship cannot happen — every insert filters on
+            // `is_mapped`. Reported as absent rather than invented, on the
+            // same rule the snapshot follows everywhere else.
+            window.parent = self
+                .toplevel_parent(window.key)
+                .and_then(|parent| self.scene.handle(parent));
         }
         snapshot
     }

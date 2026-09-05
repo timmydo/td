@@ -87,9 +87,9 @@ pub enum Request {
     /// right` presses and hoping nothing moved in between. Naming a window is
     /// not a capability the compositor lacked — the POINTER names one every
     /// time it clicks — it is one no keyboard could spell.
-    FocusWindow(SurfaceKey),
-    SendWindow(SurfaceKey, u8),
-    MoveWindow(SurfaceKey, Direction),
+    FocusWindow(u64),
+    SendWindow(u64, u8),
+    MoveWindow(u64, Direction),
 }
 
 /// The vocabulary, as one list, so the parser and the help text cannot drift:
@@ -102,17 +102,17 @@ pub const USAGE: &[(&str, &str)] = &[
         "move the focused window to that workspace, staying where you are",
     ),
     (
-        "send <client:object> <1-9>",
+        "send <@id> <1-9>",
         "move that window to that workspace, staying where you are",
     ),
     ("focus <left|right|up|down>", "focus the window that way"),
     (
-        "focus <client:object>",
+        "focus <@id>",
         "focus that window, showing its workspace when it is not in view",
     ),
     ("move <left|right|up|down>", "move the focused window that way"),
     (
-        "move <client:object> <left|right|up|down>",
+        "move <@id> <left|right|up|down>",
         "move that window that way, showing its workspace first",
     ),
     ("fullscreen", "toggle fullscreen for the focused window"),
@@ -162,42 +162,75 @@ impl Request {
                 format!("present {}", presentation_word(presentation))
             }
             Request::Group => "group".to_string(),
-            Request::FocusWindow(key) => format!("focus {}", window_word(key)),
-            Request::SendWindow(key, number) => {
-                format!("send {} {number}", window_word(key))
+            Request::FocusWindow(handle) => format!("focus {}", handle_word(handle)),
+            Request::SendWindow(handle, number) => {
+                format!("send {} {number}", handle_word(handle))
             }
-            Request::MoveWindow(key, direction) => {
-                format!("move {} {}", window_word(key), direction_word(direction))
+            Request::MoveWindow(handle, direction) => {
+                format!(
+                    "move {} {}",
+                    handle_word(handle),
+                    direction_word(direction)
+                )
             }
         }
     }
 }
 
-/// The id `layout` prints, which is the id these accept: one spelling, so a
-/// caller can feed the report back in without transforming it.
-fn window_word(key: SurfaceKey) -> String {
-    format!("{}:{}", key.client, key.object)
+/// How a handle is written, in the report and in a request alike, so a caller
+/// feeds one straight back without transforming it.
+///
+/// The `@` is what keeps the grammar unambiguous: `send <1-9>` sends the
+/// FOCUSED window, so a bare number as a handle would make `send 7` mean
+/// "send the focused window to workspace 7" to the parser and "send window 7
+/// somewhere" to the person, with no way to tell which was meant.
+fn handle_word(handle: u64) -> String {
+    format!("@{handle}")
 }
 
 /// Whether a word NAMES a window rather than describing one.
 ///
-/// An id carries a colon and nothing else in this grammar does — not a
+/// An id BEGINS with `@` and nothing else in this grammar does — not a
 /// direction, not a workspace number — so the overloaded verbs tell their two
-/// forms apart by shape rather than by counting arguments. A word with a colon
-/// that is not a well-formed id is an error and not a fall-through to the
-/// other form, or `send 1:x 3` would complain about a workspace number.
+/// forms apart by shape rather than by counting arguments. A word beginning
+/// `@` that is not a well-formed id is an error and not a fall-through to the
+/// other form, or `send @x 3` would complain about a workspace number.
+///
+/// `starts_with` and not `contains`: a malformed argument that happens to hold
+/// an `@` somewhere is not an attempt to name a window, and swallowing it here
+/// would answer `move 1@2 left` with a complaint about the id rather than
+/// about the thing that is actually wrong with it.
+///
+/// The sigil is what makes the shape legible at all. `send <1-9>` already
+/// means "send the FOCUSED window there", so a bare number would make
+/// `send 7` ambiguous between that and "send window 7", and counting
+/// arguments to resolve it would silently pick one reading of a request the
+/// caller could not have known was ambiguous.
 fn names_window(word: Option<&str>) -> bool {
-    word.is_some_and(|word| word.contains(':'))
+    word.is_some_and(|word| word.starts_with('@'))
 }
 
-fn window(word: Option<&str>, verb: &str) -> Result<SurfaceKey, String> {
+fn window(word: Option<&str>, verb: &str) -> Result<u64, String> {
     let word = word.ok_or_else(|| format!("'{verb}' needs a window id"))?;
-    let bad = || format!("'{word}' is not a window id; ids look like 3:12");
-    let (client, object) = word.split_once(':').ok_or_else(bad)?;
-    Ok(SurfaceKey {
-        client: client.parse().map_err(|_| bad())?,
-        object: object.parse().map_err(|_| bad())?,
-    })
+    let bad = || format!("'{word}' is not a window id; ids look like @12");
+    let digits = word.strip_prefix('@').ok_or_else(bad)?;
+    // ONE spelling, which `u64::from_str` alone does not give: it accepts a
+    // leading `+` and any number of leading zeros, so `@+5`, `@05` and `@5`
+    // would be three ways to say one window, each arrived at silently. That is
+    // the failure `@@5` is refused for, and worse — a caller pasting `@` onto
+    // a padded or signed number never learns it was forgiven, and two callers
+    // comparing notes disagree about what they addressed. So: digits, at least
+    // one, and no leading zero. `@0` goes with them rather than resolving to
+    // nothing, because 0 is not a name this compositor ever mints and telling
+    // a caller its id is malformed beats telling it the window is gone.
+    let leading_zero = digits.starts_with('0');
+    if digits.is_empty()
+        || leading_zero
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    digits.parse().map_err(|_| bad())
 }
 
 /// The overloaded verbs. Each is its own function so the parser's `match`
@@ -213,6 +246,7 @@ fn focus_request<'a>(
     if names_window(word) {
         return Ok(Request::FocusWindow(window(word, verb)?));
     }
+    retired_here(word)?;
     Ok(Request::Focus(direction(word, verb)?))
 }
 
@@ -222,9 +256,10 @@ fn send_request<'a>(
 ) -> Result<Request, String> {
     let word = words.next();
     if names_window(word) {
-        let key = window(word, verb)?;
-        return Ok(Request::SendWindow(key, workspace(words.next(), verb)?));
+        let handle = window(word, verb)?;
+        return Ok(Request::SendWindow(handle, workspace(words.next(), verb)?));
     }
+    retired_here(word)?;
     Ok(Request::Send(workspace(word, verb)?))
 }
 
@@ -234,10 +269,45 @@ fn move_request<'a>(
 ) -> Result<Request, String> {
     let word = words.next();
     if names_window(word) {
-        let key = window(word, verb)?;
-        return Ok(Request::MoveWindow(key, direction(words.next(), verb)?));
+        let handle = window(word, verb)?;
+        return Ok(Request::MoveWindow(handle, direction(words.next(), verb)?));
     }
+    retired_here(word)?;
     Ok(Request::Move(direction(word, verb)?))
+}
+
+/// Refuse the address this channel used to take, where it could have been
+/// written: the FIRST argument of a verb that took one.
+///
+/// `send 1:5 3` is a caller working from an old report or an old note, and
+/// "1:5 is not a workspace number" sends it to correct the one word in the
+/// line that was right. Asked only here and not inside the shared argument
+/// parsers, because `send @1 1:5` and `workspace 1:5` never held an address
+/// in that position — telling THEM about a retired form would be the same
+/// misdirection the other way round.
+fn retired_here(word: Option<&str>) -> Result<(), String> {
+    match word.and_then(retired_address) {
+        Some(retired) => Err(retired),
+        None => Ok(()),
+    }
+}
+
+/// Whether a word is shaped like the retired `client:object` address. Both
+/// halves must be there and both must be digits: an empty half makes the
+/// digit check vacuously true, and a word that never looked like an address
+/// keeps its own complaint.
+fn retired_address(word: &str) -> Option<String> {
+    let (client, object) = word.split_once(':')?;
+    if client.is_empty() || object.is_empty() {
+        return None;
+    }
+    if !client.bytes().chain(object.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "'{word}' is the retired client:object address; windows are named \
+         @12 now, and `layout` prints the one to use"
+    ))
 }
 
 fn workspace(word: Option<&str>, verb: &str) -> Result<u8, String> {
@@ -298,6 +368,15 @@ fn presentation_word(presentation: Presentation) -> &'static str {
 /// One window, as the report names it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlWindow {
+    /// What a caller ADDRESSES this window by, and what `id=` prints. Minted
+    /// once per window and never reissued, so an id from a stale report names
+    /// nothing rather than whatever reused its object number.
+    pub handle: u64,
+    /// The Wayland pair, reported as `object=` for diagnosis only. It is what
+    /// the compositor keys its own scene by and what appears in its logs, so
+    /// withholding it would make a report harder to line up against them —
+    /// but it is not addressable, because it is exactly what a client may
+    /// reuse.
     pub key: SurfaceKey,
     pub workspace: u8,
     /// Where it is laid out. Present for a window on a workspace nobody is
@@ -314,18 +393,21 @@ pub struct ControlWindow {
     /// windows they are rather than leaving a caller to find out by being
     /// told a window it can see does not exist.
     pub floating: bool,
-    /// The window this one is constrained to, if any: an xdg-shell parent, an
-    /// imported foreign one, or a portal's. Reported because it changes what
+    /// The HANDLE of the window this one is constrained to, if any: an
+    /// xdg-shell parent, an imported foreign one, or a portal's. A handle
+    /// rather than a key because a caller acts on what it reads here, and the
+    /// pair is not addressable. Reported because it changes what
     /// an addressed order DOES — the compositor keeps a family on one
     /// workspace and its topmost constrained child above its ancestor, so
     /// naming any member reaches the family rather than the member alone.
     /// Without the field a caller could see neither the relationship nor a
     /// reason for the answer it got.
-    pub parent: Option<SurfaceKey>,
+    pub parent: Option<u64>,
     /// The client's own `xdg_toplevel.set_app_id`, or `None` from a client
-    /// that set none. This is the field a caller can PREDICT: an id is stable
-    /// while a window lives but is a Wayland object number that means nothing
-    /// to a person and differs every boot, so an agent told to put "the
+    /// that set none. This is the field a caller can PREDICT: a handle is
+    /// stable for as long as its window and longer, but it is still a number
+    /// this compositor made up — it means nothing to a person and differs
+    /// between two runs of the same session — so an agent told to put "the
     /// browser" somewhere has nothing else to match on.
     pub app_id: Option<String>,
     /// The client's own `xdg_toplevel.set_title`, or `None` from a client that
@@ -391,9 +473,10 @@ pub fn report(snapshot: &ControlSnapshot) -> String {
     ));
     for window in &snapshot.windows {
         out.push_str(&format!(
-            "window id={}:{} workspace={} x={} y={} width={} height={} \
-             visible={} focused={} fullscreen={} floating={} parent={} \
-             app_id={} title={}\n",
+            "window id={} object={}:{} workspace={} x={} y={} width={} \
+             height={} visible={} focused={} fullscreen={} floating={} \
+             parent={} app_id={} title={}\n",
+            handle_word(window.handle),
             window.key.client,
             window.key.object,
             window.workspace,
@@ -405,7 +488,7 @@ pub fn report(snapshot: &ControlSnapshot) -> String {
             window.focused,
             window.fullscreen,
             window.floating,
-            window.parent.map(window_word).unwrap_or_default(),
+            window.parent.map(handle_word).unwrap_or_default(),
             clean_app_id(window.app_id.as_deref()),
             clean_title(window.title.as_deref()),
         ));
@@ -516,26 +599,37 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
         // `Err` here means the session could not, and telling a caller to go
         // and look at the session because they typed a stale id is the wrong
         // instruction.
-        Request::FocusWindow(key) => {
+        Request::FocusWindow(handle) => {
+            let Some(key) = runtime.window_for_handle(handle) else {
+                return Ok(Answer::NoSuchWindow(handle));
+            };
             let acted = runtime.control_focus(key)?;
-            return found(runtime, key, acted);
+            return found(runtime, handle, key, acted);
         }
-        Request::SendWindow(key, number) => {
+        Request::SendWindow(handle, number) => {
+            let Some(key) = runtime.window_for_handle(handle) else {
+                return Ok(Answer::NoSuchWindow(handle));
+            };
             return match runtime.control_send(key, number)? {
                 Sent::Done => Ok(Answer::Ok),
-                Sent::NoWindow => found(runtime, key, false),
-                // Asked HERE rather than in the runtime because it is a
-                // property of the answer and not of the move: the refusal is
-                // the same either way, and only the sentence differs.
-                Sent::FollowsParent(root) if runtime.is_floating(root) => {
-                    Ok(Answer::FamilyStuck(key, root))
+                Sent::NoWindow => found(runtime, handle, key, false),
+                // Floating is asked HERE rather than in the runtime because it
+                // is a property of the answer and not of the move: the refusal
+                // is the same either way, and only the sentence differs. The
+                // NAME came with the root, since only the runtime can say
+                // which ancestor is still nameable.
+                Sent::FollowsParent { root, named } if runtime.is_floating(root) => {
+                    Ok(Answer::FamilyStuck(handle, named))
                 }
-                Sent::FollowsParent(root) => Ok(Answer::FollowsParent(key, root)),
+                Sent::FollowsParent { named, .. } => Ok(Answer::FollowsParent(handle, named)),
             };
         }
-        Request::MoveWindow(key, direction) => {
+        Request::MoveWindow(handle, direction) => {
+            let Some(key) = runtime.window_for_handle(handle) else {
+                return Ok(Answer::NoSuchWindow(handle));
+            };
             let acted = runtime.control_move(key, direction)?;
-            return found(runtime, key, acted);
+            return found(runtime, handle, key, acted);
         }
     };
     // `Runtime::command`, the keyboard's own path, whole-output damage and
@@ -552,23 +646,23 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
 pub enum Answer {
     Ok,
     Report(String),
-    NoSuchWindow(SurfaceKey),
+    NoSuchWindow(u64),
     /// Named a window that IS there and cannot be arranged: a portal dialog.
     /// Its own answer because "no window" would be a lie about a window the
     /// report had just listed, and a caller cannot fix what it is not told.
-    NotArrangeable(SurfaceKey),
+    NotArrangeable(u64),
     /// Named a window that cannot leave its family's workspace alone. Carries
     /// the family's ROOT, because that is the window the caller should have
     /// named: an answer that withholds it makes the caller read the report
     /// again, and one that names the immediate parent of a child two deep
     /// hands back a window that would be refused for the same reason.
-    FollowsParent(SurfaceKey, SurfaceKey),
+    FollowsParent(u64, u64),
     /// Named a window whose family cannot move at all, because the root it
     /// follows is itself unarrangeable — a portal dialog can be a parent, and
     /// `Layout::float` has taken it out of the tree. Its own answer so the
     /// caller learns that in ONE refusal: pointing at the root and letting
     /// them discover it is refused too is a remedy that is not one.
-    FamilyStuck(SurfaceKey, SurfaceKey),
+    FamilyStuck(u64, u64),
 }
 
 /// Which kind of "no" a refused order is.
@@ -579,7 +673,12 @@ pub enum Answer {
 /// question nobody asked. The two cannot disagree today — `topmost_parented`
 /// follows only a mapped, overlapping, tiled child, which is never the
 /// floating case below — so this is a rule to keep rather than a bug to fix.
-fn found(runtime: &Runtime, key: SurfaceKey, acted: bool) -> Result<Answer, String> {
+fn found(
+    runtime: &Runtime,
+    handle: u64,
+    key: SurfaceKey,
+    acted: bool,
+) -> Result<Answer, String> {
     if acted {
         return Ok(Answer::Ok);
     }
@@ -587,9 +686,9 @@ fn found(runtime: &Runtime, key: SurfaceKey, acted: bool) -> Result<Answer, Stri
     // report, so telling a caller it does not exist would be false about the
     // one thing the caller can see.
     if runtime.is_floating(key) {
-        return Ok(Answer::NotArrangeable(key));
+        return Ok(Answer::NotArrangeable(handle));
     }
-    Ok(Answer::NoSuchWindow(key))
+    Ok(Answer::NoSuchWindow(handle))
 }
 
 /// The answer to one request: a status line, then a body only a question has.
@@ -614,23 +713,23 @@ pub fn answer(runtime: &Mutex<Runtime>, line: &str) -> String {
     match outcome {
         Ok(Answer::Ok) => "ok\n".to_string(),
         Ok(Answer::Report(report)) => format!("ok\n{report}"),
-        Ok(Answer::NoSuchWindow(key)) => {
-            format!("error no window {}\n", window_word(key))
+        Ok(Answer::NoSuchWindow(handle)) => {
+            format!("error no window {}\n", handle_word(handle))
         }
-        Ok(Answer::NotArrangeable(key)) => format!(
+        Ok(Answer::NotArrangeable(handle)) => format!(
             "error window {} is floating and cannot be arranged\n",
-            window_word(key)
+            handle_word(handle)
         ),
-        Ok(Answer::FollowsParent(key, root)) => format!(
+        Ok(Answer::FollowsParent(child, root)) => format!(
             "error window {} follows {}; send that one\n",
-            window_word(key),
-            window_word(root)
+            handle_word(child),
+            handle_word(root)
         ),
-        Ok(Answer::FamilyStuck(key, root)) => format!(
+        Ok(Answer::FamilyStuck(child, root)) => format!(
             "error window {} follows {}, which is floating and cannot be \
              arranged\n",
-            window_word(key),
-            window_word(root)
+            handle_word(child),
+            handle_word(root)
         ),
         Err(error) => format!("unavailable {error}\n"),
     }
@@ -1013,24 +1112,9 @@ mod tests {
             Request::Present(Presentation::Stacked),
             Request::Present(Presentation::Tabbed),
             Request::Group,
-            Request::FocusWindow(SurfaceKey {
-                client: 3,
-                object: 12,
-            }),
-            Request::SendWindow(
-                SurfaceKey {
-                    client: 3,
-                    object: 12,
-                },
-                7,
-            ),
-            Request::MoveWindow(
-                SurfaceKey {
-                    client: 40,
-                    object: 1,
-                },
-                Direction::Right,
-            ),
+            Request::FocusWindow(12),
+            Request::SendWindow(12, 7),
+            Request::MoveWindow(40, Direction::Right),
         ];
         for request in every {
             let line = request.render();
@@ -1053,7 +1137,7 @@ mod tests {
         };
         match inner {
             "1-9" => "1".to_string(),
-            "client:object" => "3:12".to_string(),
+            "@id" => "@12".to_string(),
             alternation => alternation
                 .split('|')
                 .next()
@@ -1070,9 +1154,9 @@ mod tests {
         // that produced an empty string would make several pass for nothing.
         assert_eq!(example("focus"), "focus");
         assert_eq!(example("<1-9>"), "1");
-        assert_eq!(example("<client:object>"), "3:12");
+        assert_eq!(example("<@id>"), "@12");
         assert_eq!(example("<left|right|up|down>"), "left");
-        assert!(Request::parse("focus 3:12").is_ok(), "the id example is not one");
+        assert!(Request::parse("focus @12").is_ok(), "the id example is not one");
     }
 
     #[test]
@@ -1103,6 +1187,20 @@ mod tests {
             assert!(
                 Request::parse(&line).is_ok(),
                 "help names '{form}' but '{line}' does not parse"
+            );
+        }
+        // Every FORM, not every verb. Checked by verb, deleting all three
+        // addressed entries left this green: `focus`, `send` and `move` were
+        // still named by their unaddressed entries, so the half of the
+        // vocabulary a caller cannot guess could go undocumented without a
+        // test noticing. An addressed form is the half that needs the help
+        // most — nothing about a window suggests it is spelled `@12`.
+        for verb in ["send", "focus", "move"] {
+            assert!(
+                USAGE.iter().any(|(form, _)| {
+                    form.starts_with(verb) && form.contains("<@id>")
+                }),
+                "the help text does not document the addressed '{verb}'"
             );
         }
     }
@@ -1152,6 +1250,7 @@ mod tests {
             active_workspace: 1,
             occupied: vec![1],
             windows: vec![ControlWindow {
+                handle: 9,
                 key: SurfaceKey {
                     client: 7,
                     object: 3,
@@ -1210,6 +1309,7 @@ mod tests {
             occupied: vec![1, 2],
             windows: vec![
                 ControlWindow {
+                    handle: 11,
                     key: SurfaceKey {
                         client: 1,
                         object: 5,
@@ -1230,6 +1330,7 @@ mod tests {
                     title: Some("shell".to_string()),
                 },
                 ControlWindow {
+                    handle: 12,
                     key: SurfaceKey {
                         client: 2,
                         object: 9,
@@ -1255,12 +1356,12 @@ mod tests {
             report(&snapshot),
             "output width=800 height=600 windows=2\n\
              workspace active=2 occupied=1,2\n\
-             window id=1:5 workspace=1 x=0 y=24 width=800 height=576 \
-             visible=false focused=false fullscreen=false floating=false \
-             parent= app_id=org.td.term title=shell\n\
-             window id=2:9 workspace=2 x=0 y=24 width=400 height=576 \
-             visible=true focused=true fullscreen=false floating=false \
-             parent= app_id= title=\n"
+             window id=@11 object=1:5 workspace=1 x=0 y=24 width=800 \
+             height=576 visible=false focused=false fullscreen=false \
+             floating=false parent= app_id=org.td.term title=shell\n\
+             window id=@12 object=2:9 workspace=2 x=0 y=24 width=400 \
+             height=576 visible=true focused=true fullscreen=false \
+             floating=false parent= app_id= title=\n"
         );
     }
 
@@ -1330,6 +1431,33 @@ mod tests {
         (Arc::new(Mutex::new(runtime)), frame)
     }
 
+    #[test]
+    fn the_fixture_mints_handles_in_the_order_it_commits() {
+        // Every wire literal in this module writes a handle by hand — `focus
+        // @1` for the first window a fixture commits. That is only readable
+        // because minting is in commit order, and only SAFE because this says
+        // so: a change to where handles are minted would otherwise leave the
+        // suite addressing whichever windows the new order happened to name,
+        // with each test still green about the wrong one.
+        let first = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let second = SurfaceKey {
+            client: 1,
+            object: 2,
+        };
+        let third = SurfaceKey {
+            client: 2,
+            object: 2,
+        };
+        let (runtime, _frame) = session_of(&[first, second, third]);
+        let report = layout_of(&runtime);
+        assert_eq!(handle_of(&report, first), 1, "{report}");
+        assert_eq!(handle_of(&report, second), 2, "{report}");
+        assert_eq!(handle_of(&report, third), 3, "{report}");
+    }
+
     fn layout_of(runtime: &Mutex<Runtime>) -> String {
         let answered = answer(runtime, "layout");
         answered
@@ -1345,13 +1473,35 @@ mod tests {
             .collect()
     }
 
-    fn record_for(report: &str, key: SurfaceKey) -> String {
-        let wanted = format!("window id={}:{} ", key.client, key.object);
+    fn record_for(report: &str, handle: u64) -> String {
+        let wanted = format!("window id=@{handle} ");
         windows_in(report)
             .into_iter()
             .find(|line| line.starts_with(&wanted))
-            .unwrap_or_else(|| panic!("no record for {}:{} in\n{report}", key.client, key.object))
+            .unwrap_or_else(|| panic!("no record for @{handle} in\n{report}"))
             .to_string()
+    }
+
+    /// The handle the report gives a window a test committed by key.
+    ///
+    /// Read out of the report rather than predicted from mint order, because
+    /// that is what a caller does and because a test that hard-coded the order
+    /// would pass while the report named something else entirely.
+    fn handle_of(report: &str, key: SurfaceKey) -> u64 {
+        // The FIELD, not a substring: `title` runs to the end of the line and
+        // a client picks it, so a window titled `object=1:1` would otherwise
+        // answer for one it is not. This module has a test about exactly that
+        // kind of forgery, so its own helper should not be forgeable.
+        let wanted = format!("object={}:{}", key.client, key.object);
+        windows_in(report)
+            .into_iter()
+            .find(|line| line.split_whitespace().nth(2) == Some(wanted.as_str()))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|field| field.strip_prefix("id=@"))
+            .and_then(|handle| handle.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("no handle for {}:{} in\n{report}", key.client, key.object)
+            })
     }
 
     #[test]
@@ -1378,18 +1528,19 @@ mod tests {
         // window would move `second` and this would catch it.
         let before = ask(&socket.0, Request::Layout).expect("layout");
         assert!(
-            record_for(&before, second).contains("focused=true"),
+            record_for(&before, handle_of(&before, second)).contains("focused=true"),
             "the fixture does not focus the window this test assumes:\n{before}"
         );
 
-        ask(&socket.0, Request::SendWindow(first, 3)).expect("send");
+        let named = handle_of(&before, first);
+        ask(&socket.0, Request::SendWindow(named, 3)).expect("send");
         let after = ask(&socket.0, Request::Layout).expect("layout");
         assert!(
-            record_for(&after, first).contains("workspace=3"),
+            record_for(&after, handle_of(&after, first)).contains("workspace=3"),
             "the named window did not move:\n{after}"
         );
         assert!(
-            record_for(&after, second).contains("workspace=1"),
+            record_for(&after, handle_of(&after, second)).contains("workspace=1"),
             "the order moved the focused window instead:\n{after}"
         );
         // And the view did not follow it, which is `send`'s own rule.
@@ -1416,15 +1567,17 @@ mod tests {
         let socket = temporary("control-sock");
         serve(&socket.0, Arc::clone(&runtime)).expect("serve");
 
-        ask(&socket.0, Request::SendWindow(first, 4)).expect("send");
-        ask(&socket.0, Request::FocusWindow(first)).expect("focus");
+        let listed = ask(&socket.0, Request::Layout).expect("layout");
+        let named = handle_of(&listed, first);
+        ask(&socket.0, Request::SendWindow(named, 4)).expect("send");
+        ask(&socket.0, Request::FocusWindow(named)).expect("focus");
         let after = ask(&socket.0, Request::Layout).expect("layout");
         assert!(
             after.contains("workspace active=4 "),
             "focusing a hidden window did not show its workspace:\n{after}"
         );
         assert!(
-            record_for(&after, first).contains("focused=true"),
+            record_for(&after, handle_of(&after, first)).contains("focused=true"),
             "the named window is not the focused one:\n{after}"
         );
     }
@@ -1439,24 +1592,21 @@ mod tests {
             object: 1,
         };
         let (runtime, _frame) = session_of(&[window]);
-        let ghost = SurfaceKey {
-            client: 9,
-            object: 9,
-        };
+        // 99 is a handle this session has not minted YET. It is not reserved
+        // against the future — mint 99 windows and it names one — and that is
+        // exactly right: what a handle promises is that it never comes BACK,
+        // not that a number nobody has been given stays unusable forever.
         assert_eq!(
-            answer(&runtime, "focus 9:9"),
-            "error no window 9:9\n",
+            answer(&runtime, "focus @99"),
+            "error no window @99\n",
             "a stale id was reported as a broken compositor"
         );
-        assert_eq!(answer(&runtime, "send 9:9 2"), "error no window 9:9\n");
-        assert_eq!(answer(&runtime, "move 9:9 left"), "error no window 9:9\n");
+        assert_eq!(answer(&runtime, "send @99 2"), "error no window @99\n");
+        assert_eq!(answer(&runtime, "move @99 left"), "error no window @99\n");
         // And the client turns that into the refusal exit, not the absent one.
         assert_eq!(
-            split_answer(&answer(&runtime, "focus 9:9"), false),
-            Err(ControlFailure::Refused(format!(
-                "no window {}:{}",
-                ghost.client, ghost.object
-            )))
+            split_answer(&answer(&runtime, "focus @99"), false),
+            Err(ControlFailure::Refused("no window @99".to_string()))
         );
     }
 
@@ -1478,18 +1628,18 @@ mod tests {
         let (runtime, _frame) = session_of(&[first, second]);
         let before = layout_of(&runtime);
         assert!(
-            record_for(&before, second).contains("focused=true"),
+            record_for(&before, handle_of(&before, second)).contains("focused=true"),
             "the fixture does not focus the window this test assumes:\n{before}"
         );
 
-        assert_eq!(answer(&runtime, "focus 1:1"), "ok\n");
+        assert_eq!(answer(&runtime, "focus @1"), "ok\n");
         let after = layout_of(&runtime);
         assert!(
-            record_for(&after, first).contains("focused=true"),
+            record_for(&after, handle_of(&after, first)).contains("focused=true"),
             "focus did not move to the named window:\n{after}"
         );
         assert!(
-            record_for(&after, second).contains("focused=false"),
+            record_for(&after, handle_of(&after, second)).contains("focused=false"),
             "two windows are focused at once:\n{after}"
         );
         // And the view did not wander, since it was already the right one.
@@ -1517,22 +1667,22 @@ mod tests {
         assert_eq!(answer(&runtime, "fullscreen"), "ok\n");
         let before = layout_of(&runtime);
         assert!(
-            record_for(&before, covering).contains("fullscreen=true"),
+            record_for(&before, handle_of(&before, covering)).contains("fullscreen=true"),
             "the fixture did not go fullscreen:\n{before}"
         );
 
-        assert_eq!(answer(&runtime, "focus 1:1"), "ok\n");
+        assert_eq!(answer(&runtime, "focus @1"), "ok\n");
         let after = layout_of(&runtime);
         assert!(
-            record_for(&after, hidden).contains("focused=true"),
+            record_for(&after, handle_of(&after, hidden)).contains("focused=true"),
             "the named window was not focused:\n{after}"
         );
         assert!(
-            record_for(&after, hidden).contains("visible=true"),
+            record_for(&after, handle_of(&after, hidden)).contains("visible=true"),
             "the named window was focused but left invisible:\n{after}"
         );
         assert!(
-            record_for(&after, covering).contains("fullscreen=false"),
+            record_for(&after, handle_of(&after, covering)).contains("fullscreen=false"),
             "the covering window kept a fullscreen that hides the named one:\n{after}"
         );
     }
@@ -1544,13 +1694,16 @@ mod tests {
         // windows that are in no tree. Asked that way, an order aimed at an
         // unmapped window reported `ok` for doing nothing — and, for `focus`,
         // moved the view to a workspace to show a window that is not there.
+        //
+        // Object ids apart from the handles, so `@1` in the three refusals
+        // below is the handle and cannot be the object number.
         let window = SurfaceKey {
             client: 1,
-            object: 1,
+            object: 51,
         };
         let other = SurfaceKey {
             client: 2,
-            object: 2,
+            object: 52,
         };
         let (runtime, _frame) = session_of(&[window, other]);
         {
@@ -1563,11 +1716,81 @@ mod tests {
             );
         }
         assert_eq!(
-            answer(&runtime, "focus 1:1"),
-            "error no window 1:1\n",
+            answer(&runtime, "focus @1"),
+            "error no window @1\n",
             "an unmapped window was reported as addressable"
         );
-        assert_eq!(answer(&runtime, "send 1:1 3"), "error no window 1:1\n");
+        assert_eq!(answer(&runtime, "send @1 3"), "error no window @1\n");
+        // `move` too. It is the one this path can most easily lose: the handle
+        // RESOLVES here — the window is unmapped, not gone — so the refusal
+        // has to come from `reveal` further down rather than from the lookup.
+        assert_eq!(answer(&runtime, "move @1 left"), "error no window @1\n");
+    }
+
+    #[test]
+    fn a_handle_whose_window_was_replaced_addresses_neither() {
+        // The failure the whole migration is for, seen from the wire. A client
+        // may destroy a surface and be handed the same object id for the next
+        // one, so under the old address a caller holding `1:1` from an earlier
+        // report would silently have started ordering a DIFFERENT window
+        // about. Here the old name must find nothing, the new window must be
+        // untouched, and every addressed verb must agree — a resolver that
+        // fell back to "the nearest live window" would be invisible to a test
+        // that only asks after an empty session.
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let bystander = SurfaceKey {
+            client: 2,
+            object: 2,
+        };
+        let (runtime, _frame) = session_of(&[key, bystander]);
+        let retired = handle_of(&layout_of(&runtime), key);
+        {
+            let mut locked = runtime.lock().expect("runtime");
+            locked.remove(key).expect("remove");
+            locked
+                .commit(
+                    key,
+                    crate::buffer::Surface::from_shm_pixels(
+                        100,
+                        100,
+                        [1u8, 2, 3, 0].repeat(10_000),
+                        crate::scene::SHM_XRGB8888,
+                    )
+                    .expect("test surface"),
+                )
+                .expect("commit");
+        }
+        let report = layout_of(&runtime);
+        let live = handle_of(&report, key);
+        assert_ne!(live, retired, "the replacement inherited a dead name:\n{report}");
+
+        // Every verb, because each resolves the handle in its own arm.
+        for order in [
+            format!("focus @{retired}"),
+            format!("send @{retired} 3"),
+            format!("move @{retired} left"),
+        ] {
+            assert_eq!(
+                answer(&runtime, &order),
+                format!("error no window @{retired}\n"),
+                "'{order}' reached a window"
+            );
+        }
+
+        // And the replacement is where it was, on the workspace it was
+        // committed to rather than the 3 the stale `send` asked for.
+        let after = layout_of(&runtime);
+        assert!(
+            record_for(&after, live).contains("workspace=1 "),
+            "a stale order moved the replacement:\n{after}"
+        );
+        assert!(
+            record_for(&after, handle_of(&after, bystander)).contains("workspace=1 "),
+            "a stale order moved a bystander:\n{after}"
+        );
     }
 
     #[test]
@@ -1579,13 +1802,16 @@ mod tests {
         // which is the one thing it could not act on: there is nothing to
         // spell differently. So the report says which windows those are, and
         // the refusal says why.
+        //
+        // Object ids apart from the handles: `@2` in the refusal below can
+        // only be the dialog's handle, never its Wayland object number.
         let parent = SurfaceKey {
             client: 1,
-            object: 1,
+            object: 41,
         };
         let dialog = SurfaceKey {
             client: 2,
-            object: 2,
+            object: 42,
         };
         let (runtime, _frame) = session_of(&[parent, dialog]);
         {
@@ -1607,21 +1833,21 @@ mod tests {
 
         let report = layout_of(&runtime);
         assert!(
-            record_for(&report, dialog).contains("floating=true"),
+            record_for(&report, handle_of(&report, dialog)).contains("floating=true"),
             "the dialog is not reported as floating:\n{report}"
         );
         assert!(
-            record_for(&report, parent).contains("floating=false"),
+            record_for(&report, handle_of(&report, parent)).contains("floating=false"),
             "a tiled window is reported as floating:\n{report}"
         );
 
-        let refused = "error window 2:2 is floating and cannot be arranged\n";
-        assert_eq!(answer(&runtime, "focus 2:2"), refused);
-        assert_eq!(answer(&runtime, "send 2:2 3"), refused);
-        assert_eq!(answer(&runtime, "move 2:2 left"), refused);
+        let refused = "error window @2 is floating and cannot be arranged\n";
+        assert_eq!(answer(&runtime, "focus @2"), refused);
+        assert_eq!(answer(&runtime, "send @2 3"), refused);
+        assert_eq!(answer(&runtime, "move @2 left"), refused);
         // And a window that really is absent still gets the other answer, so
         // the two refusals stay apart rather than one swallowing the other.
-        assert_eq!(answer(&runtime, "focus 9:9"), "error no window 9:9\n");
+        assert_eq!(answer(&runtime, "focus @99"), "error no window @99\n");
     }
 
     /// A parent and the child constrained to it, both mapped and grouped.
@@ -1658,7 +1884,7 @@ mod tests {
         let (runtime, _frame) = session_of(&[first, second]);
         let before = layout_of(&runtime);
         let left_of = |report: &str, key: SurfaceKey| -> i32 {
-            let record = record_for(report, key);
+            let record = record_for(report, handle_of(report, key));
             record
                 .split_whitespace()
                 .find_map(|field| field.strip_prefix("x="))
@@ -1670,7 +1896,7 @@ mod tests {
             "the fixture does not order the windows as this test assumes:\n{before}"
         );
 
-        assert_eq!(answer(&runtime, "move 1:1 right"), "ok\n");
+        assert_eq!(answer(&runtime, "move @1 right"), "ok\n");
         let after = layout_of(&runtime);
         assert!(
             left_of(&after, first) > left_of(&after, second),
@@ -1701,7 +1927,7 @@ mod tests {
         assert!(before.iter().any(|byte| *byte != 0), "nothing was painted");
 
         // Focus moves the decoration, so the pixels have to change.
-        assert_eq!(answer(&runtime, "focus 1:1"), "ok\n");
+        assert_eq!(answer(&runtime, "focus @1"), "ok\n");
         let focused = screen(&frame);
         assert_ne!(
             focused, before,
@@ -1709,7 +1935,7 @@ mod tests {
         );
 
         // And a send, whose window leaves the shown workspace entirely.
-        assert_eq!(answer(&runtime, "send 1:1 4"), "ok\n");
+        assert_eq!(answer(&runtime, "send @1 4"), "ok\n");
         let sent = screen(&frame);
         assert_ne!(
             sent, focused,
@@ -1726,9 +1952,15 @@ mod tests {
         // would put focus back on the child anyway. Pinned because it is the
         // one place an addressed order acts on a window other than the one
         // named, and a caller reading `ok` deserves the rule written down.
+        //
+        // The parent's OBJECT ID is deliberately not its handle. Every fixture
+        // in this module used to commit `1:1` first, so `parent=@1` held just
+        // as well for a report that printed the Wayland object number — the
+        // one thing `parent=` must not be. Object 7, committed first, is still
+        // handle 1, and the two numbers can no longer be confused.
         let parent = SurfaceKey {
             client: 1,
-            object: 1,
+            object: 7,
         };
         let child = SurfaceKey {
             client: 1,
@@ -1744,22 +1976,22 @@ mod tests {
         // follows a child only where the two overlap, so side-by-side tiles
         // are unaffected and `focus <parent>` focuses the parent named.
         assert_eq!(answer(&runtime, "group"), "ok\n");
-        assert_eq!(answer(&runtime, "focus 2:2"), "ok\n");
+        assert_eq!(answer(&runtime, "focus @3"), "ok\n");
 
-        assert_eq!(answer(&runtime, "focus 1:1"), "ok\n");
+        assert_eq!(answer(&runtime, "focus @1"), "ok\n");
         let after = layout_of(&runtime);
         assert!(
-            record_for(&after, child).contains("focused=true"),
+            record_for(&after, handle_of(&after, child)).contains("focused=true"),
             "the family constraint was not applied:\n{after}"
         );
         // And the report says why, so the answer is predictable from it: the
         // child names its parent.
         assert!(
-            record_for(&after, child).contains("parent=1:1 "),
+            record_for(&after, handle_of(&after, child)).contains("parent=@1 "),
             "the child does not name its parent:\n{after}"
         );
         assert!(
-            record_for(&after, parent).contains("parent= "),
+            record_for(&after, handle_of(&after, parent)).contains("parent= "),
             "a window with no parent claims one:\n{after}"
         );
     }
@@ -1790,12 +2022,12 @@ mod tests {
         family(&runtime, parent, child);
         assert_eq!(answer(&runtime, "group"), "ok\n");
 
-        assert_eq!(answer(&runtime, "move 1:1 right"), "ok\n");
+        assert_eq!(answer(&runtime, "move @1 right"), "ok\n");
         let after = layout_of(&runtime);
         // The CHILD left the group, which is what clicking the parent and
         // pressing the chord does: the click lands on the child above it.
         assert!(
-            record_for(&after, child).contains("parent=1:1 "),
+            record_for(&after, handle_of(&after, child)).contains("parent=@1 "),
             "the fixture lost the relationship:\n{after}"
         );
         let order: Vec<&str> = windows_in(&after)
@@ -1804,7 +2036,7 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            vec!["id=1:1", "id=2:2", "id=1:2"],
+            vec!["id=@1", "id=@3", "id=@2"],
             "a different window moved than the pointer would have moved"
         );
     }
@@ -1825,10 +2057,10 @@ mod tests {
             object: 2,
         };
         let (runtime, _frame) = session_of(&[window, other]);
-        assert_eq!(answer(&runtime, "send 1:1 1"), "ok\n");
+        assert_eq!(answer(&runtime, "send @1 1"), "ok\n");
         let after = layout_of(&runtime);
         assert!(
-            record_for(&after, window).contains("workspace=1 "),
+            record_for(&after, handle_of(&after, window)).contains("workspace=1 "),
             "the window that was already there moved:\n{after}"
         );
 
@@ -1856,7 +2088,7 @@ mod tests {
                 .expect("commit");
         }
         family(&runtime, window, child);
-        assert_eq!(answer(&runtime, "send 1:3 1"), "ok\n");
+        assert_eq!(answer(&runtime, "send @3 1"), "ok\n");
     }
 
     #[test]
@@ -1865,32 +2097,37 @@ mod tests {
         // that works. Naming the immediate parent of a child two deep hands
         // back a window refused for the same reason — a second dead end — so
         // it names the ROOT of the chain, which has no parent to follow.
+        //
+        // The object ids are deliberately not 1, 2, 3. Committed in this
+        // order the handles ARE 1, 2, 3, so a fixture numbered to match would
+        // let a refusal print the Wayland object id and still read `@1` —
+        // the one number that must not appear where a handle belongs.
         let root = SurfaceKey {
             client: 1,
-            object: 1,
+            object: 11,
         };
         let middle = SurfaceKey {
             client: 1,
-            object: 2,
+            object: 12,
         };
         let leaf = SurfaceKey {
             client: 1,
-            object: 3,
+            object: 13,
         };
         let (runtime, _frame) = session_of(&[root, middle, leaf]);
         family(&runtime, root, middle);
         family(&runtime, middle, leaf);
 
         assert_eq!(
-            answer(&runtime, "send 1:3 3"),
-            "error window 1:3 follows 1:1; send that one\n"
+            answer(&runtime, "send @3 3"),
+            "error window @3 follows @1; send that one\n"
         );
         // And the remedy works, taking the whole chain with it.
-        assert_eq!(answer(&runtime, "send 1:1 3"), "ok\n");
+        assert_eq!(answer(&runtime, "send @1 3"), "ok\n");
         let after = layout_of(&runtime);
         for window in [root, middle, leaf] {
             assert!(
-                record_for(&after, window).contains("workspace=3 "),
+                record_for(&after, handle_of(&after, window)).contains("workspace=3 "),
                 "the family did not travel together:\n{after}"
             );
         }
@@ -1904,13 +2141,16 @@ mod tests {
         // refusal points at can itself be unarrangeable, and naming it would
         // hand the caller a second, different refusal and no window that
         // works. One answer says the whole thing instead.
+        // Object ids that are not the handles: committed in this order the
+        // child is `@1` and the dialog `@2`, so a refusal that printed a
+        // Wayland object number instead would now say `@21` and be caught.
         let dialog = SurfaceKey {
             client: 2,
-            object: 2,
+            object: 22,
         };
         let child = SurfaceKey {
             client: 1,
-            object: 1,
+            object: 21,
         };
         let (runtime, _frame) = session_of(&[child, dialog]);
         {
@@ -1935,17 +2175,17 @@ mod tests {
         }
         let report = layout_of(&runtime);
         assert!(
-            record_for(&report, dialog).contains("floating=true"),
+            record_for(&report, handle_of(&report, dialog)).contains("floating=true"),
             "the fixture's root is not floating:\n{report}"
         );
         assert!(
-            record_for(&report, child).contains("parent=2:2 "),
+            record_for(&report, handle_of(&report, child)).contains("parent=@2 "),
             "the fixture's child does not follow the dialog:\n{report}"
         );
 
         assert_eq!(
-            answer(&runtime, "send 1:1 3"),
-            "error window 1:1 follows 2:2, which is floating and cannot be \
+            answer(&runtime, "send @1 3"),
+            "error window @1 follows @2, which is floating and cannot be \
              arranged\n"
         );
     }
@@ -1967,10 +2207,10 @@ mod tests {
         let (runtime, _frame) = session_of(&[parent, child]);
         family(&runtime, parent, child);
 
-        assert_eq!(answer(&runtime, "focus 1:1"), "ok\n");
+        assert_eq!(answer(&runtime, "focus @1"), "ok\n");
         let after = layout_of(&runtime);
         assert!(
-            record_for(&after, parent).contains("focused=true"),
+            record_for(&after, handle_of(&after, parent)).contains("focused=true"),
             "a split tile followed its child anyway:\n{after}"
         );
     }
@@ -1982,37 +2222,40 @@ mod tests {
         // So the move was made and unmade inside one request while the caller
         // was told `ok` — the window it asked about had not moved, and reading
         // the report afterwards was the only way to find out.
+        //
+        // Object ids apart from the handles, so `@1`/`@2` in the refusal below
+        // can only have come from the handle map.
         let parent = SurfaceKey {
             client: 1,
-            object: 1,
+            object: 31,
         };
         let child = SurfaceKey {
             client: 1,
-            object: 2,
+            object: 32,
         };
         let (runtime, _frame) = session_of(&[parent, child]);
         family(&runtime, parent, child);
 
         assert_eq!(
-            answer(&runtime, "send 1:2 3"),
-            "error window 1:2 follows 1:1; send that one\n"
+            answer(&runtime, "send @2 3"),
+            "error window @2 follows @1; send that one\n"
         );
         let after = layout_of(&runtime);
         assert!(
-            record_for(&after, child).contains("workspace=1 "),
+            record_for(&after, handle_of(&after, child)).contains("workspace=1 "),
             "the refused send moved the window anyway:\n{after}"
         );
 
         // And the instruction the refusal gives actually works: sending the
         // PARENT takes the family, because the same repair follows it there.
-        assert_eq!(answer(&runtime, "send 1:1 3"), "ok\n");
+        assert_eq!(answer(&runtime, "send @1 3"), "ok\n");
         let moved = layout_of(&runtime);
         assert!(
-            record_for(&moved, parent).contains("workspace=3 "),
+            record_for(&moved, handle_of(&moved, parent)).contains("workspace=3 "),
             "the parent did not move:\n{moved}"
         );
         assert!(
-            record_for(&moved, child).contains("workspace=3 "),
+            record_for(&moved, handle_of(&moved, child)).contains("workspace=3 "),
             "the child did not follow its parent:\n{moved}"
         );
     }
@@ -2043,10 +2286,10 @@ mod tests {
             .unmap(parent)
             .expect("unmap");
 
-        assert_eq!(answer(&runtime, "send 1:2 3"), "ok\n");
+        assert_eq!(answer(&runtime, "send @2 3"), "ok\n");
         let after = layout_of(&runtime);
         assert!(
-            record_for(&after, child).contains("workspace=3 "),
+            record_for(&after, handle_of(&after, child)).contains("workspace=3 "),
             "the child was held by a parent that is gone:\n{after}"
         );
     }
@@ -2083,12 +2326,12 @@ mod tests {
         }
         let report = layout_of(&runtime);
         assert!(
-            !report.contains("id=2:2 "),
+            !report.contains("id=@2 "),
             "an unmapped dialog is still reported:\n{report}"
         );
         assert_eq!(
-            answer(&runtime, "focus 2:2"),
-            "error no window 2:2\n",
+            answer(&runtime, "focus @2"),
+            "error no window @2\n",
             "a window that is gone was called floating"
         );
     }
@@ -2105,68 +2348,164 @@ mod tests {
             object: 1,
         };
         let (runtime, _frame) = session_of(&[window]);
+        let named = handle_of(&layout_of(&runtime), window);
         let refused = apply(
             &mut runtime.lock().expect("runtime"),
-            Request::SendWindow(window, 42),
+            Request::SendWindow(named, 42),
         )
         .expect_err("an impossible workspace was accepted");
         assert!(
             refused.contains("layout refused"),
             "refused for the wrong reason: {refused}"
         );
-        // And a workspace that IS in range still cannot be spelled out of it.
-        assert!(Request::parse("send 1:1 42").is_err());
+        // And the parser refuses the same number before the runtime ever sees
+        // it. Spelled `@1`, because `send 1:1 42` would now be refused for its
+        // FIRST argument and prove nothing about the second.
+        let refused = Request::parse("send @1 42").expect_err("42 parsed");
+        assert!(
+            refused.contains("workspace"),
+            "an out-of-range workspace was refused for the wrong reason: \
+             {refused}"
+        );
     }
 
     #[test]
     fn an_overloaded_verb_tells_its_forms_apart_by_shape() {
-        // An id carries a colon and nothing else in this grammar does, so the
-        // two forms need no argument counting. A word WITH a colon that is not
-        // an id is an error rather than a fall-through: `send 1:x 3` has to
+        // An id begins `@` and nothing else in this grammar does, so the two
+        // forms need no argument counting. A word beginning `@` that is not an
+        // id is an error rather than a fall-through: `send @x 3` has to
         // complain about the id and not about a workspace number.
-        assert_eq!(
-            Request::parse("focus 1:5"),
-            Ok(Request::FocusWindow(SurfaceKey {
-                client: 1,
-                object: 5
-            }))
-        );
+        //
+        // Counting would not even be available for `send`, which is the point
+        // of the sigil: `send 7` is a complete request already, so a bare
+        // number could not be told from a workspace without guessing which
+        // the caller meant.
+        assert_eq!(Request::parse("focus @5"), Ok(Request::FocusWindow(5)));
         assert_eq!(Request::parse("focus left"), Ok(Request::Focus(Direction::Left)));
         assert_eq!(Request::parse("send 3"), Ok(Request::Send(3)));
         assert_eq!(
-            Request::parse("send 1:5 3"),
-            Ok(Request::SendWindow(
-                SurfaceKey {
-                    client: 1,
-                    object: 5
-                },
-                3
-            ))
+            Request::parse("send @5 3"),
+            Ok(Request::SendWindow(5, 3))
         );
         assert_eq!(Request::parse("move up"), Ok(Request::Move(Direction::Up)));
         assert_eq!(
-            Request::parse("move 1:5 up"),
+            Request::parse("move @5 up"),
             Ok(Request::MoveWindow(
-                SurfaceKey {
-                    client: 1,
-                    object: 5
-                },
+                5,
                 Direction::Up
             ))
         );
 
-        for wrong in ["send 1:x 3", "focus 1:", "focus :5", "move 1:2:3 left"] {
+        // A bare number stays the workspace form, so the two cannot collide.
+        assert_eq!(Request::parse("send 7"), Ok(Request::Send(7)));
+
+        // `@@5` is in the list because one sigil is the whole rule: a caller
+        // building an id by pasting `@` onto a number already read from a
+        // report would otherwise silently address window 5.
+        for wrong in [
+            "send @x 3",
+            "focus @",
+            "focus @5:2",
+            "focus @@5",
+            "move @1@2 left",
+        ] {
             let refused = Request::parse(wrong).expect_err("a bad id parsed");
             assert!(
                 refused.contains("window id"),
                 "'{wrong}' was refused for the wrong reason: {refused}"
             );
         }
-        // A named form still refuses a bad SECOND argument as itself.
-        assert!(Request::parse("send 1:5 99").is_err());
-        assert!(Request::parse("move 1:5 sideways").is_err());
+        // A named form still refuses a bad SECOND argument AS the second
+        // argument. These read `@5` and not `1:5` on purpose: spelled the old
+        // way they are refused for their first word, and would pass while
+        // saying nothing about the workspace or direction they claim to pin.
+        let refused = Request::parse("send @5 99").expect_err("99 parsed");
+        assert!(
+            refused.contains("workspace"),
+            "a bad workspace was refused for the wrong reason: {refused}"
+        );
+        let refused = Request::parse("move @5 sideways").expect_err("parsed");
+        assert!(
+            refused.contains("direction"),
+            "a bad direction was refused for the wrong reason: {refused}"
+        );
         // And the trailing-argument rule still holds over the longer forms.
-        assert!(Request::parse("send 1:5 3 4").is_err());
+        assert!(Request::parse("send @5 3 4").is_err());
+
+        // An `@` that is not the FIRST character is not an attempt to name a
+        // window. `contains` here instead of `starts_with` would swallow the
+        // word and answer with an id complaint about an argument whose actual
+        // problem is that it is not a direction.
+        let refused = Request::parse("move 1@2 left").expect_err("parsed");
+        assert!(
+            refused.contains("direction"),
+            "a malformed direction was read as an id: {refused}"
+        );
+        let refused = Request::parse("send 1@2").expect_err("parsed");
+        assert!(
+            refused.contains("workspace"),
+            "a malformed workspace was read as an id: {refused}"
+        );
+    }
+
+    #[test]
+    fn the_address_this_channel_used_to_take_says_so() {
+        // `client:object` was the address one increment ago. A caller working
+        // from an old note or an old report gets told the FORM is retired,
+        // rather than told its workspace number is unreadable — which would
+        // send it to correct the one word in the line that is right.
+        for wrong in ["send 1:5 3", "focus 1:5", "move 1:5 left", "send 12:7"] {
+            let refused = Request::parse(wrong).expect_err("a retired id parsed");
+            assert!(
+                refused.contains("retired") && refused.contains("@12"),
+                "'{wrong}' was refused for the wrong reason: {refused}"
+            );
+        }
+        // Only the shape that WAS an address, and only where one could have
+        // been written. Everything below keeps its OWN complaint: a word that
+        // never looked like an address, a half of one, and — the inversion
+        // this is most easily got wrong by — a second argument, where the
+        // caller spelled the window correctly and fumbled the other word.
+        for (wrong, expected) in [
+            ("send a:b", "workspace"),
+            ("focus :5", "direction"),
+            ("send 1: 3", "workspace"),
+            ("workspace 1:5", "workspace"),
+            ("send @1 1:5", "workspace"),
+            ("move @1 1:5", "direction"),
+        ] {
+            let refused = Request::parse(wrong).expect_err("parsed");
+            assert!(
+                refused.contains(expected) && !refused.contains("retired"),
+                "'{wrong}' should complain about the {expected}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_is_digits_and_nothing_a_number_parser_would_forgive() {
+        // `u64::from_str` accepts a leading `+` and any number of leading
+        // zeros, so `@+5` and `@005` would both be window 5 without this —
+        // a second and third spelling of one address, arrived at silently.
+        // That is the same failure `@@5` is refused for, and worse: a caller
+        // pasting `@` onto a signed number would never learn it had been
+        // forgiven, and two callers would disagree about what they addressed.
+        for wrong in ["focus @+5", "focus @005", "focus @0", "focus @-1"] {
+            let refused = Request::parse(wrong).expect_err("a lax id parsed");
+            assert!(
+                refused.contains("is not a window id"),
+                "'{wrong}' was refused for the wrong reason: {refused}"
+            );
+        }
+        // And the one spelling that is an id still is, at both ends of the
+        // range a report can print.
+        assert_eq!(Request::parse("focus @5"), Ok(Request::FocusWindow(5)));
+        assert_eq!(Request::parse("focus @1"), Ok(Request::FocusWindow(1)));
+        assert_eq!(
+            Request::parse("focus @10"),
+            Ok(Request::FocusWindow(10)),
+            "a zero that is not the LEADING digit is an ordinary digit"
+        );
     }
 
     #[test]
@@ -2212,7 +2551,8 @@ mod tests {
                 .expect("app id");
             locked.set_title(window, "real".to_string()).expect("title");
         }
-        let record = record_for(&layout_of(&runtime), window);
+        let listed = layout_of(&runtime);
+        let record = record_for(&listed, handle_of(&listed, window));
         let honest = record
             .split_once(" title=")
             .map(|(_, title)| title)
@@ -2286,12 +2626,12 @@ mod tests {
             _ => panic!("layout did not answer with a report"),
         };
         assert!(
-            record_for(&report, window).contains("app_id=org.mozilla.firefox "),
+            record_for(&report, handle_of(&report, window)).contains("app_id=org.mozilla.firefox "),
             "the report does not carry the client's own name:\n{report}"
         );
         // `title` stays last, so the app id has to sit before it and the
         // title's run-to-end-of-line rule is untouched.
-        let record = record_for(&report, window);
+        let record = record_for(&report, handle_of(&report, window));
         let app_at = record.find(" app_id=").expect("app id field");
         let title_at = record.find(" title=").expect("title field");
         assert!(app_at < title_at, "app_id must precede title: {record}");
@@ -2318,7 +2658,7 @@ mod tests {
             "layout did not report the workspace in view:\n{report}"
         );
         assert!(
-            report.contains("window id=1:1 workspace=1 "),
+            report.contains("window id=@1 object=1:1 workspace=1 "),
             "layout did not report the window:\n{report}"
         );
         assert!(report.contains("focused=true"), "{report}");
@@ -2334,7 +2674,7 @@ mod tests {
         );
         // The WINDOW stayed where it was — a switch shows a workspace, it does
         // not carry anything to it.
-        assert!(report.contains("window id=1:1 workspace=1 "), "{report}");
+        assert!(report.contains("window id=@1 object=1:1 workspace=1 "), "{report}");
         assert!(
             report.contains("visible=false"),
             "a window on another workspace is not on screen:\n{report}"
@@ -2349,7 +2689,7 @@ mod tests {
         assert_eq!(ask(&socket.0, Request::Send(3)), Ok(String::new()));
         let report = ask(&socket.0, Request::Layout).expect("layout");
         assert!(
-            report.contains("window id=1:1 workspace=3 "),
+            report.contains("window id=@1 object=1:1 workspace=3 "),
             "the window did not go to workspace 3:\n{report}"
         );
         // The view did NOT follow it, which is what `send` means here and what
@@ -2362,7 +2702,7 @@ mod tests {
             "sending a window carried the view with it:\n{report}"
         );
         assert!(
-            report.contains("window id=1:1 workspace=3 ") && report.contains("visible=false"),
+            report.contains("window id=@1 object=1:1 workspace=3 ") && report.contains("visible=false"),
             "the window did not go on without the view:\n{report}"
         );
 
@@ -2596,7 +2936,7 @@ mod tests {
         assert!(matches!(
             split_answer(
                 "ok\noutput width=1 height=2 windows=1\nworkspace active=1 \
-                 occupied=1\nwindow id=1:1 works",
+                 occupied=1\nwindow id=@1 object=1:1 works",
                 true
             ),
             Err(ControlFailure::Unreachable(_))
@@ -2613,7 +2953,8 @@ mod tests {
         // the sender's own count is the only thing that can say so.
         let short = "ok\noutput width=1 height=2 windows=2\n\
                      workspace active=1 occupied=1\n\
-                     window id=1:1 workspace=1 x=0 y=0 width=1 height=1 \
+                     window id=@1 object=1:1 workspace=1 x=0 y=0 width=1 \
+                     height=1 \
                      visible=true focused=true fullscreen=false floating=false \
                      parent= app_id= title=\n";
         assert!(
@@ -2690,7 +3031,8 @@ mod tests {
             matches!(
                 split_answer(
                     "ok\noutput width=1 height=2 windows=1\n\
-                     window id=1:1 workspace=1 x=0 y=0 width=1 height=1 \
+                     window id=@1 object=1:1 workspace=1 x=0 y=0 width=1 \
+                     height=1 \
                      visible=true focused=true fullscreen=false floating=false \
                      parent= app_id= title=\n\
                      workspace active=1 occupied=1\n",

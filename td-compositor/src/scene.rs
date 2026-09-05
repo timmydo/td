@@ -822,6 +822,16 @@ pub struct Scene {
     /// the window lives but says nothing about what the window is, and an
     /// agent asked to put "the browser" somewhere has to be able to find it.
     app_ids: BTreeMap<SurfaceKey, String>,
+    /// The name a control caller addresses a window by, and the reason it is
+    /// not the `SurfaceKey`: `object` is a Wayland object id, which a client
+    /// may reuse once it has destroyed the surface holding it, so an id read
+    /// from an earlier report could come to name a DIFFERENT window of the
+    /// same client. A handle is minted once and never reissued, so a stale one
+    /// names nothing rather than something else.
+    handles: BTreeMap<SurfaceKey, u64>,
+    /// Never decremented and never reused, which is the whole point. `u64` at
+    /// one handle per mapped toplevel is not a counter anything can exhaust.
+    next_handle: u64,
     layout: Layout,
     pointer_x: i32,
     pointer_y: i32,
@@ -868,6 +878,11 @@ impl Scene {
             portal_dialog_order: Vec::new(),
             titles: BTreeMap::new(),
             app_ids: BTreeMap::new(),
+            handles: BTreeMap::new(),
+            // From 1, so that 0 is never a handle any window has: a reader
+            // that defaults an absent number gets something that resolves to
+            // nothing rather than to the first window minted.
+            next_handle: 1,
             layout: Layout::new(),
             pointer_x: 0,
             pointer_y: 0,
@@ -1164,6 +1179,28 @@ impl Scene {
         parent: Option<SurfaceKey>,
     ) -> Result<bool, String> {
         let is_new = self.store_surface(key, surface)?;
+        // `or_insert`, not `if is_new`: an unmap DROPS the surface entry, so a
+        // window that unmaps and maps again is new to `store_surface` while
+        // being the same window to everyone else. Reminting there would change
+        // a window's name under a caller holding it, which is the failure this
+        // exists to prevent.
+        // `entry`, because this runs on every buffer of every window and a
+        // `contains_key` before an `insert` walks the tree twice to answer one
+        // question.
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.handles.entry(key) {
+            // `checked_add`, and NOTHING minted when it fails. A counter that
+            // saturates would hand `u64::MAX` to every window after the last,
+            // so two live windows would report one name and a stale address
+            // would land on whichever the map happened to order first — the
+            // one thing a handle promises not to do. Running out instead
+            // leaves the window unnamed: the report omits it and no caller can
+            // address it, which is the choice made everywhere else here, that
+            // no name beats a wrong one.
+            if let Some(next) = self.next_handle.checked_add(1) {
+                slot.insert(self.next_handle);
+                self.next_handle = next;
+            }
+        }
         if is_new {
             if self.portal_dialogs.contains(&key) {
                 self.layout.float(key, parent);
@@ -1907,7 +1944,12 @@ impl Scene {
         // client may set an app id and no title, which is ordinary, and
         // answering `false` there would call a real teardown a no-op.
         let had_app_id = self.app_ids.remove(&key).is_some();
-        self.titles.remove(&key).is_some() || had_app_id
+        // The handle goes with them. A toplevel created next on the same
+        // `wl_surface` is a different window, and inheriting the name would
+        // be the recycled-object-id confusion handles exist to end, one level
+        // up.
+        let had_handle = self.handles.remove(&key).is_some();
+        self.titles.remove(&key).is_some() || had_app_id || had_handle
     }
 
     /// The toplevel's app id, as `xdg_toplevel.set_app_id` gave it, bounded
@@ -1926,6 +1968,35 @@ impl Scene {
         }
         self.app_ids.insert(key, app_id.to_string());
         true
+    }
+
+    /// Wind the counter FORWARD, so a test can reach its end without minting
+    /// its way there. Forward only, and clamped rather than checked: a test
+    /// that wound it back would reissue handles from inside the type that
+    /// promises never to, and nothing downstream could tell that apart from a
+    /// real defect.
+    #[cfg(test)]
+    pub fn set_next_handle(&mut self, next: u64) {
+        self.next_handle = next.max(self.next_handle);
+    }
+
+    /// This window's handle, if it has taken pixels at least once.
+    pub fn handle(&self, key: SurfaceKey) -> Option<u64> {
+        self.handles.get(&key).copied()
+    }
+
+    /// The window a handle names, if it still names one.
+    ///
+    /// Linear over the windows that HAVE handles, which is more than the ones
+    /// on screen: an unmap keeps a handle, so this scans every live surface
+    /// that has ever committed. That is bounded by `MAX_OBJECTS` per client
+    /// times the connected clients, and it runs under the lock the report walk
+    /// already runs its own linear pass under; a second map keyed the other
+    /// way would be a second thing to keep in step for no gain at that size.
+    pub fn key_for_handle(&self, handle: u64) -> Option<SurfaceKey> {
+        self.handles
+            .iter()
+            .find_map(|(key, candidate)| (*candidate == handle).then_some(*key))
     }
 
     pub fn app_id(&self, key: SurfaceKey) -> Option<&str> {
@@ -2003,6 +2074,7 @@ impl Scene {
         let dropped = self.drop_popups_of(key);
         self.titles.remove(&key);
         self.app_ids.remove(&key);
+        self.handles.remove(&key);
         self.layout.forget(key);
         self.clear_hint();
         self.forget_cursor_surface(key);
@@ -2058,6 +2130,7 @@ impl Scene {
             .retain(|key| key.client != client);
         self.titles.retain(|key, _| key.client != client);
         self.app_ids.retain(|key, _| key.client != client);
+        self.handles.retain(|key, _| key.client != client);
         self.surface_charge = self.surface_charge.saturating_sub(removed);
         // Cursor surfaces are not in `surfaces`, so the sweep above misses
         // them: a departing client's retained cursor pixels would be held
@@ -2349,7 +2422,12 @@ impl Scene {
                 // happen inside one borrow — and a made-up number would be
                 // worse than the window going unreported.
                 let workspace = self.layout.workspace_of(view.key)?;
+                // Same argument as the workspace above: a mapped toplevel has
+                // been through `commit_parented` and so has a handle, and
+                // inventing one would name a window nothing can resolve.
+                let handle = self.handle(view.key)?;
                 Some(ControlWindow {
+                    handle,
                     key: view.key,
                     workspace,
                     rect: view.rect,
@@ -4021,6 +4099,254 @@ mod tests {
             Some("org.td.other"),
             "another client's name went with it"
         );
+    }
+
+    #[test]
+    fn a_handle_outlives_an_unmap_because_the_window_did() {
+        // The trap this exists for: an unmap DROPS the surface entry, so a
+        // window that hides and comes back is new to `store_surface` while
+        // being the same window to a caller holding its name. Minting on that
+        // answer would rename a window behind the caller's back, which is the
+        // exact failure the whole handle scheme exists to prevent.
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        let minted = scene.handle(key).expect("a mapped window has a handle");
+        // Ordinary repainting first: a second buffer on a window that never
+        // went anywhere. This is the commonest commit there is, so a rule that
+        // renamed a window here would rename most windows constantly.
+        scene.commit(key, surface([4, 5, 6, 0], 8, 8)).unwrap();
+        assert_eq!(
+            scene.handle(key),
+            Some(minted),
+            "a repaint renamed the window it painted"
+        );
+        scene.unmap(key);
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        assert_eq!(
+            scene.handle(key),
+            Some(minted),
+            "a remapped window was renamed"
+        );
+        assert_eq!(scene.key_for_handle(minted), Some(key));
+    }
+
+    #[test]
+    fn a_handle_is_never_reissued_however_the_window_went() {
+        // The property the control surface's addressing rests on. A Wayland
+        // object id may come back — a client that destroys a surface may be
+        // handed the same number for the next one — so a caller holding an
+        // id read from an earlier report could address a DIFFERENT window.
+        // A handle that only counts up makes a stale name resolve to nothing.
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+            let minted = scene.handle(key).expect("mapped");
+            assert!(!seen.contains(&minted), "handle {minted} came back");
+            seen.push(minted);
+            // The same key, recycled the way a client may recycle it.
+            scene.remove(key);
+            assert_eq!(scene.handle(key), None, "a removed window kept its name");
+        }
+        for stale in &seen {
+            assert_eq!(
+                scene.key_for_handle(*stale),
+                None,
+                "handle {stale} named a window again"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handle_lives_and_dies_exactly_as_a_title_does() {
+        // Same three moments as `an_app_id_lives_and_dies_exactly_as_a_title
+        // _does`, and for a sharper reason: a name that outlived its window
+        // would be a name a control caller could still ACT on.
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let other = SurfaceKey {
+            client: 2,
+            object: 1,
+        };
+
+        // 1. the role object goes, leaving the wl_surface alive. A toplevel
+        // created on it next is a different window and must not inherit this
+        // one's name.
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        let first = scene.handle(key).expect("mapped");
+        assert!(
+            scene.forget_title(key),
+            "forgetting a named window answered that nothing was forgotten"
+        );
+        assert_eq!(scene.handle(key), None, "a destroyed toplevel kept its name");
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        assert_ne!(
+            scene.handle(key),
+            Some(first),
+            "the next toplevel on the surface inherited a dead window's name"
+        );
+
+        // 2. the surface goes.
+        scene.remove(key);
+        assert_eq!(scene.handle(key), None, "a removed surface kept its name");
+
+        // 3. the client goes, taking its own windows and no others.
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        scene.commit(other, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        let survivor = scene.handle(other).expect("mapped");
+        scene.remove_client(1);
+        assert_eq!(scene.handle(key), None, "a departed client kept its name");
+        assert_eq!(
+            scene.handle(other),
+            Some(survivor),
+            "another client's window was renamed"
+        );
+    }
+
+    #[test]
+    fn a_retired_handle_never_names_the_window_that_replaced_it() {
+        // The case the whole scheme exists for, and the one a test that only
+        // removes everything cannot see: the OLD window is gone, a NEW one is
+        // alive on the same Wayland key, and the stale name must find neither
+        // the dead window nor the live one. A resolver that fell back to
+        // "something near enough" would pass a suite that only ever asks after
+        // an empty scene.
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let mut scene = Scene::new();
+        for teardown in 0..3 {
+            scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+            let retired = scene.handle(key).expect("mapped");
+            match teardown {
+                0 => {
+                    scene.remove(key);
+                }
+                1 => {
+                    scene.forget_title(key);
+                }
+                _ => {
+                    scene.remove_client(1);
+                }
+            }
+            // The replacement: same client, same object, different window.
+            scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+            let live = scene.handle(key).expect("mapped");
+            assert_ne!(live, retired, "teardown {teardown} reissued a name");
+            assert_eq!(
+                scene.key_for_handle(retired),
+                None,
+                "teardown {teardown}: a retired name found a window"
+            );
+            assert_eq!(
+                scene.key_for_handle(live),
+                Some(key),
+                "teardown {teardown}: the live window lost its name"
+            );
+            scene.remove(key);
+        }
+    }
+
+    #[test]
+    fn a_counter_at_its_end_stops_naming_rather_than_repeat_a_name() {
+        // `u64` will not run out, but the behaviour AT the end is a choice and
+        // not a detail: saturating would hand one name to every window after
+        // the last, so two live windows would answer to it and a stale address
+        // would land on whichever the map ordered first. Refusing to mint
+        // leaves the window unnamed instead — off the report and unaddressable
+        // — which is the same trade the report makes everywhere else, that no
+        // name beats a wrong one.
+        let mut scene = Scene::new();
+        let last = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let beyond = SurfaceKey {
+            client: 1,
+            object: 2,
+        };
+        let further = SurfaceKey {
+            client: 1,
+            object: 3,
+        };
+        scene.set_next_handle(u64::MAX);
+        scene.commit(last, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        assert_eq!(scene.handle(last), None, "the last handle was minted");
+        scene.commit(beyond, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        scene.commit(further, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        assert_eq!(scene.handle(beyond), None);
+        assert_eq!(scene.handle(further), None);
+        assert_eq!(
+            scene.key_for_handle(u64::MAX),
+            None,
+            "an exhausted counter handed out its own end"
+        );
+        // And an unnamed window is left OUT of the report rather than put in
+        // it under a name nothing can resolve.
+        let snapshot = scene.control_snapshot(800, 600);
+        assert!(
+            snapshot.windows.is_empty(),
+            "an unnamed window was reported: {:?}",
+            snapshot.windows
+        );
+    }
+
+    #[test]
+    fn a_commit_the_scene_refuses_mints_no_name() {
+        // "The first time a toplevel TAKES pixels", not the first time it
+        // tries to. Minting above `store_surface` rather than after it would
+        // burn a name on a commit the ceiling refused, leaving a handle for a
+        // surface the scene never held and advancing the counter for a window
+        // that never appeared. That also unpicks the bound `key_for_handle`
+        // documents, which counts stored surfaces and not attempted ones.
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        scene.surface_charge = BufferCharge::shm(MAX_SCENE_BYTES);
+        let refused = scene
+            .commit(key, surface([1, 2, 3, 0], 8, 8))
+            .expect_err("the ceiling passed a surface it cannot hold");
+        assert!(refused.contains("exceeding"), "refused for another reason: {refused}");
+        assert_eq!(scene.handle(key), None, "a refused commit minted a name");
+
+        // And the counter did not move: the window that DOES take pixels gets
+        // the name the refused one would have taken.
+        scene.surface_charge = BufferCharge::none();
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        assert_eq!(
+            scene.handle(key),
+            Some(1),
+            "a refused commit spent a name anyway"
+        );
+    }
+
+    #[test]
+    fn no_window_is_ever_named_zero() {
+        // A reader that defaults an absent number gets one that resolves to
+        // nothing, rather than to whichever window was minted first.
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        assert_eq!(scene.key_for_handle(0), None, "0 named a window");
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        assert_eq!(scene.handle(key), Some(1));
+        assert_eq!(scene.key_for_handle(0), None, "0 named the first window");
     }
 
     #[test]
