@@ -15,7 +15,8 @@ use crate::ladder::{
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_BUSD_RUNTIME_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
+    TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER, TD_FIREFOX_BOOT_MARKER,
+    TD_FIREFOX_CONTENT_MARKER,
     TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
     TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
     TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
@@ -345,11 +346,38 @@ const FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS: u16 =
         + FIREFOX_DOWNLOAD_TIMEOUT_SECS
         + FIREFOX_FILE_CHOOSER_TIMEOUT_SECS * FIREFOX_FILE_CHOOSER_STAGES
         + FIREFOX_INPUT_POLL_SLEEP_SECS;
-const FIREFOX_GREETER_WAIT_ITERATIONS: u16 =
+// By this many iterations every Firefox oracle has published or failed,
+// whichever variant the boot runs.
+const FIREFOX_ORACLES_WAIT_ITERATIONS: u16 =
     FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS
         + FIREFOX_SOAK_TIMEOUT_SECS
         + FIREFOX_SOAK_BRACKET_MARGIN_SECS
         + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS;
+const CLAUDE_NAME: &str = "claude";
+const CLAUDE_COMPLETION_PATH: &str = "/run/td-claude-evidence-complete";
+const CLAUDE_COMPLETION_TMP_PATH: &str = "/run/.td-claude-evidence-complete.tmp";
+const CLAUDE_COMPLETION: &str = "td-claude-evidence-v1";
+// Where a failed launch's captured output goes: a file, never the console,
+// since the payload's bytes are its own and a marker among them would be an
+// exact line to the host oracle.
+const CLAUDE_ERROR_PATH: &str = "/run/td-claude-evidence.err";
+// td-jail's whole answer to a launch with a pipe on its stdout: stage 1's
+// stdio test, reached only once TERM let the terminal grant resolve, and
+// the one line the by-name launcher passes through unchanged.
+const CLAUDE_REFUSED_LINE: &str =
+    "td-jail: terminal grant: launcher stdout: not a character device";
+// The terminal oracle starts once every Firefox oracle has published, so no
+// second window shares a frame the compositor probes measure; it polls for
+// that itself, since `after=` releases it when the soak unit starts.
+const CLAUDE_PRE_RUN_WAIT_ITERATIONS: u16 = FIREFOX_ORACLES_WAIT_ITERATIONS;
+// The greeter's allowance past the Firefox horizon for two launches, each a
+// td-jail stage 1 and a payload start under emulation, the second under a
+// td-term of its own, bracketed by four bounded identity probes; Firefox's
+// one ready attempt gets this long. The launches carry no deadline of their
+// own, so a hung payload reds the boot at the greeter's cap, not sooner.
+const CLAUDE_EVIDENCE_BUDGET_SECS: u16 = 180;
+const APPLICATION_GREETER_WAIT_ITERATIONS: u16 =
+    CLAUDE_PRE_RUN_WAIT_ITERATIONS + CLAUDE_EVIDENCE_BUDGET_SECS;
 
 /// Seconds a terminal application's window must stay up after td-term
 /// reported it ready before the evidence unit reads its jail instance: long
@@ -389,6 +417,18 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         external_uid: 65538,
         runtime: "empty-runtime",
         runtime_recipe: super::empty_runtime::recipe,
+    },
+    // Claude Code: a marked foreign payload on the freedesktop runtime, run as
+    // a terminal application with no bus name — the first foreign-payload
+    // terminal program, beside Firefox's foreign non-terminal one and the
+    // source-built terminal mail/news.
+    ShippedApplication {
+        name: CLAUDE_NAME,
+        package: CLAUDE_NAME,
+        package_recipe: super::claude::recipe,
+        external_uid: 65539,
+        runtime: "freedesktop-platform-25-08",
+        runtime_recipe: super::freedesktop_platform_25_08::recipe,
     },
 ];
 
@@ -1135,7 +1175,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 34] = [
+const TD_SVC_UNITS: [&str; 35] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -1166,6 +1206,7 @@ const TD_SVC_UNITS: [&str; 34] = [
     "firefox-evidence",
     "firefox-input",
     "firefox-soak",
+    "claude-evidence",
     "bootsuccess",
     "bootfail",
     "sshd",
@@ -1690,6 +1731,29 @@ fn build_td_svc_conf() -> String {
          after=firefox-input\n\
          restart=never\n\
          \n\
+         # Claude Code is a foreign-payload terminal program, and this is\n\
+         # its boot oracle. It runs once every Firefox oracle has published,\n\
+         # so no second window shares a frame those measure, and launches\n\
+         # twice as the UI user: once with no terminal of its own, which the\n\
+         # fresh-terminal grant must refuse before anything runs, and once\n\
+         # inside a pseudo-terminal from td-term --command, which runs the\n\
+         # payload's own --version to exit status 0. td-term reports its\n\
+         # child's status on one line of its own, matched whole wherever it\n\
+         # lies in the capture, since td-term's ready diagnostic has followed\n\
+         # it there; td-jail's status is 0 or 1, so a failed terminal\n\
+         # acquisition, broker registration, jail or payload is a failed\n\
+         # launch. Firefox's process token and bus identity are read before\n\
+         # and after, so the launches ran beside the same live instance. A\n\
+         # failed launch's captured output goes to a file, never the console,\n\
+         # and trusted unit code prints only fixed lines, the marker among\n\
+         # them, before publishing the atomic completion the greeter waits\n\
+         # for.\n\
+         [claude-evidence]\n\
+         type=daemon\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-as {ui_user} -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-as {ui_user} -- /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
+         after=firefox-soak\n\
+         restart=never\n\
+         \n\
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
@@ -1827,6 +1891,14 @@ fn build_td_svc_conf() -> String {
         firefox_seccomp_audit_wait = FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS,
         seccomp_probe = FIREFOX_SECCOMP_PROBE_PATH,
         bus_socket = SESSION_BUS_SOCKET,
+        claude_name = CLAUDE_NAME,
+        claude_pre_run_wait = CLAUDE_PRE_RUN_WAIT_ITERATIONS,
+        claude_error_path = CLAUDE_ERROR_PATH,
+        claude_refused_line = CLAUDE_REFUSED_LINE,
+        claude_marker = TD_CLAUDE_TERMINAL_MARKER,
+        claude_completion = CLAUDE_COMPLETION,
+        claude_completion_path = CLAUDE_COMPLETION_PATH,
+        claude_completion_tmp_path = CLAUDE_COMPLETION_TMP_PATH,
     )
 }
 
@@ -3129,11 +3201,13 @@ fn build_profile(sys: &SystemDef) -> String {
          status=$(/bin/td-util cat /run/td-boot-success-ok 2>/dev/null); \
          firefox=$(/bin/td-util cat {firefox_evidence_path} 2>/dev/null); \
          firefox_complete=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); \
+         claude_complete=$(/bin/td-util cat {claude_completion_path} 2>/dev/null); \
          input_ok=1; if [ \"$input_required\" = 1 ]; then input_ok=0; \
          input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); \
          [ \"$input\" = {firefox_input_completion} ] && input_ok=1; fi; \
          [ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {firefox_evidence} ] && \
-         [ \"$firefox_complete\" = {firefox_completion} ] && [ \"$input_ok\" = 1 ] && break; \
+         [ \"$firefox_complete\" = {firefox_completion} ] && [ \"$input_ok\" = 1 ] && \
+         [ \"$claude_complete\" = {claude_completion} ] && break; \
          if [ \"$status\" = td-boot-success-v1 ]; then \
          firefox_wait=$((firefox_wait+1)); \
          [ \"$firefox_wait\" -ge {firefox_greeter_wait} ] && break; fi; \
@@ -3147,7 +3221,9 @@ fn build_profile(sys: &SystemDef) -> String {
         firefox_input_cmdline_token = FIREFOX_INPUT_CMDLINE_TOKEN,
         firefox_input_completion = FIREFOX_INPUT_COMPLETION,
         firefox_input_completion_path = FIREFOX_INPUT_COMPLETION_PATH,
-        firefox_greeter_wait = FIREFOX_GREETER_WAIT_ITERATIONS,
+        firefox_greeter_wait = APPLICATION_GREETER_WAIT_ITERATIONS,
+        claude_completion = CLAUDE_COMPLETION,
+        claude_completion_path = CLAUDE_COMPLETION_PATH,
     ));
     s
 }
@@ -5268,6 +5344,7 @@ mod tests {
             Step::WriteFile { path, content, exec: false }
                 if path == "{root}/real-root/etc/td-profiler-application-roots.tsv"
                     && content == "td-profiler-application-roots-v1\n\
+claude\tclaude-2.1.260\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
 firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
 mail\tmail-0.1\tsource\tempty-runtime-1\tsource\n\
 news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
@@ -5744,11 +5821,16 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 + FIREFOX_INPUT_POLL_SLEEP_SECS
         );
         assert_eq!(
-            FIREFOX_GREETER_WAIT_ITERATIONS,
+            FIREFOX_ORACLES_WAIT_ITERATIONS,
             FIREFOX_INPUT_PRE_SOAK_WAIT_ITERATIONS
                 + FIREFOX_SOAK_TIMEOUT_SECS
                 + FIREFOX_SOAK_BRACKET_MARGIN_SECS
                 + FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS
+        );
+        assert_eq!(CLAUDE_PRE_RUN_WAIT_ITERATIONS, FIREFOX_ORACLES_WAIT_ITERATIONS);
+        assert_eq!(
+            APPLICATION_GREETER_WAIT_ITERATIONS,
+            CLAUDE_PRE_RUN_WAIT_ITERATIONS + CLAUDE_EVIDENCE_BUDGET_SECS
         );
         assert_eq!(
             FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
@@ -5757,7 +5839,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 + FIREFOX_NETWORK_TIMEOUT_SECS
         );
         assert!(
-            u64::from(FIREFOX_GREETER_WAIT_ITERATIONS)
+            u64::from(APPLICATION_GREETER_WAIT_ITERATIONS)
                 <= crate::ladder::DEFAULT_BOOT_TIMEOUT_SECS
                     .saturating_sub(crate::ladder::QEMU_GUEST_WAIT_MARGIN_SECS)
                     .saturating_sub(u64::from(BOOT_SUCCESS_ITERATION_BUDGET_SECS)),
@@ -6675,6 +6757,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("firefox-evidence", vec!["firefox", "netup"]),
             ("firefox-input", vec!["firefox-evidence"]),
             ("firefox-soak", vec!["firefox-input"]),
+            ("claude-evidence", vec!["firefox-soak"]),
             (
                 "bootsuccess",
                 sysinit
@@ -6712,10 +6795,11 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     /// host pid, and the descriptor budget is charged per admission key. What
     /// remains is that no boot oracle drives two applications' traffic on one
     /// live bus: the entry that lifts this count brings that oracle. The
-    /// terminal applications ship with no bus policy at all: a static td-owned
-    /// program with no D-Bus client, which the broker would admit as a peer
-    /// that sees and addresses only the portal and itself, and the two
-    /// surfaces it could once reach are now the closed gaps §D names.
+    /// terminal applications ship with no bus policy at all: mail and news are
+    /// static td-owned programs, Claude is a foreign payload, none with a
+    /// D-Bus client, which the broker would admit as a peer that sees and
+    /// addresses only the portal and itself, and the two surfaces it could
+    /// once reach are now the closed gaps §D names.
     ///
     /// Which is NOT what this counts, and the gap is stated here rather than
     /// left for a reader to assume away. A package count does not bound peers:
@@ -6747,8 +6831,12 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
              drives yet: the entry that lifts this count brings the oracle. \
              See APPLICATIONS.md §D for the limits of this tripwire"
         );
-        // Every other shipped application is the shape §D admits beside it: a
-        // static terminal program on the empty runtime with no bus name.
+        // Every other shipped application holds no bus name and is a terminal
+        // application the broker would admit as a peer that sees and addresses
+        // only the portal and itself. mail and news are td-owned source builds
+        // on the empty runtime; Claude is the reviewed foreign payload on
+        // Firefox's runtime, the first foreign-payload terminal application, so
+        // the runtime is one of those two rather than empty-runtime alone.
         for application in SHIPPED_APPLICATIONS
             .iter()
             .filter(|application| application.name != FIREFOX_NAME)
@@ -6760,8 +6848,132 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 .expect("a shipped application declares its permissions");
             assert_eq!(permissions.session_bus().count(), 0, "{}", application.name);
             assert!(permissions.terminal(), "{} is a terminal application", application.name);
-            assert_eq!(application.runtime, "empty-runtime", "{}", application.name);
+            let foreign_terminal = application.name == CLAUDE_NAME
+                && application.runtime == "freedesktop-platform-25-08";
+            assert!(
+                application.runtime == "empty-runtime" || foreign_terminal,
+                "{} is neither a source-built empty-runtime terminal app nor the \
+                 reviewed foreign-payload terminal app Claude",
+                application.name
+            );
         }
+    }
+
+    /// Every shipped application has a boot oracle unit of its own, named
+    /// `<name>-evidence`, and the roster's length is pinned so that adding an
+    /// entry is a reviewed change here rather than a silent one.
+    #[test]
+    fn every_shipped_application_has_a_boot_oracle_unit() {
+        assert_eq!(
+            SHIPPED_APPLICATIONS.len(),
+            4,
+            "the roster changed: another application brings its own boot \
+             oracle unit, named below, and APPLICATIONS.md §D says what a \
+             package count cannot cover"
+        );
+        for application in SHIPPED_APPLICATIONS {
+            let unit = format!("{}-evidence", application.name);
+            assert!(
+                TD_SVC_UNITS.contains(&unit.as_str()),
+                "{} ships without a boot oracle unit {unit}",
+                application.name
+            );
+            // The unit is a real td-svc entry that runs once per boot: the
+            // source-built mail/news oracles are oneshots that require their
+            // app, the foreign firefox/claude oracles are daemons that never
+            // restart. Either way it is a defined unit, not just a name.
+            assert!(
+                matches!(unit_key(&unit, "type").as_deref(), Some("oneshot") | Some("daemon")),
+                "{unit} is not a defined oracle unit"
+            );
+        }
+    }
+
+    /// Claude Code's boot oracle: gated on the autotest token,
+    /// run after every Firefox oracle has published, a launch with no
+    /// terminal refused by the grant's stdio test before a launch inside
+    /// td-term's is proved by the child's status, both bracketed by
+    /// Firefox's process token and bus identity, the payload's captured
+    /// bytes kept off the console, and the marker and completion only after
+    /// all of it, in that order.
+    #[test]
+    fn claude_evidence_refuses_without_a_terminal_and_runs_inside_one() {
+        let exec = unit_key("claude-evidence", "exec").unwrap_or_default();
+        assert_eq!(unit_after("claude-evidence"), vec!["firefox-soak"]);
+        assert!(unit_key("claude-evidence", "requires").is_none());
+        assert!(unit_key("claude-evidence", "timeout").is_none());
+        for needle in [
+            format!("*\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac"),
+            format!("while [ \"$n\" -lt {CLAUDE_PRE_RUN_WAIT_ITERATIONS} ]"),
+            format!("firefox=$(/bin/td-util cat {FIREFOX_COMPLETION_PATH} 2>/dev/null)"),
+            format!("if [ \"$firefox\" = {FIREFOX_COMPLETION} ]; then"),
+            format!(
+                "*\" {FIREFOX_INPUT_CMDLINE_TOKEN} \"*) input=$(/bin/td-util cat \
+                 {FIREFOX_INPUT_COMPLETION_PATH} 2>/dev/null); [ \"$input\" = \
+                 {FIREFOX_INPUT_COMPLETION} ] && break;; *) break;; esac"
+            ),
+            format!("[ \"$n\" -lt {CLAUDE_PRE_RUN_WAIT_ITERATIONS} ] || exit 1"),
+            format!("/bin/rm -f {CLAUDE_ERROR_PATH} {CLAUDE_COMPLETION_TMP_PATH} || exit 1"),
+            format!(
+                "process_before=$(/bin/td-login exec-as tester -- /bin/td-jail \
+                 --probe-process-token {FIREFOX_NAME} --marionette) || exit 1"
+            ),
+            format!(
+                "bus_before=$(/bin/td-login exec-as tester -- /bin/td-busd application \
+                 {SESSION_BUS_SOCKET} {FIREFOX_NAME}) || exit 1"
+            ),
+            format!(
+                "if refused=$(/bin/td-login exec-as tester -- /bin/env TERM=td-term \
+                 /bin/{CLAUDE_NAME} --version 2>&1 </dev/null); then /bin/echo \
+                 \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi"
+            ),
+            format!(
+                "if [ \"$refused\" = \"{CLAUDE_REFUSED_LINE}\" ]; then :; else /bin/td-util \
+                 printf \"%s\\n\" \"$refused\" > {CLAUDE_ERROR_PATH};"
+            ),
+            format!(
+                "ran=$(/bin/td-login exec-as tester -- /bin/td-term run --socket \
+                 /run/user/1000/wayland-0 --ready-socket /run/user/1000/td-claude-evidence-ready \
+                 --command /bin/{CLAUDE_NAME} --version 2>&1 </dev/null)"
+            ),
+            format!(
+                "if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \
+                 \"td-term: the terminal.s child exited with status 0\"; then :; else \
+                 /bin/td-util printf \"%s\\n\" \"$ran\" > {CLAUDE_ERROR_PATH};"
+            ),
+            "[ \"$process_after\" = \"$process_before\" ] || exit 1".to_string(),
+            "[ \"$bus_after\" = \"$bus_before\" ] || exit 1".to_string(),
+            format!("/bin/echo \"{TD_CLAUDE_TERMINAL_MARKER}\""),
+            format!("{CLAUDE_COMPLETION} > {CLAUDE_COMPLETION_TMP_PATH}"),
+            format!("/bin/mv {CLAUDE_COMPLETION_TMP_PATH} {CLAUDE_COMPLETION_PATH} && exit 0"),
+        ] {
+            assert!(exec.contains(needle.as_str()), "claude-evidence lacks {needle:?}");
+        }
+        // The payload's captured bytes never reach the console: each capture
+        // is read once by the check and once by the write to the file.
+        assert!(!exec.contains("\"$refused\" >&2") && !exec.contains("\"$ran\" >&2"));
+        assert_eq!(exec.matches("\"$refused\"").count(), 2);
+        assert_eq!(exec.matches("\"$ran\"").count(), 2);
+        let before = exec.find("process_before=$(").unwrap();
+        let refused = exec.find("if refused=").unwrap();
+        let ran = exec.find("ran=$(").unwrap();
+        let after = exec.find("process_after=$(").unwrap();
+        let marker = exec.find(TD_CLAUDE_TERMINAL_MARKER).unwrap();
+        let published = exec.find(CLAUDE_COMPLETION).unwrap();
+        assert!(before < refused && refused < ran && ran < after);
+        assert!(after < marker && marker < published);
+        assert_eq!(exec.matches("--command").count(), 1);
+        assert_eq!(exec.matches("--version").count(), 2);
+        assert_eq!(exec.matches("--probe-process-token").count(), 2);
+        assert_eq!(exec.matches("/bin/td-busd application").count(), 2);
+        // Nothing but this unit publishes the completion, and the greeter
+        // waits for it beside Firefox's.
+        let services = build_td_svc_conf();
+        assert_eq!(services.matches(CLAUDE_COMPLETION_TMP_PATH).count(), 4);
+        let profile = build_profile(&SYSTEM);
+        assert!(profile.contains(&format!(
+            "claude_complete=$(/bin/td-util cat {CLAUDE_COMPLETION_PATH} 2>/dev/null)"
+        )));
     }
 
     /// The session bus is a unit, runs as the UI user, and binds where the seat
@@ -7115,6 +7327,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
             "{in:codex}".to_string(),
+            format!("{{payload:{CLAUDE_NAME}}}"),
             "{payload:empty-runtime}".to_string(),
             format!("{{payload:{FIREFOX_NAME}}}"),
             "{payload:freedesktop-platform-25-08}".to_string(),
@@ -7803,40 +8016,36 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                     && link == "{root}/real-root/bin/fixture"
         )));
 
-        assert_eq!(SYSTEM.applications.len(), 3);
-        let shipped = SYSTEM
-            .applications
-            .first()
-            .expect("the first shipped application");
-        assert_eq!(
-            (shipped.name, shipped.package, shipped.runtime),
-            (FIREFOX_NAME, FIREFOX_NAME, "freedesktop-platform-25-08"),
-            "the system image must pair the reviewed Firefox package and runtime"
-        );
-        let terminal: Vec<(&str, &str, &str)> = SYSTEM
+        assert_eq!(SYSTEM.applications.len(), 4);
+        let shipped: Vec<_> = SYSTEM
             .applications
             .iter()
-            .skip(1)
             .map(|application| (application.name, application.package, application.runtime))
             .collect();
         assert_eq!(
-            terminal,
+            shipped,
             vec![
+                (FIREFOX_NAME, FIREFOX_NAME, "freedesktop-platform-25-08"),
                 (TD_MAIL_NAME, TD_MAIL_NAME, "empty-runtime"),
                 (TD_NEWS_NAME, TD_NEWS_NAME, "empty-runtime"),
+                (CLAUDE_NAME, CLAUDE_NAME, "freedesktop-platform-25-08"),
             ],
-            "the terminal applications are their own packages on the empty runtime"
+            "the system image pairs each reviewed package with its runtime: \
+             Firefox, the terminal apps mail and news, then the Claude payload"
         );
         let system_recipe = recipe();
         assert_eq!(
             system_recipe.payload_inputs,
             Some(vec![
+                CLAUDE_NAME.into(),
                 "empty-runtime".into(),
                 FIREFOX_NAME.into(),
                 "freedesktop-platform-25-08".into(),
                 TD_MAIL_NAME.into(),
                 TD_NEWS_NAME.into(),
-            ])
+            ]),
+            "each reviewed package and each runtime is one payload input, deduped \
+             and sorted; the two freedesktop apps share one runtime input"
         );
     }
 
@@ -9819,7 +10028,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                     "[ \"$input\" = {FIREFOX_INPUT_COMPLETION} ] && input_ok=1"
                 ))
                 && profile.contains(&format!(
-                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {FIREFOX_EVIDENCE} ] && [ \"$firefox_complete\" = {FIREFOX_COMPLETION} ] && [ \"$input_ok\" = 1 ] && break"
+                    "[ \"$status\" = td-boot-success-v1 ] && [ \"$firefox\" = {FIREFOX_EVIDENCE} ] && [ \"$firefox_complete\" = {FIREFOX_COMPLETION} ] && [ \"$input_ok\" = 1 ] && [ \"$claude_complete\" = {CLAUDE_COMPLETION} ] && break"
                 )),
             "Firefox evidence must be exact without controlling deployment health"
         );
@@ -10156,7 +10365,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 && profile.contains("set -f; wait=0")
                 && profile.contains("firefox_wait=0")
                 && profile.contains(&format!(
-                    "[ \"$firefox_wait\" -ge {FIREFOX_GREETER_WAIT_ITERATIONS} ] && break"
+                    "[ \"$firefox_wait\" -ge {APPLICATION_GREETER_WAIT_ITERATIONS} ] && break"
                 ))
                 && profile.contains("exit"),
             "profile must exit on the autotest cmdline token so the headless boot powers off"

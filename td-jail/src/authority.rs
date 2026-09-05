@@ -86,7 +86,10 @@ const TERMINAL_ENVIRONMENT_BYTES: usize = "TERM".len()
 const MAX_ENTRY_BYTES: usize = 4096;
 const MAX_APPLICATION_ARGUMENTS: usize = 256;
 const MAX_APPLICATION_ARGUMENT_BYTES: usize = 64 * 1024;
-const FIREFOX_RUNTIME: &str = "freedesktop-platform-25-08";
+/// The reviewed dynamic platform, whose `/usr` carries the loader every
+/// entry on it needs; `dynamic_runtime` admits it and its versioned
+/// successors.
+const DYNAMIC_RUNTIME: &str = "freedesktop-platform-25-08";
 const FIREFOX_LIBRARY_PATH: &str = "/app/lib:/app/lib/firefox";
 const FIREFOX_NAME: &str = "firefox";
 const PROC_CMDLINE_PATH: &str = "/proc/cmdline";
@@ -160,6 +163,11 @@ pub(crate) struct LaunchPlan {
     pub(crate) entry: String,
     pub(crate) environment: Vec<(OsString, OsString)>,
     pub(crate) loader_library_path: Option<String>,
+    /// The runtime supplies the entry's loader, so stage 1 links `/bin`,
+    /// `/lib`, `/lib64` and `/sbin` into `/usr` and stage 2 proves them,
+    /// whether or not the package carries a library path of its own; a
+    /// static empty-runtime application gets no aliases.
+    pub(crate) runtime_aliases: bool,
     pub(crate) arguments: Vec<OsString>,
     /// `devices=tty`: stage 1 acquires the launcher's fresh terminal as the
     /// session's controlling terminal and stage 2 hands it to the entry.
@@ -589,13 +597,14 @@ where
     // in the component with no policy language and take it away from the one
     // that will have it.
     //
-    // The broker now has some of it: a per-caller filter keyed on the instance
-    // this jail registers, authenticated reply ownership, and well-known names
-    // whose grant comes from the list below. It does NOT yet have match rules,
-    // and its admission quota is still keyed on a pid a jailed caller can fork
-    // past. What bounds the remainder is the image shipping ONE application —
-    // asserted in the system recipe, not promised here. APPLICATIONS.md §D
-    // carries what has to land before a second one does.
+    // The broker has it: a per-caller filter keyed on the instance this jail
+    // registers, authenticated reply ownership, well-known names whose grant
+    // comes from the list below, match rules, admission keyed on the
+    // registered instance, no host pid for a jailed caller, and a descriptor
+    // budget charged per admission key. Applications ship beside Firefox —
+    // the terminal mail, news and Claude (APPLICATIONS.md rungs 31-33); what
+    // no oracle yet drives is a message routed between two applications'
+    // peers, and §D says so.
     let state = prepare_state(
         name,
         outside_identity,
@@ -675,6 +684,7 @@ where
         entry: spec.entry,
         environment,
         loader_library_path: spec.loader_library_path,
+        runtime_aliases: spec.runtime_aliases,
         arguments,
         terminal,
         terminfo,
@@ -1088,6 +1098,7 @@ struct ParsedSpec {
     entry: String,
     environment: BTreeMap<String, String>,
     loader_library_path: Option<String>,
+    runtime_aliases: bool,
     permissions: PermissionPolicy,
 }
 
@@ -1169,6 +1180,7 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
         )));
     }
     ResolvedResourceLimits::from_policy(permissions.resources())?;
+    let runtime_aliases = dynamic_runtime(&runtime)?;
     let loader_library_path = reviewed_loader_library_path(&name, &runtime)?.map(str::to_string);
     if environment.get("LD_LIBRARY_PATH").map(String::as_str)
         != loader_library_path.as_deref()
@@ -1183,11 +1195,14 @@ fn parse_spec(text: &str) -> io::Result<ParsedSpec> {
         entry,
         environment,
         loader_library_path,
+        runtime_aliases,
         permissions,
     })
 }
 
-fn reviewed_loader_library_path(name: &str, runtime: &str) -> io::Result<Option<&'static str>> {
+/// The runtime's canonical store output name, from the `/td/store` path the
+/// spec names.
+fn runtime_output_name(runtime: &str) -> io::Result<&str> {
     const STORE_HASH_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
     let basename = runtime
@@ -1204,15 +1219,27 @@ fn reviewed_loader_library_path(name: &str, runtime: &str) -> io::Result<Option<
     {
         return Err(invalid("application runtime has a malformed store basename"));
     }
-    let output = basename
+    basename
         .get(33..)
         .filter(|name| !name.is_empty() && !name.contains('/') && !matches!(*name, "." | ".."))
-        .ok_or_else(|| invalid("application runtime has no canonical store output name"))?;
-    let firefox_runtime = output == FIREFOX_RUNTIME
+        .ok_or_else(|| invalid("application runtime has no canonical store output name"))
+}
+
+/// Whether the runtime supplies the entry's loader: the reviewed dynamic
+/// platform, at its exact name or a versioned successor. Every entry on it
+/// finds its interpreter through the `/lib64` alias into `/usr`, whether or
+/// not the package carries a library path of its own, and a static
+/// empty-runtime application has no loader to alias.
+fn dynamic_runtime(runtime: &str) -> io::Result<bool> {
+    let output = runtime_output_name(runtime)?;
+    Ok(output == DYNAMIC_RUNTIME
         || output
-            .strip_prefix(FIREFOX_RUNTIME)
-            .is_some_and(|suffix| suffix.starts_with('-'));
-    Ok(match (name, firefox_runtime) {
+            .strip_prefix(DYNAMIC_RUNTIME)
+            .is_some_and(|suffix| suffix.starts_with('-')))
+}
+
+fn reviewed_loader_library_path(name: &str, runtime: &str) -> io::Result<Option<&'static str>> {
+    Ok(match (name, dynamic_runtime(runtime)?) {
         ("firefox", true) => Some(FIREFOX_LIBRARY_PATH),
         _ => None,
     })
@@ -4046,6 +4073,8 @@ mod tests {
         assert_eq!(spec.name, "fixture");
         assert_eq!(spec.entry, "/app/bin/fixture");
         assert_eq!(spec.environment.len(), 4);
+        // A static empty runtime has no loader to alias.
+        assert!(!spec.runtime_aliases);
 
         let shared_network = text.replace(
             "sockets=wayland\n",
@@ -4164,6 +4193,7 @@ mod tests {
             spec.loader_library_path.as_deref(),
             Some(FIREFOX_LIBRARY_PATH)
         );
+        assert!(spec.runtime_aliases);
         for altered in [
             text.replace("LD_LIBRARY_PATH=/app/lib:/app/lib/firefox\n", ""),
             text.replace(FIREFOX_LIBRARY_PATH, "/app/lib"),
@@ -4184,6 +4214,28 @@ mod tests {
         assert!(validate_stage2_loader_library_path(Some("/app/lib")).is_err());
     }
 
+    /// The aliases follow the runtime, not the package library path: the
+    /// dynamic platform's loader is what every entry on it needs, and an
+    /// empty runtime has none to alias. Claude Code's boot oracle found
+    /// stage 2 keying them on Firefox's library path instead.
+    #[test]
+    fn runtime_aliases_follow_the_runtime() {
+        const DIGEST: &str = "0123456789abcdfghijklmnpqrsvwxyz";
+        for (runtime, expected) in [
+            ("freedesktop-platform-25-08", true),
+            ("freedesktop-platform-25-08-25.08", true),
+            ("freedesktop-platform-25-089", false),
+            ("empty-runtime-1", false),
+        ] {
+            assert_eq!(
+                dynamic_runtime(&format!("/td/store/{DIGEST}-{runtime}")).unwrap(),
+                expected,
+                "{runtime}"
+            );
+        }
+        assert!(dynamic_runtime("/usr/lib/runtime").is_err());
+    }
+
     /// An application with no reviewed loader path is held to carrying NONE:
     /// the compiler omits the variable for such a policy, and an empty
     /// `LD_LIBRARY_PATH=` is refused here exactly as a borrowed one is.
@@ -4192,6 +4244,7 @@ mod tests {
         let text = "format=1\nname=claude\nruntime=/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08-25.08\nentry=/app/bin/claude\n\n[Environment]\nDISABLE_UPDATES=1\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nshared=network\nsockets=wayland\n\n[Filesystem]\n~/src=rw:create\n";
         let spec = parse_spec(text).unwrap();
         assert_eq!(spec.loader_library_path, None);
+        assert!(spec.runtime_aliases, "a dynamic runtime aliases its loader");
         for altered in [
             text.replace("DISABLE_UPDATES=1\n", "DISABLE_UPDATES=1\nLD_LIBRARY_PATH=\n"),
             text.replace(

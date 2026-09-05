@@ -6592,11 +6592,11 @@ mod tests {
         assert_eq!(payload_closure_of(&good, |_| false).unwrap().members, 1);
     }
 
-    /// The shipped deployment's exact containment answer. The imported package
-    /// and runtime must be listed as foreign recipes and source pins while the
-    /// image that stages them remains unmarked.
+    /// The shipped deployment's exact containment answer. The two imported
+    /// packages and their shared runtime must be listed as foreign recipes and
+    /// source pins while the image that stages them remains unmarked.
     #[test]
-    fn the_shipped_deployment_reports_only_its_two_foreign_payloads() {
+    fn the_shipped_deployment_reports_only_its_three_foreign_payloads() {
         let answer = payload_closure(&[PAYLOAD_CLOSURE_DEFAULT]).unwrap();
         // Both counts tied to the WALK rather than to a floor: `> 50` is
         // satisfied by the whole catalog as easily as by the deployment's
@@ -6606,10 +6606,11 @@ mod tests {
         assert_eq!(answer.members, nodes.len());
         assert_eq!(answer.seeds, classify_graph_inputs(&nodes).unwrap().len());
         assert!(answer.seeds > 20, "{} seeds", answer.seeds);
-        assert_eq!(answer.unmarked(), answer.members - 2);
+        assert_eq!(answer.unmarked(), answer.members - 3);
         assert_eq!(
             answer.foreign_members,
             [
+                "claude".to_string(),
                 "firefox".to_string(),
                 "freedesktop-platform-25-08".to_string(),
             ]
@@ -6617,6 +6618,7 @@ mod tests {
         assert_eq!(
             answer.pins,
             [
+                "claude-code-source".to_string(),
                 "firefox-154-source".to_string(),
                 "freedesktop-platform-25-08-source".to_string(),
             ]

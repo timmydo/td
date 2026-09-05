@@ -16,14 +16,16 @@ const MEMORY_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PIDS_MAX: u32 = 2048;
 
 /// The exact upstream Claude Code native release, admitted as a marked payload
-/// and placed at its entry name without being executed. The vendor publishes
-/// each version as one glibc-dynamic ELF beside a manifest of SHA-256 sums, so
-/// the pin is checkable against upstream's own hash. This increment packages
-/// the seed only: it requests no terminal and is not yet selected into the
-/// image, and its updater is disabled because nothing in the private home may
-/// execute (APPLICATIONS.md §C). Later increments add the terminal grant, the
-/// caller's working directory, image selection, and the executable state
-/// subtree that lets the application update itself.
+/// and placed at its entry name without being executed by the build. The
+/// vendor publishes each version as one glibc-dynamic ELF beside a manifest
+/// of SHA-256 sums, so the pin is checkable against upstream's own hash. A
+/// terminal program: the policy carries the fresh-terminal grant, so a launch
+/// has a pseudo-terminal of its own from `td-term --command` or is refused
+/// before anything runs (APPLICATIONS.md §C), and the system image's
+/// `claude-evidence` unit proves both halves at boot. Its updater is disabled
+/// because nothing in the private home may execute. Later increments add the
+/// caller's working directory, a launcher card that opens it, and the
+/// executable state subtree that lets the application update itself.
 pub fn recipe() -> Recipe {
     let Some(dynamic_policy) = dynamic_application_policy("claude", RUNTIME) else {
         return invalid_recipe("dynamic-policy");
@@ -50,6 +52,10 @@ pub fn recipe() -> Recipe {
         // terminal program opens no window, and the read-only socket bind
         // grants nothing it will use.
         .and_then(|value| value.with_socket(PermissionSocket::Wayland))
+        // The fresh-terminal grant: stage 1 acquires the pseudo-terminal on
+        // its own stdio and the entry gets three clones of it, or the launch
+        // is refused with a diagnostic naming td-term's --command.
+        .and_then(|value| value.with_terminal())
         .and_then(|value| value.with_filesystem("~/src", FilesystemAccess::ReadWrite, true))
         .and_then(|value| value.with_memory_high(MEMORY_HIGH_BYTES))
         .and_then(|value| value.with_memory_max(MEMORY_MAX_BYTES))
@@ -148,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seed_requests_a_project_tree_and_no_bus_or_update_path() {
+    fn the_application_requests_a_terminal_and_a_project_tree_and_no_bus() {
         let recipe = recipe();
         let launcher = recipe.application_launcher.as_ref().expect("launcher");
         assert_eq!(launcher.display_name(), "Claude Code");
@@ -158,7 +164,7 @@ mod tests {
             .to_keyfile();
         assert_eq!(
             policy,
-            "format=1\n\n[Context]\nshared=network\nsockets=wayland\n\n[Filesystem]\n~/src=rw:create\n\n[Resources]\nmemory-high=3221225472\nmemory-max=4294967296\npids-max=2048\n"
+            "format=1\n\n[Context]\nshared=network\nsockets=wayland\ndevices=tty\n\n[Filesystem]\n~/src=rw:create\n\n[Resources]\nmemory-high=3221225472\nmemory-max=4294967296\npids-max=2048\n"
         );
     }
 }

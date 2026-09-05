@@ -730,8 +730,12 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// The continuity soak adds its bounded 360-second Marionette session and a
 /// 30-second allowance for the four identity probes and local process reads
 /// which bracket it. The dedicated seccomp-audit variant adds its bounded
-/// 30-second end-barrier drain after that same soak.
-pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2794;
+/// 30-second end-barrier drain after that same soak. Claude Code's terminal
+/// oracle adds the greeter's 180-second allowance for its two launches and
+/// four identity probes after every Firefox oracle has published; the
+/// launches carry no deadline of their own, so a hung payload reds the boot
+/// at the greeter's cap rather than sooner.
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2974;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
 
 /// The source release identities and exact `--version` output shared by the
@@ -1198,6 +1202,15 @@ pub const TD_FIREFOX_SOAK_MARKER: &str = "TD-FIREFOX-SOAK-OK minimum-seconds=300
 /// outer-filter denial in the interval arrived and matches the compiled roster.
 pub const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str =
     "TD-FIREFOX-SECCOMP-OK probes=17";
+/// Emitted by the trusted Claude Code evidence unit after Claude Code, a
+/// foreign-payload terminal program, was refused a launch with no terminal of
+/// its own and then ran `--version` to exit status 0 inside a fresh
+/// pseudo-terminal from `td-term --command` under the compositor, with
+/// Firefox's instance live on the same broker: a foreign payload acquiring a
+/// fresh terminal through td-jail and registering on the live bus beside
+/// Firefox, since either failing is a nonzero status.
+pub const TD_CLAUDE_TERMINAL_MARKER: &str =
+    "TD-CLAUDE-TERMINAL-OK without-terminal=refused child-status=0";
 pub const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = "TD-TERM-CLIPBOARD-FOCUS-READY serial=";
 pub const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = "TD-TERM-CLIPBOARD-TARGET-READY ";
 pub const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str = "TD-TERM-CLIPBOARD-SELECTION-READY bytes=7";

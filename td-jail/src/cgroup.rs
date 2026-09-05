@@ -128,15 +128,27 @@ impl Instance {
         })
     }
 
-    pub(crate) fn report_and_release(mut self) -> io::Result<Report> {
-        let report = report(&self.directory);
+    pub(crate) fn report_and_release(mut self) -> io::Result<Option<Report>> {
+        // A short-lived application can exit and be reaped, and its leaf
+        // removed by the independent cleanup, before this read runs. The
+        // report is observability, discarded when the launch succeeded and
+        // only enriching the error when it failed, so a leaf already gone is
+        // not itself a failure -- `None`, the same answer the rest of this
+        // module gives a leaf that vanished mid-read. A live probe reads the
+        // leaf directly and still requires it; this is the post-exit path.
+        let report = match report(&self.directory) {
+            Ok(report) => Some(report),
+            Err(error) if reads_as_gone(&error) => None,
+            Err(error) => {
+                self.remove_on_drop = false;
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("read application cgroup diagnostics: {error}"),
+                ));
+            }
+        };
         self.remove_on_drop = false;
-        report.map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("read application cgroup diagnostics: {error}"),
-            )
-        })
+        Ok(report)
     }
 
     fn remove(&mut self) -> io::Result<()> {
@@ -1093,6 +1105,41 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn the_post_exit_report_tolerates_a_leaf_already_reaped() {
+        let base = std::env::temp_dir().join(format!(
+            "td-jail-cgroup-report-{}",
+            std::process::id()
+        ));
+        let present = base.join("present");
+        fs::create_dir_all(&present).unwrap();
+        fs::write(
+            present.join("memory.events"),
+            "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        )
+        .unwrap();
+        fs::write(present.join("memory.peak"), "4096\n").unwrap();
+        fs::write(
+            present.join("cpu.stat"),
+            "usage_usec 1\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n",
+        )
+        .unwrap();
+        let live = Instance {
+            directory: present.clone(),
+            membership: "/td-user-1000/present".to_string(),
+            remove_on_drop: false,
+        };
+        assert!(live.report_and_release().unwrap().is_some());
+        // A leaf the cleanup already removed: gone, not a hard error.
+        let gone = Instance {
+            directory: base.join("gone"),
+            membership: "/td-user-1000/gone".to_string(),
+            remove_on_drop: false,
+        };
+        assert!(gone.report_and_release().unwrap().is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn a_task_reaped_mid_read_is_gone_rather_than_unreadable() {

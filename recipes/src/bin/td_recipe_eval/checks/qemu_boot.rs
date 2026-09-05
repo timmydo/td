@@ -193,6 +193,7 @@ const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_M
 const TD_FIREFOX_INPUT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MARKER;
 const TD_FIREFOX_SOAK_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SOAK_MARKER;
 const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SECCOMP_AUDIT_MARKER;
+const TD_CLAUDE_TERMINAL_MARKER: &str = td_recipe::ladder::TD_CLAUDE_TERMINAL_MARKER;
 const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
 const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_TARGET_PREFIX;
 const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str =
@@ -371,10 +372,11 @@ const FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS: usize = 7;
 const FIREFOX_AUDIO_MAX_TRANSIENT_RUNS: usize = 2;
 const FIREFOX_AUDIO_CAPTURE_MARGIN_SECS: u64 = 2;
 /// At 48 kHz stereo S16, the physical-input boot's host timeout remains below
-/// the 512 MiB absolute capture ceiling. QEMU records leading/trailing silence
-/// too, so the disk ceiling covers that whole bound while verification streams
-/// it.
-const MAX_AUDIO_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
+/// the 640 MiB absolute capture ceiling: Claude Code's terminal oracle took
+/// the timeout past the 512 MiB one, and the unit test below pins
+/// that the default timeout fits. QEMU records leading/trailing silence too,
+/// so the disk ceiling covers that whole bound while verification streams it.
+const MAX_AUDIO_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
 const QMP_OUTPUT_HEIGHT: u32 = 800;
 const PORTAL_CLIENT_X: usize = 160;
 const PORTAL_CLIENT_Y: usize = 141;
@@ -499,6 +501,7 @@ struct ConsoleEvidence {
     td_firefox_input: bool,
     td_firefox_soak: bool,
     td_firefox_seccomp_audit: bool,
+    td_claude_terminal: bool,
     td_term_clipboard_focus: Option<u32>,
     td_term_clipboard_target: Option<TerminalClipboardTarget>,
     td_term_clipboard_selection: bool,
@@ -774,6 +777,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         SelectionExpectation::Current,
     )?;
     validate_firefox_input(&first, true)?;
+    validate_claude_terminal(&first)?;
     validate_firefox_seccomp_audit(&first, false)?;
     require_selected_deployment(
         &first,
@@ -1449,6 +1453,30 @@ fn validate_failed_target_boot(result: &BootResult, ordinal: &str) -> Result<(),
         ));
     }
     Ok(())
+}
+
+/// Claude Code's boot oracle, the first foreign-payload terminal application.
+/// The trusted `claude-evidence`
+/// unit prints the marker only after a launch with no terminal of its own was
+/// refused by td-jail's fresh-terminal grant, and a launch inside a
+/// pseudo-terminal from `td-term --command` under the compositor then ran
+/// `claude --version` to exit status 0: stage 1 acquiring the terminal,
+/// registering the instance with the live broker beside Firefox's, and the
+/// payload executing from its jail, since any of those failing is a nonzero
+/// status, and the unit matches td-term's own status line whole wherever the
+/// capture holds it.
+fn validate_claude_terminal(result: &BootResult) -> Result<(), String> {
+    if result.evidence.td_claude_terminal {
+        return Ok(());
+    }
+    Err(format!(
+        "Claude Code did not run inside a fresh terminal beside Firefox; missing console \
+         evidence {TD_CLAUDE_TERMINAL_MARKER:?} — the terminal grant refused nothing, or \
+         td-term --command did not give stage 1 a terminal it could acquire, or the \
+         instance registration, the jail, or the payload's own --version failed. Last \
+         serial output:\n{}",
+        tail(&result.console, 80)
+    ))
 }
 
 fn validate_firefox_input(result: &BootResult, expect_audio_capture: bool) -> Result<(), String> {
@@ -4061,6 +4089,15 @@ fn boot(
 
     // -M pc + TCG: no KVM needed (the sandbox denies /dev/kvm and the host may not
     //   expose it either; TCG always works and a tiny kernel boots fast).
+    // -cpu Nehalem: the default `qemu64` model has neither SSE4.2 nor POPCNT, and a
+    //   modern userland binary that assumes the x86-64-v2 baseline dies on the first
+    //   such instruction with SIGILL. Firefox's conservative distro build stays
+    //   inside qemu64; the Claude Code payload does not, and its terminal oracle
+    //   caught this. Nehalem is the lowest stock model that supplies that baseline,
+    //   so it is the smallest change from qemu64 and leaves the finely timed HDA
+    //   audio proof as close to its measured envelope as a CPU change allows. The
+    //   payload's AVX/AVX2/AVX-512 paths stay behind its own CPUID dispatch and are
+    //   not reached under this model.
     // -serial file:<console>: route ttyS0 straight to a file — deterministic, no
     //   tty/stdio games (unlike -nographic, which wants a terminal on stdin).
     // -display none / -monitor none: fully headless. The attached virtio-vga still
@@ -4103,7 +4140,7 @@ fn boot(
     // kill records to reach printk when CONFIG_AUDIT is compiled in.
     let append = kernel_append(plan.extra_append);
     let mut cmd = Command::new(qemu);
-    cmd.args(["-M", "pc", "-accel", "tcg", "-m", plan.mem, "-no-reboot"])
+    cmd.args(["-M", "pc", "-accel", "tcg", "-cpu", "Nehalem", "-m", plan.mem, "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
         .args(["-no-user-config", "-vga", "none"])
         .args(["-device", "virtio-vga"])
@@ -5218,6 +5255,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FIREFOX_FILE_CHOOSER_MARKER),
         exact_line_window(TD_FIREFOX_SOAK_MARKER),
         exact_line_window(TD_FIREFOX_SECCOMP_AUDIT_MARKER),
+        exact_line_window(TD_CLAUDE_TERMINAL_MARKER),
         TD_APPLICATION_CURSOR_PREFIX.len().saturating_add(32),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
@@ -5682,6 +5720,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_firefox_soak,
         buf,
         TD_FIREFOX_SOAK_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_claude_terminal,
+        buf,
+        TD_CLAUDE_TERMINAL_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -8997,7 +9041,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 82] {
+    fn all_console_markers() -> [&'static str; 83] {
         [
             MARKER,
             EROFS_MARKER,
@@ -9073,6 +9117,7 @@ mod tests {
             TD_FIREFOX_FILE_CHOOSER_MARKER,
             TD_FIREFOX_SOAK_MARKER,
             TD_FIREFOX_SECCOMP_AUDIT_MARKER,
+            TD_CLAUDE_TERMINAL_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
@@ -9155,6 +9200,27 @@ mod tests {
             let mut rejected = ConsoleEvidence::default();
             latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");
             assert!(!rejected.td_firefox_soak, "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn claude_terminal_evidence_requires_one_exact_line() {
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_CLAUDE_TERMINAL_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_claude_terminal);
+        for invalid in [
+            format!("noise {TD_CLAUDE_TERMINAL_MARKER}\n"),
+            format!("\n{TD_CLAUDE_TERMINAL_MARKER} trailing\n"),
+            "\nTD-CLAUDE-TERMINAL-OK without-terminal=refused child-status=1\n".to_string(),
+            "\nTD-CLAUDE-TERMINAL-OK child-status=0\n".to_string(),
+        ] {
+            let mut rejected = ConsoleEvidence::default();
+            latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");
+            assert!(!rejected.td_claude_terminal, "accepted {invalid:?}");
         }
     }
 
@@ -10868,8 +10934,9 @@ mod tests {
             firefox_audio_capture_ceiling(Duration::from_secs(DEFAULT_BOOT_TIMEOUT_SECS)).unwrap(),
             maximum_capture
         );
-        let first_unsupported =
-            MAX_AUDIO_CAPTURE_BYTES / bytes_per_second - FIREFOX_AUDIO_CAPTURE_MARGIN_SECS + 1;
+        let first_unsupported = (MAX_AUDIO_CAPTURE_BYTES - 44) / bytes_per_second
+            - FIREFOX_AUDIO_CAPTURE_MARGIN_SECS
+            + 1;
         assert!(
             firefox_audio_capture_ceiling(Duration::from_secs(first_unsupported))
                 .unwrap_err()

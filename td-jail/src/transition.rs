@@ -46,6 +46,7 @@ const STAGE2_FIREFOX_SECCOMP_PROBE_ARG: &str =
     "--firefox-seccomp-probe";
 const STAGE2_FETCH_SOCKET_ARG: &str = "--fetch-socket";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
+const STAGE2_RUNTIME_ALIASES_ARG: &str = "--runtime-aliases";
 const STAGE2_TERMINAL_ARG: &str = "--terminal";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
@@ -373,6 +374,8 @@ pub struct Stage2Launch {
     /// (`sockets=fetch`), and the readback requires it there, its socket
     /// under it.
     fetch_socket: bool,
+    /// The runtime supplies the loader: stage 1 linked the four aliases
+    /// into `/usr` and said so in its own word, and stage 2 proves them.
     runtime_aliases: bool,
     /// Stage 1 acquired the session's controlling terminal and passed it as
     /// this process's stdout; the entry gets it as all three stdio.
@@ -431,6 +434,7 @@ struct Stage2MountBinding<'a> {
     firefox_seccomp_probe: bool,
     fetch_socket: bool,
     loader_library_path: Option<&'a str>,
+    runtime_aliases: bool,
     terminal: bool,
 }
 
@@ -745,6 +749,14 @@ where
             Some("absent") => false,
             _ => return Err(usage_error()),
         };
+        if args.next().as_deref() != Some(STAGE2_RUNTIME_ALIASES_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let runtime_aliases = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("present") => true,
+            Some("absent") => false,
+            _ => return Err(usage_error()),
+        };
         if args.next().as_deref() != Some(STAGE2_LOADER_LIBRARY_PATH_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -759,6 +771,11 @@ where
             _ => return Err(usage_error()),
         };
         authority::validate_stage2_loader_library_path(loader_library_path.as_deref())?;
+        // A package library path is searched by the runtime's loader, which
+        // only the aliases reach.
+        if loader_library_path.is_some() && !runtime_aliases {
+            return Err(usage_error());
+        }
         if args.next().as_deref() != Some(STAGE2_TERMINAL_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -872,7 +889,7 @@ where
             firefox_autotest_policy,
             firefox_seccomp_probe,
             fetch_socket,
-            runtime_aliases: loader_library_path.is_some(),
+            runtime_aliases,
             terminal,
             environment,
             filesystems,
@@ -978,6 +995,14 @@ fn stage2_launch_arguments(
         }),
         OsString::from(STAGE2_FETCH_SOCKET_ARG),
         OsString::from(if mounts.fetch_socket {
+            "present"
+        } else {
+            "absent"
+        }),
+    ]);
+    stage2.extend([
+        OsString::from(STAGE2_RUNTIME_ALIASES_ARG),
+        OsString::from(if mounts.runtime_aliases {
             "present"
         } else {
             "absent"
@@ -2219,7 +2244,7 @@ fn prepare_mount_plan(
         create_dir(&format!("{NEW_ROOT}/home/td"), 0o700)?;
         mount_application_tree(&application.package_files, &format!("{NEW_ROOT}/app"))?;
         mount_application_tree(&application.runtime_files, &format!("{NEW_ROOT}/usr"))?;
-        if application.loader_library_path.is_some() {
+        if application.runtime_aliases {
             install_runtime_aliases()?;
         }
         prepare_etc(application)?;
@@ -5775,7 +5800,7 @@ impl ManagedCgroup {
             .ok_or_else(|| io::Error::other("cgroup cleanup helper is already finished"))?
             .finish();
         match (cgroup_result, cleanup_result) {
-            (Ok(report), Ok(())) => Ok(Some(report)),
+            (Ok(report), Ok(())) => Ok(report),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(cgroup), Err(cleanup)) => Err(io::Error::other(format!(
                 "{cgroup}; cgroup cleanup helper: {cleanup}"
@@ -5948,6 +5973,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                     .is_some(),
                 fetch_socket: application.fetch_socket.is_some(),
                 loader_library_path: application.loader_library_path.as_deref(),
+                runtime_aliases: application.runtime_aliases,
                 terminal: application.terminal,
             },
             Stage2ResourceBinding {
@@ -6552,6 +6578,8 @@ mod tests {
                 "present",
                 STAGE2_FETCH_SOCKET_ARG,
                 "absent",
+                STAGE2_RUNTIME_ALIASES_ARG,
+                "absent",
                 STAGE2_LOADER_LIBRARY_PATH_ARG,
                 "absent",
                 STAGE2_TERMINAL_ARG,
@@ -6643,6 +6671,8 @@ mod tests {
             NO_TIMEZONE,
             STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
             "absent",
+            STAGE2_RUNTIME_ALIASES_ARG,
+            "absent",
             STAGE2_LOADER_LIBRARY_PATH_ARG,
             "absent",
             STAGE2_ENVIRONMENT_ARG,
@@ -6668,6 +6698,8 @@ mod tests {
             STAGE2_TIMEZONE_ARG,
             NO_TIMEZONE,
             STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
+            "absent",
+            STAGE2_RUNTIME_ALIASES_ARG,
             "absent",
             STAGE2_LOADER_LIBRARY_PATH_ARG,
             "absent",
@@ -6767,6 +6799,7 @@ mod tests {
                 firefox_seccomp_probe: true,
                 fetch_socket: false,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
+                runtime_aliases: true,
                 terminal: false,
             },
             Stage2ResourceBinding {
@@ -6797,22 +6830,21 @@ mod tests {
         let mut misspelled = emitted.clone();
         misspelled[zone_index + 1] = OsString::from("europe/berlin");
         assert!(parse_mode(misspelled.into_iter()).is_err());
-        let mut mismatched = emitted.clone();
-        let loader_index = mismatched
+        let loader_index = emitted
             .iter()
             .position(|argument| argument == STAGE2_LOADER_LIBRARY_PATH_ARG)
             .unwrap();
+        let mut mismatched = emitted.clone();
         mismatched[loader_index + 1] = OsString::from("absent");
         mismatched.remove(loader_index + 2);
         assert!(parse_mode(mismatched.into_iter()).is_err());
-        // The fetch grant travels right before the loader path, as one of
+        // The fetch grant travels right before the aliases word, as one of
         // exactly two words; `present` is a launch with the grant, and
         // nothing but the two words is accepted.
         let fetch_index = emitted
             .iter()
             .position(|argument| argument == STAGE2_FETCH_SOCKET_ARG)
             .unwrap();
-        assert_eq!(fetch_index + 2, loader_index);
         assert_eq!(emitted[fetch_index + 1], "absent");
         let mut fetched = emitted.clone();
         fetched[fetch_index + 1] = OsString::from("present");
@@ -6847,6 +6879,7 @@ mod tests {
                 firefox_seccomp_probe: true,
                 fetch_socket: true,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
+                runtime_aliases: true,
                 terminal: false,
             },
             Stage2ResourceBinding {
@@ -6864,6 +6897,26 @@ mod tests {
                 ..
             } if launch.fetch_socket
         ));
+        // The aliases word travels right before the loader path, as one of
+        // exactly two words; a library path without the aliases that reach
+        // it is refused, as is any other word or an omitted pair. It follows
+        // the fetch grant.
+        let aliases_index = emitted
+            .iter()
+            .position(|argument| argument == STAGE2_RUNTIME_ALIASES_ARG)
+            .unwrap();
+        assert_eq!(fetch_index + 2, aliases_index);
+        assert_eq!(loader_index, aliases_index + 2);
+        assert_eq!(emitted[aliases_index + 1], "present");
+        let mut without_aliases = emitted.clone();
+        without_aliases[aliases_index + 1] = OsString::from("absent");
+        assert!(parse_mode(without_aliases.into_iter()).is_err());
+        let mut bogus_aliases = emitted.clone();
+        bogus_aliases[aliases_index + 1] = OsString::from("maybe");
+        assert!(parse_mode(bogus_aliases.into_iter()).is_err());
+        let mut unstated_aliases = emitted.clone();
+        unstated_aliases.drain(aliases_index..aliases_index + 2);
+        assert!(parse_mode(unstated_aliases.into_iter()).is_err());
         // The terminal grant travels right after the loader path, as one
         // of exactly two words; a launch without it says so rather than
         // omitting the flag, and stage 2 refuses anything else.
@@ -6930,6 +6983,7 @@ mod tests {
                 firefox_seccomp_probe: false,
                 fetch_socket: false,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
+                runtime_aliases: true,
                 terminal: true,
             },
             Stage2ResourceBinding {
