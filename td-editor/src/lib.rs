@@ -4,9 +4,14 @@
 //! this library opens no files, starts no threads and reads no global state.
 
 pub mod fill;
+#[path = "../../td-compositor/src/font.rs"]
+pub mod font;
+#[path = "../../td-compositor/src/font_data.rs"]
+mod font_data;
 pub mod keys;
 pub mod layout;
 pub mod model;
+pub mod render;
 pub mod replay;
 pub mod text;
 

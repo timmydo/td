@@ -13,7 +13,7 @@ Unicode-scalar editing and single-cell Unifont rendering, preserves UTF-8
 BOM and uniform LF/CRLF files, defaults to Windows-like bindings, and uses
 an explicitly selected local English word list. Spelling runs only on
 request; an edit clears marks without starting another scan. That spelling
-profile is designed but not implemented in this core increment.
+profile is designed but not implemented yet.
 
 ## Implemented core
 
@@ -50,8 +50,30 @@ compares generated rows with an exhaustive scalar-vector reference, checks
 every interior cell pixel, and round-trips every caret boundary through hit
 testing. Use `Viewport::layout` to borrow validated model text with matching
 wrap geometry, and cache its metrics by revision and geometry. These are
-library APIs, not yet wired
-to interactive keys or replay; no window or drawing backend is claimed.
+library APIs, not yet wired to interactive keys or replay.
+
+`src/render.rs` supplies the safe software reference backend. A borrowed
+`Scene` streams clipped rectangle/glyph operations; `Raster` writes them into
+a caller-owned, stride-checked XRGB8888 buffer. The renderer uses the existing
+compositor Unifont data and decoder directly, with no copied font or new
+dependency. It draws tabs, bounded display labels, menu/status chrome,
+selection, and a caret, at integer scales 1–4. Pixel-oracle tests cover clipping,
+damage, padding, fallback glyphs, scrolling and extreme geometry. Menus and
+tab close marks are drawing only; their input adapters are not implemented.
+
+Inspect a deterministic 800x600 rendering without a display:
+
+```text
+td-editor/target/release/td-editor --preview > /tmp/td-editor-preview.ppm
+td-editor/target/release/td-editor --font-license
+```
+
+The first command writes a binary P6 PPM fixture, not an interactive window;
+use a PPM-capable image viewer. The second prints the embedded font provenance
+and complete notices. This backend performs CPU rasterization and does not
+yet allocate Wayland shared-memory buffers or use a GPU. Building from source
+currently needs the full td checkout for the shared modules and license data;
+the resulting executable does not need an installed td system.
 
 Editor-only code/configuration changes are routed by `td-builder ready` to
 this crate's tests and Clippy, with the dependency-free lock checks retained.

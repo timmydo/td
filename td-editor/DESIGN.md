@@ -20,6 +20,11 @@ produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
 caret affinity, pixel hit testing, vertical/page-motion calculation and
 viewport scrolling. It is not yet connected to key dispatch or replay.
+The safe reference renderer streams bitmap scene operations into a
+caller-owned XRGB8888 buffer. `--preview` emits a fixed headless PPM fixture;
+it is not an interactive window. Menus, tab close marks and status are drawn
+but do not yet have input adapters. Wayland buffer ownership remains future
+work.
 
 The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
@@ -402,6 +407,80 @@ size is 800x600 pixels. A zero configure dimension retains that axis's
 current size; a dimension outside the resource ceilings closes the connection
 with a diagnostic. Rendering failures must not mark any document saved.
 
+### Implemented reference-renderer contract
+
+`render::Scene` borrows the editor and display-only `Label` values. Labels
+are not file associations: each names an existing tab, duplicates are refused,
+and there are at most 64 labels of at most 4096 UTF-8 bytes each. Missing
+labels display `Untitled`; dirty tabs prefix `*`. Labels use whole bitmap
+cells, truncate without ellipsis and substitute U+FFFD for control scalars.
+The caller owns the selected key profile and `View` (scroll origin, soft
+wrap, caret affinity, focus and blink visibility). Rendering never mutates
+documents or acknowledges a save. Scrolling is measured in visual rows and
+columns; soft wrap ignores the horizontal origin. Origins are admitted up to
+16 Mi rows and 128 Mi columns. The adapter must clamp them with `Viewport`
+when the document or geometry changes; an admitted origin beyond the text
+draws a blank document area.
+
+`Geometry` admits nonzero axes through 8192 and at most 32 MiB of tight
+four-byte pixels. `Raster` additionally validates the supplied byte stride:
+it must be a multiple of four, at least width times four, with stride times
+height at most 32 MiB and within the borrowed buffer. Validation happens
+before writes. Pixels are B, G, R, 0xff bytes; row padding and any trailing
+allocation bytes are untouched. The backend accepts only 8x16 fonts and
+integer scales 1–4. The font is decoded once by the caller and borrowed;
+the production face and parser are the compositor's existing source modules.
+`--font-license` prints embedded provenance, COPYING and OFL notices from the
+same assets directory. No host font search or new font input is introduced.
+The source recipe must stage these five repository-relative inputs, keeping
+their paths relative to `td-editor/src` exactly as in the checkout:
+
+```text
+td-compositor/src/font.rs
+td-compositor/src/font_data.rs
+td-compositor/assets/PROVENANCE
+td-compositor/assets/unifont-COPYING
+td-compositor/assets/unifont-OFL-1.1.txt
+```
+
+There is no editor recipe yet; adding one must replace the editor-only gate
+exemption with target-artifact coverage, as specified below.
+
+Chrome dimensions below are logical pixels multiplied by the frame scale.
+The menu occupies the first 24 pixels, the tab strip the next 24, and the
+status strip the bottom 24. Document content starts at (8, 48), has eight
+pixels of right margin, and uses only full 8x16 cells. Tabs are 160 pixels
+wide with 24 pixels reserved for the close mark. A contiguous slice of tabs
+is shown, keeping the active tab visible; a surface narrower than one tab
+clips that tab. Tiny surfaces may have no document cells; status paints last
+and wins any chrome overlap. The palette is white paper, #202124 ink,
+#f0f0f0 chrome, #c5c7cb borders, #2468c5 focused selection with white ink, and
+#d6d9df unfocused selection with ordinary ink. The caret is one logical pixel
+wide; an upstream soft-wrap caret remains inside the row's right edge.
+
+Selection covers whole scalar cells, including the complete visible tab
+span. A selected logical newline paints one trailing cell only where a full
+visible cell remains, never a sliver in the unused partial-column space;
+soft-wrap boundaries do not invent a newline cell. The renderer emits glyph
+operations only for visible cells. It traverses layout to reach the first
+visible row, then scans each visible row from its start to reach the horizontal
+origin. A selected newline also needs the row's full width. This is not a
+random-access row cache: scene construction and seeking may scan text.
+`Scene::emit` streams solid fills and transparent glyphs without a retained
+operation list. Each draw carries a signed-origin, bounded-size clip;
+`Raster::draw` intersects it with the surface and primitive before writing.
+`Raster::paint` refuses a geometry/scale mismatch before writing. A damage
+rectangle replays the same scene clipped to that region; the caller owns
+damage accumulation and persistent buffer validity. It must repaint newly
+allocated buffers completely. Frame callbacks and release events are not
+implemented by these APIs.
+
+The headless `--preview` command uses these production APIs with a fixed
+800x600, scale-1 two-tab fixture and writes binary P6 PPM to stdout. It does
+not inspect files, environment, clocks or displays. Tests pin its complete
+byte checksum, compare rasterization to independent pixel-membership and
+font-row oracles, and prove partitioned damage matches a full repaint.
+
 ### GPU access and the Firefox prerequisite
 
 GPU access is implementable in td-jail. The intended grant is `devices=dri`
@@ -693,6 +772,8 @@ td-builder's automatic cargo test/clippy gate and commits its one-package
 2. First usable Wayland window: shared codecs and audited descriptor/file
    adapter, reference bitmap rendering, US keyboard input, open/save, prompts
    and clipboard; deterministic protocol/pixel proof and the Weston US test.
+   The safe layout and bitmap reference-renderer libraries are landed
+   prerequisites; they do not by themselves complete this window milestone.
 3. On-demand whole-document spelling and complete local control: explicit
    scans, result marking/invalidation, paged semantic queries and frame
    synchronization. Exercise the production dispatcher through both inputs.
