@@ -6244,9 +6244,9 @@ mod tests {
     /// is reachable from here, so this reads them.
     ///
     /// `cargo test` for this crate is reached whenever td-busd changes:
-    /// `affected.rs` narrows the cargo table only when every changed path is
-    /// inside an unembedded crate, and td-busd is embedded by a recipe, so a
-    /// change to it takes the whole table.
+    /// `affected.rs` runs a changed crate's suite and every reader's, and the
+    /// `include_str!` below makes this crate a reader of td-busd, an edge its
+    /// reader-graph test pins.
     #[test]
     fn the_brokers_ceilings_admit_every_name_this_module_can_build() {
         const BROKER: &str = include_str!("../../td-busd/src/transport.rs");

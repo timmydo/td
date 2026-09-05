@@ -1325,11 +1325,12 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // The editor core has no recipe or workspace consumer yet. Keep this
-    // exemption coupled to UNEMBEDDED_CRATES and its dependency guards;
-    // packaging the editor must replace it with target-artifact coverage.
-    // As for td-review above, the host preflight covers the editor's gate
-    // 325 lock/test/clippy obligations without the unrelated check pools.
+    // The editor core has no recipe or workspace consumer yet, so no check
+    // target reaches it; packaging the editor must replace this arm with
+    // target-artifact coverage. As for td-review above, the host preflight
+    // covers the editor's gate 325 lock/test/clippy obligations without the
+    // unrelated check pools — beside the workspace suite, whose builder
+    // tests read every roster lock and manifest, the editor's included.
     if p.starts_with("td-editor/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         return;
@@ -3072,15 +3073,209 @@ pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, usize)>,
     Ok(out)
 }
 
-/// Standalone crates that NO recipe embeds, and so the only ones whose diff
-/// cannot reach the engine workspace.
+/// Whether `text` names crate `name`'s DIRECTORY: `name/` with no identifier
+/// character before it. The slash is what keeps `td-sh/` out of `td-shell/`;
+/// the boundary before keeps it out of the store path `abc-td-sh/bin/td-sh`
+/// a td-login test spells, which is no read of td-sh.
+fn names_crate_dir(text: &str, name: &str) -> bool {
+    let needle = format!("{name}/");
+    let mut from = 0usize;
+    while let Some(at) = text.get(from..).and_then(|rest| rest.find(&needle)) {
+        let start = from.saturating_add(at);
+        let before = text.get(..start).and_then(|s| s.chars().next_back());
+        if !before.is_some_and(is_name_char) {
+            return true;
+        }
+        from = start.saturating_add(1);
+    }
+    false
+}
+
+/// Whether a manifest names crate `name` as a whole word outside a `#`
+/// comment — `td-boot = { path = "../td-boot" }` does, `td-booted` and a
+/// comment about td-boot do not. A cut at the first `#` on a line is the
+/// whole of the TOML this reads; a `#` inside a quoted value would hide the
+/// rest of that line, and no manifest here has one.
+fn manifest_names(text: &str, name: &str) -> bool {
+    for line in text.lines() {
+        let code = line.split_once('#').map_or(line, |(code, _)| code);
+        let mut from = 0usize;
+        while let Some(at) = code.get(from..).and_then(|rest| rest.find(name)) {
+            let start = from.saturating_add(at);
+            let end = start.saturating_add(name.len());
+            let before = code.get(..start).and_then(|s| s.chars().next_back());
+            let after = code.get(end..).and_then(|s| s.chars().next());
+            if !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char) {
+                return true;
+            }
+            from = start.saturating_add(1);
+        }
+    }
+    false
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// The directories `crate_readers` walks whole; a target declared by `path`
+/// under one of them is already read.
+const SCANNED_SOURCE_DIRS: [&str; 4] = ["src/", "tests/", "examples/", "benches/"];
+
+/// The files a manifest declares by a `path = "..."` line of its own, outside
+/// `#` comments, as spelled: `[[bin]]`, `[lib]`, `[[test]]` and the rest all
+/// place a target this way. A dependency's `path` on its own line is returned
+/// too and is a directory, which the caller tells apart; one inside an inline
+/// table is not, and is a dependency by construction.
+fn manifest_target_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let code = line.split_once('#').map_or(line, |(code, _)| code).trim();
+        let Some(rest) = code.strip_prefix("path") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let Some(inner) = rest
+            .trim()
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+        else {
+            continue;
+        };
+        if !inner.is_empty() {
+            out.push(inner.to_string());
+        }
+    }
+    out
+}
+
+/// Every `.rs` under `dir`, `//` comments stripped, one file after another
+/// with a newline between them; empty for a directory that is absent. Absent
+/// is the ONLY tolerated failure: a directory that cannot be listed or a
+/// file that cannot be read is an error, never "reads nothing" — a scan over
+/// a tree it could not read would be the dispatcher narrowing its own
+/// coverage. `required` makes an absent or empty tree an error too. A symlink
+/// the walk meets is an error: the entry's own type does not follow one, so
+/// a link to a directory would drop a subtree and a link to a file the file,
+/// and either is this scan reading less than it reports. The root itself is
+/// opened by `read_dir`, which follows a link there and so reads more, not
+/// less.
+fn sources_under(dir: &Path, required: bool) -> Result<String, String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && d == dir => break,
+            Err(e) => return Err(format!("{} could not be listed: {e}", d.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{} could not be listed: {e}", d.display()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("{} could not be typed: {e}", path.display()))?;
+            if kind.is_symlink() {
+                return Err(format!(
+                    "{} is a symlink in a scanned source tree",
+                    path.display()
+                ));
+            }
+            if kind.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    if required && files.is_empty() {
+        return Err(format!("no sources under {}", dir.display()));
+    }
+    let mut out = String::new();
+    for f in &files {
+        let raw = std::fs::read_to_string(f)
+            .map_err(|e| format!("{} could not be read: {e}", f.display()))?;
+        out.push_str(&strip_line_comments(&raw));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// For each roster crate, the roster crates that read its files and so build
+/// or test differently when it changes. A reader is a crate that NAMES the
+/// other's directory anywhere in its sources outside `//` comments — `src`,
+/// `tests`, `examples`, `benches`, `build.rs`, and every target its manifest
+/// declares by `path` outside those directories, td-compositor's two `tools/`
+/// importers today, since a `#[cfg(test)]` include or a tool binary is still
+/// a build the preflight runs — or names the crate in its manifest outside a
+/// `#` comment, which is what a path dependency does.
 ///
-/// Every other td-* crate has its sources `include_str!`'d into its recipe
-/// (`recipes/src/recipes/<crate>.rs`) so the lintable crate and the shipped
-/// binary are one text — which makes `recipes`, and therefore `cargo test
-/// --workspace`, a READER of those files. Checked against the tree rather than
-/// trusted, in `unembedded_crates_are_really_unembedded`.
-const UNEMBEDDED_CRATES: [&str; 2] = ["td-review", "td-editor"];
+/// Naming, rather than a list of the forms a read can take, because that list
+/// is open: `#[path]`, `include_str!`, `include!`, a `read_to_string` over a
+/// path built two lines earlier, a `concat!`. Every one of them spells the
+/// directory in a string, and rustfmt may put that string on any line, so a
+/// rule that wanted the reading form and the path on one line missed a
+/// wrapped argument (review's finding). A name in an error message counts
+/// too, and only widens the run, which is the cheap direction. A crate is
+/// never its own reader. Today: td-portal builds modules out of td-compositor
+/// and td-busd through `#[path]`, td-install out of td-boot, td-jail's tests
+/// `include_str!` td-busd's spec and transport source, and td-login names
+/// td-busd's directory in a test's argument string, which is no read at all
+/// and only widens.
+fn crate_readers(root: &Path, roster: &[GateCrate]) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut out: Vec<(String, Vec<String>)> =
+        roster.iter().map(|c| (c.name.clone(), Vec::new())).collect();
+    for reader in roster {
+        let base = root.join(&reader.name);
+        let mut text = sources_under(&base.join("src"), true)?;
+        for sub in ["tests", "examples", "benches"] {
+            text.push_str(&sources_under(&base.join(sub), false)?);
+        }
+        let build_rs = base.join("build.rs");
+        if build_rs.is_file() {
+            let raw = std::fs::read_to_string(&build_rs)
+                .map_err(|e| format!("{} could not be read: {e}", build_rs.display()))?;
+            text.push_str(&strip_line_comments(&raw));
+            text.push('\n');
+        }
+        let manifest_path = base.join("Cargo.toml");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("{} could not be read: {e}", manifest_path.display()))?;
+        // A target the manifest places outside the directories above is built
+        // and linted all the same. Read by its declared path; a declared file
+        // that is not there is an error, not an absent read. A directory is a
+        // path DEPENDENCY, which `manifest_names` reads by name.
+        for target in manifest_target_paths(&manifest) {
+            if SCANNED_SOURCE_DIRS.iter().any(|d| target.starts_with(d)) {
+                continue;
+            }
+            let p = base.join(&target);
+            match std::fs::metadata(&p) {
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(_) => {}
+                Err(e) => return Err(format!("{} could not be inspected: {e}", p.display())),
+            }
+            let raw = std::fs::read_to_string(&p)
+                .map_err(|e| format!("{} could not be read: {e}", p.display()))?;
+            text.push_str(&strip_line_comments(&raw));
+            text.push('\n');
+        }
+        for read in roster {
+            if read.name == reader.name {
+                continue;
+            }
+            if names_crate_dir(&text, &read.name) || manifest_names(&manifest, &read.name) {
+                if let Some((_, readers)) = out.iter_mut().find(|(n, _)| *n == read.name) {
+                    push_unique(readers, &reader.name);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// Files under `builder/src` that are NOT the build engine, and so do not owe
 /// the from-source behavioural tier the rest of that directory does.
@@ -3103,13 +3298,18 @@ const HOST_ONLY_ENGINE_SOURCES: [&str; 1] = ["builder/src/ready.rs"];
 /// The subset of the derived command list a diff over `changed` can actually
 /// invalidate.
 ///
-/// Narrow ONLY where it is provably sound: every changed path must sit inside
-/// an `UNEMBEDDED_CRATES` directory. Anything else — `builder/`, `recipes/`, a
-/// crate a recipe embeds, an unmapped file, an empty diff — takes the whole
-/// list, so every unknown fails safe.
+/// The workspace commands always run: `recipes` embeds every target crate's
+/// sources, so the workspace suite can be redded by a change to any of them,
+/// and the builder's own tests name the one crate no recipe embeds. A path
+/// names the roster crate whose directory holds it; that crate's commands
+/// run, and so do those of every crate that READS it — closed transitively,
+/// since a reader of a reader saw the change too. Anything the rule does not
+/// recognise — `builder/`, `recipes/`, `engine/`, an unmapped path, a `..`,
+/// an empty diff — takes the whole list, so every unknown fails safe.
 fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, String> {
     let all = cargo_test_cmds_all(root)?;
-    let mut scoped: Vec<&'static str> = Vec::new();
+    let roster = discover_gate_crates(root)?;
+    let mut selected: Vec<String> = Vec::new();
     for p in changed {
         // A `..` is refused rather than resolved: `td-review/../td-sh/x.rs`
         // starts with the crate and names another. git never emits one, so this
@@ -3117,33 +3317,50 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
         if p.contains("..") {
             return Ok(all);
         }
-        let owner = UNEMBEDDED_CRATES.iter().find(|c| {
+        let owner = roster.iter().find(|c| {
             // The separator matters: `td-reviewer/x` is not `td-review/x`.
-            p.starts_with(*c) && p.as_bytes().get(c.len()) == Some(&b'/')
+            p.starts_with(&c.name) && p.as_bytes().get(c.name.len()) == Some(&b'/')
         });
         match owner {
-            Some(c) if !scoped.contains(c) => scoped.push(c),
-            Some(_) => {}
+            Some(c) => push_unique(&mut selected, &c.name),
             None => return Ok(all),
         }
     }
-    if scoped.is_empty() {
+    if selected.is_empty() {
         return Ok(all);
+    }
+    let readers = crate_readers(root, &roster)?;
+    // Closed over readers: a crate pushed here is itself looked up in turn.
+    let mut i = 0;
+    while let Some(name) = selected.get(i).cloned() {
+        for (read, its_readers) in &readers {
+            if *read == name {
+                for reader in its_readers {
+                    push_unique(&mut selected, reader);
+                }
+            }
+        }
+        i = i.saturating_add(1);
     }
     let narrowed: Vec<String> = all
         .iter()
-        .filter(|cmd| {
-            cmd_manifest_crate(cmd).is_some_and(|c| scoped.contains(&c))
+        .filter(|cmd| match cmd_manifest_crate(cmd) {
+            Some(c) => selected.iter().any(|s| s == c),
+            None => true,
         })
         .cloned()
         .collect();
-    // An EMPTY narrowing must never be taken at face value: the preflight's
-    // loop over nothing exits 0 having run no cargo at all — a green that
-    // tested the crate not at all. `unembedded_crates_have_cargo_commands`
-    // keeps this unreachable; this is what happens if it ever is not.
-    match narrowed.is_empty() {
-        true => Ok(all),
-        false => Ok(narrowed),
+    // A selected crate without a command of its own would make this a list
+    // that omits the very crate that changed, and a preflight over it would
+    // exit 0 having tested that crate not at all.
+    // `every_roster_crate_narrows_to_its_own_commands` keeps this unreachable;
+    // this is what happens if it ever is not.
+    let each_has_commands = selected
+        .iter()
+        .all(|s| narrowed.iter().any(|c| cmd_manifest_crate(c) == Some(s.as_str())));
+    match each_has_commands {
+        true => Ok(narrowed),
+        false => Ok(all),
     }
 }
 
@@ -3719,110 +3936,156 @@ mod tests {
         );
     }
 
-    /// The premise the cargo-test narrowing rests on, checked against the tree
-    /// rather than trusted: no workspace member reads these crates' files, so
-    /// `cargo test --workspace` cannot be redded by one.
-    ///
-    /// Three legs, because the workspace has three ways to become a reader: a
-    /// recipe embedding the sources, a manifest depending on the crate, and a
-    /// workspace source opening one of its files. Each is the change that would
-    /// make the narrowing unsound, and each reds HERE rather than by quietly
-    /// skipping a suite that had started to matter.
-    ///
-    /// It is TEXTUAL, and so bounded: a path assembled at compile time by
-    /// `concat!` would defeat all three. What it defends is the ordinary way a
-    /// crate comes to be read, which is the way every embedded crate is read
+    /// The reader graph the cargo-test narrowing rests on, checked against
+    /// the tree rather than trusted. The `#[path]` and `include_str!` readers
+    /// the tree carries — td-portal and td-editor both build modules out of
+    /// td-compositor — are the positive controls, so the scan cannot go
+    /// vacuous; td-review, the one crate no recipe embeds, is read by nobody,
+    /// so its change runs its own suite and the workspace's and no other; no
+    /// crate reads itself, and nothing off the roster appears. Textual, and
+    /// so bounded: a path assembled by `concat!` from pieces that never spell
+    /// the directory would escape it, which is not how any crate is read
     /// today.
     #[test]
-    fn unembedded_crates_are_really_unembedded() {
-        // Gated on what this test READS, not a repo-wide sentinel.
-        let dir = repo_root().join("recipes/src");
-        if !dir.is_dir() {
-            eprintln!("SKIP: {dir:?} absent (builder-only sandbox)");
+    fn the_reader_graph_carries_every_include_the_tree_has() {
+        let root = repo_root();
+        // An error, not an empty roster, is what the builder-only package
+        // sandbox produces: `discover_gate_crates` refuses an empty one.
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        let readers = crate_readers(&root, &roster).expect("crate readers");
+        let readers_of = |name: &str| -> Vec<&str> {
+            let mut out: Vec<&str> = readers
+                .iter()
+                .filter(|(read, _)| read == name)
+                .flat_map(|(_, its)| its.iter().map(String::as_str))
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        assert_eq!(readers_of("td-compositor"), ["td-editor", "td-portal"]);
+        // td-login is here for a test's argument string `/bin/td-busd/`, no
+        // read at all: the edge only widens, and pinning it pins the rule that
+        // a name is a name wherever it is spelled.
+        assert_eq!(readers_of("td-busd"), ["td-jail", "td-login", "td-portal"]);
+        assert_eq!(readers_of("td-boot"), ["td-install"]);
+        assert!(readers_of("td-review").is_empty(), "{readers:?}");
+        assert!(readers_of("td-sh").is_empty(), "{readers:?}");
+        for (read, its_readers) in &readers {
+            assert!(!its_readers.contains(read), "{read} reads itself");
+            assert!(roster.iter().any(|c| c.name == *read), "{read} is not on the roster");
+            for reader in its_readers {
+                assert!(roster.iter().any(|c| c.name == *reader), "{reader} is off the roster");
+            }
+        }
+    }
+
+    /// A target the manifest declares outside the walked directories is read
+    /// like the rest: a `tools/` binary that includes another crate's source
+    /// makes its crate a reader, a declared file that is missing is an error,
+    /// and a dependency's directory `path` is left to the name rule.
+    #[test]
+    fn a_target_declared_outside_the_source_dirs_is_scanned() {
+        assert_eq!(
+            manifest_target_paths(
+                "[[bin]]\nname = \"t\"\npath = \"tools/t.rs\" # a tool\n# path = \"no.rs\"\n\
+                 [lib]\npath=\"src/lib.rs\"\ntd-boot = { path = \"../td-boot\" }\n"
+            ),
+            ["tools/t.rs", "src/lib.rs"]
+        );
+        let root = std::env::temp_dir().join(format!("td-declared-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, text) in [
+            ("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n[[bin]]\nname = \"t\"\npath = \"tools/t.rs\"\n"),
+            ("td-aa/src/lib.rs", "pub fn aa() {}\n"),
+            ("td-aa/tools/t.rs", "const S: &str = include_str!(\"../../td-bb/src/lib.rs\");\n"),
+            ("td-bb/Cargo.toml", "[package]\nname = \"td-bb\"\n[dependencies.td-cc]\npath = \"../td-cc\"\n"),
+            ("td-bb/src/lib.rs", "pub fn bb() {}\n"),
+            ("td-cc/Cargo.toml", "[package]\nname = \"td-cc\"\n"),
+            ("td-cc/src/lib.rs", "pub fn cc() {}\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        }
+        let krate = |name: &str| GateCrate {
+            name: name.to_string(),
+            clippy_all_targets: false,
+            test_args: None,
+            gate_test_args: None,
+        };
+        let roster = vec![krate("td-aa"), krate("td-bb"), krate("td-cc")];
+        let readers = crate_readers(&root, &roster).expect("readers");
+        let of = |name: &str| -> Vec<String> {
+            readers
+                .iter()
+                .filter(|(read, _)| read == name)
+                .flat_map(|(_, its)| its.clone())
+                .collect()
+        };
+        assert_eq!(of("td-bb"), ["td-aa"], "{readers:?}");
+        assert_eq!(of("td-cc"), ["td-bb"], "{readers:?}");
+        assert!(of("td-aa").is_empty(), "{readers:?}");
+        std::fs::remove_file(root.join("td-aa/tools/t.rs")).unwrap();
+        let err = crate_readers(&root, &roster).unwrap_err();
+        assert!(err.contains("tools/t.rs"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two name tests, in both directions: the directory form finds a
+    /// wrapped argument and a path built away from its read, and neither form
+    /// matches a longer name or a comment.
+    #[test]
+    fn a_reader_is_found_however_the_path_is_spelled_and_prefixes_are_not() {
+        assert!(names_crate_dir("#[path = \"../../td-busd/src/wire.rs\"]", "td-busd"));
+        assert!(names_crate_dir("include_str!(\n    \"../../td-busd/spec/x\"\n)", "td-busd"));
+        assert!(names_crate_dir("let p = root.join(\"td-boot/src/x.rs\");\nread(p)", "td-boot"));
+        assert!(!names_crate_dir("\"../td-shell/src/x.rs\"", "td-sh"));
+        assert!(!names_crate_dir("\"xtd-sh/src/x.rs\"", "td-sh"));
+        assert!(!names_crate_dir("\"td-sh\"", "td-sh"));
+        assert!(!names_crate_dir(
+            &strip_line_comments("// see td-compositor/DESIGN.md\nlet x = 1;"),
+            "td-compositor"
+        ));
+        assert!(manifest_names("td-boot = { path = \"../td-boot\" }", "td-boot"));
+        assert!(!manifest_names("# td-boot = { path = \"../td-boot\" }", "td-boot"));
+        assert!(!manifest_names("td-booted = 1\nname = \"td-bootloader\"", "td-boot"));
+    }
+
+    /// A tree the scan cannot read is an error, not a crate that reads
+    /// nothing: only a genuinely absent optional directory is empty.
+    #[test]
+    fn an_unreadable_source_tree_is_an_error_not_an_empty_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("td-sources-under-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sealed = root.join("src/sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn a() {} // td-sh/x\n").unwrap();
+        std::fs::write(sealed.join("m.rs"), "fn b() {}\n").unwrap();
+        let readable = sources_under(&root.join("src"), true).expect("a readable tree");
+        assert!(readable.contains("fn a() {}") && readable.contains("fn b() {}"));
+        assert!(!readable.contains("td-sh/"), "comments must be stripped: {readable:?}");
+        assert_eq!(sources_under(&root.join("tests"), false).expect("absent optional"), "");
+        assert!(sources_under(&root.join("tests"), true).is_err(), "absent required");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = sources_under(&root.join("src"), true);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        if std::fs::metadata("/proc/self").is_ok() && is_root() {
+            eprintln!("SKIP: root reads a sealed directory");
             return;
         }
-        let mut sources = Vec::new();
-        collect_rs_files(&dir, &mut sources);
-        assert!(!sources.is_empty(), "no recipe sources found under {dir:?}");
-        let texts: Vec<(PathBuf, String)> = sources
-            .into_iter()
-            .map(|f| {
-                let t = std::fs::read_to_string(&f).unwrap();
-                (f, t)
-            })
-            .collect();
-        // POSITIVE CONTROL. Without one the scan can go vacuous — if recipes
-        // ever stop naming their crates the way they do now, every entry below
-        // passes because nothing matches anything.
-        assert!(
-            texts.iter().any(|(_, t)| t.contains("td-sh")),
-            "the scan found no mention of td-sh, which IS embedded — it is \
-             looking at the wrong thing and would pass any roster"
-        );
-        // The NAME, not one spelling of a relative path: a nested module needs
-        // a fourth `../`, and `concat!` would spell it no way this could
-        // predict. A recipe crate that so much as NAMES one of these is the
-        // signal, and today it names none.
-        for krate in UNEMBEDDED_CRATES {
-            for (f, text) in &texts {
-                assert!(
-                    !text.contains(krate),
-                    "{krate} is named by {f:?}, so the recipes crate may read it \
-                     and the cargo-test narrowing for it is no longer sound"
-                );
-            }
-        }
-        // …and no workspace member may depend on one as a crate, which would
-        // make the workspace suite a reader without naming a path at all.
-        for manifest in [
-            "builder/Cargo.toml",
-            "recipes/Cargo.toml",
-            "engine/Cargo.toml",
-        ] {
-            let text = std::fs::read_to_string(repo_root().join(manifest)).unwrap();
-            for krate in UNEMBEDDED_CRATES {
-                assert!(
-                    !text.contains(krate),
-                    "{manifest} names {krate}, so the workspace depends on it"
-                );
-            }
-        }
-        // …and no OTHER workspace member may read one's files either. `recipes`
-        // is held to naming the crate at all, which `builder` cannot be — it
-        // legitimately spells `td-review/Cargo.toml` in the very table this
-        // narrowing filters. So the bar there is a READ: the crate name on a
-        // line that also opens something. That is how a workspace member would
-        // actually come to read the crate — `builder/src/ready.rs` already
-        // records that its `parse_cases` is mirrored in td-review's
-        // `record.rs`, and a test that read that file to compare the two is
-        // exactly the change this must red on.
-        const READERS: [&str; 5] = [
-            "include_str!",
-            "include_bytes!",
-            "read_to_string",
-            "File::open",
-            "#[path",
-        ];
-        for dir in ["builder/src", "engine/src"] {
-            let d = repo_root().join(dir);
-            if !d.is_dir() {
-                continue;
-            }
-            let mut srcs = Vec::new();
-            collect_rs_files(&d, &mut srcs);
-            assert!(!srcs.is_empty(), "no sources under {d:?}");
-            for f in srcs {
-                let text = std::fs::read_to_string(&f).unwrap();
-                for line in text.lines() {
-                    for krate in UNEMBEDDED_CRATES {
-                        assert!(
-                            !(line.contains(krate) && READERS.iter().any(|r| line.contains(r))),
-                            "{f:?} reads {krate}: {line:?}"
-                        );
-                    }
-                }
-            }
-        }
+        assert!(got.is_err(), "an unlistable subdirectory must be an error: {got:?}");
+    }
+
+    fn is_root() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(|l| l.contains("\t0\t")))
+            .unwrap_or(false)
     }
 
     /// Every module reached through a `crate::`/`super::` path, however it is
@@ -5083,25 +5346,30 @@ mod tests {
         );
     }
 
-    /// Every roster entry must HAVE commands in the table. Without this the
-    /// filter yields an empty list for it, and a preflight that loops over
-    /// nothing exits 0 having run no cargo at all.
+    /// Every roster crate must narrow to commands of both KINDS for itself.
+    /// Without this the filter could yield a list without one, and a
+    /// preflight over it would exit 0 having tested that crate not at all;
+    /// and `render_cargo_test` prints the words "cargo test + clippy"
+    /// unconditionally, so a crate that had lost its test line would advertise
+    /// a run it no longer does.
     #[test]
-    fn unembedded_crates_have_cargo_commands() {
-        let cmds = gate_cmds();
-        for krate in UNEMBEDDED_CRATES {
-            let mine: Vec<&str> = cmds
-                .iter()
-                .map(String::as_str)
-                .filter(|c| cmd_manifest_crate(c) == Some(krate))
-                .collect();
-            // Both KINDS, not merely two commands: `render_cargo_test` prints
-            // the words "cargo test + clippy" unconditionally, so a crate that
-            // had lost its test line would advertise a run it no longer does.
+    fn every_roster_crate_narrows_to_its_own_commands() {
+        let root = repo_root();
+        // An error, not an empty roster, is what the builder-only package
+        // sandbox produces: `discover_gate_crates` refuses an empty one.
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        for krate in roster {
+            let mine = cargo_test_cmds(&root, &[format!("{}/src/lib.rs", krate.name)])
+                .expect("narrowing");
             for want in ["cargo test ", "cargo clippy "] {
                 assert!(
-                    mine.iter().any(|c| c.starts_with(want)),
-                    "{krate} has no `{want}` command: {mine:?}"
+                    mine.iter().any(|c| c.starts_with(want)
+                        && cmd_manifest_crate(c) == Some(krate.name.as_str())),
+                    "{} has no `{want}` command: {mine:?}",
+                    krate.name
                 );
             }
         }
@@ -5131,38 +5399,79 @@ mod tests {
 
     /// The narrowing itself, in both directions. The unsound direction is the
     /// one that matters: anything the rule does not recognise must take the
-    /// whole table, so a new crate or an unmapped path fails safe.
+    /// whole table, so a new path shape or an unmapped file fails safe.
     #[test]
-    fn cargo_commands_narrow_only_for_unembedded_crates() {
+    fn cargo_commands_narrow_to_the_crate_its_readers_and_the_workspace() {
         let root = repo_root();
+        if discover_gate_crates(&root).is_err() {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        }
         let all = gate_cmds().len();
         let one = |p: &str| cargo_test_cmds(&root, &[p.to_string()]).expect("narrowing");
-        // td-review alone: its own manifest and nothing else — no --workspace,
-        // which is where the seed-recipe builds and tarball decoding live.
-        let scoped = one("td-review/src/land.rs");
-        assert_eq!(scoped.len(), 2, "test + clippy for one crate: {scoped:?}");
-        assert!(scoped.iter().all(|c| c.contains("td-review/Cargo.toml")));
-        assert!(!scoped.iter().any(|c| c.contains("--workspace")));
-        // A crate a recipe embeds must NOT narrow.
-        assert_eq!(one("td-sh/src/main.rs").len(), all);
-        assert_eq!(one("td-compositor/src/pty.rs").len(), all);
-        // Neither may the engine, an unmapped path, or an empty diff.
+        let names = |cmds: &[String]| -> Vec<String> {
+            let mut out: Vec<String> = cmds
+                .iter()
+                .filter_map(|c| cmd_manifest_crate(c).map(str::to_string))
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        let workspace = |cmds: &[String]| cmds.iter().filter(|c| c.contains("--workspace")).count();
+        // td-review: the workspace suite and its own, nothing else — nobody
+        // reads it.
+        let review = one("td-review/src/land.rs");
+        assert_eq!(review.len(), 4, "{review:?}");
+        assert_eq!(workspace(&review), 2);
+        assert_eq!(names(&review), ["td-review"]);
+        // An embedded crate nobody else reads: the same shape.
+        let sh = one("td-sh/src/main.rs");
+        assert_eq!(sh.len(), 4, "{sh:?}");
+        assert_eq!(names(&sh), ["td-sh"]);
+        // A crate others read brings its readers: td-portal and td-editor build
+        // modules out of td-compositor sources, so a change there is a change
+        // to what they compile; td-busd is read by three.
+        let comp = one("td-compositor/src/pty.rs");
+        assert_eq!(names(&comp), ["td-compositor", "td-editor", "td-portal"]);
+        assert_eq!(comp.len(), 8, "{comp:?}");
+        assert_eq!(
+            names(&one("td-busd/src/wire.rs")),
+            ["td-busd", "td-jail", "td-login", "td-portal"]
+        );
+        assert_eq!(names(&one("td-boot/src/protocol.rs")), ["td-boot", "td-install"]);
+        // The order holds within a narrowed list: every test before any clippy,
+        // the workspace first.
+        assert!(comp.first().is_some_and(|c| c.starts_with("cargo test --frozen --workspace")));
+        let last_test = comp.iter().rposition(|c| c.starts_with("cargo test ")).unwrap_or(0);
+        let first_clippy = comp
+            .iter()
+            .position(|c| c.starts_with("cargo clippy "))
+            .unwrap_or(comp.len());
+        assert!(last_test < first_clippy, "{comp:?}");
+        // The engine, an unmapped path, or an empty diff take the whole table.
         assert_eq!(one("builder/src/affected.rs").len(), all);
         assert_eq!(one("recipes/src/recipes/td-sh.rs").len(), all);
+        assert_eq!(one("engine/src/lib.rs").len(), all);
         assert_eq!(one("who/knows.rs").len(), all);
         assert_eq!(cargo_test_cmds(&root, &[]).expect("narrowing").len(), all);
         // A prefix is not a directory: `td-reviewer/` is a different crate.
         assert_eq!(one("td-reviewer/src/main.rs").len(), all);
         // Nor may a `..` that starts with the crate and names another.
         assert_eq!(one("td-review/../td-sh/src/main.rs").len(), all);
+        // Two crates take the union of what each brings.
+        let two = cargo_test_cmds(
+            &root,
+            &["td-review/src/land.rs".to_string(), "td-sh/src/main.rs".to_string()],
+        )
+        .expect("narrowing");
+        assert_eq!(two.len(), 6, "{two:?}");
+        assert_eq!(names(&two), ["td-review", "td-sh"]);
         // One narrowable path does not license the OTHERS in the same diff.
         assert_eq!(
             cargo_test_cmds(
                 &root,
-                &[
-                    "td-review/src/land.rs".to_string(),
-                    "builder/src/gates.rs".to_string(),
-                ]
+                &["td-review/src/land.rs".to_string(), "builder/src/gates.rs".to_string()]
             )
             .expect("narrowing")
             .len(),
@@ -5185,15 +5494,18 @@ mod tests {
             "td-editor/README.md",
             "td-editor/DESIGN.md",
         ];
+        // The editor's own commands ride beside the workspace suite, as
+        // td-review's do: the builder's tests read every roster lock and
+        // manifest, so a change to the editor's can red them.
         for path in editor_paths {
             let output = path_output(&root, path);
             assert!(!output.contains("td-builder check"), "{path}: {output}");
-            assert!(!output.contains("--workspace"), "{path}: {output}");
             if path.ends_with(".md") {
                 assert!(output.contains("Selected checks: none"), "{path}: {output}");
             } else {
                 assert!(
-                    output.contains("--manifest-path td-editor/Cargo.toml"),
+                    output.contains("--workspace (builder/recipes/engine)")
+                        && output.contains("--manifest-path td-editor/Cargo.toml"),
                     "{path}: {output}"
                 );
             }
@@ -5201,9 +5513,9 @@ mod tests {
         let mut paths: Vec<String> = editor_paths.iter().map(|p| (*p).to_string()).collect();
         assert!(compute_selection(&root, &paths).targets.is_empty());
         let commands = cargo_test_cmds(&root, &paths).unwrap();
-        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert_eq!(commands.len(), 4, "{commands:?}");
         assert!(commands.iter().all(|c| {
-            c.contains("--manifest-path td-editor/Cargo.toml")
+            c.contains("--workspace") || c.contains("--manifest-path td-editor/Cargo.toml")
         }));
         assert!(commands.iter().any(|c| c.starts_with("cargo test --frozen ")));
         assert!(commands.iter().any(|c| {
@@ -5229,12 +5541,15 @@ mod tests {
         let root = repo_root();
         let changed = vec!["td-review/src/land.rs".to_string()];
         let line = preflight_cmd(&root, "cargo-test", &changed).unwrap_or_default();
-        let ran = cargo_test_cmds(&root, &changed).expect("narrowing");
+        let Ok(ran) = cargo_test_cmds(&root, &changed) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
         let running: Vec<&str> = ran.iter().filter_map(|c| cmd_manifest_crate(c)).collect();
         assert!(!running.is_empty(), "nothing would run: {line:?}");
         // Both directions, over EVERY crate the full table names. The "names
         // each one that runs" half is vacuous on its own: a render that printed
-        // all thirteen manifests would satisfy it, and printing a command the
+        // every roster manifest would satisfy it, and printing a command the
         // preflight will not run is exactly the lie this test exists to catch.
         for cmd in gate_cmds() {
             let Some(krate) = cmd_manifest_crate(&cmd) else {
@@ -5247,7 +5562,8 @@ mod tests {
                 "{line:?} disagrees with what would run about {krate}"
             );
         }
-        assert!(!line.contains("--workspace"), "{line:?}");
+        // The workspace suite rides every narrowed run, and the line says so.
+        assert!(line.contains("--workspace"), "{line:?}");
         // …and the unnarrowed line is unchanged from what it always printed.
         let full = preflight_cmd(&root, "cargo-test", &["builder/src/main.rs".to_string()])
             .unwrap_or_default();
@@ -5880,8 +6196,8 @@ mod tests {
     // It no longer runs with NO repo tree: one line of each expectation is the
     // cargo-test render, which is derived from the sibling `td-*` crates rather
     // than read from a constant. In the builder-only package sandbox it SKIPS,
-    // the way `unembedded_crates_are_really_unembedded` does. Pinning the crate
-    // list here instead would rebuild the central table this mechanism removed.
+    // the way the reader-graph tests do. Pinning the crate list here instead
+    // would rebuild the central table this mechanism removed.
     // The dynamic mappings stay covered by `self_test_passes_against_repo`.
     #[test]
     fn renders_exact_output_for_static_paths() {
@@ -5947,11 +6263,12 @@ mod tests {
             ])
         );
 
-        // td-review → the cargo-test preflight, scoped to td-review's OWN
-        // manifest, and NOTHING else. Pinned as exact output because both
-        // absences are the point — a stray target restores bootstrap builds,
-        // and a stray manifest would restore the workspace suite, for a crate
-        // none of it reads.
+        // td-review → the cargo-test preflight over the workspace suite and
+        // td-review's OWN manifest, and NOTHING else: the only selection with
+        // no `td-builder check` line at all. Pinned as exact output because
+        // the absences are the point — a stray target would restore an hour
+        // of bootstrap builds, and a stray manifest another crate's suite,
+        // for a crate none of it reads.
         assert_eq!(
             path_output(&root, "td-review/src/land.rs"),
             expect(&[
@@ -5961,7 +6278,7 @@ mod tests {
                 "  td-review/src/land.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --frozen --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
