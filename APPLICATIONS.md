@@ -3225,10 +3225,17 @@ two ioctls the truncation *is* the point.
    Every helper record except the deliberately forked x32-kill probe must carry
    the exact main-process pid independently read before and after the soak. The
    process-token lookup admits only the token-bearing process whose current
-   procfs status proves the installed no-new-privileges seccomp sandbox. The
-   main-process token additionally requires a namespace PID greater than 1,
-   so the namespace-init td-jail stage carrying the same application argv
-   cannot substitute.
+   procfs status proves the installed no-new-privileges seccomp sandbox. A
+   token that begins with `-` is a flag and names a process by an exact argv
+   word after argv[0]; any other token is a program and names a process by
+   the final path component of argv[0], which for a td-jail launch is the
+   entry path, so that a terminal application's boot evidence can name the
+   program its entry runs as, `tmc` or `tn`, without either taking a marker
+   argument. Neither form reads the other's field, so a wrapper carrying the
+   program's name as an argument is not the program.
+   Every token additionally requires a namespace PID greater than 1, so the
+   namespace-init td-jail stage, which runs as `td-jail` and carries the
+   entry path after `--launch`, cannot substitute for any of them.
    The x32 record must carry a distinct child pid.
    Only that complete variant enables kernel audit and raises its backlog;
    every other QEMU proof boot passes `audit=0`, because the compiled but

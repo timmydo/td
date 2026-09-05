@@ -13,7 +13,6 @@ const MAX_ACTIVE_SCAN: usize = 256;
 const MAX_PROCESS_TOKEN_BYTES: usize = 64;
 const MAX_PROCESS_CMDLINE_BYTES: u64 = 64 * 1024;
 const MAX_PROCESS_STATUS_BYTES: u64 = 64 * 1024;
-const FIREFOX_MAIN_PROCESS_TOKEN: &str = "--marionette";
 const MAX_FIREFOX_CHILDREN: usize = 256;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `ESRCH`. Named because `std` gives it no `ErrorKind`, so the only way to
@@ -362,10 +361,29 @@ pub(crate) fn valid_process_token(token: &str) -> bool {
         })
 }
 
+/// A token names a process one of two ways, told apart by its first byte.
+/// One that begins with `-` is a flag and names a process by an exact argv
+/// word after argv[0]; any other is a program and names a process by the
+/// final path component of argv[0], which for a td-jail launch is the entry
+/// path (`/app/bin/tmc` runs as `tmc`). Neither reads the other's field, so
+/// a wrapper carrying the program's name as an argument is not the program,
+/// a path component such as `bin` names nothing, and a word matches only
+/// whole.
 fn command_has_token(command: &[u8], token: &str) -> bool {
-    command
-        .split(|byte| *byte == 0)
-        .any(|argument| argument == token.as_bytes())
+    if token.is_empty() {
+        return false;
+    }
+    let token = token.as_bytes();
+    let mut arguments = command.split(|byte| *byte == 0);
+    let program = arguments.next().unwrap_or_default();
+    if token.starts_with(b"-") {
+        return arguments.any(|argument| argument == token);
+    }
+    let program_name = program
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or_default();
+    program_name == token
 }
 
 fn read_process_command(path: &Path) -> Option<Vec<u8>> {
@@ -397,12 +415,11 @@ fn revalidated_process_starttime(path: &Path, initial: u64) -> Option<u64> {
     (observed == initial).then_some(observed)
 }
 
-fn token_process_sandbox(
-    command: &[u8],
-    token: &str,
-    status: &str,
-    require_application_child: bool,
-) -> Option<ProcessSandbox> {
+/// The namespace-init td-jail stage is in the instance's cgroup under the
+/// same sandbox, runs as `td-jail`, and carries the entry path after
+/// `--launch`; a namespace PID above 1 is what every token requires of the
+/// process that answers for it, so that stage answers for none.
+fn token_process_sandbox(command: &[u8], token: &str, status: &str) -> Option<ProcessSandbox> {
     if !command_has_token(command, token) {
         return None;
     }
@@ -410,7 +427,7 @@ fn token_process_sandbox(
     (sandbox.no_new_privileges == 1
         && sandbox.seccomp == 2
         && sandbox.filters > 0
-        && (!require_application_child || sandbox.namespace_pid > 1))
+        && sandbox.namespace_pid > 1)
         .then_some(sandbox)
 }
 
@@ -448,14 +465,7 @@ pub(crate) fn probe_process_token(
         let Ok(status) = read_bounded(&proc_directory.join("status")) else {
             continue;
         };
-        if token_process_sandbox(
-            &command,
-            token,
-            &status,
-            token == FIREFOX_MAIN_PROCESS_TOKEN,
-        )
-        .is_none()
-        {
+        if token_process_sandbox(&command, token, &status).is_none() {
             continue;
         }
         let membership_path = format!("/proc/{pid}/cgroup");
@@ -471,7 +481,7 @@ pub(crate) fn probe_process_token(
         return Ok(process_token_evidence(&instance, token, pid, starttime));
     }
     Err(io::Error::other(format!(
-        "no process in active application cgroup {instance:?} has argument {token:?}"
+        "no process in active application cgroup {instance:?} runs as or has argument {token:?}"
     )))
 }
 
@@ -1187,8 +1197,10 @@ mod tests {
     }
 
     #[test]
-    fn process_argument_evidence_is_exact_and_bounded() {
+    fn process_token_evidence_is_exact_and_bounded() {
         assert!(valid_process_token("-contentproc"));
+        assert!(valid_process_token("tmc"));
+        assert!(valid_process_token("tn"));
         assert!(!valid_process_token(""));
         assert!(!valid_process_token("content proc"));
         assert!(!valid_process_token("bad\nargument"));
@@ -1199,7 +1211,32 @@ mod tests {
         assert!(command_has_token(command, "-contentproc"));
         assert!(!command_has_token(command, "contentproc"));
         assert!(!command_has_token(command, "-content"));
+        // The program an entry runs as, with or without a directory, and
+        // nothing in between: a path component is not a program name, and
+        // an argv[0] that ends in a slash names no program at all.
+        assert!(command_has_token(command, "firefox"));
+        assert!(command_has_token(b"/app/bin/tmc\0", "tmc"));
+        assert!(command_has_token(b"tn\0--offline\0", "tn"));
+        assert!(!command_has_token(b"/app/bin/tmc\0", "bin"));
+        assert!(!command_has_token(b"/app/bin/tmc\0", "tm"));
+        assert!(!command_has_token(b"/app/bin/tmc/\0", "tmc"));
+        assert!(!command_has_token(b"/\0", "tmc"));
+        assert!(!command_has_token(b"", "tmc"));
+        assert!(!command_has_token(b"/app/bin/tmc\0", ""));
+        // A program token reads argv[0] alone: a wrapper carrying the name
+        // as an argument is not the program, and the namespace-init stage,
+        // which carries the entry path after `--launch`, names no program
+        // by the path as a word either. A flag token reads the words alone.
+        assert!(!command_has_token(b"/usr/bin/strace\0-o\0log\0tmc\0", "tmc"));
+        assert!(!command_has_token(STAGE2_COMMAND, "tmc"));
+        assert!(!command_has_token(STAGE2_COMMAND, "/app/bin/tmc"));
+        assert!(!valid_process_token("/app/bin/tmc"));
+        assert!(command_has_token(STAGE2_COMMAND, "td-jail"));
+        assert!(!command_has_token(b"/app/bin/-contentproc\0", "-contentproc"));
     }
+
+    const STAGE2_COMMAND: &[u8] =
+        b"/td/store/h-td-jail-0.1.0/bin/td-jail\0--stage2\0tok\0--launch\0/app/bin/tmc\0";
 
     #[test]
     fn transient_or_oversized_process_commands_are_skipped() {
@@ -1241,48 +1278,55 @@ mod tests {
             "Name:\tfirefox\nNSpid:\t8123\t17\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n";
         let command = b"/app/lib/firefox/firefox\0--marionette\0";
         assert_eq!(
-            token_process_sandbox(command, "--marionette", status, true)
+            token_process_sandbox(command, "--marionette", status)
                 .unwrap()
                 .namespace_pid,
             17
         );
-        assert!(token_process_sandbox(command, "-contentproc", status, false).is_none());
-        assert!(token_process_sandbox(
-            command,
-            "--marionette",
-            &status.replace("NSpid:\t8123\t17", "NSpid:\t8123\t1"),
-            true,
-        )
-        .is_none());
+        assert!(token_process_sandbox(command, "-contentproc", status).is_none());
+        let namespace_init = status.replace("NSpid:\t8123\t17", "NSpid:\t8123\t1");
+        assert!(token_process_sandbox(command, "--marionette", &namespace_init).is_none());
         assert!(token_process_sandbox(
             command,
             "--marionette",
             &status.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
-            true,
         )
         .is_none());
         assert!(token_process_sandbox(
             command,
             "--marionette",
             &status.replace("Seccomp:\t2", "Seccomp:\t0"),
-            true,
         )
         .is_none());
         assert!(token_process_sandbox(
             command,
             "--marionette",
             &status.replace("Seccomp_filters:\t3", "Seccomp_filters:\t0"),
-            true,
         )
         .is_none());
 
         let content_command = b"/app/lib/firefox/firefox-bin\0-contentproc\0";
         assert_eq!(
-            token_process_sandbox(content_command, "-contentproc", status, false)
+            token_process_sandbox(content_command, "-contentproc", status)
                 .unwrap()
                 .namespace_pid,
             17
         );
+        assert!(token_process_sandbox(content_command, "-contentproc", &namespace_init).is_none());
+
+        // A program-name token is held to the same namespace PID: the entry
+        // is the namespace init's child, and the namespace init itself,
+        // which runs as `td-jail`, answers for no token.
+        let entry_command = b"/app/bin/tmc\0";
+        assert_eq!(
+            token_process_sandbox(entry_command, "tmc", status)
+                .unwrap()
+                .namespace_pid,
+            17
+        );
+        assert!(token_process_sandbox(entry_command, "tmc", &namespace_init).is_none());
+        assert!(token_process_sandbox(STAGE2_COMMAND, "td-jail", &namespace_init).is_none());
+        assert!(token_process_sandbox(STAGE2_COMMAND, "tmc", status).is_none());
     }
 
     #[test]
