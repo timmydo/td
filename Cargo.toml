@@ -36,3 +36,25 @@ members = ["builder", "recipes", "engine"]
 # has a stable target as the binaries grow. Profiles are only honoured at the
 # workspace root (member [profile.*] sections are ignored), so this is the one
 # place it can live for td-builder and td-recipe-eval.
+
+# td-builder and td-engine are optimized under the TEST profile. td-builder's
+# xz and bzip2 decoders are exercised on real release tarballs
+# (`xz::tests::decodes_real_release_tarballs` decodes a Linux tarball to some
+# 800 MiB), and an unoptimized decoder made those two tests the whole wall
+# clock of the workspace suite: 152 s and 43 s here, against 25 s and 4 s with
+# td-builder at opt-level 2, and 18 s and 4 s once td-engine — whose crc32 and
+# sha256 the xz decoder calls; bzip2 carries its own table — is optimized as
+# well; the next-longest test takes 14 s. Test only: `cargo test` alone reads
+# this, and `cargo build`, `check`, `clippy` and every release build are
+# untouched. These two packages only: the recipes crate has no such loop and
+# stays unoptimized itself, linking the one optimized engine unit. Only
+# `opt-level` is set, so the profile keeps `dev`'s debug assertions, overflow
+# checks and incremental builds — the tests are unchanged, only faster. A cold
+# test build costs some seventeen seconds more, an incremental one no more, and
+# neither package's non-test units share artifacts with `cargo build` any
+# longer. A debugger session wants unoptimized locals; one run gets them with
+# `cargo test --config profile.test.package.td-builder.opt-level=0`.
+[profile.test.package.td-builder]
+opt-level = 2
+[profile.test.package.td-engine]
+opt-level = 2
