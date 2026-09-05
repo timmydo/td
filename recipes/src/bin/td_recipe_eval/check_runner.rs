@@ -3510,6 +3510,54 @@ pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String
     Ok(out)
 }
 
+/// The check-owning recipes a change under `dirs` can reach: each whose
+/// closure holds a recipe that may read one of them — by the catalog's
+/// named-directory table (`catalog::named_dirs`), or a `local_source` under
+/// it. A scope none of whose directories any recipe reads is an error
+/// rather than an empty reach: a scope that missed a read would skip every
+/// check, so the caller lists them all instead. One unread directory beside
+/// a read one contributes nothing: the dispatcher sends a changed crate with
+/// its readers, and a reader no recipe embeds is not a miss. `dirs` are
+/// top-level directory names.
+pub(crate) fn checks_reaching(dirs: &[&str]) -> Result<BTreeSet<String>, String> {
+    if dirs.is_empty() {
+        return Err("empty scope".to_string());
+    }
+    let all = catalog::all();
+    let mut reached: BTreeSet<&str> = BTreeSet::new();
+    for dir in dirs {
+        let dir = dir.trim_end_matches('/');
+        if dir.is_empty() || dir.contains('/') || dir.contains("..") {
+            return Err(format!("scope `{dir}` is not a top-level directory name"));
+        }
+        let under = format!("{dir}/");
+        for (stem, recipe) in &all {
+            let local = recipe.local_source.as_deref().map(|s| s.trim_start_matches("./"));
+            let reads = catalog::named_dirs(stem).contains(&dir)
+                || local.is_some_and(|s| s == dir || s.starts_with(&under));
+            if reads {
+                reached.insert(stem);
+            }
+        }
+    }
+    if reached.is_empty() {
+        return Err(format!("no recipe reads any of {}", dirs.join(" ")));
+    }
+    let catalog: BTreeMap<&str, Recipe> = all.iter().map(|(s, r)| (*s, r.clone())).collect();
+    let mut out = BTreeSet::new();
+    for (stem, recipe) in &all {
+        if recipe.checks.as_ref().is_none_or(|c| c.is_empty()) {
+            continue;
+        }
+        let mut closure = Vec::new();
+        visit_recipe(stem, &catalog, &mut HashSet::new(), &mut HashSet::new(), &mut closure)?;
+        if closure.iter().any(|n| reached.contains(n.stem.as_str())) {
+            out.insert((*stem).to_string());
+        }
+    }
+    Ok(out)
+}
+
 fn visit_recipe(
     stem: &str,
     catalog: &BTreeMap<&str, Recipe>,
@@ -7122,9 +7170,20 @@ chmod 755 '{}'
         assert!(reapable_scratch(base));
 
         // Released, the first name is reusable — a dead predecessor does not cost a
-        // name forever.
+        // name forever. Asked again for a while rather than once: the lock is on
+        // the open file description, which a child that a sibling test is between
+        // forking and exec'ing still holds a copy of until exec closes it, so under
+        // load the first ask can find the released name held for a moment.
         drop(hold_first);
-        let (again, _hold) = claim_scratch(&root, name).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (again, _hold) = loop {
+            let claimed = claim_scratch(&root, name).unwrap();
+            if claimed.0 == first || std::time::Instant::now() >= deadline {
+                break claimed;
+            }
+            drop(claimed);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert_eq!(again, first);
         let _ = fs::remove_dir_all(&lw);
     }
@@ -7948,6 +8007,54 @@ chmod 755 '{}'
         assert!(!is_plain_basename("a\tb"));
         assert!(!is_plain_basename("a\\b"));
         assert!(!is_plain_basename("..\\etc"));
+    }
+
+    /// The reach of a scope: td-compositor, a directory td-portal's recipe
+    /// embeds, selects exactly the checks whose closure builds a recipe that
+    /// names it and leaves the rest; a scope nothing reads is an error
+    /// rather than an empty list, and so is one that is not a directory
+    /// name, while an unread directory beside a read one changes nothing.
+    #[test]
+    fn checks_reaching_follows_the_embeds_through_the_closure() {
+        let reached = checks_reaching(&["td-compositor"]).expect("reach");
+        assert!(!reached.is_empty());
+        // Both directions: every selected owner reads the crate somewhere in
+        // its closure, and every check owner that does is selected — the
+        // second is the one a dropped owner would fail.
+        let all = catalog::all();
+        let reads = |stem: &str| {
+            catalog::named_dirs(stem).contains(&"td-compositor")
+                || all.iter().any(|(s, r)| {
+                    *s == stem
+                        && r.local_source.as_deref().is_some_and(|l| {
+                            let l = l.trim_start_matches("./");
+                            l == "td-compositor" || l.starts_with("td-compositor/")
+                        })
+                })
+        };
+        for (stem, recipe) in &all {
+            if recipe.checks.as_ref().is_none_or(|c| c.is_empty()) {
+                continue;
+            }
+            let closure = recipe_closure(&[stem]).expect("closure");
+            let expected = closure.iter().any(|n| reads(&n.stem));
+            assert_eq!(
+                expected,
+                reached.contains(*stem),
+                "{stem}: reads td-compositor in its closure {expected}, selected {}",
+                reached.contains(*stem)
+            );
+        }
+        assert!(!reached.contains("curl-x86-64-test"), "{reached:?}");
+        let every = checks_reaching(&["td-boot"]).expect("reach");
+        assert!(every.len() > reached.len(), "{every:?}");
+        assert!(checks_reaching(&["no-such-dir"]).is_err());
+        assert_eq!(
+            checks_reaching(&["td-compositor", "no-such-dir"]).expect("reach beside an unread dir"),
+            reached
+        );
+        assert!(checks_reaching(&["td-sh/src"]).is_err());
+        assert!(checks_reaching(&[]).is_err());
     }
 
     // The reuse memo round-trips, and a stale-plan file (header fingerprint != the

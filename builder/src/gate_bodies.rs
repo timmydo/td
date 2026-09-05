@@ -177,6 +177,21 @@ fn run_out(program: &str, args: &[&str], ctx: &str) -> Result<String, String> {
     run_out_env(program, args, &[], ctx)
 }
 
+/// A `check-list` output split into the evaluator's `# ` notes and the check
+/// names, one per line or several, in order. The notes ride stdout because
+/// `run_out_env` keeps stderr only for a failure.
+fn split_check_list(raw: &str) -> (Vec<&str>, Vec<&str>) {
+    let mut notes = Vec::new();
+    let mut stems = Vec::new();
+    for line in raw.lines() {
+        match line.strip_prefix("# ") {
+            Some(note) => notes.push(note.trim()),
+            None => stems.extend(line.split_whitespace()),
+        }
+    }
+    (notes, stems)
+}
+
 /// `run_out`, plus extra env vars set on the child (inheriting the rest of the
 /// current environment — never `env -i`, matching the bash gates' bare
 /// `VAR=val cmd` prefix form).
@@ -1680,10 +1695,70 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
         ("TD_STAGE0_BASE", &stage0_base),
     ];
 
-    let checks = run_out_env(&eval_s, &["check-list"], &envs, "td-recipe-eval check-list")?;
-    if checks.trim().is_empty() {
+    let every = run_out_env(&eval_s, &["check-list"], &envs, "td-recipe-eval check-list")?;
+    if every.trim().is_empty() {
         return Err("FAIL: no recipe checks selected".to_string());
     }
+    // A confined change runs the checks it can reach. The evaluator decides
+    // the reach from its own table of what each recipe embeds, and lists
+    // everything when a scope is one nothing reads; the checks left out are
+    // NAMED, in the report too, so a scoped run never reads as a full one.
+    let scope = crate::check_loop::check_scope(
+        std::env::var_os("TD_CHECK_FULL").is_some(),
+        std::env::var(crate::check_loop::CHECK_SCOPE_ENV).ok().as_deref(),
+    );
+    let mut unreached: Vec<String> = Vec::new();
+    let checks = match &scope {
+        None => every.clone(),
+        Some(dirs) => {
+            let mut args: Vec<&str> = vec!["check-list", "--reaching"];
+            args.extend(dirs.iter().map(String::as_str));
+            let raw = run_out_env(&eval_s, &args, &envs, "td-recipe-eval check-list --reaching")?;
+            let (notes, stems) = split_check_list(&raw);
+            let listed = stems.join(" ");
+            unreached = every
+                .split_whitespace()
+                .filter(|c| !stems.contains(c))
+                .map(str::to_string)
+                .collect();
+            let (reached, total) = (stems.len(), every.split_whitespace().count());
+            for note in &notes {
+                println!(">> recipe-checks: evaluator: {note}");
+            }
+            // A full list must not read as a narrowing, and a miss must say
+            // it was one: the evaluator's note carries the reason.
+            if !notes.is_empty() {
+                println!(
+                    ">> recipe-checks: the evaluator could not map a change under [{}] to \
+                     the checks it reaches and listed every one; running all {total}",
+                    dirs.join(" ")
+                );
+            } else if reached == total {
+                println!(
+                    ">> recipe-checks: a change under [{}] reaches every one of the {total} \
+                     check(s); running all {total}",
+                    dirs.join(" ")
+                );
+            } else {
+                println!(
+                    ">> recipe-checks: scoped to what a change under [{}] reaches: {reached} of \
+                     {total} check(s)",
+                    dirs.join(" ")
+                );
+            }
+            if listed.trim().is_empty() {
+                println!(
+                    "PASS: recipe-checks - no recipe check reaches a change under [{}]; none \
+                     of {} run: {} (td-builder check recipe-checks runs them all)",
+                    dirs.join(" "),
+                    unreached.len(),
+                    unreached.join(" ")
+                );
+                return Ok(());
+            }
+            listed
+        }
+    };
 
     // The whole work list first: every (spec, index) this run will execute. Built
     // before anything runs so the checks can be dispatched CONCURRENTLY — one
@@ -1737,7 +1812,7 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
         }
     }
 
-    let (report, verdict) = recipe_checks_verdict(ran, failures, &skipped, memoized);
+    let (report, verdict) = recipe_checks_verdict(ran, failures, &skipped, memoized, &unreached);
     for line in report {
         println!("{line}");
     }
@@ -1759,6 +1834,7 @@ fn recipe_checks_verdict(
     failures: usize,
     skipped: &[String],
     memoized: usize,
+    unreached: &[String],
 ) -> (Vec<String>, Result<(), String>) {
     // The caveat rides the FAIL arm too: "1 of 25 failed" alongside 20 silent
     // skips reads as though 24 checks vouched for the tree.
@@ -1781,9 +1857,20 @@ fn recipe_checks_verdict(
              them again"
         )
     });
+    // The checks a scope left out are named here, beside the verdict — the
+    // top of a long log says only how many it runs — and on the FAIL arm too:
+    // "1 of 3 failed" over 41 unreached reads as a suite of three.
+    let unreached_note = (!unreached.is_empty()).then(|| {
+        format!(
+            ">> recipe-checks: {} check(s) not reached by the change and not run: {} \
+             (td-builder check recipe-checks runs them all)",
+            unreached.len(),
+            unreached.join(" ")
+        )
+    });
     if failures != 0 {
         return (
-            caveat.into_iter().chain(memo_note).collect(),
+            caveat.into_iter().chain(memo_note).chain(unreached_note).collect(),
             Err(format!(
                 "FAIL: recipe-checks - {failures} of {ran} recipe-owned check(s) failed"
             )),
@@ -1810,6 +1897,7 @@ fn recipe_checks_verdict(
     // a full one — and prose coupling is what broke twice (#268, #315).
     let mut lines: Vec<String> = caveat.into_iter().collect();
     lines.extend(memo_note);
+    lines.extend(unreached_note);
     let fresh = ran.saturating_sub(skipped.len()).saturating_sub(memoized);
     let memo_note = if memoized != 0 {
         format!(" ({memoized} memoized)")
@@ -3946,12 +4034,12 @@ mod tests {
         let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
 
         // A real failure outranks any number of skips.
-        let (_, v) = recipe_checks_verdict(25, 1, &s(&["a#1"]), 0);
+        let (_, v) = recipe_checks_verdict(25, 1, &s(&["a#1"]), 0, &[]);
         assert!(v.unwrap_err().starts_with("FAIL: "));
 
         // Nothing ran anywhere here → the gate's own tolerated skip, tagged so
         // `cli` maps it to 69 + sentinel rather than a bare failure.
-        let (_, v) = recipe_checks_verdict(3, 0, &s(&["a#1", "b#1", "c#1"]), 0);
+        let (_, v) = recipe_checks_verdict(3, 0, &s(&["a#1", "b#1", "c#1"]), 0, &[]);
         let err = v.unwrap_err();
         assert!(err.starts_with(UNPROVISIONED_TAG), "{err:?}");
         assert!(err.contains("a#1 b#1 c#1"), "names them: {err:?}");
@@ -3959,17 +4047,17 @@ mod tests {
 
         // A failure does not excuse dropping the caveat: "1 of 25 failed" over
         // 20 silent skips reads as though 24 checks vouched for the tree.
-        let (lines, v) = recipe_checks_verdict(25, 1, &s(&["a#1", "b#1"]), 0);
+        let (lines, v) = recipe_checks_verdict(25, 1, &s(&["a#1", "b#1"]), 0, &[]);
         assert!(v.is_err() && lines.len() == 1, "{lines:?}");
         assert!(lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL));
         assert!(lines[0].contains("a#1 b#1"));
 
         // Nothing ran at all is never a pass.
-        let (_, v) = recipe_checks_verdict(0, 0, &[], 0);
+        let (_, v) = recipe_checks_verdict(0, 0, &[], 0, &[]);
         assert!(v.is_err(), "0 checks must not report green");
 
         // Partial → green, but the caveat comes FIRST and names every skip.
-        let (lines, v) = recipe_checks_verdict(3, 0, &s(&["b#1"]), 0);
+        let (lines, v) = recipe_checks_verdict(3, 0, &s(&["b#1"]), 0, &[]);
         assert!(v.is_ok());
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("NOT full coverage") && lines[0].contains("b#1"));
@@ -3983,7 +4071,7 @@ mod tests {
         assert!(lines[1].starts_with("PASS: ") && lines[1].contains("ran 2 of 3"));
 
         // Clean run → one PASS line, no caveat.
-        let (lines, v) = recipe_checks_verdict(3, 0, &[], 0);
+        let (lines, v) = recipe_checks_verdict(3, 0, &[], 0, &[]);
         assert!(v.is_ok() && lines.len() == 1 && lines[0].starts_with("PASS: "));
         assert!(
             !lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL),
@@ -3991,30 +4079,55 @@ mod tests {
         );
     }
 
+    /// A scoped run names what it left out beside its verdict.
+    #[test]
+    fn a_scoped_run_names_the_checks_it_did_not_reach() {
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let (lines, v) = recipe_checks_verdict(9, 0, &[], 0, &s(&["x#1", "y#2"]));
+        assert!(v.is_ok());
+        assert!(
+            lines.iter().any(|l| l.contains("2 check(s) not reached") && l.contains("x#1 y#2")),
+            "{lines:?}"
+        );
+        assert!(lines.last().is_some_and(|l| l.starts_with("PASS: recipe-checks - ran 9 of 9")));
+        let (lines, _) = recipe_checks_verdict(9, 0, &[], 0, &[]);
+        assert!(!lines.iter().any(|l| l.contains("not reached")), "{lines:?}");
+        let (lines, v) = recipe_checks_verdict(9, 1, &[], 0, &s(&["x#1"]));
+        assert!(v.is_err());
+        assert!(
+            lines.iter().any(|l| l.contains("1 check(s) not reached") && l.contains("x#1")),
+            "a failure still names what the scope left out: {lines:?}"
+        );
+        let (notes, stems) = split_check_list("# scope miss: no recipe reads x\na\nb c\n");
+        assert_eq!(notes, vec!["scope miss: no recipe reads x"]);
+        assert_eq!(stems, vec!["a", "b", "c"]);
+        assert_eq!(split_check_list(""), (vec![], vec![]));
+    }
+
     /// A memoized pass is a pass that is counted apart and said out loud, on
     /// its own line and in the PASS line's count, so a run that answered
     /// everything from the memo cannot read as one that re-proved it all.
     #[test]
     fn recipe_checks_reports_memoized_passes_apart() {
-        let (lines, v) = recipe_checks_verdict(44, 0, &[], 41);
+        let (lines, v) = recipe_checks_verdict(44, 0, &[], 41, &[]);
         assert!(v.is_ok());
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("41 of 44") && lines[0].contains("TD_CHECK_FULL=1"));
         assert!(lines[1].starts_with("PASS: ") && lines[1].contains("ran 3 of 44 (41 memoized)"));
         // All memoized is still green: every check has a pass on record for
         // exactly these inputs.
-        let (lines, v) = recipe_checks_verdict(3, 0, &[], 3);
+        let (lines, v) = recipe_checks_verdict(3, 0, &[], 3, &[]);
         assert!(v.is_ok() && lines[1].contains("ran 0 of 3 (3 memoized)"), "{lines:?}");
         // A failure still outranks it, and the count of what ran is honest
         // beside a skip.
-        let (lines, v) = recipe_checks_verdict(3, 1, &[], 2);
+        let (lines, v) = recipe_checks_verdict(3, 1, &[], 2, &[]);
         assert!(
             lines.iter().any(|l| l.contains("2 of 3 check(s) answered from the verdict memo")),
             "a failure beside memoized passes still counts them: {lines:?}"
         );
         assert!(v.is_err());
         let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
-        let (lines, v) = recipe_checks_verdict(4, 0, &s(&["a#1"]), 2);
+        let (lines, v) = recipe_checks_verdict(4, 0, &s(&["a#1"]), 2, &[]);
         assert!(v.is_ok() && lines.last().is_some_and(|l| l.contains("ran 1 of 4 (2 memoized)")), "{lines:?}");
     }
 

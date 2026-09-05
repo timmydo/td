@@ -9,6 +9,9 @@
 
 pub mod application;
 pub mod catalog;
+// The build script's source scans, here for their tests only.
+#[cfg(test)]
+mod embed_scan;
 // JSON value/parser/canonical writer lives in the shared, std-only td-engine
 // (one copy for td-recipe-eval + td-builder). Re-exported so `crate::json::` /
 // `td_recipe::json::` paths are unchanged.

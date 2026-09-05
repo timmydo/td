@@ -24,6 +24,19 @@ pub fn all() -> Vec<(&'static str, Recipe)> {
     registry::all()
 }
 
+/// The `td-*` directories recipe `stem` may read: the crate sources its own
+/// file embeds, and those the crate's shared modules embed, which any recipe
+/// may use. A change under one of them can change what the recipe builds;
+/// no other change to a crate can, short of the evaluator itself. Read from
+/// the sources at build time by `build.rs`, so it is the table of the binary
+/// that answers. Empty for an unknown stem.
+pub fn named_dirs(stem: &str) -> &'static [&'static str] {
+    registry::named_dirs()
+        .iter()
+        .find(|(s, _)| *s == stem)
+        .map_or(&[][..], |(_, dirs)| dirs)
+}
+
 mod registry {
     include!(concat!(env!("OUT_DIR"), "/registry.rs"));
 }
@@ -470,5 +483,101 @@ mod tests {
         ] {
             assert!(rust.contains(required), "rust bootstrap omitted {required}");
         }
+    }
+}
+
+#[cfg(test)]
+mod named_dirs_tests {
+    use super::*;
+
+    /// The table carries the embeds the tree has: td-portal builds out of
+    /// td-compositor and td-busd, and every recipe may reach td-boot's
+    /// protocol through the crate's shared module. Each list is sorted, names
+    /// only `td-*` directories, and an unknown stem has none.
+    #[test]
+    fn named_dirs_carry_the_embeds_the_recipes_spell() {
+        let portal = named_dirs("td-portal");
+        for dir in ["td-busd", "td-compositor", "td-portal"] {
+            assert!(portal.contains(&dir), "td-portal: {portal:?}");
+        }
+        assert!(named_dirs("td-sh").contains(&"td-sh"));
+        assert!(!named_dirs("td-sh").contains(&"td-compositor"));
+        for (stem, _) in all() {
+            let dirs = named_dirs(stem);
+            assert!(dirs.contains(&"td-boot"), "{stem}: {dirs:?}");
+            assert!(dirs.contains(&"td-profiler"), "{stem}: {dirs:?}");
+            assert!(
+                dirs.iter().zip(dirs.iter().skip(1)).all(|(a, b)| a < b),
+                "{stem}: {dirs:?}"
+            );
+            assert!(dirs.iter().all(|d| d.starts_with("td-")), "{stem}: {dirs:?}");
+        }
+        assert!(named_dirs("no-such-recipe").is_empty());
+    }
+
+    /// The evaluator's own sources under `src/bin/` are outside the shared
+    /// scan, on the ground that they embed crate files only in their test
+    /// modules: a runtime include there would change a check's assertions
+    /// without changing any recipe, and neither the scope nor the verdict
+    /// key would see it. So every include naming `td-` must lie inside a
+    /// top-level `#[cfg(test)] mod`, found by its column-0 attribute over
+    /// `mod x {` and closed by brace count outside literals and comments —
+    /// not merely after the file's first `#[cfg(test)]`, which qemu_boot.rs
+    /// puts on single items in the middle of production code. The test
+    /// modules' own embeds prove the spans are found.
+    #[test]
+    fn the_evaluator_embeds_crate_files_only_in_its_test_modules() {
+        use crate::embed_scan::{block_end, strip_comments};
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+        let mut pending = vec![bin];
+        let (mut seen, mut in_tests) = (0usize, 0usize);
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("list src/bin") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let code = strip_comments(&std::fs::read_to_string(&path).expect("read"));
+                let mut spans: Vec<(usize, usize)> = Vec::new();
+                let mut offset = 0usize;
+                let mut after_attr = false;
+                for line in code.split_inclusive('\n') {
+                    let text = line.trim_end();
+                    if after_attr && text.starts_with("mod ") && text.ends_with('{') {
+                        let open = offset + line.rfind('{').expect("brace");
+                        let close = block_end(&code, open).unwrap_or_else(|| {
+                            panic!("{}: test module at byte {open} never closes", path.display())
+                        });
+                        spans.push((open, close));
+                    }
+                    after_attr = text == "#[cfg(test)]";
+                    offset += line.len();
+                }
+                let mut offset = 0usize;
+                for (n, line) in code.split_inclusive('\n').enumerate() {
+                    let embeds = line.contains("include_str!")
+                        || line.contains("include_bytes!")
+                        || line.contains("#[path");
+                    if embeds && line.contains("td-") {
+                        assert!(
+                            spans.iter().any(|(open, close)| (*open..*close).contains(&offset)),
+                            "{}:{}: embed of a crate file outside a test module: {}",
+                            path.display(),
+                            n + 1,
+                            line.trim()
+                        );
+                        in_tests += 1;
+                    }
+                    offset += line.len();
+                }
+                seen += 1;
+            }
+        }
+        assert!(seen > 3, "scanned {seen} evaluator sources");
+        assert!(in_tests >= 4, "the test modules' own embeds prove the spans: {in_tests}");
     }
 }

@@ -1582,6 +1582,13 @@ fn format_output(
         }
         if !sel.targets.is_empty() {
             o.push_str(&format!("  {}\n", check_command(&sel.targets)));
+            if let Some(dirs) = check_scope(root, changed, &sel.targets) {
+                o.push_str(&format!(
+                    "  recipe-checks scope: {} ({} on the command above)\n",
+                    dirs.join(" "),
+                    crate::check_loop::CHECK_SCOPE_ENV
+                ));
+            }
         }
     }
 
@@ -2637,23 +2644,22 @@ fn sort_unique(mut v: Vec<String>) -> Vec<String> {
 
 /// Run the loop entry — THIS binary's `check` subcommand (check.sh is retired;
 /// the td programs are called directly, #318).
-fn run_self_check(root: &Path, targets: &[String]) -> i32 {
+/// `td-builder check <targets>`, with the recipe-checks scope on its
+/// environment where the change has one: the same `check_scope` the dry run
+/// printed, over the same paths.
+fn run_self_check(root: &Path, targets: &[String], changed: &[String]) -> i32 {
     let Ok(me) = std::env::current_exe() else {
         return 1;
     };
-    let mut args: Vec<String> = vec!["check".to_string()];
-    args.extend(targets.iter().cloned());
-    run_command(root, &me.display().to_string(), &args)
-}
-
-fn run_command(root: &Path, program: &str, args: &[String]) -> i32 {
-    Command::new(program)
-        .args(args)
-        .current_dir(root)
-        .status()
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(1)
+    let mut cmd = Command::new(&me);
+    cmd.arg("check").args(targets).current_dir(root);
+    // The child's scope is this run's or none: one exported by the caller's
+    // shell must not outlive a change that has left the roster.
+    cmd.env_remove(crate::check_loop::CHECK_SCOPE_ENV);
+    if let Some(dirs) = check_scope(root, changed, targets) {
+        cmd.env(crate::check_loop::CHECK_SCOPE_ENV, dirs.join(" "));
+    }
+    cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
 }
 
 fn run_shell(root: &Path, script: &str) -> i32 {
@@ -3469,39 +3475,11 @@ const HOST_ONLY_ENGINE_SOURCES: [&str; 1] = ["builder/src/ready.rs"];
 fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, String> {
     let all = cargo_test_cmds_all(root)?;
     let roster = discover_gate_crates(root)?;
-    let mut selected: Vec<String> = Vec::new();
-    for p in changed {
-        // A `..` is refused rather than resolved: `td-review/../td-sh/x.rs`
-        // starts with the crate and names another. git never emits one, so this
-        // is reachable only through `--path`.
-        if p.contains("..") {
-            return Ok(all);
-        }
-        let owner = roster.iter().find(|c| {
-            // The separator matters: `td-reviewer/x` is not `td-review/x`.
-            p.starts_with(&c.name) && p.as_bytes().get(c.name.len()) == Some(&b'/')
-        });
-        match owner {
-            Some(c) => push_unique(&mut selected, &c.name),
-            None => return Ok(all),
-        }
-    }
-    if selected.is_empty() {
+    let Some(mut selected) = changed_roster_crates(&roster, changed) else {
         return Ok(all);
-    }
+    };
     let readers = crate_readers(root, &roster)?;
-    // Closed over readers: a crate pushed here is itself looked up in turn.
-    let mut i = 0;
-    while let Some(name) = selected.get(i).cloned() {
-        for (read, its_readers) in &readers {
-            if *read == name {
-                for reader in its_readers {
-                    push_unique(&mut selected, reader);
-                }
-            }
-        }
-        i = i.saturating_add(1);
-    }
+    close_over_readers(&mut selected, &readers);
     let narrowed: Vec<String> = all
         .iter()
         .filter(|cmd| match cmd_manifest_crate(cmd) {
@@ -3522,6 +3500,63 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
         true => Ok(narrowed),
         false => Ok(all),
     }
+}
+
+/// The roster crates a change is confined to, in first-seen order, or None
+/// where any path is not inside one: `builder/`, an unmapped file, an empty
+/// diff, or a `..`, which is refused rather than resolved since
+/// `td-review/../td-sh/x.rs` starts with one crate and names another (git
+/// never emits one, so it is reachable only through `--path`).
+fn changed_roster_crates(roster: &[GateCrate], changed: &[String]) -> Option<Vec<String>> {
+    let mut selected: Vec<String> = Vec::new();
+    for p in changed {
+        if p.contains("..") {
+            return None;
+        }
+        // The separator matters: `td-reviewer/x` is not `td-review/x`.
+        let owner = roster
+            .iter()
+            .find(|c| p.starts_with(&c.name) && p.as_bytes().get(c.name.len()) == Some(&b'/'))?;
+        push_unique(&mut selected, &owner.name);
+    }
+    (!selected.is_empty()).then_some(selected)
+}
+
+/// Close `selected` over the reader graph: a crate pushed here is itself
+/// looked up in turn, since a reader of a reader saw the change too.
+fn close_over_readers(selected: &mut Vec<String>, readers: &[(String, Vec<String>)]) {
+    let mut i = 0;
+    while let Some(name) = selected.get(i).cloned() {
+        for (read, its_readers) in readers {
+            if *read == name {
+                for reader in its_readers {
+                    push_unique(selected, reader);
+                }
+            }
+        }
+        i = i.saturating_add(1);
+    }
+}
+
+/// The recipe-checks scope of a change: the roster crates it is confined
+/// to, closed over their readers and sorted, when the targets run the
+/// recipe-checks gate at all; None otherwise, which runs every check. The
+/// same confinement the cargo narrowing uses, so the two cannot disagree
+/// about what a change touches; the evaluator turns the crates into checks
+/// from its own table of what each recipe embeds. A tree the reader scan
+/// cannot read gives no scope, and the cargo preflight over the same tree
+/// has already failed the run by then.
+fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Vec<String>> {
+    let runs_recipe_checks = targets.iter().any(|t| t == "check" || t == "recipe-checks");
+    if !runs_recipe_checks {
+        return None;
+    }
+    let roster = discover_gate_crates(root).ok()?;
+    let mut selected = changed_roster_crates(&roster, changed)?;
+    let readers = crate_readers(root, &roster).ok()?;
+    close_over_readers(&mut selected, &readers);
+    selected.sort();
+    Some(selected)
 }
 
 /// The crate a `--manifest-path <crate>/Cargo.toml` command names; None for the
@@ -3865,7 +3900,7 @@ pub fn run(args: &[String]) -> u8 {
     // Nothing escalates to the full loop: every diff runs its bounded selected
     // targets.
     if !sel.targets.is_empty() {
-        let code = run_self_check(&root, &sel.targets);
+        let code = run_self_check(&root, &sel.targets, &changed);
         // EXIT_UNPROVISIONED is the loop's documented "nothing could run
         // here" machine signal. It is explained loudly here but PROPAGATED UNCHANGED —
         // never rewritten to success: the run did not validate the targets,
@@ -4134,6 +4169,40 @@ mod tests {
                 assert!(roster.iter().any(|c| c.name == *reader), "{reader} is off the roster");
             }
         }
+    }
+
+    /// The recipe-checks scope follows the cargo narrowing's confinement: a
+    /// td-compositor change scopes to it and its readers, a change that leaves
+    /// the roster has none, `..` has none, and targets without the
+    /// recipe-checks gate have none. The dry run prints the scope on its own
+    /// line under the check command, and only then.
+    #[test]
+    fn the_check_scope_is_the_confinement_the_cargo_narrowing_uses() {
+        let root = repo_root();
+        if discover_gate_crates(&root).is_err() {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        }
+        let check = vec!["check".to_string(), "recipe-checks".to_string()];
+        let paths = |ps: &[&str]| ps.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            check_scope(&root, &paths(&["td-compositor/src/main.rs"]), &check),
+            Some(paths(&["td-compositor", "td-editor", "td-portal"]))
+        );
+        assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check), Some(paths(&["td-sh"])));
+        assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs", "builder/src/x.rs"]), &check), None);
+        assert_eq!(check_scope(&root, &paths(&["td-sh/../td-txt/x.rs"]), &check), None);
+        assert_eq!(check_scope(&root, &[], &check), None);
+        assert_eq!(
+            check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &paths(&["check-engine"])),
+            None
+        );
+        let out = path_output(&root, "td-sh/src/lib.rs");
+        assert!(
+            out.contains("  td-builder check check recipe-checks\n  recipe-checks scope: td-sh (TD_CHECK_SCOPE on the command above)\n"),
+            "{out}"
+        );
+        assert!(!path_output(&root, "check.sh").contains("recipe-checks scope"));
     }
 
     /// A target the manifest declares outside the walked directories is read

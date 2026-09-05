@@ -29,6 +29,12 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 mod sha256;
 
+// The two scans over this crate's sources, kept in the library so its tests
+// cover them: a build script has no tests of its own.
+#[path = "src/embed_scan.rs"]
+mod embed_scan;
+use embed_scan::{strip_comments, td_dirs_embedded, td_dirs_named};
+
 fn main() -> Result<(), Box<dyn Error>> {
     // The directory path retriggers on file ADDS/REMOVES (dir mtime); an EDIT to
     // an existing file does NOT change the dir mtime, so each recipe file is
@@ -38,10 +44,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
     let recipes_dir = PathBuf::from(&manifest_dir).join("src/recipes");
-    // (stem, module) pairs. The module name is the stem with '-' mapped to '_',
-    // emitted as a raw identifier (`r#...`) so stems that collide with Rust
-    // keywords (`true`, `move`, `loop`, ...) still compile.
-    let mut recipes: Vec<(String, String)> = Vec::new();
+    // (stem, module, named dirs) triples. The module name is the stem with '-'
+    // mapped to '_', emitted as a raw identifier (`r#...`) so stems that
+    // collide with Rust keywords (`true`, `move`, `loop`, ...) still compile.
+    // The named dirs are the `td-*` directories the file spells, which is how
+    // a recipe embeds crate sources (`include_str!("../../../td-sh/...")`).
+    let mut recipes: Vec<(String, String, Vec<String>)> = Vec::new();
     for entry in fs::read_dir(&recipes_dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -86,24 +94,103 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
-        recipes.push((stem.to_string(), module));
+        let text = fs::read_to_string(entry.path())?;
+        recipes.push((stem.to_string(), module, td_dirs_named(&text)));
     }
     recipes.sort();
     if recipes.is_empty() {
         return Err("src/recipes is empty — the catalog would be vacuous".into());
     }
+    // The library's shared modules — everything under `src/` but the recipe
+    // files and the evaluator's own `src/bin/` — embed crate sources too
+    // (`lib.rs` places td-boot's protocol and td-profiler's contract by
+    // `#[path]`), and any recipe may use one, so what they EMBED is every
+    // recipe's. Only what they embed: a shared module multiplies into every
+    // recipe, and `ladder.rs`'s doc comments cite the compositor sources
+    // whose markers it duplicates, which would make every check a reader of
+    // td-compositor. A recipe file keeps the wide rule, where a stray name
+    // widens one recipe's reach and not all of them. The evaluator's own
+    // sources embed crate files only in their test modules, which
+    // `catalog::named_dirs_tests` pins. And a crate a shared module names in
+    // code without embedding it is an error here, not a narrowed scope: it
+    // is a read the embed scan would miss, or prose that belongs in a
+    // comment.
+    let repo = PathBuf::from(&manifest_dir);
+    let repo = repo.parent().ok_or("recipes crate has no parent directory")?;
+    let mut crate_dirs: Vec<String> = Vec::new();
+    for entry in fs::read_dir(repo)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("td-") && entry.path().join("Cargo.toml").is_file() {
+            crate_dirs.push(name);
+        }
+    }
+    let mut shared: Vec<String> = Vec::new();
+    let src = PathBuf::from(&manifest_dir).join("src");
+    let mut pending = vec![src.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                if dir == src && (name == "recipes" || name == "bin") {
+                    continue;
+                }
+                pending.push(path);
+            } else if name.to_string_lossy().ends_with(".rs") {
+                let text = fs::read_to_string(&path)?;
+                let embedded = td_dirs_embedded(&text);
+                for named in td_dirs_named(&strip_comments(&text)) {
+                    if crate_dirs.contains(&named) && !embedded.contains(&named) {
+                        return Err(format!(
+                            "{}: names `{named}/` outside a comment without embedding it; a \
+                             shared module reads a crate only through a `#[path]` or \
+                             `include_*!` literal, which is what the recipe-checks scope sees",
+                            path.display()
+                        )
+                        .into());
+                    }
+                }
+                for d in embedded {
+                    if !shared.contains(&d) {
+                        shared.push(d);
+                    }
+                }
+            }
+        }
+    }
 
     let mut out = String::new();
     writeln!(out, "// @generated by build.rs from src/recipes/*.rs — do not edit.")?;
-    for (stem, module) in &recipes {
+    for (stem, module, _) in &recipes {
         let path = format!("{manifest_dir}/src/recipes/{stem}.rs");
         writeln!(out, "#[path = {path:?}]")?;
         writeln!(out, "pub mod r#{module};")?;
     }
     writeln!(out, "pub fn all() -> Vec<(&'static str, crate::types::Recipe)> {{")?;
     writeln!(out, "    vec![")?;
-    for (stem, module) in &recipes {
+    for (stem, module, _) in &recipes {
         writeln!(out, "        ({stem:?}, r#{module}::recipe()),")?;
+    }
+    writeln!(out, "    ]")?;
+    writeln!(out, "}}")?;
+    writeln!(out, "/// The `td-*` directories each recipe may read: those its own file")?;
+    writeln!(out, "/// names, and those a shared module of this crate names. Sorted.")?;
+    writeln!(
+        out,
+        "pub fn named_dirs() -> &'static [(&'static str, &'static [&'static str])] {{"
+    )?;
+    writeln!(out, "    &[")?;
+    for (stem, _, dirs) in &recipes {
+        let mut every: Vec<&String> = dirs.iter().chain(shared.iter()).collect();
+        every.sort();
+        every.dedup();
+        let list: Vec<String> = every.iter().map(|d| format!("{d:?}")).collect();
+        writeln!(out, "        ({stem:?}, &[{}]),", list.join(", "))?;
     }
     writeln!(out, "    ]")?;
     writeln!(out, "}}")?;

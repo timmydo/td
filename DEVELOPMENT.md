@@ -69,6 +69,17 @@ recorded pass before it runs, so a failure leaves nothing to answer from.
 `td-recipe-eval clear-store` drops the memos with the rest of the ladder work
 dir.
 
+When every changed path lies under `td-*` crates, `ready` also scopes the
+recipe-checks gate: the crates and their readers travel to the gate in
+`TD_CHECK_SCOPE`, and the gate runs only the checks whose closure builds a
+recipe that embeds one of them, naming the checks it did not run. That can
+be none: a crate no recipe check builds passes the gate with every check
+named as unreached. A scope none of whose crates any recipe reads runs every
+check and says so. A scoped pass is journaled under its scope, so
+`td-builder check --resume` on the same tree does not take it for a full
+one. `TD_CHECK_FULL` runs every check in full, scope or not, and
+`td-builder check recipe-checks` on its own has no scope.
+
 When `ready` passes, push the branch:
 
 ```text

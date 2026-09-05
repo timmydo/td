@@ -44,6 +44,42 @@ fn fatal(msg: &str) -> String {
 /// Defined in td-engine so td-recipe-eval speaks the identical contract.
 pub use td_engine::exit::EXIT_UNPROVISIONED;
 
+/// The crates a change is confined to, space-separated, set by
+/// `affected-checks --run` on the `td-builder check` it spawns and forwarded
+/// into the gate sandbox: the recipe-checks gate runs only the checks a
+/// change under them can reach. `TD_CHECK_FULL` overrides it.
+pub const CHECK_SCOPE_ENV: &str = "TD_CHECK_SCOPE";
+
+/// The recipe-checks scope: the space-separated directory names in
+/// `TD_CHECK_SCOPE`, unless `TD_CHECK_FULL` is set or the value is empty,
+/// which both mean every check. Read here by the loop for the journal key
+/// and by the gate for its list, through this one function.
+pub(crate) fn check_scope(full: bool, scope: Option<&str>) -> Option<Vec<String>> {
+    if full {
+        return None;
+    }
+    let dirs: Vec<String> = scope?.split_whitespace().map(str::to_string).collect();
+    (!dirs.is_empty()).then_some(dirs)
+}
+
+/// The verdict journal key for a run under `scope`: the tree key alone for
+/// an unscoped run, and sha256 over the tree key and the scope for a scoped
+/// one. A scoped recipe-checks PASS proves less than the gate's name says,
+/// so it must not be what an unscoped `--resume` on the same tree finds
+/// (review's finding); the same scope on the same tree still finds it.
+fn scoped_tree_key(key: &str, scope: Option<&[String]>) -> String {
+    match scope {
+        None => key.to_string(),
+        Some(dirs) => {
+            let mut h = crate::sha256::Sha256::new();
+            h.update(key.as_bytes());
+            h.update(b"\0scope\0");
+            h.update(dirs.join(" ").as_bytes());
+            crate::sha256::to_base16(&h.finalize())
+        }
+    }
+}
+
 /// The error-string half of the same signal: a control-plane routine (a gate
 /// body, a `provision-*`/`stage0-place` verb) prefixes its `Err` with this when
 /// the failure is a toolchain PROVISIONING gap — no rust/cc reachable in this
@@ -1842,8 +1878,10 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // to force a cold climb.
     // TD_CHECK_FULL is forwarded as well: inside the sandbox it is what makes
     // a recipe check run in full rather than answer from its verdict memo
-    // (check_runner.rs), the same knob that ignores --resume below.
-    for k in ["TD_CHECK_DISABLE", "TD_CHECK_FULL"] {
+    // (check_runner.rs), the same knob that ignores --resume below. So is
+    // TD_CHECK_SCOPE, the crates a change is confined to, which the
+    // recipe-checks gate narrows its list by (gate_bodies.rs).
+    for k in ["TD_CHECK_DISABLE", "TD_CHECK_FULL", CHECK_SCOPE_ENV] {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));
         }
@@ -1856,8 +1894,12 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         eprintln!("td-builder check: TD_CHECK_FULL is set — ignoring --resume");
         resume = false;
     }
+    let scope = check_scope(
+        std::env::var_os("TD_CHECK_FULL").is_some(),
+        std::env::var(CHECK_SCOPE_ENV).ok().as_deref(),
+    );
     match tree_key(&root) {
-        Some(key) => child_envs.push((s("TD_CHECK_TREE"), key)),
+        Some(key) => child_envs.push((s("TD_CHECK_TREE"), scoped_tree_key(&key, scope.as_deref()))),
         None if resume => {
             return Err(fatal(
                 "--resume needs a git working tree to key the verdict journal, and `git` failed here — cannot prove the tree is unchanged, refusing to skip",
@@ -2337,5 +2379,28 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
         // A sources dir that does not exist -> not present, no panic.
         let d = scratch("kh-seed-nodir");
         assert!(!kh_seed_present(&d.join("sources"), "i386"));
+    }
+}
+
+#[cfg(test)]
+mod scope_key_tests {
+    use super::*;
+
+    /// A scoped run journals under a key of its own: the tree key is
+    /// untouched without a scope, and two scopes, or a scope and none, never
+    /// share a key, while the same scope keys the same.
+    #[test]
+    fn a_scoped_run_keys_its_journal_apart() {
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        assert_eq!(scoped_tree_key("abc", None), "abc");
+        let sh = scoped_tree_key("abc", Some(&s(&["td-sh"])));
+        assert_ne!(sh, "abc");
+        assert_ne!(sh, scoped_tree_key("abc", Some(&s(&["td-sh", "td-txt"]))));
+        assert_ne!(sh, scoped_tree_key("abd", Some(&s(&["td-sh"]))));
+        assert_eq!(sh, scoped_tree_key("abc", Some(&s(&["td-sh"]))));
+        assert_eq!(check_scope(false, Some("td-sh td-portal")), Some(s(&["td-sh", "td-portal"])));
+        assert_eq!(check_scope(false, Some("  ")), None);
+        assert_eq!(check_scope(false, None), None);
+        assert_eq!(check_scope(true, Some("td-sh")), None);
     }
 }
