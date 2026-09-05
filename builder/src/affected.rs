@@ -2617,22 +2617,78 @@ pub(crate) fn git_ok(root: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// The repo root, the way the shell roots itself (`cd "$(dirname "$0")/.."`):
-/// `git rev-parse --show-toplevel` when git is present, else CWD. Keeps the
-/// subcommand CWD-robust like the oracle; outside a git repo it falls back to CWD.
-pub(crate) fn resolve_root() -> PathBuf {
-    if let Ok(o) = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-    {
-        if o.status.success() {
-            let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !top.is_empty() {
-                return PathBuf::from(top);
+/// The repo root: in `repo`, engine-side, since the run record every
+/// invocation writes resolves it too (see `engine_set`). Re-exported so
+/// `ready` keeps this module as its one import.
+pub(crate) use crate::repo::resolve_root;
+
+/// `gate-crates locks|cargo-cmds|names` — the gate roster, derived.
+///
+/// Gate 325 used to spell this out three times over: a dependency-free lock
+/// check per crate, a clippy line per crate, a `cargo test` line per crate, and
+/// a closing sentence naming them all. That was a fourth hand-kept copy of the
+/// roster `affected.rs` already derives, and it had drifted: td-jail, td-portal
+/// and td-profiler were absent from every one of them, so the in-loop gate
+/// silently did not lint or test three shipped crates.
+///
+/// The script asks for the roster now, so a crate joins the gate by existing —
+/// the same rule the host preflight already follows. Here rather than in
+/// `main.rs` so the dispatch names this module in its arm alone (see
+/// `engine_set`).
+pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
+    let fail = |msg: &str| {
+        eprintln!("td-builder: gate-crates: {msg}");
+        ExitCode::FAILURE
+    };
+    let root = resolve_root();
+    match args {
+        [op] if op == "locks" => {
+            let locks = match dependency_free_locks(&root) {
+                Ok(locks) => locks,
+                Err(e) => return fail(&e),
+            };
+            // Belt-and-braces: `discover_gate_crates` already refuses an empty
+            // roster, and this list always carries the workspace root lock. It
+            // is here so a future change to either cannot make this arm report
+            // success over nothing.
+            if locks.is_empty() {
+                return fail("the derived roster is empty — it cannot be");
             }
+            for (lock, packages) in &locks {
+                if let Err(e) = assert_dependency_free(&root, lock, *packages) {
+                    return fail(&e);
+                }
+            }
+            println!("{} dependency-free lock(s) verified", locks.len());
+            ExitCode::SUCCESS
+        }
+        [op] if op == "cargo-cmds" => match gate_cargo_cmds(&root) {
+            Ok(cmds) if !cmds.is_empty() => {
+                for cmd in cmds {
+                    println!("{cmd}");
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(_) => fail("the derived command list is empty — it cannot be"),
+            Err(e) => fail(&e),
+        },
+        [op] if op == "names" => match gate_crate_names(&root) {
+            Ok(names) if !names.is_empty() => {
+                println!("{}", names.join(", "));
+                ExitCode::SUCCESS
+            }
+            Ok(_) => fail("the derived roster is empty — it cannot be"),
+            Err(e) => fail(&e),
+        },
+        _ => {
+            eprintln!("usage: td-builder gate-crates locks");
+            eprintln!("       td-builder gate-crates cargo-cmds");
+            eprintln!("       td-builder gate-crates names");
+            // 2 for "typed wrong", as `text_cli` does — a failed CHECK is 1,
+            // and the gate script must be able to tell them apart.
+            ExitCode::from(2)
         }
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn sort_unique(mut v: Vec<String>) -> Vec<String> {
@@ -3456,6 +3512,11 @@ fn crate_readers(root: &Path, roster: &[GateCrate]) -> Result<Vec<(String, Vec<S
 /// dependencies: it DECIDES which checks run, so exempting it would let the
 /// dispatcher narrow its own coverage with the tier that would have caught it
 /// switched off.
+///
+/// The verdict memo's host-only set, `engine_set::HOST_ONLY`, is a different
+/// question — what a check's own run can execute, which never includes the
+/// dispatcher — and wider; `engine_sources_never_name_a_host_only_module`
+/// pins that one.
 ///
 /// Checked against the tree rather than trusted, in
 /// `host_only_sources_are_not_reachable_from_the_engine`.
@@ -5081,6 +5142,587 @@ mod tests {
                 "main.rs never names {stem} — the scan is looking for the \
                  wrong thing and would pass any roster"
             );
+        }
+    }
+
+    /// The memo key's host-only set (`engine_set::HOST_ONLY`) is sound only
+    /// if nothing a build verb runs can reach one of those files. Pinned over
+    /// the shipped code of every `builder/src` file — `lex`ed, so a comment
+    /// is gone and a literal spanning lines is a literal, and every column-0
+    /// `#[cfg(test)] mod … { … }` cut out by a brace count over blanked
+    /// literals — as these rules:
+    ///
+    /// 1. No engine file names a host-only module: as `stem::`, or after
+    ///    `crate::`, `super::` or `self::`, bare or in a `{…}` group across
+    ///    lines, read off the code with literals blanked, so a string can
+    ///    neither hide one nor fake one.
+    /// 2. No engine file includes a host-only file, by `include_str!`,
+    ///    `include_bytes!`, `include!` or `#[path]` however spaced, the
+    ///    marker found outside every literal and the path read from the one
+    ///    that follows; an include whose argument is not one literal — a
+    ///    `concat!`, which is how the gate runner reads the generated
+    ///    registry, every `gate_defs/` file — is refused outright in an
+    ///    engine file.
+    /// 3. `main.rs` names a host-only module only on a line of the form
+    ///    `Some("verb") … => stem::` every one of whose verb literals is in
+    ///    `engine_set::HOST_ONLY_VERBS` (an or-pattern names each), and
+    ///    never by a crate, self or super path or a `use` item (`use ready
+    ///    as r;` at the crate root reaches the module without spelling
+    ///    `ready::`), nor with a `#[macro_use]`, which would hand a host
+    ///    module's macros to every module after it.
+    /// 4. Every `impl` in a host-only file, `unsafe` or not — its header
+    ///    joined to its `{`, however rustfmt broke it — is for a type a
+    ///    host-only file declares, and a `crate::`-qualified target's module
+    ///    is host-only (an unqualified `m::Type` is matched by its type name
+    ///    alone): an `impl` on an engine type would let an engine caller run
+    ///    host code without naming it.
+    /// 5. No host-only file exports a macro or declares one at module
+    ///    level: a macro is reached without its module's name.
+    ///
+    /// A directory entry of the set is no module and is reached by path
+    /// alone, which rule 2 covers. Positive controls: each host-only verb
+    /// dispatches into a host-only module and no other verb does; the gate
+    /// runner names the gate bodies and includes the registry by a composed
+    /// path; `ready` names the routing; every host-only file module is named
+    /// by the dispatch, declared by it, or named by another host-only file;
+    /// each detector reads the shape it claims; and at least thirty engine
+    /// files were scanned.
+    #[test]
+    fn engine_sources_never_name_a_host_only_module() {
+        let root = repo_root();
+        let src = root.join("builder/src");
+        let mut sources = Vec::new();
+        collect_rs_files(&src, &mut sources);
+        let stems: Vec<String> = crate::engine_set::HOST_ONLY
+            .iter()
+            .filter_map(|e| e.strip_suffix(".rs"))
+            .map(str::to_string)
+            .collect();
+        let names = |code: &str, stem: &str| {
+            names_at_boundary(code, &format!("{stem}::"))
+                || module_paths_named(code).iter().any(|m| m == stem)
+        };
+        let imports =
+            |code: &str, stem: &str| use_items(code).iter().any(|item| word_in(item, stem));
+        // Every verb literal of a dispatch line `Some("verb") … => stem::`,
+        // read off the text with its literals intact; `None` for any other
+        // line naming the stem.
+        let dispatch_verbs = |text: &str, stem: &str| -> Option<Vec<String>> {
+            let t = text.trim_start();
+            t.starts_with("Some(\"").then_some(())?;
+            let (pattern, rhs) = t.split_once("=> ")?;
+            rhs.starts_with(&format!("{stem}::")).then_some(())?;
+            // A guard's own literal is no verb.
+            let pattern = pattern.split(" if ").next().unwrap_or(pattern);
+            let verbs: Vec<String> = pattern
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect();
+            (!verbs.is_empty()).then_some(verbs)
+        };
+
+        struct Scanned {
+            path: PathBuf,
+            rel: String,
+            host: bool,
+            shipped: String,
+            code: String,
+        }
+        let mut files: Vec<Scanned> = Vec::new();
+        let mut host_types: Vec<String> = Vec::new();
+        for f in &sources {
+            let rel = f.strip_prefix(&src).unwrap().to_str().unwrap().to_string();
+            let host = crate::engine_set::is_host_only(&rel);
+            let lexed = lex(&std::fs::read_to_string(f).unwrap());
+            let shipped = without_test_modules(&lexed, &rel);
+            let code = blank_strings(&shipped);
+            if host {
+                for kw in ["struct", "enum", "trait", "union"] {
+                    for name in declared(&code, kw) {
+                        push_unique(&mut host_types, &name);
+                    }
+                }
+            }
+            files.push(Scanned { path: f.clone(), rel, host, shipped, code });
+        }
+
+        let mut named: Vec<String> = Vec::new();
+        let mut verbs_seen: Vec<String> = Vec::new();
+        let mut engine_files = 0usize;
+        for sc in &files {
+            let Scanned { path, rel, host, shipped, code } = sc;
+            if *host {
+                for stem in &stems {
+                    if names(code, stem) {
+                        push_unique(&mut named, stem);
+                    }
+                }
+                for header in impl_headers(code) {
+                    let (module, ty) = impl_target(&header)
+                        .unwrap_or_else(|| panic!("{rel}: an impl header this scan cannot read: {header}"));
+                    match module {
+                        Some(m) => assert!(
+                            stems.contains(&m),
+                            "{rel} implements {ty} from engine module {m}: an engine caller \
+                             would run host code without naming it"
+                        ),
+                        None => assert!(
+                            host_types.contains(&ty),
+                            "{rel} implements {ty}, which no host-only file declares: an engine \
+                             caller would run host code without naming it"
+                        ),
+                    }
+                }
+                assert!(
+                    !code.contains("#[macro_export]")
+                        && !code.lines().any(|l| l.starts_with("macro_rules!")),
+                    "{rel} offers a macro: one is reached without its module's name"
+                );
+                continue;
+            }
+            engine_files += 1;
+            let includes = included_paths(code, shipped).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            for literal in includes {
+                let target = normalized(&path.parent().unwrap().join(&literal));
+                if let Some(under) = target.strip_prefix(&src).ok().and_then(Path::to_str) {
+                    assert!(
+                        !crate::engine_set::is_host_only(under),
+                        "{rel} includes host-only {under}: the memo key would not see it"
+                    );
+                }
+            }
+            for stem in &stems {
+                if rel != "main.rs" {
+                    assert!(
+                        !names(code, stem),
+                        "{rel} names host-only module {stem}: an engine file reaching it \
+                         would make it engine code the memo key does not see"
+                    );
+                    continue;
+                }
+                if code.contains(&format!("mod {stem};")) {
+                    push_unique(&mut named, stem);
+                }
+                assert!(
+                    module_paths_named(code).iter().all(|m| m != stem),
+                    "main.rs reaches {stem} by a crate/self/super path: the dispatch names it bare"
+                );
+                assert!(
+                    !imports(code, stem),
+                    "main.rs imports {stem}: the dispatch names it in its arm alone"
+                );
+                for (code_line, text_line) in code.lines().zip(shipped.lines()) {
+                    if !names_at_boundary(code_line, &format!("{stem}::")) {
+                        continue;
+                    }
+                    let verbs = dispatch_verbs(text_line, stem).unwrap_or_else(|| {
+                        panic!("main.rs names {stem} outside a dispatch arm: {}", text_line.trim())
+                    });
+                    for verb in verbs {
+                        assert!(
+                            crate::engine_set::HOST_ONLY_VERBS.contains(&verb.as_str()),
+                            "main.rs routes `{verb}` into host-only {stem}: a verb a build may \
+                             run would execute code the memo key does not see"
+                        );
+                        push_unique(&mut verbs_seen, &verb);
+                    }
+                    push_unique(&mut named, stem);
+                }
+            }
+            if rel == "main.rs" {
+                assert!(
+                    !code.lines().any(|l| l.trim_start().starts_with("#[macro_use]")),
+                    "main.rs uses #[macro_use]: a host module's macros would reach every \
+                     module after it"
+                );
+            }
+        }
+        assert!(engine_files >= 30, "{engine_files} engine files scanned");
+        for stem in &stems {
+            assert!(
+                named.contains(stem),
+                "{stem} is named by nothing — the scan is looking for the wrong thing"
+            );
+        }
+        let mut expected: Vec<String> = crate::engine_set::HOST_ONLY_VERBS
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        expected.sort();
+        verbs_seen.sort();
+        assert_eq!(
+            verbs_seen, expected,
+            "the verbs whose arms name a host-only module are exactly HOST_ONLY_VERBS"
+        );
+
+        // Positive controls over known edges and over each detector's shape.
+        let by_rel = |rel: &str| files.iter().find(|s| s.rel == rel).unwrap();
+        assert!(names(&by_rel("gates.rs").code, "gate_bodies"));
+        let gates = by_rel("gates.rs");
+        assert!(
+            included_paths(&gates.code, &gates.shipped).is_err(),
+            "the gate runner's composed registry include is the shape rule 2 refuses"
+        );
+        assert!(names(&by_rel("ready.rs").code, "affected"));
+        assert!(!names(&by_rel("build.rs").code, "affected"), "the engine's build.rs is not host code");
+        for ty in ["GateSet", "SlotPool", "CheckError"] {
+            assert!(host_types.contains(&ty.to_string()), "{ty} is declared host-side");
+        }
+        assert!(imports("use crate::{\n    ready as r,\n};", "ready"), "a group across lines");
+        assert!(imports("pub(crate) use ready as r;", "ready") && !imports("use readying::x;", "ready"));
+        assert!(imports("pub(in crate::x) use ready as r;", "ready") && imports("pub (crate) use ready;", "ready"));
+        assert!(module_paths_named("use super::{check_loop as loops};").contains(&"check_loop".to_string()));
+        // A non-host stem: the from-source tier's own scan forbids this file
+        // from spelling the `ready` path even in a literal.
+        assert!(module_paths_named("self::check_memory::nproc").contains(&"check_memory".to_string()));
+        let plain = "include_str!( \"a/b.rs\" ); #[path=\"c.rs\"]";
+        assert_eq!(included_paths(plain, plain).unwrap(), ["a/b.rs", "c.rs"]);
+        let composed = "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"))";
+        assert!(included_paths(composed, composed).is_err());
+        let quoted = "let m = \"include_str!(\"; let p = \"gate_defs/x\";";
+        assert_eq!(included_paths(&blank_strings(quoted), quoted).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            impl_target("impl<'a> fmt::Display for crate::drv::Drv<'a> {"),
+            Some((Some("drv".into()), "Drv".into()))
+        );
+        assert_eq!(impl_target("impl SlotPool {"), Some((None, "SlotPool".into())));
+        assert_eq!(impl_target("impl<T: Clone> Wrap<T> {"), Some((None, "Wrap".into())));
+        assert_eq!(
+            impl_target("impl Drop for super::gates::GateSet {"),
+            Some((Some("gates".into()), "GateSet".into()))
+        );
+        assert_eq!(impl_target("    let x = 1;"), None);
+        assert_eq!(
+            impl_headers("impl<'a, T: Long>\n    Trait for GateSet<'a>\n{\n    fn f() {}\n}\nimpl X {}\n"),
+            ["impl<'a, T: Long> Trait for GateSet<'a> {", "impl X {}"]
+        );
+        assert_eq!(impl_headers("impl\n    Y\n{\n"), ["impl Y {"]);
+        assert_eq!(impl_target("impl Y {"), Some((None, "Y".into())));
+        assert_eq!(impl_headers("unsafe impl Send for X {}\n"), ["unsafe impl Send for X {}"]);
+        assert_eq!(
+            impl_target("unsafe impl Send for crate::drv::Drv {}"),
+            Some((Some("drv".into()), "Drv".into()))
+        );
+        assert_eq!(
+            dispatch_verbs("        Some(\"check\") if mode == \"x\" => check_loop::cli(args),", "check_loop"),
+            Some(vec!["check".into()])
+        );
+        let arm = "        Some(\"gate-run\" | \"gate-body\") => gates::cli(args),";
+        assert_eq!(dispatch_verbs(arm, "gates"), Some(vec!["gate-run".into(), "gate-body".into()]));
+        assert_eq!(dispatch_verbs(arm, "affected"), None);
+        assert_eq!(
+            dispatch_verbs("        Some(\"check\") if x == 1 => check_loop::cli(args),", "check_loop"),
+            Some(vec!["check".into()])
+        );
+
+        /// `lexed` with every column-0 `#[cfg(test)]\nmod … { … }` cut out,
+        /// braces counted over blanked literals, so what is left is the
+        /// shipped code wherever it lies — between two test modules or after
+        /// the last. A `#[cfg(test)] mod x;` declaration has no body and is
+        /// left alone; a module that never closes is a loud error.
+        fn without_test_modules(lexed: &str, rel: &str) -> String {
+            let code = blank_strings(lexed);
+            let mut out = String::with_capacity(lexed.len());
+            let mut from = 0usize;
+            let mut search = 0usize;
+            while let Some(at) = code[search..].find("\n#[cfg(test)]\nmod ") {
+                let attr = search + at + 1;
+                let mod_start = attr + "#[cfg(test)]\n".len();
+                let mod_end = code[mod_start..].find('\n').map_or(code.len(), |e| mod_start + e);
+                let mod_line = &code[mod_start..mod_end];
+                search = mod_end;
+                if !mod_line.trim_end().ends_with('{') {
+                    continue;
+                }
+                let open = mod_start + mod_line.rfind('{').unwrap();
+                let mut depth = 0usize;
+                let mut close = None;
+                for (i, c) in code[open..].char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(open + i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let close = close.unwrap_or_else(|| panic!("{rel}: a test module never closes"));
+                out.push_str(&lexed[from..attr]);
+                from = close + 1;
+                search = from;
+            }
+            out.push_str(&lexed[from..]);
+            out
+        }
+
+        /// Every identifier `kw` declares in `code` (`pub struct GateSet {`,
+        /// `pub(crate) enum X`), the keyword at a word boundary.
+        fn declared(code: &str, kw: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let needle = format!("{kw} ");
+            let mut from = 0usize;
+            while let Some(at) = code[from..].find(&needle) {
+                let abs = from + at;
+                from = abs + needle.len();
+                let before = code[..abs].chars().next_back();
+                if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let name: String = code[from..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+            out
+        }
+
+        /// Every `impl` header in `code`, each joined from its first line to
+        /// the line holding its `{`, single-spaced, so a header rustfmt broke
+        /// across lines reads as one.
+        fn impl_headers(code: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut header: Option<String> = None;
+            for line in code.lines() {
+                let t = line.trim();
+                let starts = t
+                    .strip_prefix("unsafe")
+                    .map_or(t, str::trim_start)
+                    .strip_prefix("impl")
+                    .is_some_and(|r| r.is_empty() || r.starts_with('<') || r.starts_with(' '));
+                if header.is_none() && starts {
+                    header = Some(String::new());
+                }
+                if let Some(acc) = header.as_mut() {
+                    if !acc.is_empty() {
+                        acc.push(' ');
+                    }
+                    acc.push_str(t);
+                    if t.contains('{') || t.ends_with(';') {
+                        out.push(std::mem::take(acc));
+                        header = None;
+                    }
+                }
+            }
+            out
+        }
+
+        /// What an `impl` header implements: the last path segment after
+        /// `for`, or after `impl` and its generics, with the module a
+        /// `crate::`/`super::` path names, if any (`super::` from a top-level
+        /// module is the crate root). `None` for text that is no impl header.
+        fn impl_target(header: &str) -> Option<(Option<String>, String)> {
+            let header = header.trim_start();
+            let rest = header
+                .strip_prefix("unsafe")
+                .map_or(header, str::trim_start)
+                .strip_prefix("impl")?;
+            let rest = match rest.strip_prefix('<') {
+                Some(generics) => {
+                    let mut depth = 1usize;
+                    let mut end = None;
+                    for (i, c) in generics.char_indices() {
+                        match c {
+                            '<' => depth += 1,
+                            '>' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = Some(i);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    &generics[end? + 1..]
+                }
+                None => rest.strip_prefix(' ')?,
+            };
+            let target = match rest.split_once(" for ") {
+                Some((_, after)) => after,
+                None => rest,
+            };
+            let mut target = target.trim_start().trim_start_matches(|c: char| c == '&' || c == '(');
+            loop {
+                let t = target.trim_start();
+                if let Some(r) = t.strip_prefix('\'') {
+                    target = r.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+                } else if let Some(r) = t.strip_prefix("mut ") {
+                    target = r;
+                } else if let Some(r) = t.strip_prefix("dyn ") {
+                    target = r;
+                } else {
+                    target = t;
+                    break;
+                }
+            }
+            let path: String = target
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            let segments: Vec<&str> = path.split("::").collect();
+            let last = (*segments.last()?).to_string();
+            if last.is_empty() {
+                return None;
+            }
+            let module = match segments.first().copied() {
+                Some("crate" | "super") if segments.len() > 2 => segments.get(1).map(|s| s.to_string()),
+                _ => None,
+            };
+            Some((module, last))
+        }
+
+        /// Every literal an `include_str!`, `include_bytes!`, `include!` or
+        /// `#[path …]` names, however spaced: the marker is found in `code`,
+        /// where literals are blanked, so one inside a string is data; the
+        /// path is read from `text` at the same offsets (`lex` has already
+        /// made every raw string an ordinary one). An argument that is not
+        /// one literal — a `concat!` — is an error: a composed path cannot
+        /// be checked, so it is refused rather than passed over.
+        fn included_paths(code: &str, text: &str) -> Result<Vec<String>, String> {
+            let mut out = Vec::new();
+            for marker in ["include_str!", "include_bytes!", "include!", "#[path"] {
+                let mut from = 0usize;
+                while let Some(at) = code[from..].find(marker) {
+                    let abs = from + at;
+                    let after = abs + marker.len();
+                    from = after;
+                    let skipped = code[after..]
+                        .find(|c: char| !(c.is_whitespace() || c == '(' || c == '='))
+                        .unwrap_or(code.len() - after);
+                    let quote = after + skipped;
+                    if code.get(quote..quote + 1) != Some("\"") {
+                        return Err(format!(
+                            "`{marker}` with no literal argument, refused as a composed path: {}",
+                            text[abs..].lines().next().unwrap_or("").trim()
+                        ));
+                    }
+                    let body = &text[quote + 1..];
+                    let end = body.find('"').ok_or("an include literal never closes")?;
+                    out.push(body[..end].to_string());
+                }
+            }
+            Ok(out)
+        }
+
+        /// Every module named right after `crate::`, `super::` or `self::`:
+        /// bare, or as the first segment of each entry of a `{…}` group
+        /// there, across lines. A nested group's inner names are listed too
+        /// — more names, never fewer, so the scan fails safe.
+        fn module_paths_named(text: &str) -> Vec<String> {
+            let ident = |s: &str| -> String {
+                s.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect()
+            };
+            let mut out = Vec::new();
+            for prefix in ["crate::", "super::", "self::"] {
+                let mut from = 0usize;
+                while let Some(at) = text[from..].find(prefix) {
+                    let start = from + at + prefix.len();
+                    from = start;
+                    let rest = &text[start..];
+                    let Some(group) = rest.strip_prefix('{') else {
+                        let name = ident(rest);
+                        if !name.is_empty() {
+                            out.push(name);
+                        }
+                        continue;
+                    };
+                    let mut depth = 1usize;
+                    let mut end = group.len();
+                    for (i, c) in group.char_indices() {
+                        match c {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = i;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for entry in group[..end].split(',') {
+                        let first = ident(entry.trim());
+                        if !first.is_empty() {
+                            out.push(first);
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// Every `use` item — `use`, `pub use`, `pub(crate) use`,
+        /// `pub(in …) use`, however spaced — from its first line to the
+        /// line holding its `;`.
+        fn use_items(text: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut item: Option<String> = None;
+            for line in text.lines() {
+                let t = line.trim_start();
+                let after_pub = t.strip_prefix("pub").map(|r| {
+                    let r = r.trim_start();
+                    match r.strip_prefix('(') {
+                        Some(inner) => inner.find(')').map_or("", |e| &inner[e + 1..]).trim_start(),
+                        None => r,
+                    }
+                });
+                let starts = t.starts_with("use ") || after_pub.is_some_and(|r| r.starts_with("use "));
+                if item.is_none() && starts {
+                    item = Some(String::new());
+                }
+                if let Some(acc) = item.as_mut() {
+                    acc.push_str(t);
+                    acc.push(' ');
+                    if t.contains(';') {
+                        out.push(std::mem::take(acc));
+                        item = None;
+                    }
+                }
+            }
+            out
+        }
+
+        /// `word` as a whole identifier somewhere in `text`.
+        fn word_in(text: &str, word: &str) -> bool {
+            let boundary = |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            let mut from = 0usize;
+            while let Some(at) = text[from..].find(word) {
+                let abs = from + at;
+                if boundary(text[..abs].chars().next_back())
+                    && boundary(text[abs + word.len()..].chars().next())
+                {
+                    return true;
+                }
+                from = abs + word.len();
+            }
+            false
+        }
+
+        fn normalized(p: &Path) -> PathBuf {
+            let mut out = PathBuf::new();
+            for c in p.components() {
+                match c {
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => out.push(other.as_os_str()),
+                }
+            }
+            out
         }
     }
 

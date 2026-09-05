@@ -52,7 +52,7 @@ const NATIVE: &[&str] = &[
     "toolchain-x86_64-input-addressed",
 ];
 
-use crate::check_loop::UNPROVISIONED_TAG;
+use td_engine::exit::UNPROVISIONED_TAG;
 
 /// `td-builder gate-body <name>` — run one native gate body.
 pub fn cli(name: &str) -> ExitCode {
@@ -90,7 +90,7 @@ pub fn cli(name: &str) -> ExitCode {
             // classifies it Unprovisioned (tolerated), never RED.
             if let Some(rest) = e.strip_prefix(UNPROVISIONED_TAG) {
                 eprintln!("gate-body {name}: unprovisioned — {rest}");
-                crate::check_loop::unprovisioned_exit()
+                td_engine::exit::unprovisioned_exit()
             } else {
                 eprintln!("{e}");
                 ExitCode::FAILURE

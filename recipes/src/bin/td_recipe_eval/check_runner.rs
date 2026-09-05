@@ -1281,11 +1281,12 @@ fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
     (base.join("store"), base.join("db"))
 }
 
-/// sha256 over the evaluator binary, the builder binary, every
+/// sha256 over the evaluator binary, the builder's engine fingerprint, every
 /// `seed/patches/*.patch`, and every committed `cargo_locks` file, in a fixed
 /// order — the pure-plan fingerprint that keys the build-run reuse memo. Recipes
 /// and seed pins are compiled INTO the binaries (a change rebuilds them and
-/// re-keys); a patch change alters a hashed file; and a rust rung's committed
+/// re-keys; the builder's fingerprint covers what a build can execute and not
+/// its host tooling); a patch change alters a hashed file; and a rust rung's committed
 /// `Cargo.lock` is the one build input read from the repo at build time rather
 /// than compiled in, so a lock bump (which changes that rung's output) must
 /// re-key here too. A `local_source` recipe (#469) is the same shape as a lock:
@@ -1298,18 +1299,16 @@ fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
 /// a declared lock or source dir that cannot be read fails closed.
 fn plan_fingerprint(
     eval: &Path,
-    builder: &Path,
+    builder_engine: &str,
     patches_dir: &Path,
     repo_root: &Path,
     cargo_locks: &[String],
     local_sources: &[String],
 ) -> Result<String, String> {
     let mut h = crate::sha256::Sha256::new();
-    for bin in [eval, builder] {
-        let bytes = fs::read(bin).map_err(|e| format!("read {}: {e}", bin.display()))?;
-        h.update(&(bytes.len() as u64).to_le_bytes());
-        h.update(&bytes);
-    }
+    let bytes = fs::read(eval).map_err(|e| format!("read {}: {e}", eval.display()))?;
+    hash_field(&mut h, &bytes);
+    hash_field(&mut h, builder_engine.as_bytes());
     hash_repo_inputs(&mut h, patches_dir, repo_root, cargo_locks, local_sources)?;
     Ok(crate::sha256::to_base16(&h.finalize()))
 }
@@ -1444,6 +1443,38 @@ fn hash_source_tree(dir: &Path, h: &mut crate::sha256::Sha256) -> Result<(), Str
 fn hash_field(h: &mut crate::sha256::Sha256, bytes: &[u8]) {
     h.update(&(bytes.len() as u64).to_le_bytes());
     h.update(bytes);
+}
+
+/// The staged builder's engine fingerprint: what `td-builder
+/// engine-fingerprint` prints, the digest its build script took over the
+/// sources a build can execute — not its routing, check loop or gates, which
+/// no check runs — with the seed digest table it compiles in. The memo keys
+/// hold it in place of the binary's bytes, so an edit to that host tooling
+/// re-keys nothing. Fails closed on a builder that does not report one, or
+/// reports anything but a digest: a key with no builder in it would answer
+/// for every builder.
+fn builder_engine_fingerprint(tb: &Path) -> Result<String, String> {
+    let out = Command::new(tb)
+        .arg("engine-fingerprint")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn {} engine-fingerprint: {e}", tb.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let digest = stdout.trim();
+    let is_digest = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !out.status.success() || !is_digest {
+        return Err(format!(
+            "{} reports no engine fingerprint (exit {:?}, stdout {:?}): {}",
+            tb.display(),
+            out.status.code(),
+            stdout.trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(digest.to_string())
 }
 
 /// The committed cargo locks and local-source dirs a closure reads at build
@@ -1675,6 +1706,10 @@ fn lock_file(path: &Path) -> Result<File, String> {
 pub(crate) struct RecipeCheckRunner {
     root: PathBuf,
     tb: PathBuf,
+    /// The staged builder's engine fingerprint, asked of it once per run:
+    /// every check keys on it twice, and the builder does not change under
+    /// a run.
+    engine_fp: std::sync::OnceLock<Result<String, String>>,
     builder_path: String,
     builder_store: PathBuf,
     builder_db: PathBuf,
@@ -1902,6 +1937,7 @@ impl RecipeCheckRunner {
         Ok(Self {
             root,
             tb,
+            engine_fp: std::sync::OnceLock::new(),
             builder_path: cb,
             builder_store: stage0_base.join("store"),
             builder_db: stage0_base.join("builder.db"),
@@ -3150,11 +3186,22 @@ impl RecipeCheckRunner {
             .collect()
     }
 
+    /// `builder_engine_fingerprint` of the staged builder, asked once and
+    /// held for the run, an error included: a builder that reports none
+    /// reports none for every check.
+    fn builder_engine_fingerprint(&self) -> Result<String, String> {
+        self.engine_fp
+            .get_or_init(|| builder_engine_fingerprint(&self.tb))
+            .clone()
+    }
+
     /// The compiled-plan fingerprint for TARGET: sha256 over the running evaluator
-    /// binary, the staged builder binary, every `seed/patches/*.patch`, and every
-    /// committed `Cargo.lock` a rung in TARGET's closure vendors from. Mirrors the
-    /// loop-userland fingerprint (check_loop.rs), extended with the builder binary
-    /// (it equally determines the output bytes a reuse skips) and the closure's
+    /// binary, the staged builder's engine fingerprint, every
+    /// `seed/patches/*.patch`, and every committed `Cargo.lock` a rung in
+    /// TARGET's closure vendors from. Mirrors the loop-userland fingerprint
+    /// (check_loop.rs), extended with the builder's engine fingerprint (its
+    /// engine equally determines the output bytes a reuse skips; its host
+    /// tooling determines none of them) and the closure's
     /// cargoLocks (the one build input read from the repo, not compiled in — a lock
     /// bump changes a rust rung's output but no binary, so it MUST re-key here), and
     /// every `local_source` dir a rung in the closure interns (#469: an editable
@@ -3167,7 +3214,7 @@ impl RecipeCheckRunner {
         let (locks, local_sources) = closure_repo_inputs(&closure);
         plan_fingerprint(
             &eval,
-            &self.tb,
+            &self.builder_engine_fingerprint()?,
             &self.root.join("seed/patches"),
             &self.root,
             &locks,
@@ -3182,9 +3229,11 @@ impl RecipeCheckRunner {
     /// included, so a change to a crate a recipe embeds re-keys exactly the
     /// checks whose closure builds it; the seed patches, committed cargo locks
     /// and local-source trees the closure reads at build time, hashed as the
-    /// build-run memo hashes them; the staged builder binary, which is also
-    /// how `seed/seed-digests.txt` reaches the key, compiled into td-builder
-    /// as it is — a key over builder SOURCES would lose that; and the
+    /// build-run memo hashes them; the staged builder's engine fingerprint —
+    /// the digest its build script took over the sources a build can
+    /// execute, `seed/seed-digests.txt` among them, and not over its
+    /// routing, check loop or gates, which no check runs, so an edit to
+    /// those re-keys nothing where the binary's bytes would; and the
     /// evaluator's OWN sources, as `build.rs` fingerprinted them when this
     /// binary was compiled, so the key names the assertions that run and not
     /// the tree at the moment of asking, and so an edit anywhere under
@@ -3225,11 +3274,7 @@ impl RecipeCheckRunner {
             hash_field(&mut h, node.stem.as_bytes());
             hash_field(&mut h, node.recipe.to_json().to_canonical().as_bytes());
         }
-        // Streamed: the builder is a whole executable, and a check runs
-        // beside others.
-        let builder = crate::sha256::sha256_file(&self.tb)
-            .map_err(|e| format!("hash {}: {e}", self.tb.display()))?;
-        hash_field(&mut h, builder.as_bytes());
+        hash_field(&mut h, self.builder_engine_fingerprint()?.as_bytes());
         let (locks, local_sources) = closure_repo_inputs(&closure);
         hash_repo_inputs(
             &mut h,
@@ -7189,6 +7234,7 @@ chmod 755 '{}'
         RecipeCheckRunner {
             root: PathBuf::new(),
             tb: PathBuf::new(),
+            engine_fp: std::sync::OnceLock::new(),
             builder_path: String::new(),
             builder_store: PathBuf::new(),
             builder_db: PathBuf::new(),
@@ -7967,6 +8013,7 @@ chmod 755 '{}'
         let runner = RecipeCheckRunner {
             root: PathBuf::new(),
             tb: PathBuf::new(),
+            engine_fp: std::sync::OnceLock::new(),
             builder_path: String::new(),
             builder_store: PathBuf::new(),
             builder_db: PathBuf::new(),
@@ -8104,9 +8151,10 @@ chmod 755 '{}'
         assert_eq!(map.get("trailing"), None);
     }
 
-    // The fingerprint changes if ANY of the evaluator bytes, the builder bytes, or a
-    // patch changes; it is stable when nothing changes; a missing patch dir is fine;
-    // and the length-delimiting defeats a concatenation collision.
+    // The fingerprint changes if ANY of the evaluator bytes, the builder's engine
+    // fingerprint, or a patch changes; it is stable when nothing changes; a
+    // missing patch dir is fine; and the length-delimiting defeats a
+    // concatenation collision.
     #[test]
     fn plan_fingerprint_changes_with_any_input_and_tolerates_no_patch_dir() {
         let tmp = env::temp_dir().join(format!("td-fp-test-{}", process::id()));
@@ -8114,41 +8162,38 @@ chmod 755 '{}'
         let patches = tmp.join("seed/patches");
         fs::create_dir_all(&patches).unwrap();
         let eval = tmp.join("td-recipe-eval");
-        let builder = tmp.join("td-builder");
         fs::write(&eval, b"EVAL-v1").unwrap();
-        fs::write(&builder, b"BUILDER-v1").unwrap();
         fs::write(patches.join("a.patch"), b"patch-a").unwrap();
         // A committed cargoLock read relative to the repo root (here `tmp`).
         fs::create_dir_all(tmp.join("recipes/locks/x")).unwrap();
         fs::write(tmp.join("recipes/locks/x/Cargo.lock"), b"lock-v1").unwrap();
         let locks = vec!["recipes/locks/x/Cargo.lock".to_string()];
-        let fp = |locks: &[String], srcs: &[String]| {
-            plan_fingerprint(&eval, &builder, &patches, &tmp, locks, srcs).unwrap()
+        let fp = |builder: &str, locks: &[String], srcs: &[String]| {
+            plan_fingerprint(&eval, builder, &patches, &tmp, locks, srcs).unwrap()
         };
 
-        let base = fp(&locks, &[]);
+        let base = fp("BUILDER-v1", &locks, &[]);
         // Deterministic: same inputs, same fingerprint.
-        assert_eq!(base, fp(&locks, &[]));
+        assert_eq!(base, fp("BUILDER-v1", &locks, &[]));
         // Evaluator change re-keys.
         fs::write(&eval, b"EVAL-v2").unwrap();
-        let after_eval = fp(&locks, &[]);
+        let after_eval = fp("BUILDER-v1", &locks, &[]);
         assert_ne!(base, after_eval);
-        // Builder change re-keys.
-        fs::write(&builder, b"BUILDER-v2").unwrap();
-        let after_builder = fp(&locks, &[]);
+        // A builder engine change re-keys.
+        let after_builder = fp("BUILDER-v2", &locks, &[]);
         assert_ne!(after_eval, after_builder);
         // Patch change re-keys.
         fs::write(patches.join("a.patch"), b"patch-a2").unwrap();
-        let after_patch = fp(&locks, &[]);
+        let after_patch = fp("BUILDER-v2", &locks, &[]);
         assert_ne!(after_builder, after_patch);
         // A committed cargoLock bump re-keys (the repo-read build input).
         fs::write(tmp.join("recipes/locks/x/Cargo.lock"), b"lock-v2").unwrap();
-        let after_lock = fp(&locks, &[]);
+        let after_lock = fp("BUILDER-v2", &locks, &[]);
         assert_ne!(after_patch, after_lock);
         // Dropping the lock from the closure (no rust rung) re-keys and is stable.
-        let nolock = fp(&[], &[]);
+        let nolock = fp("BUILDER-v2", &[], &[]);
         assert_ne!(after_lock, nolock);
-        assert_eq!(nolock, fp(&[], &[]));
+        assert_eq!(nolock, fp("BUILDER-v2", &[], &[]));
 
         // A local_source dir (#469): its in-tree content is read at build time, so
         // editing it MUST re-key. Declaring one re-keys; a byte edit under it
@@ -8157,40 +8202,38 @@ chmod 755 '{}'
         fs::create_dir_all(&srcdir).unwrap();
         fs::write(srcdir.join("main.rs"), b"fn main() {}").unwrap();
         let srcs = vec!["tests/demo-src".to_string()];
-        let with_src = fp(&[], &srcs);
+        let with_src = fp("BUILDER-v2", &[], &srcs);
         assert_ne!(nolock, with_src);
-        assert_eq!(with_src, fp(&[], &srcs));
+        assert_eq!(with_src, fp("BUILDER-v2", &[], &srcs));
         fs::write(srcdir.join("main.rs"), b"fn main() { /* v2 */ }").unwrap();
-        let after_src_edit = fp(&[], &srcs);
+        let after_src_edit = fp("BUILDER-v2", &[], &srcs);
         assert_ne!(with_src, after_src_edit);
         // The skipped `target`/`.git` dirs do NOT perturb the fingerprint (they are
         // excluded from the interned content address too).
         fs::create_dir_all(srcdir.join("target")).unwrap();
         fs::write(srcdir.join("target/junk"), b"artifact").unwrap();
-        assert_eq!(after_src_edit, fp(&[], &srcs));
+        assert_eq!(after_src_edit, fp("BUILDER-v2", &[], &srcs));
 
         // A missing patch dir is fine (hashes as zero patches) and stable.
         let nopatch = tmp.join("gone");
-        let f1 = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[], &[]).unwrap();
+        let f1 = plan_fingerprint(&eval, "BUILDER-v2", &nopatch, &tmp, &[], &[]).unwrap();
         assert_eq!(
             f1,
-            plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[], &[]).unwrap()
+            plan_fingerprint(&eval, "BUILDER-v2", &nopatch, &tmp, &[], &[]).unwrap()
         );
 
         // Length-delimiting: splitting a byte across the eval/builder boundary must
         // NOT collide (naive concatenation would).
         fs::write(&eval, b"ab").unwrap();
-        fs::write(&builder, b"c").unwrap();
-        let split_a = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[], &[]).unwrap();
+        let split_a = plan_fingerprint(&eval, "c", &nopatch, &tmp, &[], &[]).unwrap();
         fs::write(&eval, b"a").unwrap();
-        fs::write(&builder, b"bc").unwrap();
-        let split_b = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[], &[]).unwrap();
+        let split_b = plan_fingerprint(&eval, "bc", &nopatch, &tmp, &[], &[]).unwrap();
         assert_ne!(split_a, split_b);
 
         // A declared-but-missing lock fails closed (never silently ignored).
         assert!(plan_fingerprint(
             &eval,
-            &builder,
+            "BUILDER-v2",
             &nopatch,
             &tmp,
             &["recipes/locks/gone/Cargo.lock".to_string()],
@@ -8200,13 +8243,69 @@ chmod 755 '{}'
         // A declared-but-missing local_source dir also fails closed.
         assert!(plan_fingerprint(
             &eval,
-            &builder,
+            "BUILDER-v2",
             &nopatch,
             &tmp,
             &[],
             &["tests/gone-src".to_string()]
         )
         .is_err());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The builder's engine fingerprint is what its `engine-fingerprint` verb
+    /// prints, and nothing else counts: a builder that lacks the verb, fails,
+    /// or prints anything but a digest is an error, never a key with no
+    /// builder in it.
+    #[test]
+    fn a_builder_engine_fingerprint_is_the_digest_its_verb_prints_or_an_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !Path::new("/bin/sh").exists() {
+            eprintln!("SKIP: no /bin/sh");
+            return;
+        }
+        let tmp = env::temp_dir().join(format!("td-engine-fp-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let digest = "0123456789abcdef".repeat(4);
+        let script = |name: &str, body: &str| {
+            let p = tmp.join(name);
+            fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            // The ETXTBSY race `write_fake_cargo` documents: a fork in another
+            // test thread holds our write fd until it execs, and the code under
+            // test execs this script. Prove it runs before handing it over.
+            for _ in 0..400 {
+                match Command::new(&p).arg("--td-fixture-probe").stdin(Stdio::null()).output() {
+                    Err(e) if e.raw_os_error() == Some(26) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5))
+                    }
+                    _ => return p,
+                }
+            }
+            panic!("fixture {} never stopped being Text-file-busy", p.display());
+        };
+        let good = script(
+            "good",
+            &format!("[ \"$1\" = engine-fingerprint ] || exit 2\necho {digest}"),
+        );
+        assert_eq!(builder_engine_fingerprint(&good).unwrap(), digest);
+        // Trailing whitespace is the verb's newline, nothing more.
+        let padded = script("padded", &format!("echo '  {digest}  '"));
+        assert_eq!(builder_engine_fingerprint(&padded).unwrap(), digest);
+        for (name, body) in [
+            ("old", "echo 'usage: td-builder' >&2; exit 2"),
+            ("prose", "echo not-a-digest"),
+            ("short", "echo abcdef"),
+            ("upper", &format!("echo {}", digest.to_uppercase())),
+            ("failing", &format!("echo {digest}; exit 1")),
+            ("empty", "true"),
+        ] {
+            let p = script(name, body);
+            let err = builder_engine_fingerprint(&p).unwrap_err();
+            assert!(err.contains("reports no engine fingerprint"), "{name}: {err}");
+        }
+        assert!(builder_engine_fingerprint(&tmp.join("absent")).is_err());
         let _ = fs::remove_dir_all(&tmp);
     }
 

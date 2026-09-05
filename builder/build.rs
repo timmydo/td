@@ -19,7 +19,20 @@ use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+// SHA-256 straight from the engine's source file: a build script cannot use
+// the crate it builds for, and a build-dependency edge would compile the
+// engine twice. The module is std-only and self-contained by its own contract.
+#[path = "../engine/src/sha256.rs"]
+#[allow(dead_code)]
+mod sha256;
+
+// The host-only list the engine fingerprint skips, kept in the crate so its
+// own tests and the reachability test in `affected.rs` pin the same one.
+#[path = "src/engine_set.rs"]
+#[allow(dead_code)]
+mod engine_set;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=src/gate_defs");
@@ -86,5 +99,117 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     fs::write(out_dir.join("gate_registry.rs"), out)?;
+
+    let fingerprint = engine_source_fingerprint(Path::new(&manifest_dir))?;
+    println!("cargo:rustc-env=TD_BUILDER_ENGINE_FINGERPRINT={fingerprint}");
+    Ok(())
+}
+
+/// sha256 over the builder's ENGINE sources — every file under `src/` but
+/// the host-only ones `engine_set` names, this script, this crate's manifest,
+/// the engine crate's `src/` and manifest, the workspace manifest and lock,
+/// the repo's cargo config where present, since it shapes the binary as the
+/// manifests do, and `seed/seed-digests.txt`, which `main.rs` compiles in —
+/// as (path, file digest) pairs in path order. `td-builder
+/// engine-fingerprint` prints it, and the evaluator keys a recipe check's
+/// verdict memo and plan memo on it in place of the binary's bytes: an edit
+/// to the routing, the check loop or a gate re-keys nothing, an edit to any
+/// source a build can execute re-keys everything, and a binary reports the
+/// sources it was built from whatever the tree holds now. Every
+/// fingerprinted file is declared to cargo, and every directory walked for
+/// its adds and removes, so an edit reruns this script; the walk does not
+/// enter a host-only directory (a gate added or removed still reruns this
+/// for the registry above, and the digest stays). A hidden entry is
+/// skipped, file or directory alike; any other symlink is an error, since
+/// the walk does not follow one and skipping it would fingerprint less than
+/// the compiler reads.
+fn engine_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn Error>> {
+    let root = manifest_dir
+        .parent()
+        .ok_or("builder crate has no parent directory")?;
+    let mut files: Vec<PathBuf> = [
+        "builder/build.rs",
+        "builder/Cargo.toml",
+        "engine/Cargo.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "seed/seed-digests.txt",
+    ]
+    .iter()
+    .map(|rel| root.join(rel))
+    .collect();
+    // The repo's cargo config, when present. Its directory is what cargo
+    // watches, so the file appearing, changing or going reruns this — and
+    // only an existing path is ever declared: a declared path that does not
+    // exist makes cargo rerun the script on every build. A toolchain pin is
+    // not read: the host toolchain is outside the key by policy.
+    let cargo_dir = root.join(".cargo");
+    if cargo_dir.is_dir() {
+        println!("cargo:rerun-if-changed={}", cargo_dir.display());
+        let config = cargo_dir.join("config.toml");
+        if config.is_file() {
+            files.push(config);
+        }
+    }
+    let src = manifest_dir.join("src");
+    let host_only = |rel: &str, is_dir: bool| match is_dir {
+        true => engine_set::is_host_only_dir(rel),
+        false => engine_set::is_host_only(rel),
+    };
+    walk_sources(&src, &src, &host_only, &mut files)?;
+    let engine_src = root.join("engine/src");
+    walk_sources(&engine_src, &engine_src, &|_, _| false, &mut files)?;
+    files.sort();
+    let mut h = sha256::Sha256::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(root)?
+            .to_str()
+            .ok_or("non-UTF-8 path under the engine sources")?;
+        println!("cargo:rerun-if-changed={}", file.display());
+        let digest = sha256::sha256_file(file)
+            .map_err(|e| format!("fingerprint {}: {e}", file.display()))?;
+        h.update(rel.as_bytes());
+        h.update(b"\0");
+        h.update(digest.as_bytes());
+        h.update(b"\n");
+    }
+    Ok(sha256::to_base16(&h.finalize()))
+}
+
+/// Every file under `dir` (within `base`, which the `skip` decision sees
+/// paths relative to), depth first; a skipped entry, file or directory, is
+/// neither fingerprinted nor declared.
+fn walk_sources(
+    base: &Path,
+    dir: &Path,
+    skip: &dyn Fn(&str, bool) -> bool,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    for entry in fs::read_dir(dir).map_err(|e| format!("list {}: {e}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        // Hidden before symlink: an emacs lock is a hidden symlink.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        let rel = path
+            .strip_prefix(base)?
+            .to_str()
+            .ok_or("non-UTF-8 path under the engine sources")?;
+        if skip(rel, kind.is_dir()) {
+            continue;
+        }
+        if kind.is_symlink() {
+            return Err(format!("{}: symlink under the engine sources", path.display()).into());
+        }
+        if kind.is_dir() {
+            walk_sources(base, &path, skip, out)?;
+        } else {
+            out.push(path);
+        }
+    }
     Ok(())
 }

@@ -294,7 +294,7 @@ fn forward_to_stderr(out: &std::process::Output) {
 /// would let any other 69 mint one and turn a regression into a tolerated skip.
 fn tag_child_failure(out: &std::process::Output, msg: String) -> String {
     if td_engine::exit::child_reported_host_gap(out.status.code(), &out.stdout, &out.stderr) {
-        return format!("{}{msg}", crate::check_loop::UNPROVISIONED_TAG);
+        return format!("{}{msg}", td_engine::exit::UNPROVISIONED_TAG);
     }
     msg
 }
@@ -319,13 +319,13 @@ pub(crate) enum ProvisionErr {
 impl ProvisionErr {
     /// Render for the string-tag exit-code contract the verbs, `bootstrap_stage0`,
     /// and the native gate bodies share: an `Unavailable` gap carries the
-    /// [`crate::check_loop::UNPROVISIONED_TAG`] so the CLI maps it to
+    /// [`td_engine::exit::UNPROVISIONED_TAG`] so the CLI maps it to
     /// `EXIT_UNPROVISIONED`; a `Broken` toolchain is untagged so it maps to
     /// `ExitCode::FAILURE` (RED).
     pub(crate) fn tagged(&self) -> String {
         match self {
             ProvisionErr::Unavailable(m) => {
-                format!("{}{m}", crate::check_loop::UNPROVISIONED_TAG)
+                format!("{}{m}", td_engine::exit::UNPROVISIONED_TAG)
             }
             ProvisionErr::Broken(m) => m.clone(),
         }
@@ -734,7 +734,7 @@ pub(crate) fn bootstrap_stage0(
 /// the same trust domain: a same-user writer can forge a record at the derived
 /// location; the daemon-owned provenance db is the #472 follow-on.
 pub(crate) fn builder_lineage_dir() -> Result<PathBuf, String> {
-    Ok(crate::check_loop::daemon_runtime_dir()?.join("builder-lineage"))
+    Ok(crate::build_daemon::daemon_runtime_dir()?.join("builder-lineage"))
 }
 
 /// The registry filename for a `sha256:<hex>` NAR hash — validated so a db-
@@ -1816,8 +1816,8 @@ mod tests {
     #[test]
     fn only_a_69_that_carries_the_sentinel_is_tagged_unprovisioned() {
         use std::os::unix::process::ExitStatusExt;
-        let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL;
-        let tag = crate::check_loop::UNPROVISIONED_TAG;
+        let sentinel = td_engine::exit::UNPROVISIONED_SENTINEL;
+        let tag = td_engine::exit::UNPROVISIONED_TAG;
         // ExitStatus::from_raw takes a wait(2) status word: code << 8.
         let out = |code: i32, stdout: &str, stderr: &str| std::process::Output {
             status: std::process::ExitStatus::from_raw(code << 8),

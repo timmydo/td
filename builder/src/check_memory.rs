@@ -11,6 +11,13 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// The CPUs this process may run on, 1 when the count cannot be read: what a
+/// job budget is divided over. Engine-side, since a build's hosted job count
+/// is one caller (see `engine_set`); the gate runner is the other.
+pub(crate) fn nproc() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
 pub const GIB: u64 = 1024 * 1024 * 1024;
 // One-GiB admission granularity lets a finite per-user/container envelope run
 // one serialized low-memory gate without weakening the 2-GiB-per-compiler-job

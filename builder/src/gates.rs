@@ -638,9 +638,7 @@ impl SlotPool {
     }
 }
 
-pub(crate) fn nproc() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-}
+pub(crate) use crate::check_memory::nproc;
 
 fn slot_pool_from_env() -> SlotPool {
     SlotPool

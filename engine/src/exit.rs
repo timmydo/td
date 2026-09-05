@@ -34,6 +34,24 @@ pub const EXIT_PROVENANCE_REJECTED: i32 = 78;
 /// caller separate td's own "nothing to run here" from a stray EX_UNAVAILABLE.
 pub const UNPROVISIONED_SENTINEL: &str = "[td-unprovisioned-69:re#469]";
 
+/// The error-string half of the same signal: a control-plane routine (a gate
+/// body, a `provision-*`/`stage0-place` verb) prefixes its `Err` with this when
+/// the failure is a toolchain PROVISIONING gap — no rust/cc reachable in this
+/// jail — rather than a code regression. The verb / gate-body CLI maps a
+/// so-tagged error to [`EXIT_UNPROVISIONED`] so gate-run tolerates it
+/// (Unprovisioned, not RED); the host `cargo-test` preflight is the real per-PR
+/// enforcement (re #469).
+pub const UNPROVISIONED_TAG: &str = "UNPROVISIONED: ";
+
+/// Print [`UNPROVISIONED_SENTINEL`] to stderr, then return the process exit code
+/// for a toolchain-provisioning gap. EVERY [`EXIT_UNPROVISIONED`] exit funnels
+/// through here so the log token gate-run keys on and the exit code can never
+/// drift apart.
+pub fn unprovisioned_exit() -> std::process::ExitCode {
+    eprintln!("{UNPROVISIONED_SENTINEL}");
+    std::process::ExitCode::from(EXIT_UNPROVISIONED as u8)
+}
+
 /// The stdout token a `check-run` prints when it answers from its verdict
 /// memo instead of running: the check passed here before with every input
 /// it reads unchanged since. The gate counts such a check as passed and says

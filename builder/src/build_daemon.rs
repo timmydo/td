@@ -31,6 +31,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+/// The daemon's runtime dir (sockets, pid files, lineage records):
+/// `TD_DAEMON_DIR` or `$HOME/.td/build-daemon`. The daemon/child verbs and the
+/// stage0 lineage record RE-DERIVE their paths here rather than trusting an
+/// argv (re #469 round-8). Engine-side, since a build sandbox binds it (see
+/// `engine_set`); the check loop imports it.
+pub(crate) fn daemon_runtime_dir() -> Result<std::path::PathBuf, String> {
+    match std::env::var("TD_DAEMON_DIR") {
+        Ok(v) if !v.trim().is_empty() => Ok(std::path::PathBuf::from(v)),
+        _ => {
+            let home =
+                std::env::var("HOME").map_err(|_| "no HOME for TD_DAEMON_DIR".to_string())?;
+            Ok(std::path::Path::new(&home).join(".td/build-daemon"))
+        }
+    }
+}
+
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const WORKER_STACK_BYTES: usize = 512 * 1024;

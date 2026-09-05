@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::host_bin::{arm_check_child, host_cargo_bin, wait_with_deadline};
+
 fn fatal(msg: &str) -> String {
     format!("td-builder check: FATAL: {msg}")
 }
@@ -80,14 +82,10 @@ fn scoped_tree_key(key: &str, scope: Option<&[String]>) -> String {
     }
 }
 
-/// The error-string half of the same signal: a control-plane routine (a gate
-/// body, a `provision-*`/`stage0-place` verb) prefixes its `Err` with this when
-/// the failure is a toolchain PROVISIONING gap — no rust/cc reachable in this
-/// jail — rather than a code regression. The verb / gate-body CLI maps a
-/// so-tagged error to `EXIT_UNPROVISIONED` so gate-run tolerates it
-/// (Unprovisioned, not RED); the host `cargo-test` preflight is the real per-PR
-/// enforcement (re #469).
-pub(crate) const UNPROVISIONED_TAG: &str = "UNPROVISIONED: ";
+/// The error-string half of the same signal, and the exit that prints the
+/// sentinel: both in the engine crate's `exit` beside the code, since the
+/// build verbs raise them too (see `engine_set`).
+use td_engine::exit::{unprovisioned_exit, UNPROVISIONED_TAG};
 
 /// The stderr LOG token every `EXIT_UNPROVISIONED` exit prints (see
 /// [`unprovisioned_exit`]). gate-run reads a finished gate's captured log and
@@ -106,15 +104,6 @@ pub(crate) use td_engine::exit::UNPROVISIONED_SENTINEL;
 /// machine signal rather than FATAL prose — the coupling that broke twice, #268
 /// then #315, is exactly what a stable token avoids.
 pub(crate) const GATES_SKIPPED_SENTINEL: &str = "[td-gates-skipped:re#469]";
-
-/// Print [`UNPROVISIONED_SENTINEL`] to stderr, then return the process exit code
-/// for a toolchain-provisioning gap. EVERY `EXIT_UNPROVISIONED` exit funnels
-/// through here so the log token gate-run keys on and the exit code can never
-/// drift apart.
-pub(crate) fn unprovisioned_exit() -> ExitCode {
-    eprintln!("{UNPROVISIONED_SENTINEL}");
-    ExitCode::from(EXIT_UNPROVISIONED as u8)
-}
 
 /// The two ways a check can end unhappily. `Unprovisioned` is a RUNNER-setup gap
 /// (nothing ran — not a code regression); `Fatal` is every other hard error.
@@ -694,44 +683,6 @@ fn warm_argv(base: &[String]) -> Vec<String> {
     }
 }
 
-/// Wait for a warm child under an optional deadline: block when there is
-/// none; past it (or on a wait error), kill the child and report failure —
-/// a killed child is a failed warm step, never a failed check.
-fn wait_with_deadline(child: &mut std::process::Child, deadline: Option<Instant>) -> bool {
-    let Some(d) = deadline else {
-        return child.wait().map(|st| st.success()).unwrap_or(false);
-    };
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) => return st.success(),
-            Ok(None) if Instant::now() >= d => {
-                let _ = crate::sys::kill_child_recorded(
-                    child,
-                    "the warm step outlived its deadline (check-loop warm)",
-                );
-                let _ = child.wait();
-                return false;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => {
-                let _ = crate::sys::kill_child_recorded(
-                    child,
-                    &format!("waiting for the warm step failed: {e} (check-loop warm)"),
-                );
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
-}
-
-fn arm_check_child(cmd: &mut Command) {
-    // Every child spawned before the final gate sandbox must die when this
-    // hosted runner dies. PR_SET_PDEATHSIG is reset across fork, so arming only
-    // the runner in check_host is not enough for provisioning and warm tools.
-    crate::sandbox::die_with_parent(cmd);
-}
-
 fn spawn_argv(
     argv: &[String],
     root: &Path,
@@ -888,200 +839,6 @@ fn newstore_bin(root: &Path, newstore_rel: &str, bin: &str) -> Option<PathBuf> {
         .min()
 }
 
-/// Host-cargo fallback for a warm-prelude tool: `cargo build --release` in
-/// `<dir>/` and return `target/release/<bin>`. None when cargo is absent, the
-/// build fails, or it outlives the warm deadline (a hung cargo — e.g. a stale
-/// target-dir lock — must not stall the prelude; every warm is best-effort,
-/// the gates enforce presence).
-/// Resolve `bin` in a `:`-joined PATH fragment (the form `stage0::provision_*`
-/// return) to an absolute executable: the child runs under a provisioned
-/// toolchain PATH, so the binary must come from THERE, not an ambient lookup.
-fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
-    frags.split(':').filter(|f| !f.is_empty()).find_map(|d| {
-        let p = Path::new(d).join(bin);
-        // Require the exec bit, matching stage0::find_in_path and
-        // gate_bodies::find_in_path_frags: a non-executable same-named file
-        // earlier on PATH must not shadow the real tool.
-        let ok = std::fs::metadata(&p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
-        ok.then_some(p)
-    })
-}
-
-/// Build a td network tool (`dir` = `net`, the merged td-net multicall — the only
-/// crate this is called for, via [`host_net_applet`]) with the HOST cargo, STATICALLY
-/// linked (crt-static against a matched
-/// glibc), and return the binary. Best-effort: any missing piece (no toolchain,
-/// no static glibc, a non-static result) logs and returns `None` so the warm
-/// degrades to the td-built binary or is skipped — it never returns a
-/// DYNAMICALLY linked control-plane tool, which would drag a mutable
-/// host/guix-home runpath and flake with `libgcc_s.so.1` exit 127 (re #469).
-///
-/// Scope: td-feed/td-fetch run on the HOST (the warm's network prep), where NSS
-/// is present, so the static glibc's runtime `dlopen` of NSS modules during DNS
-/// resolves normally. `assert_static` proves an empty STARTUP closure (no
-/// PT_INTERP/DT_NEEDED/run-path — the flake fix), NOT that DNS needs zero runtime
-/// DSOs. td-subst's code compiles into td-net, but the td-subst APPLET is deliberately
-/// NOT resolved here (host_net_applet is called only for the fetch/feed applets): it is
-/// sourced ambiently (`TD_SUBST_BIN`/PATH) and runs inside
-/// the NEWNET-isolated loop sandbox, so its name-resolution/NSS posture is a separate
-/// question (PR #534 discussion) — statically linking that path is out of scope.
-///
-/// Unlike the pure-std tools, the network crates (ureq/rustls/ring) pull in
-/// PROC-MACROS that must compile for the host compiler, so `+crt-static` cannot
-/// go in a global RUSTFLAGS (it would try to statically link the proc-macro
-/// dylibs — "does not support these crate types"). Instead pass `--target
-/// x86_64-unknown-linux-musl` and set the static flags via CARGO_ENCODED_RUSTFLAGS
-/// ([`musl_static_encoded_rustflags`]): with `--target` set they apply to the
-/// MUSL_TARGET binary + its normal deps ONLY, leaving host-kind build scripts /
-/// proc-macros dynamic. The MUSL_TARGET link uses rustc's bundled `rust-lld` and
-/// musl's self-contained `libc.a` (no external glibc, no linker-glibc matching), so
-/// the result is fully static with an EMPTY runtime closure. CARGO_ENCODED_RUSTFLAGS
-/// is cargo's HIGHEST-precedence flag source — the one form a guix cargo wrapper
-/// (which re-injects `RUSTFLAGS="… -C linker=<gcc> -rpath …"` at runtime) cannot
-/// outrank; a per-target CARGO_TARGET_<musl>_RUSTFLAGS would lose to that global
-/// RUSTFLAGS, dropping `rust-lld` and baking a mutable guix-home DT_RUNPATH that
-/// fails assert_static. The compiler is pinned too: RUSTC to the provisioned rustc and
-/// RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER removed, so no ambient rustc or wrapper
-/// interposes on the control-plane build. ring's `cc-rs` build script compiles
-/// ring's C/asm FOR the musl target, so its CC/AR env forms (CC/HOST_CC/TARGET_CC
-/// and the per-target CC_<musl> spellings → the toolchain's `gcc`, AR alongside —
-/// every form cc-rs consults is pinned so an ambient one cannot outrank them). The
-/// HOST build scripts / proc-macros still link with the provisioned cc via
-/// CARGO_TARGET_<host-triple>_LINKER; `cc` may be absent by that name (a guix
-/// profile exposes only `gcc`), so it is pinned explicitly.
-fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) -> Option<PathBuf> {
-    let penv = crate::stage0::ProvisionEnv::from_env(root);
-    let rustpath = match crate::stage0::provision_rust(&penv) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("td-builder check: static {bin}: no rust toolchain ({e}) — skipping host build");
-            return None;
-        }
-    };
-    let ccpath = match crate::stage0::provision_cc(&penv) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("td-builder check: static {bin}: no C toolchain ({e}) — skipping host build");
-            return None;
-        }
-    };
-    let Some(cargo) = find_in_frags(&rustpath, "cargo") else {
-        eprintln!("td-builder check: static {bin}: no cargo on the provisioned rust toolchain — skipping host build");
-        return None;
-    };
-    let Some(rustc) = find_in_frags(&rustpath, "rustc") else {
-        eprintln!("td-builder check: static {bin}: no rustc on the provisioned rust toolchain — skipping host build");
-        return None;
-    };
-    let Some(cc) = find_in_frags(&ccpath, "cc").or_else(|| find_in_frags(&ccpath, "gcc")) else {
-        eprintln!("td-builder check: static {bin}: no cc/gcc on the provisioned C toolchain — skipping host build");
-        return None;
-    };
-    let Some(ar) = find_in_frags(&ccpath, "ar") else {
-        eprintln!("td-builder check: static {bin}: no ar on the provisioned C toolchain — skipping host build");
-        return None;
-    };
-
-    // Host triple (`rustc -vV`'s `host:` line): the triple cargo compiles the host
-    // build scripts / proc-macros for — those link with the provisioned cc.
-    let host_triple = match crate::stage0::rustc_host_triple(&rustc) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("td-builder check: static {bin}: {e} — skipping host build");
-            return None;
-        }
-    };
-    let musl = crate::stage0::MUSL_TARGET;
-    // The MUSL_TARGET binary gets the static flags (via CARGO_ENCODED_RUSTFLAGS —
-    // see the doc comment); the host build-script link gets the provisioned cc as
-    // its per-target linker.
-    let host_linker_var = crate::stage0::target_linker_var(&host_triple);
-    let encoded_rustflags = crate::stage0::musl_static_encoded_rustflags();
-    // cc-rs (ring's C build) resolves the compiler/archiver from the FIRST of
-    // several env forms, and the per-target-suffixed forms outrank the plain
-    // CC/HOST_CC/AR we set. ring's C compiles FOR the musl target, so pin every
-    // form cc-rs consults for that triple (both dash and underscore spellings) to
-    // the matched toolchain so an ambient CC_<triple>/AR_<triple>/HOST_AR cannot
-    // slip a different compiler into a control-plane binary (review PR #534).
-    let musl_us = musl.replace('-', "_");
-    let cc_target = format!("CC_{musl}");
-    let cc_target_us = format!("CC_{musl_us}");
-    let ar_target = format!("AR_{musl}");
-    let ar_target_us = format!("AR_{musl_us}");
-    let ambient_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{rustpath}:{ccpath}:{ambient_path}");
-
-    let mut command = Command::new(&cargo);
-    command
-        .args(["build", "--release", "--quiet", "--target", musl])
-        .current_dir(root.join(dir))
-        .env("PATH", &new_path)
-        // Pin the compiler itself: an inherited RUSTC would build with a
-        // different rustc than the one we read the triple from, and an inherited
-        // RUSTC_WRAPPER (e.g. sccache) would interpose on the control-plane build.
-        // Set the wrappers to "" (not env_remove): an ABSENT var lets cargo fall
-        // back to a `.cargo/config.toml` `build.rustc-wrapper`, whereas an empty
-        // value means "no wrapper" regardless of config (Agy review, PR #534).
-        .env("RUSTC", &rustc)
-        .env("RUSTC_WRAPPER", "")
-        .env("RUSTC_WORKSPACE_WRAPPER", "")
-        .env("CC", &cc)
-        .env("HOST_CC", &cc)
-        .env("TARGET_CC", &cc)
-        .env(&cc_target, &cc)
-        .env(&cc_target_us, &cc)
-        .env("AR", &ar)
-        .env("HOST_AR", &ar)
-        .env("TARGET_AR", &ar)
-        .env(&ar_target, &ar)
-        .env(&ar_target_us, &ar)
-        .env(&host_linker_var, &cc)
-        .env("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags)
-        .stdin(Stdio::null());
-    arm_check_child(&mut command);
-    let child = command.spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("td-builder check: static {bin}: cannot spawn cargo ({e}) — skipping host build");
-            return None;
-        }
-    };
-    if !wait_with_deadline(&mut child, deadline) {
-        return None;
-    }
-    let p = root
-        .join(dir)
-        .join("target")
-        .join(musl)
-        .join("release")
-        .join(bin);
-    if !p.is_file() {
-        return None;
-    }
-    // Fail closed on a non-static result rather than hand a dynamic control-plane
-    // binary to the warm (re #469).
-    if let Err(e) = crate::elf::assert_static(&p) {
-        eprintln!(
-            "td-builder check: static {bin}: host build produced a non-static binary ({e}) — skipping"
-        );
-        return None;
-    }
-    Some(p)
-}
-
-/// The host td-net multicall itself (no applet link): the `provision-net` verb's
-/// resolver, so a caller outside this binary — the evaluator's interactive source
-/// warm — gets the SAME statically linked build the prelude uses rather than a
-/// second copy of it. Applet dispatch is by argv there (`td-net feed …`), which is
-/// why this returns the multicall and `host_net_applet` returns a link.
-pub(crate) fn host_td_net(root: &Path) -> Option<PathBuf> {
-    host_cargo_bin(root, "net", "td-net", None)
-}
-
 /// Build the merged `net` control-plane crate (td-net) with the host cargo, statically,
 /// then return an APPLET-named link to it (td-fetch/td-feed/td-subst) beside the binary —
 /// so argv[0] basename multicall dispatch selects the applet with the caller's argv
@@ -1127,40 +884,6 @@ fn host_net_applet(root: &Path, applet: &str, deadline: Option<Instant>) -> Opti
     Some(link)
 }
 
-/// One `[[package]]` entry of a Cargo.lock that carries a checksum — `(name,
-/// version, sha256)`. The checksummed entries are the vendored crates-io deps;
-/// the root (path) crate has no checksum and is excluded, exactly the
-/// reduction the retired shell awk did.
-pub(crate) fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
-    // Tolerate non-canonical whitespace around `=` and leading indentation so a
-    // hand-edited lock cannot slip a field past the trust-boundary scanners; a
-    // cargo-written lock (column-0 fields, single space) parses identically.
-    fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        let (k, v) = line.trim().split_once('=')?;
-        if k.trim() != key {
-            return None;
-        }
-        let inner = v.trim().strip_prefix('"')?;
-        let end = inner.find('"')?;
-        inner.get(..end).filter(|s| !s.is_empty())
-    }
-    let mut out = Vec::new();
-    let (mut name, mut ver): (Option<&str>, Option<&str>) = (None, None);
-    for line in lock.lines() {
-        if line.starts_with("[[package]]") {
-            (name, ver) = (None, None);
-        } else if let Some(v) = field(line, "name") {
-            name = Some(v);
-        } else if let Some(v) = field(line, "version") {
-            ver = Some(v);
-        } else if let Some(sum) = field(line, "checksum") {
-            if let (Some(n), Some(v)) = (name, ver) {
-                out.push((n.to_string(), v.to_string(), sum.to_string()));
-            }
-        }
-    }
-    out
-}
 
 /// Warm a td crate's OWN dependency closure (native since this port — was
 /// tools/warm-td-fetch-crates.sh, the prelude's last `sh tools/…` spawn;
@@ -1213,7 +936,7 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
         return;
     };
     let mut complete = true;
-    for (crate_name, ver, sum) in parse_lock_checksums(&lock) {
+    for (crate_name, ver, sum) in crate::cargo_lock::parse_lock_checksums(&lock) {
         let nv = format!("{crate_name}-{ver}");
         let out = dest.join(format!("{nv}.crate"));
         if crate::sha256::sha256_file(&out).ok().as_deref() == Some(sum.as_str()) {
@@ -1733,20 +1456,6 @@ fn built_recipe_eval(root: &Path) -> Option<PathBuf> {
             .unwrap_or_default(),
     );
     executable(&path).then_some(path)
-}
-
-/// The daemon's runtime dir (sockets, pid files, lineage records):
-/// `TD_DAEMON_DIR` or `$HOME/.td/build-daemon`. The daemon/child verbs and the
-/// stage0 lineage record RE-DERIVE their paths here rather than trusting an
-/// argv (re #469 round-8).
-pub(crate) fn daemon_runtime_dir() -> Result<PathBuf, String> {
-    match std::env::var("TD_DAEMON_DIR") {
-        Ok(v) if !v.trim().is_empty() => Ok(PathBuf::from(v)),
-        _ => {
-            let home = std::env::var("HOME").map_err(|_| s("no HOME for TD_DAEMON_DIR"))?;
-            Ok(Path::new(&home).join(".td/build-daemon"))
-        }
-    }
 }
 
 pub fn cli(args: &[String]) -> ExitCode {
@@ -2275,71 +1984,6 @@ mod tests {
         for bad in ["", "s", "m", "-5", "1.5", "5x", "m30", "30 m"] {
             assert_eq!(parse_timeout_secs(bad), None, "`{bad}` must not parse");
         }
-    }
-
-    #[test]
-    fn parse_lock_checksums_takes_only_checksummed_packages() {
-        // The root (path) crate carries no checksum and must be excluded; the
-        // vendored crates-io deps carry one each.
-        let lock = "\
-# This file is automatically @generated by Cargo.\n\
-version = 3\n\
-\n\
-[[package]]\n\
-name = \"adler2\"\n\
-version = \"2.0.0\"\n\
-source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
-checksum = \"512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627\"\n\
-\n\
-[[package]]\n\
-name = \"td-fetch\"\n\
-version = \"0.1.0\"\n\
-dependencies = [\n\
- \"ureq\",\n\
-]\n\
-\n\
-[[package]]\n\
-name = \"ureq\"\n\
-version = \"2.10.1\"\n\
-source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
-checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\n";
-        let got = parse_lock_checksums(lock);
-        assert_eq!(
-            got,
-            vec![
-                (
-                    "adler2".to_string(),
-                    "2.0.0".to_string(),
-                    "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627".to_string()
-                ),
-                (
-                    "ureq".to_string(),
-                    "2.10.1".to_string(),
-                    "b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67".to_string()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_lock_checksums_covers_the_real_td_net_lock() {
-        // The td-net crate-closure warm vendors ≥70 crates; the parser must see at least
-        // that many in the real net/Cargo.lock (drift guard: a lockfile-format change that
-        // blinds the parser reds here, not as a silently-cold warm).
-        let lock =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../net/Cargo.lock"))
-                .unwrap();
-        let got = parse_lock_checksums(&lock);
-        assert!(
-            got.len() >= 70,
-            "only {} checksummed packages parsed",
-            got.len()
-        );
-        assert!(
-            got.iter()
-                .all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
-            "malformed triplet parsed from the real lock"
-        );
     }
 
     #[test]

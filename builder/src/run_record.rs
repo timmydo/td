@@ -318,7 +318,7 @@ impl Guard {
 pub fn record_if_long_run(args: &[String]) -> Option<Guard> {
     let hosted = std::env::var_os(crate::check_memory::HOST_CHILD_ENV).is_some();
     let verb = should_record(args, hosted)?;
-    let root = crate::affected::resolve_root();
+    let root = crate::repo::resolve_root();
     let guard = Guard::record(&root, verb);
     if guard.is_none() {
         // The trade is deliberate — a run that cannot write a note still runs
@@ -718,7 +718,7 @@ fn stop_main(args: &[String], root: &Path, wait: Duration) -> u8 {
 }
 
 pub fn stop_cli(args: &[String]) -> ExitCode {
-    ExitCode::from(stop_main(args, &crate::affected::resolve_root(), CONFIRM))
+    ExitCode::from(stop_main(args, &crate::repo::resolve_root(), CONFIRM))
 }
 
 // Opting out LOCALLY, which is what AGENTS.md allows inline test code to do,
