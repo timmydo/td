@@ -5092,6 +5092,35 @@ slave and all three parent-side `Stdio` clones, retaining only the master.
 Closing that master produces the kernel's normal PTY hangup; child exit unmaps
 the surface and terminates the client.
 
+A `--command` child that ends badly, by a non-zero status or a signal, leaves
+its last screen in the log before td-term reports the exit: the rows of the
+active screen at exit — whichever screen that is, and however far back the
+reader had scrolled, because the program's last words are there and not in the
+history — with trailing blanks and the blank rows below the last written one
+dropped, one `td-term: last screen (<program>): ` line each, the program being
+the command's final path component, in one buffer written once and beginning on
+a fresh line, since a writer sharing the console may have left one unfinished.
+The prefix means no row can begin a console line, which is what the
+line-anchored boot markers require, short of a write the kernel cuts and td-term
+resumes, the residue every console writer shares; it does not defend the markers
+the boot oracle latches as substrings, so the oracle blanks those records, from
+the prefix wherever it stands in a line to the line's end, a co-writer's residue
+on that line going with it, which can lose a latch but not forge one, before its
+latches read the console, because a marker on a jailed application's screen is
+not evidence. A character the control report would not print in a title is a
+space here for the same reason. A program that leaves the alternate screen
+before dying shows the primary screen, which is what the window showed. The
+window closes with the session, and what td-jail or the program wrote there was
+otherwise on no log; the first boot of the terminal applications ended in two
+windows that had shown a refusal nobody could read. The default shell reports
+nothing, because a shell exits with its last command's status and a logout after
+a failed command is not news; a clean exit reports nothing; and the output is
+bounded by the grid. The screen may hold what the user typed, and the console it
+goes to is trusted by image configuration today (td-login/THREAT-MODEL.md);
+under principle 7's target trust model a screen copied to a shared console is a
+disclosure, so this is scoped to the current model rather than a permanent
+grant.
+
 The PTY reader thread owns a master descriptor and parks in `read` whenever the
 child is idle, and safe `std` cannot interrupt that: there is no poll, no read
 timeout, and closing a descriptor another thread is reading is not something

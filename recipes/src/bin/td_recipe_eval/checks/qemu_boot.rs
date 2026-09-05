@@ -4793,8 +4793,16 @@ fn drain_console(
                     buf.extend_from_slice(slice);
                     drained += n;
                     let scan_from = prior_len.saturating_sub(overlap).saturating_sub(1);
+                    // Read before the widening below: a window that begins
+                    // at the stream's first byte began there before it was
+                    // widened, and the flag must not depend on where a line
+                    // happens to start.
+                    let at_stream_start = scan_from == 0;
+                    // Back to the start of that line, so a screen record the
+                    // seam split is presented with its prefix and blanked.
+                    let scan_from = line_start(buf, scan_from, SCREEN_RECORD_LOOKBACK);
                     let scan = buf.get(scan_from..).unwrap_or(buf.as_slice());
-                    latch_console_evidence_from(evidence, scan, marker, scan_from == 0);
+                    latch_console_evidence_from(evidence, scan, marker, at_stream_start);
                     if buf.len() > CAP {
                         let drop = buf.len() - CAP;
                         buf.drain(..drop);
@@ -4929,6 +4937,64 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
     .fold(0, usize::max)
 }
 
+/// td-term copies a `--command` child's last screen to the console when the
+/// child ends badly, one record per row, each beginning so and naming the
+/// program in parentheses after it. A screen is a jailed application's
+/// text.
+const TD_TERM_LAST_SCREEN_PREFIX: &str = "td-term: last screen";
+
+/// How far back a scan window is widened to reach the start of its first
+/// line: the widest row td-term can carry, at four bytes a cell, plus its
+/// widest program name at four bytes a character, plus the prefix around
+/// the name. A line longer than that is not a screen record; the test pins
+/// the two widths to the compositor's constants.
+const SCREEN_RECORD_LOOKBACK: usize = 4 * 16_384 + 4 * 32 + 32;
+
+/// The start of the line `from` is on: one past the last newline before it,
+/// looking back at most `bound` bytes, and `bound` bytes back when there is
+/// none.
+fn line_start(buf: &[u8], from: usize, bound: usize) -> usize {
+    let floor = from.saturating_sub(bound);
+    buf.get(floor..from)
+        .and_then(|span| span.iter().rposition(|&byte| byte == b'\n'))
+        .map_or(floor, |at| floor.saturating_add(at).saturating_add(1))
+}
+
+/// The window with every screen record blanked: a marker on a jailed
+/// application's screen is not evidence, and a program that printed
+/// `Kernel panic` before dying did not panic the kernel. Blanked to spaces
+/// in a copy, so every offset and line terminator stays where it was and
+/// the line-anchored latches see the framing they saw; the retained console
+/// keeps the records, which are the diagnostic. A record runs from its
+/// prefix to the end of the line, wherever in the line the prefix stands:
+/// td-term begins a report on a fresh line, but a writer whose line was
+/// unfinished when the report went out leaves the first record after its
+/// text, and nothing but td-term writes the prefix. `drain_console` widens
+/// its window back to the start of its first line, so a record the read
+/// seam split is seen with its prefix.
+fn without_screen_records(window: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let prefix = TD_TERM_LAST_SCREEN_PREFIX.as_bytes();
+    let mut blanked: Option<Vec<u8>> = None;
+    let mut at = 0;
+    while at < window.len() {
+        let rest = window.get(at..).unwrap_or_default();
+        let line_end = rest
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(window.len(), |length| at.saturating_add(length));
+        let line = rest.get(..line_end.saturating_sub(at)).unwrap_or_default();
+        // `windows` wants a width above zero; the prefix is a non-empty constant.
+        if let Some(begins) = line.windows(prefix.len()).position(|word| word == prefix) {
+            let copy = blanked.get_or_insert_with(|| window.to_vec());
+            if let Some(record) = copy.get_mut(at.saturating_add(begins)..line_end) {
+                record.fill(b' ');
+            }
+        }
+        at = line_end.saturating_add(1);
+    }
+    blanked.map_or(std::borrow::Cow::Borrowed(window), std::borrow::Cow::Owned)
+}
+
 fn exact_line_window(marker: &str) -> usize {
     marker.len().saturating_add(3)
 }
@@ -4944,6 +5010,8 @@ fn latch_console_evidence_from(
     target: &[u8],
     starts_at_stream_boundary: bool,
 ) {
+    let buf = without_screen_records(buf);
+    let buf: &[u8] = &buf;
     latch_marker(&mut evidence.target, buf, target);
     latch_marker(&mut evidence.greeter, buf, GREETER_MARKER.as_bytes());
     latch_marker(
@@ -8804,6 +8872,120 @@ mod tests {
             "a marker split across a read boundary must still latch - the rescan overlap \
              regressed"
         );
+    }
+
+    /// A failing `--command` child's screen reaches the console as
+    /// `td-term: last screen (<program>):` records, and a screen is a jailed
+    /// application's text: a marker on one is not evidence, and a program
+    /// that printed `Kernel panic` before dying did not panic the kernel. The
+    /// lines around a record keep their framing, and a record after another
+    /// writer's unfinished line is a record still.
+    #[test]
+    fn a_screen_record_is_not_evidence() {
+        let record = |row: &str| format!("{TD_TERM_LAST_SCREEN_PREFIX} (mail): {row}");
+        let mut evidence = ConsoleEvidence::default();
+        let console = format!(
+            "\n{}\n{}\n{}\n",
+            record(TD_UTIL_RUNTIME_MARKER),
+            record("Kernel panic - not syncing"),
+            record(TD_JAIL_KILL_REAPS_MARKER)
+        );
+        latch_console_evidence(&mut evidence, console.as_bytes(), b"target");
+        assert!(
+            !evidence.td_util_runtime && !evidence.kernel_panic && !evidence.td_jail_kill_reaps,
+            "a screen record latched a marker"
+        );
+        let console = format!(
+            "\n{}\n{TD_JAIL_KILL_REAPS_MARKER}\n...{}\n",
+            record("x"),
+            record(TD_UTIL_RUNTIME_MARKER)
+        );
+        latch_console_evidence(&mut evidence, console.as_bytes(), b"target");
+        assert!(evidence.td_jail_kill_reaps, "the line after a record is a line of its own");
+        assert!(
+            !evidence.td_util_runtime,
+            "a record after an unfinished line latched its marker"
+        );
+        assert!(!evidence.kernel_panic);
+        latch_console_evidence(
+            &mut evidence,
+            format!("...\n{TD_UTIL_RUNTIME_MARKER}\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_util_runtime, "the marker on a line of its own is evidence");
+
+        // Blanking keeps every offset and terminator; the record's prefix is
+        // td-term's own spelling.
+        let line = format!("{}\r", record("b c"));
+        let window = format!("a\n{line}\nd");
+        let blanked = without_screen_records(window.as_bytes());
+        assert_eq!(blanked.len(), window.len());
+        assert_eq!(
+            &*blanked,
+            format!("a\n{}\nd", " ".repeat(line.len())).as_bytes()
+        );
+        let after_dots = format!("..{line}\nd");
+        let blanked = without_screen_records(after_dots.as_bytes());
+        assert_eq!(
+            &*blanked,
+            format!("..{}\nd", " ".repeat(line.len())).as_bytes()
+        );
+        assert!(matches!(
+            without_screen_records(b"a\nb\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let term_client = include_str!("../../../../../td-compositor/src/term_client.rs");
+        assert!(term_client.contains(&format!(
+            "const LAST_SCREEN_PREFIX: &str = {TD_TERM_LAST_SCREEN_PREFIX:?};"
+        )));
+        // The lookback's two widths are the compositor's.
+        assert!(term_client.contains("const MAX_REPORTED_PROGRAM_CHARS: usize = 32;"));
+        let compositor = include_str!("../../../../../td-compositor/src/main.rs");
+        assert!(compositor.contains("const MAX_UI_DIMENSION: usize = 16_384;"));
+        assert!(SCREEN_RECORD_LOOKBACK >= 4 * 16_384 + 4 * 32 + "td-term: last screen (): ".len());
+    }
+
+    /// A record the read seam splits is blanked all the same: the scan window
+    /// is widened back to the start of its first line, so the prefix is seen
+    /// even when it lies farther back than the marker overlap reaches. The
+    /// same bytes under another prefix latch, which is what says the
+    /// blanking and not the seam kept the marker out.
+    #[test]
+    fn drain_console_blanks_a_screen_record_split_across_a_read_boundary() {
+        const CHUNK: usize = 8192;
+        let overlap = evidence_marker_max_len(b"target-never-appears");
+        let pad = "p".repeat(overlap + 64);
+        let head = format!("{TD_TERM_LAST_SCREEN_PREFIX} (mail): ");
+        let marker_at = CHUNK + 1;
+        let start = marker_at - head.len() - pad.len();
+        assert!(start + head.len() < CHUNK - overlap - 1);
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        for (prefix, expected) in [(head.clone(), false), ("x".repeat(head.len()), true)] {
+            let path = dir.join(if expected { "control.log" } else { "console.log" });
+            let mut bytes = vec![b'x'; start - 1];
+            bytes.push(b'\n');
+            bytes.extend_from_slice(prefix.as_bytes());
+            bytes.extend_from_slice(pad.as_bytes());
+            assert_eq!(bytes.len(), marker_at, "the marker must begin past the seam");
+            bytes.extend_from_slice(TD_UTIL_RUNTIME_MARKER.as_bytes());
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&[b'y'; 128]);
+            fs::write(&path, &bytes).unwrap();
+            let mut file = None;
+            let mut buffer = Vec::new();
+            let mut evidence = ConsoleEvidence::default();
+            drain_console_to_eof(
+                &path,
+                &mut file,
+                &mut buffer,
+                b"target-never-appears",
+                &mut evidence,
+            )
+            .unwrap();
+            assert_eq!(evidence.td_util_runtime, expected, "prefix {prefix:?}");
+        }
     }
 
     #[test]

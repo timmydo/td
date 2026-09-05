@@ -564,9 +564,10 @@ fn clean_app_id(app_id: Option<&str>) -> String {
 ///   of a terminal should see what the record says.
 ///
 /// A list rather than a category test, because this crate has no Unicode
-/// tables and will not grow one for a label field. Ordinary text in any script
+/// tables and will not grow one for a label field, nor for the screen rows and
+/// program names td-term reports through it. Ordinary text in any script
 /// survives; what does not is the set below, named with its reason.
-fn reportable(character: char) -> bool {
+pub(crate) fn reportable(character: char) -> bool {
     !character.is_control()
         && !matches!(character,
             // Line and paragraph separators (Zl, Zp).

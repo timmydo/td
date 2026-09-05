@@ -1724,6 +1724,9 @@ struct Child {
     input: Arc<pty::Input>,
     drained: bool,
     status: Option<ExitStatus>,
+    /// The name a `--command` program's last screen is reported under when
+    /// it ends badly, and `None` for the default shell, which is not.
+    program: Option<String>,
 }
 
 struct ClipboardWrite {
@@ -1784,6 +1787,7 @@ impl Default for Child {
             input: pty::Input::new(),
             drained: false,
             status: None,
+            program: None,
         }
     }
 }
@@ -2123,6 +2127,13 @@ fn serve_event(
     }
     // Both halves, in either order.
     if let (true, Some(status)) = (child.drained, child.status) {
+        // One locked `write_all` of one buffer, as every line this file
+        // puts on the console is: a row that landed on a line of its own
+        // could pass for a marker.
+        if let Some(report) = last_screen_report(child.program.as_deref(), status, model.as_ref())
+        {
+            let _ = std::io::stderr().lock().write_all(report.as_bytes());
+        }
         return Err(ended(status));
     }
     settle(connection, surface, model, session)?;
@@ -2194,6 +2205,7 @@ fn start_child(
     pty: &Pty,
     events: &SyncSender<Event>,
     command: &pty::ChildCommand,
+    program: Option<String>,
     account: &pty::Account,
     input: Arc<pty::Input>,
 ) -> Result<Started, String> {
@@ -2242,6 +2254,7 @@ fn start_child(
             input,
             drained: false,
             status: None,
+            program,
         },
     ))
 }
@@ -2280,7 +2293,8 @@ fn start(
 ) -> Result<Running, String> {
     let account = pty::current_account(inputs.status, inputs.passwd)?;
     let command = pty::child_command(Path::new(pty::CTTYHACK), inputs.command)?;
-    let (children, child) = start_child(pty, events, &command, &account, input)?;
+    let program = launched_program_name(inputs.command);
+    let (children, child) = start_child(pty, events, &command, program, &account, input)?;
     let (rows, columns) = cells;
     let published = ready::publish(inputs.ready_socket, rows, columns)?;
     Ok((children, child, published))
@@ -2305,6 +2319,93 @@ fn ended(status: ExitStatus) -> String {
         Some(code) => format!("the terminal's child exited with status {code}"),
         None => format!("the terminal's child was killed by a signal ({status})"),
     }
+}
+
+/// How every row of a report begins; the boot oracle reads a console line
+/// that begins so as a record, whatever follows.
+const LAST_SCREEN_PREFIX: &str = "td-term: last screen";
+
+/// The most of a program's name a report carries.
+const MAX_REPORTED_PROGRAM_CHARS: usize = 32;
+
+/// The name a `--command` child is reported under, and `None` for the
+/// default shell: the program's final path component, bounded, with any
+/// character the report would not print made a space, so the name can
+/// neither end a line nor run it long. Told by the argv rather than by the
+/// command built from it, because a `--command` that names the shell's own
+/// wrapper is still a launched program.
+fn launched_program_name(command: &[OsString]) -> Option<String> {
+    let program = command.first()?;
+    let name = Path::new(program)
+        .file_name()
+        .unwrap_or(program.as_os_str())
+        .to_string_lossy();
+    Some(
+        name.chars()
+            .take(MAX_REPORTED_PROGRAM_CHARS)
+            .map(|character| {
+                if crate::control::reportable(character) {
+                    character
+                } else {
+                    ' '
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The log lines for a `--command` child that ended badly, and nothing for
+/// any other exit. The window closes with the session, and what td-jail or
+/// the program wrote there was on no log; a program launched by `--command`
+/// has no other place to be heard. The rows are the active screen's at
+/// exit — whichever screen is active, and however far back the reader had
+/// scrolled, because the program's last words are there and not in the
+/// history — with trailing blanks and the blank rows below the last written
+/// one dropped, each behind `td-term: last screen (<program>): ` so a row
+/// names the program it came from, written into ONE buffer for one
+/// write as the rows are read, and beginning on a fresh line, because a
+/// writer that shares the console may have left one unfinished and a record
+/// belongs at a line's start. A character the control report would not
+/// print in a title is a space here for the same reason: a line separator
+/// or a direction control in a log line is a forged record. The default
+/// shell reports nothing: it exits with its last command's status, and a
+/// logout after a failed command is not news. Bounded by the grid.
+fn last_screen_report(
+    program: Option<&str>,
+    status: ExitStatus,
+    model: Option<&Terminal>,
+) -> Option<String> {
+    if status.success() {
+        return None;
+    }
+    let program = program?;
+    // Neither focused nor ringing: the cursor and the bell are the
+    // renderer's business, and this reads cells.
+    let snapshot = render::Snapshot::new(model?, false, false);
+    let (rows, columns) = (snapshot.rows(), snapshot.columns());
+    let prefix = format!("{LAST_SCREEN_PREFIX} ({program}): ");
+    let mut report = String::with_capacity(1 + rows * (prefix.len() + columns + 1));
+    report.push('\n');
+    let mut line = String::with_capacity(columns);
+    // Where the report ends: after the last row that had anything on it,
+    // and nowhere for a blank screen.
+    let mut kept = 0;
+    for row in 0..rows {
+        line.clear();
+        for column in 0..columns {
+            let scalar = snapshot.cell(row, column).scalar;
+            line.push(if crate::control::reportable(scalar) { scalar } else { ' ' });
+        }
+        let written = line.trim_end();
+        report.push_str(&prefix);
+        report.push_str(written);
+        report.push('\n');
+        if !written.is_empty() {
+            kept = report.len();
+        }
+    }
+    report.truncate(kept);
+    (!report.is_empty()).then_some(report)
 }
 
 /// The same turn, reading the event here. Startup has nothing else to serve,
@@ -2743,6 +2844,89 @@ mod tests {
             seat: 5,
             data_device_manager: 6,
         })
+    }
+
+    /// The report is for a `--command` child that ended badly: the active
+    /// screen's rows, each attributed to the program, in one buffer, the
+    /// blank rows below the last written one dropped and one between written
+    /// rows kept, a control character the report would not print made a
+    /// space, on a fresh line; whichever screen is active, the alternate
+    /// while a program is on it and the primary once it has left; and
+    /// nothing for a clean exit, the default shell, a screen not yet built,
+    /// or a blank one.
+    #[test]
+    fn a_launched_child_that_ends_badly_reports_its_last_screen() {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = ExitStatus::from_raw(1 << 8);
+        let killed = ExitStatus::from_raw(9);
+        let clean = ExitStatus::from_raw(0);
+        let mail = Some("mail");
+        let mut terminal = Terminal::new(4, 12).unwrap();
+        terminal.feed(b"td-jail: no\r\n\r\n  two  ");
+        let report = "\ntd-term: last screen (mail): td-jail: no\n\
+                      td-term: last screen (mail): \n\
+                      td-term: last screen (mail):   two\n";
+        assert_eq!(
+            last_screen_report(mail, failed, Some(&terminal)).as_deref(),
+            Some(report)
+        );
+        assert_eq!(
+            last_screen_report(mail, killed, Some(&terminal)).as_deref(),
+            Some(report)
+        );
+        assert!(last_screen_report(mail, clean, Some(&terminal)).is_none());
+        assert!(last_screen_report(None, failed, Some(&terminal)).is_none());
+        assert!(last_screen_report(mail, failed, None).is_none());
+        let blank = Terminal::new(2, 4).unwrap();
+        assert!(last_screen_report(mail, failed, Some(&blank)).is_none());
+
+        // The active screen, not the history: the program's last words are
+        // on it.
+        let mut terminal = Terminal::new(2, 12).unwrap();
+        terminal.feed(b"one\r\ntwo\r\nthree");
+        assert_eq!(
+            last_screen_report(mail, failed, Some(&terminal)).as_deref(),
+            Some("\ntd-term: last screen (mail): two\ntd-term: last screen (mail): three\n")
+        );
+
+        // Whichever screen is active.
+        let mut terminal = Terminal::new(1, 12).unwrap();
+        terminal.feed(b"primary\x1b[?1049halt");
+        assert_eq!(
+            last_screen_report(mail, failed, Some(&terminal)).as_deref(),
+            Some("\ntd-term: last screen (mail): alt\n")
+        );
+        terminal.feed(b"\x1b[?1049l");
+        assert_eq!(
+            last_screen_report(mail, failed, Some(&terminal)).as_deref(),
+            Some("\ntd-term: last screen (mail): primary\n")
+        );
+
+        let mut terminal = Terminal::new(1, 12).unwrap();
+        terminal.feed("a\u{2028}b\u{202e}c".as_bytes());
+        assert_eq!(
+            last_screen_report(mail, failed, Some(&terminal)).as_deref(),
+            Some("\ntd-term: last screen (mail): a b c\n")
+        );
+    }
+
+    /// The name is the program's final path component, scrubbed and bounded
+    /// as a report row is, and the default shell has none.
+    #[test]
+    fn a_launched_program_is_named_by_its_final_path_component() {
+        let name = |argv: &[&str]| {
+            let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
+            launched_program_name(&argv)
+        };
+        assert_eq!(name(&["/bin/mail"]).as_deref(), Some("mail"));
+        assert_eq!(name(&["/bin/news", "--offline"]).as_deref(), Some("news"));
+        assert_eq!(name(&["/bin/a\nb\u{2028}c"]).as_deref(), Some("a b c"));
+        let long = format!("/bin/{}", "n".repeat(MAX_REPORTED_PROGRAM_CHARS + 9));
+        assert_eq!(
+            name(&[&long]).map(|name| name.chars().count()),
+            Some(MAX_REPORTED_PROGRAM_CHARS)
+        );
+        assert!(name(&[]).is_none());
     }
 
     #[test]
@@ -5000,6 +5184,67 @@ mod tests {
         );
     }
 
+    /// The other link: a `--command` that starts hands the child the name
+    /// its last screen is reported under. The pure report function proves
+    /// the gate, and the report goes to the process's own stderr, where a
+    /// test cannot read it; so this proves that the argv reaches the
+    /// child's name, with the fixture as the program, and pins the exit
+    /// site's call by its text, since a `start` wired to report nothing
+    /// would leave every failing window silent.
+    #[test]
+    fn the_command_in_the_start_inputs_names_the_child() {
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let (sender, _events) = sync_channel(MAX_PENDING_EVENTS);
+        let directory = std::env::temp_dir();
+        let unique = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+        let ready_socket = directory.join(format!("td-term-named-command-{unique}"));
+        let status = std::fs::read_to_string(PROC_STATUS).unwrap();
+        let uid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().nth(1))
+            .unwrap();
+        let passwd = directory.join(format!("td-term-named-command-passwd-{unique}"));
+        std::fs::write(
+            &passwd,
+            format!("td:x:{uid}:{uid}::{}:/bin/sh\n", directory.display()),
+        )
+        .unwrap();
+        let fixture = fixture_command("term_client_child_fixture");
+        let expected = fixture
+            .program
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap();
+        let mut command = vec![fixture.program.into_os_string()];
+        command.extend(fixture.arguments);
+
+        let (_threads, child, _ready) = start(
+            &pty,
+            &sender,
+            &StartInputs {
+                status: Path::new(PROC_STATUS),
+                passwd: &passwd,
+                ready_socket: &ready_socket,
+                command: &command,
+            },
+            (22, 74),
+            pty::Input::new(),
+        )
+        .unwrap();
+        std::fs::remove_file(&passwd).unwrap();
+        assert_eq!(child.program.as_deref(), Some(expected.as_str()));
+        // Assembled, so this test's own text cannot satisfy the search.
+        let exit_site = format!(
+            "last_screen_report(child.program.as_deref(), {}, model.as_ref())",
+            "status"
+        );
+        assert!(
+            include_str!("term_client.rs").contains(&exit_site),
+            "the exit site reports the child's program"
+        );
+    }
+
     /// The BELL is deliberately kept where a reply is consumed: §10 says the
     /// next submitted frame inverts a one-pixel ring and clears the bit after
     /// release, and taking it here would destroy the only record that a
@@ -5093,6 +5338,7 @@ mod tests {
             input: Arc::clone(&input),
             drained: false,
             status: None,
+            program: None,
         };
         serve_event(
             &mut connection,
@@ -5475,6 +5721,7 @@ mod tests {
             &pty,
             &sender,
             &fixture_command("term_client_abort_fixture"),
+            None,
             &account,
             pty::Input::new(),
         )
@@ -7003,6 +7250,7 @@ mod tests {
             &pty,
             &sender,
             &fixture_command("term_client_echo_fixture"),
+            None,
             &account,
             Arc::clone(&queued),
         )
@@ -7111,6 +7359,7 @@ mod tests {
             &pty,
             &sender,
             &fixture_command("term_client_child_fixture"),
+            None,
             &account,
             pty::Input::new(),
         )
