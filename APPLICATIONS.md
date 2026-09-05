@@ -8908,6 +8908,137 @@ Two things it does not merge. Deduplicating *storage* does nothing for
 it does nothing for the **reboot**, which is a property of where the
 package lives rather than of how many copies of it exist.
 
+### W.4 A secret manager that keeps principle 7
+
+**Today.** The terminal applications keep their credentials in the
+application's private configuration directory as a mode-0600 file. tmc's
+`password_command` runs through `sh -c`, and the jail has no shell: the
+`mail` package is a static binary on the empty runtime, so `/app/bin` and
+`/usr/bin` hold nothing but `tmc`. The POC therefore reads the file
+directly: tmc gains `password_file`, a path it opens itself, and the
+provisioner writes that file. That is APPLICATIONS.md §E's admitted
+degradation for `.Secret`: the file is protected by directory mode alone,
+so anything that reads the application's files reads its passwords, and
+a launcher on the same uid outside the jail can read every application's.
+
+**Target.** Principle 7 (AGENTS.md) fixes the shape: human authentication
+is a FIDO2 token, secrets at rest are hardware-sealed, TPM possession is
+device binding rather than identity, and elevation is one named
+operation with typed arguments and one consent bound to that request.
+A secret manager under those rules is:
+
+1. **One store, sealed to the device.** `td-authd` (not built; see
+   `td-login/THREAT-MODEL.md`) owns a per-user secret store whose master
+   key is sealed to the TPM's platform state and released only after a
+   FIDO2 user-presence assertion at session start. Nothing at rest is
+   readable without both the device and the token. A second enrolled
+   token is the recovery path, or the store is explicitly unrecoverable.
+2. **Applications never see the store.** They see `.Secret` (§E's portal
+   row): the portal hands each application ONE application-scoped secret
+   over a descriptor, derived from the master key and the application's
+   authenticated identity (`FLATPAK_ID` as the broker fixed it), never
+   the master key. The application encrypts its own credential file with
+   it. Revoking an application re-derives nothing else.
+3. **Writing a credential is an elevation.** `td-secret set
+   <application>/<name>` is the named operation; its typed arguments are
+   the application identity and the secret name; the one consent is the
+   token touch on the secure-attention path the compositor must provide
+   first (§L.1). There is no remembered approval and no grace window.
+4. **No server.** Nothing is synchronized anywhere; the store lives in
+   the persistent `/var` subvolume beside the machine identity
+   `td-firstboot` mints, and moves with the device.
+
+**Increments.** (a) The portal row: `.Secret` served by td-portal with a
+per-application secret derived from a file-backed master key, so the
+application side (tmc's `password_command` replaced by a
+`secret = "portal"` mode) can land and be tested before any hardware.
+(b) TPM sealing of that master key. (c) FIDO2 release at session start,
+which needs the secure-attention path. (d) `td-secret set` as the first
+consumer of `td-authd`'s one-operation elevation. Until (a) lands,
+`password_file` stays, and the provisioner writes its file at mode 0600.
+
+### W.5 td-editor: a td-owned editor for mail and text
+
+**Why.** `tmc` composes in `$EDITOR`; the image ships no editor, and the
+jail's `/app` cannot see one that is not packaged with the application.
+An editor is also the first td program that must render text in a
+Wayland window from a source other than a terminal.
+
+**Shape.** A dependency-free Rust crate, `td-editor`, built like the
+other td crates (direct rustc, static) and packaged into the `mail`
+application's store closure as `/app/bin/td-editor` with
+`EDITOR=/app/bin/td-editor` in the manifest environment. It is a native
+Wayland client: the mail jail already carries `sockets=wayland`, so the
+editor opens its own toplevel beside the terminal, and tmc waits for it
+to exit as it does for any editor.
+
+**Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont
+PSF2 face and a pure renderer over it; td-term draws with it. The editor
+borrows exactly that: the PSF2 reader and glyph renderer move to a
+shared source module the compositor and the editor both embed (the way
+`engine/src/permissions.rs` is shared with td-jail), so the editor
+renders the same cells, the same six renditions and the same cursor. No
+second font, no second rasterizer.
+
+**Behaviour, in landing order.** (1) A buffer model and an Emacs keymap
+as pure data with tests: movement (`C-a`, `C-e`, `C-f`, `C-b`, `M-f`,
+`M-b`, `C-n`, `C-p`, `C-v`, `M-v`), mark and region (`C-SPC`, `C-w`,
+`M-w`, `C-y`), kill line (`C-k`), undo (`C-/`), incremental search
+(`C-s`, `C-r`), save and quit (`C-x C-s`, `C-x C-c`), and `M-q`
+fill-paragraph. (2) The Wayland client: toplevel, keyboard with the
+compositor's keymap, frame submission through the shared renderer, and
+the resize contract td-term already meets. (3) auto-fill-mode: wrapping
+at a configured column while typing, on by default for a mail draft.
+(4) flyspell-mode: a pinned, reviewed word list (a source pin like every
+other input) and the underline rendition on misspelled words, with
+`M-$` correction. (5) Mouse selection through `wl_pointer`, and the
+clipboard through `wl_data_device`, which td-compositor already serves
+to td-term. (6) The packaging step above and the manifest environment.
+
+**Non-goals.** Syntax highlighting, multiple windows, a terminal mode.
+The terminal fallback for a headless session is a later increment; the
+mail composition path is the one the editor exists for.
+
+### W.6 Opening links and attachments from a jailed terminal application
+
+**Diagnosis.** `tn` opens a link by trying, in order, a configured
+browser command through `sh -c`, `$BROWSER` as a program, then
+`xdg-open` and `open`. `tmc` opens links through `sh -c` with its
+configured browser and saved attachments through `$OPENER` or
+`xdg-open`; it also runs its editor through `sh -c`. Inside the jail
+none of those exist: the `mail` and `news` packages are static binaries
+on the empty runtime, so `PATH=/app/bin:/usr/bin` holds only the
+application itself, there is no `sh`, no `xdg-open`, `$BROWSER` is
+unset, and `/bin/firefox` is a host path the jail does not see. Outside
+the jail the image has no `xdg-open` either, so the unjailed behaviour
+was already "no browser opener available". The portal is the designed
+answer (§E, row 4): `.OpenURI` starts the configured browser for `http`
+and `https` and refuses `file`; it is listed as absent in rung 22.
+Composing mail has the same shape: until td-editor (W.5) ships inside
+the `mail` closure at `/app/bin/td-editor`, tmc has no editor to run.
+
+**Plan.** (1) td-portal serves `org.freedesktop.portal.OpenURI.OpenURI`
+for `http` and `https` exactly as §E's row specifies: the handler is the
+image's browser application launched through its `/bin` entry, so the
+URL reaches Firefox's own jail and nothing else. A second Firefox launch
+must hand the URL to the running instance; Firefox does that over the
+session bus name it owns (`org.mozilla.firefox`), and the broker must
+admit that one call between two instances of the same application. (2) A
+td-owned helper, `td-open URL`, dependency-free Rust reusing td-portal's
+client-side D-Bus codec, packaged into each terminal application's store
+closure as `/app/bin/td-open`. The applications then need no D-Bus code:
+`tn`'s configured browser command and `tmc`'s opener become
+`/app/bin/td-open`, and the manifests set `BROWSER=/app/bin/td-open`.
+(3) Attachments: saving goes to the `xdg-download` grant the mail
+manifest carries, which is the directory Firefox already shares. Opening
+an attachment needs `OpenURI.OpenFile`, the descriptor-taking member §E
+marks NotSupported in v1 because the handler runs in another sandbox; it
+lands after (1) with the descriptor forwarded to the handler's jail as a
+read-only grant, which is the Documents-portal shape without FUSE.
+(4) The application-side change in the `news` and `tmc` repositories:
+prefer `$BROWSER` when set before probing `xdg-open`, so the manifest
+environment is enough and no `sh -c` is involved.
+
 ### W.7 Relaunching a terminal application without root
 
 **Diagnosis.** `mail` and `news` are started once at boot by td-svc
