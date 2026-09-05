@@ -1,0 +1,20 @@
+[package]
+name = "td-editor"
+version = "0.1.0"
+edition = "2021"
+description = "A dependency-free text editor: document model and headless replay"
+license = "GPL-3.0-or-later"
+
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

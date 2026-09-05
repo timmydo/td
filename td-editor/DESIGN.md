@@ -9,9 +9,16 @@ the starting point for successive agents; the root `AGENTS.md` and
 
 ## Status and scope
 
-This is the design foundation. No editor executable, Wayland compatibility,
-GPU acceleration, spelling engine, or jail integration is implemented by
-this document. The rules below define version 1; milestones identify the
+The safe document core and `td-editor --replay` are implemented. They cover
+UTF-8/file-format conversion, scalar edits and selection, bounded tabs and
+undo/redo, save-snapshot state tracking, literal search/replace, paragraph
+filling, Auto Fill, and logical Windows/Emacs key dispatch. The core opens no
+files and reads no environment or clocks. File baselines/metadata, actual
+save I/O, layout/vertical motion, Wayland, GPU rendering, spelling and the
+control socket are not implemented yet. Key bindings for those adapters
+produce explicit requests; replay does not pretend to perform their work.
+
+The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
 The deliverable is a usable editor, reached through independently tested
 core, UI, and integration increments. The separate GPU prerequisite is
@@ -75,6 +82,9 @@ profiles. Common navigation keys and Shift-selection work in both profiles.
 Find and Replace use literal, case-sensitive UTF-8 strings, without regular
 expressions. Search reports reaching the end before an explicit next search
 wraps; Replace All is one undo transaction and skips overlapping matches.
+When matches exist, Replace All collapses the selection at document end;
+Undo restores its original endpoints. Windows Escape cancels a pending action
+without clearing the document selection; Emacs cancellation clears the mark.
 Go To Line uses one-based logical lines, independent of soft wrapping. The
 status row shows line, display column, line-ending mode, fill mode, key
 profile, and spelling status. A missing search match changes no selection.
@@ -183,6 +193,11 @@ Version 1 resource ceilings are part of the API:
 | Control | One active connection, 16 queued commands, 1 MiB request/response frame, 256 KiB raw text per response page, five-second whole-request deadline. |
 
 Undo stores edit deltas and cursor/selection before and after the transaction.
+The core uses one contiguous replacement span per transaction, trimming
+unchanged scalar prefixes and suffixes. Replace All spanning distant matches
+also retains the intervening bytes; its payload remains charged to the same
+global budget. Evicting an old undo entry does not invalidate redo from the
+current live state; evicting the next redo entry removes its dependent branch.
 Each typed scalar, paste, replacement, fill, or delete command is one
 transaction; typing coalescing is outside version 1. Content-state IDs are
 retained by undo/redo so undoing to a saved state clears dirty status. A
@@ -192,6 +207,20 @@ separate monotonically increasing revision changes on every text transition,
 including undo/redo, and rejects stale asynchronous/control results. IDs are
 checked `u64` counters; exhaustion refuses the operation. Save completion
 records the content-state ID of its snapshot, not the then-current state.
+
+An untouched New/Untitled tab is clean; editing makes it dirty, and undoing
+back to its initial state makes it clean again. This differs from opening a
+missing pathname, which the future file adapter must mark dirty.
+
+The first core increment exposes `save_snapshot`/`acknowledge_saved` as the
+future file adapter's contract; it stores the saved content-state ID but no
+file baseline. Snapshot tokens are bound to the originating editor instance;
+another instance cannot acknowledge them even if its tab/state IDs match.
+The adapter must serialize saves per tab and acknowledge only
+after the captured bytes have been written. The replay wire cannot synthesize
+save acknowledgements or discard dirty tabs. Replay EOF ends the in-memory
+test session, with no persistence claim. `load` is a replay-only byte-fixture
+operation, not filesystem Open. See README for the implemented wire subset.
 
 ## Paragraph filling
 
@@ -227,8 +256,13 @@ the exact original bytes and selection; a no-op creates no history entry.
 Auto Fill runs only after a typed ASCII space or Tab, never after paste,
 remote text insertion, file loading, or an automatic replacement. If the
 caret's current line exceeds the fill column, greedily wrap that line using
-the same indentation and word-width rules. Retain its trailing typed
-separator so typing the next word remains separated. Do not pull text from
+the same indentation and word-width rules. Unlike Fill Paragraph, retain
+horizontal whitespace, replacing only the final space/tab before a wrapped
+word with newline plus the original indentation. Extra separators remain as
+trailing whitespace on the preceding line; trailing whitespace may exceed
+the fill column. Retain the trailing typed separator so typing the next word
+remains separated. An interior typed separator remains a separator or becomes
+a line break, never a collapsed no-op. Do not pull text from
 the next logical line. The inserted separator and any resulting wrap form
 one transaction. A limit failure refuses that entire typing transaction.
 
