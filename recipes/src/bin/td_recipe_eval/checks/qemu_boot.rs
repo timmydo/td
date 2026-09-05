@@ -147,12 +147,20 @@ const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_DR
 /// an unbounded line would make that overlap unbounded too.
 ///
 /// The headroom is real but not generous, and an earlier comment here claimed
-/// it was: a virtio-gpu line is about 146 bytes of the 256, and a driver with a
-/// long name and a long mode name could exceed it. Past the bound the line is
-/// SKIPPED, and the boot then fails with "the marker was absent", which reads
-/// as a broken card rather than as a report nobody would print. That is the
-/// known unhelpful failure of this bound rather than a residual risk.
-const DRM_REPORT_MAX: usize = 256;
+/// it was. Past the bound a line is SKIPPED, and the boot then fails with "the
+/// marker was absent", which reads as a broken card rather than as a report
+/// nobody would print — the known unhelpful failure of this bound rather than a
+/// residual risk.
+///
+/// Raised from 256 when the mapping half was added. A virtio-gpu line was about
+/// 146 bytes and is now about 196, which left 60 — and a driver with a long name
+/// carrying a mode whose name fills `DRM_DISPLAY_MODE_LEN` can spend more than
+/// that. The number is chosen against the report's own worst case rather than
+/// against today's measurement: 384 leaves room for a full 32-byte mode name and
+/// a driver name at the same scale, with the whole of the mapping half still on
+/// the line. It costs a longer rescan overlap and nothing else, and that overlap
+/// is bytes retained between two reads of a console log.
+const DRM_REPORT_MAX: usize = 384;
 const TD_JAIL_TRANSITION_MARKER: &str = td_recipe::ladder::TD_JAIL_TRANSITION_MARKER;
 const TD_JAIL_SECCOMP_PROBE_MARKER: &str = td_recipe::ladder::TD_JAIL_SECCOMP_PROBE_MARKER;
 /// APPLICATIONS.md §H item 12. What it attests is stated once, on
@@ -2038,8 +2046,8 @@ fn validate_system_boot(
             let dimensions = output
                 .split_once('x')
                 .and_then(|(width, height)| Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?)));
-            match dimensions {
-                Some((width, height)) if width > 0 && height > 0 => {}
+            let (scanout_width, scanout_height) = match dimensions {
+                Some((width, height)) if width > 0 && height > 0 => (width, height),
                 _ => {
                     return Err(format!(
                         "td-compositor enumerated /dev/dri/card0 but reported no usable scanout \
@@ -2049,6 +2057,68 @@ fn validate_system_boot(
                          Report was: {report}"
                     ));
                 }
+            };
+            // The mapping half. `mapping=ok` is printed only after the probe
+            // wrote a pattern through the mapping and read it back, so its
+            // absence is the mapping class failing on a real card -- which is
+            // the whole of what this increment claims and the one thing a
+            // host-side unit test cannot establish. `mmap` answering an address
+            // is not evidence that the address is the buffer.
+            if !report.split_whitespace().any(|field| field == "mapping=ok") {
+                return Err(format!(
+                    "td-compositor enumerated a scanout but did not prove a dumb-buffer \
+                     mapping. The probe allocates a buffer at the mode's own size, maps it, \
+                     writes a pattern at the first, middle and last byte and reads it back; \
+                     `mapping=ok` is printed only when all three survive. Its absence means \
+                     CREATE_DUMB, MAP_DUMB or the mmap of the reported offset failed, or the \
+                     mapping is not the buffer. Report was: {report}"
+                ));
+            }
+            // A pitch is the kernel's choice, never `width * 4`, and a buffer
+            // has to be at least pitch * height bytes. Checking the arithmetic
+            // here is what catches a driver reporting a stride the size does
+            // not cover -- the case a renderer would discover by writing the
+            // second row into the middle of the first.
+            // The pitch is parsed as the `u32` the kernel actually reports it
+            // as, not as a `u64`. That is what keeps `pitch * height` exact:
+            // `u32 * u32` fits a `u64`, so the product cannot saturate. With a
+            // `u64` pitch a report of `pitch=<u64::MAX> bytes=<u64::MAX>`
+            // saturated `needed` to `u64::MAX` and then compared equal, so a
+            // malformed report passed the row it was supposed to fail. A
+            // pitch too large to be a `u32` parses as absent and rejects.
+            let pitch = report
+                .split_whitespace()
+                .find_map(|entry| entry.strip_prefix("pitch="))
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default();
+            let bytes = report
+                .split_whitespace()
+                .find_map(|entry| entry.strip_prefix("bytes="))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            let pitch = u64::from(pitch);
+            // Bound by the match above rather than re-derived here. An earlier
+            // revision used `dimensions.unwrap_or_default()`, which is correct
+            // only while that guard rejects a zero axis: relax it and both
+            // checks below silently compare against zero and pass anything.
+            let needed_pitch = u64::from(scanout_width).saturating_mul(4);
+            let height = u64::from(scanout_height);
+            if bytes == 0 || pitch < needed_pitch {
+                return Err(format!(
+                    "td-compositor mapped a dumb buffer but reported pitch {pitch} and \
+                     {bytes} bytes, and a pitch must cover the {needed_pitch} bytes that \
+                     four-byte pixels of a {scanout_width}-wide scanout need. \
+                     Report was: {report}"
+                ));
+            }
+            // Exact, not saturating: both factors came from `u32`s.
+            if bytes < pitch * height {
+                return Err(format!(
+                    "td-compositor reported a {bytes}-byte buffer for {height} rows of pitch \
+                     {pitch}, which needs {}. A buffer shorter than its own stride demands is \
+                     one a renderer writes past. Report was: {report}",
+                    pitch * height
+                ));
             }
         }
     }
@@ -9103,7 +9173,8 @@ mod tests {
     evidence.td_init_runtime = true;
     evidence.td_compositor_drm = Some(
         "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 \
-         mode=1280x800@60 name=1280x800 preferred=true mm=0x0 output=1280x800"
+         mode=1280x800@60 name=1280x800 preferred=true mm=0x0 output=1280x800 \
+         buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok"
             .to_string(),
     );
     evidence.td_jail_kill_reaps = true;
@@ -9381,6 +9452,113 @@ mod tests {
                 "{output} was accepted: {complaint}"
             );
         }
+    }
+
+    /// Enumerating a card and MAPPING one are different claims, and the row
+    /// asserts the second because it is the one this increment adds.
+    ///
+    /// A probe that discovered a scanout and then failed to allocate or map a
+    /// buffer prints everything up to `output=` and stops. Without this the
+    /// boot would pass on exactly the evidence the mapping class was added to
+    /// produce.
+    #[test]
+    fn a_report_without_a_proven_mapping_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_drm = Some(
+            "driver=virtio_gpu output=1280x800 buffer=1280x800 pitch=5120 bytes=4096000"
+                .to_string(),
+        );
+        let complaint = drm_complaint(evidence);
+        assert!(complaint.contains("did not prove a dumb-buffer"), "{complaint}");
+    }
+
+    /// `mapping=ok` is a whole FIELD, not a substring. A report carrying
+    /// `mapping=okay` or naming it inside a mode name would satisfy a
+    /// `contains` and prove nothing.
+    #[test]
+    fn a_mapping_field_that_only_looks_right_is_rejected() {
+        for tail in ["mapping=okay", "mapping=ok=no", "xmapping=ok", "mapping=failed"] {
+            let mut evidence = healthy_evidence();
+            evidence.td_compositor_drm = Some(format!(
+                "driver=virtio_gpu output=1280x800 pitch=5120 bytes=4096000 {tail}"
+            ));
+            let complaint = drm_complaint(evidence);
+            assert!(
+                complaint.contains("did not prove a dumb-buffer"),
+                "{tail} was accepted: {complaint}"
+            );
+        }
+    }
+
+    /// A pitch has to cover four bytes for every pixel of the scanout width.
+    ///
+    /// The kernel picks the pitch and may align it well past `width * 4`, so
+    /// the check is a floor rather than an equality — but a pitch BELOW that
+    /// floor cannot be a stride for this mode, and a renderer trusting it would
+    /// write each row over the previous one.
+    #[test]
+    fn a_pitch_too_narrow_for_the_scanout_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_drm = Some(
+            "driver=virtio_gpu output=1280x800 pitch=4096 bytes=4096000 mapping=ok".to_string(),
+        );
+        let complaint = drm_complaint(evidence);
+        assert!(complaint.contains("must cover"), "{complaint}");
+        // 1280 * 4, named so the failure says what was expected.
+        assert!(complaint.contains("5120"), "{complaint}");
+    }
+
+    /// A buffer shorter than its own stride demands is one a renderer writes
+    /// past, and the arithmetic is checked here rather than discovered there.
+    #[test]
+    fn a_buffer_shorter_than_its_stride_demands_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_drm = Some(
+            "driver=virtio_gpu output=1280x800 pitch=5120 bytes=4095999 mapping=ok".to_string(),
+        );
+        let complaint = drm_complaint(evidence);
+        assert!(complaint.contains("writes past"), "{complaint}");
+        assert!(complaint.contains("4096000"), "{complaint}");
+    }
+
+    /// A report whose numbers are too large to be real is rejected rather than
+    /// allowed to saturate its way past the arithmetic.
+    ///
+    /// Found by review. With the pitch parsed as a `u64`, `pitch * height`
+    /// saturated to `u64::MAX` and the reported `bytes` compared equal to it,
+    /// so the widest possible garbage passed the row. Parsing the pitch as the
+    /// `u32` the kernel reports makes the product exact.
+    #[test]
+    fn a_report_whose_numbers_cannot_be_real_is_rejected() {
+        for report in [
+            "driver=virtio_gpu output=1x2 pitch=18446744073709551615 \
+             bytes=18446744073709551615 mapping=ok",
+            "driver=virtio_gpu output=1280x800 pitch=4294967296 bytes=18446744073709551615 \
+             mapping=ok",
+        ] {
+            let mut evidence = healthy_evidence();
+            evidence.td_compositor_drm = Some(report.to_string());
+            let complaint = drm_complaint(evidence);
+            assert!(
+                complaint.contains("must cover") || complaint.contains("writes past"),
+                "an impossible report was accepted: {complaint}"
+            );
+        }
+    }
+
+    /// An over-aligned pitch is ACCEPTED. The kernel's choice is its own, and a
+    /// row demanding equality would reject every driver that pads a scanline.
+    #[test]
+    fn a_pitch_the_driver_padded_is_accepted() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_drm = Some(
+            "driver=virtio_gpu output=1280x800 pitch=8192 bytes=6553600 mapping=ok".to_string(),
+        );
+        let complaint = drm_complaint(evidence);
+        assert!(
+            !complaint.contains("must cover") && !complaint.contains("writes past"),
+            "a padded pitch was rejected: {complaint}"
+        );
     }
 
     /// The healthy report passes this row and the walk moves on.

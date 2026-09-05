@@ -522,13 +522,27 @@ fn probe_drm(device: &Path) -> Result<(), String> {
     let card = drm::open_card(device)?;
     let discovery = drm::discover(&card)?;
     let output = discovery.scanout.output()?;
+    // Allocated at the mode's own size, which is the only size a scanout
+    // buffer is ever wanted at, and released before this returns: the probe
+    // proves the mapping class works on this card without leaving a buffer
+    // behind on a machine that is running a compositor on the same device.
+    // From the MODE rather than from `output.dimensions`: both say the same
+    // thing, but the mode's `u16` fields widen to `u32` infallibly, and a
+    // scanout size is not a place to introduce a fallible conversion.
+    let mut frame = drm::DumbFrame::allocate(
+        &card,
+        u32::from(discovery.scanout.mode.hdisplay),
+        u32::from(discovery.scanout.mode.vdisplay),
+    )?;
+    frame.prove_mapping()?;
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
-        "TD-COMPOSITOR-DRM-PROBE-OK {} output={}x{}",
+        "TD-COMPOSITOR-DRM-PROBE-OK {} output={}x{} {}",
         discovery.describe(),
         output.dimensions.width,
-        output.dimensions.height
+        output.dimensions.height,
+        frame.describe()
     )
     .map_err(|error| format!("write DRM probe marker: {error}"))?;
     Ok(())
@@ -1107,8 +1121,19 @@ mod confinement {
         assert_eq!(occurrences(SHARED_SHA256, "core::arch::asm!"), 0);
     }
 
+    /// Four scoped `unsafe` bodies, and the fourth is a different CLASS from
+    /// the other three.
+    ///
+    /// `syscall5`, `syscall6` and the descriptor adoption are instruction
+    /// one-shots: the unsafe begins at an instruction and ends when it returns,
+    /// and what returns is a number that safe code then owns. `bytes_mut` is
+    /// not. It lends a slice over kernel-owned memory which outlives the call
+    /// and crosses a module boundary, because the renderer writes pixels INTO
+    /// the mapping — the lifetime-carrying class `UNSAFE.md` §6 budgeted before
+    /// any of it existed. Pinning each body by its exact text is what stops a
+    /// fifth from arriving quietly beside them.
     #[test]
-    fn two_scoped_unsafe_bodies_are_the_syscalls_and_exact_fd_adoption() {
+    fn four_scoped_unsafe_bodies_are_the_syscalls_the_adoption_and_the_mapping() {
         let syscall_body = r#"#[allow(unsafe_code)]
 fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     let result: isize;
@@ -1137,14 +1162,58 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         // close path from running after `File` assumes that ownership.
         unsafe { File::from_raw_fd(owned.fd) }
     }"#;
-        assert_eq!(occurrences(SYS, "#[allow(unsafe_code)]"), 2);
-        assert_eq!(occurrences(SYS, "unsafe {"), 2);
-        assert_eq!(occurrences(SYS, "core::arch::asm!"), 1);
+        let syscall6_body = r#"#[allow(unsafe_code)]
+fn syscall6(
+    number: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+) -> isize {
+    let result: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") number as isize => result,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
+            in("r9") a6,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    result
+}"#;
+        let mapping_body = r#"    #[allow(unsafe_code)]
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `drm_map_dumb` is the sole constructor and returns only after
+        // `mmap` answered a live mapping of exactly `length` bytes at
+        // `address`. `Drop` is the only unmap and cannot have run while this
+        // `&mut self` exists, and the returned borrow cannot outlive it.
+        unsafe { core::slice::from_raw_parts_mut(self.address, self.length) }
+    }"#;
+        assert_eq!(occurrences(SYS, "#[allow(unsafe_code)]"), 4);
+        assert_eq!(occurrences(SYS, "unsafe {"), 4);
+        assert_eq!(occurrences(SYS, "core::arch::asm!"), 2);
         assert_eq!(occurrences(SYS, syscall_body), 1);
+        assert_eq!(occurrences(SYS, syscall6_body), 1);
         assert_eq!(occurrences(SYS, adoption_body), 1);
+        assert_eq!(occurrences(SYS, mapping_body), 1);
         assert_eq!(occurrences(SYS, "File::from_raw_fd("), 1);
+        // The ONE way a pointer becomes a slice, and it is inside the mapping
+        // body above. A second would be a second lifetime-carrying region with
+        // no type owning its unmap.
+        assert_eq!(occurrences(SYS, "core::slice::from_raw_parts_mut("), 1);
         for syscall in [
             "const SYS_CLOSE: usize = 3;",
+            "const SYS_MMAP: usize = 9;",
+            "const SYS_MUNMAP: usize = 11;",
             "const SYS_IOCTL: usize = 16;",
             "const SYS_SENDMSG: usize = 46;",
             "const SYS_RECVMSG: usize = 47;",
@@ -1153,7 +1222,7 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         ] {
             assert!(SYS.contains(syscall), "{syscall}");
         }
-        assert_eq!(occurrences(SYS, "const SYS_"), 6);
+        assert_eq!(occurrences(SYS, "const SYS_"), 8);
         for (name, source) in OTHER.iter().chain(TEST_ONLY) {
             assert!(
                 !source.contains("unsafe"),
@@ -1259,16 +1328,21 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
     }
 
     /// `ioctl(2)`'s request number chooses the operation, so the roster is the
-    /// confinement: these eleven values, one allow-list, and ten callers.
+    /// confinement: these fourteen values, one allow-list, and thirteen callers.
     ///
-    /// Four DRM numbers READ a card. The fifth, `DROP_MASTER`, writes nothing
-    /// to the display -- it RELEASES authority that opening a primary node
-    /// granted without being asked. `MODE_SETCRTC`, `MODE_CREATE_DUMB` and the
-    /// page flip are deliberately absent: §M's backend needs them and this
-    /// increment does not, and a request that modesets must not become
-    /// reachable merely by sharing a module with five that do not.
+    /// Four DRM numbers READ a card. `DROP_MASTER` writes nothing to the
+    /// display -- it RELEASES authority that opening a primary node granted
+    /// without being asked. The dumb trio ALLOCATES, maps and frees, which is
+    /// the honest toll §M names: a dumb buffer has no `write(2)` path.
+    ///
+    /// `MODE_SETCRTC`, `MODE_ADDFB2`, the page flip and `MODE_ATOMIC` remain
+    /// deliberately absent, and the line between them and the trio is exactly
+    /// what this increment may do: allocating a buffer and writing into it
+    /// changes nothing on screen, while those four are what put pixels on
+    /// glass. A request that modesets must not become reachable merely by
+    /// sharing a module with ten that do not.
     #[test]
-    fn the_ioctl_surface_is_eleven_pinned_requests_and_ten_wrappers() {
+    fn the_ioctl_surface_is_fourteen_pinned_requests_and_thirteen_wrappers() {
         for request in [
             "const TIOCSPTLCK: usize = 0x4004_5431;",
             "const TIOCGPTPEER: usize = 0x5441;",
@@ -1281,12 +1355,15 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
             "const DRM_IOCTL_MODE_GETENCODER: usize = 0xc014_64a6;",
             "const DRM_IOCTL_MODE_GETCONNECTOR: usize = 0xc050_64a7;",
             "const DRM_IOCTL_DROP_MASTER: usize = 0x0000_641f;",
+            "const DRM_IOCTL_MODE_CREATE_DUMB: usize = 0xc020_64b2;",
+            "const DRM_IOCTL_MODE_MAP_DUMB: usize = 0xc010_64b3;",
+            "const DRM_IOCTL_MODE_DESTROY_DUMB: usize = 0xc004_64b4;",
         ] {
             assert!(SYS.contains(request), "{request}");
         }
         assert_eq!(occurrences(SYS, "const TIOC"), 4);
         assert_eq!(occurrences(SYS, "const EVIOCGABS"), 2);
-        assert_eq!(occurrences(SYS, "const DRM_IOCTL_"), 5);
+        assert_eq!(occurrences(SYS, "const DRM_IOCTL_"), 8);
         // No write-side DRM request is DECLARED, and none of their numbers
         // appears at all. The declaration is the thing to forbid rather than
         // the name: `DrmModeInfo`'s own doc says a mode is what `SETCRTC` takes
@@ -1301,8 +1378,6 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         // that moved whenever a test did would pin nothing.
         for absent in [
             "const DRM_IOCTL_MODE_SETCRTC",
-            "const DRM_IOCTL_MODE_CREATE_DUMB",
-            "const DRM_IOCTL_MODE_MAP_DUMB",
             "const DRM_IOCTL_MODE_ADDFB2",
             "const DRM_IOCTL_MODE_PAGE_FLIP",
             "const DRM_IOCTL_MODE_ATOMIC",
@@ -1312,8 +1387,6 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
             // backend's decision to make and not this increment's.
             "const DRM_IOCTL_SET_MASTER",
             "0xc068_64a2",
-            "0xc020_64b2",
-            "0xc010_64b3",
             "0xc018_64b0",
         ] {
             assert!(
@@ -1346,6 +1419,9 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
             | DRM_IOCTL_MODE_GETENCODER
             | DRM_IOCTL_MODE_GETCONNECTOR
             | DRM_IOCTL_DROP_MASTER
+            | DRM_IOCTL_MODE_CREATE_DUMB
+            | DRM_IOCTL_MODE_MAP_DUMB
+            | DRM_IOCTL_MODE_DESTROY_DUMB
     ) {"#;
         assert_eq!(occurrences(SYS, guard), 1);
         let entry = r#"    Ok(syscall5(SYS_IOCTL, fd as usize, request, argument, 0, 0))"#;
@@ -1361,11 +1437,12 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         // evdev entry point: a SIXTH wrapper reusing a pinned request would
         // satisfy every other assertion here.
         assert_eq!(every - drm, 6);
-        // One definition plus the eight requests the five DRM wrappers issue:
+        // One definition plus the eleven requests the eight DRM wrappers issue:
         // two each for the three that ask a count before they ask for data,
-        // one for the encoder, whose answer is a fixed-size struct, and one to
-        // give back mastership.
-        assert_eq!(drm, 9);
+        // one for the encoder, whose answer is a fixed-size struct, one to give
+        // back mastership, and one each to create, map and destroy a dumb
+        // buffer.
+        assert_eq!(drm, 12);
         // Both entry points reach the SAME allow-list, and it is defined once.
         // This is the assertion that stops a second `syscall5(SYS_IOCTL, ..)`
         // growing beside the roster instead of behind it.
@@ -1416,7 +1493,8 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         assert_eq!(occurrences(SYS, "as *mut [u16; 4]"), 1);
         assert_eq!(occurrences(SYS, "as *mut [i32; ABSINFO_WORDS]"), 1);
         assert!(SYS.contains("fn absinfo(words: [i32; ABSINFO_WORDS]) -> AbsInfo {"));
-        // The four DRM wrappers, each reaching its own request.
+        // The DRM wrappers that ask a card about itself, each reaching its
+        // own request.
         for (wrapper, request) in [
             ("pub fn drm_driver_name(", "DRM_IOCTL_VERSION"),
             ("pub fn drm_resources(", "DRM_IOCTL_MODE_GETRESOURCES"),
@@ -1452,19 +1530,73 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
         assert!(production(SYS).contains("probe.modes_ptr = address_of(&mut one_mode);"));
         assert_eq!(occurrences(production(DRM), "OpenOptions::new()"), 1);
         // And the policy module DECLARES no request of its own: the ABI lives
-        // in `sys.rs`, so the only requests `drm.rs` can cause are the five the
-        // allow-list admits, reached through the calls pinned above. It may
+        // in `sys.rs`, so the only requests `drm.rs` can cause are the eight
+        // the allow-list admits, reached through the calls pinned above. It may
         // still NAME one in prose, so the claim is about a declaration.
         assert!(!production(DRM).contains("const DRM_IOCTL"));
         // No raw syscall of its own: named as the two forms that would be one,
         // rather than as the word, which this module's own prose uses to say
         // how briefly it holds mastership.
         assert!(!production(DRM).contains("syscall5("));
+        assert!(!production(DRM).contains("syscall6("));
         assert!(!production(DRM).contains("asm!"));
+        // Nor does the policy module map anything itself. `DumbFrame` OWNS a
+        // `MappedRegion` and lends its bytes on, which is the whole point of
+        // the region type: the mapping pair is created and destroyed in one
+        // module, and `drm.rs` never names either half.
+        assert!(!production(DRM).contains("from_raw_parts"));
+        assert!(!production(DRM).contains("SYS_MMAP"));
+        assert!(!production(DRM).contains("SYS_MUNMAP"));
+    }
+
+    /// A dumb buffer is unmapped BEFORE its handle is released, and that
+    /// ordering is the compiler's rather than a comment's.
+    ///
+    /// Rust drops struct fields in declaration order, so `region` before
+    /// `handle` means munmap before `DESTROY_DUMB`. An `impl Drop for
+    /// DumbFrame` would invert it: a type's own `drop` runs BEFORE its fields
+    /// are dropped. Both halves are pinned because either one alone permits the
+    /// other order -- the field order is only meaningful while no destructor
+    /// preempts it.
+    ///
+    /// What is pinned is a PREFERENCE, not a safety property. The kernel
+    /// tolerates either order, since a GEM mapping holds its own reference to
+    /// the object; `UNSAFE.md` §6 carries the citation and the correction of an
+    /// earlier claim that it was required. The test earns its place by keeping
+    /// the code saying what the documents say, which is the thing that silently
+    /// stops being true.
+    #[test]
+    fn a_dumb_frame_unmaps_before_it_releases_the_handle() {
+        let drm = production(DRM);
+        assert!(
+            !drm.contains("impl Drop for DumbFrame"),
+            "DumbFrame grew a destructor, which runs before its fields drop"
+        );
+        // The handle's own guard is what performs the release, and it is the
+        // only place that does.
+        assert!(drm.contains("impl Drop for DumbHandle"));
+        assert_eq!(occurrences(drm, "sys::drm_destroy_dumb("), 1);
+        let start = drm
+            .find("pub struct DumbFrame<'card> {")
+            .expect("drm.rs no longer declares DumbFrame");
+        let body = drm.get(start..).unwrap_or_default();
+        let end = body.find('}').unwrap_or(body.len());
+        let fields = body.get(..end).unwrap_or_default();
+        let region = fields
+            .find("region: sys::MappedRegion,")
+            .expect("DumbFrame no longer holds its mapping by that name");
+        let handle = fields
+            .find("handle: DumbHandle<'card>,")
+            .expect("DumbFrame no longer holds its handle guard by that name");
+        assert!(
+            region < handle,
+            "DumbFrame declares its handle before its mapping, so the handle is \
+             released while the mapping is still live"
+        );
     }
 
     #[test]
-    fn syscall_wrapper_is_called_only_by_the_six_reviewed_operations() {
+    fn syscall_wrapper_is_called_only_by_the_eight_reviewed_operations() {
         let close = r#"errno_result(syscall5(SYS_CLOSE, fd as usize, 0, 0, 0, 0), "close")?"#;
         let receive = r#"syscall5(
             SYS_RECVMSG,
@@ -1490,7 +1622,57 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
             (&mut credentials as *mut [u32; 3]) as usize,
             (&mut length as *mut u32) as usize,
         )"#;
-        assert_eq!(occurrences(SYS, "syscall5("), 7);
+        let unmap =
+            r#"        let _ = syscall5(SYS_MUNMAP, self.address as usize, self.length, 0, 0, 0);"#;
+        let map = r#"            SYS_MMAP,
+            0,
+            length,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd as usize,
+            offset,"#;
+        assert_eq!(occurrences(SYS, "syscall5("), 8);
+        // The definition and the ONE call. `mmap` is the only six-argument
+        // syscall this crate makes, and a second caller of `syscall6` would be
+        // a second mapping with no region type owning its unmap.
+        assert_eq!(occurrences(SYS, "syscall6("), 2);
+        assert_eq!(occurrences(SYS, "SYS_MMAP"), 2);
+        assert_eq!(occurrences(SYS, "SYS_MUNMAP"), 2);
+        assert_eq!(occurrences(SYS, unmap), 1);
+        assert_eq!(occurrences(SYS, map), 1);
+        // The mapping is pinned to a SHARED read/write mapping of one owned
+        // card descriptor, which is `UNSAFE.md` §6's pinning for §11's reason:
+        // a caller-supplied protection or visibility would make this a general
+        // mapping facility rather than the one scanout target it is.
+        assert_eq!(occurrences(SYS, "const PROT_READ: usize = 0x1;"), 1);
+        assert_eq!(occurrences(SYS, "const PROT_WRITE: usize = 0x2;"), 1);
+        assert_eq!(occurrences(SYS, "const MAP_SHARED: usize = 0x1;"), 1);
+        // The region is CONSTRUCTED once, and the length it stores is the
+        // length `mmap` was called with. `UNSAFE.md` §6 claims this is pinned;
+        // a review found that it was not, and that `length: length + 4096`
+        // passed the whole suite while handing out a slice 4096 bytes past the
+        // mapping. Pinning the literal is what makes the section's claim true:
+        // the two `length`s can no longer drift apart silently.
+        let construction = r#"    let region = MappedRegion {
+        address: address as *mut u8,
+        length,
+    };"#;
+        assert_eq!(occurrences(SYS, construction), 1);
+        // `= MappedRegion {` is the CONSTRUCTION, and there is one. The bare
+        // name also spells the declaration and two `impl` headers, so counting
+        // that would pin the wrong thing.
+        assert_eq!(occurrences(production(SYS), "= MappedRegion {"), 1);
+        // And it is not clonable. `Copy` the compiler already refuses for a
+        // type with `Drop`; `Clone` it would ACCEPT, because `*mut u8` is
+        // `Copy`, and a derive would give two owners one mapping and two
+        // unmaps. Pinned as the doc line immediately preceding the
+        // declaration, so an attribute cannot be inserted between them.
+        let declaration = r#"///   and the borrow cannot outlive the guard.
+pub struct MappedRegion {
+    address: *mut u8,
+    length: usize,
+}"#;
+        assert_eq!(occurrences(SYS, declaration), 1);
         assert_eq!(occurrences(SYS, "SYS_CLOSE"), 2);
         assert_eq!(occurrences(SYS, "SYS_FCNTL"), 2);
         assert_eq!(occurrences(SYS, "SYS_IOCTL"), 2);
@@ -1571,12 +1753,18 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
             "if let Ok(encoder) = sys::drm_encoder(card, connector.encoder_id) {",
             "let Ok(encoder) = sys::drm_encoder(card, *encoder_id) else {",
             "sys::drm_drop_master(&card)",
+            "let buffer = sys::drm_create_dumb(card, width, height)?;",
+            "let region = sys::drm_map_dumb(card, &buffer)?;",
+            "let _ = sys::drm_destroy_dumb(self.card, self.handle);",
         ] {
             assert!(drm.contains(call), "drm.rs no longer spells `{call}`");
         }
-        // Five calls and no sixth: every reach into the syscall module from
-        // here is one of the five above.
-        assert_eq!(occurrences(drm, "sys::drm_"), 6);
+        // Nine calls and no tenth: every reach into the syscall module from
+        // here is one of the nine above. The dumb trio is called ONCE each --
+        // create and map from `allocate`, destroy from `DumbHandle::drop` and
+        // nowhere else, which is what makes the release a field drop rather
+        // than a statement some path can miss.
+        assert_eq!(occurrences(drm, "sys::drm_"), 9);
         let production_main = production(MAIN);
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())

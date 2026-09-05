@@ -60,7 +60,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with eleven value-pinned requests; plus one scoped client-side clipboard descriptor adoption |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with fourteen value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped client-side clipboard descriptor adoption and one lifetime-carrying mapped region |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -392,8 +392,8 @@ pointer's, not a widening of any existing one. `DRM_IOCTL_VERSION`
 `DRM_IOCTL_MODE_GETRESOURCES` (0xc04064a0) asks what it has;
 `DRM_IOCTL_MODE_GETCONNECTOR` (0xc05064a7) and `DRM_IOCTL_MODE_GETENCODER`
 (0xc01464a6) ask about one connector and one encoder. `APPLICATIONS.md` §M's
-first row is a DRM/KMS output backend, and this is the half of it that only
-READS: nothing here modesets, allocates a buffer or maps memory.
+first row is a DRM/KMS output backend, and these four are the half of it that
+only READS: none of them modesets or allocates.
 
 The fifth exists because "reads only" was not true of the OPEN.
 `DRM_IOCTL_DROP_MASTER` (0x641f) writes nothing to a display; it gives back
@@ -412,12 +412,22 @@ the confinement test now pins the DROP rather than the absence of the SET.
 `SET_MASTER` remains off the roster, and that asymmetry is the point: giving
 authority back is this increment's, taking it is the backend's.
 
-`MODE_SETCRTC`, `MODE_CREATE_DUMB`, `MODE_MAP_DUMB`, `MODE_ADDFB2`,
-`MODE_PAGE_FLIP` and `MODE_ATOMIC` are named in the confinement test as ABSENT
-rather than left unmentioned, so the backend landing adds each by amendment
-instead of arriving with a module that already has them.
+Three more joined for the MAPPING landing that followed. `MODE_CREATE_DUMB`
+(0xc02064b2), `MODE_MAP_DUMB` (0xc01064b3) and `MODE_DESTROY_DUMB`
+(0xc00464b4) allocate a scanout-sized buffer, report the offset to map it at,
+and free it. They are what makes `mmap` unavoidable and the mapping class
+below real; the section on it records what landed against the shape budgeted
+in advance.
 
-Those four are pinned for `EVIOCGABS`'s reason, arriving at it a third way.
+`MODE_SETCRTC`, `MODE_ADDFB2`, `MODE_PAGE_FLIP` and `MODE_ATOMIC` remain named
+in the confinement test as ABSENT rather than left unmentioned, so the backend
+landing adds each by amendment instead of arriving with a module that already
+has them. The line between them and the trio is what each increment may do:
+allocating a buffer and writing into it changes nothing on screen, and those
+four are what put pixels on glass.
+
+Every rostered DRM request is pinned for `EVIOCGABS`'s reason, arriving at it
+a third way.
 `_IOC` packs the argument's SIZE into bits 16..30 of a request number, and the
 kernel copies exactly that many bytes through the pointer, so each number
 states the layout of the struct it is issued with: a Rust `#[repr(C)]` that
@@ -449,7 +459,7 @@ rather than believed, since the kernel copies a connector's mode and encoder
 arrays all-or-nothing.
 
 The request roster is enforced in code, not only in a test — one
-allow-list refuses anything outside the eleven before either entry point
+allow-list refuses anything outside the fourteen before either entry point
 issues the syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.
@@ -544,11 +554,15 @@ rule is the TYPE's: a `Reader` is not clonable, exposes no descriptor, and a
 up. Detaching also requires the handshake to be over, because the socket
 read timeout a deadline sets outlives the deadline itself.
 
-### The anticipated mapping class
+### The mapping class
 
-Nothing in this crate maps memory, and the surface above is complete as
-written. This subsection is an ANTICIPATION, recorded before the code exists
-because `APPLICATIONS.md` §M asks for it: the DRM/KMS output backend that
+This subsection was written as an ANTICIPATION, before the code existed,
+because `APPLICATIONS.md` §M asked for it. The code now exists, and what
+follows is kept in the order it was written — the reasoning first, then what
+actually landed against it — because the point of writing a shape down in
+advance is lost if the record is rewritten to match the result.
+
+The anticipation, unchanged: the DRM/KMS output backend that
 replaces `/dev/fb0` cannot keep the no-mmap property — a dumb buffer has no
 `write(2)` path, so pixels enter through a mapping of the card descriptor —
 and the roster's current phrasing does not describe what that needs. Writing
@@ -594,14 +608,54 @@ What the amendment must budget when it lands:
   the entry point to caller-supplied requests, and it is named here so the
   count is right when it arrives rather than discovered in a diff.
 
-None of this is authorization, and none of it is in the code: the
-confinement tests still pin the absence of `unsafe` from every module but
-`sys.rs`, `sys.rs` carries neither mapping syscall, and no source in the
-crate names `mmap` at all. What the landing gains is that its shape was reviewed before it was written; what it
-still owes is the ordinary amendment to this file, to the roster table, and
-to `td-compositor/DESIGN.md` §4 in the same commit. What this subsection
-settles is only that the answer is not "refuse `mmap` forever", which is the
-one way td could paint itself out of hardware rendering.
+What landed, against each budgeted item:
+
+- `mmap(2)` and `munmap(2)` joined this surface. `mmap` is issued once, from
+  `drm_map_dumb`, as a `PROT_READ | PROT_WRITE`, `MAP_SHARED` mapping of one
+  owned card descriptor at the offset `DRM_IOCTL_MODE_MAP_DUMB` reported for a
+  buffer this crate created with `DRM_IOCTL_MODE_CREATE_DUMB`. `munmap`
+  receives only the owned pair, from `Drop`. The protection and visibility are
+  constants, not parameters, so this is one scanout target rather than a
+  general mapping facility.
+- `MappedRegion` owns the pair. Its `length` is the length `mmap` was called
+  with; both come from the single construction site, so there is no second path
+  on which they could disagree.
+- `Drop` unmaps and nothing else does. The type is neither `Clone` nor `Copy`.
+- `bytes_mut` lends a slice and no pointer escapes. It is the crate's ONE
+  `core::slice::from_raw_parts_mut`, and the confinement test pins that count.
+- Confinement tests pin the allow count, both syscall numbers, the single
+  owning module, the single construction site, and the length. `drm.rs` is
+  pinned as naming neither `SYS_MMAP`, `SYS_MUNMAP` nor `from_raw_parts`.
+- `DMA_BUF_IOCTL_SYNC` did NOT arrive and is still named here for when it
+  does. Nothing in this increment reads a dmabuf.
+
+Two things this increment adds that the anticipation did not name, both
+recorded because they are the kind of detail a plan written in advance
+misses. First, `mmap(2)` takes six arguments and every existing body took
+five, so `syscall6` is a second `core::arch::asm!` body rather than a widened
+first — the alternative was appending a zero at seven call sites that this
+crate's tests pin by exact text. Second, `DumbFrame` releases in a
+deliberate ORDER — the region unmaps, then the GEM handle is freed — expressed
+as field declaration order with no `Drop` of its own, because a type's own
+destructor runs BEFORE its fields are dropped and writing the release there
+would have inverted exactly the order it was meant to guarantee. A confinement
+test pins both halves.
+
+That ordering is hygiene, not a kernel requirement, and an earlier revision of
+this paragraph said "must". A review checked it and it is wrong:
+`drm_gem_mmap_obj` takes its own reference for the mapping
+(`drivers/gpu/drm/drm_gem.c:1238`, "Take a ref for this mapping of the object
+... cleaned up by the corresponding vm_close"), while `MODE_DESTROY_DUMB` is
+`drm_gem_handle_delete` and drops only the handle's reference. Closing the
+handle while mapped leaves the mapping valid, which is what libdrm and Mesa do
+routinely, and `MappedRegion::drop` never touches the handle in any case. The
+order is kept because releasing in the order things were acquired is worth
+having by default; it is recorded as a preference so a later reader does not
+build on it as a constraint.
+
+What this subsection settles is only that the answer was not "refuse `mmap`
+forever", which is the one way td could paint itself out of hardware
+rendering.
 
 ## 7. `td-util` — the diagnostics multicall
 

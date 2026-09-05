@@ -8,6 +8,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 
 const SYS_CLOSE: usize = 3;
+const SYS_MMAP: usize = 9;
+const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
 const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
@@ -40,10 +42,9 @@ const EVIOCGABS_Y: usize = 0x8018_4541;
 /// `EVIOCGABS` lesson one driver over, and `the_drm_requests_encode_the_structs_they_carry`
 /// is what makes that a test rather than a remark.
 ///
-/// These four READ. None of them modesets, allocates or takes DRM master, which
-/// is the whole of what this increment may do: discovery is allowed to look at
-/// a card that `fbcon` is currently driving, and taking mastership away from it
-/// is the next landing's decision to make explicitly.
+/// These four READ. None of them modesets or allocates: discovery is allowed to
+/// look at a card `fbcon` is currently driving, which is why the probe hands
+/// mastership back the instant the open takes it.
 const DRM_IOCTL_VERSION: usize = 0xc040_6400;
 /// `DRM_IOCTL_DROP_MASTER`. Not a write to the display: it RELEASES authority
 /// this process was given without asking for it.
@@ -65,6 +66,46 @@ const DRM_IOCTL_DROP_MASTER: usize = 0x0000_641f;
 const DRM_IOCTL_MODE_GETRESOURCES: usize = 0xc040_64a0;
 const DRM_IOCTL_MODE_GETENCODER: usize = 0xc014_64a6;
 const DRM_IOCTL_MODE_GETCONNECTOR: usize = 0xc050_64a7;
+
+/// The dumb-buffer trio. These ALLOCATE, which the four above do not.
+///
+/// They are the whole of what `APPLICATIONS.md` §M calls the honest toll: a
+/// dumb buffer has no `write(2)` path, so pixels reach a card only through a
+/// mapping of its descriptor, and refusing that forever is the one way td could
+/// paint itself out of hardware rendering.
+///
+/// Sizes are the kernel's own structs at the 7.1.4 pin — `drm_mode_create_dumb`
+/// is 32 bytes (six `__u32` then a `__u64`), `drm_mode_map_dumb` 16 and
+/// `drm_mode_destroy_dumb` 4 — and `the_drm_requests_encode_the_structs_they_carry`
+/// checks each number against the Rust type actually passed to it, which is
+/// what catches a hand-derived request that disagrees with its payload.
+///
+/// Still absent, and named absent by the confinement test: `MODE_ADDFB2`,
+/// `MODE_SETCRTC`, `MODE_PAGE_FLIP` and `MODE_ATOMIC`. Allocating a buffer and
+/// mapping it changes nothing on screen; those four are what put pixels on
+/// glass, and they arrive with the backend that has somewhere to put them.
+const DRM_IOCTL_MODE_CREATE_DUMB: usize = 0xc020_64b2;
+const DRM_IOCTL_MODE_MAP_DUMB: usize = 0xc010_64b3;
+const DRM_IOCTL_MODE_DESTROY_DUMB: usize = 0xc004_64b4;
+
+/// `PROT_READ | PROT_WRITE` and `MAP_SHARED`, the only protection and
+/// visibility a scanout mapping may ask for. Shared because the entire point is
+/// that the device sees the writes; readable as well as writable because a
+/// partial-damage repaint reads back the pixels it is not replacing.
+const PROT_READ: usize = 0x1;
+const PROT_WRITE: usize = 0x2;
+const MAP_SHARED: usize = 0x1;
+
+/// Bits per pixel for the one format this compositor scans out, `XRGB8888`.
+const DUMB_BUFFER_BPP: u32 = 32;
+
+/// The largest dumb buffer this compositor will map, in bytes.
+///
+/// The kernel reports the size and it is then handed to `mmap` as a LENGTH, so
+/// an implausible one is the `MAX_DRM_OBJECTS` problem a second time: a driver
+/// sizing this process's address space. 256 MiB is far past a 4K XRGB scanout
+/// (about 33 MiB) and far short of anything that could pass for a leak.
+const MAX_DUMB_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `enum drm_connector_status` from `include/drm/drm_connector.h`. The numbers
 /// are the kernel's, and `unknown` is NOT a synonym for disconnected: it means
@@ -191,6 +232,40 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
     result
 }
 
+/// `mmap(2)` takes six arguments, and the sixth is `r9`.
+///
+/// A separate function rather than a widened `syscall5`: every existing caller
+/// passes five, and appending a zero at each of them would have been a silent
+/// edit to call sites this crate's confinement tests pin by exact text.
+#[allow(unsafe_code)]
+fn syscall6(
+    number: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+) -> isize {
+    let result: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") number as isize => result,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
+            in("r9") a6,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    result
+}
+
 fn close_raw(fd: RawFd) -> Result<(), String> {
     if fd < 0 {
         return Err(format!("refusing to close invalid descriptor {fd}"));
@@ -239,9 +314,9 @@ pub fn restore_status_flags(file: &impl AsRawFd, flags: usize) -> Result<(), Str
 ///
 /// Unlike the two message wrappers this does not retry `EINTR`: none of the
 /// six terminal and evdev requests sleeps interruptibly, so a retry loop here
-/// would be dead code that reads like a live one. The four DRM requests DO
-/// sleep interruptibly and are issued through `drm_ioctl` below, which is that
-/// loop — the distinction is per-request and not a property of this function.
+/// would be dead code that reads like a live one. The DRM requests DO sleep
+/// interruptibly and are issued through `drm_ioctl` below, which is that loop —
+/// the distinction is per-request and not a property of this function.
 fn ioctl_checked(
     fd: RawFd,
     request: usize,
@@ -261,6 +336,9 @@ fn ioctl_checked(
             | DRM_IOCTL_MODE_GETENCODER
             | DRM_IOCTL_MODE_GETCONNECTOR
             | DRM_IOCTL_DROP_MASTER
+            | DRM_IOCTL_MODE_CREATE_DUMB
+            | DRM_IOCTL_MODE_MAP_DUMB
+            | DRM_IOCTL_MODE_DESTROY_DUMB
     ) {
         return Err(format!(
             "{operation}: refusing unreviewed ioctl request {request:#x}"
@@ -775,6 +853,229 @@ pub fn drm_drop_master(card: &impl AsRawFd) -> Result<(), String> {
     }
 }
 
+/// The kernel's `struct drm_mode_create_dumb`.
+#[repr(C)]
+struct DrmModeCreateDumb {
+    height: u32,
+    width: u32,
+    bpp: u32,
+    flags: u32,
+    handle: u32,
+    pitch: u32,
+    size: u64,
+}
+
+/// The kernel's `struct drm_mode_map_dumb`.
+#[repr(C)]
+struct DrmModeMapDumb {
+    handle: u32,
+    pad: u32,
+    offset: u64,
+}
+
+/// The kernel's `struct drm_mode_destroy_dumb`.
+#[repr(C)]
+struct DrmModeDestroyDumb {
+    handle: u32,
+}
+
+/// What the kernel chose for one dumb buffer.
+///
+/// The PITCH is the kernel's, never `width * 4`. A driver may align a scanline
+/// well past the pixel width, so a renderer computing its own stride would
+/// write the second row into the middle of the first on any card that does.
+/// Returned rather than assumed, for exactly that reason.
+pub struct DrmDumbBuffer {
+    pub handle: u32,
+    pub pitch: u32,
+    pub size: u64,
+}
+
+/// One mapping of one dumb buffer, owned as a value.
+///
+/// NOT `Clone` and not `Copy`. `Copy` the compiler refuses on its own for a
+/// type with `Drop`; `Clone` it would accept, because `*mut u8` is `Copy` and a
+/// derive would compile — two owners, two unmaps, and two `&mut [u8]` over the
+/// same bytes. A confinement test pins the declaration so a derive cannot
+/// appear above it unnoticed.
+///
+/// `UNSAFE.md` §6 budgeted this shape before the code existed, and it is a new
+/// CLASS rather than another syscall on an existing surface. Every other unsafe
+/// site in this crate is an instruction one-shot: it begins at `syscall` and
+/// ends when it returns, and what returns is a number safe code then owns. A
+/// scanout target inverts that. The mapping IS the destination — the renderer
+/// writes pixels INTO kernel-owned memory — so a slice over that memory has to
+/// cross a module boundary and stay valid while a frame is drawn.
+///
+/// The invariants, each pinned by a confinement test:
+///
+/// - `length` is the length the mapping was CREATED with, held here rather than
+///   recomputed at each use. A length that can drift from its mapping is an
+///   out-of-bounds write the compiler reads as safe — the `EVIOCGABS` failure
+///   mode one layer up.
+/// - `Drop` unmaps, and nothing else does, so the region's lifetime is this
+///   value's. That is the whole of what the name promises.
+/// - Neither `Clone` nor `Copy`: two owners would be two unmaps.
+/// - The borrowed slice is the only way out. No raw pointer reaches a caller,
+///   and the borrow cannot outlive the guard.
+pub struct MappedRegion {
+    address: *mut u8,
+    length: usize,
+}
+
+impl MappedRegion {
+    /// The pixels, borrowed for no longer than the mapping that holds them.
+    #[allow(unsafe_code)]
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `drm_map_dumb` is the sole constructor and returns only after
+        // `mmap` answered a live mapping of exactly `length` bytes at
+        // `address`. `Drop` is the only unmap and cannot have run while this
+        // `&mut self` exists, and the returned borrow cannot outlive it.
+        unsafe { core::slice::from_raw_parts_mut(self.address, self.length) }
+    }
+
+    /// The length the mapping was created with.
+    pub fn len(&self) -> usize {
+        self.length
+    }
+}
+
+impl Drop for MappedRegion {
+    fn drop(&mut self) {
+        // The pair `mmap` returned, unchanged since, unmapped exactly once.
+        let _ = syscall5(SYS_MUNMAP, self.address as usize, self.length, 0, 0, 0);
+    }
+}
+
+/// Allocate one dumb buffer on this card.
+pub fn drm_create_dumb(
+    card: &impl AsRawFd,
+    width: u32,
+    height: u32,
+) -> Result<DrmDumbBuffer, String> {
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "DRM_IOCTL_MODE_CREATE_DUMB: refusing a {width}x{height} buffer with no pixels"
+        ));
+    }
+    let mut request = DrmModeCreateDumb {
+        height,
+        width,
+        bpp: DUMB_BUFFER_BPP,
+        flags: 0,
+        handle: 0,
+        pitch: 0,
+        size: 0,
+    };
+    drm_ioctl(
+        card.as_raw_fd(),
+        DRM_IOCTL_MODE_CREATE_DUMB,
+        std::ptr::from_mut(&mut request) as usize,
+        "DRM_IOCTL_MODE_CREATE_DUMB",
+    )?;
+    if request.size == 0 || request.pitch == 0 {
+        // The handle is live whatever the geometry says, so it is released
+        // before this returns rather than leaked to a caller that never saw it.
+        let _ = drm_destroy_dumb(card, request.handle);
+        return Err(format!(
+            "DRM_IOCTL_MODE_CREATE_DUMB: the driver reported pitch {} and size {} for a {width}x{height} buffer",
+            request.pitch, request.size
+        ));
+    }
+    Ok(DrmDumbBuffer {
+        handle: request.handle,
+        pitch: request.pitch,
+        size: request.size,
+    })
+}
+
+/// Map one dumb buffer this crate created, at the offset the kernel reports.
+///
+/// The ONE construction site for `MappedRegion`, which is what makes the length
+/// in that type the length of its mapping: both come from here, and there is no
+/// second path on which they could disagree.
+pub fn drm_map_dumb(card: &impl AsRawFd, buffer: &DrmDumbBuffer) -> Result<MappedRegion, String> {
+    let length = mappable_length(buffer.size)?;
+    let fd = card.as_raw_fd();
+    if fd < 0 {
+        return Err(format!("DRM_IOCTL_MODE_MAP_DUMB: invalid descriptor {fd}"));
+    }
+    let mut request = DrmModeMapDumb {
+        handle: buffer.handle,
+        pad: 0,
+        offset: 0,
+    };
+    drm_ioctl(
+        fd,
+        DRM_IOCTL_MODE_MAP_DUMB,
+        std::ptr::from_mut(&mut request) as usize,
+        "DRM_IOCTL_MODE_MAP_DUMB",
+    )?;
+    let offset = usize::try_from(request.offset).map_err(|_| {
+        "DRM_IOCTL_MODE_MAP_DUMB: the kernel reported an offset outside this address space"
+            .to_string()
+    })?;
+    let address = errno_result(
+        syscall6(
+            SYS_MMAP,
+            0,
+            length,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd as usize,
+            offset,
+        ),
+        "mmap",
+    )?;
+    // Built BEFORE it is judged, so the refusal below unmaps through `Drop`
+    // rather than through a second copy of the unmap. An earlier revision
+    // returned the error first and leaked the mapping on a path it called
+    // impossible; a review found it, and "unreachable" is not a reason to own
+    // a region on one path and not the other.
+    let region = MappedRegion {
+        address: address as *mut u8,
+        length,
+    };
+    if region.address.is_null() {
+        return Err("mmap: the kernel returned a null mapping".to_string());
+    }
+    Ok(region)
+}
+
+/// The length a device-reported size may be mapped at, or why it may not.
+///
+/// A size read from a driver becomes an `mmap` LENGTH, so this is the
+/// `MAX_DRM_OBJECTS` problem again in a second place: an implausible number is
+/// a request to size this process's address space. Pure, so the three refusals
+/// are testable without a card — which is the whole reason it is a function
+/// rather than three `if`s inside the caller.
+fn mappable_length(size: u64) -> Result<usize, String> {
+    if size == 0 {
+        return Err("DRM_IOCTL_MODE_MAP_DUMB: refusing to map a zero-length buffer".to_string());
+    }
+    if size > MAX_DUMB_BUFFER_BYTES {
+        return Err(format!(
+            "DRM_IOCTL_MODE_MAP_DUMB: a buffer of {size} bytes is past the \
+             {MAX_DUMB_BUFFER_BYTES} this compositor will map"
+        ));
+    }
+    usize::try_from(size).map_err(|_| {
+        format!("DRM_IOCTL_MODE_MAP_DUMB: a buffer of {size} bytes does not fit this address space")
+    })
+}
+
+/// Release one dumb buffer handle.
+pub fn drm_destroy_dumb(card: &impl AsRawFd, handle: u32) -> Result<(), String> {
+    let mut request = DrmModeDestroyDumb { handle };
+    drm_ioctl(
+        card.as_raw_fd(),
+        DRM_IOCTL_MODE_DESTROY_DUMB,
+        std::ptr::from_mut(&mut request) as usize,
+        "DRM_IOCTL_MODE_DESTROY_DUMB",
+    )?;
+    Ok(())
+}
+
 /// Ask which driver is behind this node.
 pub fn drm_driver_name(card: &impl AsRawFd) -> Result<String, String> {
     let fd = card.as_raw_fd();
@@ -808,9 +1109,18 @@ pub fn drm_driver_name(card: &impl AsRawFd) -> Result<String, String> {
     // reports the full strlen, so a name that grew between the two calls is
     // reported longer than what was written. Believe the smaller number.
     name.truncate(length.min(fill.name_len));
+    // Filtered exactly as `DrmModeInfo::name` is, and for the same reason: this
+    // string goes into a whitespace-split probe report, so a driver name
+    // carrying a newline would truncate the line and one carrying " output="
+    // would shadow a later field. It also bounds the decoded LENGTH -- lossy
+    // decoding expands one invalid byte to three, so 64 invalid bytes would
+    // otherwise produce 192 characters and push the report past the bound the
+    // boot check reads it within. An asymmetry a review found: the mode name
+    // was filtered here and the driver name was not.
     Ok(String::from_utf8_lossy(&name)
-        .trim_end_matches('\0')
-        .to_string())
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .collect())
 }
 
 /// Ask what the card has.
@@ -1369,6 +1679,34 @@ pub fn discard_received(fds: &[RawFd]) {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// An ordinary scanout size maps.
+    #[test]
+    fn a_plausible_buffer_size_is_mappable() {
+        assert_eq!(mappable_length(4_096_000), Ok(4_096_000));
+        assert_eq!(mappable_length(1), Ok(1));
+        assert_eq!(mappable_length(MAX_DUMB_BUFFER_BYTES), Ok(268_435_456));
+    }
+
+    /// Zero is refused rather than mapped: `mmap` with a zero length fails
+    /// anyway, and a zero-length region would make every later bound vacuous.
+    #[test]
+    fn a_zero_length_buffer_is_not_mapped() {
+        let error = mappable_length(0).unwrap_err();
+        assert!(error.contains("zero-length"), "{error}");
+    }
+
+    /// A device-chosen size is an allocation request against this process's
+    /// address space, so an implausible one is refused BEFORE it becomes an
+    /// `mmap` length -- the ceiling `MAX_DRM_OBJECTS` applies to counts,
+    /// applied here to bytes.
+    #[test]
+    fn an_implausible_buffer_size_is_refused_before_it_becomes_a_length() {
+        let error = mappable_length(MAX_DUMB_BUFFER_BYTES + 1).unwrap_err();
+        assert!(error.contains("past the"), "{error}");
+        let error = mappable_length(u64::MAX).unwrap_err();
+        assert!(error.contains("past the"), "{error}");
+    }
     use std::io::Read;
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::os::unix::fs::MetadataExt;
@@ -1685,6 +2023,22 @@ mod tests {
             argument_size(DRM_IOCTL_MODE_GETENCODER),
             std::mem::size_of::<DrmModeGetEncoder>()
         );
+        // The dumb trio, which ALLOCATES. The stakes are the same and the
+        // consequence is more direct: `CREATE_DUMB` is copied back out, so a
+        // request understating its struct leaves `size` and `pitch` unwritten
+        // and the caller maps a buffer against numbers the kernel never set.
+        assert_eq!(
+            argument_size(DRM_IOCTL_MODE_CREATE_DUMB),
+            std::mem::size_of::<DrmModeCreateDumb>()
+        );
+        assert_eq!(
+            argument_size(DRM_IOCTL_MODE_MAP_DUMB),
+            std::mem::size_of::<DrmModeMapDumb>()
+        );
+        assert_eq!(
+            argument_size(DRM_IOCTL_MODE_DESTROY_DUMB),
+            std::mem::size_of::<DrmModeDestroyDumb>()
+        );
     }
 
     /// The kernel's own byte counts for Linux 7.1.4 on x86-64, written out
@@ -1705,6 +2059,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<DrmModeGetEncoder>(), 20);
         assert_eq!(std::mem::size_of::<DrmModeInfo>(), 68);
         assert_eq!(std::mem::align_of::<DrmModeInfo>(), 4);
+        // Six `__u32` then a `__u64`: 24 bytes of words, already 8-aligned, so
+        // 32 with no padding between them.
+        assert_eq!(std::mem::size_of::<DrmModeCreateDumb>(), 32);
+        assert_eq!(std::mem::size_of::<DrmModeMapDumb>(), 16);
+        assert_eq!(std::mem::size_of::<DrmModeDestroyDumb>(), 4);
     }
 
     /// An empty list offers the kernel no pointer at all rather than a

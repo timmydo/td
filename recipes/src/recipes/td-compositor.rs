@@ -540,11 +540,31 @@ mod tests {
     #[test]
     fn the_drm_probe_marker_is_the_one_the_compositor_prints() {
         assert!(
-            MAIN_RS.contains(&format!("\"{TD_COMPOSITOR_DRM_PROBE_MARKER} {{}} output={{}}x{{}}\"")),
+            MAIN_RS.contains(&format!(
+                "\"{TD_COMPOSITOR_DRM_PROBE_MARKER} {{}} output={{}}x{{}} {{}}\""
+            )),
             "td-compositor no longer prints {TD_COMPOSITOR_DRM_PROBE_MARKER} in the shape the boot check greps for"
         );
         // And the subcommand that prints it is reachable by the name the image
         // invokes.
         assert!(MAIN_RS.contains("\"probe-drm\" => {"));
+        // The FIELDS inside the line are a second copy of the same fact, and a
+        // rename of one is the failure this test exists to make impossible.
+        //
+        // `DumbFrame::describe` emits them and `qemu_boot.rs` reads them with
+        // `strip_prefix`, in two crates that cannot import each other. Renaming
+        // `pitch=` in the compositor passes every host test in both crates and
+        // then fails EVERY agent's `qemu-boot-system` with "reported pitch 0
+        // and 0 bytes", which reads as a broken driver rather than as a renamed
+        // field. Found by review rather than by anything failing.
+        let drm = MODULES
+            .iter()
+            .find(|(name, _)| *name == "drm")
+            .map(|(_, source)| *source)
+            .expect("td-compositor no longer declares a drm module");
+        assert!(
+            drm.contains(r#""buffer={}x{} pitch={} bytes={} mapping=ok""#),
+            "DumbFrame::describe no longer emits the fields the boot check reads"
+        );
     }
 }

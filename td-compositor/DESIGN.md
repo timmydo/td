@@ -3775,13 +3775,28 @@ the kernel's conforming ancillary framing.
   two pinned `EVIOCGABS` requests that read an absolute pointer's declared
   axis range, and the four pinned DRM requests below that read a card.
 
-The DRM five are reached only from `drm.rs`. Four READ — `DRM_IOCTL_VERSION`,
-`MODE_GETRESOURCES`, `MODE_GETCONNECTOR` and `MODE_GETENCODER`. Nothing in this
-crate modesets, allocates a buffer or maps memory; the confinement test names
-the six write-side requests as absent so that `APPLICATIONS.md` §M's backend
-adds each by amendment.
+The DRM eight are reached only from `drm.rs`. Four READ — `DRM_IOCTL_VERSION`,
+`MODE_GETRESOURCES`, `MODE_GETCONNECTOR` and `MODE_GETENCODER`. Three ALLOCATE
+— `MODE_CREATE_DUMB`, `MODE_MAP_DUMB` and `MODE_DESTROY_DUMB` — which is what
+makes `mmap` unavoidable and the mapping class real. Nothing in this crate
+modesets; the confinement test names `MODE_SETCRTC`, `MODE_ADDFB2`,
+`MODE_PAGE_FLIP` and `MODE_ATOMIC` as absent so that `APPLICATIONS.md` §M's
+backend adds each by amendment.
 
-The fifth, `DROP_MASTER`, is on the roster because opening a primary node
+A dumb buffer is unmapped BEFORE its handle is freed, and that ordering is a
+property of declaration order rather than of a comment. `DumbFrame` holds its
+`MappedRegion` ahead of a `DumbHandle` guard and deliberately has no `Drop` of
+its own: a type's own destructor runs before its fields are dropped, so writing
+the release there would invert the order it exists to guarantee. The
+confinement test pins both the field order and the absence of that destructor,
+because either alone permits the bad order.
+
+The kernel does not require this order. A GEM mapping holds its own reference
+to the object, so closing the handle first leaves the mapping valid; the order
+is kept as hygiene — release in the reverse of acquisition — and not as a
+correctness constraint. `UNSAFE.md` §6 carries the citation.
+
+`DROP_MASTER` is on the roster because opening a primary node
 GRANTS mastership: `drm_master_open` makes the first opener master when
 `dev->master` is NULL, and fbcon never sets it. So `open_card` releases it
 immediately; while it is held the fbdev damage this compositor depends on

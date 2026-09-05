@@ -8317,9 +8317,27 @@ four value-pinned `ioctl` requests and their `#[repr(C)]` structs — is in
 which is what makes the selection testable against recorded connector shapes
 rather than against a card. `UNSAFE.md` §6 carries the amendment.
 
-Nothing in it modesets, allocates a buffer or maps memory, and the confinement
-test names the six write-side requests as ABSENT so the backend adds each by
-amendment rather than arriving with a module that already has them.
+Nothing in it modesets, and the confinement test names `MODE_SETCRTC`,
+`MODE_ADDFB2`, `MODE_PAGE_FLIP` and `MODE_ATOMIC` as ABSENT so the backend adds
+each by amendment rather than arriving with a module that already has them.
+
+Row 1's MAPPING half has landed since, and it is the honest toll this section
+names rather than the backend itself. `td-compositor/src/drm.rs` allocates a
+dumb buffer at the chosen mode's size, maps it, writes a pattern at its first,
+middle and last byte, reads that back, and releases both. Nothing is displayed:
+`ADDFB2`, `SETCRTC` and the page flip are what put pixels on glass and are
+still absent. What it buys is that `mmap` is now a rostered, confined surface
+with a region type owning its unmap — `UNSAFE.md` §6 records what landed
+against the shape budgeted there in advance — so the backend increment inherits
+a mapping class instead of introducing one.
+
+The read-back is the part worth keeping: `mmap` answering an address is not
+evidence that the address is the buffer, and a length that disagreed with its
+mapping would still map and still write, just somewhere else. The last byte is
+probed because an off-by-one shows up there and nowhere else. The QEMU boot
+check asserts `mapping=ok` together with a pitch that covers the scanout width
+and a size that covers pitch times height, so the claim is proven on a real
+card rather than in a unit test.
 
 It does, however, take DRM mastership, and saying otherwise was this
 increment's one real defect. Opening a PRIMARY node makes the opener master

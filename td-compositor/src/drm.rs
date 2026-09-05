@@ -151,6 +151,195 @@ impl Discovery {
     }
 }
 
+/// The GEM handle alone, so releasing it is a FIELD DROP rather than a
+/// statement someone can reorder or an early return can skip.
+struct DumbHandle<'card> {
+    card: &'card File,
+    handle: u32,
+}
+
+impl Drop for DumbHandle<'_> {
+    fn drop(&mut self) {
+        let _ = sys::drm_destroy_dumb(self.card, self.handle);
+    }
+}
+
+/// One dumb buffer and its mapping, released together and in that order.
+///
+/// Field order is load-bearing, and there is deliberately NO `impl Drop` on
+/// this type. Rust drops fields in declaration order, so `region` unmaps before
+/// `handle` releases the GEM handle. An explicit `Drop` here would run before
+/// either field and invert that.
+///
+/// The kernel tolerates either order — a GEM mapping takes its own reference,
+/// so closing the handle first leaves the mapping valid — so this is hygiene
+/// rather than a requirement, and an earlier comment here called it "the one
+/// ordering worth avoiding", which overstated it. It is still expressed in the
+/// type rather than in a destructor, because releasing in the reverse of
+/// acquisition is the default worth having and this is the version of it the
+/// compiler enforces for free.
+pub struct DumbFrame<'card> {
+    region: sys::MappedRegion,
+    /// Never read, and that is the point: this field exists for its `Drop`,
+    /// which is what releases the GEM handle after `region` has unmapped it.
+    /// Held by value rather than released in a destructor here so the ordering
+    /// is the compiler's business rather than a comment's.
+    #[allow(dead_code)]
+    handle: DumbHandle<'card>,
+    width: u32,
+    height: u32,
+    pitch: u32,
+}
+
+impl<'card> DumbFrame<'card> {
+    /// Allocate a buffer for one scanout and map it.
+    ///
+    /// The handle guard is built BEFORE the mapping is attempted, so a failure
+    /// to map releases the buffer on the way out rather than leaking it: the
+    /// `?` below drops the guard. That is the reason for the two-step rather
+    /// than a tidier single constructor.
+    pub fn allocate(
+        card: &'card File,
+        width: u32,
+        height: u32,
+    ) -> Result<DumbFrame<'card>, String> {
+        let buffer = sys::drm_create_dumb(card, width, height)?;
+        let handle = DumbHandle {
+            card,
+            handle: buffer.handle,
+        };
+        buffer_covers_scanout(buffer.pitch, width, height, buffer.size)?;
+        let region = sys::drm_map_dumb(card, &buffer)?;
+        Ok(DumbFrame {
+            region,
+            handle,
+            width,
+            height,
+            pitch: buffer.pitch,
+        })
+    }
+
+    /// The mapping's length.
+    pub fn len(&self) -> usize {
+        self.region.len()
+    }
+
+    /// The pixels, borrowed for no longer than this frame.
+    pub fn pixels_mut(&mut self) -> &mut [u8] {
+        self.region.bytes_mut()
+    }
+
+    /// Write a known pattern through the mapping and read it back.
+    ///
+    /// The point is not the pattern. `mmap` answering an address is not
+    /// evidence that the address IS the buffer, and a length that disagreed
+    /// with its mapping would still map and still write — it would simply write
+    /// somewhere else, or past the end. Reading back what was written is the
+    /// cheapest thing that separates a live mapping from a plausible pointer.
+    ///
+    /// Split into three so the halves are testable without a card: the offsets
+    /// are chosen by arithmetic, the write and the verify are separate passes
+    /// over a plain slice, and a test can corrupt a byte between them. A single
+    /// function writing and reading the same slice could not have failed.
+    pub fn prove_mapping(&mut self) -> Result<(), String> {
+        let offsets = pattern_offsets(self.len())?;
+        let pixels = self.pixels_mut();
+        write_pattern(pixels, &offsets);
+        verify_pattern(pixels, &offsets)
+    }
+
+    /// One line, for a proof to match and a person to read.
+    pub fn describe(&self) -> String {
+        format!(
+            "buffer={}x{} pitch={} bytes={} mapping=ok",
+            self.width,
+            self.height,
+            self.pitch,
+            self.len()
+        )
+    }
+}
+
+/// The first byte of the read-back pattern. Not zero and not `0xff`: a mapping
+/// that reads back as freshly-zeroed or as unwritten memory would satisfy
+/// either of those without anything having been written.
+const PATTERN_BASE: u8 = 0xa5;
+
+/// Does a driver's reported size actually cover the scanout it is for?
+///
+/// The kernel picks the PITCH, so the size that matters is `pitch * height`,
+/// not `width * 4 * height` — which is what a caller would have assumed and
+/// what would be too small on any driver that pads a scanline. Two separate
+/// failures are named apart because they are different bugs: a pitch too narrow
+/// for the width means the driver and this code disagree about the format,
+/// while a size below `pitch * height` means the buffer is short of its own
+/// stride. Either one, trusted, is a write past the end of the mapping.
+fn buffer_covers_scanout(pitch: u32, width: u32, height: u32, size: u64) -> Result<(), String> {
+    let row = u64::from(width).saturating_mul(4);
+    if u64::from(pitch) < row {
+        return Err(format!(
+            "dumb buffer: the driver reported pitch {pitch} for a {width}-pixel row, which \
+             needs {row} bytes at four bytes per pixel"
+        ));
+    }
+    // `u32 * u32` always fits a `u64`, so this is exact at every input and the
+    // saturation is unreachable. Said rather than guarded: an earlier revision
+    // used `checked_mul` and returned an "overflows" error, which no test could
+    // reach and which therefore claimed a check that was not one.
+    let needed = u64::from(pitch).saturating_mul(u64::from(height));
+    if size < needed {
+        return Err(format!(
+            "dumb buffer: the driver reported {size} bytes for {width}x{height} at pitch \
+             {pitch}, which needs {needed}"
+        ));
+    }
+    Ok(())
+}
+
+/// The three offsets the read-back pattern uses: first, middle and LAST.
+///
+/// The last is the one that earns its place. An off-by-one in a mapping's
+/// length shows up at the final byte and nowhere else, which is the failure
+/// `UNSAFE.md` §6 asks the length to be held in the region type to prevent. A
+/// zero-length mapping is refused rather than handed an empty set, because
+/// "every one of no probes passed" is not evidence of anything.
+fn pattern_offsets(length: usize) -> Result<[usize; 3], String> {
+    let last = length
+        .checked_sub(1)
+        .ok_or_else(|| "dumb mapping: a zero-length mapping proves nothing".to_string())?;
+    Ok([0, length / 2, last])
+}
+
+/// Stamp the pattern. Offsets past the end are skipped rather than refused:
+/// `pattern_offsets` derives them from the same length, so an out-of-range one
+/// is unreachable, and `verify_pattern` is what reports a byte that did not
+/// take rather than this silently deciding a short buffer is fine.
+fn write_pattern(pixels: &mut [u8], offsets: &[usize]) {
+    for (step, offset) in offsets.iter().enumerate() {
+        if let Some(slot) = pixels.get_mut(*offset) {
+            *slot = PATTERN_BASE.wrapping_add(step as u8);
+        }
+    }
+}
+
+/// Read the pattern back, naming the first byte that disagrees.
+fn verify_pattern(pixels: &[u8], offsets: &[usize]) -> Result<(), String> {
+    let length = pixels.len();
+    for (step, offset) in offsets.iter().enumerate() {
+        let expected = PATTERN_BASE.wrapping_add(step as u8);
+        let seen = pixels
+            .get(*offset)
+            .ok_or_else(|| format!("dumb mapping: offset {offset} is past {length} bytes"))?;
+        if *seen != expected {
+            return Err(format!(
+                "dumb mapping: byte {offset} of {length} read back {seen:#04x}, not \
+                 {expected:#04x} — the mapping is not the buffer"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Open a card node and immediately give back the authority opening it took.
 ///
 /// Read-write because a DRM node is: the mode-setting requests the next
@@ -362,6 +551,107 @@ fn first_possible_crtc(encoder: &sys::DrmEncoder, resources: &sys::DrmResources)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A driver whose reported size covers its own stride is accepted, and an
+    /// over-aligned pitch is fine: the kernel picks it.
+    #[test]
+    fn a_buffer_that_covers_its_scanout_is_accepted() {
+        assert_eq!(buffer_covers_scanout(5120, 1280, 800, 4_096_000), Ok(()));
+        // A driver padding the scanline to 8192 needs a bigger buffer, and
+        // reports one. Demanding pitch == width * 4 would reject this.
+        assert_eq!(buffer_covers_scanout(8192, 1280, 800, 6_553_600), Ok(()));
+    }
+
+    /// A pitch narrower than four bytes per pixel means the driver and this
+    /// code disagree about the format, and every row would land on the one
+    /// before it.
+    #[test]
+    fn a_pitch_narrower_than_the_row_is_refused() {
+        let error = buffer_covers_scanout(4096, 1280, 800, 4_096_000).unwrap_err();
+        assert!(error.contains("pitch 4096"), "{error}");
+        assert!(error.contains("5120"), "{error}");
+    }
+
+    /// A size below `pitch * height` is a buffer short of its own stride, and
+    /// a renderer trusting it writes past the mapping on the last rows.
+    #[test]
+    fn a_size_below_its_own_stride_is_refused() {
+        let error = buffer_covers_scanout(5120, 1280, 800, 4_095_999).unwrap_err();
+        assert!(error.contains("4096000"), "{error}");
+    }
+
+    /// The widest inputs do not wrap into a small `needed` that would pass.
+    ///
+    /// `u32 * u32` fits a `u64`, so the product is exact even at the extreme
+    /// and a short buffer is still refused there. This is the test that made
+    /// the point: an earlier revision guarded the multiply with `checked_mul`
+    /// and reported an overflow that cannot happen, and this test could not be
+    /// written to reach it.
+    #[test]
+    fn the_widest_pitch_and_height_do_not_wrap() {
+        let error = buffer_covers_scanout(u32::MAX, 1, u32::MAX, 0).unwrap_err();
+        assert!(error.contains("needs"), "{error}");
+        assert!(error.contains("18446744065119617025"), "{error}");
+    }
+
+    /// A zero-length mapping proves nothing, and is refused rather than given
+    /// an empty probe set that would pass vacuously.
+    #[test]
+    fn a_zero_length_mapping_is_not_a_proof() {
+        let error = pattern_offsets(0).unwrap_err();
+        assert!(error.contains("proves nothing"), "{error}");
+    }
+
+    /// The LAST byte is probed, not just the first and the middle. This is the
+    /// whole reason the set has three members: a mapping one byte short of its
+    /// buffer reads back correctly everywhere except here.
+    #[test]
+    fn the_last_byte_of_the_mapping_is_probed() {
+        assert_eq!(pattern_offsets(1).unwrap(), [0, 0, 0]);
+        assert_eq!(pattern_offsets(2).unwrap(), [0, 1, 1]);
+        let offsets = pattern_offsets(4096).unwrap();
+        assert_eq!(offsets, [0, 2048, 4095]);
+    }
+
+    /// A mapping that keeps what was written to it passes.
+    #[test]
+    fn a_mapping_that_retains_its_writes_is_proven() {
+        let mut pixels = vec![0u8; 4096];
+        let offsets = pattern_offsets(pixels.len()).unwrap();
+        write_pattern(&mut pixels, &offsets);
+        assert_eq!(verify_pattern(&pixels, &offsets), Ok(()));
+    }
+
+    /// The three offsets carry DIFFERENT bytes, so a mapping that aliased all
+    /// three onto one address would fail rather than read back its own last
+    /// write three times.
+    #[test]
+    fn the_three_probes_are_not_the_same_byte() {
+        let mut pixels = vec![0u8; 4096];
+        let offsets = pattern_offsets(pixels.len()).unwrap();
+        write_pattern(&mut pixels, &offsets);
+        let seen: Vec<u8> = offsets.iter().filter_map(|at| pixels.get(*at).copied()).collect();
+        assert_eq!(seen.len(), 3);
+        assert_ne!(seen.first(), seen.get(1));
+        assert_ne!(seen.get(1), seen.get(2));
+    }
+
+    /// A byte that does not survive the write is named, with its offset. This
+    /// is the case a single write-then-read pass over one slice could not have
+    /// produced, and it is why the two halves are separate functions.
+    #[test]
+    fn a_byte_that_does_not_stick_is_reported_by_offset() {
+        let mut pixels = vec![0u8; 4096];
+        let offsets = pattern_offsets(pixels.len()).unwrap();
+        write_pattern(&mut pixels, &offsets);
+        // The LAST byte, which is the off-by-one a short mapping produces.
+        if let Some(slot) = pixels.get_mut(4095) {
+            *slot = 0;
+        }
+        let error = verify_pattern(&pixels, &offsets).unwrap_err();
+        assert!(error.contains("byte 4095 of 4096"), "{error}");
+        assert!(error.contains("not the buffer"), "{error}");
+    }
 
     fn mode(width: u16, height: u16, preferred: bool, name: &str) -> sys::DrmModeInfo {
         let mut mode = sys::DrmModeInfo {
