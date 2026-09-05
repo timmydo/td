@@ -20,10 +20,11 @@ profile is designed but not implemented yet.
 The safe, dependency-free library implements UTF-8/BOM/LF/CRLF conversion,
 scalar edits and selection, tabs, bounded undo/redo with saved-state tracking,
 literal search/replace, paragraph filling and Auto Fill. Logical Windows and
-Emacs keys share those commands. Navigation that needs viewport layout,
-dialogs, clipboard, spelling and actual file I/O produces an explicit adapter
-request. No Wayland window, GPU renderer, filesystem Open/Save, remote socket
-or tmc integration is claimed yet. Do not set `$EDITOR` to this binary yet.
+Emacs keys share those commands. The controller also handles visual navigation
+and pointer selection. Dialogs, clipboard, spelling and actual file I/O produce
+an explicit adapter request. No Wayland window, GPU renderer, filesystem
+Open/Save, remote socket or tmc integration is claimed yet. Do not set
+`$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
 
@@ -37,7 +38,8 @@ td-editor/target/release/td-editor --help
 
 `src/model.rs` owns state and transaction admission; `text.rs` owns the
 lossless file codec; `fill.rs` plans bounded reflow; `keys.rs` translates
-logical chords; and `replay.rs` drives the model with framed commands.
+logical chords; `ui.rs` owns input/view state; and `replay.rs` feeds that same
+controller with framed commands.
 `tests/core.rs` covers byte round trips, stale/invalid commands, limits,
 save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector
@@ -49,8 +51,10 @@ motion calculation, and independent viewport scrolling. `tests/layout.rs`
 compares generated rows with an exhaustive scalar-vector reference, checks
 every interior cell pixel, and round-trips every caret boundary through hit
 testing. Use `Viewport::layout` to borrow validated model text with matching
-wrap geometry, and cache its metrics by revision and geometry. These are
-library APIs, not yet wired to interactive keys or replay.
+wrap geometry. The controller caches metrics and retains per-tab scrolling,
+caret affinity and desired vertical column. `tests/ui.rs` exercises keyboard,
+drag, resize, focus and clock sequences, including identical pixels from
+typed events and replay. No display is needed for those interaction tests.
 
 `src/render.rs` supplies the safe software reference backend. A borrowed
 `Scene` streams clipped rectangle/glyph operations; `Raster` writes them into
@@ -58,8 +62,9 @@ a caller-owned, stride-checked XRGB8888 buffer. The renderer uses the existing
 compositor Unifont data and decoder directly, with no copied font or new
 dependency. It draws tabs, bounded display labels, menu/status chrome,
 selection, and a caret, at integer scales 1–4. Pixel-oracle tests cover clipping,
-damage, padding, fallback glyphs, scrolling and extreme geometry. Menus and
-tab close marks are drawing only; their input adapters are not implemented.
+damage, padding, fallback glyphs, scrolling and extreme geometry. Menus remain
+drawing only. Tab presses select tabs; close marks emit typed requests for the
+clicked tab without discarding it.
 
 Inspect a deterministic 800x600 rendering without a display:
 
@@ -112,6 +117,12 @@ future control adapter.
 | `find` | tab ID, revision, hex needle, backward (0/1), wrap (0/1) |
 | `replace` | tab ID, revision, hex needle, hex replacement; Replace All |
 | `key` | active tab ID, revision, hex logical chord |
+| `resize` | nonzero surface width, height, scale (1..=4) |
+| `set-soft-wrap` | tab ID, revision, `0` or `1` |
+| `scroll` | tab ID, revision, `rows` or `columns`, `forward` or `backward`, amount |
+| `pointer` | active tab ID, revision, `press`/`move`/`release`, x, y, extend (0/1) |
+| `focus` | `0` or `1`; keyboard focus, not pointer presence |
+| `tick` | monotonic elapsed milliseconds for caret blinking |
 
 Logical chords use `C-`, `M-`, and `S-`; e.g. `C-x`, `C-S-s`, `M-q`,
 `C-Space`, `Left`, `S-Left`, `Return`, `Tab`, `Space`, `Escape`, `F7`.
@@ -124,16 +135,36 @@ Responses begin `1 REQUEST_ID ok BODY...` or
 lowercase hex encoding of the error code. Creation returns the new tab ID;
 semantic document commands return the current revision; `text` returns the
 next byte offset and hex text. Keys return an empty body for completed core
-actions, `prefix` for pending C-x, or `request NAME` for a translated action
-whose adapter is absent. The latter is **not** a save, clipboard transfer,
-spelling check or visible dialog. `close-tab` refuses dirty text; no wire
-command can mark a buffer saved. Unknown/malformed commands are refused.
+actions, `prefix` for pending C-x, or `request NAME TAB_ID REVISION` for a
+translated action whose adapter is absent. The latter is **not** a save,
+clipboard transfer, spelling check or visible dialog. `close-tab` refuses
+dirty text; no wire
+command can mark a buffer saved. A New key returns the new tab ID, just like
+the `new` command. Unknown/malformed commands are refused. Up/Down and
+Page Up/Down (including Shift variants) now perform visual navigation rather
+than returning adapter requests.
 
 `state` returns `active=ID` (0 means no tab), `keys=PROFILE`, `prefix=0|1`, then one
 `tab=ID,REVISION,DIRTY,BYTES,ANCHOR,CARET,AUTO_FILL,FILL_COLUMN,BOM,ENDING`
 field per tab; ENDING is `lf` or `crlf`. Text pages never split scalars.
 Use the returned revision in subsequent commands; undo and redo advance it.
 Selection and formatting-mode changes leave the text revision unchanged.
+
+`state` additionally reports `generation=N`, `window=WIDTH,HEIGHT,SCALE`,
+`focus=0|1`, and one
+`view=ID,FIRST_ROW,LEFT_COLUMN,COLUMNS,ROWS,SOFT_WRAP,AFFINITY,DESIRED_COLUMN`
+per tab. Affinity is `upstream` or `downstream`; an unset desired column is
+`-`. A zero-cell surface has a virtual minimum 1x1 cached layout but no text
+input hit area. Generation is local state, not compositor frame completion.
+Scroll amounts are unsigned and at most `isize::MAX`; direction carries the
+sign. Replay pointer coordinates are unsigned surface pixels through
+`i64::MAX`; the typed API also accepts signed out-of-surface drag coordinates.
+Pointer drag clamps to viewport edges without autoscroll. Keys require focus;
+pointer events do not. Focus loss cancels prefix/mark/drag, preserving selection.
+An invalid key continuation preserves its prefix until cancelled explicitly.
+Ticks are milliseconds since controller creation. Send a current tick before
+each timed input event; input occurs at the last supplied tick, not an ambient
+wall clock. Timer wakes must also send ticks to animate the caret.
 
 For example, these payloads create a tab, insert `hello`, and read it back:
 

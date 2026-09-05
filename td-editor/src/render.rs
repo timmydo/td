@@ -93,6 +93,16 @@ pub struct Geometry {
     scale: Scale,
 }
 
+impl Default for Geometry {
+    fn default() -> Self {
+        Self {
+            width: 800,
+            height: 600,
+            scale: Scale(1),
+        }
+    }
+}
+
 impl Geometry {
     pub fn new(width: usize, height: usize, scale: Scale) -> Result<Self> {
         if width == 0 || height == 0 || width > MAX_AXIS || height > MAX_AXIS {
@@ -140,6 +150,24 @@ impl Geometry {
             doc.width as usize / (CELL_WIDTH * self.scale.value()),
             doc.height as usize / (CELL_HEIGHT * self.scale.value()),
         )
+    }
+    pub fn status(self) -> Rect {
+        let height = 24 * self.scale.value();
+        Rect {
+            x: 0,
+            y: self.height.saturating_sub(height) as i64,
+            width: self.width as u32,
+            height: height as u32,
+        }
+    }
+    pub fn tab_close(self, index: usize, active: usize, count: usize) -> Option<Rect> {
+        let tab = self.tab(index, active, count)?;
+        let width = (24 * self.scale.value()) as u32;
+        Some(Rect {
+            x: tab.x + i64::from(tab.width - width),
+            width,
+            ..tab
+        })
     }
     /// The active tab is always in the strip. Narrow surfaces clip one tab.
     pub fn tab(self, index: usize, active: usize, count: usize) -> Option<Rect> {
@@ -438,8 +466,11 @@ impl<'a> Scene<'a> {
                 .iter()
                 .find(|label| label.tab == id)
                 .map_or("Untitled", |label| label.title);
+            let Some(close) = self.geometry.tab_close(index, active, count) else {
+                continue;
+            };
             let title_rect = Rect {
-                width: rect.width.saturating_sub((24 * s) as u32),
+                width: rect.width.saturating_sub(close.width),
                 ..rect
             };
             self.label(
@@ -454,20 +485,15 @@ impl<'a> Scene<'a> {
             );
             self.label(
                 "x".chars(),
-                (rect.x + i64::from(rect.width) - 16 * s, rect.y + 4 * s),
-                rect,
+                (close.x + 8 * s, close.y + 4 * s),
+                close,
                 INK,
                 clip,
                 sink,
             );
         }
         self.document(clip, sink);
-        let status_rect = Rect {
-            x: 0,
-            y: (self.geometry.height as i64 - 24 * s).max(0),
-            width: self.geometry.width as u32,
-            height: (24 * s) as u32,
-        };
+        let status_rect = self.geometry.status();
         fill(status_rect, CHROME, sink);
         fill(
             Rect {

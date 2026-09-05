@@ -297,28 +297,31 @@ fn auto_fill_preserves_interior_separators_and_maps_every_caret() {
 fn pristine_new_tabs_can_close_and_undo_returns_to_clean() {
     let mut s = replay::Session::default();
     for request in 1..=100 {
-        let id = s.editor.new_tab().unwrap();
-        assert!(!s.editor.document(id).unwrap().dirty());
+        assert!(!s.request(b"1\t0\tnew").contains("error"));
+        let id = s.ui.editor().active().unwrap();
+        assert!(!s.ui.editor().document(id).unwrap().dirty());
         let close = format!("1\t{request}\tclose-tab\t{id}\t0");
         assert!(!s.request(close.as_bytes()).contains("error"));
     }
-    let id = s.editor.new_tab().unwrap();
-    apply(&mut s.editor, id, Command::Type('x'));
-    assert!(s.editor.document(id).unwrap().dirty());
-    apply(&mut s.editor, id, Command::Undo);
-    assert!(!s.editor.document(id).unwrap().dirty());
+    s.request(b"1\t0\tnew");
+    let id = s.ui.editor().active().unwrap();
+    s.request(format!("1\t0\tinsert\t{id}\t0\t78").as_bytes());
+    assert!(s.ui.editor().document(id).unwrap().dirty());
+    s.request(format!("1\t0\tundo\t{id}\t1").as_bytes());
+    assert!(!s.ui.editor().document(id).unwrap().dirty());
 }
 
 #[test]
 fn windows_cancel_keeps_selection_while_emacs_cancel_clears_it() {
     let mut s = replay::Session::default();
-    let id = s.editor.load_bytes(b"abc").unwrap();
-    select(&mut s.editor, id, 0, 2);
+    s.request(b"1\t0\tload\t616263");
+    let id = s.ui.editor().active().unwrap();
+    s.request(b"1\t0\tselect-range\t1\t0\t0\t2");
     assert!(!s
         .request(b"1\t1\tkey\t1\t0\t457363617065")
         .contains("error"));
     assert_eq!(
-        s.editor.document(id).unwrap().selection(),
+        s.ui.editor().document(id).unwrap().selection(),
         Selection {
             anchor: 0,
             caret: 2
@@ -327,7 +330,7 @@ fn windows_cancel_keeps_selection_while_emacs_cancel_clears_it() {
     s.request(b"1\t2\tset-key-profile\temacs");
     assert!(!s.request(b"1\t3\tkey\t1\t0\t432d67").contains("error"));
     assert_eq!(
-        s.editor.document(id).unwrap().selection(),
+        s.ui.editor().document(id).unwrap().selection(),
         Selection {
             anchor: 2,
             caret: 2
@@ -710,8 +713,8 @@ fn replay_rejects_malformed_stale_and_extra_fields_without_edits() {
         b"1\t7\tselect-range\t1\t1\t1\t1",
     ] {
         assert!(session.request(request).contains("\terror\t"));
-        assert_eq!(session.editor.document(1).unwrap().text(), "é");
-        assert_eq!(session.editor.document(1).unwrap().revision(), 1);
+        assert_eq!(session.ui.editor().document(1).unwrap().text(), "é");
+        assert_eq!(session.ui.editor().document(1).unwrap().revision(), 1);
     }
     assert_eq!(
         session.request(b"1\t8\ttext\t1\t1\t0\t4"),
@@ -728,7 +731,7 @@ fn replay_emacs_mark_motion_and_typing_use_document_transactions() {
         let request = format!("1\t3\tkey\t1\t0\t{}", replay::hex(key.as_bytes()));
         assert!(!s.request(request.as_bytes()).contains("error"));
     }
-    assert_eq!(s.editor.document(1).unwrap().text(), "Zc");
+    assert_eq!(s.ui.editor().document(1).unwrap().text(), "Zc");
 }
 
 #[test]

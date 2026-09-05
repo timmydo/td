@@ -23,7 +23,7 @@ pub enum Action {
     Request(&'static str),
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Keymap {
     profile: Profile,
     prefix: bool,
@@ -95,6 +95,8 @@ impl Keymap {
             "S-Down" => Some(Action::Request("select-down")),
             "PageUp" => Some(Action::Request("page-up")),
             "PageDown" => Some(Action::Request("page-down")),
+            "S-PageUp" => Some(Action::Request("select-page-up")),
+            "S-PageDown" => Some(Action::Request("select-page-down")),
             _ => None,
         };
         if let Some(action) = common {

@@ -14,17 +14,18 @@ UTF-8/file-format conversion, scalar edits and selection, bounded tabs and
 undo/redo, save-snapshot state tracking, literal search/replace, paragraph
 filling, Auto Fill, and logical Windows/Emacs key dispatch. The core opens no
 files and reads no environment or clocks. File baselines/metadata, actual
-save I/O, interactive vertical motion, Wayland, GPU rendering, spelling and the
-control socket are not implemented yet. Key bindings for those adapters
+save I/O, Wayland, GPU rendering, spelling and the control socket are not
+implemented yet. Key bindings for those adapters
 produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
 caret affinity, pixel hit testing, vertical/page-motion calculation and
-viewport scrolling. It is not yet connected to key dispatch or replay.
+viewport scrolling. The safe UI controller connects those APIs to logical
+keys, pointer selection, resize, scrolling and headless replay.
 The safe reference renderer streams bitmap scene operations into a
 caller-owned XRGB8888 buffer. `--preview` emits a fixed headless PPM fixture;
-it is not an interactive window. Menus, tab close marks and status are drawn
-but do not yet have input adapters. Wayland buffer ownership remains future
-work.
+it is not an interactive window. Menus and status are drawn; tab clicks select
+tabs and close marks emit typed requests, but visible menus/dialogs and the
+Wayland transport and buffer ownership remain future work.
 
 The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
@@ -102,6 +103,74 @@ Physical evdev positions must not stand in for letters on arbitrary host
 layouts. Shortcut modifiers and text composition are distinct. Focus loss
 cancels key repeat and pending key prefixes. Key repeat uses the compositor's
 rate and delay with explicit time inputs for deterministic tests.
+
+### Implemented input-controller contract
+
+`ui::Controller` owns the document model, key profile/prefix, mark, drag and
+per-tab view state. It exposes immutable model/view access and one typed
+`Event` dispatcher. `replay::Session` owns a controller rather than a second
+key dispatcher. Model commands, translated keys, pointer press/move/release,
+scroll, resize, soft-wrap changes, focus and explicit clock ticks all use this
+path. File, clipboard, spelling and prompt actions still return typed requests
+with the target tab and revision; they are not completed I/O or visible dialogs.
+Direct Close refuses dirty documents. No discard or save acknowledgement is
+added to replay by this controller.
+
+Each tab retains its viewport, soft-wrap flag, affinity, desired vertical
+column, and metrics cache. Metrics are refreshed when its text revision, wrap
+mode or full-cell width change; height-only resizes retain metrics and the
+desired column. Edits/nonvertical selection changes reset
+affinity to downstream and clear the desired column. Up/Down and Page Up/Down
+retain that column across short rows and reveal the caret; Shift variants,
+including Shift+Page Up/Down, extend selection. An Emacs mark extends the same
+vertical path. Tab switches preserve the tab's origin; scrolling does not move
+or reveal the caret. Later keyboard motion/editing reveals it. Resizing clamps
+the existing origin without forcing the caret onscreen. These synchronous
+scans are bounded by document size, not yet scheduled to an event-loop latency
+budget. No per-scalar cache or unbounded event queue is introduced.
+
+The initial headless geometry is 800x600 at scale 1. A decoded Resize must
+already have nonzero dimensions; the future Wayland adapter owns zero-axis
+configure retention. Surfaces with no complete document row or column retain
+a virtual minimum 1x1 layout for bounded cached state but draw no document
+cells and refuse vertical motion. The next usable geometry reflows/clamps
+normally. `Controller::scene` supplies the renderer's exact geometry, origin,
+wrap mode, affinity, focus and caret visibility.
+
+Pointer coordinates are signed physical surface pixels. Presses in full
+document cells use the layout's nearest scalar endpoint, preserving exact
+physical-pixel midpoint ties at scales 1–4; Shift-press retains
+the previous anchor. A drag remains anchored to its starting tab and byte,
+clamps out-of-surface motion to the viewport edges, and ends on release.
+There is no drag autoscroll yet. Blank rows below EOF select document end.
+Typing, semantic edits, tab/profile changes, effective resize/scroll and focus loss
+cancel dragging. Presses outside document cells or tab hit areas are ignored;
+menus are not interactive yet. Drawing and hit testing share `Geometry::tab`,
+`tab_close` and `status` rectangles for the hidden-tab slice, close area and
+status-overlap precedence on tiny windows. A clamped scroll is ignored without
+cancelling a drag.
+The close area emits a request for the clicked tab, not necessarily the active
+one. Pointer input can precede keyboard focus; only keys require focus.
+
+Focus loss cancels prefixes, mark and drag without changing document selection;
+focus gain restarts the caret without cancelling a just-delivered pointer press.
+Replay starts focused; the Wayland adapter must supply actual focus events.
+Stale commands and other rejected keys preserve prefix/view/model state. This
+includes an invalid continuation of an Emacs prefix: Escape/C-g explicitly
+cancels it. Direct `Keymap::translate` remains a lower-level decoder; the
+controller stages translation until command admission succeeds.
+
+The caller supplies monotonic milliseconds since controller creation, not
+system uptime. It must dispatch a current Tick immediately before each timed
+input event as well as on timer wakes. Events occur at the last supplied tick;
+the controller does not infer time between them. Backward ticks are refused.
+The caret is visible for 500 ms, hidden for 500 ms, and hidden when unfocused;
+accepted keys and selection/edit actions restart its visible interval. Repeat
+scheduling still belongs to the future keyboard adapter, not this blink clock.
+Every successful command conservatively advances a checked window generation;
+ignored input and ticks that do not change caret visibility do not. Rejected
+events do not advance it. Generations describe local state only: no committed
+or callback-completed frame, socket endpoint or `wait-frame` is claimed yet.
 
 ## Document model and file safety
 
@@ -772,7 +841,7 @@ td-builder's automatic cargo test/clippy gate and commits its one-package
 2. First usable Wayland window: shared codecs and audited descriptor/file
    adapter, reference bitmap rendering, US keyboard input, open/save, prompts
    and clipboard; deterministic protocol/pixel proof and the Weston US test.
-   The safe layout and bitmap reference-renderer libraries are landed
+   The safe layout, bitmap reference renderer and input controller are landed
    prerequisites; they do not by themselves complete this window milestone.
 3. On-demand whole-document spelling and complete local control: explicit
    scans, result marking/invalidation, paged semantic queries and frame

@@ -1,8 +1,9 @@
 //! Bounded headless adapter for the editor dispatcher. Framing matches the
 //! planned control transport; replay accepts consecutive frames until EOF.
 
-use crate::keys::{Action, Keymap, Profile};
-use crate::model::{Command, Editor, Selection, TabId};
+use crate::keys::Profile;
+use crate::model::{Command, Selection};
+use crate::ui::{Controller, Event, Outcome, PointerPhase};
 use crate::{Error, Result};
 use std::io::{self, Read, Write};
 
@@ -74,9 +75,7 @@ fn string(value: &str) -> Result<String> {
 
 #[derive(Default)]
 pub struct Session {
-    pub editor: Editor,
-    pub keys: Keymap,
-    mark: Option<TabId>,
+    pub ui: Controller,
 }
 
 impl Session {
@@ -118,30 +117,20 @@ impl Session {
 
     fn command(&mut self, name: &str, args: &[&str]) -> Result<String> {
         match (name, args) {
-            ("new", []) => {
-                let id = self.editor.new_tab()?;
-                self.keys.reset();
-                self.mark = None;
-                Ok(id.to_string())
-            }
-            ("load", [bytes]) => {
-                let id = self.editor.load_bytes(&unhex(bytes)?)?;
-                self.keys.reset();
-                self.mark = None;
-                Ok(id.to_string())
-            }
+            ("new", []) => reply(self.ui.dispatch(Event::New)?),
+            ("load", [bytes]) => reply(self.ui.dispatch(Event::Load(&unhex(bytes)?))?),
             ("state", []) => {
                 let mut out = format!(
                     "active={}\tkeys={}\tprefix={}",
-                    self.editor.active().unwrap_or(0),
-                    if self.keys.profile() == Profile::Windows {
+                    self.ui.editor().active().unwrap_or(0),
+                    if self.ui.keys().profile() == Profile::Windows {
                         "windows"
                     } else {
                         "emacs"
                     },
-                    u8::from(self.keys.pending())
+                    u8::from(self.ui.keys().pending())
                 );
-                for (id, doc) in self.editor.tabs() {
+                for (id, doc) in self.ui.editor().tabs() {
                     let sel = doc.selection();
                     out.push_str(&format!(
                         "\ttab={id},{},{},{},{},{},{},{},{},{}",
@@ -160,10 +149,35 @@ impl Session {
                         }
                     ));
                 }
+                let (width, height) = self.ui.geometry().dimensions();
+                out.push_str(&format!(
+                    "\tgeneration={}\twindow={width},{height},{}\tfocus={}",
+                    self.ui.generation(),
+                    self.ui.geometry().scale().value(),
+                    u8::from(self.ui.focused())
+                ));
+                for (id, _) in self.ui.editor().tabs() {
+                    let view = self.ui.tab_view(id)?;
+                    let origin = view.viewport.origin();
+                    let (columns, rows) = view.viewport.dimensions();
+                    out.push_str(&format!(
+                        "\tview={id},{},{},{columns},{rows},{},{},{}",
+                        origin.row,
+                        origin.column,
+                        u8::from(view.soft_wrap),
+                        if view.affinity == crate::layout::Affinity::Upstream {
+                            "upstream"
+                        } else {
+                            "downstream"
+                        },
+                        view.desired_column
+                            .map_or_else(|| "-".into(), |value| value.to_string())
+                    ));
+                }
                 Ok(out)
             }
             ("text", [tab, revision, offset, limit]) => {
-                let doc = self.editor.document(number(tab)?)?;
+                let doc = self.ui.editor().document(number(tab)?)?;
                 if doc.revision() != number(revision)? {
                     return Err(Error::StaleRevision);
                 }
@@ -186,91 +200,78 @@ impl Session {
                         .as_bytes())
                 ))
             }
-            ("select-tab", [tab]) => {
-                self.editor.select_tab(number(tab)?)?;
-                self.keys.reset();
-                self.mark = None;
-                Ok(String::new())
-            }
+            ("select-tab", [tab]) => reply(self.ui.dispatch(Event::SelectTab(number(tab)?))?),
             ("set-key-profile", [profile]) => {
                 let profile = match *profile {
                     "windows" => Profile::Windows,
                     "emacs" => Profile::Emacs,
                     _ => return Err(Error::InvalidArgument),
                 };
-                self.keys.set_profile(profile);
-                self.mark = None;
-                Ok(String::new())
+                reply(self.ui.dispatch(Event::Profile(profile))?)
             }
-            ("close-tab", [tab, rev]) => {
-                self.editor.close_tab(number(tab)?, number(rev)?)?;
-                self.keys.reset();
-                self.mark = None;
-                Ok(String::new())
-            }
+            ("close-tab", [tab, rev]) => reply(self.ui.dispatch(Event::Close {
+                tab: number(tab)?,
+                revision: number(rev)?,
+            })?),
             ("key", [tab, rev, key]) => {
-                let id = number(tab)?;
-                let revision = number(rev)?;
-                if self.editor.document(id)?.revision() != revision {
-                    return Err(Error::StaleRevision);
-                }
-                if self.editor.active() != Some(id) {
-                    return Err(Error::InvalidArgument);
-                }
                 let chord = string(key)?;
-                match self.keys.translate(&chord)? {
-                    Action::Edit(mut command) => {
-                        if let Command::Move { extend, .. } = &mut command {
-                            *extend |= self.mark == Some(id);
-                        }
-                        let moving = matches!(command, Command::Move { .. });
-                        self.editor.dispatch(id, revision, command)?;
-                        if !moving {
-                            self.mark = None;
-                        }
-                    }
-                    Action::New => {
-                        self.editor.new_tab()?;
-                        self.mark = None;
-                    }
-                    Action::NextTab(backward) => {
-                        self.editor.next_tab(backward)?;
-                        self.mark = None;
-                    }
-                    Action::SelectAll => {
-                        let end = self.editor.document(id)?.text().len();
-                        self.editor.dispatch(
-                            id,
-                            revision,
-                            Command::Select(Selection {
-                                anchor: 0,
-                                caret: end,
-                            }),
-                        )?;
-                    }
-                    Action::Cancel if self.keys.profile() == Profile::Windows => {
-                        self.mark = None;
-                    }
-                    Action::SetMark | Action::Cancel => {
-                        self.mark = if matches!(chord.as_str(), "C-Space") {
-                            Some(id)
-                        } else {
-                            None
-                        };
-                        let caret = self.editor.document(id)?.selection().caret;
-                        self.editor.dispatch(
-                            id,
-                            revision,
-                            Command::Select(Selection {
-                                anchor: caret,
-                                caret,
-                            }),
-                        )?;
-                    }
-                    Action::Prefix => return Ok("prefix".into()),
-                    Action::Request(request) => return Ok(format!("request\t{request}")),
-                }
-                Ok(String::new())
+                reply(self.ui.dispatch(Event::Key {
+                    tab: number(tab)?,
+                    revision: number(rev)?,
+                    chord: &chord,
+                })?)
+            }
+            ("resize", [width, height, scale]) => reply(self.ui.dispatch(Event::Resize {
+                width: size(width)?,
+                height: size(height)?,
+                scale: u8::try_from(number(scale)?).map_err(|_| Error::InvalidArgument)?,
+            })?),
+            ("focus", [value]) => reply(self.ui.dispatch(Event::Focus(boolean(value)?))?),
+            ("tick", [now]) => reply(self.ui.dispatch(Event::Tick(number(now)?))?),
+            ("set-soft-wrap", [tab, rev, value]) => reply(self.ui.dispatch(Event::Wrap {
+                tab: number(tab)?,
+                revision: number(rev)?,
+                enabled: boolean(value)?,
+            })?),
+            ("scroll", [tab, rev, axis, direction, amount]) => {
+                let amount =
+                    isize::try_from(number(amount)?).map_err(|_| Error::InvalidArgument)?;
+                let delta = match *direction {
+                    "forward" => amount,
+                    "backward" => -amount,
+                    _ => return Err(Error::InvalidArgument),
+                };
+                let (rows, columns) = match *axis {
+                    "rows" => (delta, 0),
+                    "columns" => (0, delta),
+                    _ => return Err(Error::InvalidArgument),
+                };
+                reply(self.ui.dispatch(Event::Scroll {
+                    tab: number(tab)?,
+                    revision: number(rev)?,
+                    rows,
+                    columns,
+                })?)
+            }
+            ("pointer", [tab, rev, phase, x, y, extend]) => {
+                let phase = match *phase {
+                    "press" => PointerPhase::Press,
+                    "move" => PointerPhase::Move,
+                    "release" => PointerPhase::Release,
+                    _ => return Err(Error::InvalidArgument),
+                };
+                // Replay coordinates are unsigned surface pixels. A native
+                // adapter may supply signed out-of-surface motion directly.
+                let x = i64::try_from(number(x)?).map_err(|_| Error::InvalidArgument)?;
+                let y = i64::try_from(number(y)?).map_err(|_| Error::InvalidArgument)?;
+                reply(self.ui.dispatch(Event::Pointer {
+                    tab: number(tab)?,
+                    revision: number(rev)?,
+                    phase,
+                    x,
+                    y,
+                    extend: boolean(extend)?,
+                })?)
             }
             (_, [tab, revision, rest @ ..]) => {
                 let command = match (name, rest) {
@@ -298,13 +299,29 @@ impl Session {
                     _ => return Err(Error::Protocol),
                 };
                 let id = number(tab)?;
-                self.editor.dispatch(id, number(revision)?, command)?;
-                self.mark = None;
-                Ok(self.editor.document(id)?.revision().to_string())
+                self.ui.dispatch(Event::Edit {
+                    tab: id,
+                    revision: number(revision)?,
+                    command,
+                })?;
+                Ok(self.ui.editor().document(id)?.revision().to_string())
             }
             _ => Err(Error::Protocol),
         }
     }
+}
+
+fn reply(outcome: Outcome) -> Result<String> {
+    Ok(match outcome {
+        Outcome::Created(id) => id.to_string(),
+        Outcome::Prefix => "prefix".into(),
+        Outcome::Request {
+            name,
+            tab,
+            revision,
+        } => format!("request\t{name}\t{tab}\t{revision}"),
+        Outcome::Changed | Outcome::Ignored => String::new(),
+    })
 }
 
 pub fn run(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {

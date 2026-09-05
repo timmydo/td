@@ -14,6 +14,7 @@ pub mod model;
 pub mod render;
 pub mod replay;
 pub mod text;
+pub mod ui;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
