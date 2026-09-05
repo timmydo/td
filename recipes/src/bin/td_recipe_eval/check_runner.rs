@@ -7170,21 +7170,15 @@ chmod 755 '{}'
         assert!(reapable_scratch(base));
 
         // Released, the first name is reusable — a dead predecessor does not cost a
-        // name forever. Asked again for a while rather than once: the lock is on
-        // the open file description, which a child that a sibling test is between
-        // forking and exec'ing still holds a copy of until exec closes it, so under
-        // load the first ask can find the released name held for a moment.
+        // name forever. Released by an explicit unlock, not by the close: an flock
+        // lives on the open file description, and a sibling test's `Command::spawn`
+        // may at this moment hold a duplicate of this descriptor in a child that
+        // has not exec'd yet, which would keep a closed descriptor's lock alive
+        // until it does; LOCK_UN acts on the description whatever else holds it.
+        hold_first.unlock().unwrap();
         drop(hold_first);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (again, _hold) = loop {
-            let claimed = claim_scratch(&root, name).unwrap();
-            if claimed.0 == first || std::time::Instant::now() >= deadline {
-                break claimed;
-            }
-            drop(claimed);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        assert_eq!(again, first);
+        let (again, _hold) = claim_scratch(&root, name).unwrap();
+        assert_eq!(again, first, "the released name comes back");
         let _ = fs::remove_dir_all(&lw);
     }
 
