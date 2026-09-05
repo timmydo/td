@@ -1058,6 +1058,11 @@ fn build_inittab() -> String {
 /// the shape check would still validate it, both exiting 0.
 const TD_SVC_CONF: &str = "/etc/td-svc.conf";
 
+/// The td-term terminfo entry as the image stages it: the one store file
+/// td-jail admits at a fixed mode, `0444`, which the staging copy loses and
+/// the mode-fixing step restores; the root-tree check reads it back.
+const TERMINFO_ENTRY: &str = "{root}/real-root{in:td-compositor}/share/terminfo/t/td-term";
+
 pub(super) const ROOTCHECK_ETC_NAME: &str = "rootcheck";
 pub(super) const SHADOW_ETC_NAME: &str = "shadow";
 
@@ -4189,7 +4194,8 @@ fn shape_check() -> String {
      for a in @APPLICATIONS@; do \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ] || { echo \"root tree: /bin/$a is not an application launcher pointing to /bin/td-jail - another packed /bin provider replaced it\" >&2; exit 1; }; \
      done; \
-     [ -f \"{root}/real-root{in:td-compositor}/share/terminfo/t/td-term\" ] || { echo 'root tree: the td-term terminfo entry is not packed, so /etc/terminfo resolves to a tree without it' >&2; exit 1; }; \
+     [ -f \"@TERMINFO_ENTRY@\" ] || { echo 'root tree: the td-term terminfo entry is not packed, so /etc/terminfo resolves to a tree without it' >&2; exit 1; }; \
+     [ \"$(ls -ld \"@TERMINFO_ENTRY@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: the td-term terminfo entry is not read-only (0444), the mode td-jail admits it at, so every terminal launch would be refused' >&2; exit 1; }; \
      tdsplan=$(\"$tds\" check -f \"$root@TD_SVC_CONF@\" 2>&1) || { echo 'td-svc check REJECTED the unit table this image ships - the boot would run a table the supervisor only partly understood. Its diagnostics:' >&2; printf '%s\\n' \"$tdsplan\" >&2; exit 1; }; \
      for u in @TD_SVC_UNITS@; do \
          printf '%s\\n' \"$tdsplan\" | grep -q -E \"^[0-9]+\\. $u\\$\" || { echo \"td-svc check resolved a start order without '$u' - a unit the inittab used to run is missing from the plan\" >&2; exit 1; }; \
@@ -4301,6 +4307,7 @@ fn shape_check() -> String {
         .replace("@APPLICATIONS@", &application_names(&SYSTEM).join(" "))
         .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
+        .replace("@TERMINFO_ENTRY@", TERMINFO_ENTRY)
         .replace("@PROFILER_OBJECT_INDEX@", PROFILER_OBJECT_INDEX)
         .replace("@TD_SVC_CONF_NAME@", td_svc_conf_etc_name())
         .replace(
@@ -4395,7 +4402,10 @@ pub fn recipe() -> Recipe {
     });
 
     // 1) Stage the real-root tree in build scratch. WriteFile exposes a fixed
-    //    mode, so set the shadow-file mode explicitly before packing.
+    //    mode, so set the shadow-file mode explicitly before packing. Every
+    //    staged copy is made writable by its owner, so the td-term terminfo
+    //    entry goes back to 0444, the mode td-jail's terminal grant admits
+    //    the file it binds at; the packer keeps modes as staged.
     steps.extend(real_root_steps(&SYSTEM));
     steps.push(
         Step::run(
@@ -4403,7 +4413,9 @@ pub fn recipe() -> Recipe {
             &[
                 POST_BOOTSTRAP_SH,
                 "-c",
-                "chmod 0600 '{root}/real-root/etc/shadow'",
+                &format!(
+                    "chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}'"
+                ),
             ],
         )
         .env("PATH", &post_bootstrap_path()),
@@ -9859,6 +9871,76 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // Exact for the same reason: a floor stays green while shape_check quietly
         // stops asking one archive for a payload the other still gets checked for.
         assert_eq!(greps, 9, "{greps} store-member greps found - the scan has gone stale");
+    }
+
+    /// The td-term terminfo entry ships at `0444`, the mode td-jail's terminal
+    /// grant requires of the file it binds: the packed copy is made writable
+    /// by its owner when it is staged, so the mode-fixing step restores the
+    /// mode before the packer runs, and the root-tree check refuses an image
+    /// where it did not. Pinned to the path the compositor installs the entry
+    /// at, the mode the jail reads, the step's place before the packer, and
+    /// the applets the step and the check run under, because a drift in any
+    /// of them is a boot whose every terminal window closes on a refusal, or
+    /// an image build refused for a mode it could not read.
+    #[test]
+    fn the_terminfo_entry_is_packed_at_the_mode_the_jail_admits() {
+        let terminfo = include_str!("../../../td-compositor/src/terminfo.rs");
+        assert!(
+            terminfo.contains("const INSTALL_PATH: &str = \"share/terminfo/t/td-term\";"),
+            "the compositor installs its entry somewhere else"
+        );
+        assert!(TERMINFO_ENTRY.ends_with("/share/terminfo/t/td-term"));
+        // The rule is looked for in the readback's own body, not anywhere
+        // in a file that checks many modes.
+        let transition = include_str!("../../../td-jail/src/transition.rs");
+        let readback = transition
+            .split_once("fn require_bound_terminfo_at(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("td-jail has the terminfo readback");
+        assert!(
+            readback.contains("require_mode(&entry, 0o444)?;"),
+            "td-jail admits the bound entry at a different mode"
+        );
+        // The chmod, and its place: the shape check reads the staged tree,
+        // so a chmod after the packer would leave the check green and the
+        // image wrong.
+        let steps = recipe().steps.expect("system recipe steps");
+        let chmod = format!("chmod 0444 '{TERMINFO_ENTRY}'");
+        let restored = steps
+            .iter()
+            .position(|step| matches!(
+                step,
+                Step::Run { argv, .. } if argv.iter().any(|arg| arg.contains(&chmod))
+            ))
+            .expect("no step restores the entry's mode");
+        let packed = steps
+            .iter()
+            .position(|step| matches!(step, Step::PackErofs { .. }))
+            .expect("the image is packed");
+        assert!(restored < packed, "the mode is restored after the packer read the tree");
+        // `ls -ld` and `cut`, because the check runs under the post-bootstrap
+        // applet set and `stat` is not in it: a check that named `stat`
+        // refused every image build.
+        let check = shape_check();
+        assert!(
+            check.contains(&format!(
+                "[ \"$(ls -ld \"{TERMINFO_ENTRY}\" | cut -c1-10)\" = -r--r--r-- ]"
+            )),
+            "the root-tree check does not pin the entry's mode"
+        );
+        let applets = include_str!("busybox-x86-64.rs");
+        let list = applets
+            .split_once("const POST_BOOTSTRAP_TOOL_APPLETS: &str = \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(list, _)| list)
+            .expect("the post-bootstrap applet list");
+        for applet in ["ls", "cut", "chmod"] {
+            assert!(
+                list.split(' ').any(|name| name == applet),
+                "{applet} is not a post-bootstrap applet, so the step or check could not run"
+            );
+        }
     }
 
     /// `find` and `xargs` left the image with the multicall, and this is the

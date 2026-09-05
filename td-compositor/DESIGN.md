@@ -4515,13 +4515,18 @@ expansion instead — every branch of `setaf`/`setab` is instantiated and driven
 through the model — because a redirected branch still emits a well-formed SGR,
 just for the wrong channel.
 
-The entry is not yet reachable at runtime. The child is given
-`TERMINFO=/etc/terminfo`, and the image does not expose the package's store
-`share/terminfo` there, so ncurses cannot look `td-term` up: every curses
-program still fails to start. Closing it requires an immutable-symlink category
-in the read-only-`/etc` invariant — today every `/etc` symlink must be a
-reviewed `MUTABLE_ETC` entry, and an immutable store path is not mutable state —
-which is a separate reviewed landing, not part of producing the entry.
+The entry is reachable at runtime. The child is given `TERMINFO=/etc/terminfo`,
+the image's immutable `/etc/terminfo` resolves to the package's store
+`share/terminfo`, and td-jail's terminal grant binds the one entry for the
+launcher's `TERM` read-only into a jail's own `/etc/terminfo`, where it requires
+the file at mode `0444` — the mode a bind reads from the store file itself. The
+build step's own mode does not reach the image: every tree the builder stages is
+copied writable by its owner, and a NAR restore writes `0644`, so the image's
+mode-fixing step sets `0444` on the packed entry and the root-tree check refuses
+an image whose entry is anything else, naming the launches it would refuse. The
+terminal applications' first boot is what found the requirement: both windows
+closed on td-jail's refusal of a `0644` entry, and nothing short of a booted
+jail runs that readback.
 
 What the entry omits is as deliberate as what it claims. `cols`/`lines` are
 absent because td-term sets and verifies the PTY winsize before the child

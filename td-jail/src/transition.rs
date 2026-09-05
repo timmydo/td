@@ -2932,11 +2932,30 @@ fn require_bound_zone(zone: &str) -> io::Result<()> {
 /// read-only nonempty regular file. More would be a database the application
 /// was not granted; less is a `TERM` it cannot look up.
 fn require_bound_terminfo(mountinfo: &str, name: &str) -> io::Result<()> {
+    let entry = require_bound_terminfo_at(authority::APPLICATION_TERMINFO_PATH, name)?;
+    require_mount(
+        mountinfo,
+        &entry,
+        None,
+        &["ro", "nosuid", "nodev", "noexec"],
+        &["rw"],
+    )
+}
+
+/// The readback's rules short of the mount table, over a database a test
+/// can build; the entry's path comes back for the mount check.
+///
+/// Split out for the reason `require_bound_zone_at` is: the shipped caller
+/// runs only inside a jail that has already pivoted, so nothing outside a
+/// booted image executes it. The mode rule here was first executed by the
+/// image's first boot with a terminal application, which refused every
+/// launch because the entry had been packed at `0644` — and only the boot
+/// could say so.
+fn require_bound_terminfo_at(database: &str, name: &str) -> io::Result<String> {
     let relative = authority::terminfo_entry_relative(name)?;
     let (letter, _) = relative
         .split_once('/')
         .ok_or_else(|| io::Error::other("terminal description path has no letter"))?;
-    let database = authority::APPLICATION_TERMINFO_PATH;
     let letter_directory = format!("{database}/{letter}");
     let entry = format!("{database}/{relative}");
     require_names(database, &[letter])?;
@@ -2950,13 +2969,7 @@ fn require_bound_terminfo(mountinfo: &str, name: &str) -> io::Result<()> {
             "selective /etc terminal description is not a nonempty regular file",
         ));
     }
-    require_mount(
-        mountinfo,
-        &entry,
-        None,
-        &["ro", "nosuid", "nodev", "noexec"],
-        &["rw"],
-    )
+    Ok(entry)
 }
 
 /// The readback's rules, over paths a test can build.
@@ -8411,6 +8424,97 @@ mod tests {
         let sibling_zone = sibling_runtime.join("real/zoneinfo/Etc/UTC");
         fs::hard_link(&sibling_zone, &localtime).unwrap();
         require_bound_zone_at(&localtime, &sibling_runtime, "Etc/UTC").unwrap();
+    }
+
+    /// The terminal readback answers "is this the one read-only description
+    /// for the launcher's TERM", and every way of getting that wrong — first
+    /// among them the way the first boot got it wrong: an entry at `0644`,
+    /// which is what the image's staging copy leaves and what td-jail refused
+    /// in every terminal window.
+    #[test]
+    fn the_bound_terminfo_entry_must_be_the_one_read_only_description() {
+        // The database's directories spend the test at 0555, and a
+        // failing assertion must not leave them that way: the guard puts
+        // the write bits back and removes the tree however the test ends.
+        struct Scratch {
+            directory: PathBuf,
+            locked: Vec<PathBuf>,
+        }
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                for path in &self.locked {
+                    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+                }
+                let _ = fs::remove_dir_all(&self.directory);
+            }
+        }
+        let set = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let directory = temporary_directory().unwrap();
+        let database = directory.join("terminfo");
+        let letter = database.join("t");
+        let entry = letter.join("td-term");
+        let _scratch = Scratch {
+            directory: directory.clone(),
+            locked: vec![database.clone(), letter.clone()],
+        };
+        fs::create_dir_all(&letter).unwrap();
+        fs::write(&entry, b"\x1e\x02td-term|td\0").unwrap();
+        set(&entry, 0o444);
+        set(&letter, 0o555);
+        set(&database, 0o555);
+        let db = database.to_str().unwrap();
+
+        assert_eq!(
+            require_bound_terminfo_at(db, "td-term").unwrap(),
+            entry.to_str().unwrap()
+        );
+
+        // The mode the image's staging copy left it at, refused in the words
+        // the first boot's windows showed.
+        set(&entry, 0o644);
+        let refusal = require_bound_terminfo_at(db, "td-term")
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.ends_with("mode is 0o644, expected 0o444"), "{refusal}");
+        set(&entry, 0o444);
+
+        // A name the database does not describe, and one outside the grammar.
+        assert!(require_bound_terminfo_at(db, "xterm").is_err());
+        assert!(require_bound_terminfo_at(db, "../etc").is_err());
+
+        // A second name beside the granted one, and a second letter: a
+        // database the application was not granted.
+        set(&letter, 0o755);
+        fs::write(letter.join("td-other"), b"\x1e\x02").unwrap();
+        set(&letter, 0o555);
+        assert!(require_bound_terminfo_at(db, "td-term").is_err());
+        set(&letter, 0o755);
+        fs::remove_file(letter.join("td-other")).unwrap();
+        set(&letter, 0o555);
+        set(&database, 0o755);
+        fs::create_dir(database.join("x")).unwrap();
+        set(&database, 0o555);
+        assert!(require_bound_terminfo_at(db, "td-term").is_err());
+        set(&database, 0o755);
+        fs::remove_dir(database.join("x")).unwrap();
+        set(&database, 0o555);
+
+        // A writable letter directory, then a writable database.
+        set(&letter, 0o755);
+        assert!(require_bound_terminfo_at(db, "td-term").is_err());
+        set(&letter, 0o555);
+        set(&database, 0o755);
+        assert!(require_bound_terminfo_at(db, "td-term").is_err());
+        set(&database, 0o555);
+
+        // An empty entry: read-only, at the right path, and describing
+        // nothing.
+        set(&entry, 0o644);
+        fs::write(&entry, b"").unwrap();
+        set(&entry, 0o444);
+        assert!(require_bound_terminfo_at(db, "td-term").is_err());
     }
 
     #[test]

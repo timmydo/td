@@ -2910,13 +2910,13 @@ the terminal boundary.
 **`devices=tty` — the fresh-terminal grant.** The containment bootstrap
 prevents accidental access; this grant defines deliberate acquisition, and
 what is acquired is a fresh terminal, never the operator's. Stage 1, which
-the bootstrap has already made the leader of a detached no-terminal
-session, requires its own stdin, stdout and stderr to be one open Unix98
+the bootstrap has already made the leader of a detached no-terminal session,
+requires its own stdin, stdout and stderr to be one open Unix98
 pseudo-terminal slave (major 136–143; a console or serial line is refused;
 and the same filesystem and inode, since two devpts instances can number a
 slave alike), asserts that it leads its session, issues exactly one
-`TIOCSCTTY` with argument 0 on stdin, and reads back from
-`/proc/self/stat` that its session and process group are unchanged and its
+`TIOCSCTTY` with argument 0 on stdin, and reads back from `/proc/self/stat`
+that its session and process group are unchanged and its
 controlling-terminal field decodes to that device. What the kernel enforces
 for the zero argument is exact: a terminal *some session owns* is refused,
 and stage 1 never steals. A shell's terminal is owned because td-term's
@@ -2924,45 +2924,51 @@ default child is `cttyhack`, which takes it; so `mail` typed at a td-term
 prompt fails with a diagnostic naming td-term's `--command`, the path that
 produces a session-less pty for exactly this purpose
 (`td-compositor/DESIGN.md` §12). "Never the operator's" therefore rests on
-that wrapper: a shell started with `--command /bin/sh` leads no session,
-its pty is unowned, and an application launched from it would acquire and
-share that terminal. The supervised-group path, which is no session leader,
-is refused the same way. It happens before registration, namespaces and
-the cgroup, so a refusal costs nothing to unwind, and the cgroup cleanup
-tree, which outlives the jail, gets no duplicate of the terminal. The
-terminal reaches stage 2 as its stdout, a clone of the stdin `TIOCSCTTY`
-acted on taken after the descriptor sweep so the sweep exempts nothing;
-stage 2, in the same session, proves before it mounts anything that this
-descriptor is the pseudo-terminal slave its own procfs field names, binds
-`/dev/tty` (5,0) read-only beside the five fixed nodes, and gives the entry
-three clones as stdin, stdout and stderr. Without the grant a launch's
-stage 2 proves the field is zero and its stdout is the null device, and
-`/dev/tty` is absent; the transition probe, which runs in its caller's
-session, asserts nothing about terminals. Stage 1, stage 2 and the entry
-share one process group, which is the terminal's foreground group by
-construction: `SIGWINCH` reaches the application, and a `^C` or hangup
-reaches stage 1 too, whose default disposition tears the jail down through
-the parent-death protocol, whatever the application's own handler did. A
-terminal application that handles `^C` itself must therefore disable `ISIG`,
-as every raw-mode program does; cooked-mode `SIGINT` handling waits on stage
-1 being able to ignore terminal signals, which needs a signal-disposition
-syscall this crate does not confine yet. `TIOCSPGRP` is not issued and job
-control inside the jail is not a goal. The launcher's `TERM` is forwarded
-under the closed grammar `[A-Za-z0-9._+-]{1,64}` beside
-`TERMINFO=/etc/terminfo`, and the one description the image's database holds
-for that name is bound read-only at `/etc/terminfo/<c>/<name>`, which stage
-2 proves is the database's only entry; an absent or ill-formed name, or one
-the database does not describe, refuses the launch. A spec that sets `TERM`
-or `TERMINFO` is refused by the compiler and again by the launcher, and the
-two derived entries sit outside the compiled spec's ceilings. Host mode has
-no database and refuses the grant. The seccomp filter is unchanged:
-`TIOCSTI` and `TIOCLINUX`, the requests that reach another terminal, stay
-denied. The tty-driver requests an application may issue on a terminal of
-its own — `TIOCSETD`, `TCSETS`, `TIOCSWINSZ` and the rest — were reachable
-before the grant through the `/dev/ptmx` every jail binds, so the grant
-adds a descriptor on td-term's pty and no new kernel surface. A terminal
-application still declares `sockets=wayland`, which the launch requires of
-every application and which it may leave unused.
+that wrapper: a shell started with `--command /bin/sh` leads no session, its
+pty is unowned, and an application launched from it would acquire and share
+that terminal. The supervised-group path, which is no session leader, is
+refused the same way. It happens before registration, namespaces and the
+cgroup, so a refusal costs nothing to unwind, and the cgroup cleanup tree,
+which outlives the jail, gets no duplicate of the terminal. The terminal
+reaches stage 2 as its stdout, a clone of the stdin `TIOCSCTTY` acted on
+taken after the descriptor sweep so the sweep exempts nothing; stage 2, in
+the same session, proves before it mounts anything that this descriptor is
+the pseudo-terminal slave its own procfs field names, binds `/dev/tty` (5,0)
+read-only beside the five fixed nodes, and gives the entry three clones as
+stdin, stdout and stderr. Without the grant a launch's stage 2 proves the
+field is zero and its stdout is the null device, and `/dev/tty` is absent;
+the transition probe, which runs in its caller's session, asserts nothing
+about terminals. Stage 1, stage 2 and the entry share one process group,
+which is the terminal's foreground group by construction: `SIGWINCH` reaches
+the application, and a `^C` or hangup reaches stage 1 too, whose default
+disposition tears the jail down through the parent-death protocol, whatever
+the application's own handler did. A terminal application that handles `^C`
+itself must therefore disable `ISIG`, as every raw-mode program does;
+cooked-mode `SIGINT` handling waits on stage 1 being able to ignore terminal
+signals, which needs a signal-disposition syscall this crate does not
+confine yet. `TIOCSPGRP` is not issued and job control inside the jail is
+not a goal. The launcher's `TERM` is forwarded under the closed grammar
+`[A-Za-z0-9._+-]{1,64}` beside `TERMINFO=/etc/terminfo`, and the one
+description the image's database holds for that name is bound read-only at
+`/etc/terminfo/<c>/<name>`, which stage 2 proves is the database's only
+entry and requires to be at mode `0444`. A bind shows the store file's own
+mode, and the image keeps the packed entry at that mode after its writable
+staging copy, because an entry left at `0644` refuses every terminal launch:
+that was the terminal applications' first boot. The rule is general: a store
+file the jail admits at a fixed mode is restored to that mode by the image's
+mode-fixing step, since the builder's staging copy and a NAR restore both
+leave it writable, and the root-tree check reads the mode back. An absent or
+ill-formed name, or one the database does not describe, refuses the launch.
+A spec that sets `TERM` or `TERMINFO` is refused by the compiler and again
+by the launcher, and the two derived entries sit outside the compiled spec's
+ceilings. Host mode has no database and refuses the grant. The seccomp
+filter is unchanged: `TIOCSTI` and `TIOCLINUX`, the requests that reach
+another terminal, stay denied. The tty-driver requests an application may
+issue on a terminal of its own — `TIOCSETD`, `TCSETS`, `TIOCSWINSZ` and the
+rest — were reachable before the grant through the `/dev/ptmx` every jail
+binds, so the grant adds a descriptor on td-term's pty and no new kernel
+surface. A terminal application still declares `sockets=wayland`, which the
+launch requires of every application and which it may leave unused.
 
 *A read-only bind is not recursive, and neither is a read-only remount.*
 Binding a granted directory `:ro` makes that mount read-only and says
