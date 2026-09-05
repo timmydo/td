@@ -56,6 +56,8 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock cap. A regex corpus contains patterns a backtracking
@@ -1035,35 +1037,126 @@ fn classify(key: String, outcome: &CaseOutcome, exp: &Expectations) -> Classifie
 /// Run every case, classifying each against `exp`. `skip` cases are not executed.
 /// Returns the classified outcomes and the overlay keys that matched no case
 /// (stale entries); a land-on-green caller reds on both.
+///
+/// The cases run across threads (`run_cases_concurrently`). The outcomes still
+/// read in corpus order, and a case that could not be run at all reds the whole
+/// run as it always did — after every other case has had its turn, rather than
+/// before the ones queued behind it.
 pub fn run_all_classified(
     bin: &Path,
     cases: &[Case],
     exp: &Expectations,
 ) -> Result<(Vec<ClassifiedOutcome>, Vec<String>), Box<dyn std::error::Error>> {
     let keys = case_keys(cases);
+    // One slot per case, in corpus order. A collision or a `skip` is settled
+    // here; everything else is queued with the slot its outcome will fill.
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut out: Vec<ClassifiedOutcome> = Vec::new();
+    let mut slots: Vec<Option<ClassifiedOutcome>> = Vec::new();
+    let mut queued: Vec<(usize, String, &Case)> = Vec::new();
     for (case, key) in cases.iter().zip(keys) {
         // `case_keys` occurrence-qualifies repeats, so a collision here means two
         // cases really do map to one key — one overlay entry would then stand in
         // for both. Red it unconditionally rather than let it hide.
         if !seen.insert(key.clone()) {
-            out.push(ClassifiedOutcome {
+            slots.push(Some(ClassifiedOutcome {
                 key,
                 disposition: Disposition::Fail,
                 detail: Some("two cases map to the same overlay key (collision)".into()),
-            });
+            }));
             continue;
         }
         if exp.is_skip(&key) {
-            out.push(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None });
+            slots.push(Some(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None }));
             continue;
         }
-        let outcome = run_case(bin, case)?;
-        out.push(classify(key, &outcome, exp));
+        queued.push((slots.len(), key, case));
+        slots.push(None);
+    }
+    let to_run: Vec<&Case> = queued.iter().map(|(_, _, case)| *case).collect();
+    let outcomes = run_cases_concurrently(bin, &to_run);
+    for ((slot, key, _), outcome) in queued.into_iter().zip(outcomes) {
+        let outcome = outcome.map_err(|e| format!("{key}: {e}"))?;
+        if let Some(entry) = slots.get_mut(slot) {
+            *entry = Some(classify(key, &outcome, exp));
+        }
+    }
+    let mut out: Vec<ClassifiedOutcome> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        // Fails closed: a slot nothing filled is a case the run never graded,
+        // not a case that passed.
+        out.push(slot.ok_or("a queued case was never given an outcome")?);
     }
     let stale: Vec<String> = exp.keys().filter(|k| !seen.contains(*k)).cloned().collect();
     Ok((out, stale))
+}
+
+/// How many cases run at once. `RUST_TEST_THREADS` serializes the harness
+/// itself when set (`--test-threads=1` alone does not export it), so it
+/// serializes this too: a developer under strace or a sanitizer who asked for
+/// one thread that way gets one. Otherwise every hardware thread the process
+/// may use, which on Linux is the cgroup quota and the affinity mask rather
+/// than the machine's count. Never more threads than cases, never fewer than
+/// one.
+fn corpus_width(cases: usize) -> usize {
+    let asked = std::env::var("RUST_TEST_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    asked
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .min(cases)
+        .max(1)
+}
+
+/// Run `cases` across `corpus_width` threads and hand back each outcome in
+/// the order its case was given. A case's error crosses the thread boundary
+/// as text, since `Box<dyn Error>` is not `Send`; its message survives, its
+/// `source()` chain does not, and nothing downcasts one.
+///
+/// Sound because `run_case` shares nothing between cases: a cleared
+/// environment, a throwaway workdir named by a process-wide counter, and a
+/// symlink to the binary rather than a copy, so no thread holds a write
+/// descriptor that a sibling's child could inherit into an ETXTBSY. Cargo
+/// already runs the other tests in this binary on threads beside this one, so
+/// the process was never single-threaded to begin with; this only stops the
+/// corpus itself from being the one serial test that bounds the suite.
+///
+/// That argument is about the harness, not the corpus. The corpus keeps to it
+/// because every absolute operand a case names is a stateless device node
+/// (`/dev/null`, `/dev/full`, `/dev/zero`), a per-process descriptor node
+/// (`/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/1`,
+/// `/proc/self/fd/0`), or a path that never exists, and every other operand
+/// is relative and materialized into the case's own `cwd`; a case that wrote
+/// to a shared absolute path would share it with whatever runs beside it.
+/// `RUST_TEST_THREADS=1` restores the serial run.
+fn run_cases_concurrently(bin: &Path, cases: &[&Case]) -> Vec<Result<CaseOutcome, String>> {
+    if cases.is_empty() {
+        return Vec::new();
+    }
+    let width = corpus_width(cases.len());
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<Result<CaseOutcome, String>>>> =
+        cases.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..width {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(case) = cases.get(i) else { break };
+                let outcome = run_case(bin, case).map_err(|e| e.to_string());
+                if let Some(slot) = slots.get(i) {
+                    *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|| Err("the case was never run".to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1287,5 +1380,75 @@ b
         assert!(contains(b"grep: invalid option", b"invalid option"));
         assert!(!contains(b"short", b"much longer needle"));
         assert!(contains(b"anything", b""));
+    }
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn case(name: &str, script: &str, stdout: &str) -> Case {
+        Case {
+            file: "runner.tests".to_string(),
+            name: name.to_string(),
+            argv: vec![b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
+            files: Vec::new(),
+            env: Vec::new(),
+            stdin: Vec::new(),
+            expect: Expect {
+                status: Some(0),
+                stdout: Some(stdout.as_bytes().to_vec()),
+                ..Expect::default()
+            },
+        }
+    }
+
+    /// Outcomes come back in corpus order however the threads finish: the
+    /// first case spins before it answers, so the ones after it are done
+    /// first.
+    #[test]
+    fn outcomes_land_in_corpus_order_whichever_finishes_first() {
+        let sh = Path::new("/bin/sh");
+        if !sh.exists() {
+            eprintln!("SKIP: no /bin/sh");
+            return;
+        }
+        let cases = vec![
+            case(
+                "slow",
+                "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; echo slow",
+                "slow\n",
+            ),
+            case("quick", "echo quick", "quick\n"),
+            case("last", "echo last", "last\n"),
+        ];
+        let (out, stale) =
+            run_all_classified(sh, &cases, &Expectations::default()).expect("the run");
+        let keys: Vec<&str> = out.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["runner.tests::slow", "runner.tests::quick", "runner.tests::last"]);
+        for o in &out {
+            assert_eq!(o.disposition, Disposition::Pass, "{}: {:?}", o.key, o.detail);
+        }
+        assert!(stale.is_empty());
+    }
+
+    /// A case that cannot be run at all fails the run, naming the case, rather
+    /// than standing as a slot nothing filled.
+    #[test]
+    fn a_case_that_cannot_run_fails_the_run_by_name() {
+        let cases = vec![
+            case("first", "echo first", "first\n"),
+            case("second", "echo second", "second\n"),
+        ];
+        let err = run_all_classified(
+            Path::new("/nonexistent/td-txt"),
+            &cases,
+            &Expectations::default(),
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(err.contains("runner.tests::first"), "{err:?}");
     }
 }

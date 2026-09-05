@@ -47,6 +47,8 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock cap. A bulk corpus contains cases that block forever
@@ -1304,6 +1306,11 @@ fn duplicate_conflicts(is_new: bool) -> bool {
 /// not executed. Returns the classified outcomes and the list of overlay keys
 /// that matched no case (stale entries — a typo, or a renamed/removed upstream
 /// case); a caller enforcing land-on-green must red the gate when it is non-empty.
+///
+/// The cases run across threads (`run_cases_concurrently`). The outcomes still
+/// read in corpus order, and a case that could not be run at all reds the whole
+/// run as it always did — after every other case has had its turn, rather than
+/// before the ones queued behind it.
 pub fn run_dir_classified(
     shell: &Path,
     helpers: &Path,
@@ -1311,33 +1318,156 @@ pub fn run_dir_classified(
     chain: &[&str],
     exp: &Expectations,
 ) -> Result<(Vec<ClassifiedOutcome>, Vec<String>), Box<dyn std::error::Error>> {
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut out: Vec<ClassifiedOutcome> = Vec::new();
+    // The whole corpus first: the cases have to outlive the threads that run
+    // them, and keying is a serial walk in any event.
+    let mut files: Vec<(String, Vec<SpecCase>)> = Vec::new();
     for path in &spec_paths(dir)? {
         let file = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
         let text = std::fs::read_to_string(path)?;
-        let cases = parse_spec(&text)?;
-        let keys = case_keys(&file, &cases);
+        files.push((file, parse_spec(&text)?));
+    }
+    // One slot per case, in corpus order. A collision or a `skip` is settled
+    // here; everything else is queued with the slot its outcome will fill.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut slots: Vec<Option<ClassifiedOutcome>> = Vec::new();
+    let mut queued: Vec<(usize, String, &SpecCase)> = Vec::new();
+    for (file, cases) in &files {
+        let keys = case_keys(file, cases);
         for (case, key) in cases.iter().zip(keys) {
             let is_new = seen.insert(key.clone());
             if duplicate_conflicts(is_new) {
-                out.push(ClassifiedOutcome {
+                slots.push(Some(ClassifiedOutcome {
                     key,
                     disposition: Disposition::Fail,
                     detail: Some("two cases map to the same overlay key (collision) — cannot disambiguate".into()),
-                });
+                }));
                 continue;
             }
             if exp.is_skip(&key) {
-                out.push(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None });
+                slots.push(Some(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None }));
                 continue;
             }
-            let outcome = run_case(shell, helpers, case, chain)?;
-            out.push(classify(key, &outcome, exp));
+            queued.push((slots.len(), key, case));
+            slots.push(None);
         }
+    }
+    // The case that sleeps for seconds is the long one — `\j for number of
+    // jobs` runs `sleep 5` against a few milliseconds for anything else — so
+    // whatever mentions `sleep` goes to the front of the queue, where it
+    // overlaps the rest instead of ending the run. A superset is fine for a
+    // hint: most matches sleep for milliseconds, and moving them earlier
+    // costs nothing. A stable partition, so corpus order still holds within
+    // each half, and every outcome lands in its own slot regardless.
+    queued.sort_by_key(|(_, _, case)| !case.code.contains("sleep"));
+    let cases: Vec<&SpecCase> = queued.iter().map(|(_, _, case)| *case).collect();
+    let outcomes = run_cases_concurrently(shell, helpers, chain, &cases);
+    // A case that could not be run is reported as the FIRST such in corpus
+    // order, not queue order: the queue was sorted for scheduling, and which
+    // error surfaces should not depend on that.
+    let mut failed: Option<(usize, String)> = None;
+    for ((slot, key, _), outcome) in queued.into_iter().zip(outcomes) {
+        match outcome {
+            Ok(outcome) => {
+                if let Some(entry) = slots.get_mut(slot) {
+                    *entry = Some(classify(key, &outcome, exp));
+                }
+            }
+            Err(e) => {
+                if failed.as_ref().is_none_or(|(at, _)| slot < *at) {
+                    failed = Some((slot, format!("{key}: {e}")));
+                }
+            }
+        }
+    }
+    if let Some((_, e)) = failed {
+        return Err(e.into());
+    }
+    let mut out: Vec<ClassifiedOutcome> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        // Fails closed: a slot nothing filled is a case the run never graded,
+        // not a case that passed.
+        out.push(slot.ok_or("a queued case was never given an outcome")?);
     }
     let stale: Vec<String> = exp.keys().filter(|k| !seen.contains(*k)).cloned().collect();
     Ok((out, stale))
+}
+
+/// How many cases run at once. `RUST_TEST_THREADS` serializes the harness
+/// itself when set (`--test-threads=1` alone does not export it), so it
+/// serializes this too: a developer under strace or a sanitizer who asked for
+/// one thread that way gets one. Otherwise every hardware thread the process
+/// may use, which on Linux is the cgroup quota and the affinity mask rather
+/// than the machine's count. Never more threads than cases, never fewer than
+/// one.
+fn corpus_width(cases: usize) -> usize {
+    let asked = std::env::var("RUST_TEST_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    asked
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .min(cases)
+        .max(1)
+}
+
+/// Run `cases` across `corpus_width` threads and hand back each outcome in
+/// the order its case was given. A case's error crosses the thread boundary
+/// as text, since `Box<dyn Error>` is not `Send`; its message survives, its
+/// `source()` chain does not, and nothing downcasts one.
+///
+/// Sound because `run_case` shares nothing between cases: a cleared
+/// environment, a throwaway workdir named by a process-wide counter, and
+/// symlinks rather than copies, so no thread holds a write descriptor that a
+/// sibling's child could inherit into an ETXTBSY. Cargo already runs the other
+/// tests in this binary on threads beside this one, so the process was never
+/// single-threaded to begin with; this only stops the corpus itself from being
+/// the one serial test that bounds the suite.
+///
+/// That argument is about the harness, not the corpus. A case that writes
+/// under an absolute path outside its workdir, or tests one's mode, shares it
+/// with whatever runs beside it. Sixteen cases do, all under `/tmp`, by the
+/// shapes `examples/gen_expectations.rs` calls `depends_on_shared_tmp`: seven
+/// in `builtin-cd`, six in `builtin-dirs` (three of them through
+/// `HOME=/tmp`), two in `builtin-type-bash`, and `builtin-bracket`'s
+/// sticky-bit test; every one is on the overlay's `skip` list today, and an
+/// entry promoted out of it needs that path looked at first. A bare `cd /tmp`
+/// needs only the directory to exist, and runs. And a case that orders two
+/// children by sleeps a few milliseconds apart is as load-sensitive here as
+/// it already was beside the other tests cargo runs. `RUST_TEST_THREADS=1`
+/// restores the serial run for either.
+fn run_cases_concurrently(
+    shell: &Path,
+    helpers: &Path,
+    chain: &[&str],
+    cases: &[&SpecCase],
+) -> Vec<Result<CaseOutcome, String>> {
+    if cases.is_empty() {
+        return Vec::new();
+    }
+    let width = corpus_width(cases.len());
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<Result<CaseOutcome, String>>>> =
+        cases.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..width {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(case) = cases.get(i) else { break };
+                let outcome = run_case(shell, helpers, case, chain).map_err(|e| e.to_string());
+                if let Some(slot) = slots.get(i) {
+                    *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|| Err("the case was never run".to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2097,5 +2227,39 @@ dash-says
         let (buf, overflowed) = rx.recv_timeout(Duration::from_secs(30)).expect("drain");
         assert_eq!(buf.len(), CAPTURE_CAP);
         assert!(!overflowed, "the cap itself was called an overflow");
+    }
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+
+    /// A case that cannot be run fails the run naming the FIRST such case in
+    /// corpus order, though the queue put the sleeping case ahead of it.
+    #[test]
+    fn the_first_unrunnable_case_in_corpus_order_is_the_one_named() {
+        // A workdir made the way the cases' are — created exclusively, mode
+        // 0700, retried on a collision, removed on drop — rather than a name
+        // under the temp dir opened however it is found: `CaseWorkdir` says
+        // why.
+        let work = CaseWorkdir::new().expect("workdir");
+        let dir = work.path().join("spec");
+        std::fs::create_dir(&dir).expect("scratch dir");
+        std::fs::write(
+            dir.join("order.test.sh"),
+            "#### plain\necho hi\n## status: 0\n\n#### sleeper\nsleep 0.01\n## status: 0\n",
+        )
+        .expect("spec");
+        let err = run_dir_classified(
+            Path::new("/nonexistent/td-sh"),
+            Path::new("/"),
+            &dir,
+            &["td-sh"],
+            &Expectations::default(),
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(err.contains("order.test.sh::plain"), "{err:?}");
     }
 }
