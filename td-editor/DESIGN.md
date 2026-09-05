@@ -11,8 +11,11 @@ the starting point for successive agents; the root `AGENTS.md` and
 
 This is the design foundation. No editor executable, Wayland compatibility,
 GPU acceleration, spelling engine, or jail integration is implemented by
-this document. Milestones below describe required behavior, not capabilities
-that already ship. User decisions still pending are collected at the end.
+this document. The rules below define version 1; milestones identify the
+order of implementation, not choices left to each implementing agent.
+The deliverable is a usable editor, reached through independently tested
+core, UI, and integration increments. The separate GPU prerequisite is
+described under Rendering and reuse.
 
 The implementation uses Rust and `std`, with no external Cargo dependencies,
 toolkit, libwayland, libxkbcommon, spell-check subprocess, language server,
@@ -53,14 +56,28 @@ the complete session. Explicit discard is the only ordinary close path that
 may abandon edits. If saving one tab fails while quitting, quitting stops;
 successfully saved tabs stay saved and remaining tabs stay open.
 
-The two key profiles are complete alternatives over the same commands, not
-two overlapping global maps. Windows-like bindings include Ctrl+N/O/S,
+Windows-like is the default. `--keys=windows|emacs` selects the profile at
+startup and Edit > Key Bindings changes it for the whole window, cancelling
+any pending prefix. The two profiles are complete alternatives over the same
+commands, not two overlapping global maps. Windows-like bindings include
+Ctrl+N/O/S,
 Ctrl+Shift+S, Ctrl+W, Ctrl+Tab, Ctrl+Z/Y, Ctrl+X/C/V, Ctrl+A/F/H, F3, and
 Shift+F3. Emacs bindings include C-x C-f, C-x C-s, C-x C-w, C-x k,
 C-x C-c, C-/, C-space, C-w, M-w, C-y, C-a/e/b/f/p/n, M-b/f,
 C-s/r, M-q, and M-x auto-fill-mode. Prefix state is explicit; C-g cancels
 prefixes, selections, searches, and dialogs without making an edit. The
-precise initial subset must be listed in the README when it exists.
+bindings above are required for version 1. F7 invokes Check Spelling in
+both profiles; Emacs additionally exposes `M-x ispell-buffer`. The M-x prompt
+accepts the named editor commands, with completion; it is not an interpreter
+or an Emacs Lisp interface. Ctrl+Shift+Tab selects the previous tab in both
+profiles. Common navigation keys and Shift-selection work in both profiles.
+
+Find and Replace use literal, case-sensitive UTF-8 strings, without regular
+expressions. Search reports reaching the end before an explicit next search
+wraps; Replace All is one undo transaction and skips overlapping matches.
+Go To Line uses one-based logical lines, independent of soft wrapping. The
+status row shows line, display column, line-ending mode, fill mode, key
+profile, and spelling status. A missing search match changes no selection.
 
 Text insertion follows keyboard layout translation before command dispatch.
 Physical evdev positions must not stand in for letters on arbitrary host
@@ -77,31 +94,72 @@ Tabs retain independent cursors, selections, scroll positions, and histories.
 Save acknowledgements carry the exact revision that was written; an edit
 made during a save must not be marked saved by its eventual completion.
 
-Begin with a bounded contiguous UTF-8 representation and measured limits.
-Keep byte offsets private and validate UTF-8 boundaries on every external
-position or range. Terminal cells are not document storage. Cursor motion,
-deletion, rendering, and hit testing must agree about the supported text
-units. If the first increment uses Unicode scalars, say so explicitly:
-grapheme clusters, combining marks, wide glyphs, bidirectional layout,
-shaping, and IME support are separate compatibility work, never silently
-claimed by the ability to store UTF-8.
+Version 1 stores text in a contiguous UTF-8 `String` and uses Unicode scalars
+as its editing units. Left/Right and Backspace/Delete move or remove one
+scalar; selections are half-open byte ranges whose endpoints must be scalar
+boundaries. Commands with an invalid boundary fail before changing state.
+Each non-tab, non-newline scalar occupies one 8x16 font cell. Tabs advance to
+the next eight-column stop; newlines advance the logical line. A combining
+mark gets its own cell, a missing or double-width glyph gets the visible
+replacement glyph, and all text is laid out left to right. Grapheme editing,
+bidi, shaping, wide cells, compose sequences and IME input are outside
+version 1. Bytes remain intact even when their visual presentation is limited.
 
-Loading must not replace invalid UTF-8 and later save the replacement over
-the original. Detect and preserve UTF-8 BOM and the supported LF/CRLF
-convention, including absence of a final newline. Mixed line endings require
-an explicit preservation or refusal policy before implementation. Reject
-binary or unsupported input with an actionable message. Open paths are OS
-strings; non-UTF-8 filenames must not become different paths through display
-conversion. `--` terminates options so filenames beginning with `-` work.
+Up/Down move between visual rows, preserving a desired display column clamped
+to the target row; a hit inside a tab chooses the nearest endpoint, with
+ties before it.
+Home/End address logical lines. Page movement uses the current viewport's
+visible rows. Soft wrap is on by default and wraps at the last fitting space
+or tab, or at a scalar boundary if there is none; it inserts no bytes. Layout
+produces the single position map used for drawing, selection and hit testing.
 
-Saving normally creates a unique same-directory temporary file with exclusive
+Files must be valid UTF-8, optionally starting with one UTF-8 BOM. Reject NUL,
+C0 controls other than Tab/LF/CR, DEL, and bare CR. Strip the initial BOM into
+a retained flag and normalize CRLF to LF in memory. Accept uniformly LF or
+CRLF files; reject mixed line endings without opening an editable tab. New
+files and files with no newline use LF. Save restores the original convention
+and BOM and adds no final newline. Paste normalizes CRLF to LF and rejects
+the same unsupported controls atomically; it cannot change the file's mode.
+Repeated initial BOMs are refused on load.
+An initial U+FEFF inserted through editing is refused, since it would become
+a BOM on reopen; interior U+FEFF remains ordinary text.
+
+Open paths are `OsString`/`PathBuf`; display escaping never changes a path.
+`--` terminates options. Opening an already associated file selects its tab
+using file device/inode identity. Only regular files are opened; devices,
+directories, sockets and FIFOs are refused. A missing file opens an empty dirty tab
+associated with that path; other initial open failures report nonzero status
+before the window is created. An interactive open failure keeps existing tabs.
+
+Saving creates a unique same-directory temporary file with exclusive
 creation, writes the complete snapshot, syncs it, atomically renames it over
 the intended destination, and syncs the parent directory. An unsuccessful
-write must not truncate the original. Define symlink, hard-link, permission,
-ownership, extended-attribute, and concurrent external-edit behavior before
-shipping Save; metadata that cannot be preserved must not disappear without
-an explicit decision. A check followed by rename is not compare-and-swap:
-do not claim it excludes a writer racing between those operations.
+write must not truncate the original. New files start mode 0600. Existing
+destinations must be regular files with one hard link, no setuid/setgid bits,
+and no extended attributes (including extended ACLs). Preserve their owner,
+group and permission bits; refuse replacement if the temporary inode cannot
+match them. Refuse symlink destinations and offer Save As; reject symlinks
+when opening too, so association and later saving use the same rule.
+Extended-attribute inspection belongs in the future audited file adapter;
+safe `std` alone does not expose it, and Save must not silently skip this
+check. An unsupported attribute query refuses replacement. Save As to a new
+path remains available for files whose metadata is outside this profile.
+
+Before replacing an existing destination, reread and compare its device/inode,
+owner/group, mode, link count, length, mtime/ctime and complete bytes against
+the last load/save baseline; atime is excluded because reads may change it. A mismatch
+opens a conflict prompt with Reload / Save As / Cancel; Reload requires
+explicit discard of dirty text. There is no force-overwrite command in
+version 1. Save As refuses an existing destination. Publishing a previously
+absent path uses a same-filesystem hard link from the complete temporary
+inode and then removes the temporary name, so a concurrently created file
+is never overwritten. Both paths sync the parent after publication.
+
+The existing-file check followed by rename is not compare-and-swap and
+cannot exclude a writer racing between those operations. The file adapter
+assumes the destination directory is not being maliciously replaced by
+another process with the user's authority. Jail filesystem grants remain
+the access-control boundary; editor path checks do not create a second jail.
 
 The save adapter distinguishes failure before replacement from failure to
 confirm durability after replacement. Both keep recoverable editor state;
@@ -109,42 +167,120 @@ the latter reports that the destination may already contain the new bytes.
 Read-only directories and file-only jail grants can prevent atomic save even
 when the file itself is writable. Do not silently fall back to truncation.
 
-Admission limits cover bytes per document, total document bytes, tab count,
-undo bytes, clipboard bytes, dictionary bytes, outstanding I/O, control
-requests, and frame storage. Each refusal leaves state consistent. Avoid
-whole-document copies on every keystroke; undo stores bounded edit deltas.
-Expensive spelling and I/O work returns results tagged with tab and revision
-so stale results cannot modify the wrong buffer.
+Version 1 resource ceilings are part of the API:
 
-## Paragraph filling and spelling
+| Resource | Limit and overflow behavior |
+| --- | --- |
+| Documents | 64 tabs, 16 MiB encoded bytes per file, 64 MiB total live UTF-8 text; refuse the whole open/edit exceeding a limit. |
+| Undo/redo | 64 MiB of edit payloads and 4,096 transactions per window; evict oldest complete transactions and any redo states depending on them, never a partial transaction. |
+| File I/O | One worker, one in-flight job and eight queued job descriptors; reject additional jobs. Capture one immutable 16 MiB snapshot when a job starts, plus one 16 MiB encoded output at a time. |
+| Saved baselines | At most 64 MiB encoded file bytes across tabs, charged separately from live text; refuse an open/save needing more. |
+| Clipboard | 1 MiB per transfer; reject an oversized paste atomically. |
+| Dictionary | 16 MiB input, 250,000 distinct entries, 64 ASCII letters/apostrophes per entry; reject an oversized or malformed load. |
+| Spelling results | 10,000 stored ranges; finish scanning, count additional unknown words, and report that only the first 10,000 are marked. |
+| Frames | 8,192 pixels per axis, 32 MiB per XRGB buffer, three live buffers; defer redraw/resize until a buffer can be retired. |
+| Wayland input | 4 MiB keymap, 256 KiB buffered wire bytes, eight pending descriptors; exceeding a bound closes the display connection with an error. |
+| Control | One active connection, 16 queued commands, 1 MiB request/response frame, 256 KiB raw text per response page, five-second whole-request deadline. |
 
-Soft wrapping is display-only. Auto Fill and Fill Paragraph insert real line
-breaks and are independently selectable. A fill column is measured in the
-same display columns used by layout, with a documented tab width. An
-overlong word stays intact. Reflow is one undoable edit and does not consume
-blank lines separating paragraphs. Cursor and selection mapping must be
-defined and tested for the replaced range.
+Undo stores edit deltas and cursor/selection before and after the transaction.
+Each typed scalar, paste, replacement, fill, or delete command is one
+transaction; typing coalescing is outside version 1. Content-state IDs are
+retained by undo/redo so undoing to a saved state clears dirty status. A
+new edit clears that tab's redo branch. Evicted history cannot be recovered,
+but eviction never changes live text or the saved-state ID. A
+separate monotonically increasing revision changes on every text transition,
+including undo/redo, and rejects stale asynchronous/control results. IDs are
+checked `u64` counters; exhaustion refuses the operation. Save completion
+records the content-state ID of its snapshot, not the then-current state.
 
-The first prose profile treats blank lines as paragraph boundaries and
-retains consistent paragraph indentation. Auto Fill runs on a typed word
-separator when the current line exceeds the fill column; it does not rewrite
-an entire pasted file. Fill Paragraph explicitly reflows the paragraph at
-the caret. Quoted mail, list prefixes, source-code comments, Markdown fences,
-and language-aware paragraph rules require named extensions and tests.
+## Paragraph filling
 
-Flyspell-like behavior means marking unknown words during editing, offering
-bounded local suggestions, replacing a chosen word as one undoable command,
-and supporting ignore-for-session and an explicit personal dictionary.
-Absence of a dictionary disables checking with a visible status; it must not
-mark every word wrong. No document text is sent off-machine.
+Auto Fill and Fill Paragraph insert real line breaks; soft wrapping only
+changes display. Auto Fill is off by default, per document. The fill column
+defaults to 72 and accepts integers from 20 through 240. Columns follow the
+scalar-cell and eight-column tab rules above. An overlong word stays intact.
 
-A newline-delimited local UTF-8 word list is the proposed first dictionary
-format. Case folding, apostrophes, hyphens, token boundaries, normalization,
-and language coverage need an exact first profile. Dictionary membership is
-not a claim of full Hunspell morphology or Emacs package compatibility.
-Incremental checking prioritizes changed and visible text, with bounded work
-per event-loop turn. Results carry the document revision and dictionary
-generation. Suggestions have candidate and distance budgets.
+A paragraph is the maximal run of nonblank logical lines with exactly the
+same leading space/tab byte prefix. A blank line contains only spaces/tabs.
+The caret selects its current logical line; on a blank line Fill Paragraph
+does nothing. Version 1 has no special mail quote, list, source comment or
+Markdown syntax: their non-whitespace prefix characters are ordinary words.
+Auto Fill remains off unless explicitly enabled, including for `.eml` files.
+
+Fill removes the shared indentation for word splitting, treats runs of ASCII
+space/tab/newline as separators, and joins words with one ASCII space. It
+greedily places each whole word on the current line if its ending column is
+at most the fill column; otherwise it starts a line with the original
+indentation. The first word always fits by itself, even when it exceeds the
+column. Trailing horizontal whitespace is removed; the paragraph's final
+newline and surrounding blank lines are preserved exactly. A selection does
+not change which paragraph is filled. Repeating Fill is byte-idempotent.
+
+Reflow records the original-to-new offset of each preserved word scalar.
+Cursor and both selection endpoints inside words follow those scalars;
+endpoints in collapsed separators go before the next word, or after the last
+word when there is no next word. Endpoints in indentation clamp to the same
+indent column on the first output line. Endpoints outside the replacement
+shift by its byte-length delta. Filling is one undo transaction restoring
+the exact original bytes and selection; a no-op creates no history entry.
+
+Auto Fill runs only after a typed ASCII space or Tab, never after paste,
+remote text insertion, file loading, or an automatic replacement. If the
+caret's current line exceeds the fill column, greedily wrap that line using
+the same indentation and word-width rules. Retain its trailing typed
+separator so typing the next word remains separated. Do not pull text from
+the next logical line. The inserted separator and any resulting wrap form
+one transaction. A limit failure refuses that entire typing transaction.
+
+## On-demand spelling
+
+Check Spelling scans the entire active document only when explicitly invoked
+from Format > Check Spelling, F7, `M-x ispell-buffer`, or the control API.
+There is no spelling mode, idle timer, check-on-save, or checking while the
+user types. Unknown words receive an underline and appear in a navigable
+results list after the scan completes. Next/Previous Misspelling select the
+corresponding range; correction is ordinary text editing. Automatic
+suggestions and replacement dictionaries are outside version 1.
+
+The scan uses the current tab/revision and dictionary generation and runs in
+chunks of at most 4,096 scalars per event-loop turn. Results publish together
+at completion, never partially while scanning. A text edit cancels an active
+scan, removes that tab's existing marks, and sets Spelling: not checked.
+Cursor motion, scrolling, switching tabs and saving do not invalidate marks.
+Undo is a text edit for this purpose. Changing the dictionary cancels scans
+and clears marks in all tabs. Starting a second check cancels the old scan;
+Escape/C-g cancels a scan and leaves the document unchanged. At most one scan
+is active per window; checking holds no second full-document copy.
+
+Version 1 uses an explicitly selected local English word list supplied by
+`--dictionary PATH` or Format > Dictionary. No word list is bundled,
+downloaded, or found by probing host directories. No dictionary means
+Spelling: no dictionary, and Check Spelling reports that status without
+marking words. A malformed replacement dictionary leaves the previous one
+selected. No document text leaves the machine.
+
+The dictionary is UTF-8 with optional initial BOM, LF or CRLF records, and
+an optional final newline. Blank records are ignored. Each nonblank record
+must contain ASCII letters and may contain ASCII apostrophes only between
+letters; surrounding whitespace and other bytes are errors. Entries are
+folded to ASCII lowercase, deduplicated and held in a sorted vector. An empty
+dictionary is refused. Matching
+uses binary search. There is no stemming, affix expansion, Unicode
+normalization or Hunspell compatibility claim.
+
+Document tokens are maximal runs of Unicode alphanumeric scalars, allowing
+ASCII apostrophe or U+2019 between letters. Hyphens and underscores separate
+tokens. Only tokens entirely composed of ASCII letters and those internal
+apostrophes are checked; normalize U+2019 to ASCII apostrophe and lowercase
+ASCII before lookup. Tokens containing digits, non-ASCII letters, or more
+than 64 scalars are counted as skipped and never marked wrong. Other marks
+and punctuation delimit tokens. This is an English ASCII spelling profile,
+not a language detector. The result reports checked, unknown and skipped
+counts, its revision, and whether the stored-mark ceiling was reached.
+
+There is no writable personal dictionary in version 1. Users edit their
+chosen word-list file with the editor and explicitly reload it through the
+Dictionary command. Spelling results never change document bytes or history.
 
 ## Rendering and reuse
 
@@ -156,21 +292,85 @@ assume a render node or a GPU API. A host compositor may accelerate its own
 composition of an editor's shared-memory buffer without accelerating the
 editor's rasterization.
 
-The proposed first backend is persistent `wl_shm` buffers. Separate layout,
-bitmap drawing, buffer submission, and completion so a future backend can
-consume the same scene. Do not introduce a speculative general graphics
-framework. A submitted buffer is immutable until `wl_buffer.release`;
+The mandatory reference backend rasterizes Unifont into persistent `wl_shm`
+buffers. It is the deterministic test backend and the fallback on machines
+without usable GPU access; it does not satisfy the GPU-acceleration objective
+by itself. Layout emits clipped solid rectangles and bitmap-glyph draws with
+integer coordinates, foreground/background colors and scale 1, 2, 3 or 4.
+Font scale defaults to 1 and is user-selectable. Each backend consumes those
+same operations. No font discovery, antialiasing or fractional scaling is
+part of version 1. A frame uses one scale throughout.
+
+Draw only the visible viewport and damaged chrome; clip every operation to
+the current surface. Coalesce redraws behind one outstanding frame callback.
+A submitted buffer is immutable until `wl_buffer.release`;
 `wl_callback.done` throttles frames and is not permission to reuse a buffer.
-Resizes retain old busy buffers within an explicit budget. Damage, clipping,
-and deterministic integer scaling belong in the renderer contract.
+On resize, retain old busy buffers within the three-buffer budget and render
+only the latest configured size when a slot becomes free. Initial client
+size is 800x600 pixels. A zero configure dimension retains that axis's
+current size; a dimension outside the resource ceilings closes the connection
+with a diagnostic. Rendering failures must not mark any document saved.
+
+### GPU access and the Firefox prerequisite
+
+GPU access is implementable in td-jail. The intended grant is `devices=dri`
+with a selected `/dev/dri/renderD*` device, in addition to `sockets=wayland`.
+Render nodes allow rendering without DRM master or modesetting authority;
+the grant must not expose `/dev/dri/card*`, framebuffer or input devices.
+The current refusal is policy/implementation state, not a Linux or Wayland
+restriction. See the [kernel render-node contract](https://www.kernel.org/doc/html/latest/gpu/drm-uapi.html#render-nodes).
+
+`APPLICATIONS.md` section M remains the normative owner of this system work.
+The required increments for Firefox are:
+
+1. Add an explicit render-node grant to permission validation, launch plans,
+   device verification and mounts. Expose only the selected character device
+   and its necessary read-only sysfs discovery paths. Verify host access
+   permissions before launch; no grant exposes no GPU device. Existing
+   seccomp policy admits rendering ioctls, but device access still adds the
+   GPU driver to the application's reachable kernel surface.
+2. Supply and verify the matching GPU userspace driver in Firefox's marked
+   application runtime. Make the compiled Freedesktop 25.08 policy stop
+   forcing `LIBGL_ALWAYS_SOFTWARE=1` for the GPU profile; retain the tested
+   software profile. A QEMU GPU test also needs a 3D-capable virtual device
+   and host rendering path; the current fbdev configuration is insufficient.
+   [Mesa's VirGL design](https://docs.mesa3d.org/drivers/virgl.html) describes
+   the guest-driver/host-renderer split.
+3. Implement and test compositor DMA-BUF import, supported formats/modifiers,
+   synchronization and buffer leases. It must handle normal overlapping
+   windows as well as fullscreen. Section M requires a reliable CPU-mappable
+   composition path before advertising DMA-BUF; direct scanout alone cannot
+   satisfy that contract. DRM/KMS output, direct scanout, client GPU drawing
+   and compositor GPU drawing are separate capabilities.
+4. Prove the pinned Firefox runs with hardware WebRender on the granted GPU,
+   presents correct frames during overlap and resize, releases buffers, and
+   retains its sandbox. Check `about:support` for actual backend/adapter;
+   a visible window or a GPU-process name is insufficient. Test denied-device
+   and software-profile paths separately. Hardware video decoding is a
+   separate capability and is not implied by this rendering test.
+
+Current upstream Firefox's native Wayland compositor uses GBM/DMA-BUF and
+checks the DMA-BUF and viewporter capabilities; the pinned td runtime must be
+tested in its own right. See [Firefox's platform implementation](https://searchfox.org/firefox-main/source/gfx/thebes/gfxPlatformGtk.cpp).
+
+This path can accelerate Firefox through its foreign runtime's driver stack.
+It does not give dependency-free td-editor an OpenGL/Vulkan implementation:
+a render node is a driver interface, not a portable bitmap-drawing API.
+td-editor must not link or load the foreign runtime's Mesa, which would also
+cross td's source-built/foreign-payload boundary. Its GPU producer requires
+a separately specified source-built graphics implementation consistent with
+the zero-dependency requirement. No general GPU driver or new library is
+authorized by this document. Until that system design exists, only the
+reference renderer is implementable here and GPU editor rendering remains
+an explicit unmet objective, not a silently dropped requirement.
 
 Relevant code in `td-compositor/src`:
 
 | File | Reuse decision |
 | --- | --- |
 | `font.rs`, `font_data.rs` | Reuse the checked PSF2 decoder and pinned Unifont face; carry font provenance and license into standalone packaging. |
-| `wire.rs` | Candidate shared Wayland framing codec, with existing malformed-input tests. |
-| `conn.rs` | Reuse object allocation, framing and descriptor-lifetime lessons; remove terminal and exact-keymap coupling before sharing. |
+| `wire.rs` | Reuse the existing framing codec as shared source, including its malformed-input tests. |
+| `conn.rs` | Reference for object allocation and descriptor lifetime; keep the editor connection adapter separate because this module imports terminal rendering and td's exact keymap. |
 | `term_client.rs` | Reference for configure/ack, release, resize, clipboard and focus lifecycle; do not fork the terminal loop into the editor. |
 | `render.rs` | Reuse bounded glyph drawing and pixel-oracle approach, not terminal `Snapshot`/SGR data structures. |
 | `socket.rs` | Reference for explicit socket lifecycle and refusal of live endpoints; editor control must enforce its own path ownership. |
@@ -178,21 +378,27 @@ Relevant code in `td-compositor/src`:
 | `buffer.rs` | Compositor surface-storage and accounting design reference, not an editable text buffer. |
 | `ui.rs` | Reference for pure rendering and input models, not a toolkit or the editor's state model. |
 
-Prefer a small deliberate shared source boundary over copying large modules
-or pulling the compositor binary into the editor. Any shared-file move is an
-atomic migration that updates source staging, affected-check mappings, tests,
-and every consumer in the same increment. The standalone package must build
-from its documented source bundle without an installed td system.
+Version 1 shares `font.rs`, `font_data.rs` and `wire.rs` through explicit
+source-module paths, as td-portal already does. It neither copies those
+modules nor depends on the compositor binary. The source bundle is the td git
+checkout; `cargo build --manifest-path td-editor/Cargo.toml` will build the
+standalone binary without an installed td system. The target recipe must
+stage those exact shared sources and licenses, and shared-source changes
+must select editor tests in affected-checks. A future move of a shared file
+updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
 
 Use core `wl_compositor`, `wl_shm`, `wl_seat`, and `xdg_wm_base`; clipboard
-uses core `wl_data_device_manager` when available. Bind advertised versions
-within implemented bounds and allocate object IDs densely. Missing optional
-globals disable their feature. Missing required globals produce a named
+uses core `wl_data_device_manager` version 3 when available. Bind
+`wl_compositor` at version 4, `wl_shm` at 1, `xdg_wm_base` at 1, and
+`wl_seat` at the highest available version from 5 through 7. Lower required
+versions are refused; higher advertised versions are capped. Allocate
+object IDs densely. Missing optional globals disable their feature.
+Missing required globals produce a named
 error. Bound all wire messages and received descriptor queues; clean up
 descriptors on parse errors and disconnects. Answer shell pings while I/O or
-spelling is in progress. A configure with zero dimensions uses a safe default.
+spelling is in progress. Configure dimensions follow the rendering rules above.
 
 Resolve normal Wayland environment conventions, including an absolute or
 relative `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and inherited `WAYLAND_SOCKET`.
@@ -200,14 +406,39 @@ Descriptor adoption for the latter must be included in the audited boundary.
 No compositor-private global, readiness socket, `/dev/input`, `/dev/fb0`, td
 account database, fixed UID, or td-specific environment variable is required.
 
-The terminal currently validates its received keymap against the exact
-`keyboard::XKB_KEYMAP` bytes and refuses other compositors. That cannot be
-the editor's portability claim. Before the portable UI milestone, implement
-a bounded, explicitly documented subset of compositor-supplied XKB text maps
-with real host fixtures, or obtain approval for a different dependency
-policy. Unsupported map constructs must produce a clear diagnostic, never
-silently translate a non-US map as US. Broad keyboard-layout and IME support
-is substantial work under the zero-dependency constraint.
+Version 1 supports the US English keyboard layout, including Shift, Caps
+Lock, Control and Alt, under td-compositor and an independent compositor
+configured with its ordinary US keymap. It accepts the supplied self-contained
+XKB text-v1 map by meaning, not equality to `keyboard::XKB_KEYMAP` bytes.
+The bounded parser reads keycodes, modifier assignments, key symbols and
+table-driven XKB types: their modifier mask, level maps and preserve masks.
+It resolves virtual modifiers, including NumLock, to real masks from the
+supplied map; it does not whitelist type names or assume fixed modifier bit
+positions. This covers the ordinary US map's alphabetic, keypad and function
+key types, including Ctrl+Alt function-key levels. Unhandled keysyms at those
+levels are ignored rather than interpreted as text or system commands.
+The compositor's modifiers event is authoritative for depressed, latched
+and locked state; the client never executes XKB actions such as VT switching.
+
+Additional declarations for unused keys/types are parsed and ignored.
+Unsupported symbol-selection semantics on a used key, redirect actions,
+or additional layout groups refuse keyboard activation with the exact item
+named. Includes are refused: no keymap file is loaded from the host. The
+whole map is validated before accepting text input. A later unsupported map
+cancels repeat and disables keyboard input while retaining documents and
+pointer/menu access. Limit the parser to 200,000 tokens, nesting depth 32,
+768 keycodes, 256 types and 16 levels per key/type; overflows refuse the map.
+
+The initial translated set is ASCII printable text, Tab/Enter, navigation
+and editing keys, F1-F12 and the profile's shortcut keys. Caps affects letters;
+Num Lock selects digits versus navigation on the keypad. Non-US layouts,
+AltGr levels, dead keys and compose/IME input are outside version 1 and are
+diagnosed, never substituted with US physical-key translation. UTF-8 outside
+ASCII remains editable through files, clipboard and semantic Insert commands.
+The required independent-compositor fixture is Weston with its default US
+map; a serialized fixture and live input/pixel test must both pass before
+claiming host compatibility. Weston is a test environment, not a runtime or
+target build dependency.
 
 ## `$EDITOR`, tmc, and td-jail
 
@@ -225,6 +456,11 @@ and Wayland connection environment. It never escapes a jail to find a host
 editor or file. `sockets=wayland` grants the display connection only: it does
 not install the executable, provide its runtime closure, grant file access,
 share a control socket, or enable GPU devices.
+
+td-editor is a general text editor. Version 1 neither submits mail nor
+interprets MML, starts a mail transport, or manages attachment lifetimes.
+Those are outside this editor increment. Save As is the explicit way to
+retain draft text before the caller removes its temporary file.
 
 The caller inspected for this design is `~/src/tmc`. Its `src/tui/mod.rs`
 selects `[ui].editor`, then `$EDITOR`, then `vi`; `spawn_editor` starts
@@ -253,9 +489,10 @@ do not work around it by evaluating shell text inside the editor. The editor
 must avoid consuming the TUI's inherited terminal input.
 
 An integration increment must make the executable and exact runtime closure
-available inside the jail in which tmc runs, set its explicit `EDITOR` environment,
-and provide the intended file/directory grants. `APPLICATIONS.md` section X.4
-currently says source-built td store closures are absent from the jail, so
+available inside the jail in which tmc runs, set its explicit `EDITOR`
+environment, and provide the intended file/directory grants.
+`APPLICATIONS.md` section X.4 currently says source-built td store closures
+are absent from the jail, so
 this requires an actual packaging/layout decision; a host `/bin/td-editor`
 path is insufficient. Keep source-built editor artifacts distinct from
 marked foreign application payloads.
@@ -289,23 +526,66 @@ and exact round trips, wire fixtures for fragmented messages and descriptor
 ownership, and deterministic pixel fixtures for selection, tabs, wrapping,
 spelling underlines, dialogs, and extreme resize/clipping.
 
-Remote control is an explicit opt-in local Unix socket with a versioned,
-bounded protocol. It is off by default, under a verified private directory,
-with mode 0600, no TCP listener and no compositor control dependency. Socket
-creation must refuse unrelated files and live endpoints. A client has a
-whole-request deadline and bounded response size; a slow client must not
-stall the UI. Commands use stable tab IDs and expected revisions to reject
-stale destructive edits. Text and filenames need an unambiguous length or
-escape encoding, including embedded newlines. Responses distinguish command
-completion from the frame that later presents it; a frame-wait operation is
-needed for screenshot and integration oracles.
+`--control-socket PATH` enables remote control. It is off by default, binds
+a local Unix socket with mode 0600 under a caller-owned mode-0700 directory,
+and has no TCP listener or compositor control dependency. Refuse symlinked
+socket parents and any existing endpoint, including stale sockets; the caller
+removes stale endpoints explicitly. Cleanup removes only the socket inode
+this invocation created. A control worker handles framing and deadlines,
+sending bounded typed messages to the UI thread; socket reads and writes
+never hold the model lock or stop Wayland dispatch.
+
+Each connection carries one request and one response, then closes. A frame
+starts with a four-byte big-endian payload length, followed by exactly that
+many bytes, within the one-MiB ceiling. The payload is an ASCII record with
+tab-separated fields and no terminating newline. Its first fields are
+protocol version `1`, caller-supplied decimal request ID, and command name.
+Integers are unsigned decimal with checked conversion. Text and OS path
+arguments are lowercase hex-encoded bytes; `-` denotes an empty byte string.
+Text arguments must decode to valid UTF-8. Reject missing/extra fields,
+unknown commands/versions, bad hex, overflow and truncated frames before
+dispatch. A response echoes version/request ID, then `ok`, `error`, or
+`pending`; errors carry a stable code and hex-encoded diagnostic.
+
+Version 1 exposes `state`, `text`, `new`, `open`, `select-tab`, `select-range`,
+`insert`, `delete`, `undo`, `redo`, `find`, `replace`, `fill-paragraph`,
+`set-auto-fill`, `set-fill-column`, `set-key-profile`, `check-spelling`,
+`spelling-results`, `save`, `save-as`, `close-tab`, `quit`, `dialog-answer`,
+`key`, `pointer`, and `wait-frame`. Text mutations and close requests name a
+stable tab ID and expected revision. Stale commands return `stale-revision`
+without side effects. `state` reports the active tab, all tab IDs/revisions,
+dirty flags, cursors/selections, modes, current dialog, spelling job/status,
+and submitted/callback-completed frame generations. `text` takes tab ID,
+revision, byte offset and byte limit; it returns a scalar-aligned page and
+the next byte offset. Spelling result pages likewise pin the scan revision.
+
+Save and spelling return a job ID with `pending` when work is queued;
+`state` supplies completion/error. A queued save pins its expected revision;
+if it differs when the worker is ready, the job fails stale instead of
+saving unrequested later edits. One save per tab may be queued/in flight.
+File prompts return a dialog ID and its allowed answers; `dialog-answer`
+must name that live ID and revision, so a
+late reply cannot discard a different tab. `key` and `pointer` use the same
+decoded events as the physical adapters; replay tests also supply explicit
+clock advances. A synthetic Save or close takes the same prompt/error path.
+The implementation's protocol reference lists field order for every command
+and response alongside conformance fixtures; it cannot invent additional
+authority or a second mutation path.
+
+Every accepted UI-visible change advances a window generation. `wait-frame N`
+waits for a committed buffer tagged with generation at least N to receive
+its frame callback and reports the actual generation and document revision
+rendered. It times out after the whole-request deadline. This acknowledges
+compositor processing, not physical scanout; screenshots and image tests
+must separately observe the presented pixels. Buffer reuse still waits for
+release, independently of a frame-wait response.
 
 The control endpoint grants read/write access to all this editor's documents
 within its existing authority. It cannot bypass dirty-close confirmation or
-file conflict policy by accident; any explicit discard/overwrite command is
-named and tested. Do not expose arbitrary shell execution. Sharing control
-across the jail boundary is a separate explicit grant, not an implication of
-`sockets=wayland`.
+file conflict policy: discard requires the live close/reload dialog answer,
+and force overwrite is absent. Do not expose arbitrary shell execution.
+Sharing control across the jail boundary is a separate explicit grant, not
+an implication of `sockets=wayland`.
 
 Host protocol proof must include td-compositor and at least one independent
 Wayland compositor with its real keymap. Distinguish headless model tests,
@@ -316,28 +596,24 @@ td-builder's automatic cargo test/clippy gate and commits its one-package
 
 ## Independently landable increments
 
-1. Design and a tested safe editor core: text transactions, tabs, undo/redo,
-   key profiles, paragraph filling, dictionary profile, and headless command
-   replay. Record exact limits and implemented commands in the README.
-2. First usable Wayland window: shared transport decisions and audited
-   descriptor surface, bitmap rendering, input, open/save, prompts and
-   clipboard; deterministic protocol and pixel proof. Portable keyboard
-   support is an explicit acceptance condition, not a later hidden fix.
-3. Interactive spelling and complete local control: responsive incremental
-   checks, suggestions, personal dictionary, semantic queries and frame
+1. Tested safe editor core: the specified scalar transactions, tabs,
+   undo/redo, both key profiles, paragraph filling and headless command
+   replay, with the exact limits above.
+2. First usable Wayland window: shared codecs and audited descriptor/file
+   adapter, reference bitmap rendering, US keyboard input, open/save, prompts
+   and clipboard; deterministic protocol/pixel proof and the Weston US test.
+3. On-demand whole-document spelling and complete local control: explicit
+   scans, result marking/invalidation, paged semantic queries and frame
    synchronization. Exercise the production dispatcher through both inputs.
 4. Source-built recipe and tmc jail integration: staged shared sources and
    data licenses, runtime closure, file grants, `$EDITOR`, debug companions,
    and a test of the actual caller's child lifetime and draft cleanup.
-5. Further portability and graphics: more layouts, grapheme/IME work and
-   hardware rendering only alongside the required graphics/jail contracts.
+5. GPU editor rendering after the separately specified graphics producer and
+   jail/compositor prerequisites. Validate both reference and GPU backends
+   against the same scene operations and image oracles. A software-only
+   milestone does not complete this objective.
 
-## Decisions awaiting the user
-
-- First requested deliverable: design only, tested core, or a usable UI.
-- Whether software bitmap rendering is acceptable for the first version.
-- Default key profile; both Windows-like and Emacs remain requirements.
-- Initial dictionary/language profile and local word-list acceptance.
-- Whether this project includes mail draft retention/submission or stays a
-  general editor; tmc's source is located, but its td jail package is not yet
-  present in this checkout.
+More keyboard layouts, grapheme/IME editing, language-aware filling,
+multilingual spelling and mail submission are outside version 1. They need
+new concrete contracts when requested; implementing agents do not expand
+the initial profile implicitly.
