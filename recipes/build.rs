@@ -10,12 +10,24 @@
 //!
 //! Deterministic by construction: the registry is sorted by stem, never
 //! `read_dir` order. Pure `std` — the crate stays dependency-free.
+//!
+//! Also fingerprints the evaluator's OWN sources into
+//! `TD_EVALUATOR_SOURCE_FINGERPRINT` for the check verdict key, so the key
+//! names the logic that runs rather than whatever the tree holds when a check
+//! starts (see `evaluator_source_fingerprint`).
 
 use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+// SHA-256 straight from the engine's source file: a build script cannot use
+// the crate it builds for, and a build-dependency edge would compile the
+// engine twice. The module is std-only and self-contained by its own contract.
+#[path = "../engine/src/sha256.rs"]
+#[allow(dead_code)]
+mod sha256;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // The directory path retriggers on file ADDS/REMOVES (dir mtime); an EDIT to
@@ -98,5 +110,79 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let out_path = PathBuf::from(env::var("OUT_DIR")?).join("registry.rs");
     fs::write(&out_path, out)?;
+
+    let fingerprint = evaluator_source_fingerprint(Path::new(&manifest_dir))?;
+    println!("cargo:rustc-env=TD_EVALUATOR_SOURCE_FINGERPRINT={fingerprint}");
+    Ok(())
+}
+
+/// sha256 over the evaluator's own sources — everything under this crate's
+/// `src/`, its `build.rs` and manifest, the engine's `src/` and manifest, the
+/// workspace manifest and lock, and `tests/recipe-eval-tool.sh`, which builds
+/// the evaluator for the gate — as (path, file digest) pairs in path order.
+/// The check verdict key holds it in place of reading those trees at run
+/// time: a key read from the tree names the tree at that moment, and a check
+/// whose assertions were compiled from older sources could record a pass
+/// under a newer key. Every file is declared to cargo, and every directory
+/// for its adds and removes, so an edit reruns this script and re-keys. A
+/// hidden entry — an editor's swap file, its lock link, a scratch directory —
+/// is skipped, file or directory alike; any other symlink is an error, since
+/// the walk does not follow one and skipping it would fingerprint less than
+/// the compiler reads.
+fn evaluator_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn Error>> {
+    let root = manifest_dir
+        .parent()
+        .ok_or("recipes crate has no parent directory")?;
+    let mut files: Vec<PathBuf> = [
+        "recipes/build.rs",
+        "recipes/Cargo.toml",
+        "engine/Cargo.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "tests/recipe-eval-tool.sh",
+    ]
+    .iter()
+    .map(|rel| root.join(rel))
+    .collect();
+    for dir in ["recipes/src", "engine/src"] {
+        walk_sources(&root.join(dir), &mut files)?;
+    }
+    files.sort();
+    let mut h = sha256::Sha256::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(root)?
+            .to_str()
+            .ok_or("non-UTF-8 path under the evaluator sources")?;
+        println!("cargo:rerun-if-changed={}", file.display());
+        let digest = sha256::sha256_file(file)
+            .map_err(|e| format!("fingerprint {}: {e}", file.display()))?;
+        h.update(rel.as_bytes());
+        h.update(b"\0");
+        h.update(digest.as_bytes());
+        h.update(b"\n");
+    }
+    Ok(sha256::to_base16(&h.finalize()))
+}
+
+fn walk_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    for entry in fs::read_dir(dir).map_err(|e| format!("list {}: {e}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        // Hidden before symlink: an emacs lock is a hidden symlink.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(format!("{}: symlink under the evaluator sources", path.display()).into());
+        }
+        if kind.is_dir() {
+            walk_sources(&path, out)?;
+        } else {
+            out.push(path);
+        }
+    }
     Ok(())
 }

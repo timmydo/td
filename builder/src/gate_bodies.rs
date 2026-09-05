@@ -1725,17 +1725,19 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
     // skipped names below read in a stable order however the machine was loaded.
     let mut ran = 0usize;
     let mut failures = 0usize;
+    let mut memoized = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     for ((spec, index), outcome) in work.iter().zip(results) {
         ran += 1;
         match outcome {
             CheckOutcome::Passed => {}
+            CheckOutcome::Memoized => memoized += 1,
             CheckOutcome::HostGap => skipped.push(format!("{spec}#{index}")),
             CheckOutcome::Failed => failures += 1,
         }
     }
 
-    let (report, verdict) = recipe_checks_verdict(ran, failures, &skipped);
+    let (report, verdict) = recipe_checks_verdict(ran, failures, &skipped, memoized);
     for line in report {
         println!("{line}");
     }
@@ -1756,6 +1758,7 @@ fn recipe_checks_verdict(
     ran: usize,
     failures: usize,
     skipped: &[String],
+    memoized: usize,
 ) -> (Vec<String>, Result<(), String>) {
     // The caveat rides the FAIL arm too: "1 of 25 failed" alongside 20 silent
     // skips reads as though 24 checks vouched for the tree.
@@ -1768,9 +1771,19 @@ fn recipe_checks_verdict(
             skipped.join(" ")
         )
     });
+    // A memoized pass is a pass, but it is said out loud and counted apart:
+    // "ran 44 of 44" over 41 answers from the memo would read as 44 checks
+    // re-proved today, and "3 of 44 failed" beside 41 of them as 41 re-proved.
+    let memo_note = (memoized != 0).then(|| {
+        format!(
+            ">> recipe-checks: {memoized} of {ran} check(s) answered from the verdict memo — each \
+             passed here before with every input it reads unchanged since; TD_CHECK_FULL=1 runs \
+             them again"
+        )
+    });
     if failures != 0 {
         return (
-            caveat.into_iter().collect(),
+            caveat.into_iter().chain(memo_note).collect(),
             Err(format!(
                 "FAIL: recipe-checks - {failures} of {ran} recipe-owned check(s) failed"
             )),
@@ -1796,9 +1809,15 @@ fn recipe_checks_verdict(
     // without a stable machine signal automation cannot tell a partial run from
     // a full one — and prose coupling is what broke twice (#268, #315).
     let mut lines: Vec<String> = caveat.into_iter().collect();
+    lines.extend(memo_note);
+    let fresh = ran.saturating_sub(skipped.len()).saturating_sub(memoized);
+    let memo_note = if memoized != 0 {
+        format!(" ({memoized} memoized)")
+    } else {
+        String::new()
+    };
     lines.push(format!(
-        "PASS: recipe-checks - ran {} of {ran} recipe-owned /td/store check(s) from the Rust recipe catalog; package behavior/repro assertions live with the package recipes.",
-        ran.saturating_sub(skipped.len())
+        "PASS: recipe-checks - ran {fresh} of {ran}{memo_note} recipe-owned /td/store check(s) from the Rust recipe catalog; package behavior/repro assertions live with the package recipes."
     ));
     (lines, Ok(()))
 }
@@ -1842,6 +1861,11 @@ fn resolve_recipe_eval(root: &Path) -> Result<PathBuf, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckOutcome {
     Passed,
+    /// Passed here before with every input it reads unchanged since, and said
+    /// so with the memo sentinel on stdout instead of running. Counted as a
+    /// pass and reported apart, so a run that re-ran nothing cannot read as
+    /// one that re-proved everything.
+    Memoized,
     Failed,
     HostGap,
 }
@@ -1936,6 +1960,10 @@ fn report_finished_check(spec: &str, index: usize, done: Result<&FinishedCheck, 
                 CheckOutcome::Passed => {
                     println!("================ recipe-check {spec}#{index}: PASS ================")
                 }
+                CheckOutcome::Memoized => println!(
+                    "================ recipe-check {spec}#{index}: PASS (memoized: unchanged \
+                     since it last passed here) ================"
+                ),
                 CheckOutcome::HostGap => println!(
                     "================ recipe-check {spec}#{index}: SKIPPED (unprovisioned \
                      — nothing on this host can run it) ================"
@@ -2123,11 +2151,17 @@ fn run_recipe_check(
     // past a live child that `Drop` neither kills nor waits for. `EAGAIN` from
     // clone is reachable at width 4 under exactly the memory pressure this change
     // creates. Failing to spawn costs this check's stdout, nothing more.
+    // stdout is scanned for the MEMO sentinel as stderr is for the host-gap
+    // one: a check that answered from its verdict memo says so there.
     let stdout_reader = child.stdout.take().and_then(|out| {
         std::thread::Builder::new()
             .name("recipe-check-stdout".to_string())
             .spawn(move || {
-                capture_check_output(out, None, RECIPE_CHECK_OUTPUT_BYTES)
+                capture_check_output(
+                    out,
+                    Some(td_engine::exit::CHECK_MEMO_SENTINEL.as_bytes()),
+                    RECIPE_CHECK_OUTPUT_BYTES,
+                )
             })
             .ok()
     });
@@ -2148,8 +2182,10 @@ fn run_recipe_check(
     // Joined BEFORE the wait, so the child is never reaped with its stdout pipe
     // still filling. The two bounded tails are concatenated rather than
     // interleaved in time order.
+    let mut memoized = false;
     if let Some(handle) = stdout_reader {
         if let Ok(mut stdout) = handle.join() {
+            memoized = stdout.saw_sentinel;
             stderr.bytes.append(&mut stdout.bytes);
             stderr.truncated |= stdout.truncated;
         }
@@ -2157,8 +2193,14 @@ fn run_recipe_check(
     let status = child
         .wait()
         .map_err(|e| format!("FAIL: wait check-run {spec}: {e}"))?;
+    // The memo sentinel counts only on a SUCCESS: a check that printed it and
+    // then failed, failed.
     let outcome = if status.success() {
-        CheckOutcome::Passed
+        if memoized {
+            CheckOutcome::Memoized
+        } else {
+            CheckOutcome::Passed
+        }
     } else if td_engine::exit::host_gap_from_parts(status.code(), stderr.saw_sentinel) {
         CheckOutcome::HostGap
     } else {
@@ -3904,12 +3946,12 @@ mod tests {
         let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
 
         // A real failure outranks any number of skips.
-        let (_, v) = recipe_checks_verdict(25, 1, &s(&["a#1"]));
+        let (_, v) = recipe_checks_verdict(25, 1, &s(&["a#1"]), 0);
         assert!(v.unwrap_err().starts_with("FAIL: "));
 
         // Nothing ran anywhere here → the gate's own tolerated skip, tagged so
         // `cli` maps it to 69 + sentinel rather than a bare failure.
-        let (_, v) = recipe_checks_verdict(3, 0, &s(&["a#1", "b#1", "c#1"]));
+        let (_, v) = recipe_checks_verdict(3, 0, &s(&["a#1", "b#1", "c#1"]), 0);
         let err = v.unwrap_err();
         assert!(err.starts_with(UNPROVISIONED_TAG), "{err:?}");
         assert!(err.contains("a#1 b#1 c#1"), "names them: {err:?}");
@@ -3917,17 +3959,17 @@ mod tests {
 
         // A failure does not excuse dropping the caveat: "1 of 25 failed" over
         // 20 silent skips reads as though 24 checks vouched for the tree.
-        let (lines, v) = recipe_checks_verdict(25, 1, &s(&["a#1", "b#1"]));
+        let (lines, v) = recipe_checks_verdict(25, 1, &s(&["a#1", "b#1"]), 0);
         assert!(v.is_err() && lines.len() == 1, "{lines:?}");
         assert!(lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL));
         assert!(lines[0].contains("a#1 b#1"));
 
         // Nothing ran at all is never a pass.
-        let (_, v) = recipe_checks_verdict(0, 0, &[]);
+        let (_, v) = recipe_checks_verdict(0, 0, &[], 0);
         assert!(v.is_err(), "0 checks must not report green");
 
         // Partial → green, but the caveat comes FIRST and names every skip.
-        let (lines, v) = recipe_checks_verdict(3, 0, &s(&["b#1"]));
+        let (lines, v) = recipe_checks_verdict(3, 0, &s(&["b#1"]), 0);
         assert!(v.is_ok());
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("NOT full coverage") && lines[0].contains("b#1"));
@@ -3941,12 +3983,77 @@ mod tests {
         assert!(lines[1].starts_with("PASS: ") && lines[1].contains("ran 2 of 3"));
 
         // Clean run → one PASS line, no caveat.
-        let (lines, v) = recipe_checks_verdict(3, 0, &[]);
+        let (lines, v) = recipe_checks_verdict(3, 0, &[], 0);
         assert!(v.is_ok() && lines.len() == 1 && lines[0].starts_with("PASS: "));
         assert!(
             !lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL),
             "a full run must NOT claim incomplete coverage"
         );
+    }
+
+    /// A memoized pass is a pass that is counted apart and said out loud, on
+    /// its own line and in the PASS line's count, so a run that answered
+    /// everything from the memo cannot read as one that re-proved it all.
+    #[test]
+    fn recipe_checks_reports_memoized_passes_apart() {
+        let (lines, v) = recipe_checks_verdict(44, 0, &[], 41);
+        assert!(v.is_ok());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("41 of 44") && lines[0].contains("TD_CHECK_FULL=1"));
+        assert!(lines[1].starts_with("PASS: ") && lines[1].contains("ran 3 of 44 (41 memoized)"));
+        // All memoized is still green: every check has a pass on record for
+        // exactly these inputs.
+        let (lines, v) = recipe_checks_verdict(3, 0, &[], 3);
+        assert!(v.is_ok() && lines[1].contains("ran 0 of 3 (3 memoized)"), "{lines:?}");
+        // A failure still outranks it, and the count of what ran is honest
+        // beside a skip.
+        let (lines, v) = recipe_checks_verdict(3, 1, &[], 2);
+        assert!(
+            lines.iter().any(|l| l.contains("2 of 3 check(s) answered from the verdict memo")),
+            "a failure beside memoized passes still counts them: {lines:?}"
+        );
+        assert!(v.is_err());
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let (lines, v) = recipe_checks_verdict(4, 0, &s(&["a#1"]), 2);
+        assert!(v.is_ok() && lines.last().is_some_and(|l| l.contains("ran 1 of 4 (2 memoized)")), "{lines:?}");
+    }
+
+    /// The memo sentinel on stdout marks a memoized pass, and only on a pass:
+    /// with a non-zero exit it is a failure like any other, and on stderr it
+    /// is not the memo's line.
+    #[test]
+    fn a_recipe_check_is_memoized_only_on_a_pass_that_says_so_on_stdout() {
+        let dir = std::env::temp_dir().join(format!("td-rcm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let memo = td_engine::exit::CHECK_MEMO_SENTINEL;
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+            p
+        };
+        let run = |p: &Path| {
+            run_recipe_check(p, "spec", 1, "e", "s", RECIPE_CHECK_PEAK_BYTES)
+                .unwrap()
+                .outcome
+        };
+        assert!(matches!(
+            run(&write("memo", &format!("echo '{memo} spec#1: passed before'; exit 0"))),
+            CheckOutcome::Memoized
+        ));
+        assert!(matches!(
+            run(&write("memofail", &format!("echo '{memo}'; exit 1"))),
+            CheckOutcome::Failed
+        ));
+        assert!(matches!(
+            run(&write("memoerr", &format!("echo '{memo}' >&2; exit 0"))),
+            CheckOutcome::Passed
+        ));
+        assert!(matches!(run(&write("plain", "echo PASS; exit 0")), CheckOutcome::Passed));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The skip verdict is EVIDENCE, not the exit code alone: a 69 without the

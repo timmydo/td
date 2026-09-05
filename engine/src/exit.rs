@@ -34,6 +34,14 @@ pub const EXIT_PROVENANCE_REJECTED: i32 = 78;
 /// caller separate td's own "nothing to run here" from a stray EX_UNAVAILABLE.
 pub const UNPROVISIONED_SENTINEL: &str = "[td-unprovisioned-69:re#469]";
 
+/// The stdout token a `check-run` prints when it answers from its verdict
+/// memo instead of running: the check passed here before with every input
+/// it reads unchanged since. The gate counts such a check as passed and says
+/// how many were, so a run that re-ran nothing cannot read as one that
+/// re-proved everything. Distinctive for the same reason as the sentinel
+/// above.
+pub const CHECK_MEMO_SENTINEL: &str = "[td-check-memo:pass]";
+
 /// Did a child actually report a host gap? BOTH halves are required. The code
 /// alone is not proof — a tolerating caller re-emits the sentinel for whatever
 /// it believes, so accepting a bare 69 lets any other failure mint a skip and

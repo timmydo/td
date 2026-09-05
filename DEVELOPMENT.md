@@ -48,6 +48,27 @@ finishes an increment carries it through the full ready gate.
 that an intermediate commit is green, so keep every commit independently
 passing as it is made.
 
+The recipe-checks gate answers a check from its verdict memo when that check
+passed on this host before and nothing it reads has changed since: the
+closure's recipe definitions with the sources they embed, the seed patches,
+committed cargo locks and local-source trees, the builder binary (which
+carries the seed digest table), and the evaluator's own sources, with the
+script that builds it for the gate, as fingerprinted when it was built. The
+gate says how many checks it answered that way and counts them apart from
+the ones it ran.
+The memo does not see the host — its qemu, kernel, or toolchain — so after
+such a change, or when a recorded pass is in doubt, run everything:
+
+```text
+TD_CHECK_FULL=1 td-builder ready
+```
+
+The variable set to any value, the way `td-builder check --resume` reads it
+to rerun gates it has a passing record for. A forced rerun forgets the
+recorded pass before it runs, so a failure leaves nothing to answer from.
+`td-recipe-eval clear-store` drops the memos with the rest of the ladder work
+dir.
+
 When `ready` passes, push the branch:
 
 ```text

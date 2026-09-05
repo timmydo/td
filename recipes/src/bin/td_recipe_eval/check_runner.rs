@@ -97,8 +97,67 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("check", &[stem, &index.to_string()]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    // The verdict memo is consulted BEFORE the ladder lock: a memoized pass
+    // needs nothing the lock guards, and not queueing behind another
+    // worktree's climb is part of what it saves.
+    let key = runner.check_verdict_key(stem, index)?;
+    let bypassed = check_memo_bypassed();
+    if !bypassed && runner.check_verdict_memoized(stem, index, &key) {
+        say_memoized(stem, index, &key);
+        return Ok(());
+    }
     let _lock = lock_ladder_for_run(&runner)?;
-    crate::checks::run(check_runner, &runner, stem)
+    // Asked again under the lock: a peer running this same check — beside
+    // this run, since the lock is shared by default, or ahead of it while
+    // this run waited on an exclusive one — may have recorded the pass this
+    // run was about to earn.
+    if !bypassed && runner.check_verdict_memoized(stem, index, &key) {
+        say_memoized(stem, index, &key);
+        return Ok(());
+    }
+    // The pass on record, if any, is forgotten BEFORE the run, not after a
+    // failure: a `TD_CHECK_FULL=1` rerun that fails, or dies, must not leave
+    // the pass it was sent to doubt for the next ordinary run to answer from.
+    runner.forget_check_verdict(stem, index, &key)?;
+    crate::checks::run(check_runner, &runner, stem)?;
+    // Recorded only after a PASS — a failure or a host-gap skip returned Err
+    // above — and only if the key still matches: the inputs were hashed before
+    // a run that reads them, and the ladder lock does not serialize
+    // working-tree edits. Best-effort, as the build-run memo is: nothing here
+    // fails a check that passed.
+    match runner.check_verdict_key(stem, index) {
+        Ok(after) if after == key => {
+            if let Err(e) = runner.write_check_verdict_memo(stem, index, &key) {
+                eprintln!("check: verdict memo not recorded (non-fatal): {e}");
+            }
+        }
+        Ok(_) => eprintln!(
+            "check: inputs changed during the run; verdict memo not recorded for {stem}#{index}"
+        ),
+        Err(e) => eprintln!("check: verdict memo not recorded (re-key failed, non-fatal): {e}"),
+    }
+    Ok(())
+}
+
+fn say_memoized(stem: &str, index: usize, key: &str) {
+    println!(
+        "{} {stem}#{index}: passed here before with every input it reads unchanged \
+         since (verdict key {}); {CHECK_FULL_ENV}=1 runs it again",
+        td_engine::exit::CHECK_MEMO_SENTINEL,
+        key.get(..12).unwrap_or(key)
+    );
+}
+
+/// `TD_CHECK_FULL`, set to anything, runs every check in full, memo or not —
+/// the same knob, read the same way, that makes the check loop rerun gates it
+/// has a passing record for. For a change in something the verdict key does
+/// not read (the host's qemu, its kernel, the toolchain that built the
+/// evaluator), or when a recorded pass is itself in doubt. `clear-store`
+/// drops the memos with the rest of the ladder work dir.
+pub(crate) const CHECK_FULL_ENV: &str = "TD_CHECK_FULL";
+
+fn check_memo_bypassed() -> bool {
+    env::var_os(CHECK_FULL_ENV).is_some()
 }
 
 /// `td-recipe-eval clear-store` — the EXPLICIT cold reset, and the ONLY path that destroys
@@ -1251,6 +1310,24 @@ fn plan_fingerprint(
         h.update(&(bytes.len() as u64).to_le_bytes());
         h.update(&bytes);
     }
+    hash_repo_inputs(&mut h, patches_dir, repo_root, cargo_locks, local_sources)?;
+    Ok(crate::sha256::to_base16(&h.finalize()))
+}
+
+/// The plan inputs read from the REPO at build time rather than compiled in —
+/// the seed patches, and the closure's committed cargo locks and local-source
+/// trees — hashed into `h` in a fixed, length-delimited order. Shared by the
+/// build-run memo's fingerprint and the check verdict key, so the two cannot
+/// disagree about what a build reads. `cargo_locks` and `local_sources` must
+/// each be sorted and deduped by the caller; a declared lock or source dir
+/// that cannot be read fails closed.
+fn hash_repo_inputs(
+    h: &mut crate::sha256::Sha256,
+    patches_dir: &Path,
+    repo_root: &Path,
+    cargo_locks: &[String],
+    local_sources: &[String],
+) -> Result<(), String> {
     // Only a MISSING patch dir hashes as zero patches (a tree that GAINS the dir
     // re-keys by growing the hashed list). Any other read error — and any entry
     // error — fails closed: silently dropping a patch from the key would let a
@@ -1306,9 +1383,9 @@ fn plan_fingerprint(
         // hash_source_tree emits its own self-delimiting type/length framing, and
         // this section follows cargo_locks in a fixed order, so no cross-section
         // ambiguity. A missing/unreadable declared source dir fails closed.
-        hash_source_tree(&p, &mut h)?;
+        hash_source_tree(&p, h)?;
     }
-    Ok(crate::sha256::to_base16(&h.finalize()))
+    Ok(())
 }
 
 /// Hash a local-source tree into `h` exactly the way `copy_source_tree` interns it
@@ -1361,6 +1438,48 @@ fn hash_source_tree(dir: &Path, h: &mut crate::sha256::Sha256) -> Result<(), Str
         return Ok(());
     }
     Err(format!("unsupported file type at {}", dir.display()))
+}
+
+/// One length-delimited field of a fingerprint, so no boundary is ambiguous.
+fn hash_field(h: &mut crate::sha256::Sha256, bytes: &[u8]) {
+    h.update(&(bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
+
+/// The committed cargo locks and local-source dirs a closure reads at build
+/// time, each sorted and deduped, as the fingerprints want them.
+fn closure_repo_inputs(closure: &[RecipeNode]) -> (Vec<String>, Vec<String>) {
+    let mut locks: Vec<String> = closure
+        .iter()
+        .filter_map(|n| n.recipe.cargo_lock.clone())
+        .collect();
+    locks.sort();
+    locks.dedup();
+    let mut local_sources: Vec<String> = closure
+        .iter()
+        .filter_map(|n| n.recipe.local_source.clone())
+        .collect();
+    local_sources.sort();
+    local_sources.dedup();
+    (locks, local_sources)
+}
+
+/// A verdict memo is two lines: the key it answers for, and the one verdict it
+/// can hold. Only a pass is ever written — a failure has to be re-run to be
+/// believed, and a host-gap skip is not a verdict — so a file that says
+/// anything else is not one of ours and is ignored.
+fn serialize_check_verdict_memo(key: &str) -> String {
+    format!("fingerprint {key}\nverdict pass\n")
+}
+
+fn parse_check_verdict_memo(text: &str, expected: &str) -> bool {
+    let mut lines = text.lines();
+    lines
+        .next()
+        .and_then(|l| l.strip_prefix("fingerprint "))
+        .map(str::trim)
+        == Some(expected)
+        && lines.next().map(str::trim) == Some("verdict pass")
 }
 
 /// Parse a build-run reuse memo, returning stem -> output basename ONLY when its
@@ -3045,18 +3164,7 @@ impl RecipeCheckRunner {
     fn evaluator_fingerprint(&self, target: &str) -> Result<String, String> {
         let eval = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let closure = recipe_closure(&[target])?;
-        let mut locks: Vec<String> = closure
-            .iter()
-            .filter_map(|n| n.recipe.cargo_lock.clone())
-            .collect();
-        locks.sort();
-        locks.dedup();
-        let mut local_sources: Vec<String> = closure
-            .iter()
-            .filter_map(|n| n.recipe.local_source.clone())
-            .collect();
-        local_sources.sort();
-        local_sources.dedup();
+        let (locks, local_sources) = closure_repo_inputs(&closure);
         plan_fingerprint(
             &eval,
             &self.tb,
@@ -3065,6 +3173,121 @@ impl RecipeCheckRunner {
             &locks,
             &local_sources,
         )
+    }
+
+    /// The verdict memo key for check `index` of `stem`: sha256 over every
+    /// input the verdict depends on that the TREE can change. The check's own
+    /// coordinates (stem, index, script, runner); the recipe JSON of every
+    /// recipe in the closure — the derivation coordinates, embedded sources
+    /// included, so a change to a crate a recipe embeds re-keys exactly the
+    /// checks whose closure builds it; the seed patches, committed cargo locks
+    /// and local-source trees the closure reads at build time, hashed as the
+    /// build-run memo hashes them; the staged builder binary, which is also
+    /// how `seed/seed-digests.txt` reaches the key, compiled into td-builder
+    /// as it is — a key over builder SOURCES would lose that; and the
+    /// evaluator's OWN sources, as `build.rs` fingerprinted them when this
+    /// binary was compiled, so the key names the assertions that run and not
+    /// the tree at the moment of asking, and so an edit anywhere under
+    /// `recipes/src` or `engine/src` re-keys every check. NOT the evaluator
+    /// binary: it embeds every target crate's sources, so it changes with
+    /// any of them, and a key that held it would miss on every change to a
+    /// crate the closure never reads, which is the case the memo exists for.
+    ///
+    /// What the key does not hold is the host: its qemu, its kernel, the
+    /// toolchain that built the evaluator. A check that passed under one and
+    /// would fail under another is answered from the memo until
+    /// `TD_CHECK_FULL=1` or `clear-store`; the build-run memo makes the same
+    /// bargain for its outputs.
+    fn check_verdict_key(&self, stem: &str, index: usize) -> Result<String, String> {
+        let mut h = crate::sha256::Sha256::new();
+        hash_field(&mut h, b"td-check-verdict-v1");
+        hash_field(&mut h, stem.as_bytes());
+        hash_field(&mut h, &(index as u64).to_le_bytes());
+        let check = catalog::lookup(stem)
+            .and_then(|r| r.checks.and_then(|c| c.get(index.checked_sub(1)?).cloned()))
+            .ok_or_else(|| format!("{stem} has no check {index}"))?;
+        hash_field(&mut h, check.script.as_bytes());
+        hash_field(
+            &mut h,
+            match check.runner {
+                Some(CheckRunner::BuildOnly) => b"build-only".as_slice(),
+                Some(CheckRunner::Codex) => b"codex".as_slice(),
+                Some(CheckRunner::RustToolchain) => b"rust-toolchain".as_slice(),
+                None => b"none".as_slice(),
+            },
+        );
+        let closure = recipe_closure(&[stem])?;
+        // In stem order, not walk order: the walk is deterministic today, and
+        // the key should not depend on that staying so.
+        let mut nodes: Vec<&RecipeNode> = closure.iter().collect();
+        nodes.sort_by(|a, b| a.stem.cmp(&b.stem));
+        for node in nodes {
+            hash_field(&mut h, node.stem.as_bytes());
+            hash_field(&mut h, node.recipe.to_json().to_canonical().as_bytes());
+        }
+        // Streamed: the builder is a whole executable, and a check runs
+        // beside others.
+        let builder = crate::sha256::sha256_file(&self.tb)
+            .map_err(|e| format!("hash {}: {e}", self.tb.display()))?;
+        hash_field(&mut h, builder.as_bytes());
+        let (locks, local_sources) = closure_repo_inputs(&closure);
+        hash_repo_inputs(
+            &mut h,
+            &self.root.join("seed/patches"),
+            &self.root,
+            &locks,
+            &local_sources,
+        )?;
+        hash_field(&mut h, env!("TD_EVALUATOR_SOURCE_FINGERPRINT").as_bytes());
+        Ok(crate::sha256::to_base16(&h.finalize()))
+    }
+
+    fn check_verdict_memo_path(&self, stem: &str, index: usize, key: &str) -> PathBuf {
+        self.lw.join("check-memo").join(format!(
+            "{}.{index}.{key}.pass",
+            sanitize_target_for_filename(stem)
+        ))
+    }
+
+    /// Whether `key` has a recorded pass: the file exists and its header names
+    /// the key, the name alone being one rename away from a lie.
+    fn check_verdict_memoized(&self, stem: &str, index: usize, key: &str) -> bool {
+        fs::read_to_string(self.check_verdict_memo_path(stem, index, key))
+            .ok()
+            .is_some_and(|text| parse_check_verdict_memo(&text, key))
+    }
+
+    /// Drop the recorded pass for `key`, if any, ahead of a run that will earn
+    /// its own. A removal that fails for any reason but absence is an error:
+    /// running on would leave a pass on record that this run was sent to
+    /// doubt.
+    fn forget_check_verdict(&self, stem: &str, index: usize, key: &str) -> Result<(), String> {
+        let path = self.check_verdict_memo_path(stem, index, key);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("remove stale verdict memo {}: {e}", path.display())),
+        }
+    }
+
+    /// Publish a pass for `key`: temp then rename, the temp qualified by this
+    /// run's claimed scratch name for the reason `write_build_run_memo` gives.
+    /// Per-key files sit side by side and are never reaped, as the build-run
+    /// maps are: a stale one is inert, and `clear-store` removes them all.
+    fn write_check_verdict_memo(&self, stem: &str, index: usize, key: &str) -> Result<(), String> {
+        let dir = self.lw.join("check-memo");
+        fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let path = self.check_verdict_memo_path(stem, index, key);
+        let tmp = dir.join(format!(
+            ".{}.{index}.{key}.{}.tmp",
+            sanitize_target_for_filename(stem),
+            self.scratch_id()
+        ));
+        remove_path_if_exists(&tmp)?;
+        fs::write(&tmp, serialize_check_verdict_memo(key))
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
     }
 
     /// A memo HIT: the recorded plan for `fingerprint` is present and every
@@ -7730,6 +7953,19 @@ chmod 755 '{}'
     // The reuse memo round-trips, and a stale-plan file (header fingerprint != the
     // caller's) is ignored even if it somehow shares the filename — the header is a
     // second, in-band check on top of the fingerprint-in-filename.
+    /// The verdict memo answers for its key alone and holds one verdict: a
+    /// renamed file, a foreign key, or a line claiming anything but a pass is
+    /// not a memoized pass.
+    #[test]
+    fn check_verdict_memo_answers_only_for_its_key_and_only_a_pass() {
+        let text = serialize_check_verdict_memo("deadbeef");
+        assert!(parse_check_verdict_memo(&text, "deadbeef"));
+        assert!(!parse_check_verdict_memo(&text, "cafef00d"));
+        assert!(!parse_check_verdict_memo("fingerprint deadbeef\nverdict fail\n", "deadbeef"));
+        assert!(!parse_check_verdict_memo("fingerprint deadbeef\n", "deadbeef"));
+        assert!(!parse_check_verdict_memo("", "deadbeef"));
+    }
+
     #[test]
     fn build_run_memo_round_trips_and_rejects_a_wrong_fingerprint() {
         let mut steps = BTreeMap::new();

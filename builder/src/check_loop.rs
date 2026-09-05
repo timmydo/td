@@ -1840,7 +1840,10 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // Every build uses the one shared warm ladder (re #469) — there is no
     // cold-cache toggle to forward; `td-recipe-eval clear-store` is the only way
     // to force a cold climb.
-    for k in ["TD_CHECK_DISABLE"] {
+    // TD_CHECK_FULL is forwarded as well: inside the sandbox it is what makes
+    // a recipe check run in full rather than answer from its verdict memo
+    // (check_runner.rs), the same knob that ignores --resume below.
+    for k in ["TD_CHECK_DISABLE", "TD_CHECK_FULL"] {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));
         }
