@@ -1304,8 +1304,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // recipe builds it and it never enters a closure — so unlike the crates
     // above there is no target artifact for recipe-checks to link.
     //
-    // The only arm that selects NO check target. `cargo-test` is the one gate
-    // that reaches td-review at all — clippy --all-targets, its tests, and
+    // `cargo-test` is the one gate that reaches td-review at all —
+    // clippy --all-targets, its tests, and
     // its 1-package lock, now through the derived roster rather than a name in
     // its body — and the preflight above covers all three and then
     // some: it runs the tests with --include-ignored where the gate runs
@@ -1321,6 +1321,16 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         "td-review/*|td-review/src/*|td-review/tests/*|td-review/Cargo.toml|td-review/Cargo.lock",
         p,
     ) {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
+    // The editor core has no recipe or workspace consumer yet. Keep this
+    // exemption coupled to UNEMBEDDED_CRATES and its dependency guards;
+    // packaging the editor must replace it with target-artifact coverage.
+    // As for td-review above, the host preflight covers the editor's gate
+    // 325 lock/test/clippy obligations without the unrelated check pools.
+    if p.starts_with("td-editor/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         return;
     }
@@ -3070,7 +3080,7 @@ pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, usize)>,
 /// binary are one text — which makes `recipes`, and therefore `cargo test
 /// --workspace`, a READER of those files. Checked against the tree rather than
 /// trusted, in `unembedded_crates_are_really_unembedded`.
-const UNEMBEDDED_CRATES: [&str; 1] = ["td-review"];
+const UNEMBEDDED_CRATES: [&str; 2] = ["td-review", "td-editor"];
 
 /// Files under `builder/src` that are NOT the build engine, and so do not owe
 /// the from-source behavioural tier the rest of that directory does.
@@ -5161,6 +5171,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn editor_only_changes_select_its_own_checks_but_mixed_changes_do_not() {
+        let root = repo_root();
+        let editor_paths = [
+            "td-editor/Cargo.toml",
+            "td-editor/Cargo.lock",
+            "td-editor/.gitignore",
+            "td-editor/clippy.toml",
+            "td-editor/src/model.rs",
+            "td-editor/src/io/file.rs",
+            "td-editor/tests/core.rs",
+            "td-editor/README.md",
+            "td-editor/DESIGN.md",
+        ];
+        for path in editor_paths {
+            let output = path_output(&root, path);
+            assert!(!output.contains("td-builder check"), "{path}: {output}");
+            assert!(!output.contains("--workspace"), "{path}: {output}");
+            if path.ends_with(".md") {
+                assert!(output.contains("Selected checks: none"), "{path}: {output}");
+            } else {
+                assert!(
+                    output.contains("--manifest-path td-editor/Cargo.toml"),
+                    "{path}: {output}"
+                );
+            }
+        }
+        let mut paths: Vec<String> = editor_paths.iter().map(|p| (*p).to_string()).collect();
+        assert!(compute_selection(&root, &paths).targets.is_empty());
+        let commands = cargo_test_cmds(&root, &paths).unwrap();
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(commands.iter().all(|c| {
+            c.contains("--manifest-path td-editor/Cargo.toml")
+        }));
+        assert!(commands.iter().any(|c| c.starts_with("cargo test --frozen ")));
+        assert!(commands.iter().any(|c| {
+            c.starts_with("cargo clippy --frozen ") && c.contains("--all-targets")
+        }));
+        assert!(gate_locks().contains(&("td-editor/Cargo.lock".to_string(), 1)));
+        paths.push("builder/src/affected.rs".to_string());
+        assert_eq!(cargo_test_cmds(&root, &paths).unwrap(), gate_cmds());
+        assert!(compute_selection(&root, &paths).targets.contains(&"check".to_string()));
+        for path in [
+            "td-editor-extra/src/main.rs",
+            "td-editor/../td-sh/src/main.rs",
+        ] {
+            assert_eq!(cargo_test_cmds(&root, &[path.to_string()]).unwrap(), gate_cmds());
+            assert!(path_output(&root, path).contains("td-builder check check"));
+        }
+    }
+
     /// The rendered line and the executed list come from one call, so the dry
     /// run cannot advertise a command the run will not issue.
     #[test]
@@ -5887,9 +5948,8 @@ mod tests {
         );
 
         // td-review → the cargo-test preflight, scoped to td-review's OWN
-        // manifest, and NOTHING else: the only selection with no `td-builder
-        // check` line at all. Pinned as exact output because both absences are
-        // the point — a stray target would restore an hour of bootstrap builds,
+        // manifest, and NOTHING else. Pinned as exact output because both
+        // absences are the point — a stray target restores bootstrap builds,
         // and a stray manifest would restore the workspace suite, for a crate
         // none of it reads.
         assert_eq!(

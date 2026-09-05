@@ -43,6 +43,15 @@ save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector
 reference. It also launches the real replay executable without a display.
 
+Editor-only code/configuration changes are routed by `td-builder ready` to
+this crate's tests and Clippy, with the dependency-free lock checks retained.
+Documentation-only changes keep the normal docs-only waiver. Neither runs
+unrelated workspace tests or bootstrap/image gates. This is valid while no
+recipe or workspace member consumes editor sources; builder regression tests
+guard that boundary. Adding an editor recipe or another consumer must update
+the routing and its guard in the same increment. A diff that also changes
+the builder or another embedded component still selects its broader checks.
+
 ## Headless replay protocol
 
 Run `td-editor --replay` with binary stdin/stdout. Consecutive requests use
