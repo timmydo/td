@@ -31,6 +31,13 @@ mod gpt;
 #[path = "../../engine/src/fat.rs"]
 #[allow(dead_code)]
 mod fat;
+// Test-only, and declared with the same redundant `#[path]` as td-boot's own
+// files, so that `every_compiled_file_is_one_the_guards_read` counts it and
+// both guards read it: a file compiled only into the test binary ships in
+// nothing, but the audit counts sources, not shipped ones.
+#[cfg(test)]
+#[path = "scratch.rs"]
+mod scratch;
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -862,6 +869,12 @@ fn copy_sparse(
 ) -> io::Result<u64> {
     let span = usize::try_from(COPY_CHUNK).unwrap_or(1).max(1);
     let mut buffer = vec![0u8; span];
+    // Compared as slices rather than scanned byte by byte: slice equality on
+    // bytes is std's `memcmp`, which is optimized however this crate was
+    // compiled, and this loop reads every byte of a volume measured in
+    // gigabytes. An unoptimized per-byte scan cost the test suite tens of
+    // seconds a test.
+    let zeros = vec![0u8; span];
     let mut at = from;
     let mut written = 0u64;
     image.seek(SeekFrom::Start(from))?;
@@ -871,7 +884,10 @@ fn copy_sparse(
             .get_mut(..take)
             .ok_or_else(|| invalid("copy chunk out of range".to_string()))?;
         image.read_exact(chunk)?;
-        if chunk.iter().any(|byte| *byte != 0) {
+        let blank = zeros
+            .get(..take)
+            .ok_or_else(|| invalid("blank chunk out of range".to_string()))?;
+        if chunk != blank {
             let dest = offset
                 .checked_add(at)
                 .ok_or_else(|| invalid("a copy offset overflowed".to_string()))?;
@@ -1396,9 +1412,6 @@ mod tests {
     // this is the test half's own — a test opening a fixture is not a path the
     // installer takes from an operator, and the scan reads only the half above.
     use std::fs::OpenOptions;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
 
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
@@ -1414,9 +1427,7 @@ mod tests {
         /// A sparse file of `bytes`, which is a destination `td-install` treats
         /// exactly as it treats a disk (D9).
         fn disk(bytes: u64) -> Scratch {
-            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("td-install-test-{}-{sequence}", std::process::id()));
+            let path = scratch::path("disk");
             let file = File::create(&path).unwrap();
             file.set_len(bytes).unwrap();
             Scratch { path }
@@ -1457,12 +1468,8 @@ mod tests {
     /// A directory holding an executable `mkfs.btrfs` stand-in with `body`.
     fn fake_mkfs(body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "td-install-mkfs-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch::path("mkfs");
+        std::fs::create_dir(&dir).unwrap();
         let fake = dir.join("mkfs.btrfs");
         std::fs::write(&fake, body).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1874,12 +1881,8 @@ mod tests {
     /// escaping is a rule every future field has to remember.
     #[test]
     fn a_destination_with_a_space_in_its_name_does_not_shift_the_fields() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-install-space {}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch::path("space");
+        std::fs::create_dir(&dir).unwrap();
         let path = dir.join("a disk.img");
         File::create(&path).unwrap().set_len(DISK).unwrap();
         let mut out = Vec::new();
@@ -2236,12 +2239,8 @@ mod tests {
     /// `layout` was ever driven with a bad one.
     #[test]
     fn a_path_that_cannot_be_opened_names_itself() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-install-named-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch::path("named");
+        std::fs::create_dir(&dir).unwrap();
 
         let absent = dir.join("no-such-disk");
         let refused = run_layout(&absent, &mut Vec::new()).unwrap_err().to_string();
@@ -2544,11 +2543,12 @@ mod tests {
     /// because that is the half the scan below keys on.
     const ALLOW: &str = concat!("#[all", "ow(clippy::disallowed_methods)]");
 
-    /// The six files this binary compiles, with the item each allow in them
-    /// must sit on — none, for the four that reach no filesystem.
+    /// The seven files this binary compiles, with the item each allow in
+    /// them must sit on — none, for the four that reach no filesystem, nor
+    /// for `scratch.rs`, which is test-only and ships in nothing.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 6] {
+    fn compiled_files() -> [Compiled; 7] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -2564,10 +2564,11 @@ mod tests {
                 include_str!("../../td-boot/src/protocol.rs"),
                 [].as_slice(),
             ),
+            ("scratch.rs", include_str!("scratch.rs"), [].as_slice()),
         ]
     }
 
-    /// THE LIST ABOVE IS HAND-KEPT, and a seventh file compiled into this
+    /// THE LIST ABOVE IS HAND-KEPT, and an eighth file compiled into this
     /// binary would be read by neither guard — silently, since both count only
     /// what they were handed. Nothing but this relates it to the `#[path]`
     /// declarations it mirrors. The marker is split so this file does not
@@ -2575,7 +2576,7 @@ mod tests {
     ///
     /// Over the UNCOMMENTED source, for the reason the allow scan is: a
     /// comment explaining a `#[path]` declaration is prose, and reading one as
-    /// a declaration reds a file that compiles exactly six.
+    /// a declaration reds a file that compiles exactly seven.
     #[test]
     fn every_compiled_file_is_one_the_guards_read() {
         // WHITESPACE-INSENSITIVE from the marker on: `#[path="x.rs"]` with no
@@ -2595,7 +2596,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 6] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 7] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
@@ -2664,12 +2665,12 @@ mod tests {
         // …and no file reaches this binary any OTHER way. A `#[path]` is not
         // how Rust normally names a second file: `mod escape;` compiles
         // `src/escape.rs` with no attribute to count, and `include!` splices
-        // one into this file outright. Either is a seventh compiled source
+        // one into this file outright. Either is an eighth compiled source
         // carrying a crate-level `#![allow]` and any filesystem call it
         // likes, with both guards passing — review's, and the reason the loop
         // below counts DECLARATIONS rather than trusting the attribute.
-        // EVERY compiled file, not this one alone. A seventh file arrives
-        // through whichever of the six declares it, and until review measured
+        // EVERY compiled file, not this one alone. An eighth file arrives
+        // through whichever of the seven declares it, and until review measured
         // it the three checks below ran over `main.rs` only: an
         // `include!("spliced.rs")` in `gpt.rs` — which resolves to the same
         // file for both crates, so it is the realistic shape rather than a
@@ -2709,7 +2710,7 @@ mod tests {
             // A MACRO can assemble an attribute out of pieces no unit holds: a
             // `#[$attr]` in a definition and `allow(clippy::all)` at the call
             // site are two texts, and the scan reads text. Nothing here
-            // defines one, and these six files are compiled with no external
+            // defines one, and these seven files are compiled with no external
             // crate to import one from, so refusing the DEFINITION closes it.
             //
             // Over the UNSPACED, UNSTRINGED file rather than at a line start:
@@ -2723,8 +2724,8 @@ mod tests {
                 "{label} defines a macro, which can assemble a lint \
                  suppression the allow scan cannot read"
             );
-            // …and no module of its own. `main.rs` declares the five; any
-            // other file declaring one compiles a seventh source.
+            // …and no module of its own. `main.rs` declares the six; any
+            // other file declaring one compiles an eighth source.
             let mods = declarations(&plain_file)
                 .into_iter()
                 .filter(|(keyword, head)| *keyword == "mod" && head.trim_end().ends_with(';'))
@@ -3159,7 +3160,7 @@ mod tests {
     /// desynchronise on, and refusing them would refuse this file.
     ///
     /// What it does not lex is a raw string and a block comment, and neither
-    /// is a caveat: it refuses both, none of the six compiled files holds
+    /// is a caveat: it refuses both, none of the seven compiled files holds
     /// either (measured), and the refusal is what the raw-string check this
     /// replaces could not state soundly.
     fn plain_source(text: &str) -> Option<String> {
@@ -3995,14 +3996,20 @@ mod tests {
     fn a_relative_mkfs_is_refused_before_it_can_be_searched_for() {
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        // Its own directory, though the refusal precedes every filesystem
+        // operation: were that ordering ever lost, the image would land here
+        // and not beside every other fixture.
+        let dir = scratch::path("relative");
+        std::fs::create_dir(&dir).unwrap();
         let error = run_volume(
             &scratch.path,
             Path::new("mkfs.btrfs"),
-            &std::env::temp_dir(),
+            &dir,
             None,
             &mut Vec::new(),
         )
         .unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
         assert!(
             format!("{error}").contains("resolves through PATH"),
             "a bare name must be refused: {error}"
@@ -4013,12 +4020,8 @@ mod tests {
     /// refused, rather than truncating the disk whose table was just parsed.
     #[test]
     fn a_scratch_image_that_is_the_destination_is_refused() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-install-alias-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch::path("alias");
+        std::fs::create_dir(&dir).unwrap();
         let path = dir.join("td-volume.img");
         File::create(&path).unwrap().set_len(DISK).unwrap();
         run_layout(&path, &mut Vec::new()).unwrap();

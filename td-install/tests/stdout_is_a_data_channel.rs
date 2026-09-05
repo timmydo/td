@@ -21,10 +21,13 @@ const BIN: &str = env!("CARGO_BIN_EXE_td-install");
 /// headroom. This is sparse, but the copy reads every byte of the volume.
 const DISK: u64 = 6 * 1024 * 1024 * 1024;
 
+#[path = "../src/scratch.rs"]
+mod scratch;
+
+/// A scratch directory for one test. `scratch` says where, and why.
 fn scratch_dir(tag: &str) -> Res<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("td-install-it-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
+    let dir = scratch::path(tag);
+    std::fs::create_dir(&dir)?;
     Ok(dir)
 }
 
