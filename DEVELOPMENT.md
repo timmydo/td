@@ -97,6 +97,43 @@ it from `git log`; an untracked plan file cannot be the handoff.
 Never use `git stash` in this repository. `refs/stash` is repository-global,
 not worktree-local.
 
+# Stopping a run
+
+To abandon a long check run, ask for it:
+
+```text
+td-builder stop
+```
+
+It stops the `ready`, `check`, `affected-checks --run` or `gate-run` that THIS
+worktree started, and no other: the run writes a record inside the worktree,
+so a `stop` cannot name a run whose record it cannot see. It signals through
+the audited path, so the kill audit says who asked and why.
+
+Do not reach for `pkill -f`. Every worktree invokes the same binary path and a
+command line carries no cwd, so no pattern distinguishes your run from a
+parallel agent's: `pkill -f td-builder` ends all of them AND the shared check
+host, and the agents you did not mean to interrupt are left with swept gates
+and nothing in the kill audit naming a cause. That has happened.
+
+`stop` waits to see each run go before reporting it stopped, polling them all
+together, and exits non-zero for anything it could not account for — a run
+still alive after the wait, or a record it could not read — while still
+stopping everything else it found. Run it again to re-signal a run that has
+not gone. That non-zero exit is what makes `stop && ready` refuse to start
+over a client that is still running; nothing to stop is success on its own.
+
+What it confirms is that the recorded process has ended. A recorded run is one
+the check host took, so that process owns no build tree of its own; the hosted
+tree is the host's, and comes down on the host's client-went-away cancellation
+shortly after. `stop` does not wait for that.
+
+Short forms are not runs and are not recorded: `ready --record-only`, a bare
+`affected-checks`, `gate-run --list`. Nor are `build` and `realize`, which the
+check host does not take — signal a pid you recorded yourself. And
+`check-host-stop` is a different thing again: it stops the shared check host,
+which every worktree uses.
+
 # When something td-builder ran was killed
 
 Every signal td-builder sends to another process is recorded in one place:

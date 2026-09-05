@@ -417,7 +417,12 @@ pub fn should_forward(args: &[String]) -> bool {
     )
 }
 
-fn should_forward_with_host_state(args: &[String], already_hosted: bool) -> bool {
+// `pub(crate)` because `run_record::long_run_verb` DERIVES from this: what a
+// `stop` can name is what this forwards, less `daemon-request`, which is a
+// control message rather than a run. The hosted-state parameter is why the
+// inner form is the one exposed — `run_record` answers "should this process
+// record" separately, and must ask this question with that already settled.
+pub(crate) fn should_forward_with_host_state(args: &[String], already_hosted: bool) -> bool {
     if already_hosted {
         return false;
     }

@@ -45,6 +45,7 @@ mod oci;
 mod ostree;
 mod ready;
 mod run_capped;
+mod run_record;
 mod sandbox;
 mod scan;
 mod spawn;
@@ -8292,6 +8293,17 @@ fn main() -> ExitCode {
         Some("flock") => return applet_exit("flock", run_flock_applet(&args)),
         _ => {}
     }
+    // `record_if_long_run` owns both questions — which verbs are runs, and
+    // which process should record — and declines inside the check host, where
+    // a pid namespace makes this process pid 1: a number that names nothing
+    // from outside and is the same for every worktree's run. It sits above the
+    // branch so the binding lives to the end of `main` and the record is taken
+    // away by whichever arm below returns, not because a run might go
+    // unforwarded: a recorded run is by construction one the host takes, since
+    // `long_run_verb` derives from `should_forward`. `stop` depends on that —
+    // it signals one pid and no tree, because there is no local tree to
+    // orphan. See builder/src/run_record.rs.
+    let _run = run_record::record_if_long_run(args.get(1..).unwrap_or(&[]));
     if check_host::should_forward(args.get(1..).unwrap_or(&[])) {
         return check_host::forward(args.get(1..).unwrap_or(&[]));
     }
@@ -8315,6 +8327,11 @@ fn main() -> ExitCode {
         // runaway reds its test instead of taking the box down. Not user-facing:
         // cargo constructs the invocation. See builder/src/run_capped.rs.
         Some("run-capped") => run_capped::main(args.get(2..).unwrap_or(&[])),
+        // stop — end the long check run THIS worktree started. Every worktree
+        // invokes the same relative path, so no `pkill -f` pattern can select
+        // one; the run writes a record in its own worktree and this reads it.
+        // See builder/src/run_record.rs.
+        Some("stop") => run_record::stop_cli(args.get(2..).unwrap_or(&[])),
         Some("check-host-serve") => check_host::serve_cli(args.get(2..).unwrap_or(&[])),
         Some("check-host-stop") if args.len() == 2 => check_host::stop_cli(),
         // Internal process-lifetime boundary. It is intentionally absent from

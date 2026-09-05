@@ -247,6 +247,9 @@ boundaries are:
   one-off change;
 - one self-contained, green commit is one independently landable increment;
 - never use `git stash` in this repository;
+- never signal a process by matching its command line: every worktree runs the
+  same binary path, so `pkill -f td-builder` cannot mean "mine". Stop your own
+  check run with `td-builder stop`, or signal a pid you recorded yourself;
 - `td-builder ready` is the pre-push gate. `--record-only` is not a substitute;
 - a change request authorizes pushing the ready branch to `origin`; that branch
   is the PR the separate integrator lands.
