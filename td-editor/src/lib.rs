@@ -20,6 +20,8 @@ pub mod wayland;
 #[allow(dead_code, clippy::new_without_default)]
 #[path = "../../td-compositor/src/wire.rs"]
 mod wire;
+pub mod xkb;
+mod xkb_syntax;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

@@ -4,8 +4,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 fn raw_module_tokens(text: &str) -> usize {
+    identifier_count(text, "sys")
+}
+
+fn identifier_count(text: &str, identifier: &str) -> usize {
     text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|token| *token == "sys")
+        .filter(|token| *token == identifier)
         .count()
 }
 
@@ -26,6 +30,8 @@ fn source_inventory_and_allowances_are_closed() {
         "text.rs",
         "ui.rs",
         "wayland.rs",
+        "xkb.rs",
+        "xkb_syntax.rs",
     ]
     .into_iter()
     .map(str::to_string)
@@ -40,6 +46,21 @@ fn source_inventory_and_allowances_are_closed() {
         let name = entry.file_name().into_string().unwrap();
         actual.insert(name.clone());
         let text = std::fs::read_to_string(entry.path()).unwrap();
+        if !matches!(name.as_str(), "xkb.rs" | "xkb_syntax.rs") {
+            for module in ["xkb", "xkb_syntax"] {
+                assert_eq!(
+                    identifier_count(&text, module),
+                    usize::from(name == "lib.rs"),
+                    "partial type validation must not activate input: {name}"
+                );
+            }
+            for interface in ["wl_seat", "wl_keyboard"] {
+                assert!(
+                    !text.contains(interface),
+                    "input binding before full validation: {name}"
+                );
+            }
+        }
         let budget = match name.as_str() {
             "lib.rs" | "main.rs" => 1,
             "sys.rs" => 4,
@@ -74,6 +95,19 @@ fn source_inventory_and_allowances_are_closed() {
                 )));
                 let shared =
                     std::fs::read_to_string(root.join("../td-compositor/src").join(file)).unwrap();
+                for module in ["xkb", "xkb_syntax"] {
+                    assert_eq!(
+                        identifier_count(&shared, module),
+                        0,
+                        "partial type validation through shared source: {file}"
+                    );
+                }
+                for interface in ["wl_seat", "wl_keyboard"] {
+                    assert!(
+                        !shared.contains(interface),
+                        "input binding through shared source: {file}"
+                    );
+                }
                 assert!(!shared.contains("unsafe"));
                 assert_eq!(
                     raw_module_tokens(&shared),

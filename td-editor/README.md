@@ -107,10 +107,20 @@ TD_EDITOR_TEST_WAYLAND=/absolute/path/to/weston-socket cargo test --frozen --man
 This waits for actual frame completion. The ordinary tests need no display
 and check transferred pool pixels and lifecycle behavior with Unix sockets.
 
-Editor-only code/configuration changes are routed by `td-builder ready` to
-this crate's tests and Clippy, with the dependency-free lock checks retained.
-Documentation-only changes keep the normal docs-only waiver. Neither runs
-unrelated workspace tests or bootstrap/image gates. This is valid while no
+`src/xkb.rs` and `xkb_syntax.rs` provide the next keyboard foundation:
+bounded text-v1 lexical parsing and table-driven type selection, including
+virtual-mask bindings and preserved modifiers. Tests cover the td map and
+all 26 types of a compiled ordinary US map, with libxkbcommon-derived results
+for all 256 real-modifier combinations. The fixture's provenance and oracle
+procedure are in [tests/fixtures/README.md](tests/fixtures/README.md).
+This is not a complete keymap validator or key-event translator. Compatibility
+interpretations, keycode/symbol compilation, repeat and window input remain
+unimplemented; successful type parsing must not activate keyboard input.
+
+Editor-only changes are routed by `td-builder ready` to this crate's tests
+and Clippy alongside the workspace Rust suite, whose tests validate every
+discovered crate's lock and manifest. Documentation-only changes keep the
+normal docs-only waiver. Neither runs bootstrap/image gates. This is valid while no
 recipe or workspace member consumes editor sources; builder regression tests
 guard that boundary. Adding an editor recipe or another consumer must update
 the routing and its guard in the same increment. A diff that also changes

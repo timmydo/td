@@ -739,8 +739,10 @@ or additional layout groups refuse keyboard activation with the exact item
 named. Includes are refused: no keymap file is loaded from the host. The
 whole map is validated before accepting text input. A later unsupported map
 cancels repeat and disables keyboard input while retaining documents and
-pointer/menu access. Limit the parser to 200,000 tokens, nesting depth 32,
-768 keycodes, 256 types and 16 levels per key/type; overflows refuse the map.
+pointer/menu access. Limit the text-v1 payload to 1 MiB including an optional
+single trailing NUL, with no interior NUL. Limit the parser to 200,000 tokens,
+nesting depth 32, 768 keycodes, 256 types, 24 virtual modifiers and 16 levels
+per key/type; overflows refuse the map.
 
 The initial translated set is ASCII printable text, Tab/Enter, navigation
 and editing keys, F1-F12 and the profile's shortcut keys. Caps affects letters;
@@ -752,6 +754,55 @@ The required independent-compositor fixture is Weston with its default US
 map; a serialized fixture and live input/pixel test must both pass before
 claiming host compatibility. Weston is a test environment, not a runtime or
 target build dependency.
+
+### Implemented type-table foundation
+
+`xkb::TypeCatalog` validates the bounded lexical envelope and compiles type
+tables, not whole keyboard semantics. It requires one self-contained
+`xkb_keymap` with unique keycodes, types, compatibility and symbols sections;
+optional geometry is lexically bounded and otherwise ignored. There is no
+file lookup or action execution. Comments and quoted names do not affect
+delimiter depth; supported string escapes are backslash, quote, `n`, `r`,
+and `t`. Other escapes, includes and malformed delimiters are diagnosed.
+
+Type names are arbitrary. A type's `modifiers`, `map`, `preserve` and
+`level_name` declarations compile to a lookup table. Missing matches select
+level zero; preserve-only entries imply level zero. Selection reports
+XKB-mode consumed masks (type mask minus the selected preserve mask), not
+GTK-mode consumption. Virtual declarations and explicit real encodings are
+collected across types, compatibility and symbols. The caller must supply
+the remaining bindings derived from the map; this API never guesses Alt or
+NumLock. Entries requiring unbound virtuals are inactive, not zero-mask
+matches. Numeric type masks are restricted to the eight predefined real
+bits; virtuals must be named, with explicit encodings allowed across all
+32 state bits. Distinct modifier expressions can resolve to the same mask
+(for example Alt and Meta sharing Mod1); the first declared active entry
+wins, including preserve-only entries, as in XKB. Duplicate definitions of
+the same expression and entries outside the declared modifier mask are
+refused. Keywords and named level prefixes are case-insensitive; quoted
+type names and virtual modifier names retain their case. Unsupported assignment
+fields on unused types are retained as named diagnostics and refuse only
+when that type is resolved. This parses compiled tables, not source-level
+type defaults, includes or merge operations.
+
+The keycode count and symbol-level bounds belong to the pending full-keymap
+compiler. Keycodes, aliases, symbols, groups, modifier assignments and
+compatibility interpretations are not yet semantically validated here.
+`TypeCatalog::parse` success is explicitly insufficient for keyboard
+activation. The existing window remains read-only and does not bind a seat.
+Confinement tests pin the absence of parser callers outside the two parser
+modules and of seat/keyboard bindings; full input integration must replace
+these temporary guards together with the activation validator.
+Next implement those semantics and logical chord translation, then add the
+audited keymap-descriptor consumer, focus/repeat handling and editable-window
+close safeguards. Do not wire partial validation to text input.
+
+`tests/fixtures/us.xkb` is a complete libxkbcommon-compiled evdev/pc105/US map
+with upstream license/provenance, not a captured Weston keymap. All 26 type
+tables are checked against independently generated libxkbcommon level and
+consumed-mask results for every real-mask combination. The td map is also
+read from its existing source for tests; no production compositor keyboard
+module is imported. These fixtures do not replace the live Weston test.
 
 ## `$EDITOR`, tmc, and td-jail
 
