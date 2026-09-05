@@ -2667,6 +2667,166 @@ fn run_shell(root: &Path, script: &str) -> i32 {
         .unwrap_or(1)
 }
 
+/// Run the cargo commands as one group per manifest — the workspace's and
+/// each crate's — several groups at a time. The commands were one serial
+/// list, and each cargo run left most of the machine idle: a crate's suite
+/// builds one crate and runs a few hundred tests, and there are nineteen of
+/// them after the workspace's. The groups are independent, each with its own
+/// target directory, so they run beside each other; within a group the order
+/// holds and the first failure ends it, since clippy after a failed test is
+/// noise, while every group runs to its end so one red crate does not hide
+/// another. The exit code is the first non-zero one in table order.
+///
+/// Output is captured per command and printed whole as each finishes, on
+/// stdout under a lock, so four builds cannot interleave line by line and a
+/// redirect keeps each block whole; a start line names each command as it
+/// begins so a long build is not a silent one. Each cargo gets a share of the
+/// run's build jobs through `CARGO_BUILD_JOBS` — the caller's count when it
+/// set one, the CPUs otherwise, split as `cargo_group_plan` says; the test
+/// harnesses still take every thread, and the kernel shares them.
+fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
+    let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for cmd in cmds {
+        let key = cmd_manifest_crate(cmd).map(str::to_string);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, list)) => list.push(cmd.clone()),
+            None => groups.push((key, vec![cmd.clone()])),
+        }
+    }
+    if groups.is_empty() {
+        return 0;
+    }
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let caller = std::env::var("CARGO_BUILD_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|j| *j > 0);
+    let (width, jobs) = cargo_group_plan(groups.len(), cpus, caller);
+    let jobs = jobs.to_string();
+    if groups.len() > 1 {
+        println!(
+            "affected-checks: {} cargo groups, {width} at a time, {jobs} build job(s) each{}",
+            groups.len(),
+            caller.map_or(String::new(), |t| format!(" (CARGO_BUILD_JOBS={t} for the run)"))
+        );
+    }
+    let next = AtomicUsize::new(0);
+    let codes: Vec<Mutex<Option<i32>>> = groups.iter().map(|_| Mutex::new(None)).collect();
+    // Serializes the REPORTING, not the work.
+    let pen = Mutex::new(());
+    std::thread::scope(|scope| {
+        for _ in 0..width {
+            let (next, codes, pen, groups, jobs) = (&next, &codes, &pen, &groups, &jobs);
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some((_, list)) = groups.get(i) else {
+                    return;
+                };
+                let mut code = 0;
+                for cmd in list {
+                    {
+                        let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
+                        println!("affected-checks: running: {cmd}");
+                    }
+                    let started = std::time::Instant::now();
+                    let (got, output) = run_shell_captured(root, cmd, jobs);
+                    {
+                        use std::io::Write;
+                        let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
+                        // One stream: banners and body together under one
+                        // redirect, and nothing for a CI runner that buffers
+                        // the two apart to reorder.
+                        let mut out = std::io::stdout().lock();
+                        let _ = writeln!(
+                            out,
+                            "================ {cmd} ({}s) ================",
+                            started.elapsed().as_secs()
+                        );
+                        let _ = out.write_all(&output);
+                        if !output.ends_with(b"\n") {
+                            let _ = writeln!(out);
+                        }
+                        let verdict = match got {
+                            0 => "PASS".to_string(),
+                            code => format!("FAIL (exit {code})"),
+                        };
+                        let _ = writeln!(out, "================ {cmd}: {verdict} ================");
+                        let _ = out.flush();
+                    }
+                    if got != 0 {
+                        code = got;
+                        break;
+                    }
+                }
+                if let Some(cell) = codes.get(i) {
+                    *cell.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
+                }
+            });
+        }
+    });
+    for cell in &codes {
+        // A group nothing reported is a group that did not run to its end,
+        // which is a failure, not a pass.
+        match cell.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            Some(0) => {}
+            Some(code) => return code,
+            None => return 1,
+        }
+    }
+    0
+}
+
+/// How many cargo groups run at once: a quarter of the CPUs, at least one
+/// and at most four, never more than there are groups, so none for none.
+/// Four concurrent builds is where a sixteen-thread host is kept busy
+/// without four rustc trees competing for its memory.
+fn cargo_group_width(groups: usize, cpus: usize) -> usize {
+    (cpus / 4).clamp(1, 4).min(groups)
+}
+
+/// The run's width and each cargo's build jobs. A caller's `CARGO_BUILD_JOBS`
+/// is the WHOLE run's: `affected-checks --run` reaches here through the
+/// per-user host, which sets that variable from the request's memory budget,
+/// and four cargos each taking the budget would be four budgets. So the width
+/// never exceeds the count, and the cargos split it, one job each at the
+/// least. A run without one takes the CPUs the same way. Nothing for no
+/// groups.
+fn cargo_group_plan(groups: usize, cpus: usize, caller_jobs: Option<usize>) -> (usize, usize) {
+    let width = cargo_group_width(groups, cpus);
+    if width == 0 {
+        return (0, 0);
+    }
+    let total = caller_jobs.filter(|j| *j > 0).unwrap_or(cpus).max(1);
+    let width = width.min(total);
+    (width, (total / width).max(1))
+}
+
+/// `run_shell` with the output captured rather than inherited, and cargo's
+/// job count set for a run that shares the machine. stderr is joined to
+/// stdout inside the shell, so the two keep their order — cargo's build
+/// lines before the tests they built — where two pipes read whole would put
+/// every diagnostic after every test. Piped, cargo sees no terminal and
+/// drops its colour, so it is asked for when the reader has one, unless the
+/// caller already decided.
+fn run_shell_captured(root: &Path, script: &str, jobs: &str) -> (i32, Vec<u8>) {
+    use std::io::IsTerminal;
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!("exec 2>&1\n{script}"))
+        .current_dir(root)
+        .env("CARGO_BUILD_JOBS", jobs)
+        .stdin(std::process::Stdio::null());
+    if std::io::stdout().is_terminal() && std::env::var_os("CARGO_TERM_COLOR").is_none() {
+        cmd.env("CARGO_TERM_COLOR", "always");
+    }
+    match cmd.output() {
+        Ok(out) => (out.status.code().unwrap_or(1), out.stdout),
+        Err(e) => (1, format!("could not run `{script}`: {e}\n").into_bytes()),
+    }
+}
+
 /// Single-quote a path for the bash `-c` string preflights run through. Refuses a
 /// path holding a single quote rather than guessing at an escape — the caller then
 /// runs without the variable instead of running a mis-quoted command.
@@ -3488,13 +3648,7 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
                     return 1;
                 }
             };
-            for cmd in cmds {
-                let code = run_shell(root, &cmd);
-                if code != 0 {
-                    return code;
-                }
-            }
-            0
+            run_cargo_groups(root, &cmds)
         }
         "net-test" => run_shell(
             root,
@@ -5583,6 +5737,75 @@ mod tests {
             full.contains("--manifest-path td-review/Cargo.toml -- --include-ignored"),
             "{full:?} lost td-review's declared test args"
         );
+    }
+
+    /// The cargo groups: one per manifest in table order, run to their end,
+    /// with the first non-zero exit in table order as the verdict, and no
+    /// group's output torn by another's. Real children, since the capture and
+    /// the concurrency are what can break.
+    #[test]
+    fn cargo_groups_run_every_group_and_report_the_first_failure_in_order() {
+        // The stand-ins run through `bash -c`, as the cargo lines do. The
+        // in-sandbox cargo-test gate has BusyBox `sh` and no bash, so there
+        // every stand-in would fail to spawn and the verdict would be a 1
+        // that proves nothing; the test says so and stops instead.
+        let bash = Command::new("bash")
+            .args(["-c", "true"])
+            .stdin(std::process::Stdio::null())
+            .status();
+        if !bash.is_ok_and(|s| s.success()) {
+            eprintln!("SKIP: no bash on PATH (the in-sandbox gate)");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("td-cargo-groups-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Removed however the assertions below end.
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rm = Rm(root.clone());
+        // Shell stand-ins for the cargo lines: the runner keys groups by the
+        // `--manifest-path <crate>/Cargo.toml` spelling and runs the text. The
+        // one on stderr proves the streams are joined in order.
+        let cmds = vec![
+            "echo ws-test; test -n \"$CARGO_BUILD_JOBS\"".to_string(),
+            // The sleep lands b's failure before a's in time, so the verdict
+            // below proves table order beats completion order.
+            "echo a-test --manifest-path a/Cargo.toml; sleep 0.2; exit 3".to_string(),
+            "echo b-test --manifest-path b/Cargo.toml".to_string(),
+            "echo ws-clippy".to_string(),
+            "echo a-clippy --manifest-path a/Cargo.toml; touch a-clippy-ran".to_string(),
+            "echo b-clippy --manifest-path b/Cargo.toml; touch b-clippy-ran; exit 5".to_string(),
+        ];
+        let code = run_cargo_groups(&root, &cmds);
+        // a's failure comes first in table order, so it is the verdict even
+        // though b failed too...
+        assert_eq!(code, 3);
+        // ...b still ran to its end, and a stopped at its first failure.
+        assert!(root.join("b-clippy-ran").is_file(), "every group runs to its end");
+        assert!(!root.join("a-clippy-ran").is_file(), "a group stops at its first failure");
+        assert_eq!(run_cargo_groups(&root, &["true".to_string()]), 0);
+        assert_eq!(run_cargo_groups(&root, &[]), 0);
+        let (got, out) = run_shell_captured(&root, "echo one; echo two >&2; echo three", "1");
+        assert_eq!(got, 0);
+        assert_eq!(String::from_utf8_lossy(&out), "one\ntwo\nthree\n");
+        assert_eq!(cargo_group_plan(20, 16, None), (4, 4));
+        assert_eq!(cargo_group_plan(2, 16, None), (2, 8));
+        assert_eq!(cargo_group_plan(20, 2, None), (1, 2));
+        assert_eq!(cargo_group_plan(20, 0, None), (1, 1));
+        assert_eq!(cargo_group_plan(0, 16, None), (0, 0));
+        // A caller's count is the run's, not each cargo's: the host's memory
+        // budget is what sets it.
+        assert_eq!(cargo_group_plan(20, 16, Some(2)), (2, 1));
+        assert_eq!(cargo_group_plan(20, 16, Some(7)), (4, 1));
+        assert_eq!(cargo_group_plan(20, 16, Some(12)), (4, 3));
+        assert_eq!(cargo_group_plan(20, 16, Some(1)), (1, 1));
+        assert_eq!(cargo_group_plan(1, 16, Some(2)), (1, 2));
+        assert_eq!(cargo_group_plan(20, 16, Some(0)), (4, 4));
     }
 
     /// A listing error must RED rather than come back short: the caller's loop
