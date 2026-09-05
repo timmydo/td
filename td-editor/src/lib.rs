@@ -5,6 +5,7 @@
 
 pub mod fill;
 pub mod keys;
+pub mod layout;
 pub mod model;
 pub mod replay;
 pub mod text;

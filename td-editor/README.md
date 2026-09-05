@@ -43,6 +43,16 @@ save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector
 reference. It also launches the real replay executable without a display.
 
+`src/layout.rs` adds an allocation-free visual-row and scalar-cell map:
+soft wrapping, tab widths, caret affinity, pixel hit testing, vertical/page
+motion calculation, and independent viewport scrolling. `tests/layout.rs`
+compares generated rows with an exhaustive scalar-vector reference, checks
+every interior cell pixel, and round-trips every caret boundary through hit
+testing. Use `Viewport::layout` to borrow validated model text with matching
+wrap geometry, and cache its metrics by revision and geometry. These are
+library APIs, not yet wired
+to interactive keys or replay; no window or drawing backend is claimed.
+
 Editor-only code/configuration changes are routed by `td-builder ready` to
 this crate's tests and Clippy, with the dependency-free lock checks retained.
 Documentation-only changes keep the normal docs-only waiver. Neither runs

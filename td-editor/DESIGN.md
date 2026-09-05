@@ -14,9 +14,12 @@ UTF-8/file-format conversion, scalar edits and selection, bounded tabs and
 undo/redo, save-snapshot state tracking, literal search/replace, paragraph
 filling, Auto Fill, and logical Windows/Emacs key dispatch. The core opens no
 files and reads no environment or clocks. File baselines/metadata, actual
-save I/O, layout/vertical motion, Wayland, GPU rendering, spelling and the
+save I/O, interactive vertical motion, Wayland, GPU rendering, spelling and the
 control socket are not implemented yet. Key bindings for those adapters
 produce explicit requests; replay does not pretend to perform their work.
+The allocation-free layout library supplies visual rows, glyph intervals,
+caret affinity, pixel hit testing, vertical/page-motion calculation and
+viewport scrolling. It is not yet connected to key dispatch or replay.
 
 The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
@@ -119,9 +122,63 @@ Up/Down move between visual rows, preserving a desired display column clamped
 to the target row; a hit inside a tab chooses the nearest endpoint, with
 ties before it.
 Home/End address logical lines. Page movement uses the current viewport's
-visible rows. Soft wrap is on by default and wraps at the last fitting space
-or tab, or at a scalar boundary if there is none; it inserts no bytes. Layout
+visible rows. Soft wrap is on by default and wraps at the last fitting
+non-leading space or tab, or at a scalar boundary if there is none; it
+inserts no bytes. Layout
 produces the single position map used for drawing, selection and hit testing.
+
+The layout library streams visual rows and their scalar-cell intervals from
+borrowed validated text; it allocates neither a full-document row index nor a
+per-scalar map. `Layout::new` validates at most 16 MiB of normalized text in
+linear time. `Layout::for_document` borrows the already-validated model in
+constant time; `Viewport::layout` additionally supplies its own wrap width.
+The UI uses that viewport constructor so wrap and drawing widths agree.
+Geometry is 1..=1,024 columns and 1..=512 rows (the 8,192-pixel axis ceiling
+at scale one); the future pixel adapter handles chrome, scale and clipping.
+Row scans, position lookup and vertical movement use constant auxiliary
+space and linear work in document length. The UI adapter must schedule or
+cache that work within its event-loop budget; this library is synchronous.
+`metrics()` computes row count and longest-row width, including the final
+caret cell, in one linear traversal. Cache metrics by document revision,
+wrap mode and column width, not per scroll/hit event. A cloned row iterator
+is a resumable checkpoint while its document borrow remains valid. Edits,
+mode changes and resize invalidate layout caches; recalculate metrics and
+clamp the viewport before reading its origin or drawing. Vertical motion
+currently makes up to two linear row scans; this is not a UI latency claim.
+
+All separators are retained. A separator selected as the soft-break point
+stays on the preceding row; a nonfitting separator starts the next row.
+The last fitting ASCII space/tab after a nonseparator on that visual row
+is used only when the next scalar would overflow. Leading whitespace alone
+is not a break opportunity: wrap it with subsequent text at a scalar boundary
+instead of creating an avoidable whitespace-only row. Exact-width EOF creates
+no extra row. A newline ends its row
+without occupying a cell, and a final newline creates an empty final row.
+Tab stops restart at each visual row. If a tab is wider than an empty row,
+it occupies that row alone at its full tab width, clipped by the renderer;
+layout always consumes at least one scalar. Other Unicode whitespace is
+ordinary one-cell text, not a wrap opportunity.
+
+A soft-wrap byte boundary has upstream (end of previous row) and downstream
+(start of next row) affinity. Both represent the same selection byte offset.
+Hit testing and vertical motion preserve the chosen visual side; ordinary
+byte-only cursor placement uses downstream affinity. The UI adapter must
+retain affinity and the desired column per tab, resetting them on nonvertical
+motion or edits. Hit testing uses unscaled font pixels and picks the nearest
+scalar endpoint, with midpoint ties before the scalar, including tabs.
+Vertical/page movement clamps to the first/last row; the desired column is
+retained through short rows. Scrolling clamps its first row so a full viewport
+is shown when possible. Revealing a caret minimally adjusts the origin;
+soft wrap always resets horizontal scrolling to zero.
+Resize preserves the origin before clamping to the new layout dimensions;
+invalid dimensions fail without changing the viewport. Horizontal scrolling
+in unwrapped mode clamps against the longest row plus its final caret cell.
+`caret_pixel` places the one-pixel caret at the row's top in unscaled
+viewport pixels. In soft-wrap mode an end position at or beyond the visible
+width (including an oversized tab) clamps to the last visible pixel column;
+its semantic byte/column and affinity do not change. Unwrapped offscreen
+carets are not drawn until revealed. The pointer adapter owns y-to-row
+translation, integer scaling and chrome offsets; `Row::hit_test` owns x.
 
 Files must be valid UTF-8, optionally starting with one UTF-8 BOM. Reject NUL,
 C0 controls other than Tab/LF/CR, DEL, and bare CR. Strip the initial BOM into
