@@ -1,7 +1,7 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
-//! Pure editor state. Adapters supply text, commands and save completions;
-//! this library opens no files, starts no threads and reads no global state.
+//! Safe editor state and explicit adapters. Only the window adapter accesses
+//! the environment, clock, filesystem and Wayland connection.
 
 pub mod fill;
 #[path = "../../td-compositor/src/font.rs"]
@@ -13,8 +13,13 @@ pub mod layout;
 pub mod model;
 pub mod render;
 pub mod replay;
+mod sys;
 pub mod text;
 pub mod ui;
+pub mod wayland;
+#[allow(dead_code, clippy::new_without_default)]
+#[path = "../../td-compositor/src/wire.rs"]
+mod wire;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

@@ -3,7 +3,7 @@
 This file is the normative record of every `unsafe` in td. It exists
 because the roster is the point: the value of writing these down is being
 able to count them and see each one's justification beside the others,
-which is exactly what stops a thirteenth being added quietly. Where this file
+which is exactly what stops another being added quietly. Where this file
 and the code disagree, one of them is a bug.
 
 ## The rule
@@ -14,7 +14,7 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are THIRTEEN
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are FOURTEEN
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
@@ -30,8 +30,10 @@ files through `/proc/self/fd` so no raw descriptor ownership escapes it. The
 thirteenth, `td-audio`, is back to the plain shape: one syscall-instruction
 layer, no descriptor adoption and no mapping, because the ALSA transfer mode
 it uses is `SNDRV_PCM_ACCESS_RW_INTERLEAVED` and that mode has none. It is
-also the only surface whose scoped `#[allow]` sits on the entry point ALONE
-and not on the module — see §13 for the escape a module-level one permits.
+the first surface to pin its allowance to the entry point rather than the
+module — see §13 for the escape a module-level one permits. The fourteenth,
+`td-editor`, also uses function-level allowances: one syscall instruction and
+one adoption site for freshly installed descriptors, with no mapping.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -66,6 +68,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the private Wayland client's bounded descriptor transfer |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
+| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`; plus one scoped descriptor adoption |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -1949,3 +1952,60 @@ literal and constants declared under the
 `SNDRV_CTL` names. A fourth syscall, a twelfth request, a second socket
 option, a second scoped allowance, or any descriptor adoption is an
 amendment here and in `APPLICATIONS.md` §K in the same landing.
+
+## 14. `td-editor` — the read-only Wayland preview
+
+The editor's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
+function-scoped instruction: `recvmsg` (47), `sendmsg` (46), and `fcntl` (72).
+A second function-scoped allowance adopts newly installed nonnegative
+descriptors into `OwnedFd`. Safe `std` owns connection setup, byte-only sends,
+timeouts, file creation/unlinking, positional pixel writes, and every close.
+No raw pointer or unowned received descriptor escapes this private module.
+Other architectures are refused at compile time rather than inheriting its
+ABI. The core, layout, renderer and controller still have no raw boundary.
+
+`fcntl` is pinned to `F_DUPFD_CLOEXEC` (1030), minimum descriptor 3. Its only
+production caller duplicates the borrowed descriptor from `WAYLAND_SOCKET`;
+it never adopts or closes that original. The kernel's successful returned
+descriptor is adopted once and converted to `UnixStream`, then checked with
+safe `peer_addr`. Duplication works for sockets, where reopening procfs does
+not. The original remains open until its existing owner or process exit
+closes it. This mode requires exclusive use of the inherited stream; socket
+timeouts are shared with the original. Failed duplication adopts nothing.
+
+The one receive caller is the window connection. `recvmsg` always requests
+`MSG_CMSG_CLOEXEC` (0x40000000), with one borrowed byte slice and 128 aligned
+ancillary bytes. The bounded walk adopts every recognizable nonnegative
+`SOL_SOCKET` (1) / `SCM_RIGHTS` (1) descriptor before checking truncation or
+policy, continuing past unknown records and invalid descriptor entries while
+record boundaries remain trustworthy. A broken boundary stops the walk;
+Linux supplies conforming framing and closes rights that do not fit. Both
+truncation and every nonempty ancillary result are refused after ownership
+has been established, so drops close all delivered descriptors. This preview
+does not bind a seat and has no descriptor-bearing incoming event or retained
+descriptor queue. A test-only reader retains the same owned results to inspect
+the pool sent by the real transport. Adding keyboard/clipboard fd consumers
+requires an amendment, not a relaxation of this refusal.
+
+The only production send caller is the connection's pool-request path.
+`sendmsg` carries exactly one borrowed `File` in a 24-byte ancillary extent,
+`cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies only its
+unlinked 0600 regular SHM backing file. `MSG_NOSIGNAL` (0x4000) makes peer loss
+an error. A successful short write transfers the descriptor once; only the
+remaining ordinary bytes are retried. Interrupted calls transfer nothing.
+The complete message has one five-second write deadline, including retries.
+
+Confinement tests derive the local source inventory from the directory and
+pin the only three shared paths (font, font data, wire codec), per-file keyword
+counts without prose slack, function-only allowances, the complete raw source
+fingerprint, syscall values and all production wrapper call sites. Conditional
+allowances, additional include paths, nested source directories and generated
+source includes are refused. Kernel tests exercise transfer, close-on-exec
+duplication, refusal cleanup and truncated rights; a byte-level synthetic
+control test checks cleanup beyond unrecognized records and invalid entries.
+
+No mmap, ioctl, GPU access, poll, close syscall, credential call, child exec,
+raw environment-fd adoption or received-fd consumer is authorized here. A
+fourth syscall, another fcntl command, another caller, incoming descriptor
+consumer, or additional allowance amends this section and
+`td-editor/DESIGN.md` in the same landing.

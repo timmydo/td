@@ -14,8 +14,8 @@ UTF-8/file-format conversion, scalar edits and selection, bounded tabs and
 undo/redo, save-snapshot state tracking, literal search/replace, paragraph
 filling, Auto Fill, and logical Windows/Emacs key dispatch. The core opens no
 files and reads no environment or clocks. File baselines/metadata, actual
-save I/O, Wayland, GPU rendering, spelling and the control socket are not
-implemented yet. Key bindings for those adapters
+save I/O, interactive Wayland input, GPU rendering, spelling and the
+control socket are not implemented yet. Key bindings for those adapters
 produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
 caret affinity, pixel hit testing, vertical/page-motion calculation and
@@ -25,7 +25,9 @@ The safe reference renderer streams bitmap scene operations into a
 caller-owned XRGB8888 buffer. `--preview` emits a fixed headless PPM fixture;
 it is not an interactive window. Menus and status are drawn; tab clicks select
 tabs and close marks emit typed requests, but visible menus/dialogs and the
-Wayland transport and buffer ownership remain future work.
+interactive adapters remain future work. `--window-preview` now presents a
+read-only fixture through the real Wayland transport and SHM buffer lifecycle.
+It does not accept keyboard or pointer input and cannot open user documents.
 
 The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
@@ -627,6 +629,78 @@ must select editor tests in affected-checks. A future move of a shared file
 updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
+
+### Implemented presentation-only adapter
+
+`--window-preview` is an explicit read-only milestone, not the usable-editor
+milestone below. It opens one 800x600 scale-1 xdg toplevel, renders two clean
+fixture tabs through `ui::Controller` and the reference renderer, and follows
+configure changes. The title and fixture identify the mode; menus, tabs and
+close marks are drawing only. No seat is bound, so there is no keymap or input
+translation claim. Close is handled by the compositor's window-management
+action; terminal Ctrl+C also ends the process. Neither path can lose user text.
+The binary still refuses filenames and ordinary `$EDITOR` invocation.
+
+The adapter shares `td-compositor/src/wire.rs` without copying it. That sixth
+shared input must be staged beside the five font/license inputs when the
+future source recipe is added. Only this adapter reads the environment or
+uses files and clocks; the core's explicit-input contract is unchanged.
+
+It binds only compositor v4, SHM v1 and xdg shell v1, requiring those minimum
+versions and capping higher advertisements. Unknown globals are ignored,
+subject to 128 live registry entries and 256 bytes per interface name.
+Client IDs are dense in a 128-slot table and are reused only after delete_id;
+object exhaustion produces a diagnostic. A 16 KiB read buffer feeds a 128 KiB
+pending-byte budget and at most 256 messages are processed before checking
+redraw/close again. Invalid events and required-global removal disconnect
+with a diagnostic. The first buffer must be submitted within 20 seconds of
+the initial registry requests; connect separately has a five-second deadline.
+After submission a hidden surface may wait indefinitely for a frame callback;
+callback delivery is not a compositor-liveness requirement.
+One bounded connect worker owns a path connection attempt and drops any late
+result. Each outgoing message has a five-second absolute write deadline,
+capped by the remaining startup deadline until the first commit. Temporary
+backpressure retries within that deadline. Reads also use the remaining
+startup budget. The idle reader uses a 100 ms socket timeout or elapsed-time
+backoff for an inherited nonblocking socket, without changing shared flags.
+
+The controller receives complete acknowledged configure sizes: zero axes
+retain the previous configured axis even while a frame is outstanding.
+Dimensions must fit `Geometry`'s 8192-axis/32 MiB limits. Configure batches
+are coalesced before painting; a complete repaint is sent behind at most one
+frame callback. Callback completion does not release a buffer. Three backing
+files at most remain live, each at most 32 MiB. A free matching buffer is
+preferred; otherwise a free wrong-size buffer is destroyed and replaced.
+Busy old-size buffers
+remain immutable until release. When all three are busy, only the latest
+configured geometry is retained for the next free slot. One scratch raster
+allocation is reused. This is CPU SHM presentation, not GPU rendering.
+
+Pool files use `create_new`, mode 0600, in Rust's temporary directory (TMPDIR
+or `/tmp`); a checked process-local serial and 64 collision attempts bound
+name creation. They are unlinked immediately, then sized and written only
+through the owned `File`. An unlink failure reports the exact residual name.
+No mmap, host library or persistent font/file lookup is involved.
+
+The raw boundary is `UNSAFE.md` §14: only sendmsg, recvmsg and
+F_DUPFD_CLOEXEC, with one syscall site and one owned-descriptor adoption site.
+`WAYLAND_SOCKET` takes precedence and is duplicated close-on-exec, not adopted
+directly; its borrowed original is never closed by the adapter and stays open
+until its owner or process exit closes it. The caller must give the adapter
+exclusive use of the stream because socket timeouts are shared. Otherwise an
+absolute WAYLAND_DISPLAY works without XDG_RUNTIME_DIR, and a relative display
+(default `wayland-0`) is joined to an absolute XDG_RUNTIME_DIR. Invalid explicit
+socket values fail without trying another display. Every incoming descriptor
+is closed and refused: this mode binds no descriptor-bearing event. Keyboard
+and clipboard ownership must extend the roster before enabling those consumers.
+
+Automated socket tests inspect the actual received pool descriptor and pixels,
+exercise fragmented events, ping/close, version/ID limits, both release/callback
+orders and resize storms. The opt-in Weston test waits for a callback from the
+real compositor after the real reference buffer commit. It proves presentation,
+not keyboard, compositor screenshots, GPU rendering or td-jail integration.
+
+### Version-1 compatibility target
 
 Use core `wl_compositor`, `wl_shm`, `wl_seat`, and `xdg_wm_base`; clipboard
 uses core `wl_data_device_manager` version 3 when available. Bind

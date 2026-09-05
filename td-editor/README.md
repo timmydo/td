@@ -22,7 +22,8 @@ scalar edits and selection, tabs, bounded undo/redo with saved-state tracking,
 literal search/replace, paragraph filling and Auto Fill. Logical Windows and
 Emacs keys share those commands. The controller also handles visual navigation
 and pointer selection. Dialogs, clipboard, spelling and actual file I/O produce
-an explicit adapter request. No Wayland window, GPU renderer, filesystem
+an explicit adapter request. A read-only Wayland preview is available; no
+interactive window input, GPU renderer, filesystem
 Open/Save, remote socket or tmc integration is claimed yet. Do not set
 `$EDITOR` to this binary yet.
 
@@ -76,9 +77,35 @@ td-editor/target/release/td-editor --font-license
 The first command writes a binary P6 PPM fixture, not an interactive window;
 use a PPM-capable image viewer. The second prints the embedded font provenance
 and complete notices. This backend performs CPU rasterization and does not
-yet allocate Wayland shared-memory buffers or use a GPU. Building from source
+use a GPU. Building from source
 currently needs the full td checkout for the shared modules and license data;
 the resulting executable does not need an installed td system.
+
+Try the actual window from a terminal in your Linux x86-64 Wayland session:
+
+```text
+td-editor/target/release/td-editor --window-preview
+```
+
+It shows a fixed read-only document and follows window-manager resizing.
+Keyboard, pointer, menus and file editing are not connected yet. Close it
+through your window manager or press Ctrl+C in the launching terminal.
+This tests presentation, not a usable `$EDITOR`. No td compositor, GPU node,
+libwayland, toolkit or installed font is needed. The normal WAYLAND_DISPLAY,
+XDG_RUNTIME_DIR and inherited WAYLAND_SOCKET conventions are supported.
+The latter is borrowed and duplicated; give this process exclusive use of it.
+Temporary SHM files are private, immediately unlinked, and bounded to three
+buffers; busy buffers are never overwritten before compositor release.
+
+An optional test runs against a separately launched Weston (not a dependency
+of the editor). Set the socket to your isolated test instance:
+
+```text
+TD_EDITOR_TEST_WAYLAND=/absolute/path/to/weston-socket cargo test --frozen --manifest-path td-editor/Cargo.toml weston_presents_the_reference_buffer -- --ignored
+```
+
+This waits for actual frame completion. The ordinary tests need no display
+and check transferred pool pixels and lifecycle behavior with Unix sockets.
 
 Editor-only code/configuration changes are routed by `td-builder ready` to
 this crate's tests and Clippy, with the dependency-free lock checks retained.
