@@ -741,8 +741,10 @@ whole map is validated before accepting text input. A later unsupported map
 cancels repeat and disables keyboard input while retaining documents and
 pointer/menu access. Limit the text-v1 payload to 1 MiB including an optional
 single trailing NUL, with no interior NUL. Limit the parser to 200,000 tokens,
-nesting depth 32, 768 keycodes, 256 types, 24 virtual modifiers and 16 levels
-per key/type; overflows refuse the map.
+nesting depth 32, 768 keycode names including aliases, 256 types, 24 virtual
+modifiers, 16 levels per key/type, 1024 compatibility interpretations and
+1536 modifier-map targets; overflows refuse the map. Sparse keycode values
+do not allocate a dense table.
 
 The initial translated set is ASCII printable text, Tab/Enter, navigation
 and editing keys, F1-F12 and the profile's shortcut keys. Caps affects letters;
@@ -755,7 +757,7 @@ map; a serialized fixture and live input/pixel test must both pass before
 claiming host compatibility. Weston is a test environment, not a runtime or
 target build dependency.
 
-### Implemented type-table foundation
+### Implemented keyboard compiler
 
 `xkb::TypeCatalog` validates the bounded lexical envelope and compiles type
 tables, not whole keyboard semantics. It requires one self-contained
@@ -770,9 +772,10 @@ Type names are arbitrary. A type's `modifiers`, `map`, `preserve` and
 level zero; preserve-only entries imply level zero. Selection reports
 XKB-mode consumed masks (type mask minus the selected preserve mask), not
 GTK-mode consumption. Virtual declarations and explicit real encodings are
-collected across types, compatibility and symbols. The caller must supply
-the remaining bindings derived from the map; this API never guesses Alt or
-NumLock. Entries requiring unbound virtuals are inactive, not zero-mask
+collected across types, compatibility and symbols. `keyboard::Keymap` supplies
+the remaining bindings derived from the map; neither API guesses Alt or
+NumLock. Explicit encodings are ORed with implicit modifier-map bindings.
+Entries requiring unbound virtuals are inactive, not zero-mask
 matches. Numeric type masks are restricted to the eight predefined real
 bits; virtuals must be named, with explicit encodings allowed across all
 32 state bits. Distinct modifier expressions can resolve to the same mask
@@ -785,22 +788,78 @@ fields on unused types are retained as named diagnostics and refuse only
 when that type is resolved. This parses compiled tables, not source-level
 type defaults, includes or merge operations.
 
-The keycode count and symbol-level bounds belong to the pending full-keymap
-compiler. Keycodes, aliases, symbols, groups, modifier assignments and
-compatibility interpretations are not yet semantically validated here.
-`TypeCatalog::parse` success is explicitly insufficient for keyboard
-activation. The existing window remains read-only and does not bind a seat.
-Confinement tests pin the absence of parser callers outside the two parser
-modules and of seat/keyboard bindings; full input integration must replace
-these temporary guards together with the activation validator.
-Next implement those semantics and logical chord translation, then add the
-audited keymap-descriptor consumer, focus/repeat handling and editable-window
-close safeguards. Do not wire partial validation to text input.
+`keyboard::Keymap::parse` compiles keycodes, aliases, symbols, real modifier
+maps and compatibility interpretations from the same token stream. Keycodes
+are XKB numbers, at least eight; lookup and translation take Wayland/evdev
+numbers and add eight with checked arithmetic. Duplicate names/codes, alias
+cycles or missing targets, duplicate symbol definitions, conflicting real
+modifier assignments and out-of-range declared keycodes are refused. An
+indirect modifier-map keysym selects the lowest retained level, then lowest
+keycode, after type normalization.
+Explicit key types have arbitrary names. Absent types use XKB's standard
+one/two/four-level inference rules for ASCII case and keypad symbols; the
+selected declaration supplies the semantics, not a hardcoded type table.
+Symbols are truncated or padded with NoSymbol to that type's level count.
+
+Interpretations match specific keysyms before wildcard symbols, then
+Exactly, AllOf, NoneOf, AnyOf and AnyOfOrNone predicates, preserving source
+order for equal priority. Identical headers are refused rather than applying
+source merge operations. Ordered interpretation/key defaults, explicit key
+repeat and explicit key virtual-modifier assignments are supported. At higher
+levels, `useModMapMods=level1` predicates test an empty modmap; matching
+actions still use the key's real map for their `modMapMods` operand. Those
+higher-level matches do not add virtual bindings. Other implicit virtual
+bindings OR the matched keys' real modifier maps. NoSymbol does not match
+interpretations. Repeat comes from the first
+level's winning interpretation, or defaults to true for a nonempty first
+symbol and false for NoSymbol; an explicit key repeat value wins.
+
+SetMods, LatchMods and LockMods operands identify the logical Shift, Caps,
+Control, Alt/Meta and NumLock masks. Without a modifier action, the key's
+real assignment supplies its role. Actions are never executed. Ambiguous
+overlapping role masks, high-bit role encodings, explicit actions on used
+keys and unsupported modifier-key actions are refused. Compatibility actions
+for non-modifier keys, such as server VT switching, cannot become editor
+commands. RedirectKey is refused anywhere. A used key means one with a real
+modifier assignment or a supported text/command/modifier symbol after type
+normalization. Every handled real-mask combination is validated on used keys.
+Unsupported properties on unused keys/types do not activate them. Only one
+symbol per level and one layout group are admitted; malformed declarations,
+source merge operations and unsupported section-level syntax are refused.
+
+`lookup` reports selected symbol identity, level, consumed mask and repeat
+eligibility; unknown numeric vocabulary remains named. `translate` returns a
+logical chord or an ignored-key result. The supplied depressed, latched and
+locked masks are unioned without mutating state; nonzero groups and bits
+outside the derived profile are diagnosed. These event-local refusals have
+typed `InputError::UnsupportedState` and `UnsupportedSymbol` outcomes,
+distinct from compilation diagnostics; adapters report and ignore that event
+without disabling the validated map. Unknown/overflowing key numbers are
+ignored before state admission. The key iterator also uses evdev numbers.
+Unconsumed XKB real Lock (mask 2) uppercases ASCII letters after type
+selection, regardless of which key/action sets it. A remapped Caps role is
+admitted for type selection but does not invent a new capitalization rule.
+Consumed Control/Alt do not become shortcuts;
+preserved modifiers do. Alphabetic shortcuts normalize case and retain real
+Shift intent (`C-S-s`), without treating Caps Lock as Shift. ISO_Left_Tab
+produces `S-Tab`; keypad digits/operators become ASCII and keypad navigation
+becomes its ordinary command. F13-F35, system/media keysyms and unsupported
+function-key system-action levels are ignored. Other out-of-profile symbols
+are diagnosed on use, never substituted with physical US text.
+
+`TypeCatalog::parse` alone remains insufficient for keyboard activation.
+The existing window remains read-only and does not bind a seat. Confinement
+tests pin the absence of compiler callers outside its six modules and of
+seat/keyboard bindings. Next add the audited keymap-descriptor consumer,
+focus/repeat scheduling and editable-window close safeguards, replacing these
+temporary guards together. Repeat metadata is not a timer or held-key state.
 
 `tests/fixtures/us.xkb` is a complete libxkbcommon-compiled evdev/pc105/US map
 with upstream license/provenance, not a captured Weston keymap. All 26 type
 tables are checked against independently generated libxkbcommon level and
-consumed-mask results for every real-mask combination. The td map is also
+consumed-mask results for every real-mask combination. Another independent
+oracle checks 106 US keys' levels, keysyms, consumed masks and repeat flags
+across all 32 supported real-mask states. The td map is also
 read from its existing source for tests; no production compositor keyboard
 module is imported. These fixtures do not replace the live Weston test.
 

@@ -1,6 +1,7 @@
 //! Bounded lexical structure for self-contained XKB text; no file lookups.
 
 use crate::xkb::{Diagnostic, Result};
+use std::collections::BTreeMap;
 
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_TOKENS: usize = 200_000;
@@ -327,6 +328,82 @@ pub(crate) fn index<'a, 's>(tokens: &'a [Token<'s>]) -> Result<&'a [Token<'s>]> 
         _ => Err(tokens.first().map_or_else(
             || error("expected indexed field"),
             |t| t.error("expected indexed field"),
+        )),
+    }
+}
+
+pub(crate) fn group<'a, 's>(
+    tokens: &'a [Token<'s>],
+    open: &str,
+    close: &str,
+) -> Result<&'a [Token<'s>]> {
+    match (tokens.first(), tokens.last()) {
+        (Some(first), Some(last))
+            if first.is(open) && last.is(close) && first.span == tokens.len() =>
+        {
+            tokens
+                .get(1..tokens.len() - 1)
+                .ok_or_else(|| error("missing group contents"))
+        }
+        _ => Err(tokens
+            .first()
+            .map_or_else(|| error("expected group"), |t| t.error("expected group"))),
+    }
+}
+
+pub(crate) type Sections<'a, 's> = BTreeMap<&'static str, &'a [Token<'s>]>;
+
+pub(crate) fn sections<'a, 's>(tokens: &'a [Token<'s>]) -> Result<Sections<'a, 's>> {
+    let mut outer = statements(tokens)?;
+    let map = outer.next().ok_or_else(|| error("missing xkb_keymap"))?;
+    if outer.next().is_some() {
+        return Err(error("expected one xkb_keymap"));
+    }
+    let (header, body) = block(map)?;
+    named_header(header, "xkb_keymap")?;
+    let mut sections = BTreeMap::new();
+    for statement in statements(body)? {
+        let (header, body) = block(statement)?;
+        let first = header.first().ok_or_else(|| error("missing section"))?;
+        let name = [
+            "xkb_keycodes",
+            "xkb_types",
+            "xkb_compatibility",
+            "xkb_symbols",
+            "xkb_geometry",
+        ]
+        .into_iter()
+        .find(|name| first.is(name))
+        .ok_or_else(|| first.error("unsupported keymap section"))?;
+        named_header(header, name)?;
+        if sections.insert(name, body).is_some() {
+            return Err(first.error("duplicate keymap section"));
+        }
+    }
+    for name in [
+        "xkb_keycodes",
+        "xkb_types",
+        "xkb_compatibility",
+        "xkb_symbols",
+    ] {
+        if !sections.contains_key(name) {
+            return Err(Diagnostic {
+                offset: 0,
+                item: name.to_owned(),
+                reason: "missing required section",
+            });
+        }
+    }
+    Ok(sections)
+}
+
+fn named_header(header: &[Token<'_>], name: &str) -> Result<()> {
+    match header {
+        [kind] if kind.is(name) => Ok(()),
+        [kind, label] if kind.is(name) => label.string().map(|_| ()),
+        _ => Err(header.first().map_or_else(
+            || error("missing block header"),
+            |t| t.error("unsupported block header"),
         )),
     }
 }

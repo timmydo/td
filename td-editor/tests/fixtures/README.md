@@ -46,7 +46,39 @@ reproduce it with libxkbcommon's public API:
 The real encodings reported by `xkbcli compile-keymap --from-xkb us.xkb
 --modmaps` are NumLock=16, Alt=8, LevelThree=128, Super=64, LevelFive=32,
 Meta=8 and Hyper=32; ScrollLock has explicit encoding 32768. Tests supply
-these fixture-derived bindings to the type resolver. Deriving them from
-compatibility interpretations and modifier assignments is not implemented
-by this increment. Separate tests deliberately move Alt and NumLock to
-different masks to ensure the resolver does not guess their encodings.
+these fixture-derived bindings to the isolated type resolver. The complete
+keyboard compiler independently derives them from compatibility and modifier
+maps. Separate tests deliberately move shortcut masks to ensure the compiler
+does not guess their encodings.
+
+## Independent key oracle
+
+`us-keys.tsv` records libxkbcommon 1.13.1 results for 106 XKB keycodes:
+9 through 91, 94 through 96, 104 through 119, 125, 127, 133 and 134.
+Each line is the decimal XKB code, a tab, and a 64-bit FNV-1a digest.
+Compile the unchanged `us.xkb` with `xkb_keymap_new_from_string`, text
+format 1, no flags, and create an `xkb_state`. For each key, in ascending
+mask order 0 through 31 (Shift, Lock, Control, Mod1 and Mod2), call
+`xkb_state_update_mask(state, mask, 0, 0, 0, 0, 0)`. Hash these four values
+as little-endian u32, using the offset/multiplier above:
+
+1. `xkb_state_key_get_level(state, code, 0)`.
+2. `xkb_state_key_get_one_sym(state, code)`.
+3. `xkb_state_key_get_consumed_mods2(state, code, XKB_CONSUMED_MODE_XKB)`.
+4. `xkb_keymap_key_repeats(keymap, code)` (0 or 1).
+
+Normalize only XF86 values `0x10080000..=0x1008ffff` to `0xffffffff` in
+step 2: the editor retains those names without a numeric vocabulary and
+ignores their events. Tests separately require those named results to start
+with XF86 and produce no chord. No other unknown symbol is normalized.
+This covers ordinary text, modifiers, keypad, navigation and function keys,
+not every extra key declared by evdev. No libxkbcommon library is linked or
+invoked by the tests. Additional direct reference probes pin NoSymbol's
+absence of implicit repeat and interpretation matching, post-type Lock
+capitalization, interpretation predicate priority and first-declared ties.
+Higher-level `useModMapMods=level1` probes use `xkb_state_update_key` after
+setting Shift: AnyOfOrNone/NoneOf still supply the declared modifier action
+while adding no virtual binding. An explicit Mod3 action sets Mod3; a
+modMapMods operand uses the key's actual map. Additional probes cover
+indirect modmap lookup after type truncation, trailing NoSymbol trimming,
+swapped-case TWO_LEVEL inference and AnyOfOrNone on a disjoint real mask.

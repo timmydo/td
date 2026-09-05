@@ -250,11 +250,14 @@ fn explicit_virtual_encodings_and_binding_diagnostics() {
         catalog.resolve("custom", &[]).unwrap().select(0x8000).level,
         1
     );
-    assert!(catalog
-        .resolve("custom", &[VirtualBinding { name: "V", mask: 1 }])
-        .unwrap_err()
-        .reason
-        .contains("explicit"));
+    assert_eq!(
+        catalog
+            .resolve("custom", &[VirtualBinding { name: "V", mask: 1 }])
+            .unwrap()
+            .select(0x8001)
+            .level,
+        1
+    );
     assert_eq!(
         catalog
             .resolve(

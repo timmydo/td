@@ -8,6 +8,7 @@ pub mod fill;
 pub mod font;
 #[path = "../../td-compositor/src/font_data.rs"]
 mod font_data;
+pub mod keyboard;
 pub mod keys;
 pub mod layout;
 pub mod model;
@@ -21,6 +22,9 @@ pub mod wayland;
 #[path = "../../td-compositor/src/wire.rs"]
 mod wire;
 pub mod xkb;
+mod xkb_compat;
+mod xkb_keys;
+mod xkb_symbols;
 mod xkb_syntax;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

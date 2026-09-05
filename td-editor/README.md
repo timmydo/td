@@ -107,15 +107,17 @@ TD_EDITOR_TEST_WAYLAND=/absolute/path/to/weston-socket cargo test --frozen --man
 This waits for actual frame completion. The ordinary tests need no display
 and check transferred pool pixels and lifecycle behavior with Unix sockets.
 
-`src/xkb.rs` and `xkb_syntax.rs` provide the next keyboard foundation:
-bounded text-v1 lexical parsing and table-driven type selection, including
-virtual-mask bindings and preserved modifiers. Tests cover the td map and
-all 26 types of a compiled ordinary US map, with libxkbcommon-derived results
-for all 256 real-modifier combinations. The fixture's provenance and oracle
-procedure are in [tests/fixtures/README.md](tests/fixtures/README.md).
-This is not a complete keymap validator or key-event translator. Compatibility
-interpretations, keycode/symbol compilation, repeat and window input remain
-unimplemented; successful type parsing must not activate keyboard input.
+`src/keyboard.rs` and the `xkb*` modules compile bounded, self-contained XKB
+text-v1 maps into deterministic logical chords. Keycode aliases, symbols,
+table-driven types, modifier maps and compatibility interpretations supply
+level selection, virtual masks, consumed/preserved modifiers and repeat
+eligibility. Tests cover the td map, all 26 types of a compiled ordinary US
+map across 256 real-modifier combinations, and 106 US keys across the 32
+supported states using independent libxkbcommon results. Fixture provenance
+and oracle procedures are in [tests/fixtures/README.md](tests/fixtures/README.md).
+This is a library compiler and translator, not connected window input.
+Keymap descriptor handling, focus/held-key state and repeat scheduling remain
+pending. The read-only preview and `$EDITOR` warning above still apply.
 
 Editor-only changes are routed by `td-builder ready` to this crate's tests
 and Clippy alongside the workspace Rust suite, whose tests validate every

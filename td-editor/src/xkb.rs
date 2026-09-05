@@ -97,7 +97,7 @@ pub struct TypeCatalog {
     types: BTreeMap<String, Type>,
 }
 
-/// Real-mask encoding derived by a future keymap compiler from modifier_map
+/// Real-mask encoding derived by the keymap compiler from modifier_map
 /// and compatibility interpretations, not a fixed Alt/NumLock bit guess.
 #[derive(Clone, Copy, Debug)]
 pub struct VirtualBinding<'a> {
@@ -141,50 +141,10 @@ impl ResolvedType {
 impl TypeCatalog {
     pub fn parse(source: &str) -> Result<Self> {
         let tokens = syntax::lex(source)?;
-        let mut outer = syntax::statements(&tokens)?;
-        let map = outer
-            .next()
-            .ok_or_else(|| syntax::error("missing xkb_keymap"))?;
-        if outer.next().is_some() {
-            return Err(syntax::error("expected one xkb_keymap"));
-        }
-        let (header, body) = syntax::block(map)?;
-        named_header(header, "xkb_keymap")?;
-        let mut sections = BTreeMap::new();
-        for statement in syntax::statements(body)? {
-            let (header, body) = syntax::block(statement)?;
-            let first = header
-                .first()
-                .ok_or_else(|| syntax::error("missing section"))?;
-            let name = [
-                "xkb_keycodes",
-                "xkb_types",
-                "xkb_compatibility",
-                "xkb_symbols",
-                "xkb_geometry",
-            ]
-            .into_iter()
-            .find(|name| first.is(name))
-            .ok_or_else(|| first.error("unsupported keymap section"))?;
-            named_header(header, name)?;
-            if sections.insert(name, body).is_some() {
-                return Err(first.error("duplicate keymap section"));
-            }
-        }
-        for name in [
-            "xkb_keycodes",
-            "xkb_types",
-            "xkb_compatibility",
-            "xkb_symbols",
-        ] {
-            if !sections.contains_key(name) {
-                return Err(Diagnostic {
-                    offset: 0,
-                    item: name.to_owned(),
-                    reason: "missing required section",
-                });
-            }
-        }
+        Self::from_sections(&syntax::sections(&tokens)?)
+    }
+
+    pub(crate) fn from_sections(sections: &syntax::Sections<'_, '_>) -> Result<Self> {
         let mut catalog = Self {
             virtuals: BTreeMap::new(),
             types: BTreeMap::new(),
@@ -227,8 +187,19 @@ impl TypeCatalog {
         self.types.keys().map(String::as_str)
     }
 
+    pub(crate) fn levels(&self, name: &str) -> Option<usize> {
+        self.types.get(name).map(|typ| typ.levels)
+    }
+
+    pub(crate) fn virtuals(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.virtuals
+            .iter()
+            .map(|(name, modifier)| (name.as_str(), modifier.encoding.unwrap_or(0)))
+    }
+
     /// Unbound virtuals deactivate entries that require them; they must not
-    /// collapse into a base-level entry. Explicit encodings cannot be replaced.
+    /// collapse into a base-level entry. Supplied implicit bindings are ORed
+    /// with explicit encodings; they cannot remove explicit bits.
     /// Unsupported unused types are retained but refuse resolution by name.
     pub fn resolve(&self, name: &str, supplied: &[VirtualBinding<'_>]) -> Result<ResolvedType> {
         let typ = self.types.get(name).ok_or_else(|| Diagnostic {
@@ -244,17 +215,11 @@ impl TypeCatalog {
         }
         let mut bindings: BTreeMap<&str, u32> = BTreeMap::new();
         for binding in supplied {
-            let declaration = self.virtuals.get(binding.name).ok_or_else(|| Diagnostic {
+            self.virtuals.get(binding.name).ok_or_else(|| Diagnostic {
                 offset: typ.offset,
                 item: binding.name.to_owned(),
                 reason: "undeclared virtual binding",
             })?;
-            if declaration
-                .encoding
-                .is_some_and(|mask| mask != binding.mask)
-            {
-                return Err(typ.error("binding conflicts with explicit virtual encoding"));
-            }
             if bindings.insert(binding.name, binding.mask).is_some() {
                 return Err(typ.error("duplicate virtual binding"));
             }
@@ -265,10 +230,8 @@ impl TypeCatalog {
             .map(|(name, declaration)| {
                 (
                     declaration.bit,
-                    declaration
-                        .encoding
-                        .or_else(|| bindings.get(name.as_str()).copied())
-                        .unwrap_or(0),
+                    declaration.encoding.unwrap_or(0)
+                        | bindings.get(name.as_str()).copied().unwrap_or(0),
                 )
             })
             .collect();
@@ -428,17 +391,6 @@ impl TypeCatalog {
     }
 }
 
-fn named_header(header: &[Token<'_>], name: &str) -> Result<()> {
-    match header {
-        [kind] if kind.is(name) => Ok(()),
-        [kind, label] if kind.is(name) => label.string().map(|_| ()),
-        _ => Err(header.first().map_or_else(
-            || syntax::error("missing block header"),
-            |t| t.error("unsupported block header"),
-        )),
-    }
-}
-
 fn terms<'a, 's>(tokens: &'a [Token<'s>]) -> Result<impl Iterator<Item = &'a Token<'s>>> {
     if tokens.is_empty() || tokens.len().is_multiple_of(2) {
         return Err(syntax::error("expected modifier sum"));
@@ -451,7 +403,7 @@ fn terms<'a, 's>(tokens: &'a [Token<'s>]) -> Result<impl Iterator<Item = &'a Tok
     Ok(tokens.iter().step_by(2))
 }
 
-fn real_expression(tokens: &[Token<'_>]) -> Result<u32> {
+pub(crate) fn real_expression(tokens: &[Token<'_>]) -> Result<u32> {
     let mut mask = 0;
     for token in terms(tokens)? {
         mask |= real_modifier(token.text)
@@ -462,7 +414,7 @@ fn real_expression(tokens: &[Token<'_>]) -> Result<u32> {
 }
 
 // These are XKB's named real modifiers, not physical shortcut assignments.
-fn real_modifier(name: &str) -> Option<u32> {
+pub(crate) fn real_modifier(name: &str) -> Option<u32> {
     [
         "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5",
     ]
@@ -480,7 +432,7 @@ fn real_modifier(name: &str) -> Option<u32> {
     })
 }
 
-fn number(text: &str) -> Option<u32> {
+pub(crate) fn number(text: &str) -> Option<u32> {
     if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         u32::from_str_radix(hex, 16).ok()
     } else {

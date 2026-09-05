@@ -20,6 +20,7 @@ fn source_inventory_and_allowances_are_closed() {
     let expected: BTreeSet<_> = [
         "fill.rs",
         "keys.rs",
+        "keyboard.rs",
         "layout.rs",
         "lib.rs",
         "main.rs",
@@ -31,6 +32,9 @@ fn source_inventory_and_allowances_are_closed() {
         "ui.rs",
         "wayland.rs",
         "xkb.rs",
+        "xkb_compat.rs",
+        "xkb_keys.rs",
+        "xkb_symbols.rs",
         "xkb_syntax.rs",
     ]
     .into_iter()
@@ -46,13 +50,34 @@ fn source_inventory_and_allowances_are_closed() {
         let name = entry.file_name().into_string().unwrap();
         actual.insert(name.clone());
         let text = std::fs::read_to_string(entry.path()).unwrap();
-        if !matches!(name.as_str(), "xkb.rs" | "xkb_syntax.rs") {
-            for module in ["xkb", "xkb_syntax"] {
+        if !matches!(
+            name.as_str(),
+            "keyboard.rs"
+                | "xkb.rs"
+                | "xkb_syntax.rs"
+                | "xkb_keys.rs"
+                | "xkb_symbols.rs"
+                | "xkb_compat.rs"
+        ) {
+            for module in [
+                "keyboard",
+                "xkb",
+                "xkb_syntax",
+                "xkb_keys",
+                "xkb_symbols",
+                "xkb_compat",
+            ] {
                 assert_eq!(
                     identifier_count(&text, module),
-                    usize::from(name == "lib.rs"),
-                    "partial type validation must not activate input: {name}"
+                    usize::from(name == "lib.rs" || (name == "wayland.rs" && module == "keyboard")),
+                    "compiler must not activate input before the seat adapter: {name}"
                 );
+                if name == "wayland.rs" && module == "keyboard" {
+                    // The fixed preview document mentions keyboard input once.
+                    assert!(text.contains(
+                        "Read-only fixture: keyboard and pointer input are not connected."
+                    ));
+                }
             }
             for interface in ["wl_seat", "wl_keyboard"] {
                 assert!(
@@ -95,7 +120,14 @@ fn source_inventory_and_allowances_are_closed() {
                 )));
                 let shared =
                     std::fs::read_to_string(root.join("../td-compositor/src").join(file)).unwrap();
-                for module in ["xkb", "xkb_syntax"] {
+                for module in [
+                    "keyboard",
+                    "xkb",
+                    "xkb_syntax",
+                    "xkb_keys",
+                    "xkb_symbols",
+                    "xkb_compat",
+                ] {
                     assert_eq!(
                         identifier_count(&shared, module),
                         0,
