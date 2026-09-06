@@ -28,6 +28,9 @@ close marks and scrolls with wheels/touchpads. A small bitmap arrow supplies
 the cursor. Click File/Edit/Format/Help or press F10 for menus; arrow keys
 navigate, Return activates and Escape/Ctrl+G cancels. Edit switches key
 profiles; Format exposes Soft Wrap, Auto Fill and Fill Paragraph.
+Format > Fill Column sets the active tab's fill width (20–240 cells,
+default 72) without reflowing existing text. Return applies the number,
+Ctrl+U clears entry, and Escape/Ctrl+G cancels.
 Edit also exposes Find/Find Next/Find Previous. Windows Ctrl+F opens Find,
 F3 searches next and Shift+F3 previous; Emacs C-s/C-r open directional
 search. Type a literal case-sensitive query, Return to search, Ctrl+U to

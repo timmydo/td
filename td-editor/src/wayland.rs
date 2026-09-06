@@ -351,7 +351,7 @@ struct Window {
     clipboard: crate::data::Clipboard,
     activation_serial: Option<u32>,
     search: Option<crate::search::Prompt>,
-    goto: Option<crate::goto::Prompt>,
+    number: Option<crate::number::Prompt>,
     searches: crate::search::History,
     spelling: crate::spelling::WindowState,
 }
@@ -446,7 +446,7 @@ impl Window {
             clipboard: crate::data::Clipboard::default(),
             activation_serial: None,
             search: None,
-            goto: None,
+            number: None,
             searches: crate::search::History::default(),
             spelling: crate::spelling::WindowState::default(),
         })
@@ -818,7 +818,7 @@ impl Window {
 
     fn close(&mut self) {
         self.search = None;
-        self.goto = None;
+        self.number = None;
         self.searches.cancel_wrap();
         self.clipboard.incoming = None;
         self.menu = None;
@@ -864,7 +864,7 @@ impl Window {
     fn pointer_modal(&self) -> bool {
         self.quitting
             || self.search.is_some()
-            || self.goto.is_some()
+            || self.number.is_some()
             || self.prompt.is_some()
             || self.closing.is_some()
             || self.conflict.is_some()
@@ -1221,8 +1221,8 @@ impl Window {
             self.conflict_chord(chord, repeated);
             return Ok(false);
         }
-        if self.goto.is_some() {
-            self.goto_chord(chord, repeated)?;
+        if self.number.is_some() {
+            self.number_chord(chord, repeated)?;
             return Ok(false);
         }
         if self.search.is_some() {
@@ -1254,7 +1254,7 @@ impl Window {
         }
         if chord == "F6" {
             if !repeated {
-                self.goto_request(tab, revision)?;
+                self.number_request(tab, revision, crate::number::Kind::Line)?;
             }
             return Ok(false);
         }
@@ -1457,7 +1457,7 @@ impl Window {
         let close_notice = self.close_notice();
         let path_notice = self.path_notice();
         let search_notice = self.search_notice();
-        let goto_notice = self.goto_notice();
+        let number_notice = self.number_notice();
         let closing_notice = self.closing_notice();
         let conflict_notice = self.conflict_notice();
         let mut raster =
@@ -1480,8 +1480,8 @@ impl Window {
             closing_notice.as_deref()
         } else if conflict_notice.is_some() {
             conflict_notice.as_deref()
-        } else if goto_notice.is_some() {
-            goto_notice.as_deref()
+        } else if number_notice.is_some() {
+            number_notice.as_deref()
         } else if search_notice.is_some() {
             search_notice.as_deref()
         } else {
@@ -1857,7 +1857,11 @@ impl Window {
                 return Ok(());
             }
             Item::GoToLine => {
-                self.goto_request(tab, revision)?;
+                self.number_request(tab, revision, crate::number::Kind::Line)?;
+                return Ok(());
+            }
+            Item::FillColumn => {
+                self.number_request(tab, revision, crate::number::Kind::FillColumn)?;
                 return Ok(());
             }
             Item::Find | Item::FindNext | Item::FindPrevious => {
@@ -2354,33 +2358,46 @@ impl Window {
 }
 
 impl Window {
-    fn goto_notice(&self) -> Option<String> {
-        self.goto.as_ref().map(|prompt| {
+    fn number_notice(&self) -> Option<String> {
+        self.number.as_ref().map(|prompt| {
             let paused = if self.device.is_none() || self.input.map.is_none() {
-                "Go To Line paused: keyboard unavailable; restore the seat/keymap.\n"
+                "keyboard unavailable; restore the seat/keymap.\n"
             } else if !self.input.focused || !self.input.synchronized {
-                "Go To Line paused: focus the editor; tap and release Shift.\n"
+                "focus the editor; tap and release Shift.\n"
             } else {
                 ""
             };
-            format!("{paused}{}", prompt.notice())
+            if paused.is_empty() {
+                prompt.notice()
+            } else {
+                format!(
+                    "{} paused: {paused}{}",
+                    prompt.kind().label(),
+                    prompt.notice()
+                )
+            }
         })
     }
 
-    fn goto_request(&mut self, tab: crate::model::TabId, revision: u64) -> Result<()> {
+    fn number_request(
+        &mut self,
+        tab: crate::model::TabId,
+        revision: u64,
+        kind: crate::number::Kind,
+    ) -> Result<()> {
         self.menu = None;
         self.stop_pointer();
         self.input.cancel_repeat();
-        let prompt = match crate::goto::Prompt::new(self.ui.editor(), tab, revision) {
+        let prompt = match crate::number::Prompt::new(self.ui.editor(), tab, revision, kind) {
             Ok(prompt) => prompt,
             Err(e) => {
-                self.notify(format!("Go To Line refused: {e}"));
+                self.notify(format!("{} refused: {e}", kind.label()));
                 return Ok(());
             }
         };
         self.ui.dispatch(Event::CancelInput).map_err(error)?;
         self.searches.cancel_wrap();
-        self.goto = Some(prompt);
+        self.number = Some(prompt);
         self.search = None;
         self.clipboard.incoming = None;
         self.notice = None;
@@ -2388,11 +2405,11 @@ impl Window {
         Ok(())
     }
 
-    fn goto_chord(&mut self, chord: &str, repeated: bool) -> Result<()> {
+    fn number_chord(&mut self, chord: &str, repeated: bool) -> Result<()> {
         if repeated {
             return Ok(());
         }
-        let Some(mut prompt) = self.goto.take() else {
+        let Some(mut prompt) = self.number.take() else {
             return Ok(());
         };
         self.dirty = true;
@@ -2406,35 +2423,37 @@ impl Window {
                 Ok(target) => target,
                 Err(e) => {
                     self.notify(format!(
-                        "Go To Line cancelled: document or selection changed ({e})."
+                        "{} cancelled: {} ({e}).",
+                        prompt.kind().label(),
+                        prompt.kind().changed()
                     ));
                     return Ok(());
                 }
             };
-            let result = prompt.line().and_then(|line| {
+            let result = prompt.command().and_then(|command| {
                 self.ui.dispatch(Event::Edit {
                     tab,
                     revision,
-                    command: crate::model::Command::GoToLine(line),
+                    command,
                 })
             });
             match result {
                 Ok(_) => {
-                    self.notify("Moved to logical line.");
+                    self.notify(prompt.kind().success());
                     return Ok(());
                 }
                 Err(crate::Error::InvalidArgument | crate::Error::InvalidPosition) => {
                     prompt.refused()
                 }
                 Err(e) => {
-                    self.notify(format!("Go To Line refused: {e}"));
+                    self.notify(format!("{} refused: {e}", prompt.kind().label()));
                     return Ok(());
                 }
             }
         } else {
             prompt.type_chord(chord);
         }
-        self.goto = Some(prompt);
+        self.number = Some(prompt);
         Ok(())
     }
 
@@ -3924,7 +3943,7 @@ mod tests {
     }
 
     #[test]
-    fn goto_menu_uses_logical_lines_in_both_profiles_and_refuses_invalid_entry() {
+    fn number_menu_uses_logical_lines_in_both_profiles_and_refuses_invalid_entry() {
         for profile in [Profile::Windows, Profile::Emacs] {
             let (mut w, _peer, keyboard) = find_fixture(profile);
             w.ui = Controller::default();
@@ -3939,33 +3958,34 @@ mod tests {
                 .position(|item| *item == crate::menu::Item::GoToLine)
                 .unwrap();
             w.activate_menu(index).unwrap();
-            assert!(w.goto.is_some());
+            assert!(w.number.is_some());
             assert!(w.pointer_modal());
             w.chord("2", true).unwrap();
             key(&mut w, keyboard, 28);
-            assert!(w.goto_notice().unwrap().contains("existing line"));
+            assert!(w.number_notice().unwrap().contains("existing line"));
             assert_eq!(w.ui.editor().document(1).unwrap().selection().caret, 0);
             key(&mut w, keyboard, 4); // 3: final empty logical line
             key(&mut w, keyboard, 28);
-            assert!(w.goto.is_none());
+            assert!(w.number.is_none());
+            assert_eq!(w.notice.as_deref(), Some("Moved to logical line."));
             let doc = w.ui.editor().document(1).unwrap();
             assert_eq!(doc.selection().caret, doc.text().len());
             assert!(!doc.dirty());
             assert_eq!(doc.history_depth(), (0, 0));
-            w.goto_request(1, 0).unwrap();
+            w.number_request(1, 0, crate::number::Kind::Line).unwrap();
             key(&mut w, keyboard, 5); // 4: nonexistent
             key(&mut w, keyboard, 28);
-            assert!(w.goto.is_some());
-            assert!(w.goto_notice().unwrap().contains("existing line"));
+            assert!(w.number.is_some());
+            assert!(w.number_notice().unwrap().contains("existing line"));
             let selection = w.ui.editor().document(1).unwrap().selection();
             w.chord("C-g", false).unwrap();
-            assert!(w.goto.is_none());
+            assert!(w.number.is_none());
             assert_eq!(w.ui.editor().document(1).unwrap().selection(), selection);
         }
     }
 
     #[test]
-    fn goto_focus_pause_stale_target_and_overlay_are_nonediting() {
+    fn number_focus_pause_stale_target_and_overlay_are_nonediting() {
         let (mut w, peer, keyboard) = find_fixture(Profile::Windows);
         configure(&mut w, 800, 600);
         w.event(message(SHM, 0, &[1])).unwrap();
@@ -3974,7 +3994,7 @@ mod tests {
         done(&mut w);
         drain(&peer);
         w.search_request("find", 1, 0).unwrap();
-        w.goto_request(1, 0).unwrap();
+        w.number_request(1, 0, crate::number::Kind::Line).unwrap();
         assert!(w.search.is_none());
         w.draw().unwrap();
         assert!(w.pixels != baseline);
@@ -3985,43 +4005,43 @@ mod tests {
         assert!(w.pixels == baseline);
         done(&mut w);
         drain(&peer);
-        w.goto_request(1, 0).unwrap();
+        w.number_request(1, 0, crate::number::Kind::Line).unwrap();
         w.chord("1", false).unwrap();
         w.event(message(keyboard, 2, &[0, SURFACE])).unwrap();
-        assert!(w.goto_notice().unwrap().contains("paused"));
+        assert!(w.number_notice().unwrap().contains("paused"));
         focus(&mut w, keyboard);
         w.ui.dispatch(Event::New).unwrap();
         w.chord("Return", false).unwrap();
-        assert!(w.goto.is_none());
+        assert!(w.number.is_none());
         assert!(w.notice.as_ref().unwrap().contains("Go To Line cancelled"));
         assert_eq!(w.ui.editor().active(), Some(2));
-        w.goto_request(2, 0).unwrap();
+        w.number_request(2, 0, crate::number::Kind::Line).unwrap();
         w.close();
-        assert!(w.goto.is_none());
+        assert!(w.number.is_none());
         assert!(w.closed);
     }
 
     #[test]
-    fn goto_f6_works_below_menu_height_and_paused_invalid_feedback_is_visible() {
+    fn number_f6_works_below_menu_height_and_paused_invalid_feedback_is_visible() {
         for profile in [Profile::Windows, Profile::Emacs] {
             let (mut w, peer, keyboard) = find_fixture(profile);
             configure(&mut w, 320, 240);
             w.open_menu(crate::menu::Group::Edit).unwrap();
             assert!(w.menu.is_none());
             w.chord("F6", true).unwrap();
-            assert!(w.goto.is_none());
+            assert!(w.number.is_none());
             key(&mut w, keyboard, 64); // F6 despite unavailable Edit panel
-            assert!(w.goto.is_some());
+            assert!(w.number.is_some());
             key(&mut w, keyboard, 11); // zero
             key(&mut w, keyboard, 28);
-            assert!(w.goto_notice().unwrap().contains("Invalid line number"));
+            assert!(w.number_notice().unwrap().contains("Invalid line number"));
             w.event(message(keyboard, 2, &[0, SURFACE])).unwrap();
             w.event(message(SHM, 0, &[1])).unwrap();
             w.draw().unwrap();
             let error_pixels = w.pixels.clone();
             done(&mut w);
             drain(&peer);
-            let prompt = w.goto.as_mut().unwrap();
+            let prompt = w.number.as_mut().unwrap();
             prompt.type_chord("Backspace");
             prompt.type_chord("0"); // same digits/focus, only invalid feedback removed
             w.dirty = true;
@@ -5021,6 +5041,61 @@ mod tests {
     }
 
     #[test]
+    fn fill_column_menu_is_modal_bounded_per_tab_and_nonediting_in_both_profiles() {
+        let index = crate::menu::Group::Format
+            .items()
+            .iter()
+            .position(|item| *item == crate::menu::Item::FillColumn)
+            .unwrap();
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            let tab = w.ui.editor().active().unwrap();
+            w.ui.dispatch(Event::New).unwrap();
+            let other = w.ui.editor().active().unwrap();
+            w.ui.dispatch(Event::SelectTab(tab)).unwrap();
+            w.open_menu(crate::menu::Group::Format).unwrap();
+            w.activate_menu(index).unwrap();
+            assert!(w.number_notice().unwrap().contains("At open: 72"));
+            w.chord("2", true).unwrap();
+            for c in ["2", "4", "0", "0", "Return"] {
+                w.chord(c, false).unwrap();
+            }
+            assert!(w.number.is_some());
+            assert!(w.number_notice().unwrap().contains("Invalid fill column"));
+            assert_eq!(w.ui.editor().document(tab).unwrap().fill_column(), 72);
+            w.chord("C-u", false).unwrap();
+            w.chord("4", false).unwrap();
+            w.chord("0", false).unwrap();
+            let device = w.device.unwrap();
+            w.event(message(device, 2, &[2, SURFACE])).unwrap();
+            assert!(w.number_notice().unwrap().contains("Fill Column paused"));
+            focus(&mut w, device);
+            w.chord("Return", false).unwrap();
+            assert!(w.number.is_none());
+            assert_eq!(
+                w.notice.as_deref(),
+                Some("Fill column set; existing text is unchanged.")
+            );
+            let doc = w.ui.editor().document(tab).unwrap();
+            assert_eq!(doc.fill_column(), 40);
+            assert_eq!(doc.revision(), 0);
+            assert!(!doc.dirty());
+            assert_eq!(doc.history_depth(), (0, 0));
+            assert_eq!(w.ui.editor().document(other).unwrap().fill_column(), 72);
+            for cancel in ["Escape", "C-g"] {
+                w.open_menu(crate::menu::Group::Format).unwrap();
+                w.activate_menu(index).unwrap();
+                w.chord("2", false).unwrap();
+                w.chord(cancel, false).unwrap();
+                assert!(w.number.is_none());
+                assert_eq!(w.ui.editor().document(tab).unwrap().fill_column(), 40);
+            }
+            drain(&peer);
+        }
+    }
+
+    #[test]
     fn spelling_dictionary_menu_loads_explicitly_and_failed_replacement_keeps_marks() {
         use crate::menu::Group;
         let directory = DialogDirectory::new();
@@ -5032,7 +5107,7 @@ mod tests {
         w.chord("F7", false).unwrap();
         assert!(w.notice.as_deref().unwrap().contains("no dictionary"));
         w.open_menu(Group::Format).unwrap();
-        w.activate_menu(4).unwrap();
+        w.activate_menu(5).unwrap();
         assert!(matches!(
             w.prompt.as_ref().unwrap().action,
             PathAction::Dictionary
@@ -5046,7 +5121,7 @@ mod tests {
         assert_eq!(format!("{:?}", w.ui.editor()), before);
         assert_eq!(w.files.as_ref().unwrap().labels().count(), 0);
         w.open_menu(Group::Format).unwrap();
-        w.activate_menu(3).unwrap();
+        w.activate_menu(4).unwrap();
         w.end_turn(w.clock + 1, false).unwrap();
         assert_eq!(
             w.spelling.view(w.ui.editor()).1,
@@ -5054,7 +5129,7 @@ mod tests {
         );
         std::fs::write(&path, b"bad data").unwrap();
         w.open_menu(Group::Format).unwrap();
-        w.activate_menu(4).unwrap();
+        w.activate_menu(5).unwrap();
         path_text(&mut w, &path);
         finish_file(&mut w);
         assert!(w
@@ -5068,7 +5143,7 @@ mod tests {
         );
         std::fs::write(&path, b"known").unwrap();
         w.open_menu(Group::Format).unwrap();
-        w.activate_menu(4).unwrap();
+        w.activate_menu(5).unwrap();
         path_text(&mut w, &path);
         finish_file(&mut w);
         assert!(w.spelling.view(w.ui.editor()).1.is_empty());
@@ -5105,7 +5180,7 @@ mod tests {
             );
             for expected in [6..11, 12..17] {
                 w.open_menu(crate::menu::Group::Format).unwrap();
-                w.activate_menu(5).unwrap();
+                w.activate_menu(6).unwrap();
                 assert_eq!(
                     w.ui.editor().document(tab).unwrap().selection().range(),
                     expected

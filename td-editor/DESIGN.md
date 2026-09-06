@@ -1364,8 +1364,8 @@ controller CancelInput event performs this reset without a fake focus loss.
 File exposes New, Open, Save, Save As, Close Tab and Quit. Edit exposes Undo,
 Redo, Select All and the two key profiles, with clipboard commands enabled
 according to the data-device contract below. Format exposes Soft Wrap,
-Auto Fill, Fill Paragraph, Check Spelling, Dictionary and Next/Previous
-Misspelling under the native spelling contract above. Help
+Auto Fill, Fill Paragraph, Fill Column, Check Spelling, Dictionary and
+Next/Previous Misspelling under the native spelling contract above. Help
 shows an experimental-build About notice. A plus marks the active key profile
 or enabled format toggle. Undo/Redo availability reflects the captured
 history depth. Scratch mode disables Open/Save/Save As/Dictionary rather
@@ -1373,8 +1373,8 @@ than pretending to persist its text. Only existing bindings are shown:
 Windows uses Ctrl+ labels, Emacs uses its C-/M- chord notation, and unbound
 items have no shortcut.
 Find/Find Next/Find Previous and Go To Line use the native contracts below.
-Replace, fill-column entry and command completion remain later prompt
-increments, not hidden implementations behind these menus.
+Replace and command completion remain later prompt increments, not hidden
+implementations behind these menus.
 
 Menu actions dispatch the existing controller events, file-path requests and
 close coordinators. Keyboard, tab-close marks and menus share one native
@@ -1407,7 +1407,7 @@ popup and displays an enlargement notice; invisible/clipped rows can never
 be activated. A clipped-menu refusal does not reset pending prefix/mark/drag.
 A new physical key press still cancels native repeat before menu admission,
 as it does for every key. Escape/C-g with a menu open dismisses both the
-menu and any underlying notice; F10 only toggles the menu. At most eleven
+menu and any underlying notice; F10 only toggles the menu. At most twelve
 rows exist, with static bounded labels, and painting and hit tests use the
 same panel geometry. Header geometry derives
 from the reference renderer's single menu-bar string. Colors remain warm
@@ -1661,7 +1661,35 @@ in both profiles, query entry/cancel, both directions, explicit wrap,
 missing/stale/foreign targets, scalar byte limits and overlay-only pixels.
 The headless model/replay Find interface is unchanged.
 
-### Implemented Go To Line
+### Implemented numeric prompts: Go To Line and Fill Column
+
+Go To Line and Fill Column share the private `number` prompt implementation,
+with separate range checks and commands. No old numeric-entry path remains.
+
+Format > Fill Column opens the same numeric modal in either profile. It
+shows the setting captured at opening and starts with empty input. At most 20
+ASCII decimal digits are accepted, including leading zeros; Return accepts
+only a representable value from 20 through 240. Empty/out-of-range/overflow
+input remains visible with an error for correction, including `2400` rather
+than silently truncating it to `240`. Backspace, Ctrl+U, Escape/C-g, repeat
+suppression, focus pause and pointer blocking match Go To Line. There is no
+new direct key binding. Fill Column follows Fill Paragraph, before the
+spelling commands. The largest complete menu keeps its existing twelve-row
+minimum unchanged.
+Format itself now requires 320 by 240 pixels at scale 1, up from 320 by 216;
+multiply both axes by the integer scale. At smaller heights its entire popup
+is refused with the existing enlargement notice. F6 and F7 remain available
+without their menus, but Fill Column and other menu-only actions require
+enlarging the window.
+
+The fill-column prompt additionally captures the original fill setting,
+since setting changes do not advance text revision. A changed setting at
+submission refuses along with a changed editor/tab/revision/selection.
+Applying dispatches the existing `FillColumn` controller command: it does
+not change text, selection, saved state or undo history, and affects no other
+tab. It does not reflow immediately or enable Auto Fill. The next explicit
+Fill Paragraph or Auto Fill typing uses the new setting. The setting is
+per-document in-memory state, not persisted to files or a config directory.
 
 Edit > Go To Line or native F6 opens a numeric prompt in either key profile.
 F6 remains available when the complete Edit menu cannot fit; Ctrl+G retains

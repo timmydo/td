@@ -44,6 +44,7 @@ impl Group {
                 Wrap,
                 AutoFill,
                 Fill,
+                FillColumn,
                 Spell,
                 Dictionary,
                 NextMisspelling,
@@ -73,6 +74,7 @@ pub(crate) enum Item {
     Wrap,
     AutoFill,
     Fill,
+    FillColumn,
     Spell,
     About,
     Find,
@@ -104,6 +106,7 @@ impl Item {
             Self::Wrap => "Soft Wrap",
             Self::AutoFill => "Auto Fill",
             Self::Fill => "Fill Paragraph",
+            Self::FillColumn => "Fill Column...",
             Self::Spell => "Check Spelling",
             Self::Dictionary => "Dictionary...",
             Self::NextMisspelling => "Next Misspelling",
@@ -318,6 +321,21 @@ mod tests {
             auto_fill: false,
             copy: false,
             paste: false,
+        }
+    }
+
+    #[test]
+    fn format_with_fill_column_requires_240_scaled_pixels_of_height() {
+        for scale in 1..=4 {
+            let s = scale as usize;
+            let menu = menu(Group::Format);
+            assert_eq!(Group::Format.items().len(), 8);
+            assert!(menu
+                .panel(Geometry::new(320 * s, 239 * s, Scale::new(scale).unwrap()).unwrap())
+                .is_none());
+            assert!(menu
+                .panel(Geometry::new(320 * s, 240 * s, Scale::new(scale).unwrap()).unwrap())
+                .is_some());
         }
     }
 

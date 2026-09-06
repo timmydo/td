@@ -6,7 +6,6 @@
 pub mod clipboard;
 mod data;
 mod dialog;
-mod goto;
 pub use dialog::{Discard, Reload};
 pub mod files;
 pub mod fill;
@@ -19,6 +18,7 @@ pub mod keys;
 pub mod layout;
 pub mod model;
 mod menu;
+mod number;
 mod pointer;
 pub mod render;
 pub mod replay;

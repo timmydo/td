@@ -17,6 +17,7 @@ const HELP: &str = concat!(
     "Mouse: select/drag, tab clicks/close marks, wheel/touchpad scrolling.\n",
     "Menus: click a header or F10; arrows navigate, Return selects, Escape cancels.\n",
     "Edit switches key profiles. Format: Soft Wrap, Auto Fill, Fill Paragraph.\n",
+    "Format > Fill Column sets 20..=240 cells for that tab (default 72).\n",
     "UTF-8 clipboard requires Wayland data-device v3 and window focus; limit 1 MiB.\n",
     "Windows clipboard: Ctrl+C/X/V. Emacs: M-w/C-w/C-y. Edit also has Copy/Cut/Paste.\n",
     "Copy/Cut needs a physical key or pointer press. Escape/Ctrl+G cancels Paste.\n",
