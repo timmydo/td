@@ -917,20 +917,26 @@ pub fn local_source_digests_cli() -> Result<(), String> {
     let mut checked = 0u32;
     let mut errors: Vec<String> = Vec::new();
     for input in inputs {
-        let SeedInput::LocalSource { key, path } = &input else {
+        let SeedInput::LocalSource { key, path, trees } = &input else {
             continue;
         };
         checked += 1;
+        // The row hashes every staged tree, so a stale one names them all: an
+        // `engine/` edit moves `td-net-source` as surely as a `net/` edit does.
+        let staged_from = if trees.is_empty() {
+            path.clone()
+        } else {
+            format!("{path} with {}", trees.join(", "))
+        };
         // Every local source is reported, so one that cannot even be hashed does not
         // hide a stale row behind it — and the cleanup below stays reachable.
-        let hashed = stage_local_source_at(&root, key, path, &scratch.join(key))
+        let hashed = stage_local_source_at(&root, key, path, trees, &scratch.join(key))
             .and_then(|staged| store_path_recursive_with(&tb, &root, key, &staged))
-            .and_then(|candidate| {
-                gate_local_source_candidate(key, &candidate).map(|()| candidate)
-            });
+            .and_then(|candidate| gate_local_source_candidate(key, &candidate).map(|()| candidate))
+            .map_err(|e| format!("{e} (staged from {staged_from})"));
         match hashed {
             Ok(candidate) => {
-                println!("local source `{key}' ({path}) hashes to its pinned {candidate}")
+                println!("local source `{key}' ({staged_from}) hashes to its pinned {candidate}")
             }
             Err(e) => errors.push(e),
         }
@@ -1490,6 +1496,13 @@ fn closure_repo_inputs(closure: &[RecipeNode]) -> (Vec<String>, Vec<String>) {
         .iter()
         .filter_map(|n| n.recipe.local_source.clone())
         .collect();
+    // The sibling trees a local source stages are read at build time as the
+    // main tree is, so they key the fingerprint the same way.
+    local_sources.extend(
+        closure
+            .iter()
+            .flat_map(|n| n.recipe.local_source_trees.clone().unwrap_or_default()),
+    );
     local_sources.sort();
     local_sources.dedup();
     (locks, local_sources)
@@ -1757,12 +1770,13 @@ pub(crate) struct RecipeNode {
 /// stale-seed-store reds that `clear-store` looks like the fix, and it is not one.
 /// A cold ladder derives the same address from the same tree and reds identically,
 /// having thrown away every rung to get there.
-/// Resolve and validate a `local_source` path against a repo root: it must be a
+/// Resolve and validate an in-tree directory against a repo root: it must be a
 /// plain repo-relative path (no `..`/`.`/absolute component) that, once symlinks
-/// are resolved, stays under the root, naming a directory that is a Cargo crate
-/// (Cargo.toml + committed Cargo.lock). Returns the CANONICAL path, so whoever
-/// copies it copies the validated bytes.
-fn resolve_local_source_dir_at(root: &Path, rel: &str) -> Result<PathBuf, String> {
+/// are resolved, stays under the root. Returns the CANONICAL path, so whoever
+/// copies it copies the validated bytes. The `local_source` crate itself goes
+/// through `resolve_local_source_dir_at`, which adds the crate checks; a
+/// sibling tree needs only these rules.
+fn resolve_local_source_tree_at(root: &Path, rel: &str) -> Result<PathBuf, String> {
     if rel.is_empty() {
         return Err("local source path is empty".into());
     }
@@ -1800,6 +1814,13 @@ fn resolve_local_source_dir_at(root: &Path, rel: &str) -> Result<PathBuf, String
             canon_dir.display()
         ));
     }
+    Ok(canon_dir)
+}
+
+/// A `local_source` path resolved as above and required to be a Cargo crate
+/// (Cargo.toml + committed Cargo.lock).
+fn resolve_local_source_dir_at(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let canon_dir = resolve_local_source_tree_at(root, rel)?;
     if !canon_dir.join("Cargo.toml").is_file() {
         return Err(format!("local source `{rel}' has no Cargo.toml"));
     }
@@ -1812,11 +1833,60 @@ fn resolve_local_source_dir_at(root: &Path, rel: &str) -> Result<PathBuf, String
 /// Copy a validated `local_source` tree (minus `target`/`.git`) to `dest`. The
 /// staged tree is what BOTH the content-address computation and the intern read,
 /// so the address that is gated and the bytes that are interned cannot diverge.
-fn stage_local_source_at(root: &Path, key: &str, rel: &str, dest: &Path) -> Result<PathBuf, String> {
+///
+/// With sibling `trees`, `dest` is a directory holding every tree, the main
+/// one included, under its own basename, so a relative path from one to
+/// another resolves as it does in the checkout; the recipe's `cargo_subdir`
+/// then names the main tree's basename. Two trees with one basename are
+/// refused rather than merged.
+fn stage_local_source_at(
+    root: &Path,
+    key: &str,
+    rel: &str,
+    trees: &[String],
+    dest: &Path,
+) -> Result<PathBuf, String> {
     let dir = resolve_local_source_dir_at(root, rel)?;
+    if trees.is_empty() {
+        remove_path_if_exists(dest)?;
+        copy_source_tree(&dir, dest)
+            .map_err(|e| format!("copy local source {} for `{key}': {e}", dir.display()))?;
+        return Ok(dest.to_path_buf());
+    }
+    // Every tree is resolved and named before anything is copied, so a
+    // refused roster leaves no half-staged directory behind.
+    let mut resolved: Vec<(String, PathBuf)> = vec![(rel.to_string(), dir)];
+    for tree in trees {
+        resolved.push((tree.clone(), resolve_local_source_tree_at(root, tree)?));
+    }
+    let mut staged: Vec<(PathBuf, String)> = Vec::new();
+    for (tree_rel, tree_dir) in resolved {
+        // Named by the declared path, not the canonical one: the crate's
+        // relative paths (`../engine`, `../../td-boot/src`) are written against
+        // the checkout's names, which a symlinked tree would not keep.
+        let name = Path::new(&tree_rel)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("local source tree `{tree_rel}' for `{key}' has no name"))?;
+        if staged.iter().any(|(_, seen)| *seen == name) {
+            return Err(format!(
+                "local source `{key}' stages two trees named `{name}' — sibling trees \
+                 must have distinct basenames"
+            ));
+        }
+        staged.push((tree_dir, name));
+    }
     remove_path_if_exists(dest)?;
-    copy_source_tree(&dir, dest)
-        .map_err(|e| format!("copy local source {} for `{key}': {e}", dir.display()))?;
+    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    for (tree_dir, name) in &staged {
+        copy_source_tree(tree_dir, &dest.join(name)).map_err(|e| {
+            format!(
+                "copy local source tree {} for `{key}': {e}",
+                tree_dir.display()
+            )
+        })?;
+    }
     Ok(dest.to_path_buf())
 }
 
@@ -1877,10 +1947,15 @@ pub(crate) enum SeedInput {
     LinuxHeaders { key: String, arch: &'static str },
     Patch { key: String, patch: String },
     /// An IN-TREE source directory (#469 local-source provenance): `path` is the
-    /// repo-relative dir the recipe's `local_source` names. Interned by copying
-    /// the committed tree (minus build/VCS artifacts) into the seed store, then
+    /// repo-relative dir the recipe's `local_source` names, `trees` the sibling
+    /// dirs its `local_source_trees` stage beside it. Interned by copying the
+    /// committed tree (minus build/VCS artifacts) into the seed store, then
     /// gated against the compiled table like every other seed.
-    LocalSource { key: String, path: String },
+    LocalSource {
+        key: String,
+        path: String,
+        trees: Vec<String>,
+    },
 }
 
 impl SeedInput {
@@ -2428,9 +2503,14 @@ impl RecipeCheckRunner {
     /// (minus `target`/`.git`) into scratch. The staged tree is what both the
     /// content-address computation and the intern read, so the address that is
     /// gated and the bytes that are interned cannot diverge.
-    fn stage_local_source(&self, intern_name: &str, rel: &str) -> Result<PathBuf, String> {
+    fn stage_local_source(
+        &self,
+        intern_name: &str,
+        rel: &str,
+        trees: &[String],
+    ) -> Result<PathBuf, String> {
         let dest = self.scratch.join(format!("local-source-{intern_name}"));
-        stage_local_source_at(&self.root, intern_name, rel, &dest)
+        stage_local_source_at(&self.root, intern_name, rel, trees, &dest)
     }
 
     /// Intern an IN-TREE source directory: stage it, then content-address it into
@@ -2442,9 +2522,10 @@ impl RecipeCheckRunner {
         &self,
         intern_name: &str,
         rel: &str,
+        trees: &[String],
         db: &Path,
     ) -> Result<String, String> {
-        let staged = self.stage_local_source(intern_name, rel)?;
+        let staged = self.stage_local_source(intern_name, rel, trees)?;
         self.store_add_recursive_into(intern_name, &staged, db)
     }
 
@@ -2457,8 +2538,8 @@ impl RecipeCheckRunner {
     /// never look at this source. So an intern that happens before the gate converts
     /// "this tree's digest is stale" into "the ladder is unusable", and the developer
     /// pays a full cold climb for a one-line table fix.
-    fn ensure_local_source(&self, key: &str, rel: &str) -> Result<String, String> {
-        let staged = self.stage_local_source(key, rel)?;
+    fn ensure_local_source(&self, key: &str, rel: &str, trees: &[String]) -> Result<String, String> {
+        let staged = self.stage_local_source(key, rel, trees)?;
         let candidate = self.store_path_recursive(key, &staged)?;
         gate_local_source_candidate(key, &candidate)?;
         let derived = self.store_add_recursive(key, &staged)?;
@@ -2693,8 +2774,8 @@ impl RecipeCheckRunner {
     /// intern_* verifies the pinned artifact and interns it into the seed store — then gate
     /// the derived basename against the compiled table before use.
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<String, String> {
-        if let SeedInput::LocalSource { key, path } = input {
-            return self.ensure_local_source(key, path);
+        if let SeedInput::LocalSource { key, path, trees } = input {
+            return self.ensure_local_source(key, path, trees);
         }
         if let SeedInput::Ostree { pin, .. } = input {
             validate_ostree_pin(pin)?;
@@ -2813,7 +2894,9 @@ impl RecipeCheckRunner {
             SeedInput::Ostree { key, pin } => self.intern_ostree(key, pin, db),
             SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch, db),
             SeedInput::Patch { key, patch } => self.intern_patch(key, patch, db),
-            SeedInput::LocalSource { key, path } => self.intern_local_source(key, path, db),
+            SeedInput::LocalSource { key, path, trees } => {
+                self.intern_local_source(key, path, trees, db)
+            }
         }
     }
 
@@ -4378,6 +4461,7 @@ fn seed_input_for_recipe_source(key: &str, recipe: &Recipe) -> Result<SeedInput,
         return Ok(SeedInput::LocalSource {
             key: key.to_string(),
             path: path.clone(),
+            trees: recipe.local_source_trees.clone().unwrap_or_default(),
         });
     }
     if let Some(pin) = recipe
@@ -6784,6 +6868,7 @@ chmod 755 '{}'
             .ensure_seed_input(&SeedInput::LocalSource {
                 key: "stage0-source".into(),
                 path: "tests".into(),
+                trees: Vec::new(),
             })
             .expect_err("a local source must re-hash even with its basename interned");
         assert!(err.contains("local source"), "got: {err}");
@@ -6975,12 +7060,85 @@ chmod 755 '{}'
             .ensure_seed_input(&SeedInput::LocalSource {
                 key: "stage0-source".into(),
                 path: "tests/demo-src".into(),
+                trees: Vec::new(),
             })
             .expect_err("this runner has no td-builder to hash with");
         assert!(err.contains("store-path-recursive"), "got: {err}");
 
         assert_eq!(store_before, dir_listing(&runner.store));
         assert_eq!(db_before, fs::read(&runner.db).unwrap());
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // Sibling trees are staged beside the crate under their basenames, minus
+    // `target` and `.git`, every tree resolved and named before any is copied;
+    // a duplicate basename, a missing tree, one that escapes the checkout and
+    // one that is not repo-relative are refused and leave the previous staging
+    // as it was, and without trees the crate itself is the staged directory.
+    #[test]
+    fn sibling_trees_are_staged_beside_the_crate_under_their_basenames() {
+        let lw = env::temp_dir().join(format!("td-local-src-trees-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let root = lw.join("root");
+        for dir in [
+            "net/src",
+            "net/target",
+            "engine/src",
+            "engine/target",
+            "engine/.git",
+            "other/engine",
+            "td-boot/src",
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("net/Cargo.toml"), b"[package]\nname = \"td-net\"\n").unwrap();
+        fs::write(root.join("net/Cargo.lock"), b"version = 4\n").unwrap();
+        fs::write(root.join("net/src/main.rs"), b"fn main() {}\n").unwrap();
+        fs::write(root.join("net/target/junk"), b"x").unwrap();
+        fs::write(root.join("engine/src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        fs::write(root.join("engine/target/junk"), b"x").unwrap();
+        fs::write(root.join("engine/.git/HEAD"), b"ref\n").unwrap();
+        fs::write(root.join("td-boot/src/protocol.rs"), b"// protocol\n").unwrap();
+        let outside = lw.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let dest = lw.join("staged");
+        let trees = |list: &[&str]| list.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+
+        let staged = stage_local_source_at(
+            &root,
+            "td-net-source",
+            "net",
+            &trees(&["engine", "td-boot"]),
+            &dest,
+        )
+        .unwrap();
+        assert_eq!(staged, dest);
+        assert!(dest.join("net/Cargo.toml").is_file());
+        assert!(dest.join("net/src/main.rs").is_file());
+        assert!(dest.join("engine/src/lib.rs").is_file());
+        assert!(dest.join("td-boot/src/protocol.rs").is_file());
+        assert!(!dest.join("net/target").exists());
+        assert!(!dest.join("engine/target").exists());
+        assert!(!dest.join("engine/.git").exists());
+        let listing = dir_listing(&dest);
+        assert_eq!(listing.len(), 3, "{listing:?}");
+
+        for (roster, reason) in [
+            (trees(&["engine", "other/engine"]), "two trees named `engine'"),
+            (trees(&["missing"]), "is not a directory"),
+            (trees(&["escape"]), "resolves outside the checkout"),
+            (trees(&["../root/engine"]), "plain repo-relative path"),
+        ] {
+            let err = stage_local_source_at(&root, "td-net-source", "net", &roster, &dest)
+                .unwrap_err();
+            assert!(err.contains(reason), "{roster:?}: {err}");
+            assert_eq!(dir_listing(&dest), listing, "a refused roster stages nothing");
+        }
+
+        let alone = stage_local_source_at(&root, "td-net-source", "net", &[], &dest).unwrap();
+        assert!(alone.join("Cargo.toml").is_file());
+        assert!(!alone.join("net").exists());
         let _ = fs::remove_dir_all(&lw);
     }
 

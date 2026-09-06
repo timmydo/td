@@ -268,6 +268,7 @@ const TD_TERM_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TERM_RUNTIME_MARKER;
 // ready, so the program started on the configuration td-firstboot provisioned
 // and did not exit on it.
 const TD_MAIL_BOOT_MARKER: &str = td_recipe::ladder::TD_MAIL_BOOT_MARKER;
+const TD_FETCH_BOOT_MARKER: &str = td_recipe::ladder::TD_FETCH_BOOT_MARKER;
 const TD_NEWS_BOOT_MARKER: &str = td_recipe::ladder::TD_NEWS_BOOT_MARKER;
 const TD_APPLICATIONS_PLACED_MARKER: &str = td_recipe::ladder::TD_APPLICATIONS_PLACED_MARKER;
 
@@ -523,6 +524,7 @@ struct ConsoleEvidence {
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
     td_term_runtime: bool,
+    td_fetch_ok: bool,
     td_mail_running: bool,
     td_news_running: bool,
     td_applications_placed: bool,
@@ -2383,6 +2385,16 @@ fn validate_system_boot(
              booted to a compositor with nothing on it. The serial greeter remains the \
              recovery path. \
              Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_fetch_ok {
+        return Err(format!(
+            "the session came up, but the fetch service's marker was absent \
+             ({TD_FETCH_BOOT_MARKER:?}) — td-fetchd did not serve its socket under the \
+             UI user's runtime directory, or its probe did not get the policy's exact \
+             refusal of a loopback URL, so the terminal applications' one network \
+             client is not there (APPLICATIONS.md §W.8). Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -5213,6 +5225,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
+        exact_line_window(TD_FETCH_BOOT_MARKER),
         exact_line_window(TD_MAIL_BOOT_MARKER),
         exact_line_window(TD_NEWS_BOOT_MARKER),
         exact_line_window(TD_APPLICATIONS_PLACED_MARKER),
@@ -5703,6 +5716,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_term_runtime,
         buf,
         TD_TERM_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_line_marker(
+        &mut evidence.td_fetch_ok,
+        buf,
+        TD_FETCH_BOOT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
     );
     latch_line_marker(
         &mut evidence.td_mail_running,
@@ -8978,7 +8997,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 81] {
+    fn all_console_markers() -> [&'static str; 82] {
         [
             MARKER,
             EROFS_MARKER,
@@ -9058,6 +9077,7 @@ mod tests {
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
+            TD_FETCH_BOOT_MARKER,
             TD_MAIL_BOOT_MARKER,
             TD_NEWS_BOOT_MARKER,
             TD_APPLICATIONS_PLACED_MARKER,
@@ -9415,6 +9435,7 @@ mod tests {
     evidence.td_profiler_attribution = true;
     evidence.td_sandbox_kernel = true;
     evidence.td_term_runtime = true;
+    evidence.td_fetch_ok = true;
     evidence.td_mail_running = true;
     evidence.td_news_running = true;
     evidence.td_applications_placed = true;
@@ -10165,6 +10186,15 @@ mod tests {
              {with_markers}"
         );
 
+        let mut without_fetch = healthy_evidence();
+        without_fetch.td_fetch_ok = false;
+        let complaint = validate(&boot(without_fetch))
+            .expect_err("a boot missing the fetch marker must be rejected");
+        assert!(
+            complaint.contains(&format!("({TD_FETCH_BOOT_MARKER:?})")),
+            "the rejection must name the fetch marker: {complaint}"
+        );
+
         let mut without_mail = healthy_evidence();
         without_mail.td_mail_running = false;
         let complaint = validate(&boot(without_mail))
@@ -10197,15 +10227,17 @@ mod tests {
     }
 
     #[test]
-    fn terminal_application_evidence_requires_one_exact_line() {
+    fn session_and_application_evidence_requires_one_exact_line() {
         let latched = |evidence: &ConsoleEvidence| {
             [
+                evidence.td_fetch_ok,
                 evidence.td_mail_running,
                 evidence.td_news_running,
                 evidence.td_applications_placed,
             ]
         };
         for (index, marker) in [
+            TD_FETCH_BOOT_MARKER,
             TD_MAIL_BOOT_MARKER,
             TD_NEWS_BOOT_MARKER,
             TD_APPLICATIONS_PLACED_MARKER,
@@ -10221,7 +10253,7 @@ mod tests {
                 format!("\n..{marker}\n"),
             ] {
                 latch_console_evidence(&mut evidence, noise.as_bytes(), b"target");
-                assert_eq!(latched(&evidence), [false; 3], "accepted {noise:?}");
+                assert_eq!(latched(&evidence), [false; 4], "accepted {noise:?}");
             }
             // Both line endings the console can carry.
             let terminator = if index == 1 { "\n" } else { "\r\n" };
@@ -10230,7 +10262,7 @@ mod tests {
                 format!("\n{marker}{terminator}").as_bytes(),
                 b"target",
             );
-            let mut expected = [false; 3];
+            let mut expected = [false; 4];
             if let Some(slot) = expected.get_mut(index) {
                 *slot = true;
             }

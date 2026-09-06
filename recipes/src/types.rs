@@ -1198,6 +1198,13 @@ pub struct Recipe {
     /// and `source_pins` it is a runner-side concern and is deliberately omitted
     /// from the build JSON — the builder only needs `sourceInput`.
     pub local_source: Option<String>,
+    /// Sibling in-tree directories staged beside `local_source` (#469): the
+    /// interned seed then holds every tree, the main one included, under its
+    /// own basename, and `cargo_subdir` names the main tree's, so a relative
+    /// path between them resolves as it does in the checkout. For a crate
+    /// whose manifest or sources reach a sibling of their directory, as
+    /// td-net reaches `../engine` and `../../td-boot/src`.
+    pub local_source_trees: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -1261,6 +1268,7 @@ impl Recipe {
             cargo_git_sources: None,
             cargo_source_patches: None,
             local_source: None,
+            local_source_trees: None,
         }
     }
     pub fn gnu(name: &str, version: &str) -> Recipe {
@@ -1464,6 +1472,13 @@ impl Recipe {
     pub fn local_source(mut self, path: &str) -> Recipe {
         self.source_input = Some(format!("{}-source", self.name));
         self.local_source = Some(path.into());
+        self
+    }
+    /// Stage these repo-relative directories beside the `local_source` crate;
+    /// see `local_source_trees`. Every tree is hashed into the seed and into
+    /// the build fingerprint exactly as the main one is.
+    pub fn local_source_trees(mut self, trees: &[&str]) -> Recipe {
+        self.local_source_trees = Some(trees.iter().map(|tree| (*tree).to_string()).collect());
         self
     }
     pub fn source_pins(mut self, pins: Vec<SourcePin>) -> Recipe {

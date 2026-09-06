@@ -25,14 +25,15 @@ pub fn recipe() -> Recipe {
     else {
         return invalid_recipe("launcher");
     };
-    // Network for the protocol the program speaks, the Wayland socket the jail
-    // requires of every application, and the terminal grant: td-term hands the
+    // The fetch socket for the protocol the program speaks (APPLICATIONS.md
+    // §W.8; no network of its own), the Wayland socket the jail requires of
+    // every application, and the terminal grant: td-term hands the
     // launcher a fresh pty and td-jail makes it the program's controlling
     // terminal. The credential client needs only the default portal grant;
     // mail still owns no bus name.
     let Ok(permissions) = PermissionPolicy::new()
-        .with_network()
-        .and_then(|permissions| permissions.with_socket(PermissionSocket::Wayland))
+        .with_socket(PermissionSocket::Wayland)
+        .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
         .and_then(|permissions| permissions.with_terminal())
         .and_then(|permissions| {
             permissions.with_filesystem("xdg-download", FilesystemAccess::ReadWrite, true)
@@ -132,12 +133,13 @@ mod tests {
             APPLICATION_SEARCH_TERMS
         );
         let permissions = recipe.application_permissions.as_ref().expect("permissions");
-        assert!(permissions.network());
+        // The fetch grant, not the network: the keyfile below says which.
+        assert!(!permissions.network());
         assert!(permissions.terminal());
         assert_eq!(permissions.session_bus().count(), 0);
         assert_eq!(
             permissions.to_keyfile(),
-            "format=2\n\n[Context]\nshared=network\nsockets=wayland\ndevices=tty\n\n[Filesystem]\nxdg-download=rw:create\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
+            "format=2\n\n[Context]\nsockets=wayland;fetch\ndevices=tty\n\n[Filesystem]\nxdg-download=rw:create\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
         );
         let steps = recipe.steps.as_ref().expect("steps");
         assert!(steps.iter().any(|step| matches!(

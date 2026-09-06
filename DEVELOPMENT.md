@@ -72,6 +72,20 @@ recorded pass before it runs, so a failure leaves nothing to answer from.
 `td-recipe-eval clear-store` drops the memos with the rest of the ladder work
 dir.
 
+A recipe built from the checkout's own trees (a `local_source`, with any
+sibling `local_source_trees`) is pinned by the seed digest table the
+evaluator compiles in, so an edit to one of those trees moves its row and
+the provenance gate refuses the build, naming the row, until the table is
+regenerated:
+
+```text
+td-recipe-eval seed-digests > seed/seed-digests.txt
+```
+
+Regenerate after the last edit to the trees and commit the table with the
+change. Today `td-net` is built this way, from `net/`, `engine/` and
+`td-boot/`.
+
 When every changed path lies under `td-*` crates, `ready` also scopes the
 recipe-checks gate: the crates and their readers travel to the gate in
 `TD_CHECK_SCOPE`, and the gate runs only the checks whose closure builds a

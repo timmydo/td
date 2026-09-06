@@ -10,7 +10,7 @@ use crate::types::{CargoSourcePatch, Recipe, TextEdit};
 /// static entry on the empty runtime: the jail shows an application no
 /// `/td/store` loader.
 pub fn recipe() -> Recipe {
-    Recipe::rust("tmc", "0.1.0-g8f04e38")
+    Recipe::rust("tmc", "0.1.0-g6d5c85f")
         .source_input("tmc-source")
         .native_inputs(&[
             "rust-toolchain",
@@ -165,7 +165,7 @@ mod tests {
 
     /// The pinned upstream commit; the version suffix and the pin's URL and
     /// file name must all name it.
-    const TMC_COMMIT: &str = "8f04e380bd378f735152fae18e1bd1c189b6eddf";
+    const TMC_COMMIT: &str = "6d5c85f68b421aebdb4fdcbd1bdb33b88a5c493c";
 
     #[test]
     fn tmc_is_a_root_workspace_rust_recipe_pinned_to_one_commit() {

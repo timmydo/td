@@ -353,6 +353,42 @@ mod tests {
         );
     }
 
+    /// A local source with sibling trees is staged under basenames, so its
+    /// `cargo_subdir` must be its own basename; and the roster of trees the
+    /// seed table pins is what td-builder's affected-checks routes to the
+    /// digest preflight (builder/src/affected.rs names this test), so the
+    /// two literals must agree.
+    #[test]
+    fn local_source_trees_are_staged_by_basename_and_routed_by_the_builder() {
+        let mut trees: Vec<String> = Vec::new();
+        for (stem, recipe) in all() {
+            let siblings = recipe.local_source_trees.clone().unwrap_or_default();
+            let Some(main) = recipe.local_source.clone() else {
+                assert!(
+                    siblings.is_empty(),
+                    "{stem}: local_source_trees without a local_source stage nothing"
+                );
+                continue;
+            };
+            if siblings.is_empty() {
+                continue;
+            }
+            let basename = std::path::Path::new(&main)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string);
+            assert_eq!(
+                recipe.cargo_subdir, basename,
+                "{stem}: cargo_subdir must name the main tree's basename"
+            );
+            trees.push(main);
+            trees.extend(siblings);
+        }
+        trees.sort_unstable();
+        trees.dedup();
+        assert_eq!(trees, ["engine", "net", "td-boot"]);
+    }
+
     #[test]
     fn every_line_attribution_exception_reaches_the_target_splitter() {
         for (stem, _) in td_engine::target_profile::LINE_ATTRIBUTION_EXCEPTIONS {

@@ -23,7 +23,8 @@ use crate::ladder::{
     TD_APPLICATIONS_PLACED_MARKER, TD_COMPOSITOR_DRM_PROBE_MARKER,
     TD_COMPOSITOR_FLIP_PROBE_MARKER, TD_COMPOSITOR_KMS_PROBE_MARKER,
     TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER,
+    TD_FETCH_BOOT_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_MAIL_BOOT_MARKER,
     TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
     TD_PORTAL_CHANNEL_RUNTIME_MARKER,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
@@ -1134,7 +1135,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 32] = [
+const TD_SVC_UNITS: [&str; 34] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -1144,6 +1145,8 @@ const TD_SVC_UNITS: [&str; 32] = [
     "audio",
     "netup",
     "busd",
+    "fetchd",
+    "fetch-evidence",
     "portal",
     "portal-evidence",
     "wayland",
@@ -1377,6 +1380,38 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
+         # The fetch service (APPLICATIONS.md §W.8): td-fetchd's socket in a\n\
+         # directory of its own under the UI user's runtime directory, which\n\
+         # td-jail binds read-only, as a directory, into a jail that carries\n\
+         # sockets=fetch. After netup as well as seat: it is the one\n\
+         # network client the applications have. A jail proves the socket\n\
+         # accepting before it launches, so mail and news require this unit.\n\
+         # The socket is authenticated by its mode alone (0600 under the 0700\n\
+         # runtime directory), which is why exec-as and not su.\n\
+         [fetchd]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/td-fetchd run --socket /run/user/{ui_uid}/td-fetch/socket\n\
+         after=seat,netup\n\
+         requires=seat\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-fetchd probe /run/user/{ui_uid}/td-fetch/socket\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
+         # Boot evidence under the autotest token only: the probe, as the UI\n\
+         # user, asks the service for a loopback URL and gets the policy's exact\n\
+         # refusal, which proves the socket, the framing and the policy in a VM\n\
+         # with no route out. The in-jail half is the mail and news markers:\n\
+         # their jails carry the grant and stage 2 refuses to launch without\n\
+         # the socket bound. The marker waits for TLS setup like the other\n\
+         # exact lines; the shell leader stays, so the unit keeps its leaf.\n\
+         [fetch-evidence]\n\
+         type=oneshot\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-login exec-as {ui_user} -- /bin/td-fetchd probe /run/user/{ui_uid}/td-fetch/socket && /bin/echo {fetch_marker}'\n\
+         after=fetchd,firefox-tls-setup\n\
+         requires=fetchd\n\
+         timeout={application_evidence}\n\
+         \n\
          # Root holds td-busd's one-shot portal capability and supervises one\n\
          # literal td-login exec-as child. The child is therefore both uid 1000\n\
          # and the live direct descendant the broker authorizes to own the\n\
@@ -1488,8 +1523,8 @@ fn build_td_svc_conf() -> String {
          type=daemon\n\
          cgroup=session\n\
          exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-mail-ready --command /bin/{mail_name}'\n\
-         after=terminal,busd,portal,netup,applications-workspace,firefox-tls-setup\n\
-         requires=wayland,busd\n\
+         after=terminal,busd,portal,fetchd,applications-workspace,firefox-tls-setup\n\
+         requires=wayland,busd,fetchd\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-mail-ready'\n\
          ready-timeout=30\n\
          restart=never\n\
@@ -1514,8 +1549,8 @@ fn build_td_svc_conf() -> String {
          type=daemon\n\
          cgroup=session\n\
          exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-news-ready --command /bin/{news_name}'\n\
-         after=terminal,busd,netup,applications-workspace\n\
-         requires=wayland,busd\n\
+         after=terminal,busd,fetchd,applications-workspace\n\
+         requires=wayland,busd,fetchd\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-news-ready'\n\
          ready-timeout=30\n\
          restart=never\n\
@@ -1752,6 +1787,7 @@ fn build_td_svc_conf() -> String {
         news_program = entry_program(TD_NEWS_ENTRY),
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
+        fetch_marker = TD_FETCH_BOOT_MARKER,
         application_settle = APPLICATION_SETTLE_SECS,
         application_workspace = TERMINAL_APPLICATION_WORKSPACE,
         application_evidence = svc_timeouts::APPLICATION_EVIDENCE,
@@ -3892,6 +3928,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-busd}".into(),
         dest: "{root}/real-root{in:td-busd}".into(),
     });
+    // The fetch service (APPLICATIONS.md §W.8): the target-built td-net
+    // multicall, static, copied whole like the session substrate; the
+    // /bin/td-fetchd link below selects its applet by name.
+    steps.push(Step::CopyTree {
+        from: "{in:td-net}".into(),
+        dest: "{root}/real-root{in:td-net}".into(),
+    });
     // The activated Settings portal is a separate static process. Its root
     // supervisor and unprivileged child execute the same binary, while the
     // broker retains the capability that authorizes only that direct child.
@@ -4084,6 +4127,14 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::Symlink {
         target: "{in:td-busd}/bin/td-busd".into(),
         link: "{root}/real-root/bin/td-busd".into(),
+    });
+    // /bin/td-fetchd — the fetch service (APPLICATIONS.md §W.8), an applet of
+    // the target-built td-net multicall: the link's basename selects it, as
+    // the applet links do on the host. Named in full by the fetchd unit's
+    // exec, ready and evidence lines.
+    steps.push(Step::Symlink {
+        target: "{in:td-net}/bin/td-net".into(),
+        link: "{root}/real-root/bin/td-fetchd".into(),
     });
     steps.push(Step::Symlink {
         target: "{in:td-portal}/bin/td-portal".into(),
@@ -4389,6 +4440,8 @@ fn shape_check() -> String {
      tdctl=\"{root}/real-root{in:td-compositor}/bin/td-ctl\"; { [ -f \"$tdctl\" ] && [ -x \"$tdctl\" ]; } || { echo 'root tree: td-ctl is not packed/executable at real-root{in:td-compositor}/bin/td-ctl - the /bin/td-ctl symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-busd\" 2>/dev/null)\" = \"{in:td-busd}/bin/td-busd\" ] || { echo 'root tree: /bin/td-busd is not a symlink to the staged session bus broker - the busd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
      tdbusd=\"{root}/real-root{in:td-busd}/bin/td-busd\"; { [ -f \"$tdbusd\" ] && [ -x \"$tdbusd\" ]; } || { echo 'root tree: td-busd is not packed/executable at real-root{in:td-busd}/bin/td-busd - the /bin/td-busd symlink would dangle' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-fetchd\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-fetchd is not a symlink to the staged td-net multicall - the fetchd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
+     tdfetchd=\"{root}/real-root{in:td-net}/bin/td-net\"; { [ -f \"$tdfetchd\" ] && [ -x \"$tdfetchd\" ]; } || { echo 'root tree: td-net is not packed/executable at real-root{in:td-net}/bin/td-net - the /bin/td-fetchd symlink would dangle and the fetchd unit would exec nothing' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
      tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
      for a in @APPLICATIONS@; do \
@@ -4806,6 +4859,7 @@ pub fn recipe() -> Recipe {
             "td-busd",
             "td-portal",
             "td-secret",
+            "td-net",
         ])
         .steps(steps);
     let application_inputs = application_payload_inputs(&SYSTEM);
@@ -6138,15 +6192,21 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             assert_eq!(unit_key(unit, "type").as_deref(), Some("daemon"), "{unit}");
             assert_eq!(unit_key(unit, "restart").as_deref(), Some("never"), "{unit}");
             assert_eq!(unit_key(unit, "cgroup").as_deref(), Some("session"), "{unit}");
-            assert_eq!(unit_key(unit, "requires").as_deref(), Some("wayland,busd"), "{unit}");
+            assert_eq!(
+                unit_key(unit, "requires").as_deref(),
+                Some("wayland,busd,fetchd"),
+                "{unit}"
+            );
             // The switch is an ordering, not a requirement: a channel that
-            // failed loses the placement, not the applications.
+            // failed loses the placement, not the applications. The fetch
+            // service is a requirement: the jail proves its socket accepting
+            // before it launches (APPLICATIONS.md §W.8).
             assert_eq!(
                 unit_after(unit),
                 if unit == "mail" {
-                    vec!["terminal", "busd", "portal", "netup", "applications-workspace", "firefox-tls-setup"]
+                    vec!["terminal", "busd", "portal", "fetchd", "applications-workspace", "firefox-tls-setup"]
                 } else {
-                    vec!["terminal", "busd", "netup", "applications-workspace"]
+                    vec!["terminal", "busd", "fetchd", "applications-workspace"]
                 },
                 "{unit}"
             );
@@ -6574,6 +6634,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("audio", vec!["seat"]),
             ("netup", vec!["rootcheck"]),
             ("busd", vec!["seat"]),
+            ("fetchd", vec!["seat", "netup"]),
+            ("fetch-evidence", vec!["fetchd", "firefox-tls-setup"]),
             ("portal", vec!["busd"]),
             ("portal-evidence", vec!["portal", "firefox-tls-setup"]),
             ("wayland", vec!["seat"]),
@@ -6585,12 +6647,12 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("applications-workspace", vec!["terminal"]),
             (
                 "mail",
-                vec!["terminal", "busd", "portal", "netup", "applications-workspace", "firefox-tls-setup"],
+                vec!["terminal", "busd", "portal", "fetchd", "applications-workspace", "firefox-tls-setup"],
             ),
             ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
             (
                 "news",
-                vec!["terminal", "busd", "netup", "applications-workspace"],
+                vec!["terminal", "busd", "fetchd", "applications-workspace"],
             ),
             ("news-evidence", vec!["news", "firefox-tls-setup"]),
             ("shell-workspace", vec!["mail", "news"]),
@@ -12080,6 +12142,42 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             native_inputs.iter().any(|i| i == "td-busd"),
             "td-busd must be a declared native input, or {{in:td-busd}} does not resolve"
+        );
+    }
+
+    /// td-busd's rent again, for the fetch service: `{in:td-net}` resolves at
+    /// build time because td-net is an input, and only the CopyTree puts the
+    /// package on the image. A dangling /bin/td-fetchd is quiet in the same
+    /// way — the fetchd unit never becomes ready, td-svc restarts it for
+    /// ever, and mail, news and the fetch evidence, which require it, are
+    /// skipped — so the mistake is made visible here, and in the root-tree
+    /// shape check that names the link and the packed binary behind it.
+    #[test]
+    fn td_net_is_packed_and_not_merely_symlinked() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-net}" && dest == "{root}/real-root{in:td-net}"
+            )),
+            "td-net must be CopyTree'd into the real root (static, empty closure) - a \
+             symlink alone dangles on the image and the fetchd unit execs nothing"
+        );
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-net}/bin/td-net"
+                        && link == "{root}/real-root/bin/td-fetchd"
+            )),
+            "/bin/td-fetchd must symlink to the store td-net multicall - the fetchd \
+             unit names it in full, in its exec, ready and evidence lines"
+        );
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        assert!(
+            native_inputs.iter().any(|i| i == "td-net"),
+            "td-net must be a declared native input, or {{in:td-net}} does not resolve"
         );
     }
 

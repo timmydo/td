@@ -1981,7 +1981,7 @@ for one has to argue past this rather than rediscover it:
 | **target-side OSTree client** (repo modes, `.filez`/`.dirtree`/`.dirmeta`, GVariant) | Still refused. §B.3.1 selects a bounded control-plane deploy importer for reviewed exact commits; it does not put repository or installation machinery in the distribution. |
 | **runtime summary browsing, refs and updates** | Still refused. The control-plane importer may resolve only the exact pinned commit/object graph. A pin bump plus a rebuild is td's update mechanism; a mutable ref is discovery input at review time, never derivation input. |
 | **OpenPGP verification** | The signature is checked by a human at pin review, as it is for every other fixed-output input. An implementation on the target would be a parser for attacker-supplied input serving a trust decision already made elsewhere. |
-| **HTTP/TLS on the target** | Nothing on the target fetches. The control plane's `td-net` already does this, under the existing dependency exception. |
+| **HTTP/TLS on the target** | One thing on the target fetches: `td-fetchd`, the fetch service applet of the target-built `td-net` (§W.8), which a jailed application reaches over a socket under `sockets=fetch`. The applications themselves carry no TLS, resolve no names and hold no network; the control plane's `td-net` does this under the existing dependency exception, and the target's copy is the same tier rebuilt on the target toolchain. |
 | **a target-side `fsck`/`verify` verb** | Refused. A package is in a read-only image admitted by a signed manifest, so a userspace hash sweep would re-check it with a weaker mechanism (§B.5). This refusal has flipped three times as the layout moved, which is the entry's real content: **a refusal argued from a layout is only as settled as the layout.** |
 | **OCI / container registries** | A second foreign format with the same objection as the first. The selected Firefox experiment uses Flathub's signed OSTree commits directly; an OCI translation would add a second parser without removing the first. |
 
@@ -1996,7 +1996,7 @@ served the repository client:
 | `builder/src/store.rs` | **read, do not port** — the store semantics are the control plane's, and with packages in the store there is nothing on the target that creates a store path |
 | `builder/src/elf.rs` | **never** — see §G |
 | `engine/src/gzip.rs` | **reuse only in the control plane** — builder source extraction and the bounded deploy importer share this std-only gzip/raw-DEFLATE implementation; nothing on the target decompresses a package |
-| `net/src/http.rs`, `td-feed` | **reuse only in the control plane** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; there is no target network or repository client |
+| `net/src/http.rs`, `td-feed` | **reuse in the control plane, and on the target through `td-fetchd` alone** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; the target's one network client is the same tier's fetch service (§W.8), and there is no target repository client |
 | `builder/src/xz.rs`, `bzip2.rs`, `erofs.rs`, `tar.rs`, `oci.rs` | do not port — these serve source extraction or the image writer on the control plane |
 | `builder/src/nar.rs` | **needed, but only in the control plane** — `read_nar` is how host mode materializes a package (§X.1). Nothing on the target extracts an archive. §X.6 records the arbitrary-file-write this design found in it, fixed on main before this landed |
 | `engine` SHA-256 | **not needed** — nothing on the target hashes a package; the deployment's signed manifest is the integrity check |
@@ -9315,9 +9315,9 @@ HTTPS client, `net/src/http.rs`, ureq over rustls, ring and
 webpki-roots, and no decoder. So:
 
 1. `td-fetchd`, an applet of the td-net multicall, built as a target
-   recipe through the Cargo runner from the checkout's `net/` and
-   `engine/` trees and the committed lock's vendor closure: the first
-   target-built control-plane program, and the one target network
+   recipe through the Cargo runner from the checkout's `net/`, `engine/`
+   and `td-boot/` trees and the committed lock's vendor closure: the
+   first target-built control-plane program, and the one target network
    client. It listens on `/run/user/1000/td-fetch/socket` as the UI
    user under a `[fetchd]` unit after `seat` and `netup`,
    `restart=always`, in a directory of its own that it makes, mode
@@ -9336,9 +9336,11 @@ webpki-roots, and no decoder. So:
    environment variable is added, the path under
    `XDG_RUNTIME_DIR` being the contract. `mail` and `news` take the
    grant and lose `shared=network`, so their jails get the isolated
-   namespace with loopback alone, and the resolver and CA bundle are no
-   longer bound, nothing in the jail resolving or verifying. Firefox
-   keeps `shared=network`; it has its own TLS.
+   namespace with loopback alone and the resolver is no longer bound.
+   The CA bundle still is: td-jail binds it into every jail's
+   `/etc/ssl/certs`, where a jail without the network has nothing to
+   verify with it; unbinding it from such jails is a td-jail change for
+   a later landing. Firefox keeps `shared=network`; it has its own TLS.
 3. One request per connection, a text header block and then the body.
    The client writes `td-fetch 1`, `method GET` or `POST`, `url …`, zero
    or more `header name: value` lines with the name in lower case,

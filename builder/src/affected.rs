@@ -695,6 +695,9 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     if p == "engine/src/gzip.rs" {
         sel.add_preflight("cargo-test");
         sel.add_preflight("net-test");
+        // Staged into the td-net seed with the rest of engine/, so it moves
+        // the `td-net-source` digest row like any engine file.
+        sel.add_preflight("local-source-digests");
         sel.add_target("check-engine");
         sel.add_target("check");
         sel.add_note(
@@ -718,6 +721,11 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         sel.add_preflight("cargo-test");
         if pattern_matches("engine/Cargo.toml|engine/src/*|engine/tests/*", p) {
             sel.add_preflight("net-test");
+            // `engine/` is staged into td-net's seed (the `td-net` recipe's
+            // local-source trees, pinned by the catalog test
+            // `local_source_trees_are_staged_by_basename_and_routed_by_the_builder`),
+            // so an edit moves the `td-net-source` digest row.
+            sel.add_preflight("local-source-digests");
         }
         sel.add_target("check-engine");
         sel.add_target("recipe-rs");
@@ -847,9 +855,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         // (former feed coverage); AND, since the old fetch/* rule mapped to the broad
         // behavioral tier, a net-only change keeps that too — without it such a diff
         // would run nothing while waiving the full check. The union of BOTH former
-        // rules. The host net-test preflight compiles and tests td-net; no
-        // target gate builds its external-dependency crate from source.
+        // rules. The host net-test preflight compiles and tests td-net. The
+        // target builds it too, as the `td-net` recipe's local source with
+        // `engine/` and `td-boot/` staged beside it (APPLICATIONS.md §W.8),
+        // so an edit moves the `td-net-source` digest row. No gated check
+        // builds that recipe, so the digest preflight is the one thing that
+        // reds a stale row before an image build would.
         sel.add_preflight("net-test");
+        sel.add_preflight("local-source-digests");
         sel.add_target("check");
         add_chain_targets(sel);
         return;
@@ -1044,6 +1057,17 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     if pattern_matches("*.md|DESIGN.md|CLAUDE.md|.gitignore", p) {
+        // A document under a tree staged into the td-net seed is staged with
+        // it (copy_source_tree skips target/ and .git alone), so it moves the
+        // `td-net-source` digest row like any other file there. net/ never
+        // gets here, its own arm above catching every path beneath it.
+        if p.starts_with("engine/") || p.starts_with("td-boot/") {
+            sel.add_preflight("local-source-digests");
+            sel.add_note(&format!(
+                "{p} is a document inside a tree staged into the td-net seed, so it moves the td-net-source digest row: the digest preflight is the one check."
+            ));
+            return;
+        }
         return; // docs — no checks
     }
 
@@ -1064,6 +1088,9 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // narrower one beside the assertions below.
     if p == "td-boot/src/protocol.rs" || p == "td-boot/src/realfile.rs" {
         sel.add_preflight("cargo-test");
+        // Both are `#[path]`-included by td-net, and `td-boot/` is staged
+        // into td-net's seed: the digest row moves with them.
+        sel.add_preflight("local-source-digests");
         sel.add_target("check");
         sel.add_target("recipe-checks");
         add_chain_targets(sel);
@@ -1078,6 +1105,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         p,
     ) {
         sel.add_preflight("cargo-test");
+        if pattern_matches("td-boot/*|td-boot/src/*|td-boot/Cargo.toml|td-boot/Cargo.lock", p) {
+            // `td-boot/` is staged whole into td-net's seed.
+            sel.add_preflight("local-source-digests");
+        }
         sel.add_target("check");
         sel.add_target("recipe-checks");
         return;
@@ -1940,6 +1971,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/gzip.rs", "source extraction");
     assert_preflight!("engine/src/ostree.rs", "net-test");
     assert_preflight!("engine/src/lib.rs", "net-test");
+    // The three trees staged into td-net's seed reach the digest preflight.
+    assert_preflight!("engine/src/lib.rs", "local-source-digests");
+    assert_preflight!("engine/src/json.rs", "local-source-digests");
+    assert_preflight!("engine/src/gzip.rs", "local-source-digests");
+    // A document under engine/ or td-boot/ matches no arm of theirs and
+    // falls to the docs arm; it still moves the row. (net/'s own arm
+    // catches every path beneath it first.)
+    assert_preflight!("engine/README.md", "local-source-digests");
+    assert_preflight!("engine/DESIGN.md", "local-source-digests");
+    assert_preflight!("td-boot/README.md", "local-source-digests");
     assert_target!(
         "engine/tests/fixtures/flathub-firefox-154.commit.hex",
         "check-engine"
@@ -2193,6 +2234,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("net/src/ostree.rs", "net-test");
     assert_preflight!("net/src/http.rs", "net-test");
     assert_preflight!("net/Cargo.toml", "net-test");
+    assert_preflight!("net/src/fetchd.rs", "local-source-digests");
+    assert_preflight!("net/Cargo.lock", "local-source-digests");
     assert_contains!(
         "net/src/ostree.rs",
         "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml"
@@ -2449,6 +2492,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-netd/Cargo.toml", "recipe-checks");
     assert_target!("td-boot/src/main.rs", "check");
     assert_target!("td-boot/src/main.rs", "recipe-checks");
+    assert_preflight!("td-boot/src/main.rs", "local-source-digests");
+    assert_preflight!("td-boot/src/protocol.rs", "local-source-digests");
+    assert_preflight!("td-boot/src/realfile.rs", "local-source-digests");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
     // protocol.rs is the deployment contract three OTHER trees compile: two

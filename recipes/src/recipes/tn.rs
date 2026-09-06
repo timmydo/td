@@ -10,7 +10,7 @@ use crate::types::Recipe;
 /// because the `news` application package validates it as a static entry on
 /// the empty runtime: the jail shows an application no `/td/store` loader.
 pub fn recipe() -> Recipe {
-    Recipe::rust("tn", "0.1.0-g3de5c9e")
+    Recipe::rust("tn", "0.1.0-gf2376c7")
         .source_input("tn-source")
         .native_inputs(&[
             "rust-toolchain",
@@ -31,7 +31,7 @@ mod tests {
 
     /// The pinned upstream commit; the version suffix and the pin's URL and
     /// file name must all name it.
-    const TN_COMMIT: &str = "3de5c9e22b05527f9d90f9e9ae63256f24ba67b2";
+    const TN_COMMIT: &str = "f2376c77e4774f05f3b9bb0175eaa7d3c5081b7a";
 
     #[test]
     fn tn_is_a_root_workspace_rust_recipe_pinned_to_one_commit() {

@@ -63,7 +63,7 @@ pub fn direct_rustc_args(build_root: &str, source_root: &str) -> [String; 6] {
 /// preserve an x86-64 frame chain. Compiler-generated functions around them
 /// still use the global policy; samples entering one of these ranges are an
 /// explicit coverage boundary rather than silently trusted unwinds.
-pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 8] = [
+pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 9] = [
     (
         "codex",
         "aws-lc-sys 0.39.0, ring 0.17.14, and zstd-sys 2.0.16+zstd.1.5.7 x86_64 assembly",
@@ -86,13 +86,16 @@ pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 8] = [
     // pregenerated x86_64 assembly is compiled by its build script.
     ("tmc", "ring 0.17.14 x86_64 assembly"),
     ("tn", "ring 0.17.14 x86_64 assembly"),
+    // The target-built td-net multicall, the fetch service's tier, links
+    // rustls through the same `ring` (APPLICATIONS.md §W.8).
+    ("td-net", "ring 0.17.14 x86_64 assembly"),
 ];
 
 /// Recipes whose linked outputs include the Rust runtime boundary. The glibc
 /// and libgcc boundaries apply to every output passed to the target splitter;
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
 /// recipes by the catalog tests.
-pub const RUST_PROFILED_RECIPES: [&str; 27] = [
+pub const RUST_PROFILED_RECIPES: [&str; 28] = [
     "codex",
     "fd",
     "ripgrep",
@@ -108,6 +111,7 @@ pub const RUST_PROFILED_RECIPES: [&str; 27] = [
     "td-jail",
     "td-kexec",
     "td-login",
+    "td-net",
     "td-netd",
     "td-portal",
     "td-profiler",
@@ -138,7 +142,7 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                     && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self"))
                 || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
                 // A package's own crate assembly reaches that package alone.
-                || (*source == recipe && matches!(recipe, "codex" | "tmc" | "tn"))
+                || (*source == recipe && matches!(recipe, "codex" | "td-net" | "tmc" | "tn"))
         })
         .collect()
 }
@@ -334,6 +338,7 @@ mod tests {
                 ),
                 ("tmc", "ring 0.17.14 x86_64 assembly"),
                 ("tn", "ring 0.17.14 x86_64 assembly"),
+                ("td-net", "ring 0.17.14 x86_64 assembly"),
             ]
         );
         assert_eq!(TOOLCHAIN_DEBUG_CEILING_BYTES, 4_294_967_296);

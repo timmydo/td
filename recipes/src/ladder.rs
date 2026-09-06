@@ -1061,6 +1061,14 @@ pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";
 // provisioned and did not exit on it.
 pub const TD_MAIL_BOOT_MARKER: &str = "TD-MAIL-RUNNING";
 pub const TD_NEWS_BOOT_MARKER: &str = "TD-NEWS-RUNNING";
+// Printed by the `fetch-evidence` unit under the autotest token once
+// td-fetchd's probe, as the UI user, has asked the fetch service for a
+// loopback URL and received the policy's exact refusal: the socket is
+// served, the framing is understood and the policy is on, in a VM with no
+// route out (APPLICATIONS.md §W.8). The in-jail half is the mail and news
+// markers above: their jails carry `sockets=fetch`, and stage 2 refuses to
+// launch without the socket bound.
+pub const TD_FETCH_BOOT_MARKER: &str = "TD-FETCH-OK";
 // Printed by the `placement-evidence` unit under the autotest token once the
 // view is back on the first workspace and the compositor's own report shows
 // it active, the applications' workspace occupied, and one window on the
