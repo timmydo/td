@@ -15,9 +15,10 @@ undo/redo, save-snapshot state tracking, literal search/replace, paragraph
 filling, Auto Fill, and logical Windows/Emacs key dispatch. The core opens no
 files and reads no environment or clocks. The synchronous `files::Session`
 adapter now implements bounded file baselines and atomic save I/O, separately
-from the model. Its worker scheduling, window connection and prompts,
-pointer input, GPU rendering, spelling and the
-control socket are not implemented yet. Key bindings for those adapters
+from the model. `--window` now connects it through one file worker to
+file-backed tabs and keyboard Open/Save/Save As path prompts. Pointer input,
+GPU rendering, spelling and the control socket are not implemented yet.
+Key bindings for those absent adapters
 produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
 caret affinity, pixel hit testing, vertical/page-motion calculation and
@@ -31,7 +32,9 @@ remaining adapters remain future work. `--window-preview` now presents
 editable scratch tabs through the real Wayland transport and SHM lifecycle.
 It accepts keyboard input in both profiles, but cannot save or open user
 documents. Dirty window close requires explicit discard; process termination
-still loses scratch text. It is not yet suitable for important text.
+still loses scratch text. `--window` is a separate experimental file window;
+it is not yet the usable `$EDITOR` milestone. See the implemented file-window
+contract below for its narrower scheduling and close/conflict behavior.
 
 The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
@@ -366,7 +369,7 @@ records the content-state ID of its snapshot, not the then-current state.
 
 An untouched New/Untitled tab is clean; editing makes it dirty, and undoing
 back to its initial state makes it clean again. This differs from opening a
-missing pathname, which the future file adapter must mark dirty.
+missing pathname, which the file coordinator marks dirty at admission.
 
 The first core increment exposes `save_snapshot`/`acknowledge_saved` as the
 future file adapter's contract; it stores the saved content-state ID but no
@@ -449,11 +452,9 @@ ownership must be checked before manual removal, not inferred from the path.
 Abrupt process death can leave a private temporary file; no startup sweep
 deletes prefix-matching files.
 
-This increment does not yet create the one-worker/eight-job queue, bind file
-IDs to tabs, mark missing tabs dirty, acknowledge model save tokens, implement
-Reload/Save/Discard dialogs, or enable filename CLI arguments. Those are the
-next window increment. Callers must run these synchronous operations on the
-future file worker, never in the Wayland dispatch loop. Resource bounds are
+The synchronous adapter itself does not mutate the model or run a window.
+`session.rs` owns its one file worker and tab associations as specified below;
+no synchronous document file I/O runs in the Wayland dispatch loop. Resource bounds are
 byte/work bounds, not deadlines for a stalled filesystem. Tests use actual
 temporary files and explicit stage-failure injection; a model integration
 test edits while a snapshot is pending and acknowledges only the written
@@ -759,6 +760,113 @@ must select editor tests in affected-checks. A future move of a shared file
 updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
+
+### Implemented experimental file window
+
+`td-editor --window [--keys=windows|emacs] [--] [FILE...]` opens the file
+window. The mode flag `--window` must come first. Following profile options
+may precede or follow paths until `--`; dash-prefixed paths
+need that delimiter. There are at most 64 literal Unix-byte paths of at most
+4096 bytes each. No shell, tilde, variable or stdin expansion is performed.
+Initial opens run sequentially on the file worker before connecting Wayland;
+any failed initial open exits nonzero without creating a window or writing
+files. Duplicate paths/inodes select the existing tab without refreshing its
+baseline or replacing edits. With no paths, New creates one clean Untitled
+tab. Missing paths create empty dirty tabs without creating a disk file.
+Ordinary no-option/filename invocation remains refused: this explicit mode
+is experimental, not the `$EDITOR`/tmc integration milestone.
+
+The file window reuses the preview's transport, input dispatcher and bitmap
+renderer, with the warm palette and medium weight. It requires a v5+ seat
+advertisement (unlike the presentation-only scratch exception); absent or
+unsupported input capability/map still produces a retained-text warning.
+Its title says experimental file window, not NO SAVE. Filename labels are
+bounded escaped leaf names; arbitrary Unix bytes passed by CLI are preserved,
+not reconstructed from lossy labels. The original two-tab scratch fixture
+remains available only through `--window-preview` with no document access.
+
+Windows Ctrl+O/S/Shift+S and Emacs C-x C-f/C-s/C-w request Open/Save/Save As.
+Save on an untitled tab opens Save As. A modal path entry accepts individual
+printable scalars, Space, Backspace, Ctrl+U to clear, Return to submit and
+Escape/C-g to cancel. The current native input profile restricts what can be
+typed; arbitrary byte paths can still be opened through argv. Entry is bounded
+to 4096 UTF-8 bytes, refuses excess input, displays its final 160 scalars and
+passes the full literal path to the worker. Other commands are consumed, not
+sent to the document. Prompt input and confirmation do not auto-repeat.
+Cancelling preserves document selection, undo and text. Opening a prompt
+clears the previous notice so cancellation does not resurrect stale feedback.
+Submission closes the
+prompt and displays pending/success/failure; retry starts a fresh prompt.
+Prompts and notices share the existing clipped top-six-document-row overlay.
+When input is unavailable or not synchronized, the prompt instead prefixes
+readiness instructions without erasing the entered path.
+This is keyboard-only: pointer input, clickable menus and clipboard remain
+unimplemented.
+
+`session::Session` keeps FileId-to-TabId associations and an opaque model save
+token per pending save. One `std::thread::Builder` worker exclusively owns
+`files::Session`. There is exactly one submitted job and no waiting queue in
+this increment; additional requests are refused visibly before allocating
+another snapshot. Version 1's eight queued descriptors remain future work.
+Two capacity-one channels carry jobs/completions; the UI never waits on them
+or joins a file operation. It captures the encoded snapshot at admission and
+polls completions from the existing at-most-100ms event-loop wake. Protocol
+events, redraw, resize, tab switching and ordinary edits continue during I/O.
+An Open completion that changes the active tab cancels held-key repeat so it
+cannot continue typing into the new document. Save completion keeps repeat.
+Saves verify the requested tab revision before snapshot creation. Only a
+successful transaction dispatches `Event::Saved` with that snapshot's token;
+later edits remain dirty. Failures preserve model text, saved state and the
+old file association. Publication and cleanup warnings precede long path
+diagnostics so bounded notices retain those consequences. A disk conflict
+refuses the write and suggests Save As to a new path; Reload is not yet
+implemented. Save As never replaces an existing or already-associated path.
+
+Open admission and clean tab close update the coordinator's live association
+set. Before each job, the worker forgets associations absent from that set,
+including a previous Open result rejected by the model's tab/text budget.
+Between jobs those unclaimed baselines may remain retained, still charged to
+the file adapter's 64-file/64-MiB limits; they are released before any new
+admission and when the worker exits. In addition to the retained baseline
+budget, a new Open hands one at-most-16-MiB encoded result to the UI; decoding it can
+transiently allocate another at-most-16-MiB string before model admission.
+Duplicate opens transfer no text, only association metadata.
+Save owns one at-most-16-MiB encoded snapshot, with the transaction adapter's
+validation/readback scratch as specified in its section. No other queued
+snapshot or file result can accumulate.
+
+Untitled Save As first probes destination metadata on the worker and refuses
+an existing name without reading its contents. A name created between that
+probe and reservation can still be read and decoded by the adapter's Open:
+its bytes count toward the 64-MiB baseline budget, alongside the submitted
+16-MiB snapshot and up to 16 MiB of transient decode scratch. That unclaimed
+baseline is released before the next job. No-clobber publication is still
+enforced by the transaction, not inferred from the early probe. Reservation
+failures identify the destination, not the user's document, as the problem.
+
+While a file job is pending, tab/window close is refused with a notice. Close
+does not cancel a write or schedule an automatic exit; retry after completion.
+Dirty tab close asks the user to save first. Dirty window close offers only
+explicit whole-window Discard or Cancel; cancel and save individual tabs
+before retrying. Only a fresh Ctrl+D discards unsaved edits and exits;
+completed saves are never reverted. The full Save/Discard/Cancel tab/window
+dialog remains future work. Input-unavailable and unfocused states give
+readiness instructions instead of claiming confirmation works. There is no
+recovery: abrupt termination or a fatal display error can lose unsaved edits.
+A fatal display error during a file job additionally reports that the write
+may have published. File syscall duration is not bounded; a stalled filesystem
+can keep a job pending and ordinary close refused until the user terminates
+the process. Dropping the session disconnects the worker, but cannot cancel a
+filesystem call already in progress. No normal close exits with a pending job.
+
+Deterministic channel-driven tests execute the production file jobs with
+explicit completion timing, checking edit-during-save, stale requests,
+missing/duplicate opens, conflict refusal, no-clobber Save As and rejected
+admission cleanup. A real worker test covers startup handoff. Fake-compositor
+tests route both profiles through modal paths, pending-close refusal and save
+completion, checking actual file bytes and changed SHM pixels. These tests do
+not claim the still-required interactive Weston US or td-jail/tmc oracle.
+The replay protocol remains filesystem-free and cannot forge save completion.
 
 ### Implemented scratch-window adapter
 

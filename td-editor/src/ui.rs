@@ -19,6 +19,10 @@ pub enum Event<'a> {
     New,
     /// Byte fixture or already-authorized file-adapter completion, not a path.
     Load(&'a [u8]),
+    /// Authorized file completion: an absent file must not appear saved.
+    MissingFile,
+    /// Opaque token for the exact state successfully published by the adapter.
+    Saved(crate::model::SavePoint),
     SelectTab(TabId),
     Close {
         tab: TabId,
@@ -252,15 +256,20 @@ impl Controller {
 
     fn apply(&mut self, event: Event<'_>) -> Result<Outcome> {
         match event {
-            Event::New | Event::Load(_) => {
+            Event::New | Event::Load(_) | Event::MissingFile => {
                 let id = match event {
                     Event::Load(bytes) => self.editor.load_bytes(bytes)?,
+                    Event::MissingFile => self.editor.missing_file()?,
                     _ => self.editor.new_tab()?,
                 };
                 self.reset_input();
                 self.refresh(Some(id))?;
                 self.wake_caret();
                 Ok(Outcome::Created(id))
+            }
+            Event::Saved(point) => {
+                self.editor.acknowledge_saved(point)?;
+                Ok(Outcome::Changed)
             }
             Event::SelectTab(id) => {
                 self.editor.select_tab(id)?;

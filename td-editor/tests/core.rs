@@ -533,7 +533,20 @@ fn the_executable_replays_without_a_display_and_refuses_editor_invocation() {
     assert!(output.stderr.is_empty());
     let failure = Process::new(binary).arg("file.txt").output().unwrap();
     assert!(!failure.status.success());
-    assert!(String::from_utf8_lossy(&failure.stderr).contains("file editing is not connected yet"));
+    assert!(String::from_utf8_lossy(&failure.stderr)
+        .contains("ordinary $EDITOR invocation is not ready"));
+    let failure = Process::new(binary)
+        .args(["--window", "/dev/null"])
+        .output()
+        .unwrap();
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("NotRegular"));
+    let failure = Process::new(binary)
+        .args(["--window", "--keys=invalid"])
+        .output()
+        .unwrap();
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("unknown window option"));
 }
 
 #[test]

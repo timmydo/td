@@ -1,4 +1,4 @@
-//! Scratch editing milestone; no document paths or persistence.
+//! Wayland presentation and input, with an optional asynchronous file session.
 
 use crate::font::Font;
 use crate::keyboard::{Keymap, Modifiers};
@@ -268,6 +268,38 @@ struct Window {
     clock: u64,
     notice: Option<String>,
     quitting: bool,
+    files: Option<crate::session::Session>,
+    prompt: Option<PathPrompt>,
+}
+
+enum PathAction {
+    Open,
+    Save {
+        tab: crate::model::TabId,
+        revision: u64,
+    },
+}
+struct PathPrompt {
+    action: PathAction,
+    text: String,
+}
+impl PathPrompt {
+    fn notice(&self) -> String {
+        let action = match self.action {
+            PathAction::Open => "Open",
+            PathAction::Save { .. } => "Save As (new path only)",
+        };
+        // Keep the insertion end visible even for a long path. The full literal
+        // value, never this presentation, is passed to the worker.
+        let start = self
+            .text
+            .char_indices()
+            .rev()
+            .nth(159)
+            .map_or(0, |(i, _)| i);
+        let tail = self.text.get(start..).unwrap_or_default();
+        format!("{action}: literal path, no shell expansion\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{}{}|", if tail.len() < self.text.len() { "..." } else { "" }, tail)
+    }
 }
 
 impl Window {
@@ -315,6 +347,8 @@ impl Window {
             clock: 0,
             notice: None,
             quitting: false,
+            files: None,
+            prompt: None,
         })
     }
 
@@ -375,13 +409,23 @@ impl Window {
             self.bind("wl_seat", version, seat)?;
             self.seat = Some(seat);
         } else {
+            if self.files.is_some() {
+                return Err("file window requires wl_seat v5+".into());
+            }
             self.notify("No wl_seat v5+; scratch input unavailable");
         }
         self.connection.words(COMPOSITOR, 0, &[SURFACE])?;
         self.connection.words(WM, 2, &[XDG_SURFACE, SURFACE])?;
         self.connection.words(XDG_SURFACE, 1, &[TOPLEVEL])?;
         for (opcode, value) in [
-            (2, "td-editor — scratch preview (NO SAVE)"),
+            (
+                2,
+                if self.files.is_some() {
+                    "td-editor — experimental file window"
+                } else {
+                    "td-editor — scratch preview (NO SAVE)"
+                },
+            ),
             (3, "td-editor"),
         ] {
             let mut body = Builder::new();
@@ -582,6 +626,11 @@ impl Window {
 
     fn close(&mut self) {
         self.input.cancel_repeat();
+        if self.files.as_ref().is_some_and(|files| files.busy()) {
+            self.notify("File operation pending. Wait for completion, then close again; quitting does not cancel a write.");
+            return;
+        }
+        self.prompt = None;
         if self.ui.editor().tabs().any(|(_, doc)| doc.dirty()) {
             self.quitting = true;
             self.dirty = true;
@@ -662,9 +711,11 @@ impl Window {
                     !self.input.synchronized && self.input.focused && self.input.map.is_some();
                 self.input.modifiers(modifiers);
                 if ready {
-                    self.notify(
-                        "Keymap ready; Escape dismisses this notice. Scratch only: no Save.",
-                    );
+                    self.notify(if self.files.is_some() {
+                        "Keymap ready. Experimental file window; Escape dismisses."
+                    } else {
+                        "Keymap ready; Escape dismisses this notice. Scratch only: no Save."
+                    });
                 }
             }
             KeyboardEvent::Timing(rate, delay) => self.input.timing(rate, delay, self.clock)?,
@@ -695,6 +746,10 @@ impl Window {
             }
             return Ok(false);
         }
+        if self.prompt.is_some() {
+            self.path_chord(chord, repeated);
+            return Ok(false);
+        }
         if matches!(chord, "Escape" | "C-g") && self.notice.take().is_some() {
             self.dirty = true;
         }
@@ -720,20 +775,40 @@ impl Window {
                 tab,
                 revision,
             }) => {
+                if self.files.as_ref().is_some_and(|files| files.busy()) {
+                    self.notify("File operation pending; wait before closing tabs.");
+                    return Ok(false);
+                }
                 match self.ui.dispatch(Event::Close { tab, revision }) {
                     Ok(_) => {
                         self.labels.retain(|(id, _)| *id != tab);
+                        if let Some(files) = &mut self.files { files.forget(tab); }
                         if self.ui.editor().active().is_none() { self.closed = true; }
                         self.dirty = true;
                     }
-                    Err(crate::Error::Dirty) => self.notify("Tab has unsaved scratch text. Undo to clean, or close the window to discard all."),
+                    Err(crate::Error::Dirty) => self.notify(if self.files.is_some() {
+                        "Tab has unsaved edits. Save first, or close the window to explicitly discard all unsaved edits."
+                    } else { "Tab has unsaved scratch text. Undo to clean, or close the window to discard all." }),
                     Err(detail) => self.notify(detail.to_string()),
                 }
                 Ok(false)
             }
+            Ok(Outcome::Request {
+                name,
+                tab,
+                revision,
+            }) if self.files.is_some() && matches!(name, "open" | "save" | "save-as") => {
+                self.file_request(name, tab, revision);
+                Ok(false)
+            }
             Ok(Outcome::Request { name, .. }) => {
                 self.notify(format!(
-                    "{name} is not connected in this scratch preview. Escape dismisses."
+                    "{name} is not connected in this {}. Escape dismisses.",
+                    if self.files.is_some() {
+                        "experimental window"
+                    } else {
+                        "scratch preview"
+                    }
                 ));
                 Ok(false)
             }
@@ -746,6 +821,20 @@ impl Window {
     }
 
     fn tick(&mut self, now: u64, repeat: bool) -> Result<()> {
+        let active = self.ui.editor().active();
+        if let Some(result) = self
+            .files
+            .as_mut()
+            .and_then(|files| files.poll(&mut self.ui))
+        {
+            if self.ui.editor().active() != active {
+                self.input.cancel_repeat();
+            }
+            self.notify(match result {
+                Ok(notice) => notice,
+                Err(detail) => format!("File operation failed: {detail}"),
+            });
+        }
         let before = self.ui.generation();
         self.ui.dispatch(Event::Tick(now)).map_err(error)?;
         self.clock = now;
@@ -800,8 +889,15 @@ impl Window {
             .labels
             .iter()
             .map(|(tab, title)| Label { tab: *tab, title })
+            .chain(
+                self.files
+                    .iter()
+                    .flat_map(|files| files.labels())
+                    .map(|(tab, title)| Label { tab, title }),
+            )
             .collect();
         let close_notice = self.close_notice();
+        let path_notice = self.path_notice();
         let mut raster =
             Raster::new(&mut self.pixels, &self.font, geometry, width * 4).map_err(error)?;
         raster
@@ -809,6 +905,8 @@ impl Window {
             .map_err(error)?;
         let notice = if self.quitting {
             Some(close_notice)
+        } else if path_notice.is_some() {
+            path_notice.as_deref()
         } else {
             self.notice.as_deref()
         };
@@ -934,7 +1032,103 @@ impl Window {
 }
 
 impl Window {
+    fn path_notice(&self) -> Option<String> {
+        let prompt = self.prompt.as_ref()?;
+        let readiness = if self.device.is_none() || self.input.map.is_none() {
+            "Path entry paused: keyboard unavailable; restore the seat/keymap.\n"
+        } else if !self.input.focused || !self.input.synchronized {
+            "Path entry paused: focus the editor; tap and release Shift.\n"
+        } else {
+            ""
+        };
+        Some(format!("{readiness}{}", prompt.notice()))
+    }
+
+    fn file_request(&mut self, name: &str, tab: crate::model::TabId, revision: u64) {
+        let Some(files) = &mut self.files else {
+            return;
+        };
+        self.input.cancel_repeat();
+        if files.busy() {
+            self.notify("File operation pending; wait before trying again.");
+        } else if name == "save" && files.associated(tab) {
+            let result = files.save(&self.ui, tab, revision, None);
+            self.notify(match result {
+                Ok(()) => "Saving snapshot; newer edits will remain unsaved.".into(),
+                Err(detail) => detail,
+            });
+        } else {
+            self.notice = None;
+            self.prompt = Some(PathPrompt {
+                action: if name == "open" {
+                    PathAction::Open
+                } else {
+                    PathAction::Save { tab, revision }
+                },
+                text: String::new(),
+            });
+            self.dirty = true;
+        }
+    }
+
+    fn path_chord(&mut self, chord: &str, repeated: bool) {
+        if repeated {
+            return;
+        }
+        let Some(mut prompt) = self.prompt.take() else {
+            return;
+        };
+        self.dirty = true;
+        match chord {
+            "Escape" | "C-g" => return,
+            "Return" => {
+                if prompt.text.is_empty() {
+                    self.prompt = Some(prompt);
+                    return;
+                }
+                let Some(files) = &mut self.files else {
+                    return;
+                };
+                let path = PathBuf::from(&prompt.text);
+                let result = match prompt.action {
+                    PathAction::Open => files.open(path),
+                    PathAction::Save { tab, revision } => {
+                        files.save(&self.ui, tab, revision, Some(path))
+                    }
+                };
+                self.notify(match result {
+                    Ok(()) => "File operation pending...".into(),
+                    Err(detail) => detail,
+                });
+                return;
+            }
+            "Backspace" => {
+                prompt.text.pop();
+            }
+            "C-u" => prompt.text.clear(),
+            _ => {
+                let text = if chord == "Space" { " " } else { chord };
+                let mut chars = text.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    if !c.is_control() && prompt.text.len() + c.len_utf8() <= 4096 {
+                        prompt.text.push(c);
+                    }
+                }
+            }
+        }
+        self.prompt = Some(prompt);
+    }
+
     fn close_notice(&self) -> &'static str {
+        if self.files.is_some() {
+            return if self.device.is_none() || self.input.map.is_none() {
+                "Cannot confirm discard: keyboard unavailable.\nUnsaved edits remain in memory. Restore input to cancel or discard.\nTerminating the process loses unsaved edits."
+            } else if !self.input.focused || !self.input.synchronized {
+                "Discard pending; input not ready.\nFocus the editor; tap and release Shift.\nEscape/Ctrl+G: cancel and save first; Ctrl+D: discard ALL unsaved edits."
+            } else {
+                "Discard ALL unsaved edits and quit?\nEscape/Ctrl+G: Cancel (then Save each tab first)\nCtrl+D: Discard and quit\nCompleted saves are not reverted."
+            };
+        }
         if self.device.is_none() || self.input.map.is_none() {
             "Cannot confirm discard: keyboard unavailable.\nScratch text is retained in memory.\nRestore keyboard/map to cancel or discard.\nTerminating this process loses ALL scratch text."
         } else if !self.input.focused || !self.input.synchronized {
@@ -1114,6 +1308,41 @@ pub fn preview_with_profile(profile: Profile) -> io::Result<()> {
         let mut window = Window::new(stream, std::env::temp_dir())?;
         window.ui.dispatch(Event::Profile(profile)).map_err(error)?;
         window.run()
+    };
+    work().map_err(io::Error::other)
+}
+
+/// Experimental file window; ordinary $EDITOR invocation remains unavailable.
+pub fn file_window(profile: Profile, paths: Vec<PathBuf>) -> io::Result<()> {
+    let work = || -> Result<()> {
+        if paths.len() > 64 {
+            return Err("at most 64 input paths".into());
+        }
+        let mut files = crate::session::Session::start()?;
+        let mut ui = Controller::default();
+        for path in paths {
+            files.initial_open(&mut ui, path)?;
+        }
+        if ui.editor().active().is_none() {
+            ui.dispatch(Event::New).map_err(error)?;
+        }
+        ui.dispatch(Event::Profile(profile)).map_err(error)?;
+        ui.dispatch(Event::Focus(false)).map_err(error)?;
+        let endpoint = endpoint(
+            std::env::var_os("WAYLAND_SOCKET"),
+            std::env::var_os("WAYLAND_DISPLAY"),
+            std::env::var_os("XDG_RUNTIME_DIR"),
+        )?;
+        let mut window = Window::new(connect(endpoint)?, std::env::temp_dir())?;
+        window.ui = ui;
+        window.labels.clear();
+        window.files = Some(files);
+        window.notify("Experimental file window. Open/Save/Save As work; no mouse, clipboard, spelling or recovery. Not ready for $EDITOR.");
+        let result = window.run();
+        if result.is_err() && window.files.as_ref().is_some_and(|files| files.busy()) {
+            return Err(format!("{}; file operation was pending and may have published. Verify the destination; unsaved edits are not recovered.", result.err().unwrap_or_default()));
+        }
+        result
     };
     work().map_err(io::Error::other)
 }
@@ -1305,6 +1534,248 @@ mod tests {
             assert!(!w.ui.editor().document(tab).unwrap().dirty());
             key(&mut w, device, 15); // Ctrl+Tab
             assert_ne!(w.ui.editor().active().unwrap(), tab);
+        }
+    }
+
+    #[test]
+    fn file_prompts_save_snapshots_and_keep_window_alive_during_io() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, peer, device) = seat_fixture();
+            send_map(&mut w, &peer, device, &map_file());
+            focus(&mut w, device);
+            w.ui = Controller::default();
+            w.ui.dispatch(Event::New).unwrap();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            w.labels.clear();
+            w.files = Some(crate::session::Session::start().unwrap());
+            let tab = w.ui.editor().active().unwrap();
+            key(&mut w, device, 30); // real descriptor/map/seat path inserts 'a'
+            let text = w.ui.editor().document(tab).unwrap().text().to_owned();
+            let save = |w: &mut Window| {
+                if profile == Profile::Emacs {
+                    w.chord("C-x", false).unwrap();
+                }
+                w.chord("C-s", false).unwrap();
+            };
+            save(&mut w);
+            assert!(w.prompt.is_some());
+            w.chord("b", false).unwrap();
+            w.chord("Return", true).unwrap(); // held confirmations never submit
+            assert!(!w.files.as_ref().unwrap().busy());
+            w.chord("C-g", false).unwrap();
+            assert!(w.prompt.is_none());
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), text);
+            save(&mut w);
+            let directory = std::env::temp_dir().join(format!(
+                "td-editor-window-{}-{}",
+                std::process::id(),
+                NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("saved draft");
+            for c in path.to_str().unwrap().chars() {
+                w.chord(&c.to_string(), false).unwrap();
+            }
+            assert!(w.prompt.as_ref().unwrap().notice().contains("saved draft"));
+            w.event(message(SHM, 0, &[1])).unwrap();
+            configure(&mut w, 800, 600);
+            w.draw().unwrap();
+            let prompt_pixels = w.pixels.clone();
+            drain(&peer);
+            w.chord("Return", false).unwrap();
+            assert!(w.files.as_ref().unwrap().busy());
+            w.close();
+            assert!(!w.closed && !w.quitting);
+            w.chord(
+                if profile == Profile::Emacs {
+                    "C-x"
+                } else {
+                    "C-w"
+                },
+                false,
+            )
+            .unwrap();
+            if profile == Profile::Emacs {
+                w.chord("k", false).unwrap();
+            }
+            assert!(w.ui.editor().document(tab).is_ok());
+            w.event(message(device, 3, &[0, 0, 48, 1])).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while w.files.as_ref().unwrap().busy() {
+                assert!(Instant::now() < deadline, "file worker completion timeout");
+                w.tick(w.clock + 1, false).unwrap();
+                std::thread::yield_now();
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b"a");
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "ab");
+            assert!(w.input.repeat(w.clock + 1000).unwrap().is_some());
+            assert!(w.ui.editor().document(tab).unwrap().dirty());
+            assert!(w
+                .notice
+                .as_ref()
+                .unwrap()
+                .contains("newer edits remain unsaved"));
+            done(&mut w);
+            w.draw().unwrap();
+            assert_ne!(w.pixels, prompt_pixels);
+            drain(&peer);
+            w.close();
+            assert!(w.quitting && !w.closed);
+            assert!(w
+                .close_notice()
+                .contains("Completed saves are not reverted"));
+            w.chord("C-d", true).unwrap();
+            assert!(!w.closed);
+            w.chord("Escape", false).unwrap();
+            assert!(!w.quitting);
+            w.close();
+            w.chord("C-d", false).unwrap();
+            assert!(w.closed);
+            assert_eq!(std::fs::read(&path).unwrap(), b"a");
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_dir(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn path_entry_is_literal_bounded_and_modal() {
+        let (mut w, _peer) = fixture();
+        w.ui.dispatch(Event::Focus(true)).unwrap();
+        w.files = Some(crate::session::Session::start().unwrap());
+        let tab = w.ui.editor().active().unwrap();
+        let before = w.ui.editor().document(tab).unwrap().text().to_owned();
+        w.notify("old notice");
+        w.chord("C-o", false).unwrap();
+        assert!(w.notice.is_none());
+        for chord in ["~", "/", "$", "(", ";", "Space", "λ"] {
+            w.chord(chord, false).unwrap();
+        }
+        assert_eq!(w.prompt.as_ref().unwrap().text, "~/$(; λ");
+        w.chord("Backspace", false).unwrap();
+        w.chord("C-u", false).unwrap();
+        assert!(w.prompt.as_ref().unwrap().text.is_empty());
+        w.chord("Return", false).unwrap();
+        assert!(w.prompt.is_some());
+        w.prompt.as_mut().unwrap().text = "a".repeat(4095);
+        w.chord("λ", false).unwrap();
+        assert_eq!(w.prompt.as_ref().unwrap().text.len(), 4095);
+        w.chord("x", false).unwrap();
+        w.chord("y", false).unwrap();
+        assert_eq!(w.prompt.as_ref().unwrap().text.len(), 4096);
+        assert!(w.prompt.as_ref().unwrap().notice().ends_with("x|"));
+        w.chord("C-n", false).unwrap();
+        assert_eq!(w.ui.editor().active(), Some(tab));
+        w.chord("Escape", false).unwrap();
+        assert!(w.notice.is_none());
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), before);
+        assert!(!w.files.as_ref().unwrap().busy());
+    }
+
+    #[test]
+    fn file_window_requires_a_v5_seat_and_uses_its_own_title() {
+        for version in [None, Some(4), Some(5)] {
+            let (client, peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            let mut w = Window::new(client, std::env::temp_dir()).unwrap();
+            w.files = Some(crate::session::Session::start().unwrap());
+            for event in [
+                global(1, "wl_compositor", 4),
+                global(2, "wl_shm", 1),
+                global(3, "xdg_wm_base", 1),
+            ] {
+                w.event(event).unwrap();
+            }
+            if let Some(version) = version {
+                w.event(global(4, "wl_seat", version)).unwrap();
+            }
+            let result = w.event(message(SYNC, 0, &[0]));
+            if version != Some(5) {
+                assert!(result
+                    .unwrap_err()
+                    .contains("file window requires wl_seat v5+"));
+                assert!(!w.bound);
+            } else {
+                result.unwrap();
+                assert!(w.seat.is_some());
+                let (messages, _) = drain(&peer);
+                let title = messages
+                    .iter()
+                    .find(|m| m.object == TOPLEVEL && m.opcode == 2)
+                    .unwrap();
+                let mut cursor = Cursor::new(&title.payload);
+                assert_eq!(
+                    cursor.string().unwrap(),
+                    "td-editor — experimental file window"
+                );
+                cursor.finish().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn path_entry_reports_input_loss_without_erasing_the_path() {
+        let (mut w, peer, device) = seat_fixture();
+        send_map(&mut w, &peer, device, &map_file());
+        focus(&mut w, device);
+        w.files = Some(crate::session::Session::start().unwrap());
+        w.chord("C-o", false).unwrap();
+        w.chord("x", false).unwrap();
+        assert!(!w.path_notice().unwrap().contains("paused"));
+        w.input.synchronized = false;
+        assert!(w.path_notice().unwrap().contains("tap and release Shift"));
+        w.input.map = None;
+        assert!(w.path_notice().unwrap().contains("keyboard unavailable"));
+        assert_eq!(w.prompt.as_ref().unwrap().text, "x");
+        w.chord("Escape", false).unwrap();
+        assert!(w.path_notice().is_none());
+    }
+
+    #[test]
+    fn open_completion_never_repeats_into_the_new_active_tab() {
+        for already_open in [false, true] {
+            let (mut w, peer, device) = seat_fixture();
+            send_map(&mut w, &peer, device, &map_file());
+            focus(&mut w, device);
+            w.files = Some(crate::session::Session::start().unwrap());
+            let directory = std::env::temp_dir().join(format!(
+                "td-editor-repeat-{}-{}",
+                std::process::id(),
+                NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("new");
+            let old = w.ui.editor().active().unwrap();
+            if already_open {
+                w.files
+                    .as_mut()
+                    .unwrap()
+                    .initial_open(&mut w.ui, path.clone())
+                    .unwrap();
+                w.ui.dispatch(Event::SelectTab(old)).unwrap();
+            }
+            w.files.as_mut().unwrap().open(path).unwrap();
+            w.input.timing(1000, 0, w.clock).unwrap();
+            // No event-loop tick between submission and this held physical press.
+            w.event(message(device, 3, &[0, 0, 30, 1])).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while w.files.as_ref().unwrap().busy() {
+                assert!(Instant::now() < deadline, "Open completion timeout");
+                w.tick(w.clock + 1, true).unwrap();
+                std::thread::yield_now();
+            }
+            let new = w.ui.editor().active().unwrap();
+            assert_ne!(new, old);
+            assert_eq!(w.ui.editor().document(new).unwrap().text(), "");
+            w.tick(w.clock + 1000, true).unwrap();
+            assert_eq!(w.ui.editor().document(new).unwrap().text(), "");
+            // The held key still needs a release before a fresh press may type.
+            w.event(message(device, 3, &[0, 0, 30, 1])).unwrap();
+            assert_eq!(w.ui.editor().document(new).unwrap().text(), "");
+            key(&mut w, device, 30);
+            w.event(message(device, 3, &[0, 0, 30, 1])).unwrap();
+            assert_eq!(w.ui.editor().document(new).unwrap().text(), "a");
+            std::fs::remove_dir(directory).unwrap();
         }
     }
 
@@ -1530,10 +2001,7 @@ mod tests {
         w.event(message(SYNC, 0, &[0])).unwrap();
         assert_eq!(w.required, [1, 2, 3, 5]);
         let (messages, _) = drain(&peer);
-        let binding = messages
-            .iter()
-            .rfind(|m| m.object == REGISTRY)
-            .unwrap();
+        let binding = messages.iter().rfind(|m| m.object == REGISTRY).unwrap();
         let mut cursor = Cursor::new(&binding.payload);
         assert_eq!(cursor.u32().unwrap(), 5);
         assert_eq!(cursor.string().unwrap(), "wl_seat");

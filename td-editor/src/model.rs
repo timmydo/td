@@ -232,6 +232,9 @@ impl Editor {
         }
         self.add(text::decode(bytes)?, true)
     }
+    pub(crate) fn missing_file(&mut self) -> Result<TabId> {
+        self.add(text::decode(b"")?, false)
+    }
     fn add(&mut self, decoded: text::Decoded, saved: bool) -> Result<TabId> {
         if self.tabs.len() >= self.limits.tabs
             || self.total_text_bytes() + decoded.text.len() > self.limits.text_bytes

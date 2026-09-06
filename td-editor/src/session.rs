@@ -1,0 +1,630 @@
+//! Window file coordinator. The worker alone owns filesystem associations;
+//! completions enter the same controller as ordinary editing commands.
+
+use crate::files::{FileId, Session as Files};
+use crate::model::{SavePoint, TabId};
+use crate::ui::{Controller, Event, Outcome};
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+
+type Result<T> = std::result::Result<T, String>;
+
+enum Operation {
+    Open(PathBuf),
+    Save {
+        file: Option<FileId>,
+        path: Option<PathBuf>,
+        bytes: Vec<u8>,
+    },
+}
+struct Job {
+    keep: BTreeSet<FileId>,
+    operation: Operation,
+}
+struct Loaded {
+    file: FileId,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    missing: bool,
+}
+enum Completion {
+    Open(Loaded),
+    Saved { file: FileId, path: PathBuf },
+}
+enum Pending {
+    Open,
+    Save { tab: TabId, point: SavePoint },
+}
+struct Association {
+    file: FileId,
+    title: String,
+}
+
+pub(crate) struct Session {
+    sender: SyncSender<Job>,
+    receiver: Receiver<Result<Completion>>,
+    pending: Option<Pending>,
+    associations: BTreeMap<TabId, Association>,
+    failed: bool,
+}
+
+impl Session {
+    pub(crate) fn start() -> Result<Self> {
+        let (sender, jobs) = mpsc::sync_channel(1);
+        let (results, receiver) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("td-editor-files".into())
+            .spawn(move || {
+                let mut files = Files::default();
+                let mut known = BTreeSet::new();
+                while let Ok(job) = jobs.recv() {
+                    let result = execute(&mut files, &mut known, job);
+                    if results.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            sender,
+            receiver,
+            pending: None,
+            associations: BTreeMap::new(),
+            failed: false,
+        })
+    }
+
+    pub(crate) fn busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn available(&self) -> Result<()> {
+        if self.failed {
+            Err("File worker disconnected; restart the editor".into())
+        } else if self.busy() {
+            Err("File operation pending; wait before trying again".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn submit(&mut self, operation: Operation, pending: Pending) -> Result<()> {
+        self.available()?;
+        let keep = self.associations.values().map(|a| a.file).collect();
+        self.sender
+            .try_send(Job { keep, operation })
+            .map_err(|e| e.to_string())?;
+        self.pending = Some(pending);
+        Ok(())
+    }
+
+    pub(crate) fn open(&mut self, path: PathBuf) -> Result<()> {
+        if path.as_os_str().as_bytes().len() > 4096 {
+            return Err("Path exceeds 4096 bytes".into());
+        }
+        self.submit(Operation::Open(path), Pending::Open)
+    }
+
+    /// Only before connecting the display; the event loop uses poll instead.
+    pub(crate) fn initial_open(&mut self, ui: &mut Controller, path: PathBuf) -> Result<()> {
+        self.open(path)?;
+        let result = self.receiver.recv().map_err(|e| e.to_string())?;
+        let pending = self.pending.take();
+        self.finish(ui, pending, result).map(|_| ())
+    }
+
+    pub(crate) fn associated(&self, tab: TabId) -> bool {
+        self.associations.contains_key(&tab)
+    }
+    pub(crate) fn forget(&mut self, tab: TabId) {
+        self.associations.remove(&tab);
+    }
+    pub(crate) fn labels(&self) -> impl Iterator<Item = (TabId, &str)> {
+        self.associations
+            .iter()
+            .map(|(id, a)| (*id, a.title.as_str()))
+    }
+
+    pub(crate) fn save(
+        &mut self,
+        ui: &Controller,
+        tab: TabId,
+        revision: u64,
+        path: Option<PathBuf>,
+    ) -> Result<()> {
+        self.available()?;
+        if path
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().as_bytes().len() > 4096)
+        {
+            return Err("Path exceeds 4096 bytes".into());
+        }
+        let doc = ui.editor().document(tab).map_err(|e| e.to_string())?;
+        if doc.revision() != revision {
+            return Err(
+                "Save refused: tab changed since the request; retry Save (stale-revision)".into(),
+            );
+        }
+        let file = self.associations.get(&tab).map(|a| a.file);
+        if file.is_none() && path.is_none() {
+            return Err("Save As needs a path".into());
+        }
+        let (point, bytes) = ui.editor().save_snapshot(tab).map_err(|e| e.to_string())?;
+        self.submit(
+            Operation::Save { file, path, bytes },
+            Pending::Save { tab, point },
+        )
+    }
+
+    /// Nonblocking; at most one completion and one encoded snapshot can exist.
+    pub(crate) fn poll(&mut self, ui: &mut Controller) -> Option<Result<String>> {
+        let result = match self.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) if self.failed => return None,
+            Err(TryRecvError::Disconnected) => {
+                self.failed = true;
+                Err("File worker disconnected; a pending write may have reached disk. Verify the destination; text remains unsaved.".into())
+            }
+        };
+        let pending = self.pending.take();
+        Some(self.finish(ui, pending, result))
+    }
+
+    fn finish(
+        &mut self,
+        ui: &mut Controller,
+        pending: Option<Pending>,
+        result: Result<Completion>,
+    ) -> Result<String> {
+        match (pending, result?) {
+            (Some(Pending::Open), Completion::Open(loaded)) => {
+                if let Some((&tab, _)) = self
+                    .associations
+                    .iter()
+                    .find(|(_, a)| a.file == loaded.file)
+                {
+                    ui.dispatch(Event::SelectTab(tab))
+                        .map_err(|e| e.to_string())?;
+                    return Ok("Selected already-open file; edits and baseline retained".into());
+                }
+                let event = if loaded.missing {
+                    Event::MissingFile
+                } else {
+                    Event::Load(&loaded.bytes)
+                };
+                let Outcome::Created(tab) = ui.dispatch(event).map_err(|e| match e {
+                    crate::Error::Limit => {
+                        "Open refused: tab or text budget exhausted; existing tabs unchanged"
+                            .to_string()
+                    }
+                    _ => format!("Open was not admitted ({e}); existing tabs unchanged"),
+                })?
+                else {
+                    return Err("file admission did not create a tab".into());
+                };
+                self.associate(tab, loaded.file, &loaded.path);
+                Ok(format!(
+                    "Opened{}: {:?}",
+                    if loaded.missing {
+                        " (new file, not saved)"
+                    } else {
+                        ""
+                    },
+                    loaded.path,
+                ))
+            }
+            (Some(Pending::Save { tab, point }), Completion::Saved { file, path }) => {
+                ui.dispatch(Event::Saved(point))
+                    .map_err(|e| e.to_string())?;
+                self.associate(tab, file, &path);
+                let dirty = ui
+                    .editor()
+                    .document(tab)
+                    .map_err(|e| e.to_string())?
+                    .dirty();
+                Ok(format!(
+                    "Saved snapshot{}: {:?}",
+                    if dirty {
+                        "; newer edits remain unsaved"
+                    } else {
+                        ""
+                    },
+                    path,
+                ))
+            }
+            _ => Err("unexpected file completion".into()),
+        }
+    }
+
+    fn associate(&mut self, tab: TabId, file: FileId, path: &std::path::Path) {
+        let title = format!("{:?}", path.file_name().unwrap_or(path.as_os_str()))
+            .chars()
+            .take(512)
+            .collect();
+        self.associations.insert(tab, Association { file, title });
+    }
+}
+
+fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<Completion> {
+    // Release closed tabs and rejected Open admissions before the next job.
+    known.retain(|id| {
+        if job.keep.contains(id) {
+            true
+        } else {
+            files.forget(*id);
+            false
+        }
+    });
+    match job.operation {
+        Operation::Open(path) => {
+            let file = files.open(&path).map_err(file_error)?;
+            known.insert(file);
+            Ok(Completion::Open(Loaded {
+                file,
+                path: files.path(file).map_err(|e| e.to_string())?.to_owned(),
+                bytes: if job.keep.contains(&file) {
+                    Vec::new()
+                } else {
+                    files.bytes(file).map_err(|e| e.to_string())?.to_vec()
+                },
+                missing: files.missing(file).map_err(|e| e.to_string())?,
+            }))
+        }
+        Operation::Save { file, path, bytes } => {
+            let file = match (file, path) {
+                (Some(file), Some(path)) => {
+                    files.save_as(file, &path, bytes).map_err(file_error)?;
+                    file
+                }
+                (Some(file), None) => {
+                    files.save(file, bytes).map_err(file_error)?;
+                    file
+                }
+                (None, Some(path)) => {
+                    // A refused Save As should not read an existing destination.
+                    // Reservation still rechecks races through the file adapter.
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(_) => return Err(
+                            "Save As requires a new path; destination exists and was not modified"
+                                .into(),
+                        ),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "Cannot inspect Save As destination; nothing written: {e}"
+                            ))
+                        }
+                    }
+                    let file = files.open(&path).map_err(|e| {
+                        format!(
+                            "Cannot reserve Save As destination; nothing written: {}",
+                            file_error(e)
+                        )
+                    })?;
+                    let reserved = known.contains(&file);
+                    known.insert(file);
+                    if reserved || !files.missing(file).map_err(|e| e.to_string())? {
+                        return Err("Save As requires a new, unassociated path; destination was not modified".into());
+                    }
+                    files.save(file, bytes).map_err(file_error)?;
+                    file
+                }
+                (None, None) => return Err("Save As needs a path".into()),
+            };
+            Ok(Completion::Saved {
+                file,
+                path: files.path(file).map_err(|e| e.to_string())?.to_owned(),
+            })
+        }
+    }
+}
+
+fn file_error(error: crate::files::Failure) -> String {
+    // Put consequences before possibly long path diagnostics so the bounded
+    // window notice cannot truncate the publication/cleanup warning away.
+    format!(
+        "{}{}{}{}",
+        if error.published || error.publication_attempted {
+            "Destination may contain the snapshot; save is UNCONFIRMED. Verify disk contents. "
+        } else {
+            ""
+        },
+        if error.residual.is_some() {
+            "Temporary cleanup is unconfirmed. "
+        } else {
+            ""
+        },
+        if error.kind == crate::files::Kind::Conflict {
+            "Disk conflict: use Save As to a NEW path or cancel. Reload is not implemented. "
+        } else {
+            ""
+        },
+        error
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::model::Command;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "td-editor-session-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // The real job executor behind a manually advanced channel gives a
+    // deterministic delayed-I/O oracle without timing-dependent sleeps.
+    struct Harness {
+        session: Session,
+        jobs: Receiver<Job>,
+        results: SyncSender<Result<Completion>>,
+        files: Files,
+        known: BTreeSet<FileId>,
+        ui: Controller,
+    }
+    impl Harness {
+        fn new() -> Self {
+            let (sender, jobs) = mpsc::sync_channel(1);
+            let (results, receiver) = mpsc::sync_channel(1);
+            Self {
+                session: Session {
+                    sender,
+                    receiver,
+                    pending: None,
+                    associations: BTreeMap::new(),
+                    failed: false,
+                },
+                jobs,
+                results,
+                files: Files::default(),
+                known: BTreeSet::new(),
+                ui: Controller::default(),
+            }
+        }
+        fn complete(&mut self) -> Result<String> {
+            let job = self.jobs.try_recv().unwrap();
+            let result = execute(&mut self.files, &mut self.known, job);
+            self.results.send(result).ok().unwrap();
+            self.session.poll(&mut self.ui).unwrap()
+        }
+        fn open(&mut self, path: PathBuf) -> TabId {
+            self.session.open(path).unwrap();
+            self.complete().unwrap();
+            self.ui.editor().active().unwrap()
+        }
+        fn edit(&mut self, tab: TabId, command: Command) {
+            let revision = self.ui.editor().document(tab).unwrap().revision();
+            self.ui
+                .dispatch(Event::Edit {
+                    tab,
+                    revision,
+                    command,
+                })
+                .unwrap();
+        }
+        fn save(&mut self, tab: TabId, path: Option<PathBuf>) {
+            let revision = self.ui.editor().document(tab).unwrap().revision();
+            self.session.save(&self.ui, tab, revision, path).unwrap();
+        }
+    }
+
+    #[test]
+    fn delayed_save_acknowledges_only_snapshot_and_bounds_work() {
+        let directory = Directory::new();
+        let path = directory.path("draft");
+        fs::write(&path, b"\xef\xbb\xbfold\r\n").unwrap();
+        let mut h = Harness::new();
+        let tab = h.open(path.clone());
+        h.edit(tab, Command::Insert("first ".into()));
+        h.save(tab, None);
+        assert!(h.session.busy());
+        assert!(h.session.poll(&mut h.ui).is_none());
+        assert!(h.session.open(directory.path("other")).is_err());
+        assert!(h.session.save(&h.ui, tab, 1, None).is_err());
+        h.edit(tab, Command::Insert("second ".into()));
+        assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbfold\r\n");
+        assert!(h.complete().unwrap().contains("newer edits"));
+        assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbffirst old\r\n");
+        assert!(h.ui.editor().document(tab).unwrap().dirty());
+        h.edit(tab, Command::Undo);
+        assert!(!h.ui.editor().document(tab).unwrap().dirty());
+        assert!(!h.session.busy());
+        assert!(h.session.save(&h.ui, tab, 0, None).is_err());
+    }
+
+    #[test]
+    fn missing_tabs_are_dirty_and_duplicate_open_never_reloads() {
+        let directory = Directory::new();
+        let path = directory.path("new");
+        let mut h = Harness::new();
+        let tab = h.open(path.clone());
+        assert!(!path.exists());
+        assert!(h.ui.editor().document(tab).unwrap().dirty());
+        h.edit(tab, Command::Insert("memory".into()));
+        assert_eq!(h.open(path.clone()), tab);
+        assert_eq!(h.ui.editor().document(tab).unwrap().text(), "memory");
+        assert_eq!(h.ui.editor().tabs().count(), 1);
+        h.save(tab, None);
+        h.complete().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"memory");
+        assert!(!h.ui.editor().document(tab).unwrap().dirty());
+        fs::write(&path, b"external").unwrap();
+        assert_eq!(h.open(path.clone()), tab);
+        h.edit(tab, Command::Insert("later ".into()));
+        h.save(tab, None);
+        assert!(h.complete().unwrap_err().contains("Disk conflict"));
+        assert_eq!(fs::read(path).unwrap(), b"external");
+        assert!(h.ui.editor().document(tab).unwrap().dirty());
+        h.save(tab, Some(directory.path("rescued")));
+        h.complete().unwrap();
+        assert_eq!(
+            fs::read(directory.path("rescued")).unwrap(),
+            b"memorylater "
+        );
+        assert!(!h.ui.editor().document(tab).unwrap().dirty());
+    }
+
+    #[test]
+    fn untitled_save_as_refuses_existing_and_reserved_names() {
+        let directory = Directory::new();
+        let existing = directory.path("existing");
+        fs::write(&existing, b"keep").unwrap();
+        let mut h = Harness::new();
+        let reserved = directory.path("reserved");
+        let reserved_tab = h.open(reserved.clone());
+        h.ui.dispatch(Event::New).unwrap();
+        let tab = h.ui.editor().active().unwrap();
+        h.edit(tab, Command::Insert("new".into()));
+        assert!(h
+            .session
+            .save(&h.ui, tab, 1, Some(PathBuf::from("a".repeat(4097))))
+            .is_err());
+        assert!(!h.session.busy());
+        assert!(matches!(h.jobs.try_recv(), Err(TryRecvError::Empty)));
+        for path in [existing.clone(), reserved.clone()] {
+            h.save(tab, Some(path));
+            assert!(h.complete().is_err());
+            assert!(!h.session.associated(tab));
+            assert!(h.ui.editor().document(tab).unwrap().dirty());
+        }
+        assert_eq!(fs::read(existing).unwrap(), b"keep");
+        assert!(!reserved.exists());
+        assert!(h.session.associated(reserved_tab));
+        let destination = directory.path("new");
+        h.save(tab, Some(destination.clone()));
+        h.complete().unwrap();
+        assert!(h.session.associated(tab));
+        assert!(!h.ui.editor().document(tab).unwrap().dirty());
+        assert_eq!(fs::read(destination).unwrap(), b"new");
+        assert_eq!(h.known.len(), 2);
+    }
+
+    #[test]
+    fn rejected_open_and_closed_associations_are_released_before_next_job() {
+        let directory = Directory::new();
+        let mut h = Harness::new();
+        for _ in 0..64 {
+            h.ui.dispatch(Event::New).unwrap();
+        }
+        h.session.open(directory.path("rejected")).unwrap();
+        assert!(h
+            .complete()
+            .unwrap_err()
+            .contains("tab or text budget exhausted"));
+        assert_eq!(h.known.len(), 1);
+        let tab = h.ui.editor().active().unwrap();
+        h.ui.dispatch(Event::Close { tab, revision: 0 }).unwrap();
+        h.open(directory.path("admitted"));
+        assert_eq!(h.known.len(), 1);
+        assert_eq!(h.session.associations.len(), 1);
+        let tab = h.ui.editor().active().unwrap();
+        h.save(tab, None);
+        h.complete().unwrap();
+        h.ui.dispatch(Event::Close { tab, revision: 0 }).unwrap();
+        h.session.forget(tab);
+        h.open(directory.path("next"));
+        assert_eq!(h.known.len(), 1);
+    }
+
+    #[test]
+    fn real_worker_initial_open_and_disconnect_are_observable() {
+        let directory = Directory::new();
+        let mut session = Session::start().unwrap();
+        let mut ui = Controller::default();
+        session
+            .initial_open(&mut ui, directory.path("missing"))
+            .unwrap();
+        assert!(ui
+            .editor()
+            .document(ui.editor().active().unwrap())
+            .unwrap()
+            .dirty());
+        let mut h = Harness::new();
+        h.session.open(directory.path("unused")).unwrap();
+        drop(h.results);
+        assert!(h
+            .session
+            .poll(&mut h.ui)
+            .unwrap()
+            .unwrap_err()
+            .contains("may have reached disk"));
+        assert!(!h.session.busy());
+        assert!(h.session.poll(&mut h.ui).is_none());
+        assert!(h.session.open(directory.path("again")).is_err());
+    }
+
+    #[test]
+    fn duplicate_open_transfers_no_text_and_keeps_existing_tab() {
+        let directory = Directory::new();
+        let path = directory.path("draft");
+        fs::write(&path, b"baseline").unwrap();
+        let mut h = Harness::new();
+        let tab = h.open(path.clone());
+        h.edit(tab, Command::Insert("edited ".into()));
+        h.session.open(path).unwrap();
+        let completion = execute(&mut h.files, &mut h.known, h.jobs.try_recv().unwrap()).unwrap();
+        assert!(matches!(&completion, Completion::Open(loaded) if loaded.bytes.is_empty()));
+        h.results.send(Ok(completion)).ok().unwrap();
+        h.session.poll(&mut h.ui).unwrap().unwrap();
+        assert_eq!(h.ui.editor().active(), Some(tab));
+        assert_eq!(
+            h.ui.editor().document(tab).unwrap().text(),
+            "edited baseline"
+        );
+        assert!(h.ui.editor().document(tab).unwrap().dirty());
+    }
+
+    #[test]
+    fn refused_save_as_does_not_read_or_admit_existing_destinations() {
+        let directory = Directory::new();
+        fs::write(directory.path("invalid"), b"\xff").unwrap();
+        fs::File::create(directory.path("large"))
+            .unwrap()
+            .set_len(crate::text::MAX_FILE_BYTES as u64 + 1)
+            .unwrap();
+        let mut h = Harness::new();
+        h.ui.dispatch(Event::New).unwrap();
+        let tab = h.ui.editor().active().unwrap();
+        h.edit(tab, Command::Insert("my valid text".into()));
+        for name in ["invalid", "large"] {
+            h.save(tab, Some(directory.path(name)));
+            assert!(h
+                .complete()
+                .unwrap_err()
+                .contains("destination exists and was not modified"));
+            assert!(h.known.is_empty());
+            assert_eq!(h.files.baseline_bytes(), 0);
+            assert!(!h.session.associated(tab));
+            assert!(h.ui.editor().document(tab).unwrap().dirty());
+        }
+        assert_eq!(fs::read(directory.path("invalid")).unwrap(), b"\xff");
+        assert_eq!(
+            fs::metadata(directory.path("large")).unwrap().len(),
+            crate::text::MAX_FILE_BYTES as u64 + 1
+        );
+    }
+}

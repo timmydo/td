@@ -21,10 +21,10 @@ The safe, dependency-free library implements UTF-8/BOM/LF/CRLF conversion,
 scalar edits and selection, tabs, bounded undo/redo with saved-state tracking,
 literal search/replace, paragraph filling and Auto Fill. Logical Windows and
 Emacs keys share those commands. The controller also handles visual navigation
-and pointer selection. Dialogs, clipboard, spelling and window file I/O produce
-an explicit adapter request. The Wayland scratch preview accepts keyboard
-editing with both profiles; no pointer input, GPU renderer, filesystem
-Open/Save, remote socket or tmc integration is claimed yet. Do not set
+and pointer selection. The experimental `--window` connects file Open/Save
+and Save As through one worker, with literal keyboard path prompts and both
+key profiles. No native pointer input, GPU renderer, clipboard, spelling,
+remote socket or tmc integration is claimed yet. Do not set
 `$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
@@ -52,8 +52,10 @@ atomic Save, and no-clobber Save As. It preserves BOM/line endings through
 the model's encoded snapshots. Errors distinguish publication attempts from
 confirmed publication and report temporary cleanup failures. Inline tests
 exercise real files, failures at each save stage, concurrent changes and
-exact saved-state acknowledgements. The worker queue, tab associations and
-window prompts are not connected yet: the window still cannot Open or Save.
+exact saved-state acknowledgements. File-worker dispatch, tab associations and
+window prompts are now connected by `session.rs`. It permits one file job at
+a time; additional requests are visibly refused, not queued. Saves acknowledge
+only the snapshot written, so typing during a save leaves newer edits dirty.
 See DESIGN's file-safety section for metadata restrictions and race limits.
 
 An optional kernel attribute test needs a dedicated UTF-8 fixture with an
@@ -112,6 +114,31 @@ currently needs the full td checkout for the shared modules and license data;
 the resulting executable does not need an installed td system.
 
 Try the actual window from a terminal in your Linux x86-64 Wayland session:
+
+```text
+td-editor/target/release/td-editor --window /absolute/path/to/test-draft.txt
+td-editor/target/release/td-editor --window --keys=emacs /absolute/path/to/test-draft.txt
+```
+
+Use a disposable copy while this is experimental. With no path, it starts an
+Untitled tab; a missing path starts a dirty new-file tab without creating the
+file until Save. Windows: Ctrl+O opens, Ctrl+S saves, Ctrl+Shift+S saves as.
+Emacs: C-x C-f opens, C-x C-s saves, C-x C-w saves as. Paths are literal:
+Return submits, Escape/Ctrl+G cancels, Backspace deletes, Ctrl+U clears. Save
+As requires a new pathname. Put the mode flag `--window` first, and use `--`
+before dash-prefixed command-line paths.
+Switch tabs with Ctrl+Tab. An existing file opened again selects its current
+tab without reloading it. External disk changes refuse Save; use Save As to
+a new name to preserve your edits. There is no conflict Reload yet.
+
+Close is refused during pending I/O. After completion, save each dirty tab
+before closing, or explicitly discard all unsaved edits at the window-close
+question. Ctrl+D confirms discard; Escape/Ctrl+G cancels. Completed saves are
+not undone by discard. Fatal errors or process termination can lose unsaved
+edits; a pending write may have reached disk. There is no recovery. The full
+Save/Discard/Cancel dialog and `$EDITOR` invocation remain future work.
+
+The original no-file-access scratch fixture is still available:
 
 ```text
 td-editor/target/release/td-editor --window-preview
