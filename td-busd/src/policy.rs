@@ -7,7 +7,8 @@
 //! peer. That is correct for a session of mutually trusting programs and it
 //! is not the confinement boundary §D describes.
 //!
-//! The three-valued identity in `lineage` is what this reads, and each arm is
+//! The lineage result, constrained by the kernel application UID, is what
+//! this reads. Each arm is
 //! a decision rather than a default:
 //!
 //! - `Unconfined` is a POSITIVE grant and is unrestricted. td's trust model
@@ -15,7 +16,9 @@
 //!   same-uid processes may do; §E is explicit that this is a proved answer
 //!   and not a fallback, which is the whole reason the oracle landed before
 //!   this filter did.
-//! - `Jailed` gets §D's default sandboxed policy.
+//! - `Jailed` gets §D's sandboxed policy and immutable deployment grants.
+//! - `Launcher` is a deployed application UID before entering a jail. It
+//!   may register its fixed identity but gets no peer or portal access.
 //! - `Unknown` is denied everything the boundary protects, which is every
 //!   other peer. It is the ambiguous case and §D fails it closed, because
 //!   failing the other way is privilege up: a peer whose lineage the broker
@@ -122,7 +125,7 @@ pub fn may_own(caller: &Identity, name: &str) -> bool {
     match caller {
         Identity::Unconfined => true,
         Identity::Jailed { owned, .. } => owned.iter().any(|granted| granted == name),
-        Identity::Unknown(_) => false,
+        Identity::Unknown(_) | Identity::Launcher => false,
     }
 }
 
@@ -159,8 +162,8 @@ pub fn is_portal_service_name(name: &str) -> bool {
 /// Whether this identity may exercise a supervised portal capability.
 ///
 /// Separate from `may_register`: creating a jail record and claiming a portal
-/// service are independent authorities even though both currently require a
-/// positively proved unconfined peer.
+/// service are independent authorities. A deployment application launcher
+/// may register but cannot exercise a portal capability.
 pub fn may_hold_portal_service(caller: &Identity) -> bool {
     matches!(caller, Identity::Unconfined)
 }
@@ -214,7 +217,7 @@ pub fn may_see(caller: &Identity, own: Option<&str>, target: &str) -> bool {
         // because there is no permission file to have granted one. An
         // unprovable peer is not a sandboxed application with a reduced
         // grant, it is a peer the broker could not place at all.
-        Identity::Unknown(_) => told_already,
+        Identity::Unknown(_) | Identity::Launcher => told_already,
         Identity::Jailed { owned, .. } => {
             told_already
                 || is_portal_name(target)
@@ -249,7 +252,7 @@ pub fn may_ask_credentials(caller: &Identity, own: Option<&str>, target: &str) -
     let told_already = target == BUS_NAME || Some(target) == own;
     match caller {
         Identity::Unconfined => true,
-        Identity::Unknown(_) => told_already,
+        Identity::Unknown(_) | Identity::Launcher => told_already,
         Identity::Jailed { .. } => told_already,
     }
 }
@@ -268,7 +271,7 @@ pub fn may_ask_credentials(caller: &Identity, own: Option<&str>, target: &str) -
 pub fn may_learn_pid(caller: &Identity) -> bool {
     match caller {
         Identity::Unconfined => true,
-        Identity::Unknown(_) | Identity::Jailed { .. } => false,
+        Identity::Launcher | Identity::Unknown(_) | Identity::Jailed { .. } => false,
     }
 }
 
@@ -313,17 +316,38 @@ pub fn may_signal(caller: &Identity) -> bool {
 
 /// Whether `caller` may use `td.Jail1` at all.
 ///
-/// Registration is authenticated by uid, which in v1 does not distinguish one
-/// session peer from another — so this is the only thing between a confined
-/// application and the interface that decides what confined applications ARE.
-/// A jailed peer that could register would name its own instance and app id.
+/// A deployed application UID may register only its immutable identity and
+/// grants. The human UID retains that ability for installed applications
+/// during the launcher cutover. Jailed peers cannot rewrite their lineage.
 pub fn may_register(caller: &Identity) -> bool {
-    matches!(caller, Identity::Unconfined)
+    matches!(caller, Identity::Unconfined | Identity::Launcher)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_owned_name_rules_agree_with_the_broker_boundary() {
+        for root in [
+            "org.freedesktop.DBus",
+            "org.freedesktop.portal",
+            "org.freedesktop.impl.portal",
+            "org.example.App",
+        ] {
+            for suffix in ["", ".Child", ".Child.Grandchild"] {
+                let name = format!("{root}{suffix}");
+                assert!(crate::name::valid_well_known_name(&name));
+                assert_eq!(
+                    crate::app_policy::owned_name(&name),
+                    !is_reserved_name(&name)
+                );
+            }
+        }
+        for name in ["", ":1.1", "org.*", "org..Example", "org.1Example"] {
+            assert!(!crate::app_policy::owned_name(name));
+        }
+    }
 
     fn jailed() -> Identity {
         Identity::Jailed {
@@ -658,12 +682,12 @@ mod tests {
     /// A host pid is told to an unconfined caller and to nobody else: a
     /// confined caller's own namespace closes the number, and an unplaceable
     /// caller is treated as confined, because a disclosure that fails open
-    /// is privilege up. Pinned over all three identities so the `Unknown`
-    /// arm cannot drift to `true` behind the two arms the transport tests
-    /// drive most.
+    /// is privilege up. Cover registration-only launchers too: their fixed
+    /// application UID is not an unconfined human-session grant.
     #[test]
     fn only_an_unconfined_caller_is_told_a_host_pid() {
         assert!(may_learn_pid(&Identity::Unconfined));
+        assert!(!may_learn_pid(&Identity::Launcher));
         assert!(!may_learn_pid(&granted(&["org.mozilla.firefox"])));
         assert!(!may_learn_pid(&Identity::Unknown("no pidfd".to_string())));
     }

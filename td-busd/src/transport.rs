@@ -938,7 +938,7 @@ impl<'a> Connection<'a> {
         };
         Ok(IdentifiedPeer {
             credential,
-            identity,
+            identity: instances.constrain(credential.uid, identity),
             authentication,
         })
     }
@@ -1648,14 +1648,10 @@ impl<'a> Connection<'a> {
             && on_the_jail_object(message)
             && on(JAIL_INTERFACE);
         if jail_method {
-            // The one live `AccessDenied` on this bus. Registration is
-            // authenticated by uid and in v1 every session peer shares one,
-            // so a confined application reaching this interface could name
-            // its own instance and app id — the record every later answer
-            // about it is derived from. Denied rather than reported absent,
-            // which is the opposite of the rule for names: the interface is
-            // not a secret, and a peer that may not use it is better told so
-            // than left calling a method that seems not to exist.
+            // A jailed peer cannot rewrite its own confinement record.
+            // Unconfined human launchers and fixed application principals
+            // reach the registry, which applies deployment grants and UID
+            // binding before creating a pending instance.
             if !policy::may_register(&self.identity) {
                 return self.refuse_if_wanted(
                     message,
@@ -1930,13 +1926,9 @@ impl<'a> Connection<'a> {
     /// Phase one:
     /// `Register(s instance, s app_id, as services, as owned) -> s token`.
     ///
-    /// Called by stage 0 before it unshares anything, because the pid the
-    /// record needs does not exist yet. §D is explicit that this is
-    /// authenticated by uid; all unprivileged app registrants use uid 1000, so
-    /// the app id is a string the registrant supplies, the walk is sound about
-    /// WHICH instance a connection belongs to and says nothing about whether
-    /// that instance is what it calls itself, and per-app uids are the fix.
-    /// That is recorded in §D rather than papered over here.
+    /// Called before entering a jail. Stock registration is constrained by
+    /// the immutable deployment table and the external kernel UID. Human-UID
+    /// launchers retain installed-name impersonation until their UID cutover.
     fn jail_register(
         &mut self,
         message: &message::Message<'_>,
@@ -2734,14 +2726,10 @@ impl<'a> Connection<'a> {
     /// reached it is the shape it claims. A registry that also had to defend
     /// against malformed strings would be two graders for one rule.
     ///
-    /// The fourth is the application's `[Session Bus Policy]` `own` entries.
-    /// It is a REGISTRANT-supplied list, like the app id and on the same v1
-    /// terms — registration is authenticated by uid and nothing else — so
-    /// nothing here treats it as authenticated metadata. What this function
-    /// establishes is only that each entry is a well-known name and that none
-    /// of them is reserved; what the entries are WORTH is `may_own`'s
-    /// question, and §D's answer is that a launcher able to forge this list is
-    /// already able to launch whatever it likes.
+    /// The fourth argument supplies `own` entries. This layer checks their
+    /// syntax and reserved names. The stock registry additionally requires
+    /// the canonical deployment list; generic brokers retain the supplied
+    /// claims. The application UID, never a wire field, selects its role.
     fn registration_arguments(
         &mut self,
         message: &message::Message<'_>,
@@ -4392,6 +4380,25 @@ fn loopback_at(path: &Path, uid: u32) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stock_application_names_are_registerable() {
+        for name in [
+            "firefox", "mail", "a.b-c_d0", "App", "1app", "a..b", ".", "-app",
+        ] {
+            if crate::app_policy::application_name(name) {
+                assert!(valid_application_id(name), "{name}");
+            }
+        }
+        for length in [1, 31, 32, 33, 64] {
+            let name = "a".repeat(length);
+            assert_eq!(crate::app_policy::application_name(&name), length <= 32);
+            if crate::app_policy::application_name(&name) {
+                assert!(valid_application_id(&name));
+            }
+        }
+    }
+
     use crate::lineage::Procfs;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;

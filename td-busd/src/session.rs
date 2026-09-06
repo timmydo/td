@@ -8,12 +8,10 @@ use std::path::Path;
 pub(crate) const UID: u32 = 992;
 pub(crate) const HUMAN_UID: u32 = 1000;
 pub(crate) const SOCKET: &str = "/run/td-bus/1000/bus";
-
-pub(crate) fn admits(uid: u32) -> bool {
-    // Root supervises portal activation. Human processes include the current
-    // jail launchers and portal; per-app UIDs are not active yet.
-    matches!(uid, 0 | HUMAN_UID)
-}
+// Linux x86-64, matching this crate's syscall surface.
+const O_NOFOLLOW: i32 = 0x20000;
+const O_DIRECTORY: i32 = 0x10000;
+const O_NONBLOCK: i32 = 0x800;
 
 pub(crate) fn check(uid: u32) -> Result<(), String> {
     if uid != UID {
@@ -55,23 +53,124 @@ fn directory(path: &Path, owner: (u32, u32), exact: bool) -> Result<(), String> 
     Ok(())
 }
 
+/// The immutable image owns both the policy file and its parent.
+pub(crate) fn load_policy() -> Result<crate::app_policy::Policy, String> {
+    let directory = Path::new(crate::app_policy::PATH)
+        .parent()
+        .ok_or("bus policy has no parent")?;
+    load_policy_from(directory, (0, 0))
+}
+
+fn load_policy_from(
+    directory: &Path,
+    owner: (u32, u32),
+) -> Result<crate::app_policy::Policy, String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let etc = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+        .open(directory)
+        .map_err(|error| format!("open bus policy directory: {error}"))?;
+    let metadata = etc.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || metadata.uid() != owner.0
+        || metadata.gid() != owner.1
+        || metadata.mode() & 0o7022 != 0
+    {
+        return Err("bus policy directory is not root-controlled".into());
+    }
+    let name = Path::new(crate::app_policy::PATH)
+        .file_name()
+        .ok_or("bus policy has no filename")?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(Path::new(&format!("/proc/self/fd/{}", etc.as_raw_fd())).join(name))
+        .map_err(|error| format!("open bus application policy: {error}"))?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != owner.0
+        || metadata.gid() != owner.1
+        || metadata.mode() & 0o7777 != 0o444
+        || metadata.nlink() != 1
+        || metadata.len() > crate::app_policy::MAX_BYTES as u64
+    {
+        return Err("bus application policy must be one bounded root-owned 0444 file".into());
+    }
+    let mut text = String::new();
+    file.take(crate::app_policy::MAX_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("read bus application policy: {error}"))?;
+    let policy = crate::app_policy::Policy::parse(&text)?;
+    if policy.owner() != HUMAN_UID {
+        return Err("bus application policy names another session".into());
+    }
+    Ok(policy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
-    fn only_active_kernel_identities_are_admitted() {
-        assert!(admits(0));
-        assert!(admits(1000));
-        for uid in [1, 991, 992, 993, 994, 1001, 65534, 65536, 65537, u32::MAX] {
-            assert!(!admits(uid));
+    fn policy_loader_refuses_mutable_redirected_and_noncanonical_files() {
+        let root = std::env::temp_dir().join(format!("td-bus-policy-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = fs::metadata(&root).unwrap();
+        let owner = (metadata.uid(), metadata.gid());
+        let path = root.join(Path::new(crate::app_policy::PATH).file_name().unwrap());
+        let valid = "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n";
+        assert!(load_policy_from(&root, owner).is_err());
+        fs::write(&path, valid).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(load_policy_from(&root, owner).unwrap().to_tsv(), valid);
+        assert!(load_policy_from(&root, (owner.0.wrapping_add(1), owner.1)).is_err());
+        for mode in [0o644, 0o400, 0o1444] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(load_policy_from(&root, owner).is_err(), "mode {mode:o}");
         }
-        assert!(check(1000).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let other = root.join("other");
+        fs::hard_link(&path, &other).unwrap();
+        assert!(load_policy_from(&root, owner).is_err());
+        fs::remove_file(&path).unwrap();
+        symlink(&other, &path).unwrap();
+        assert!(load_policy_from(&root, owner).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&other).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(load_policy_from(&root, owner).is_err());
+        fs::remove_dir(&path).unwrap();
+        for content in [
+            valid.replace("1000", "1001"),
+            valid.replace("65536", "065536"),
+            "x".repeat(crate::app_policy::MAX_BYTES + 1),
+        ] {
+            fs::write(&path, content).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+            assert!(load_policy_from(&root, owner).is_err());
+            fs::remove_file(&path).unwrap();
+        }
+        fs::write(&path, valid).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(load_policy_from(&root, owner).is_err());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.with_extension("link");
+        symlink(&root, &link).unwrap();
+        assert!(load_policy_from(&link, owner).is_err());
+        fs::remove_file(link).unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
     fn shared_directory_refuses_redirects_and_other_writers() {
+        assert!(check(HUMAN_UID).is_err());
         let root = std::env::temp_dir().join(format!("td-bus-directory-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();

@@ -317,7 +317,14 @@ activates the compositor assignment as service account `tdc1000` at
 UID/GID 993 and the broker as `tdb1000` at UID/GID 992. Firstboot
 prepares the broker runtime after durable enrollment, whose success
 td-svc requires before broker startup. Portal and app assignments remain
-reserved. Activation consumes the same service-only class defined here.
+reserved. The broker loads an immutable deployment table binding each
+reserved application UID to one installed name and exact bus grants. An
+application UID outside a jail receives registration authority only;
+its name is not exposed as a jailed portal identity until lineage is
+proven. Human-UID launchers remain an explicit interim and can still
+register any installed application, with its fixed grants. This does
+not activate application accounts or isolate their state yet.
+Activation consumes the same service-only class defined here.
 `td-authd/DESIGN.md` specifies that reservation contract. The image's
 paired td-authd terminal launcher uses ordinary `exec-as` after a
 read-only reservation check and private-channel authentication. It fixes

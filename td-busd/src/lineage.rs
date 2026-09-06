@@ -92,7 +92,7 @@ use std::time::{Duration, Instant};
 /// that an unproved lineage is refused.
 const MAX_DEPTH: usize = 1024;
 
-/// The three answers, and the middle one is the point.
+/// The lineage answer after the stock kernel-UID policy is applied.
 ///
 /// `Unconfined` is a POSITIVE result rather than a default, which is what lets
 /// §E rest full portal access on it. It means the walk terminated without
@@ -100,9 +100,13 @@ const MAX_DEPTH: usize = 1024;
 /// accounted for at query time — so "descends from none of them" is a
 /// statement about a complete registry rather than an absence of evidence.
 /// Anything that is merely unproved is `Unknown`, and `Unknown` is denied by
-/// both the broker and the portal.
+/// both the broker and the portal. A deployed application UID with proved
+/// unconfined lineage becomes `Launcher`, whose only extra authority is
+/// registering its immutable application identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
+    /// A deployment application UID outside any jail, allowed only to register.
+    Launcher,
     Jailed {
         app_id: String,
         instance: String,
@@ -143,7 +147,7 @@ impl Identity {
     pub fn admission_instance(&self) -> Option<&str> {
         match self {
             Self::Jailed { instance, .. } => Some(instance),
-            Self::Unconfined | Self::Unknown(_) => None,
+            Self::Unconfined | Self::Launcher | Self::Unknown(_) => None,
         }
     }
 
@@ -151,7 +155,7 @@ impl Identity {
     pub fn is_unknown(&self) -> bool {
         match self {
             Self::Unknown(_) => true,
-            Self::Jailed { .. } | Self::Unconfined => false,
+            Self::Jailed { .. } | Self::Launcher | Self::Unconfined => false,
         }
     }
 }
@@ -374,10 +378,9 @@ pub struct Instance {
     /// of a default policy that owns no name. Unlike `services` this one is
     /// READ: `policy::may_own` consults the copy that reached the identity.
     ///
-    /// Registrant-supplied, like the app id and for the same reason — v1
-    /// authenticates registration by uid and nothing else — so the transport
-    /// grades every entry before it arrives, and the broker's reservation is
-    /// applied again at the point of use rather than trusted from here.
+    /// The wire grades syntax. The stock registry also requires the exact
+    /// deployment grant list; generic host/test registries retain claims.
+    /// Reserved names are refused again at use.
     pub owned: Vec<String>,
 }
 
@@ -390,9 +393,9 @@ pub struct Instance {
 /// ACTIVATE, is exactly the one no signature can catch. A mutation that did
 /// precisely that survived a whole suite before this became a struct.
 ///
-/// Every field is registrant-supplied. §D authenticates registration by uid
-/// and nothing else in v1, so what is recorded here is a claim, graded for
-/// shape at the wire and worth what §D says a launcher's word is worth.
+/// Every field arrives over the wire. The stock registry binds the app and
+/// grants to immutable policy plus the kernel UID. Human launchers retain
+/// installed-name impersonation; generic brokers retain supplied claims.
 #[derive(Debug, Clone)]
 pub struct Registration {
     pub instance: String,
@@ -446,11 +449,8 @@ struct Pending {
     services: Vec<String>,
     owned: Vec<String>,
     /// The uid that opened phase one. Phase two must come from the same uid.
-    /// In v1 every session peer is uid 1000 so this refuses nothing today —
-    /// §D is explicit that registration is authenticated by uid and that the
-    /// app id is therefore a string the registrant supplies. It is written now
-    /// because per-app uids (§L v2) make this line the whole check, and a
-    /// check added later is a check that was missing in between.
+    /// The stock policy binds an application UID to its installed identity;
+    /// the human UID remains an interim launcher for installed applications.
     uid: u32,
     /// When phase one ran, for `PENDING_LIFETIME`.
     opened: Instant,
@@ -494,6 +494,7 @@ struct Pending {
 /// being queued.
 pub struct Instances {
     inner: Mutex<State>,
+    policy: Option<crate::app_policy::Policy>,
 }
 
 #[derive(Default)]
@@ -542,6 +543,42 @@ impl Instances {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(State::default()),
+            policy: None,
+        }
+    }
+
+    pub fn for_session(policy: crate::app_policy::Policy) -> Self {
+        Self {
+            inner: Mutex::new(State::default()),
+            policy: Some(policy),
+        }
+    }
+
+    pub fn admits(&self, uid: u32) -> bool {
+        self.policy.as_ref().is_none_or(|policy| policy.admits(uid))
+    }
+
+    pub fn constrain(&self, uid: u32, identity: Identity) -> Identity {
+        let Some(policy) = &self.policy else {
+            return identity;
+        };
+        if uid == 0 || uid == policy.owner() {
+            return identity;
+        }
+        let Some(rule) = policy.for_uid(uid) else {
+            return Identity::Unknown("kernel UID has no deployment application role".into());
+        };
+        match identity {
+            Identity::Unconfined => Identity::Launcher,
+            Identity::Jailed {
+                ref app_id,
+                ref owned,
+                ..
+            } if app_id == &rule.application && owned == &rule.owned => identity,
+            Identity::Unknown(_) => identity,
+            Identity::Jailed { .. } | Identity::Launcher => {
+                Identity::Unknown("jail lineage disagrees with the kernel application UID".into())
+            }
         }
     }
 
@@ -580,6 +617,14 @@ impl Instances {
         registrant: Caller,
         now: Instant,
     ) -> Result<String, String> {
+        if let Some(policy) = &self.policy {
+            policy.registration(
+                uid,
+                &registration.app_id,
+                &registration.services,
+                &registration.owned,
+            )?;
+        }
         let Registration {
             instance,
             app_id,
@@ -1440,6 +1485,83 @@ mod tests {
     /// A registration that predeclares nothing and is granted nothing, which
     /// is what almost every test here wants: the fields it does not name are
     /// the ones it is not about.
+    #[test]
+    fn deployment_policy_checks_registration_before_creating_an_instance() {
+        let table = Table::with(&[(1, 0, 1), (900, 1, 90), (100, 900, 95)]);
+        let policy = crate::app_policy::Policy::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
+        )
+        .unwrap();
+        let instances = Instances::for_session(policy);
+        for (uid, app, grants) in [
+            (65537, "firefox", vec!["org.mozilla.firefox".into()]),
+            (0, "firefox", vec!["org.mozilla.firefox".into()]),
+            (65536, "mail", vec![]),
+            (1000, "invented", vec![]),
+            (65536, "firefox", vec![]),
+            (65536, "firefox", vec!["org.example.Extra".into()]),
+        ] {
+            let request = registration_with("one", app, vec![], grants);
+            assert!(instances
+                .open(&table, request, uid, table.caller(900))
+                .is_err());
+            assert!(instances.granted("one").is_none());
+        }
+        let request =
+            registration_with("one", "firefox", vec![], vec!["org.mozilla.firefox".into()]);
+        let token = instances
+            .open(&table, request, 65536, table.caller(900))
+            .unwrap();
+        instances
+            .complete(&table, &token, 100, 65536, table.caller(900))
+            .unwrap();
+        let identity = instances.constrain(65536, instances.resolve(&table, 100));
+        assert_eq!(identity.app_id(), Some("firefox"));
+        assert!(crate::policy::may_own(&identity, "org.mozilla.firefox"));
+        assert!(!crate::policy::may_own(&identity, "org.example.Extra"));
+        assert!(instances.constrain(65537, identity).is_unknown());
+    }
+
+    #[test]
+    fn an_application_uid_without_jail_lineage_has_only_registration_authority() {
+        let policy = crate::app_policy::Policy::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n",
+        )
+        .unwrap();
+        let instances = Instances::for_session(policy);
+        let caller = instances.constrain(65536, Identity::Unconfined);
+        assert_eq!(caller, Identity::Launcher);
+        assert!(crate::policy::may_register(&caller));
+        assert_eq!(caller.app_id(), None);
+        assert!(!crate::policy::may_hold_portal_service(&caller));
+        for target in [
+            "org.freedesktop.portal.Desktop",
+            "org.mozilla.firefox",
+            ":1.2",
+        ] {
+            assert!(!crate::policy::may_see(&caller, Some(":1.1"), target));
+            assert!(!crate::policy::may_talk(&caller, Some(":1.1"), target));
+            assert!(!crate::policy::may_ask_credentials(
+                &caller,
+                Some(":1.1"),
+                target
+            ));
+            assert!(!crate::policy::may_own(&caller, target));
+        }
+        assert!(instances
+            .constrain(65536, Identity::Unknown("unproved".into()))
+            .is_unknown());
+        assert!(instances
+            .constrain(65537, Identity::Unconfined)
+            .is_unknown());
+        for uid in [0, 1000] {
+            assert_eq!(
+                instances.constrain(uid, Identity::Unconfined),
+                Identity::Unconfined
+            );
+        }
+    }
+
     fn registration(instance: &str, app_id: &str) -> Registration {
         registration_with(instance, app_id, Vec::new(), Vec::new())
     }

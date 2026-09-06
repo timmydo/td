@@ -745,7 +745,11 @@ symlink, the store path, the per-app uid allocation, the permission file,
 the state directory, the D-Bus `td.AppId` credential, the cgroup, and the
 launcher table. Its build-time language has **LANDED**: 1–32 ASCII bytes,
 each an alphanumeric, `.`, `_` or `-`, with no leading dash and no `..`.
-The single name `.` is also refused. That is the `td-login` account language
+The single name `.` is also refused. Stock application identities must
+also fit the principal registry: lowercase-first, lowercase letters,
+digits, dots, underscores and hyphens, within that 32-byte limit and
+without `..`. Generic host/test Register retains the broader language.
+That is the `td-login` account language
 narrowed for an open path key, and it excludes path separators without a
 second rule. Runtime package names use the same language. The later launcher
 resolver still re-validates its caller-controlled `argv[0]`; build-time
@@ -3501,9 +3505,10 @@ One **session** bus at `/run/td-bus/1000/bus`, owned by the reserved
 broker UID/GID 992 (`tdb1000`). Firstboot creates `/run/td-bus` as
 root-owned 0755 and its `1000` child as broker-owned 0755 after durable
 identity enrollment. The socket is 0666; the listener admits only kernel
-UID 0 (portal supervision) and UID 1000 (current human, portal and jail
-clients), before connection quota reservation or authentication. Other
-reserved service and application UIDs remain refused. Refusals allocate
+UID 0 (portal supervision), UID 1000 (current human, portal and jail
+clients), and application UIDs in the immutable deployment policy before
+connection quota reservation or authentication. Other reserved service
+UIDs and applications absent from that deployment remain refused. Refusals allocate
 no connection worker and share the existing first-and-every-64 log
 sampling. The public socket does not promise availability against local
 connection floods. `run-session` requires UID 992 and checks every
@@ -3519,6 +3524,41 @@ binds the protected host endpoint at its own `/run/user/1000/bus`;
 clients inside keep their existing bus address. There is no system bus:
 nothing on td speaks one, and the first thing that wants one is a design
 review rather than a config file.
+
+**Deployment application identity.** `run-session` loads
+`/etc/td-bus-applications.tsv` before binding. The image generates this
+regular root-owned 0444 file from the same application names and reserved
+UIDs as `/etc/td-principals.tsv`, with exact `own` grants from each
+package's permission declaration. The broker pins `/etc`, refuses links,
+other writers, non-regular or multiply-linked files, and reads at most
+64 KiB plus one overflow byte. The canonical ASCII format is a
+`td-bus-applications-v1<TAB>1000` header followed by name-sorted rows of
+`UID<TAB>application<TAB>comma-separated sorted owned names`. Rows have
+unique UIDs and application names; limits are 256 applications and 32
+owned names each. Stock names use the intersection of the principal
+and launcher grammars defined in §B. Reserved broker/portal names are
+never grants. Multiple reviewed applications may receive the same
+owned-name grant; ownership arbitration remains the broker's ordinary
+queue, and the grant includes permission to address the current holder.
+
+The stock registry accepts only installed names with exactly those
+grants in sorted order and an empty service-activation list. td-jail
+emits the sorted names from its parsed permission policy. An application UID may
+register only its own name. Before it enters a jail, a positively proved
+unconfined application process becomes `Launcher`: it may register but
+cannot own names, address peers or portals, activate portal services,
+learn host PIDs, or obtain a jailed `td.AppId`. Proven jailed lineage must
+agree with its kernel UID's name and grants; disagreement fails closed. `Unknown`
+lineage stays denied. UID mapping for EXTERNAL claims never selects this
+role. Generic host/test brokers retain their caller-supplied registry.
+
+The application UID and state cutover remains pending. Human-UID
+launchers can still register any installed name with its exact grants,
+so installed-name impersonation by another human-UID process remains
+possible. Root's trusted portal connection cannot register an app in the
+stock profile. This policy table is rebuilt for the selected deployment;
+the persistent UID reservation ledger also retains removed assignments
+and does not grant them access to a deployment where they are absent.
 
 `td-busd` also **absorbs `xdg-dbus-proxy`**. Upstream starts a filtering
 proxy per sandbox and bind-mounts the proxied socket; td bind-mounts the
@@ -3868,22 +3908,16 @@ That token is also what makes §A.0's completeness invariant checkable:
 **stage 1 refuses to proceed without it**, so entering the jail without
 having registered is a refusal rather than an unregistered instance.
 
-**What the broker CANNOT check is the app id itself, and §L.1 has to be
-read in that light.** Registration is authenticated by uid, and in v1
-every unprivileged application registrant is uid 1000 — so nothing distinguishes a genuine
-`td-jail` performing this protocol from any other uid-1000 process
-performing it, and the app id is a string the registrant supplies. The
-lineage walk is sound about *which instance a connection belongs to* and
-says nothing about whether that instance is what it calls itself. Two
-consequences worth naming rather than leaving to be discovered: a rogue
-process can register as `firefox` and be NAMED `firefox` in an elevation
-prompt whose whole value is naming the requester (§L.1 property 2 claims
-the requester "never gets to say what it is", which is true of the pid
-and false of the id); and registering a legitimate unconfined process's
-pid as an instance's stage-2 pid mislabels that process, denying it the
-portal access it should have. Per-app uids (§L, v2) are the fix for both,
-since the registrant's uid then IS the claim — which makes this a third
-argument for scheduling them, beside the two §L already gives.
+**The remaining app-id exposure is the human-UID launcher.** The stock
+broker constrains registration to installed names and exact grants. Its
+application-UID policy also binds each dedicated UID to one name, but
+those application accounts and their state cutover are still pending.
+Current launchers share UID 1000, so another human-UID process can still
+register an installed app such as `firefox` and have that name reported
+in a future elevation prompt. It may also mislabel its own child as a
+jail. Lineage proves which instance owns a connection; it cannot prove
+which installed application a human-UID registrant intended to launch.
+Per-app UID activation is required before the prompt can trust the name.
 
 A connection arriving between the two phases is refused rather than
 queued — the ambiguous case fails closed, as above — and the token is
@@ -4355,10 +4389,9 @@ refused the registration interface outright rather than told it is not
 there. It is not a secret — the difference from a name is that a peer
 which may not use an interface is better told so than left calling a
 method that appears not to exist — and it is the interface that CREATES
-confinement records: registration is authenticated by uid, every v1
-session peer shares one, and a jailed peer that could register would name
-its own instance and app id, which is the record every later answer about
-it derives from.
+confinement records. A jailed peer may not rewrite its own instance.
+Unconfined human launchers retain installed-name impersonation; a
+dedicated application UID is bound to its immutable name and grants.
 
 What the filter depended on had already landed, which is what made this
 increment reviewable on its own: the registration protocol and the
@@ -4423,10 +4456,10 @@ tempting cleanup: dropping a pending registration when the connection
 that opened it closes would discard every legitimate registration at
 exactly the moment §A sweeps descriptors.
 
-None of this makes the app id authentic: the v1 exposure above stands,
-and a rogue can still call its own child `firefox`. It is the difference
-between mislabelling a process you already own and relabelling somebody
-else's.
+The parentage proof alone does not authenticate an app name. The stock
+application-UID policy supplies that binding; human-UID launchers can
+still mislabel their own child as another installed app. Generic brokers
+retain the caller-supplied name.
 
 **The app id is graded as a td identity, not as a bus name.** A draft
 used the bus-name grammar, which is wrong in both directions: §B's
@@ -4684,15 +4717,12 @@ rather than a reach into somebody else's.
 
 **td-jail performs this protocol, and every application the image starts
 at boot does it.** Every jailed application is a registered instance and
-reports `td.AppId`; everything else on the session bus still resolves
-`Unconfined`, which is right — the compositor and the terminal are not
-in jails. The app-id caveat below is unchanged and is the reason the
-filter still cannot land on this alone: registration is authenticated by
-uid, every unprivileged application registrant is uid 1000, and the app id is a string the
-registrant supplies. The walk is sound about WHICH instance a connection
-belongs to and says nothing about whether that instance is what it calls
-itself. Per-app uids are the fix and this is the third argument for
-scheduling them.
+reports `td.AppId`. A deployment application UID outside a jail is a
+registration-only `Launcher`; ordinary human-UID processes with proved
+unconfined lineage remain `Unconfined`. The stock policy fixes installed
+names and grants, while current human-UID launchers retain the
+installed-name impersonation exposure described in §D. Application UID
+and state activation is the remaining prerequisite for trusted names.
 
 **What the launcher sends is fixed by its own grammar, not by anything
 the application controls.** The **app id is the application's td name** —
@@ -8174,7 +8204,7 @@ requester ──request──▶ td-authd (root)
    walk, `Unknown` denied. A rogue application cannot present itself as
    another *process*, because the pid is the kernel's answer rather than
    its own. **It can still present itself under another NAME while v1
-   runs every application registrant at uid 1000**, since §D's registration authenticates
+   runs application launchers at uid 1000**, since §D's registration authenticates
    by uid and the app id is supplied by the registrant — so the prompt's
    "firefox is asking to publish a deployment" is only as good as
    per-app uids, which is the prerequisite this section already refuses
@@ -8275,7 +8305,7 @@ has, which is the other reason it is primary.
 | **Input-focus theft** | Exclusive input for the prompt's lifetime; no client receives those events at all |
 | **Elevate-a-shell** | Structurally impossible — no operation returns a process, and the table is enumerated |
 | **Replay of a captured approval** | The assertion covers requester, operation, pinned arguments and a nonce, **length-prefixed rather than concatenated** (or `("a","bc")` and `("ab","c")` collide), and the nonce is consumed before the operation starts |
-| **The requester lies about what it is** | It never says which PROCESS it is — that is `SO_PEERCRED` plus lineage. It does say which APPLICATION, since §D's registration is authenticated by uid and v1 runs every application registrant at uid 1000, so the name in the prompt is only as good as per-app uids. A draft wrote this row the other way round, claiming an escaped app is "promoted to `Unconfined`" where the prompt can only say "a process"; under §E's own definition that is wrong, because an escapee is still a descendant of a live registered stage-2 pid and resolves `Jailed` — the filter denies `unshare`, `setns` and `clone(CLONE_NEWUSER)`, and killing PID 1 of a pid namespace kills the namespace. The exposure is the id, not the lineage |
+| **The requester lies about what it is** | It never says which PROCESS it is — that is `SO_PEERCRED` plus lineage. It does say which APPLICATION, since §D's registration is authenticated by uid and v1 runs application launchers at uid 1000, so the name in the prompt is only as good as per-app uids. A draft wrote this row the other way round, claiming an escaped app is "promoted to `Unconfined`" where the prompt can only say "a process"; under §E's own definition that is wrong, because an escapee is still a descendant of a live registered stage-2 pid and resolves `Jailed` — the filter denies `unshare`, `setns` and `clone(CLONE_NEWUSER)`, and killing PID 1 of a pid namespace kills the namespace. The exposure is the id, not the lineage |
 | **Walk-up attacker at an unlocked session** | **Out of scope by decision.** A password model would resist it and this one does not; that is the accepted trade. A screen lock is where to address it, and it belongs to the session rather than to elevation |
 | **Prompt spam from an unidentifiable requester** | **Partly unanswerable as specified.** Rate-limiting assumes a stable requester identity, and `Unconfined` code can fork a fresh process per request. Rate-limit the jailed case per app id; for `Unconfined` the limit can only be global, which degrades into denying elevation to everyone while an attacker spams |
 

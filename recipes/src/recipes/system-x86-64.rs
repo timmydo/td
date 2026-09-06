@@ -36,6 +36,11 @@ use crate::types::{Recipe, Step};
 
 use crate::td_boot_protocol;
 
+#[path = "../../../td-busd/src/app_policy.rs"]
+#[allow(dead_code)]
+mod bus_application_policy;
+const BUS_APPLICATION_POLICY: &str = bus_application_policy::PATH;
+
 const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 /// How many /etc/bootsuccess sweeps the bus marker may be missing for before
 /// the script stops waiting for it.
@@ -3782,11 +3787,37 @@ fn build_principals(sys: &SystemDef) -> String {
     text
 }
 
+fn build_bus_application_policy(sys: &SystemDef) -> Result<String, String> {
+    let mut rules = Vec::new();
+    for application in sys.applications {
+        let recipe = (application.package_recipe)();
+        let permissions = recipe
+            .application_permissions
+            .ok_or_else(|| format!("{} has no application permissions", application.name))?;
+        let owned = permissions
+            .session_bus()
+            .filter(|(_, access)| *access == td_engine::permissions::BusAccess::Own)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        rules.push(bus_application_policy::Rule {
+            uid: application.external_uid,
+            application: application.name.into(),
+            owned,
+        });
+    }
+    bus_application_policy::Policy::new(UI_UID, rules).map(|policy| policy.to_tsv())
+}
+
 /// The generated /etc files (config + the login-glue and boot-check scripts). `exec`
 /// marks the ones getty/init reference as executables. Shared by the real-root staging
 /// (written under `{root}/real-root/etc`) and the shape check (which asserts they landed).
-fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
-    vec![
+fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, String> {
+    Ok(vec![
+        (
+            application_etc_name(BUS_APPLICATION_POLICY),
+            build_bus_application_policy(sys)?,
+            false,
+        ),
         ("passwd", build_passwd(sys), false),
         (
             application_etc_name(PRINCIPALS_PATH),
@@ -3831,7 +3862,7 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         ("firefox-tls-ready", build_firefox_tls_ready(), true),
         ("bootsuccess", build_bootsuccess(sys), true),
         ("bootfail", build_bootfail(), true),
-    ]
+    ])
 }
 
 /// Which of the two structurally distinct boot phases a cpio is packed for. They carry
@@ -3933,7 +3964,7 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
 /// (stage-1/init mount over them). `/home` and `/root`
 /// are immutable symlinks into the writable `/var` mount; per-user ownership is fixed at
 /// boot by `/etc/rootcheck`.
-fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
+fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
     // Empty mountpoints and the immutable root-image skeleton. State directories are
     // created after /var is mounted, rather than hidden content packed into EROFS.
@@ -4362,7 +4393,7 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         link: "{root}/real-root/bin/td-profiler".into(),
     });
     // Generated /etc.
-    for (name, content, exec) in etc_files(sys) {
+    for (name, content, exec) in etc_files(sys)? {
         steps.push(Step::WriteFile {
             path: format!("{{root}}/real-root/etc/{name}"),
             content,
@@ -4387,7 +4418,7 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             "{root}/real-root/etc/td-profiler-application-roots.tsv",
         ],
     ));
-    steps
+    Ok(steps)
 }
 
 /// A producer-rung shape check on the deployment bundle and staged real-root
@@ -4452,10 +4483,11 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release @TD_PORTAL_SETTINGS_NAME@ mutable-state inittab @TD_SVC_CONF_NAME@ @APPLICATION_CONFIG_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
+     for f in passwd group shadow hostname os-release @BUS_APPLICATION_POLICY_NAME@ @TD_PORTAL_SETTINGS_NAME@ mutable-state inittab @TD_SVC_CONF_NAME@ @APPLICATION_CONFIG_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - immutable image config must be a regular file in the erofs, not a hole in the read-only /etc\" >&2; exit 1; fi; \
      done; \
+     [ \"$(ls -ld \"$root/etc/@BUS_APPLICATION_POLICY_NAME@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: bus application policy must have mode 0444' >&2; exit 1; }; \
      for f in @APPLICATION_REGISTRY_NAME@ @APPLICATION_LAUNCHER_NAME@; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing - compileApplicationTables did not materialize the application image contract\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - application selection must be immutable image content\" >&2; exit 1; fi; \
@@ -4711,6 +4743,7 @@ fn shape_check() -> String {
             application_etc_name(APPLICATION_LAUNCHER_TABLE),
         )
         .replace("@APPLICATION_COUNT@", &SYSTEM.applications.len().to_string())
+        .replace("@BUS_APPLICATION_POLICY_NAME@", application_etc_name(BUS_APPLICATION_POLICY))
 
         // `<etc path>=<target>` pairs, and the etc paths alone. Both lists are
         // space-joined and unquoted in the script, which
@@ -4779,6 +4812,25 @@ fn etc_globs() -> Vec<String> {
     globs
 }
 
+fn invalid_system_policy(why: &str) -> Recipe {
+    let reason: String = why
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    Recipe::mesboot("system-x86-64", "0.2").steps(vec![Step::Require {
+        paths: vec![format!(
+            "{{out}}/invalid-system-application-policy--{reason}"
+        )],
+        exec: false,
+    }])
+}
+
 pub fn recipe() -> Recipe {
     let mut steps = Vec::new();
     steps.push(Step::MkDir {
@@ -4790,7 +4842,11 @@ pub fn recipe() -> Recipe {
     //    staged copy is made writable by its owner, so the td-term terminfo
     //    entry goes back to 0444, the mode td-jail's terminal grant admits
     //    the file it binds at; the packer keeps modes as staged.
-    steps.extend(real_root_steps(&SYSTEM));
+    let root_steps = match real_root_steps(&SYSTEM) {
+        Ok(steps) => steps,
+        Err(why) => return invalid_system_policy(&why),
+    };
+    steps.extend(root_steps);
     steps.push(
         Step::run(
             "{out}",
@@ -4798,7 +4854,7 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}'"
+                    "chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}' '{{root}}/real-root{BUS_APPLICATION_POLICY}'"
                 ),
             ],
         )
@@ -5394,7 +5450,7 @@ mod tests {
             "profiler evidence is an ordering boundary, not deployment health"
         );
 
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(steps.iter().any(|step| matches!(
             step,
             Step::WriteFile { path, content, exec: false }
@@ -6588,7 +6644,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             "unstaged direct client flags: {client_flags:?}"
         );
         assert_eq!(unit_key("wayland", "cgroup").as_deref(), Some("service"));
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         for (name, package) in [("td-authd", "td-authd"), ("td-term", "td-compositor")] {
             assert!(steps.iter().any(|step| matches!(step,
                 Step::Symlink { link, target }
@@ -7260,9 +7316,116 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     }
 
     #[test]
+    fn missing_application_permissions_refuse_staging_with_a_named_reason() {
+        fn without_permissions() -> Recipe {
+            Recipe::mesboot("fixture", "1")
+        }
+        const MISSING: &[ShippedApplication] = &[ShippedApplication {
+            name: "fixture",
+            package: "fixture",
+            package_recipe: without_permissions,
+            external_uid: 65536,
+            runtime: "empty-runtime",
+            runtime_recipe: super::super::empty_runtime::recipe,
+        }];
+        let system = SystemDef {
+            applications: MISSING,
+            ..SYSTEM
+        };
+        let why = real_root_steps(&system).err().unwrap();
+        assert!(why.contains("fixture has no application permissions"));
+        let recipe = invalid_system_policy(&why);
+        assert!(
+            matches!(recipe.steps.as_deref(), Some([Step::Require { paths, exec: false }])
+            if paths == &["{out}/invalid-system-application-policy--fixture-has-no-application-permissions"])
+        );
+    }
+
+    #[test]
+    fn invalid_application_identity_prevents_root_staging() {
+        const DUPLICATE: &[ShippedApplication] = &[
+            ShippedApplication {
+                name: "one",
+                package: "td-jail-fixture",
+                package_recipe: super::super::td_jail_fixture::recipe,
+                external_uid: 65536,
+                runtime: "empty-runtime",
+                runtime_recipe: super::super::empty_runtime::recipe,
+            },
+            ShippedApplication {
+                name: "two",
+                package: "td-jail-fixture",
+                package_recipe: super::super::td_jail_fixture::recipe,
+                external_uid: 65536,
+                runtime: "empty-runtime",
+                runtime_recipe: super::super::empty_runtime::recipe,
+            },
+        ];
+        let system = SystemDef {
+            applications: DUPLICATE,
+            ..SYSTEM
+        };
+        assert!(build_bus_application_policy(&system).is_err());
+        assert!(real_root_steps(&system).is_err());
+    }
+
+    #[test]
+    fn broker_policy_is_derived_from_the_deployments_principals_and_grants() {
+        let text = build_bus_application_policy(&SYSTEM).unwrap();
+        let policy = bus_application_policy::Policy::parse(&text).unwrap();
+        assert_eq!(policy.owner(), UI_UID);
+        let principals = build_principals(&SYSTEM);
+        for application in SYSTEM.applications {
+            let rule = policy.for_uid(application.external_uid).unwrap();
+            assert_eq!(rule.application, application.name);
+            assert!(principals.contains(&format!(
+                "application\t{UI_UID}\t{}\t{}\n",
+                application.name, rule.uid
+            )));
+            let permissions = (application.package_recipe)()
+                .application_permissions
+                .unwrap();
+            let owned: Vec<String> = permissions
+                .session_bus()
+                .filter(|(_, access)| *access == td_engine::permissions::BusAccess::Own)
+                .map(|(name, _)| name.into())
+                .collect();
+            assert_eq!(rule.owned, owned);
+        }
+        assert_eq!(
+            policy.for_name("firefox").unwrap().owned,
+            ["org.mozilla.firefox"]
+        );
+        let file = etc_files(&SYSTEM)
+            .unwrap()
+            .into_iter()
+            .find(|(name, _, _)| *name == application_etc_name(BUS_APPLICATION_POLICY))
+            .unwrap();
+        assert_eq!(file.1, text);
+        assert!(!file.2);
+        assert!(shape_check().contains(application_etc_name(BUS_APPLICATION_POLICY)));
+        assert!(shape_check().contains(&format!(
+            "$(ls -ld \"$root{BUS_APPLICATION_POLICY}\" | cut -c1-10)\" = -r--r--r--"
+        )));
+        let mode_step = format!("'{{root}}/real-root{BUS_APPLICATION_POLICY}'");
+        assert!(recipe().steps.unwrap().iter().any(|step| match step {
+            Step::Run { argv, .. } => argv
+                .iter()
+                .any(|argument| argument.contains("chmod 0444") && argument.contains(&mode_step)),
+            _ => false,
+        }));
+        let staged = real_root_steps(&SYSTEM).unwrap();
+        assert!(staged.iter().any(
+            |step| matches!(step, Step::WriteFile { path, content, exec: false }
+            if path == &format!("{{root}}/real-root{BUS_APPLICATION_POLICY}") && content == &text)
+        ));
+    }
+
+    #[test]
     fn immutable_portal_settings_have_one_canonical_source() {
         assert_eq!(td_portal_settings_etc_name(), "td-portal-settings");
         let generated = etc_files(&SYSTEM)
+            .unwrap()
             .into_iter()
             .find(|(name, _, _)| *name == td_portal_settings_etc_name());
         assert_eq!(
@@ -8103,7 +8266,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             users: SYSTEM.users,
             applications: APPLICATIONS,
         };
-        let steps = real_root_steps(&fixture);
+        let steps = real_root_steps(&fixture).unwrap();
         assert_eq!(
             application_payload_inputs(&fixture),
             vec!["fixture-package", "fixture-runtime"]
@@ -8315,7 +8478,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 Some(initramfs_bin_names(Phase::Deployment)),
             ),
         ];
-        for (name, content, _) in etc_files(&SYSTEM) {
+        for (name, content, _) in etc_files(&SYSTEM).unwrap() {
             sources.push((format!("/etc/{name}"), content, None));
         }
         sources
@@ -8719,7 +8882,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     fn packed_bin_names_for(sys: &SystemDef) -> Vec<String> {
         const LINK_PREFIX: &str = "{root}/real-root/bin/";
         let mut names = Vec::new();
-        for step in real_root_steps(sys) {
+        for step in real_root_steps(sys).unwrap() {
             if let Step::Symlink { link, .. } = step {
                 if let Some(name) = link.strip_prefix(LINK_PREFIX) {
                     names.push(name.to_string());
@@ -9064,7 +9227,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     /// whichever step ran last would decide which — silently.
     #[test]
     fn no_mutable_etc_entry_shadows_a_generated_etc_file() {
-        for (generated, _, _) in etc_files(&SYSTEM) {
+        for (generated, _, _) in etc_files(&SYSTEM).unwrap() {
             assert!(
                 !mutable_etc_names().contains(&generated),
                 "/etc/{generated} is both generated image config and a MUTABLE_ETC entry"
@@ -9080,7 +9243,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     /// that cannot resolve TERM just draws badly.
     #[test]
     fn every_immutable_etc_entry_points_into_the_store() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         for entry in IMMUTABLE_ETC {
             let link = format!("{{root}}/real-root/etc/{}", entry.etc);
             assert!(
@@ -9250,7 +9413,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     /// symlink going missing until the cutover landing tried to run it.
     #[test]
     fn the_terminal_is_packaged_as_bin_td_term() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|step| matches!(
                 step,
@@ -9267,7 +9430,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     /// that never became a staging step reds here rather than in a full image build.
     #[test]
     fn every_mutable_etc_entry_is_staged_as_a_symlink() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         for entry in MUTABLE_ETC {
             let link = format!("{{root}}/real-root/etc/{}", entry.etc);
             assert!(
@@ -9774,7 +9937,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
 
     #[test]
     fn homes_are_immutable_links_into_var() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         for (link, target) in [("/home", "var/home"), ("/root", "var/root")] {
             let path = format!("{{root}}/real-root{link}");
             assert!(
@@ -9883,7 +10046,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     #[test]
     fn boot_markers_are_wired() {
         let rootcheck = build_rootcheck(&SYSTEM);
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             rootcheck.contains(SYSTEM_ROOT_RO_MARKER),
             "rootcheck must emit the ro-root marker"
@@ -10792,7 +10955,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // The provider, gone. Same scan as `nothing_on_the_image_is_busybox`,
         // asserted here too because THIS is the test that claims these two
         // names are unreachable, and they are reachable the moment it is back.
-        for step in real_root_steps(&SYSTEM) {
+        for step in real_root_steps(&SYSTEM).unwrap() {
             if let Step::CopyTree { from, .. } = &step {
                 assert!(
                     !from.contains("busybox"),
@@ -10862,7 +11025,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // not derive. The wildcard below is a runtime backstop, NOT a
         // compile-time one: a new variant compiles fine here and fails only if
         // `real_root_steps` emits it — which is the moment it would matter.
-        for step in real_root_steps(&SYSTEM) {
+        for step in real_root_steps(&SYSTEM).unwrap() {
             let paths: Vec<String> = match step {
                 Step::Symlink { target, link } => vec![target, link],
                 Step::CopyTree { from, dest } => vec![from, dest],
@@ -11089,7 +11252,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// therefore asserts a match AND a non-match, and this test pins both halves.
     #[test]
     fn td_txt_serves_its_farm_and_the_grep_probe_discriminates() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -11444,7 +11607,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
 
     #[test]
     fn td_jail_is_packed_and_its_target_probe_gates_boot_success() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(steps.iter().any(|step| matches!(
             step,
             Step::CopyTree { from, dest }
@@ -11548,7 +11711,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// symlink text — `shape_check` compares link targets and cannot execute an applet.
     #[test]
     fn td_util_serves_its_farm_and_every_name_is_probed() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -11659,7 +11822,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// the real parser at build time.
     #[test]
     fn td_init_serves_its_farm_and_every_name_is_probed() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -11845,7 +12008,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
              setgid bit"
         );
 
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -12176,7 +12339,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // script switched to either would escape a reboot-only scan while the count still held.
         const POWER: [&str; 3] = ["reboot", "poweroff", "halt"];
         let mut initiators = 0;
-        for (name, body, _) in etc_files(&SYSTEM) {
+        for (name, body, _) in etc_files(&SYSTEM).unwrap() {
             let mut body = body;
             for (applet, probe) in TD_INIT_FARM {
                 body = body.replace(&td_init_probe(applet, probe, &SYSTEM), "");
@@ -12217,7 +12380,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// reverts the /etc files to plain writes would silently break network bring-up.
     #[test]
     fn td_netd_is_packed_and_etc_is_run_backed() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -12332,7 +12495,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
         // And the file really is generated at that name.
         assert!(
-            etc_files(&SYSTEM).iter().any(|(n, _, _)| *n == name),
+            etc_files(&SYSTEM)
+                .unwrap()
+                .iter()
+                .any(|(n, _, _)| *n == name),
             "no etc_files entry generates {name}, so PID 1 would exec td-svc against a \
              path that does not exist"
         );
@@ -12352,7 +12518,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// the real-root half of its own new binary.
     #[test]
     fn td_sh_is_packed_and_not_merely_symlinked() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -12398,7 +12564,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// paying the same rent.
     #[test]
     fn td_svc_is_packed_and_not_merely_symlinked() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -12441,7 +12607,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// mistake visible where the change is made.
     #[test]
     fn td_busd_is_packed_and_not_merely_symlinked() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -12477,7 +12643,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// shape check that names the link and the packed binary behind it.
     #[test]
     fn td_net_is_packed_and_not_merely_symlinked() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|s| matches!(
                 s,
@@ -12506,7 +12672,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
 
     #[test]
     fn td_portal_is_packed_and_not_merely_symlinked() {
-        let steps = real_root_steps(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM).unwrap();
         assert!(
             steps.iter().any(|step| matches!(
                 step,
@@ -12563,6 +12729,7 @@ mod principal_tests {
         }
         assert!(build_td_svc_conf().contains("--application-owner 1000:1000 --enroll-principals\n"));
         assert!(etc_files(&SYSTEM)
+            .unwrap()
             .iter()
             .any(|(name, contents, exec)| *name == "td-principals.tsv"
                 && *contents == build_principals(&SYSTEM)

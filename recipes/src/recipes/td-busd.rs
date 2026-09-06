@@ -3,6 +3,10 @@ use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-busd/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    (
+        "app_policy",
+        include_str!("../../../td-busd/src/app_policy.rs"),
+    ),
     ("auth", include_str!("../../../td-busd/src/auth.rs")),
     ("authscript", include_str!("../../../td-busd/src/authscript.rs")),
     ("corpus", include_str!("../../../td-busd/src/corpus.rs")),

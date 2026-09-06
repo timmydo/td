@@ -16,8 +16,9 @@
 //! Rung 15's first increment is here too, on td's own interface rather than
 //! the specification's: `td.Jail1.Register` and `td.Jail1.Complete` at
 //! `/td/Jail1` record which jailed instance a process belongs to, and
-//! `lineage` answers that question for a connection. Nothing consults the
-//! answer drives per-connection name visibility, ownership and signal policy.
+//! `lineage` answers that question for a connection. The stock deployment
+//! policy constrains that answer using its kernel UID before it drives
+//! per-connection visibility, ownership and signal policy.
 //!
 //! What no call gets is silence. A caller waiting on a serial that will never
 //! be answered hangs rather than fails, so a call this broker cannot serve is
@@ -28,6 +29,7 @@
 //! registration methods still do their work, because the flag withdraws the
 //! answer and not the request.
 
+mod app_policy;
 mod auth;
 mod authscript;
 mod corpus;
@@ -84,19 +86,25 @@ fn report_admission_refusal(quota: &transport::Quota, pid: i32, why: &str) {
 /// broker that exited zero having served nothing would satisfy its supervision
 /// unit and leave every portal call hanging.
 fn run(socket: &Path, session: bool) -> Result<String, String> {
-    if session {
+    let profile = if session {
         session::check(current_uid()?)?;
-    }
+        Some(session::load_policy()?)
+    } else {
+        None
+    };
     let bound = if session {
         transport::bind_session(socket)
     } else {
         transport::bind(socket)
     }
     .map_err(|error| format!("cannot listen on {}: {error}", socket.display()))?;
-    serve_bound(bound, session)
+    serve_bound(bound, profile)
 }
 
-fn serve_bound(bound: transport::Bound, session: bool) -> Result<String, String> {
+fn serve_bound(
+    bound: transport::Bound,
+    profile: Option<app_policy::Policy>,
+) -> Result<String, String> {
     let text = transport::guid_text().map_err(|error| format!("cannot make a guid: {error}"))?;
     // Validated once HERE, so a guid this bus cannot use fails at startup
     // rather than once per peer in a thread whose failure nobody is reading.
@@ -113,7 +121,10 @@ fn serve_bound(bound: transport::Bound, session: bool) -> Result<String, String>
     let bus = Arc::new(registry::Bus::new());
     // Every jail instance this broker knows. Shared with every connection
     // thread: the registration methods write it and every accept reads it.
-    let instances = Arc::new(lineage::Instances::new());
+    let instances = Arc::new(match profile {
+        Some(policy) => lineage::Instances::for_session(policy),
+        None => lineage::Instances::new(),
+    });
     let guid_text = Arc::new(text);
     // Consecutive failed accepts. Reset by any success, so a busy bus that
     // sheds the occasional peer never approaches the ceiling.
@@ -161,7 +172,7 @@ fn serve_bound(bound: transport::Bound, session: bool) -> Result<String, String>
                 continue;
             }
         };
-        if session && !session::admits(credential.uid) {
+        if !instances.admits(credential.uid) {
             report_admission_refusal(
                 &quota,
                 credential.pid,
@@ -315,6 +326,7 @@ fn main() {
 
 #[cfg(test)]
 const SOURCES: &[(&str, &str)] = &[
+    ("app_policy", include_str!("app_policy.rs")),
     ("main", include_str!("main.rs")),
     ("auth", include_str!("auth.rs")),
     ("sys", include_str!("sys.rs")),
@@ -441,12 +453,15 @@ mod tests {
             0o666
         );
         thread::spawn(move || {
-            let _ = serve_bound(bound, true);
+            let _ = serve_bound(
+                bound,
+                Some(app_policy::Policy::new(session::HUMAN_UID, Vec::new()).unwrap()),
+            );
         });
         let stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
         assert_eq!(
             handshake(&stream).is_some(),
-            session::admits(current_uid().unwrap())
+            [0, session::HUMAN_UID].contains(&current_uid().unwrap())
         );
         drop(stream);
         std::fs::remove_dir_all(dir).unwrap();
