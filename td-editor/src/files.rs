@@ -191,12 +191,75 @@ struct Entry {
     bytes: Vec<u8>,
 }
 
+impl Entry {
+    fn matches(&self, location: &Location, stamp: Option<&Stamp>) -> bool {
+        self.location.path == location.path
+            || match (&self.stamp, stamp) {
+                (Some(a), Some(b)) => a.identity() == b.identity(),
+                _ => false,
+            }
+    }
+}
+
 /// Own on one file worker. IDs are local to this session, not model tab IDs.
 /// Dropping/removing an association never deletes its destination.
 pub struct Session {
     entries: BTreeMap<FileId, Entry>,
     next: FileId,
     budget: usize,
+}
+
+/// A validated replacement, not yet the save baseline. Its exclusive session
+/// borrow prevents intervening association changes. Drop to cancel; commit
+/// only after the document accepts these bytes and its discard decision.
+///
+/// ```compile_fail,E0499
+/// let mut files = td_editor::files::Session::default();
+/// if let Ok(reload) = files.prepare_reload(1) {
+///     files.forget(1); // the prepared replacement still owns the borrow
+///     reload.commit();
+/// }
+/// files.forget(1);
+/// ```
+#[must_use = "dropping a prepared reload cancels it"]
+pub struct Reload<'a> {
+    session: &'a mut Session,
+    original: FileId,
+    replacement: FileId,
+    entry: Entry,
+}
+
+impl Reload<'_> {
+    pub fn file_id(&self) -> FileId {
+        self.replacement
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.entry.bytes
+    }
+    pub fn path(&self) -> &Path {
+        &self.entry.location.path
+    }
+    pub fn missing(&self) -> bool {
+        self.entry.stamp.is_none()
+    }
+    /// No I/O or fallible admission remains after preparation. The new ID
+    /// lets a worker distinguish accepted and rejected document completions.
+    pub fn commit(self) -> FileId {
+        self.session.entries.remove(&self.original);
+        self.session.entries.insert(self.replacement, self.entry);
+        self.replacement
+    }
+}
+
+impl std::fmt::Debug for Reload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reload")
+            .field("original", &self.original)
+            .field("replacement", &self.replacement)
+            .field("bytes", &self.entry.bytes.len())
+            .field("missing", &self.missing())
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for Session {
@@ -259,13 +322,11 @@ impl Session {
         let location = Location::resolve(path)?;
         let opened = open_regular(&location.path)?;
         let stamp = opened.as_ref().map(|(_, stamp)| stamp);
-        if let Some((&id, _)) = self.entries.iter().find(|(_, e)| {
-            e.location.path == location.path
-                || match (&e.stamp, stamp) {
-                    (Some(a), Some(b)) => a.identity() == b.identity(),
-                    _ => false,
-                }
-        }) {
+        if let Some((&id, _)) = self
+            .entries
+            .iter()
+            .find(|(_, e)| e.matches(&location, stamp))
+        {
             return Ok(id);
         }
         if self.entries.len() >= MAX_FILES {
@@ -275,10 +336,62 @@ impl Session {
             .next
             .checked_add(1)
             .ok_or_else(|| Failure::new(Kind::Limit, "file IDs exhausted"))?;
+        let entry = self.read_entry(location, opened, 0)?;
+        let id = self.next;
+        self.entries.insert(id, entry);
+        self.next = next;
+        Ok(id)
+    }
+
+    /// Reread the stored resolved pathname, without replacing its baseline.
+    /// Failed preparation and dropped candidates preserve all associations.
+    /// A successful preparation consumes one ID even when later cancelled.
+    pub fn prepare_reload(&mut self, id: FileId) -> Result<Reload<'_>> {
+        let original = self.entry(id)?;
+        let next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| Failure::new(Kind::Limit, "file IDs exhausted"))?;
+        let location = Location::resolve(&original.location.path)?;
+        if location.path != original.location.path {
+            return Err(Failure::new(
+                Kind::Conflict,
+                "reload parent redirects to another path; Open that path explicitly",
+            ));
+        }
+        let opened = open_regular(&location.path)?;
+        let stamp = opened.as_ref().map(|(_, stamp)| stamp);
+        if self
+            .entries
+            .iter()
+            .any(|(&other, entry)| other != id && entry.matches(&location, stamp))
+        {
+            return Err(Failure::new(
+                Kind::Exists,
+                "reload destination belongs to another open association",
+            ));
+        }
+        let entry = self.read_entry(location, opened, original.bytes.len())?;
+        let replacement = self.next;
+        self.next = next;
+        Ok(Reload {
+            session: self,
+            original: id,
+            replacement,
+            entry,
+        })
+    }
+
+    fn read_entry(
+        &self,
+        location: Location,
+        opened: Option<(File, Stamp)>,
+        old_bytes: usize,
+    ) -> Result<Entry> {
         let (stamp, bytes, baseline_file) = match opened {
             Some((file, stamp)) => {
                 self.admit(
-                    0,
+                    old_bytes,
                     usize::try_from(stamp.len)
                         .map_err(|_| Failure::new(Kind::Limit, "file too large"))?,
                 )?;
@@ -290,18 +403,12 @@ impl Session {
             None => (None, Vec::new(), None),
         };
         location.check_parent()?;
-        let id = self.next;
-        self.entries.insert(
-            id,
-            Entry {
-                location,
-                stamp,
-                _baseline_file: baseline_file,
-                bytes,
-            },
-        );
-        self.next = next;
-        Ok(id)
+        Ok(Entry {
+            location,
+            stamp,
+            _baseline_file: baseline_file,
+            bytes,
+        })
     }
 
     /// Bytes must be an immutable encoded model snapshot. On success the
@@ -728,7 +835,10 @@ mod tests {
             path
         }
         fn no_temporaries(&self) {
-            for entry in fs::read_dir(&self.0).unwrap() {
+            Self::check_no_temporaries(&self.0);
+        }
+        fn check_no_temporaries(path: &Path) {
+            for entry in fs::read_dir(path).unwrap() {
                 assert!(!entry
                     .unwrap()
                     .file_name()
@@ -741,6 +851,285 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn prepared_borrow_can_be_released_before_session_access() {
+        let mut files = Session::default();
+        if let Ok(reload) = files.prepare_reload(1) {
+            reload.commit();
+        }
+        files.forget(1);
+    }
+
+    #[test]
+    fn prepared_reload_can_wait_for_the_next_job_before_commit_or_cancel() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for accept in [false, true] {
+            let directory = Directory::new();
+            let path = directory.write("file", b"old");
+            let mut files = Session::default();
+            let original = files.open(&path).unwrap();
+            fs::write(&path, b"candidate").unwrap();
+            let (completion, results) = mpsc::sync_channel(1);
+            let (submit, jobs) = mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let candidate = files.prepare_reload(original).unwrap();
+                let replacement = candidate.file_id();
+                completion
+                    .send((replacement, candidate.bytes().to_vec()))
+                    .unwrap();
+                let keep = jobs.recv_timeout(Duration::from_secs(5)).unwrap();
+                if keep == replacement {
+                    candidate.commit();
+                } else {
+                    drop(candidate);
+                }
+                completion
+                    .send((keep, files.bytes(keep).unwrap().to_vec()))
+                    .unwrap();
+            });
+            let (replacement, bytes) = results.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(bytes, b"candidate");
+            // The UI can finish admission or reject before sending another job.
+            let keep = if accept { replacement } else { original };
+            submit.send(keep).unwrap();
+            let (id, baseline) = results.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(id, keep);
+            assert_eq!(
+                baseline,
+                if accept {
+                    b"candidate".as_slice()
+                } else {
+                    b"old"
+                }
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn reload_cancel_keeps_baseline_and_commit_replaces_it_under_a_fresh_id() {
+        let directory = Directory::new();
+        let path = directory.write("file", b"old");
+        let mut files = Session::default();
+        let original = files.open(&path).unwrap();
+        fs::write(&path, b"\xef\xbb\xbfnew\r\n").unwrap();
+        let candidate = files.prepare_reload(original).unwrap();
+        let abandoned = candidate.file_id();
+        let debug = format!("{candidate:?}");
+        assert!(!debug.contains("new") && !debug.contains(&path.to_string_lossy().to_string()));
+        assert_ne!(abandoned, original);
+        assert_eq!(candidate.bytes(), b"\xef\xbb\xbfnew\r\n");
+        assert_eq!(candidate.path(), path);
+        assert!(!candidate.missing());
+        drop(candidate);
+        assert_eq!(files.bytes(original).unwrap(), b"old");
+        assert_eq!(files.open(&path).unwrap(), original);
+        assert!(files.bytes(abandoned).is_err());
+        assert_eq!(
+            files.save(original, b"edit".to_vec()).unwrap_err().kind,
+            Kind::Conflict
+        );
+        let candidate = files.prepare_reload(original).unwrap();
+        let adopted = candidate.file_id();
+        assert_ne!(adopted, abandoned);
+        assert_eq!(candidate.commit(), adopted);
+        assert!(files.bytes(original).is_err());
+        assert_eq!(files.bytes(adopted).unwrap(), b"\xef\xbb\xbfnew\r\n");
+        assert_eq!(files.open(&path).unwrap(), adopted);
+        files.save(adopted, b"saved".to_vec()).unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"saved");
+        directory.no_temporaries();
+    }
+
+    #[test]
+    fn reload_admission_counts_replacement_not_both_retained_copies() {
+        let directory = Directory::new();
+        let path = directory.write("file", b"old");
+        let other = directory.write("other", b"xy");
+        let mut files = Session {
+            budget: 5,
+            ..Session::default()
+        };
+        let original = files.open(&path).unwrap();
+        files.open(&other).unwrap();
+        for i in 2..MAX_FILES {
+            files
+                .open(&directory.path(&format!("missing-{i}")))
+                .unwrap();
+        }
+        fs::write(&path, b"new").unwrap();
+        let candidate = files.prepare_reload(original).unwrap();
+        let adopted = candidate.commit();
+        assert_eq!(files.entries.len(), MAX_FILES);
+        assert_eq!(files.baseline_bytes(), 5);
+        fs::write(&path, b"four").unwrap();
+        assert!(matches!(
+            files.prepare_reload(adopted),
+            Err(Failure {
+                kind: Kind::Limit,
+                ..
+            })
+        ));
+        assert_eq!(files.bytes(adopted).unwrap(), b"new");
+        assert_eq!(files.baseline_bytes(), 5);
+        assert_eq!(files.entries.len(), MAX_FILES);
+    }
+
+    #[test]
+    fn reload_refuses_invalid_text_special_targets_and_exhaustion_atomically() {
+        let directory = Directory::new();
+        let path = directory.write("file", b"old");
+        let mut files = Session::default();
+        let original = files.open(&path).unwrap();
+        let next = files.next;
+        for bytes in [b"\xff".as_slice(), b"a\0", b"a\r\nb\n"] {
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                files.prepare_reload(original),
+                Err(Failure {
+                    kind: Kind::InvalidText,
+                    ..
+                })
+            ));
+            assert_eq!(files.next, next);
+            assert_eq!(files.bytes(original).unwrap(), b"old");
+        }
+        File::create(&path)
+            .unwrap()
+            .set_len(text::MAX_FILE_BYTES as u64 + 1)
+            .unwrap();
+        assert!(matches!(
+            files.prepare_reload(original),
+            Err(Failure {
+                kind: Kind::Limit,
+                ..
+            })
+        ));
+        fs::remove_file(&path).unwrap();
+        symlink(directory.path("absent"), &path).unwrap();
+        assert_eq!(
+            files.prepare_reload(original).unwrap_err().kind,
+            Kind::NotRegular
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            files.prepare_reload(original).unwrap_err().kind,
+            Kind::NotRegular
+        );
+        fs::remove_dir(&path).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            files.prepare_reload(original).unwrap_err().kind,
+            Kind::NotRegular
+        );
+        drop(listener);
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"valid").unwrap();
+        files.next = u64::MAX;
+        fs::remove_file(&path).unwrap();
+        symlink(directory.path("absent"), &path).unwrap();
+        assert!(matches!(
+            files.prepare_reload(original),
+            Err(Failure {
+                kind: Kind::Limit,
+                ..
+            })
+        ));
+        assert_eq!(files.bytes(original).unwrap(), b"old");
+        assert_eq!(files.entries.len(), 1);
+        files.next = next;
+        assert!(matches!(
+            files.prepare_reload(0),
+            Err(Failure {
+                kind: Kind::MissingAssociation,
+                ..
+            })
+        ));
+        directory.no_temporaries();
+    }
+
+    #[test]
+    fn reload_missing_paths_and_later_disk_changes_keep_normal_save_checks() {
+        let directory = Directory::new();
+        let path = directory.write("file", b"old");
+        let mut files = Session::default();
+        let original = files.open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let candidate = files.prepare_reload(original).unwrap();
+        assert!(candidate.missing() && candidate.bytes().is_empty());
+        let missing = candidate.commit();
+        assert!(files.missing(missing).unwrap());
+        assert!(!path.exists());
+        fs::write(&path, b"appeared").unwrap();
+        assert_eq!(
+            files.save(missing, b"edit".to_vec()).unwrap_err().kind,
+            Kind::Exists
+        );
+        let candidate = files.prepare_reload(missing).unwrap();
+        assert!(!candidate.missing());
+        assert_eq!(candidate.bytes(), b"appeared");
+        fs::write(&path, b"changed after read").unwrap();
+        let adopted = candidate.commit();
+        assert_eq!(files.bytes(adopted).unwrap(), b"appeared");
+        assert_eq!(
+            files.save(adopted, b"edit".to_vec()).unwrap_err().kind,
+            Kind::Conflict
+        );
+        assert_eq!(fs::read(path).unwrap(), b"changed after read");
+        directory.no_temporaries();
+    }
+
+    #[test]
+    fn reload_refuses_another_live_inode_and_rebinds_a_replaced_parent() {
+        let directory = Directory::new();
+        let path = directory.write("file", b"old");
+        let other = directory.write("other", b"other");
+        let mut files = Session::default();
+        let original = files.open(&path).unwrap();
+        let other_id = files.open(&other).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&other, &path).unwrap();
+        assert!(matches!(
+            files.prepare_reload(original),
+            Err(Failure {
+                kind: Kind::Exists,
+                ..
+            })
+        ));
+        assert_eq!(files.bytes(original).unwrap(), b"old");
+        assert_eq!(files.bytes(other_id).unwrap(), b"other");
+        let parent = directory.path("parent");
+        fs::create_dir(&parent).unwrap();
+        let nested = parent.join("text");
+        fs::write(&nested, b"before").unwrap();
+        let old_nested = files.open(&nested).unwrap();
+        fs::rename(&parent, directory.path("retired-parent")).unwrap();
+        fs::write(directory.path("text"), b"redirected").unwrap();
+        symlink(&directory.0, &parent).unwrap();
+        assert_eq!(
+            files.prepare_reload(old_nested).unwrap_err().kind,
+            Kind::Conflict
+        );
+        assert_eq!(files.bytes(old_nested).unwrap(), b"before");
+        fs::remove_file(&parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(&nested, b"replacement").unwrap();
+        let candidate = files.prepare_reload(old_nested).unwrap();
+        assert_eq!(candidate.bytes(), b"replacement");
+        let adopted = candidate.commit();
+        files.save(adopted, b"saved".to_vec()).unwrap();
+        assert_eq!(fs::read(&nested).unwrap(), b"saved");
+        assert_eq!(
+            fs::read(directory.path("retired-parent/text")).unwrap(),
+            b"before"
+        );
+        directory.no_temporaries();
+        Directory::check_no_temporaries(&parent);
+        Directory::check_no_temporaries(&directory.path("retired-parent"));
     }
 
     #[test]

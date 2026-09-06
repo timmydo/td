@@ -389,9 +389,10 @@ operation, not filesystem Open. See README for the implemented wire subset.
 
 `files::Session` is a synchronous, exclusive worker-owned adapter, with no
 model mutation, UI dispatch, environment setting, process spawn or control
-endpoint. Its public operations are Open, Save, Save As, baseline/path/missing
-queries, and Forget. File IDs are local to that session, separate from tab
-IDs. At most 64 associations and 64 MiB of encoded baselines are retained.
+endpoint. Its public operations are Open, prepared Reload, Save, Save As,
+baseline/path/missing queries, and Forget. File IDs are local to that session,
+separate from tab IDs. At most 64 associations and 64 MiB of encoded baselines
+are retained.
 The 16 MiB file ceiling is checked before reading, snapshot validation and
 publication; complete-file comparison streams through an 8 KiB buffer.
 The baseline budget counts retained encoded bytes, not all process memory.
@@ -400,8 +401,9 @@ decodes up to another 16 MiB through the shared codec before writing. That
 copy deliberately avoids a second codec or trusting caller-supplied bytes.
 It is freed before publication. Session debug output exposes only counts,
 never paths or document text, and a compile-time test pins `Session: Send`.
-Open validates the file codec before association admission. Open/save errors
-leave all associations and baselines unchanged. Forget removes only an
+Open validates the file codec before association admission. Open, reload
+preparation and save errors leave all associations and baselines unchanged.
+Forget removes only an
 association, never a filesystem object.
 
 Paths retain arbitrary Unix filename bytes and must fit 4096 bytes both
@@ -423,6 +425,55 @@ Save As refuses both existing names and names reserved by another open
 association, and changes the association only on fully confirmed success.
 Existing baselines retain their opened file handle, preventing inode-number
 reuse while the association lives (at most 64 such handles plus 64 parents).
+
+`Session::prepare_reload` rereads the associated stored resolved pathname
+using the same regular-file, codec, stable-read and parent/name checks as
+Open. It resolves that pathname's parent anew: a replaced directory is an
+explicitly requested new location, not the old retained directory. If parent
+resolution redirects the stored absolute path elsewhere, preparation refuses
+with Conflict; use explicit Open for that different path. A final symlink or
+special file is still refused. A candidate matching another live association's
+path or retained inode is refused with Exists, never merged into that tab.
+A missing destination produces an empty, explicitly missing candidate and
+does not create anything. These are file-adapter semantics; the window's
+Reload command and dirty-document confirmation are not connected yet.
+
+The returned `files::Reload` exclusively borrows its originating session.
+No Open, Save, forget, second preparation or other session mutation can
+intervene while it exists. It exposes validated bytes/path/missing state
+and a fresh FileId via `file_id`, while retaining the original association
+unchanged. Its Debug output contains only IDs, byte count and missing state,
+never paths or text.
+Dropping the candidate cancels it. Only after the model accepts the candidate
+for its still-current, explicitly authorized revision may the coordinator
+consume it with `commit`: that replaces the old association under the fresh
+ID without further I/O or fallible admission. Old IDs stop resolving. Every
+successful preparation consumes an ID, even if cancelled; failed preparation
+does not. Exhaustion refuses preparation before filesystem access or any
+association mutation.
+Commit installs the read snapshot, not a claim that disk stopped changing;
+the next ordinary Save still compares the complete adopted baseline.
+
+Preparation admits `retained baseline bytes - old bytes + candidate bytes`
+against 64 MiB and retains at most one additional 16-MiB candidate. It works
+at the 64-association limit because it replaces one entry rather than adding
+a live association. The old baseline and its descriptors remain pinned until
+commit or cancellation. Preparation may transiently allocate the codec's
+additional at-most-16-MiB decoded validation string and retain one extra
+parent and regular-file handle. The future worker-to-model handoff may copy
+one at-most-16-MiB encoded result and decode it separately; it must not commit
+the borrowed candidate when that admission is cancelled, stale or over budget.
+
+The window integration will keep this borrow inside the worker, not return
+it from the one-job executor or send it to the UI. The worker sends the
+candidate's bytes/path/missing flag and fresh ID, then receives the next
+ordinary job while retaining the borrow. That job's live association set
+names the fresh ID only if model admission succeeded; otherwise it still
+names the old ID (or neither if the tab closed). Commit or drop the candidate
+before executing that next job. An idle worker already waits for jobs: no
+new UI wait or acknowledgement channel is needed. Job-channel disconnection
+drops the candidate; the session then exits. At most one candidate remains
+retained while idle. A threaded channel oracle exercises both decisions.
 
 Save takes ownership of one encoded, immutable model snapshot. It admits
 the replacement baseline budget and validates the bytes before any write.

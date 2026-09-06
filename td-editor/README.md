@@ -58,6 +58,11 @@ a time; additional requests are visibly refused, not queued. Saves acknowledge
 only the snapshot written, so typing during a save leaves newer edits dirty.
 See DESIGN's file-safety section for metadata restrictions and race limits.
 
+The file adapter also exposes a prepared Reload: dropping it keeps the old
+baseline, while accepting it adopts validated replacement bytes under a new
+association ID. This prerequisite is tested but is not yet a window
+Reload command; model admission and explicit dirty-text discard come next.
+
 An optional kernel attribute test needs a dedicated UTF-8 fixture with an
 extended attribute (for example one created with `setfattr -n user.test -v x`).
 No attribute tool is a build or runtime dependency:
