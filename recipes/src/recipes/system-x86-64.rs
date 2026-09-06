@@ -168,6 +168,8 @@ struct ShippedApplication {
     name: &'static str,
     package: &'static str,
     package_recipe: fn() -> Recipe,
+    /// Stable reserved identity for the later per-application UID cutover.
+    external_uid: u32,
     runtime: &'static str,
     runtime_recipe: fn() -> Recipe,
 }
@@ -195,6 +197,10 @@ const APPLICATION_CONFIG: &str = crate::ladder::TD_APPLICATION_CONFIG_PATH;
 const PROFILER_OBJECT_INDEX: &str = "/etc/td-profiler-objects.tsv";
 const PROFILER_APPLICATION_ROOTS: &str = "/etc/td-profiler-application-roots.tsv";
 const PROFILER_CAPTURE_ROOT: &str = "/var/lib/td-profiler/captures";
+const PRINCIPALS_PATH: &str = "/etc/td-principals.tsv";
+const COMPOSITOR_RESERVED_UID: u32 = 993;
+const BROKER_RESERVED_UID: u32 = 992;
+const PORTAL_RESERVED_UID: u32 = 991;
 const PROFILER_USER: &str = "profiler";
 const PROFILER_UID: u32 = 997;
 const PROFILER_GID: u32 = 997;
@@ -360,6 +366,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         name: FIREFOX_NAME,
         package: FIREFOX_NAME,
         package_recipe: super::firefox::recipe,
+        external_uid: 65536,
         runtime: "freedesktop-platform-25-08",
         runtime_recipe: super::freedesktop_platform_25_08::recipe,
     },
@@ -370,6 +377,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         name: TD_MAIL_NAME,
         package: TD_MAIL_NAME,
         package_recipe: super::mail::recipe,
+        external_uid: 65537,
         runtime: "empty-runtime",
         runtime_recipe: super::empty_runtime::recipe,
     },
@@ -377,6 +385,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         name: TD_NEWS_NAME,
         package: TD_NEWS_NAME,
         package_recipe: super::news::recipe,
+        external_uid: 65538,
         runtime: "empty-runtime",
         runtime_recipe: super::empty_runtime::recipe,
     },
@@ -1283,7 +1292,7 @@ fn build_td_svc_conf() -> String {
          # once, owned by that user, never rewritten, and no first-boot decision.\n\
          [td-firstboot]\n\
          type=oneshot\n\
-         exec=/bin/td-firstboot provision --application-home {ui_home} --application-owner {ui_uid}:{ui_gid}\n\
+         exec=/bin/td-firstboot provision --application-home {ui_home} --application-owner {ui_uid}:{ui_gid} --enroll-principals\n\
          after=hostname\n\
          timeout={firstboot}\n\
          \n\
@@ -3594,12 +3603,32 @@ fn build_firefox_tls_ready() -> String {
     )
 }
 
+fn build_principals(sys: &SystemDef) -> String {
+    let mut text = format!(
+        "td-principals-v1\nsession\t{UI_UID}\t{COMPOSITOR_RESERVED_UID}\t{BROKER_RESERVED_UID}\t{PORTAL_RESERVED_UID}\n"
+    );
+    let mut applications: Vec<&ShippedApplication> = sys.applications.iter().collect();
+    applications.sort_by_key(|application| application.name);
+    for application in applications {
+        text.push_str(&format!(
+            "application\t{UI_UID}\t{}\t{}\n",
+            application.name, application.external_uid
+        ));
+    }
+    text
+}
+
 /// The generated /etc files (config + the login-glue and boot-check scripts). `exec`
 /// marks the ones getty/init reference as executables. Shared by the real-root staging
 /// (written under `{root}/real-root/etc`) and the shape check (which asserts they landed).
 fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
     vec![
         ("passwd", build_passwd(sys), false),
+        (
+            application_etc_name(PRINCIPALS_PATH),
+            build_principals(sys),
+            false,
+        ),
         ("group", build_group(sys), false),
         (SHADOW_ETC_NAME, build_shadow(sys), false),
         ("hostname", format!("{}\n", sys.hostname), false),
@@ -4580,12 +4609,21 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}'"
+                    "chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}'"
                 ),
             ],
         )
         .env("PATH", &post_bootstrap_path()),
     );
+
+    steps.push(Step::run(
+        "{root}",
+        &[
+            "{in:td-firstboot}/bin/td-firstboot",
+            "check-principals",
+            "{root}/real-root",
+        ],
+    ));
 
     // 2) Pack distinct direct-boot selector and selected-deployment initramfs
     //    artifacts. Only the selector contains td-kexec.
@@ -7293,7 +7331,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             unit_key("td-firstboot", "exec"),
             Some(format!(
                 "/bin/td-firstboot provision --application-home {UI_HOME} \
-                 --application-owner {UI_UID}:{UI_GID}"
+                 --application-owner {UI_UID}:{UI_GID} --enroll-principals"
             )),
             "td-firstboot must be handed the login user's home and identity for the \
              terminal applications' first configuration"
@@ -7658,6 +7696,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             name: "fixture",
             package: "fixture-package",
             package_recipe: super::super::td_jail_fixture::recipe,
+            external_uid: 65539,
             runtime: "fixture-runtime",
             runtime_recipe: super::super::empty_runtime::recipe,
         }];
@@ -8333,6 +8372,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 name: "rg",
                 package: "catalog-rg",
                 package_recipe: super::super::td_jail_fixture::recipe,
+                external_uid: 65539,
                 runtime: "runtime-rg",
                 runtime_recipe: super::super::empty_runtime::recipe,
             },
@@ -8340,6 +8380,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 name: "td-netd",
                 package: "catalog-netd",
                 package_recipe: super::super::td_jail_fixture::recipe,
+                external_uid: 65540,
                 runtime: "runtime-netd",
                 runtime_recipe: super::super::empty_runtime::recipe,
             },
@@ -12063,5 +12104,73 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             native_inputs.iter().any(|input| input == "td-portal"),
             "td-portal must be a declared native input"
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../td-firstboot/src/principals.rs"]
+#[allow(dead_code)]
+mod principal_schema;
+
+#[cfg(test)]
+mod principal_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn deployment_principals_parse_and_cannot_alias_system_credentials() {
+        let registry = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
+        registry
+            .verify_accounts(
+                &build_passwd(&SYSTEM),
+                &build_group(&SYSTEM),
+                &build_shadow(&SYSTEM),
+            )
+            .unwrap();
+        let session = registry.session(UI_UID).unwrap();
+        assert_eq!(
+            (session.compositor, session.broker, session.portal),
+            (993, 992, 991)
+        );
+        for (name, uid) in [("firefox", 65536), ("mail", 65537), ("news", 65538)] {
+            assert_eq!(registry.application(UI_UID, name).unwrap().uid, uid);
+        }
+        assert!(build_td_svc_conf().contains("--application-owner 1000:1000 --enroll-principals\n"));
+        assert!(etc_files(&SYSTEM)
+            .iter()
+            .any(|(name, contents, exec)| *name == "td-principals.tsv"
+                && *contents == build_principals(&SYSTEM)
+                && !exec));
+    }
+
+    #[test]
+    fn reserved_ids_remain_fixed_when_the_application_order_changes() {
+        const REVERSED: &[ShippedApplication] = &[
+            ShippedApplication {
+                name: "news",
+                package: "news",
+                package_recipe: super::super::news::recipe,
+                external_uid: 65538,
+                runtime: "empty-runtime",
+                runtime_recipe: super::super::empty_runtime::recipe,
+            },
+            ShippedApplication {
+                name: "mail",
+                package: "mail",
+                package_recipe: super::super::mail::recipe,
+                external_uid: 65537,
+                runtime: "empty-runtime",
+                runtime_recipe: super::super::empty_runtime::recipe,
+            },
+        ];
+        let sys = SystemDef {
+            applications: REVERSED,
+            ..SYSTEM
+        };
+        let text = build_principals(&sys);
+        let registry = principal_schema::Registry::parse(&text).unwrap();
+        assert_eq!(registry.application(UI_UID, "mail").unwrap().uid, 65537);
+        assert_eq!(registry.application(UI_UID, "news").unwrap().uid, 65538);
+        assert!(text.ends_with("application\t1000\tmail\t65537\napplication\t1000\tnews\t65538\n"));
     }
 }

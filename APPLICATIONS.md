@@ -7830,40 +7830,29 @@ it stays confined; after an escape the process has the session's uid and
 can connect to every uid-accessible socket. Same-uid is not a post-escape
 boundary.
 
-The Android-style answer — a distinct uid per app — is the largest
-security gain available after the jail itself, converting "escape owns
-the account" into "escape owns an empty uid". It is also much bigger than
-it looks. Unprivileged processes may write only a single identity
-mapping; anything else needs `CAP_SETUID` in the parent namespace, so it
-needs a root `td-idmapd` broker (verify the requester, the pidfd, that
-the target's maps are empty, that it is a registered child, and that the
-app id owns the range; write `setgroups=deny` and the two maps; retain
-nothing). That broker is 2–4k lines — but `~/.td/app/<name>` is then owned
-by the wrong uid and needs a chown policy or idmapped mounts
-(`open_tree`, `mount_setattr(MOUNT_ATTR_IDMAP)`, `move_mount`), the
-Wayland/bus/audio socket permissions and every `SO_PEERCRED` check must
-accept a *set* of uids, `AUTH EXTERNAL 1000` no longer equals the peer
-uid, and per-app subuid allocation becomes persistent system state.
-Realistically 8–15k lines beyond the broker, and it puts root on every
-launch path.
+A distinct external uid per application converts an escape from ownership
+of the human account into ownership of that application's state. The
+identity registry reserves those UIDs explicitly and persists retired
+assignments, as specified in `td-authd/DESIGN.md`.
 
-**Recommendation: same-uid for v1, designed for the change.** The cheap
-part is free now — every registration struct carries a uid *set* rather
-than a scalar, and grants are expressed ACL-compatibly — so the later
-project is additive rather than a rewrite. Schedule it as its own
-hardening milestone after the first foreign-toolkit window, and make it
-the default when it lands rather than opt-in.
+The trusted root launcher will select the assigned service account and
+start td-jail through td-login's checked credential drop. The jail already
+supports distinct inside and outside identities: starting at the assigned
+external uid lets it install its own single-entry map to uid 1000 inside.
+No second daemon writes another process's identity maps. Root still belongs
+on every supported launch path, selecting only the immutable application
+and its account; it must accept no caller-selected executable or uid.
 
-**The question is not "accept a root component or not".** `td-authd`
-(§L.1) exists for elevation regardless of identity, so the question is
-whether the component td has already accepted should also do this. It
-should: uid allocation is registry bookkeeping, and writing
-`setgroups=deny` plus two maps for a process it can verify is a small
-addition to something whose whole job is verify-then-act, and whose
-enumerated-operation shape is exactly right for it. That does not shrink the 8–15k of downstream work — the chown
-policy, the uid *sets* in every credential check, the socket permissions
-— but it removes the largest structural objection, which was standing up
-a second privileged path on every launch.
+Credential checks must consume the admitted external UID or an explicit
+set of service/application UIDs, and filesystem grants must remain
+ACL-compatible. The retained AUTH EXTERNAL rules below account for uid 1000
+inside differing from the external kernel identity.
+
+Activation requires one atomic migration of application state ownership,
+compositor/broker/portal identities, cgroups, socket permissions, and peer
+credential checks. The current ledger only reserves identities. Until that
+migration lands, the image continues to use the v1 same-uid model and cannot
+claim a secure consent boundary.
 
 **Two consequences must be designed for now even though the work is
 v2**, because both are silent breakages rather than missing features:
@@ -9066,6 +9055,15 @@ specifies the PCR, memory, physical-bus, rollback and update boundaries, plus
 the pinned host-emulator oracle. That oracle covers TPM restart, changed
 measurements, a different TPM and actual store migration; it is separate from
 the desktop boot check.
+
+The secure-attention prerequisites reserve distinct compositor, broker,
+portal, and application identities in immutable `/etc/td-principals.tsv`.
+Firstboot checks those reservations against all account databases and
+persists their union in `/var/lib/td/principals.tsv`, retaining retired
+assignments so updates cannot reuse their UIDs. This is reservation only;
+the image still uses its existing session identities. Activating the split
+must migrate state and socket authorization together. `td-authd/DESIGN.md`
+specifies the canonical table, account classes, and durable ledger.
 
 **Remaining increments, in order on the rolling workstream.** (c) Gate release
 on FIDO2 user presence at session start, after the compositor provides secure

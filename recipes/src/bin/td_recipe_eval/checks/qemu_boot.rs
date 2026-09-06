@@ -271,6 +271,7 @@ const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_OWNER_MA
 const SYSTEM_ETC_MUTABLE_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_MUTABLE_MARKER;
 const TD_FIRSTBOOT_NEW_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_NEW_MARKER;
 const TD_FIRSTBOOT_STABLE_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_STABLE_MARKER;
+const TD_PRINCIPALS_MARKER: &str = td_recipe::ladder::TD_PRINCIPALS_MARKER;
 const TD_FIRSTBOOT_HOST_KEY_PREFIX: &str = td_recipe::ladder::TD_FIRSTBOOT_HOST_KEY_PREFIX;
 const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_WRITE_MARKER;
 const SYSTEM_PERSIST_READ_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_READ_MARKER;
@@ -437,6 +438,7 @@ struct ConsoleEvidence {
     etc_mutable: bool,
     firstboot_new: bool,
     firstboot_stable: bool,
+    principals_enrolled: bool,
     /// This machine's SSH host-key fingerprint, as td-firstboot printed it. An
     /// Option rather than a bool because its VALUE is the evidence: comparing it
     /// across reboots is what proves the identity persisted rather than merely
@@ -1711,6 +1713,12 @@ fn validate_system_boot(
              one did not resolve (so td-firstboot did not provision it), /etc/machine-id is not \
              32 hex digits through its symlink, or the unprivileged login user could read the \
              SSH host PRIVATE key (or could not read its .pub). Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.principals_enrolled {
+        return Err(format!(
+            "the {ordinal} boot did not reserve deployment identities ({TD_PRINCIPALS_MARKER} absent). Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -5031,6 +5039,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SYSTEM_ETC_MUTABLE_MARKER.len(),
         TD_FIRSTBOOT_NEW_MARKER.len(),
         TD_FIRSTBOOT_STABLE_MARKER.len(),
+        TD_PRINCIPALS_MARKER.len(),
         TD_FIRSTBOOT_HOST_KEY_PREFIX.len() + HOST_KEY_MAX,
         SYSTEM_STATE_WRITABLE_MARKER.len(),
         SYSTEM_STATE_OWNER_MARKER.len(),
@@ -5255,6 +5264,11 @@ fn latch_console_evidence_from(
         &mut evidence.firstboot_new,
         buf,
         TD_FIRSTBOOT_NEW_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.principals_enrolled,
+        buf,
+        TD_PRINCIPALS_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.firstboot_stable,
@@ -9241,6 +9255,7 @@ mod tests {
     evidence.etc_mutable = true;
     evidence.etc_read_only = true;
     evidence.firstboot_new = true;
+    evidence.principals_enrolled = true;
     evidence.git_runtime = true;
     evidence.host_key = Some("ssh-ed25519 AAAA".to_string());
     evidence.persist_read = true;
@@ -9360,6 +9375,31 @@ mod tests {
             complaint.contains(TD_JAIL_KILL_REAPS_MARKER),
             "the rejection must name the marker that was absent: {complaint}"
         );
+    }
+
+    #[test]
+    fn principal_reservations_are_required_for_every_healthy_boot() {
+        let mut result = BootResult {
+            evidence: healthy_evidence(),
+            exited_clean: true,
+            reason: String::new(),
+            console: String::new(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        result.evidence.shutdown = true;
+        let validate = |result: &BootResult| {
+            validate_system_boot(
+                result,
+                PersistencePhase::None,
+                IdentityPhase::Fresh,
+                "first",
+                SelectionExpectation::Current,
+            )
+        };
+        assert_eq!(validate(&result), Ok(()));
+        result.evidence.principals_enrolled = false;
+        assert!(validate(&result).unwrap_err().contains(TD_PRINCIPALS_MARKER));
     }
 
     /// The whole report is read back off its own line.
@@ -10565,6 +10605,7 @@ mod tests {
             SYSTEM_ETC_MUTABLE_MARKER,
             TD_FIRSTBOOT_NEW_MARKER,
             TD_FIRSTBOOT_STABLE_MARKER,
+            TD_PRINCIPALS_MARKER,
             host_key_line.as_str(),
             SYSTEM_STATE_WRITABLE_MARKER,
             SYSTEM_STATE_OWNER_MARKER,
@@ -10633,6 +10674,7 @@ mod tests {
         assert!(evidence.etc_mutable);
         assert!(evidence.firstboot_new);
         assert!(evidence.firstboot_stable);
+        assert!(evidence.principals_enrolled);
         assert_eq!(evidence.host_key.as_deref(), Some("SHA256:aGVsbG8gd29ybGQ"));
         assert!(evidence.state_writable);
         assert!(evidence.state_owner);

@@ -20,6 +20,8 @@ mod credentials;
 mod crypto;
 mod machineid;
 mod mounts;
+mod principal_store;
+mod principals;
 #[path = "../../td-secret/src/store.rs"]
 #[allow(dead_code, reason = "the console and portal share store entry points")]
 mod secret_store;
@@ -40,6 +42,7 @@ use std::process::ExitCode;
 /// the two copies cannot drift.
 const NEW_MARKER: &str = "TD-FIRSTBOOT-NEW-OK";
 const STABLE_MARKER: &str = "TD-FIRSTBOOT-STABLE-OK";
+const PRINCIPALS_MARKER: &str = "TD-PRINCIPALS-ENROLLED";
 const HOST_KEY_PREFIX: &str = "TD-FIRSTBOOT-HOSTKEY ";
 
 /// Where per-machine state lives. The recipe's `MUTABLE_ETC` table points every
@@ -158,6 +161,7 @@ struct Config {
     /// The login user whose terminal applications get a first configuration,
     /// or `None` when the invocation names none.
     applications: Option<ApplicationHome>,
+    enroll_principals: bool,
 }
 
 /// Where the terminal applications' state lives and who owns it. The
@@ -195,16 +199,21 @@ enum Failure {
 fn usage() -> String {
     format!(
         "usage: td-firstboot [provision] [--state-dir DIR] [--keygen PROGRAM] \
-         [--application-home DIR --application-owner UID:GID]\n  \
+         [--application-home DIR --application-owner UID:GID] [--enroll-principals]\n  \
          provisions this machine's identity under {DEFAULT_STATE_DIR}: {MACHINE_ID}, \
          {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with the application pair, a first \
-         configuration for each terminal application under DIR/{APPLICATION_STATE_ROOT}\n"
+         configuration for each terminal application under DIR/{APPLICATION_STATE_ROOT}\n  \
+         td-firstboot check-principals ROOT validates staged deployment identities without writing\n"
     )
 }
 
 fn run(args: &[String]) -> Result<(), Failure> {
     let config = match parse(args)? {
         Invocation::Help => return emit(&usage()).map_err(Failure::Failed),
+        Invocation::CheckPrincipals(root) => {
+            principals::check_deployment(&root).map_err(Failure::Failed)?;
+            return emit("TD-PRINCIPALS-CHECK-OK\n").map_err(Failure::Failed);
+        }
         Invocation::Provision(config) => config,
     };
     let plan = Plan::of(&config);
@@ -239,6 +248,12 @@ fn run(args: &[String]) -> Result<(), Failure> {
     // right after the marker below could lose the whole tree and mint a different
     // machine on the next boot.
     sync_directories(&plan.key_dir, boundary.as_deref())?;
+
+    if config.enroll_principals {
+        let desired = principals::Registry::load().map_err(Failure::Failed)?;
+        principal_store::provision(&desired).map_err(Failure::Failed)?;
+        emit(&format!("{PRINCIPALS_MARKER}\n")).map_err(Failure::Failed)?;
+    }
 
     let machine_id = provision_machine_id(&plan.machine_id)?;
     let (host_key, fingerprint) = provision_host_key(&config, &plan)?;
@@ -292,11 +307,21 @@ fn run(args: &[String]) -> Result<(), Failure> {
 /// What an argv asked for.
 enum Invocation {
     Help,
+    CheckPrincipals(PathBuf),
     Provision(Config),
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
+    if args.first().is_some_and(|verb| verb == "check-principals") {
+        let [_, root] = args else {
+            return Err(Failure::Usage(
+                "check-principals requires one deployment root".into(),
+            ));
+        };
+        return Ok(Invocation::CheckPrincipals(PathBuf::from(root)));
+    }
     let mut state: Option<PathBuf> = None;
+    let mut enroll_principals = false;
     let mut keygen = DEFAULT_KEYGEN.to_string();
     let mut application_home: Option<PathBuf> = None;
     let mut application_owner: Option<(u32, u32)> = None;
@@ -311,7 +336,15 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
     let mut index = 0;
     while let Some(flag) = rest.get(index) {
         match flag.as_str() {
-            // Every flag that does not end the parse takes a value, so the stride
+            "--enroll-principals" => {
+                if enroll_principals {
+                    return Err(Failure::Usage("duplicate --enroll-principals".into()));
+                }
+                enroll_principals = true;
+                index += 1;
+                continue;
+            }
+            // Every other flag that does not end the parse takes a value, so the stride
             // below is unconditional.
             "--state-dir" | "--keygen" | "--application-home" | "--application-owner" => {
                 let Some(value) = rest.get(index + 1) else {
@@ -358,11 +391,17 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
             ))
         }
     };
+    if enroll_principals && state.is_some() {
+        return Err(Failure::Usage(
+            "principal enrollment requires the persistent default state directory".into(),
+        ));
+    }
     Ok(Invocation::Provision(Config {
         require_persistent: state.is_none(),
         state: state.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
         keygen,
         applications,
+        enroll_principals,
     }))
 }
 
@@ -1097,7 +1136,9 @@ mod tests {
     fn config(args: &[&str]) -> Result<Config, Failure> {
         match parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>())? {
             Invocation::Provision(config) => Ok(config),
-            Invocation::Help => Err(Failure::Usage("asked for help".to_string())),
+            Invocation::Help | Invocation::CheckPrincipals(_) => Err(Failure::Usage(
+                "asked for a non-provisioning operation".to_string(),
+            )),
         }
     }
 
@@ -1420,5 +1461,47 @@ mod tests {
         assert!(!NEW_MARKER.contains(HOST_KEY_PREFIX));
         assert!(!STABLE_MARKER.contains(HOST_KEY_PREFIX));
         assert!(HOST_KEY_PREFIX.ends_with(' '), "the fingerprint follows it");
+    }
+}
+
+#[cfg(test)]
+mod principal_arguments {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn staged_check_accepts_only_a_deployment_root() {
+        let args = ["check-principals".to_string(), "/staged".to_string()];
+        assert!(
+            matches!(parse(&args), Ok(Invocation::CheckPrincipals(root)) if root == Path::new("/staged"))
+        );
+        assert!(parse(&args[..1]).is_err());
+        let mut mixed = args.to_vec();
+        mixed.push("--enroll-principals".into());
+        assert!(parse(&mixed).is_err());
+    }
+
+    #[test]
+    fn enrollment_is_explicit_and_cannot_redirect_persistent_state() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+        let Invocation::Provision(config) =
+            parse(&args(&["provision", "--enroll-principals"])).unwrap()
+        else {
+            panic!("expected provision");
+        };
+        assert!(config.enroll_principals && config.require_persistent);
+        for arguments in [
+            vec!["--enroll-principals", "--enroll-principals"],
+            vec!["--enroll-principals", "--state-dir", "/tmp/private"],
+            vec!["--state-dir", "/tmp/private", "--enroll-principals"],
+            vec!["--enroll-principals=yes"],
+        ] {
+            assert!(matches!(parse(&args(&arguments)), Err(Failure::Usage(_))));
+        }
     }
 }

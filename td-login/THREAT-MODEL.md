@@ -301,6 +301,11 @@ They do not switch process credentials or authenticate a human. Firstboot
 unseals an explicitly enrolled store into volatile storage before the existing
 auto-login path runs; the TPM policy authenticates selected platform state,
 not that login's user. td-login's session authorization table is unchanged.
+Firstboot also reserves the future compositor, broker, portal, and per-app
+identities in a persistent ledger, without creating accounts or switching
+credentials. It refuses current account records that alias a reservation;
+future activation requires the same service-only class defined here.
+`td-authd/DESIGN.md` specifies that reservation contract.
 FIDO2 release must wait for secure attention and trusted input; no login or
 `su` behavior is a substitute for that future authorization.
 

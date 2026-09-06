@@ -53,6 +53,14 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-firstboot/src/machineid.rs"),
     ),
     ("mounts", include_str!("../../../td-firstboot/src/mounts.rs")),
+    (
+        "principals",
+        include_str!("../../../td-firstboot/src/principals.rs"),
+    ),
+    (
+        "principal_store",
+        include_str!("../../../td-firstboot/src/principal_store.rs"),
+    ),
 ];
 
 pub fn recipe() -> Recipe {
@@ -159,6 +167,62 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/td-firstboot".into()],
         exec: true,
     });
+    // Compile the reservation fixtures with the same target toolchain; only
+    // the production binary and its debug companion enter the output.
+    for (name, source) in [
+        (
+            "principals_tests",
+            include_str!("../../../td-firstboot/src/principals_tests.rs"),
+        ),
+        (
+            "principal_store_tests",
+            include_str!("../../../td-firstboot/src/principal_store_tests.rs"),
+        ),
+    ] {
+        steps.push(Step::WriteFile {
+            path: format!("{{src}}/td-firstboot/src/{name}.rs"),
+            content: source.into(),
+            exec: false,
+        });
+    }
+    steps.push(Step::WriteFile {
+        path: "{src}/principal-tests.rs".into(),
+        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
+        exec: false,
+    });
+    steps.push(
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--test",
+                "--crate-name",
+                "td_principals_tests",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                &linker,
+                "-L",
+                glib,
+                &lib_b,
+                &bin_b,
+                "-Clink-arg=-L{root}/eh",
+                "-Clink-arg=-static-libgcc",
+                "-o",
+                "{root}/principal-tests",
+                "{src}/principal-tests.rs",
+            ],
+        )
+        .env("PATH", &path)
+        .env("SOURCE_DATE_EPOCH", "1"),
+    );
+    steps.push(Step::run("{root}", &["{root}/principal-tests"]));
+
     // Fail closed on any interpreter/needed/rpath: this runs before the machine has
     // an identity, and a provisioning tool that cannot start has nothing to report
     // its own failure with.
@@ -180,6 +244,7 @@ mod tests {
     use super::*;
     use crate::ladder::{
         TD_FIRSTBOOT_HOST_KEY_PREFIX, TD_FIRSTBOOT_NEW_MARKER, TD_FIRSTBOOT_STABLE_MARKER,
+        TD_PRINCIPALS_MARKER,
     };
 
     /// Read a `const NAME: &str = "…";` value straight out of the embedded source.
@@ -200,6 +265,7 @@ mod tests {
         for (name, marker) in [
             ("NEW_MARKER", TD_FIRSTBOOT_NEW_MARKER),
             ("STABLE_MARKER", TD_FIRSTBOOT_STABLE_MARKER),
+            ("PRINCIPALS_MARKER", TD_PRINCIPALS_MARKER),
             ("HOST_KEY_PREFIX", TD_FIRSTBOOT_HOST_KEY_PREFIX),
         ] {
             assert_eq!(

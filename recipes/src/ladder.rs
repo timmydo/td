@@ -567,6 +567,10 @@ pub const TD_FIRSTBOOT_NEW_MARKER: &str = "TD-FIRSTBOOT-NEW-OK";
 /// DUPLICATED as `STABLE_MARKER` in td-firstboot/src/main.rs.
 pub const TD_FIRSTBOOT_STABLE_MARKER: &str = "TD-FIRSTBOOT-STABLE-OK";
 
+/// Firstboot validated the current accounts and durably reserved all active
+/// and retired principal identities. Duplicated in td-firstboot's main.rs.
+pub const TD_PRINCIPALS_MARKER: &str = "TD-PRINCIPALS-ENROLLED";
+
 /// Prefix of the line `/bin/td-firstboot` prints this machine's SSH host-key
 /// fingerprint on: `TD-FIRSTBOOT-HOSTKEY SHA256:<base64>`. The oracle compares the
 /// fingerprint across reboots — a marker can only say a key was reused, this proves
