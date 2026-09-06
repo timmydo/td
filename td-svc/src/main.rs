@@ -25,6 +25,7 @@ mod control;
 mod evict;
 mod logs;
 mod order;
+mod pair;
 mod procfs;
 mod supervise;
 mod sys;
@@ -71,7 +72,8 @@ fn usage() -> String {
          halt      the same, then halt\n\
          FILE defaults to {DEFAULT_PATH}; everything but check/run talks to {socket}\n\
          ({sentinel} is internal: `run` spawns it to catch Ctrl-Alt-Del, and it \
-         blocks on stdin until its parent lets go)"
+         blocks on stdin until its parent lets go)\n\
+         (pair-run is internal: `run` uses it to launch pair-exec daemons)"
     ,
         socket = control::PATH,
         sentinel = cad::SENTINEL_VERB
@@ -82,16 +84,26 @@ fn usage() -> String {
 /// a supervisor.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
-    Check { path: String },
-    Run { path: String },
+    Check {
+        path: String,
+    },
+    Run {
+        path: String,
+    },
     /// The Ctrl-Alt-Del sentinel: block until our parent lets go. Not a control
     /// verb — it addresses no supervisor and reads no table.
     CadSentinel,
+    PairRun {
+        left: Vec<String>,
+        right: Vec<String>,
+    },
     /// A request for the RUNNING supervisor, sent over the control socket.
     /// The verb and its argument travel verbatim — this process parses only
     /// enough to know it is not `check`/`run`, so the one authority on what a
     /// request means stays `Runtime::control`.
-    Ctl { request: String },
+    Ctl {
+        request: String,
+    },
     Usage(String),
 }
 
@@ -104,6 +116,12 @@ fn route(args: &[String]) -> Route {
     let Some(verb) = args.first() else {
         return Route::Usage("no subcommand".into());
     };
+    if verb == pair::VERB {
+        return match pair::parse(args.get(1..).unwrap_or(&[])) {
+            Ok((left, right)) => Route::PairRun { left, right },
+            Err(why) => Route::Usage(why),
+        };
+    }
     if verb == cad::SENTINEL_VERB {
         // Takes nothing. An argument here means whoever typed it expected this
         // to do something, and it does exactly one thing.
@@ -222,6 +240,18 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Route::PairRun { left, right } => {
+            let result = pair::await_start(&mut std::io::stdin().lock())
+                .and_then(|()| pair::run(&left, &right));
+            match result {
+                Ok(ended) => emit_err(&format!(
+                    "td-svc: {} paired daemon exited ({}); stopping the pair\n",
+                    ended.peer, ended.status
+                )),
+                Err(why) => emit_err(&format!("td-svc: {why}\n")),
+            }
+            ExitCode::FAILURE
+        }
         Route::Ctl { request } => match control::ask(control::PATH, &request) {
             Ok(reply) => {
                 if let Err(e) = emit(&reply) {
@@ -729,8 +759,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            11,
-            "expected eleven modules beside the crate root"
+            12,
+            "expected twelve modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -742,7 +772,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these twelve files and nothing else.
+    /// `src/` holds these thirteen files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -753,7 +783,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_twelve_scanned_modules() {
+    fn src_holds_exactly_the_thirteen_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -767,6 +797,7 @@ mod confinement {
                 "logs.rs",
                 "main.rs",
                 "order.rs",
+                "pair.rs",
                 "procfs.rs",
                 "supervise.rs",
                 "sys.rs",

@@ -27,6 +27,8 @@ pub struct Unit {
     pub name: String,
     pub kind: Kind,
     pub argv: Vec<String>,
+    /// A second daemon sharing a private stdin socket and one lifecycle.
+    pub pair_argv: Option<Vec<String>>,
     /// Ordering only. A failed dependency does NOT skip these — see `requires`.
     pub after: Vec<String>,
     /// Strict dependency: a failure here skips this unit. Opt-in, and per
@@ -136,6 +138,7 @@ impl Default for Unit {
             name: String::new(),
             kind: Kind::Oneshot,
             argv: Vec::new(),
+            pair_argv: None,
             after: Vec::new(),
             requires: Vec::new(),
             restart: Restart::Never,
@@ -440,6 +443,14 @@ fn apply(unit: &mut Unit, key: &str, value: &str, stanza: &mut Stanza) -> Result
             stanza.saw_type = true;
         }
         "exec" => unit.argv = split_argv(value)?,
+        "pair-exec" => {
+            if unit.pair_argv.is_some() {
+                return Err("duplicate pair-exec=".into());
+            }
+            let argv = split_argv(value)?;
+            crate::pair::validate_command(&argv)?;
+            unit.pair_argv = Some(argv);
+        }
         "ready" => unit.ready = split_argv(value)?,
         "after" => unit.after = parse_list(value),
         "requires" => unit.requires = parse_list(value),
@@ -577,6 +588,24 @@ fn finish(unit: Unit, stanza: Stanza, units: &mut Vec<Unit>, problems: &mut Vec<
         problems.push(format!("{name}: no exec="));
         ok = false;
     }
+    if unit.pair_argv.is_some() {
+        if unit.kind != Kind::Daemon || unit.is_console() || unit.cgroup != Cgroup::Service {
+            problems.push(format!(
+                "{name}: pair-exec= requires type=daemon, cgroup=service, and no tty="
+            ));
+            ok = false;
+        }
+        if unit.ready.is_empty() {
+            problems.push(format!(
+                "{name}: pair-exec= needs a ready= probe of both daemons"
+            ));
+            ok = false;
+        }
+        if let Err(why) = crate::pair::validate_command(&unit.argv) {
+            problems.push(format!("{name}: paired exec: {why}"));
+            ok = false;
+        }
+    }
     // DESIGN.md I5. `requires` is what makes a unit skippable, and a console
     // that can be skipped is a machine that cannot be repaired from itself.
     if unit.is_console() && !unit.requires.is_empty() {
@@ -659,6 +688,37 @@ fn apply_defaults(unit: &mut Unit) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_daemons_are_one_unit_with_two_literal_commands() {
+        let (units, errors) = parse(
+            "[trusted]\ntype=daemon\nexec=/bin/a 'two words'\npair-exec=/bin/b ''\nrestart=on-failure\nready=/bin/probe\n"
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].argv, ["/bin/a", "two words"]);
+        assert_eq!(units[0].pair_argv.as_ref().unwrap(), &["/bin/b", ""]);
+    }
+
+    #[test]
+    fn pair_configuration_cannot_silently_drop_its_contract() {
+        for extra in [
+            "type=oneshot",
+            "tty=ttyS0",
+            "cgroup=session",
+            "pair-exec=/bin/c",
+            "pair-exec=",
+            "exec=relative",
+            "pair-exec=relative",
+            "ready=",
+        ] {
+            let (units, errors) = parse(&format!(
+                "[trusted]\ntype=daemon\nexec=/bin/a\npair-exec=/bin/b\nready=/bin/probe\n{extra}\n"
+            ));
+            assert!(units.is_empty(), "admitted {extra}: {units:?}");
+            assert!(!errors.is_empty());
+        }
+    }
 
     #[test]
     fn a_minimal_table_parses() {

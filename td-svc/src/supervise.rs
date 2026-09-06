@@ -262,6 +262,10 @@ pub struct Service {
     /// timer a unit whose containment outlived its leader would sit `stopping`
     /// forever, never reaching `Stopped` however long the console stayed idle.
     next_sweep: Option<Instant>,
+    /// Open kernel controls for the running pair, retained until its whole tree is empty.
+    pair: Option<crate::pair::Cohort>,
+    /// Automatic restart policy is applied only after paired containment drains.
+    pair_resume: Option<(Phase, Option<Instant>)>,
 }
 
 impl Service {
@@ -287,6 +291,8 @@ impl Service {
             tty_dev: None,
             killed: false,
             next_sweep: None,
+            pair: None,
+            pair_resume: None,
             retired: false,
         }
     }
@@ -686,11 +692,14 @@ pub fn log(msg: &str) {
 fn build(unit: &Unit, report: bool, captured: bool) -> Result<(Command, Vec<String>), String> {
     let mut said: Vec<String> = Vec::new();
     let prog = unit.argv.first().ok_or_else(|| "empty exec".to_string())?;
-    let mut cmd = Command::new(prog);
-    cmd.args(unit.argv.get(1..).unwrap_or(&[]));
-    // Nothing supervised reads td-svc's stdin; a daemon that inherited it would
-    // steal console input.
-    cmd.stdin(Stdio::null());
+    let mut cmd = if let Some(peer) = &unit.pair_argv {
+        crate::pair::command(&unit.argv, peer)?
+    } else {
+        let mut command = Command::new(prog);
+        command.args(unit.argv.get(1..).unwrap_or(&[]));
+        command.stdin(Stdio::null());
+        command
+    };
 
     match &unit.tty {
         Some(_) => {
@@ -1299,19 +1308,39 @@ impl Runtime {
             }
         };
 
+        let cohort = if unit.pair_argv.is_some() {
+            let result = leaf
+                .as_deref()
+                .ok_or("paired service has no cgroup".to_string())
+                .and_then(crate::pair::Cohort::open);
+            match result {
+                Ok(cohort) => Some(cohort),
+                Err(why) => {
+                    self.record_start_failure(index, &format!("{}: {why}", unit.name));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         match cmd.spawn() {
             Ok(mut child) => {
                 let pid = child.id() as i32;
-                // Placed first, so the window in which the child is outside its
-                // leaf is the shortest this design can make it. A failure is
-                // reported and the service is left running: it is already
-                // alive, and killing a started service to enforce accounting
-                // would trade a live machine for a tidy one.
+                let pair_start = child.stdin.take();
+                let mut pair_placed = false;
+                // Paired children wait for placement behind the start gate.
+                // Ordinary services retain their existing accounting fallback.
                 if let Some(leaf) = &leaf {
                     match cgroup::place(leaf, pid) {
                         // Already exited. Nothing was accounted and nothing is
                         // left to bound, so there is no loss to report.
-                        Ok(cgroup::Placed::Yes | cgroup::Placed::ProcessGone) => {}
+                        Ok(cgroup::Placed::Yes) => pair_placed = true,
+                        Ok(cgroup::Placed::ProcessGone) => {}
+                        Err(error) if unit.pair_argv.is_some() => log(&format!(
+                            "{}: coordinator placement failed ({error}); paired daemons refused",
+                            unit.name
+                        )),
                         Err(error) => log(&format!(
                             "{}: not placed in its cgroup ({error}); it runs unaccounted{}",
                             unit.name,
@@ -1326,6 +1355,8 @@ impl Runtime {
                 let starttime = procfs::stat_of(pid).ok().flatten().map(|s| s.starttime);
                 if let Some(service) = self.services.get_mut(index) {
                     service.pid = Some(pid);
+                    service.pair = cohort;
+                    service.pair_resume = None;
                     service.starttime = starttime;
                     service.tty_dev = attached.device;
                     service.killed = false;
@@ -1352,10 +1383,16 @@ impl Runtime {
                 // about — and it is unclosable, because the pid does not exist
                 // to record until `spawn` returns.
                 self.attach_logs(index, &mut child, &unit);
-                self.persist_started();
+                let recorded = self.persist_started() && starttime.is_some();
                 if !self.watch(child, unit.name.clone(), generation) {
                     self.abandon(index, pid, &unit.name);
                     return;
+                }
+                if unit.pair_argv.is_some() {
+                    if let Err(why) = crate::pair::release_start(pair_start, pair_placed, recorded) {
+                        log(&format!("{}: {why}", unit.name));
+                        return;
+                    }
                 }
                 if unit.kind == Kind::Daemon {
                     let name = unit.name.clone();
@@ -1396,6 +1433,9 @@ impl Runtime {
         if let Some(service) = self.services.get_mut(index) {
             service.phase = Phase::Failed;
             service.pid = None;
+            // A pair has not received its start grant when watch fails.
+            service.pair = None;
+            service.pair_resume = None;
             service.starttime = None;
             service.started = None;
             service.deadline = None;
@@ -1514,6 +1554,10 @@ impl Runtime {
             let Some(service) = self.services.get(index) else {
                 continue;
             };
+            // Cleanup owns the unit regardless of its saved restart phase.
+            if service.stopping {
+                continue;
+            }
             // Eligible when it has never run, or when a retry is due. `Failed`
             // with a `retry_at` is a restarting daemon, not a dead unit.
             let eligible = match service.phase {
@@ -1657,6 +1701,13 @@ impl Runtime {
     /// waiter, and had its pid handed to something new — which this would then
     /// kill. `/proc` field 22 is what a pid alone cannot tell us.
     fn escalate(&mut self, index: usize) {
+        if self.services.get(index).is_some_and(|s| s.pair.is_some()) {
+            self.kill_pair(index);
+            if self.services.get(index).is_some_and(|s| s.pid.is_none()) {
+                self.finish_stop(index);
+            }
+            return;
+        }
         let Some(service) = self.services.get_mut(index) else {
             return;
         };
@@ -1888,17 +1939,33 @@ impl Runtime {
         // pid would ask `/proc` about a pid that is no longer ours — and a
         // recycled one answers, keeping the containment occupied for good.
         let scope = without_reaped_leader(scope);
-        let remaining = match scope {
-            // Nothing was ever signalled (no containment to derive), so there
-            // is nothing that could still be running under it.
-            None => 0,
-            Some(mode) => {
-                let scan = procfs::members(mode, self.self_pid);
-                if let Err(e) = &scan {
-                    log(&format!("{name}: cannot confirm it stopped: {e}"));
+        let pair_empty = self
+            .services
+            .get_mut(index)
+            .and_then(|service| service.pair.as_mut())
+            .map(crate::pair::Cohort::empty);
+        let paired = pair_empty.is_some();
+        let remaining = match pair_empty {
+            Some(Ok(true)) => 0,
+            Some(Ok(false)) => 1,
+            Some(Err(why)) => {
+                if self.services.get(index).is_some_and(|s| s.next_sweep.is_none()) {
+                    log(&format!("{name}: cannot confirm paired containment is empty: {why}"));
                 }
-                occupancy(scan.as_ref())
+                1
             }
+            None => match scope {
+                // Nothing was ever signalled (no containment to derive), so there
+                // is nothing that could still be running under it.
+                None => 0,
+                Some(mode) => {
+                    let scan = procfs::members(mode, self.self_pid);
+                    if let Err(e) = &scan {
+                        log(&format!("{name}: cannot confirm it stopped: {e}"));
+                    }
+                    occupancy(scan.as_ref())
+                }
+            },
         };
         let Some(service) = self.services.get_mut(index) else {
             return;
@@ -1915,10 +1982,14 @@ impl Runtime {
             let first = service.next_sweep.is_none();
             service.next_sweep = Instant::now().checked_add(STOP_SWEEP_INTERVAL);
             if first {
-                log(&format!(
-                    "{name}: leader exited but {remaining} process(es) remain in its \
-                     containment; not stopped yet"
-                ));
+                if paired {
+                    log(&format!("{name}: paired containment is not proven empty; not stopped yet"));
+                } else {
+                    log(&format!(
+                        "{name}: leader exited but {remaining} process(es) remain in its \
+                         containment; not stopped yet"
+                    ));
+                }
             }
             return;
         }
@@ -1926,6 +1997,8 @@ impl Runtime {
         service.stop_scope = None;
         service.kill_at = None;
         service.next_sweep = None;
+        service.pair = None;
+        let pair_resume = service.pair_resume.take();
         if service.start_after_stop {
             service.start_after_stop = false;
             // Down, not Stopped: `start_eligible` picks it up on the next pass.
@@ -1935,6 +2008,10 @@ impl Runtime {
             service.phase = Phase::Down;
             service.fast_failures = 0;
             log(&format!("{name}: stopped; restarting as asked"));
+        } else if let Some((phase, retry_at)) = pair_resume {
+            service.phase = phase;
+            service.retry_at = retry_at;
+            log(&format!("{name}: paired containment drained; applying restart policy"));
         } else {
             service.phase = Phase::Stopped;
             log(&format!("{name}: stopped"));
@@ -2378,8 +2455,9 @@ impl Runtime {
     ///
     /// Best effort. A supervisor that cannot write this still supervises — what
     /// is lost is its successor's ability to clean up after it, which is not
-    /// worth refusing to run a machine over.
-    fn persist_started(&self) {
+    /// worth refusing to run a machine over. Paired launches require success
+    /// before releasing their coordinator's start gate.
+    fn persist_started(&self) -> bool {
         let mut entries: Vec<crate::evict::Entry> = self.unevicted.clone();
         entries.extend(self
             .services
@@ -2398,7 +2476,9 @@ impl Runtime {
                  supervisor will not know to evict it",
                 self.started_path
             ));
+            return false;
         }
+        true
     }
 
     /// Point this instance's stdout and stderr at the service's capture.
@@ -3027,6 +3107,7 @@ impl Runtime {
             // Replying "already running" and doing nothing would instead leave
             // the unit STOPPED while the client exited 0 believing it started.
             service.start_after_stop = true;
+            service.pair_resume = None;
             return format!("{name}: stop in progress; will start again once it exits\n");
         }
         if service.pid.is_some() {
@@ -3069,6 +3150,7 @@ impl Runtime {
                     return unknown(name);
                 };
                 service.start_after_stop = then_start;
+                service.pair_resume = None;
                 return format!(
                     "{name}: {verb} requested; a stop is already in progress and its \
                      containment is not empty yet\n"
@@ -3144,6 +3226,7 @@ impl Runtime {
         };
         service.stopping = true;
         service.start_after_stop = then_start;
+        service.pair_resume = None;
         service.stop_scope = Some(containment);
         service.deadline = None;
         service.retry_at = None;
@@ -3157,7 +3240,45 @@ impl Runtime {
         format!("{name}: {verb} requested; TERM sent to {containment:?}\n")
     }
 
+    fn kill_pair(&mut self, index: usize) {
+        let Some(service) = self.services.get_mut(index) else {
+            return;
+        };
+        let Some(cohort) = service.pair.as_mut() else {
+            return;
+        };
+        if let Err(why) = cohort.kill() {
+            if !service.killed {
+                log(&format!(
+                    "{}: {why}; paired containment remains held",
+                    service.unit.name
+                ));
+            }
+        }
+        service.killed = true;
+        service.kill_at =
+            Instant::now().checked_add(service.unit.stop_timeout.max(STOP_SWEEP_INTERVAL));
+    }
+
     fn on_exit(&mut self, name: &str, code: Option<i32>) {
+        self.record_exit(name, code);
+        let Some(index) = self.index_of(name) else {
+            return;
+        };
+        let Some(service) = self.services.get_mut(index) else {
+            return;
+        };
+        if service.pair.is_some() && !service.stopping {
+            service.pair_resume = Some((service.phase, service.retry_at.take()));
+            service.stopping = true;
+            service.start_after_stop = false;
+            service.next_sweep = None;
+            self.kill_pair(index);
+            self.finish_stop(index);
+        }
+    }
+
+    fn record_exit(&mut self, name: &str, code: Option<i32>) {
         let Some(index) = self.services.iter().position(|s| s.unit.name == name) else {
             return;
         };
@@ -3173,8 +3294,10 @@ impl Runtime {
         service.pid = None;
         service.started = None;
         service.deadline = None;
-        // It died, so the escalation has nothing left to kill.
-        service.kill_at = None;
+        // A pair retains the requested grace deadline for its surviving peers.
+        if service.pair.is_none() || !service.stopping {
+            service.kill_at = None;
+        }
         // The instance this probe was following is gone; stop it forking.
         if let Some(cancel) = service.cancel.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -3425,7 +3548,6 @@ impl Runtime {
             }
         }
     }
-
 }
 
 /// One readiness attempt, bounded. Returns true only on a clean exit within
@@ -3485,6 +3607,171 @@ mod tests {
         let (units, problems) = parse(text);
         assert!(problems.is_empty(), "{problems:?}");
         Runtime::new(units, "<test>").0
+    }
+
+    struct PairControls(std::path::PathBuf);
+    impl PairControls {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("td-svc-pair-{}-{stamp}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("cgroup.kill"), "").unwrap();
+            std::fs::write(path.join("cgroup.events"), "populated 0\n").unwrap();
+            Self(path)
+        }
+        fn events(&self, text: &str) {
+            std::fs::write(self.0.join("cgroup.events"), text).unwrap();
+        }
+    }
+    impl Drop for PairControls {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn running_pair(restart: &str) -> (Runtime, PairControls) {
+        let controls = PairControls::new();
+        let mut rt = runtime(&format!(
+            "[paired]\ntype=daemon\nexec=/first\npair-exec=/second\nready=/probe\nrestart={restart}\n"
+        ));
+        mark_running(&mut rt, "paired", Duration::from_millis(1));
+        let service = rt.lookup_mut("paired").unwrap();
+        service.pid = Some(777_777);
+        service.pair = Some(crate::pair::Cohort::open(&controls.0).unwrap());
+        controls.events("populated 1\n");
+        (rt, controls)
+    }
+
+    #[test]
+    fn building_a_paired_unit_reaches_the_coordinator_with_both_commands() {
+        let rt = runtime(
+            "[paired]\ntype=daemon\nexec=/first ''\npair-exec=/second 'two words'\nready=/probe\n",
+        );
+        let unit = &rt.lookup("paired").unwrap().unit;
+        let (command, _) = build(unit, false, false).unwrap();
+        assert_eq!(command.get_program(), "/proc/self/exe");
+        let argv: Vec<String> = command
+            .get_args()
+            .map(|s| s.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            matches!(crate::route(&argv), crate::Route::PairRun { left, right }
+            if left == unit.argv && Some(&right) == unit.pair_argv.as_ref())
+        );
+    }
+
+    #[test]
+    fn automatic_pair_restart_waits_for_the_whole_cgroup_to_empty() {
+        let (mut rt, controls) = running_pair("on-failure");
+        rt.on_exit("paired", Some(1));
+        assert_eq!(
+            std::fs::read_to_string(controls.0.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        let service = rt.lookup("paired").unwrap();
+        assert!(service.stopping && service.pid.is_none() && service.retry_at.is_none());
+        assert_eq!(service.fast_failures, 1);
+        rt.start_eligible();
+        assert_eq!(
+            rt.lookup("paired").unwrap().fast_failures,
+            1,
+            "attempted a new spawn before cleanup"
+        );
+        controls.events("unreadable-state\n");
+        rt.finish_stop(0);
+        assert!(rt.lookup("paired").unwrap().stopping);
+        controls.events("populated 0\n");
+        rt.finish_stop(0);
+        let service = rt.lookup("paired").unwrap();
+        assert!(!service.stopping && service.pair.is_none());
+        assert!(matches!(service.phase, Phase::Failed));
+        assert!(service.retry_at.is_some());
+        assert_eq!(service.fast_failures, 1);
+    }
+
+    #[test]
+    fn a_held_pair_cannot_restart_before_cleanup_finishes() {
+        let (mut rt, controls) = running_pair("on-failure");
+        rt.lookup_mut("paired").unwrap().fast_failures = 12;
+        rt.on_exit("paired", Some(1));
+        assert!(matches!(rt.lookup("paired").unwrap().phase, Phase::Held));
+        // The kernel has drained it, but the sweep has not retired its controls.
+        // Starting here would reuse a unit still marked stopping with old timers.
+        controls.events("populated 0\n");
+        rt.start_eligible();
+        let service = rt.lookup("paired").unwrap();
+        assert!(service.stopping && service.pid.is_none() && service.pair.is_some());
+        assert_eq!(service.fast_failures, 13);
+        assert!(matches!(service.phase, Phase::Held));
+        rt.finish_stop(0);
+        let service = rt.lookup("paired").unwrap();
+        assert!(!service.stopping && service.pair.is_none());
+        assert!(service.retry_at.is_some());
+        assert!(matches!(service.phase, Phase::Held));
+    }
+
+    #[test]
+    fn an_operator_can_change_retry_intent_but_cannot_bypass_pair_cleanup() {
+        for start in [false, true] {
+            let (mut rt, controls) = running_pair("always");
+            rt.on_exit("paired", Some(1));
+            let reply = if start {
+                rt.control_start("paired")
+            } else {
+                rt.control_stop("paired", false)
+            };
+            assert!(!reply.starts_with("error:"), "{reply}");
+            assert!(rt.lookup("paired").unwrap().stopping);
+            rt.start_eligible();
+            assert!(rt.lookup("paired").unwrap().pid.is_none());
+            controls.events("populated 0\n");
+            rt.finish_stop(0);
+            let service = rt.lookup("paired").unwrap();
+            assert!(!service.stopping && service.retry_at.is_none());
+            assert_eq!(
+                service.phase,
+                if start { Phase::Down } else { Phase::Stopped }
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_pair_stop_preserves_the_grace_period_after_leader_exit() {
+        let (mut rt, controls) = running_pair("always");
+        let deadline = Instant::now().checked_add(Duration::from_secs(30));
+        let service = rt.lookup_mut("paired").unwrap();
+        service.stopping = true;
+        service.kill_at = deadline;
+        rt.on_exit("paired", None);
+        assert_eq!(rt.lookup("paired").unwrap().kill_at, deadline);
+        assert!(std::fs::read_to_string(controls.0.join("cgroup.kill"))
+            .unwrap()
+            .is_empty());
+        rt.escalate(0);
+        assert_eq!(
+            std::fs::read_to_string(controls.0.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        controls.events("populated 0\n");
+        rt.finish_stop(0);
+        assert!(matches!(rt.lookup("paired").unwrap().phase, Phase::Stopped));
+        assert!(rt.lookup("paired").unwrap().retry_at.is_none());
+    }
+
+    #[test]
+    fn restart_never_still_drains_the_failed_pair() {
+        let (mut rt, controls) = running_pair("never");
+        rt.on_exit("paired", Some(1));
+        assert!(rt.lookup("paired").unwrap().stopping);
+        controls.events("populated 0\n");
+        rt.finish_stop(0);
+        let service = rt.lookup("paired").unwrap();
+        assert!(!service.stopping && service.retry_at.is_none());
+        assert!(matches!(service.phase, Phase::Failed));
     }
 
     /// Simulate a spawn so exit handling can be tested without a real process.

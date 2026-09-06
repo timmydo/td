@@ -195,6 +195,14 @@ measured accounting gap that matters.** Readiness probes are a known part of
 that gap — `ready=` runs as a separate child of td-svc and is not placed in
 the unit's leaf, so `memory.peak` and `pids.peak` exclude it.
 
+Paired daemons (§4) now meet the first trigger by construction: their
+coordinator forks two children. Its stdin therefore carries a one-byte start
+grant, withheld until the parent has placed the coordinator, recorded it, and
+installed its waiter. EOF without that grant launches neither daemon. Both
+inherit the established leaf; the coordinator's own early allocation remains
+in the ordinary spawn-to-placement accounting window. This changes only the
+paired path. Ordinary services retain the placement contract above.
+
 A unit whose leader hands its processes to another cgroup declares
 `cgroup=session` and gets no leaf. Its limits are refused rather than written
 into a leaf its processes have already left — §3's accepted-and-ignored rule,
@@ -216,9 +224,9 @@ handoff case: nothing was refused on its behalf, so a limit on it really would
 be lost. The name rule above makes it unreachable through the table, which is
 why it is stated here rather than trusted.
 
-A cgroup failure never fails a start. A machine whose cgroupfs is missing or
-unwritable would otherwise start nothing at all, the console included, and a
-machine that will not boot cannot be repaired from itself: I5 outranks
+A cgroup failure never fails an ordinary start. A machine whose cgroupfs is
+missing or unwritable would otherwise start nothing at all, the console
+included, and a machine that will not boot cannot be repaired from itself: I5 outranks
 accounting, exactly as it does for the delegation above. What §3 does demand
 is that the loss is never silent, so a unit that ends up outside its leaf says
 so by name, and says UNBOUNDED when the table declared a limit that is now not
@@ -226,6 +234,11 @@ in force. The one case reported collectively rather than per unit is the
 parent's absence, below. The parent's absence is reported once, at startup,
 rather than by every unit in turn — except by a unit that declared a limit,
 which is that unit's own fact and is said rather than inferred.
+
+A paired unit is the explicit exception: failed placement closes its start
+gate and starts neither peer. Paired units cannot provide a console, so this
+does not weaken I5. They require a service leaf even without resource limits;
+the gate makes their descendant placement an enforceable launch contract.
 
 Every operation here is safe filesystem I/O; I1 remains exactly one syscall.
 
@@ -263,7 +276,17 @@ restart=always
 Keys: `type` (`oneshot` | `daemon`), `exec`, `after`, `requires`, `restart`
 (`always` | `on-failure` | `never`), `tty`, `log`, `console` (`yes` | `no`),
 `timeout`, `ready`, `ready-timeout`, `stop-timeout`, `cgroup`
-(`service` | `session`), `memory-max`, `pids-max`, `cpu-weight`.
+(`service` | `session`), `memory-max`, `pids-max`, `cpu-weight`, `pair-exec`.
+
+`pair-exec` names a second literal argv, parsed exactly as `exec`. It requires
+`type=daemon`, `cgroup=service`, no `tty`, and a nonempty `ready` probe that
+checks the live pair. Both executable names must be absolute. Each argv has
+at most 256 arguments and 32 KiB of argument bytes, with no NUL; empty
+arguments after the executable remain valid. Duplicate `pair-exec` is
+rejected. The two daemons form one service, so ordering, readiness, restart,
+logging, limits and stop apply to the pair (§4).
+The author chooses the restart policy: omitting `restart` retains the usual
+`never` default and requires an operator to start a failed pair again.
 
 `memory-max` takes a byte count with an optional binary `K`, `M` or `G`;
 `pids-max` a count; `cpu-weight` 1..=10000, which is a share under contention
@@ -411,6 +434,112 @@ port, so it passes while the real listener is dead.
 | control channel | `std::os::unix::net::UnixListener` |
 | Ctrl-Alt-Del | write `/proc/sys/kernel/ctrl-alt-del` and `/proc/sys/kernel/cad_pid` |
 | identity across restart | `/proc/<pid>/stat` field 22 (starttime) |
+
+### Paired daemons and private descriptors
+
+The `pair-exec` path is the launch prerequisite for the future private
+compositor/authd connection. It does not enable consent or change the shipped
+desktop identities. There is no named socket to discover or reconnect to.
+
+The main supervisor starts its own `pair-run` applet through `/proc/self/exe`
+as the unit's process
+group leader. This coordinator receives two argv vectors in an internal
+count-prefixed encoding, never shell text. Its stdin is a startup pipe, not
+the console. The main supervisor sends exactly byte `1` and closes the pipe
+only after successful cgroup placement, recording the coordinator's pid and
+starttime, and installing the waiter. The coordinator requires both the byte
+and EOF; holding the pipe open still withholds launch. This internal gate has
+no timer: the supervisor owns the writer and drops it on every path. A missing
+or malformed grant refuses launch. An unreadable starttime or a failed record
+write withholds the grant;
+ordinary services retain the existing best-effort record contract.
+
+Before spawning the coordinator, td-svc opens the service leaf's
+`cgroup.kill` and `cgroup.events` and requires `populated 0`. The open
+controls pin that kernel cgroup until teardown completes. An occupied old
+leaf, missing control, or unreadable population refuses a new launch.
+
+After the grant, the coordinator creates `UnixStream::pair` and spawns the
+two commands. Each receives exactly its own endpoint as fd 0 through safe
+`OwnedFd`/`Stdio` conversion. All other endpoint copies are close-on-exec and
+the coordinator drops its copies immediately after each spawn. stdout and
+stderr inherit the unit's existing capture or console destinations. Neither
+peer starts a new process group here; the coordinator and both peers belong
+to the same supervised containment. A command that changes credentials uses
+td-login's existing literal-argv service path. Each peer owns fd 0 and must
+prevent its own later child processes from inheriting the private channel.
+
+Either peer exiting, including with status zero, ends the pair and returns
+failure so `restart=on-failure` creates a fresh connection. A failed second
+spawn also kills and reaps the first. The coordinator retains each `Child`
+and polls `try_wait` every 250 ms, preserving the safe `Child::kill` identity
+check rather than moving ownership to a waiter and later signalling a
+possibly reused numeric pid. It kills both direct children before waiting
+for either during cleanup. This is immediate failure teardown; a normal
+operator stop instead signals the existing group with TERM and retains the
+unit's grace deadline for survivors after the coordinator exits.
+
+On an unexpected coordinator exit, td-svc writes `1` to the pinned
+`cgroup.kill` control, which kills the whole subtree including grandchildren
+and concurrent forks. A requested stop uses that control at its KILL
+deadline. Both paths retain the pair in `stopping` until the pinned
+`cgroup.events` reports `populated 0`; malformed, missing, oversized or
+unreadable state is not emptiness. Automatic backoff and restart policy are
+saved across cleanup, including the capped `Held` phase. No phase is eligible
+while `stopping` remains set. Every unexpected paired exit counts as failure,
+even after a long lifetime, following the ordinary failure-backoff policy;
+explicit operator restart resets the count. An operator can change retry intent,
+but cannot start the next generation before the old cgroup empties. A
+restart never reuses the old socket. This uses the cgroup v2 kernel contract
+documented in `Documentation/admin-guide/cgroup-v2.rst`, not numeric process
+group identity after its leader has been reaped.
+
+Paired commands and their descendants must remain in their service leaf.
+They must not use the uid-1000 login/session handoff that moves work out of
+it. Unprivileged peers cannot move out of this root-owned cgroup; a root
+peer deliberately changing containment is outside this launch contract.
+Uninterruptible tasks can hold cleanup indefinitely, and a supervisor that
+lost its crash record may find an occupied leaf it cannot adopt. These are
+refusals to start a duplicate, not fallback to a fresh pair.
+
+This establishes descriptor delivery and a shared lifecycle, not an
+authenticated human channel. `SO_PEERCRED` on this socketpair identifies its
+creator, not the eventual process holding the opposite endpoint. Peer pidfd
+pinning, separate compositor and application identities, exclusive device
+ownership, trusted-input routing and capture exclusion remain prerequisites
+for consent. No consumer may infer them from `pair-exec` alone.
+
+Host integration tests and the target producer recipe run the actual
+`pair-run` applet with pure-std fixture peers. They prove bidirectional fd-0
+exchange, the absence of an inherited opposite endpoint, launch refusal
+before the start grant, malformed grant refusal, peer-exit teardown and
+second-spawn failure. No fixture or test executable enters the output.
+Unit tests also drive the real command producer and start-grant writer, and
+the supervisor's retry/grace/stop state transitions against file fixtures
+for cgroup control values. Those fixtures verify decision-making and fd
+pinning; they do not emulate the kernel's process-killing implementation.
+
+`tests/pair_vm.rs` is a standalone static binary with a host runner and minimal
+VM init fixture, rather than a cargo harness test. In the guest it mounts
+proc/sysfs/cgroup2, runs the actual
+supervisor on a paired unit, and makes one peer fork a grandchild that
+deliberately retains fd 0. The other peer exits; the next generation must
+observe that grandchild dead before reporting `TD-PAIR-VM: PASS`. The
+fixture requires a VM marker in its initramfs and needs no network or
+attached disk. Compile it as a static executable with the test host's Rust
+toolchain (or td's target toolchain), then run:
+
+```text
+pair-vm --run-vm /absolute/bzImage /absolute/td-svc /absolute/busybox /absolute/new-serial.log
+```
+
+The runner uses the host's `qemu-system-x86_64`, creates and removes its own
+initramfs, attaches no disks or network, and enforces a 120-second / 2-MiB
+serial-output bound. It refuses to overwrite a prior log and always kills and
+waits for its own QEMU child. The guest marker is created only in the archive;
+ordinary invocation on the host still refuses. Record the three artifact
+paths, fixture compiler provenance and red/green verdict in the commit. This
+bounded VM run remains a separate check from the producer's transport tests.
 
 ### Process groups, and why `tty=` is exempt
 

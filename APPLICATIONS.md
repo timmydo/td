@@ -7975,17 +7975,21 @@ with a pidfd** rather than trusting a reusable pid. A dedicated uid alone
 would not survive the missing descriptor; the descriptor alone would not
 survive same-uid `ptrace`.
 
-**`td-svc` cannot pass a descriptor today, and that is a FOURTH
-prerequisite** — this section listed three and missed the one its own
-mechanism rests on. `td-svc`'s unit table is a closed key set (`type`,
-`exec`, `ready`, `after`, `requires`, `restart`, `tty`, `log`, `console`,
-and the three timeouts), any other key is a parse error, and there is no
-socket activation, no fd passing and no `User=`; a unit that runs as
-somebody else spells it `exec=/bin/su -s /bin/sh …` inside its argv. So
-"a socketpair created by root `td-svc` at startup and handed to each side
-at spawn" is a td-svc landing before it is a `td-authd` one, and it is
-the piece with the widest blast radius, since a supervisor that can hand
-out descriptors can hand out the wrong one.
+**Descriptor delivery is available through td-svc's `pair-exec`**, a
+second literal daemon argv in one non-console unit. Its coordinator
+creates a private socketpair and gives each peer its own endpoint on fd 0
+after the supervisor establishes cgroup placement, process recording and
+its waiter. Teardown retains pinned cgroup controls and waits for the old
+subtree to empty before restarting; see `td-svc/DESIGN.md` §4. Identity
+changes use td-login's literal `exec-service-as` path with a dedicated
+service account. The uid-1000 login path is ineligible: it moves into the
+application session cgroup, outside the paired service's leaf. This does not
+provide arbitrary fd-number assignment or named socket activation.
+
+The compositor/authd consumer and peer pidfd pinning remain unbuilt.
+`SO_PEERCRED` on the delivered socketpair identifies its creator, not the
+eventual holder of the opposite endpoint, so descriptor delivery alone is
+not peer authentication and enables no consent path.
 
 #### Three things the secure path needs that the tree does not have
 

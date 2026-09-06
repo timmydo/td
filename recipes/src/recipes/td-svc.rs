@@ -56,6 +56,7 @@ const MODULES: &[(&str, &str)] = &[
     ("evict", include_str!("../../../td-svc/src/evict.rs")),
     ("logs", include_str!("../../../td-svc/src/logs.rs")),
     ("order", include_str!("../../../td-svc/src/order.rs")),
+    ("pair", include_str!("../../../td-svc/src/pair.rs")),
     ("procfs", include_str!("../../../td-svc/src/procfs.rs")),
     ("supervise", include_str!("../../../td-svc/src/supervise.rs")),
     ("sys", include_str!("../../../td-svc/src/sys.rs")),
@@ -162,6 +163,44 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/td-svc".into()],
         exec: true,
     });
+    steps.push(Step::WriteFile {
+        path: "{src}/pair-tests.rs".into(),
+        content: include_str!("../../../td-svc/tests/pair.rs").into(),
+        exec: false,
+    });
+    steps.push(
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--test",
+                "--crate-name",
+                "pair_tests",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                &linker,
+                "-L",
+                glib,
+                &lib_b,
+                &bin_b,
+                "-Clink-arg=-L{root}/eh",
+                "-Clink-arg=-static-libgcc",
+                "-o",
+                "{root}/pair-tests",
+                "{src}/pair-tests.rs",
+            ],
+        )
+        .env("PATH", &path)
+        .env("TD_SVC_TEST_BINARY", "{out}/bin/td-svc")
+        .env("SOURCE_DATE_EPOCH", "1"),
+    );
+    steps.push(Step::run("{root}", &["{root}/pair-tests"]));
     // Fail closed on any interpreter/needed/rpath: PID 1's only child must come
     // up before, and independently of, any dynamic closure.
     steps.push(split_target_debug("{out}"));
@@ -180,6 +219,18 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_rust_does_not_contain_live_recipe_templates() {
+        for (name, source) in std::iter::once(("main", MAIN_RS))
+            .chain(MODULES.iter().copied())
+            .chain(std::iter::once(("pair-tests", include_str!("../../../td-svc/tests/pair.rs"))))
+        {
+            for template in ["{root}", "{src}", "{out}", "{tools}", "{jobs}", "{in:", "{payload:"] {
+                assert!(!source.contains(template), "{name}.rs contains recipe template {template}");
+            }
+        }
+    }
 
     /// `MODULES` and `main.rs`'s `mod` lines must agree exactly.
     ///
