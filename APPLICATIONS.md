@@ -8318,15 +8318,21 @@ row buys; moving callers to the logical one is the KMS landing's.
 Row 1's DISCOVERY half has landed, and it is worth being exact about which
 half. `td-compositor/src/drm.rs` opens a card node, asks which driver is behind
 it, enumerates connectors, encoders and CRTCs, and chooses the connector to
-drive, the mode to ask for, and a CRTC that can drive it. The kernel ABI —
-four value-pinned `ioctl` requests and their `#[repr(C)]` structs — is in
+drive, the mode to ask for, and a CRTC that can drive it. That half's kernel
+ABI was four value-pinned `ioctl` requests and their `#[repr(C)]` structs, in
 `sys.rs` with the rest of the crate's syscalls; what is in `drm.rs` is policy,
 which is what makes the selection testable against recorded connector shapes
-rather than against a card. `UNSAFE.md` §6 carries the amendment.
+rather than against a card. `UNSAFE.md` §6 carries the amendment and the
+current count.
 
-Nothing in it modesets, and the confinement test names `MODE_SETCRTC`,
-`MODE_ADDFB2`, `MODE_PAGE_FLIP` and `MODE_ATOMIC` as ABSENT so the backend adds
-each by amendment rather than arriving with a module that already has them.
+Nothing in it modesets, and the confinement test named `MODE_SETCRTC`,
+`MODE_ADDFB2`, `MODE_PAGE_FLIP` and `MODE_ATOMIC` as ABSENT so the backend
+added each by amendment rather than arriving with a module that already had
+them. Two of those four have since been admitted: the modeset half below
+takes `SETCRTC` and `ADDFB2`, and the stand-in for "not ours" moved to the
+remaining pair in the same landing, because a test naming an admitted request
+as absent asserts nothing while still passing. Read that pair, not this
+sentence, for what the test pins today.
 
 Row 1's MAPPING half has landed since, and it is the honest toll this section
 names rather than the backend itself. `td-compositor/src/drm.rs` allocates a
