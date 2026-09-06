@@ -44,6 +44,13 @@ td-builder ready --record-only
 says `checks NOT run` and is not permission to push. The same agent that
 finishes an increment carries it through the full ready gate.
 
+`ready` resolves the committed check selection locally. When it selects no
+preflights or check targets, it finishes locally with the normal review-record
+and clean-tree validation, without joining the shared check host's queue.
+Nonempty selections still run through that host. This uses the affected-path
+mapping, not a blanket Markdown exemption: documentation that selects a check
+still runs it. `ready` remains required for documentation updates.
+
 `ready` runs the selected checks once over the branch tip. It does not prove
 that an intermediate commit is green, so keep every commit independently
 passing as it is made.
@@ -176,6 +183,10 @@ What it confirms is that the recorded process has ended. A recorded run is one
 the check host took, so that process owns no build tree of its own; the hosted
 tree is the host's, and comes down on the host's client-went-away cancellation
 shortly after. `stop` does not wait for that.
+
+`ready` records its run when it hands selected checks to the shared host.
+Its initial local selection and record scan, including an empty-selection
+completion, have no run record for `stop` to name.
 
 Short forms are not runs and are not recorded: `ready --record-only`, a bare
 `affected-checks`, `gate-run --list`. Nor are `build` and `realize`, which the

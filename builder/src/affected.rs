@@ -3925,12 +3925,26 @@ pub fn main(args: &[String]) -> ExitCode {
     ExitCode::from(run(args))
 }
 
-/// The dispatcher proper, returning the code rather than an opaque `ExitCode`:
-/// `td-builder ready` runs the same bounded selection in-process and has to know
-/// whether it passed.
+/// The standalone dispatcher returns its check status as an exit code.
 pub fn run(args: &[String]) -> u8 {
-    let root = resolve_root();
+    match run_selected(&resolve_root(), args, false) {
+        RunOutcome::Complete(code) => code,
+        RunOutcome::NeedsHost => {
+            eprintln!("affected-checks: unexpected deferred execution");
+            1
+        }
+    }
+}
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RunOutcome {
+    Complete(u8),
+    NeedsHost,
+}
+
+/// With deferral enabled, leave nonempty execution to the shared check host.
+/// Empty selections and query failures finish locally with their real status.
+pub(crate) fn run_selected(root: &Path, args: &[String], defer_checks: bool) -> RunOutcome {
     let mut base = "origin/main".to_string();
     let mut run = false;
     let mut committed_only = false;
@@ -3947,7 +3961,7 @@ pub fn run(args: &[String]) -> u8 {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("affected-checks: --base needs a ref");
-                    return 2;
+                    return RunOutcome::Complete(2);
                 }
                 base = args[i].clone();
             }
@@ -3955,34 +3969,34 @@ pub fn run(args: &[String]) -> u8 {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("affected-checks: --path needs a path");
-                    return 2;
+                    return RunOutcome::Complete(2);
                 }
                 explicit_paths.push(args[i].clone());
             }
             "-h" | "--help" => {
                 print!("{HELP}");
-                return 0;
+                return RunOutcome::Complete(0);
             }
             other => {
                 eprintln!("affected-checks: unknown arg '{other}'");
                 eprint!("{HELP}");
-                return 2;
+                return RunOutcome::Complete(2);
             }
         }
         i += 1;
     }
 
     if self_test {
-        let failures = run_self_test(&root);
+        let failures = run_self_test(root);
         for f in &failures {
             eprintln!("FAIL: {f}");
         }
         if failures.is_empty() {
             println!("PASS: affected-checks self-test");
-            return 0;
+            return RunOutcome::Complete(0);
         }
         eprintln!("affected-checks self-test: {} failure(s)", failures.len());
-        return 1;
+        return RunOutcome::Complete(1);
     }
 
     // --- assemble the changed-path set ---
@@ -3992,14 +4006,14 @@ pub fn run(args: &[String]) -> u8 {
         sort_unique(explicit_paths.clone())
     } else {
         if !git_ok(
-            &root,
+            root,
             &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
         ) {
-            if base == "origin/main" && git_ok(&root, &["rev-parse", "--verify", "main^{commit}"]) {
+            if base == "origin/main" && git_ok(root, &["rev-parse", "--verify", "main^{commit}"]) {
                 base = "main".to_string();
             } else {
                 eprintln!("affected-checks: base ref '{base}' is not available");
-                return 2;
+                return RunOutcome::Complete(2);
             }
         }
         // The shell's `merge_base=$(git merge-base …)` runs under `set -e`, so a
@@ -4007,7 +4021,7 @@ pub fn run(args: &[String]) -> u8 {
         // mirror that rather than continue with an empty merge-base + bogus header.
         match Command::new("git")
             .args(["merge-base", &base, "HEAD"])
-            .current_dir(&root)
+            .current_dir(root)
             .output()
         {
             Ok(o) if o.status.success() => {
@@ -4019,11 +4033,11 @@ pub fn run(args: &[String]) -> u8 {
             }
             Ok(o) => {
                 eprint!("{}", String::from_utf8_lossy(&o.stderr));
-                return o.status.code().unwrap_or(1) as u8;
+                return RunOutcome::Complete(o.status.code().unwrap_or(1) as u8);
             }
             Err(e) => {
                 eprintln!("affected-checks: git merge-base failed: {e}");
-                return 1;
+                return RunOutcome::Complete(1);
             }
         }
         // EVERY changed-path query is checked: an empty answer from a FAILED
@@ -4037,13 +4051,13 @@ pub fn run(args: &[String]) -> u8 {
         // td-review path alone, hiding the deletion that can red the workspace.
         // Off, a rename is a delete plus an add and both sides are seen.
         let Some(mut all) = git_lines_checked(
-            &root,
+            root,
             &["diff", "--no-renames", "--name-only", &merge_base, "HEAD"],
         ) else {
             eprintln!(
                 "affected-checks: git diff --no-renames --name-only {merge_base} HEAD failed"
             );
-            return 1;
+            return RunOutcome::Complete(1);
         };
         if !committed_only {
             // Checked for the same reason the committed query is, and the
@@ -4056,9 +4070,9 @@ pub fn run(args: &[String]) -> u8 {
                 &["diff", "--cached", "--no-renames", "--name-only"][..],
                 &["ls-files", "--others", "--exclude-standard"][..],
             ] {
-                let Some(lines) = git_lines_checked(&root, q) else {
+                let Some(lines) = git_lines_checked(root, q) else {
                     eprintln!("affected-checks: git {} failed", q.join(" "));
-                    return 1;
+                    return RunOutcome::Complete(1);
                 };
                 all.extend(lines);
             }
@@ -4068,33 +4082,37 @@ pub fn run(args: &[String]) -> u8 {
 
     if changed.is_empty() {
         println!("affected-checks: no changed paths relative to {base}");
-        return 0;
+        return RunOutcome::Complete(0);
     }
 
-    let sel = compute_selection(&root, &changed);
+    let sel = compute_selection(root, &changed);
     let header = Header {
         explicit,
         base: &base,
         merge_base: &merge_base,
     };
-    print!("{}", format_output(&root, &header, &changed, &sel, run));
+    print!("{}", format_output(root, &header, &changed, &sel, run));
 
     if !run {
-        return 0;
+        return RunOutcome::Complete(0);
+    }
+
+    if defer_checks && (!sel.preflights.is_empty() || !sel.targets.is_empty()) {
+        return RunOutcome::NeedsHost;
     }
 
     // --- execute ---
     for pre in &sel.preflights {
-        let code = run_preflight(&root, pre, &changed);
+        let code = run_preflight(root, pre, &changed);
         if code != 0 {
-            return code as u8;
+            return RunOutcome::Complete(code as u8);
         }
     }
 
     // Nothing escalates to the full loop: every diff runs its bounded selected
     // targets.
     if !sel.targets.is_empty() {
-        let code = run_self_check(&root, &sel.targets, &changed);
+        let code = run_self_check(root, &sel.targets, &changed);
         // EXIT_UNPROVISIONED is the loop's documented "nothing could run
         // here" machine signal. It is explained loudly here but PROPAGATED UNCHANGED —
         // never rewritten to success: the run did not validate the targets,
@@ -4113,10 +4131,10 @@ pub fn run(args: &[String]) -> u8 {
                 sel.targets.join(" ")
             );
         }
-        return code as u8;
+        return RunOutcome::Complete(code as u8);
     }
 
-    0
+    RunOutcome::Complete(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -4126,6 +4144,36 @@ pub fn run(args: &[String]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_defers_every_nonempty_selection_before_execution() {
+        let root = repo_root();
+        for path in ["README.md", "td-review/VM.md", ".gitignore"] {
+            let args = vec!["--path".into(), path.into(), "--run".into()];
+            assert_eq!(
+                run_selected(&root, &args, true),
+                RunOutcome::Complete(0),
+                "{path}"
+            );
+        }
+        for path in [
+            "engine/README.md",
+            "td-profiler/DESIGN.md",
+            "td-review/src/main.rs",
+            "unknown.rs",
+        ] {
+            let args = vec!["--path".into(), path.into(), "--run".into()];
+            assert_eq!(
+                run_selected(&root, &args, true),
+                RunOutcome::NeedsHost,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            run_selected(&root, &["--base".into()], true),
+            RunOutcome::Complete(2)
+        );
+    }
 
     fn repo_root() -> PathBuf {
         // builder/ → repo root.

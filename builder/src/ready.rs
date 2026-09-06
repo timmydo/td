@@ -6,7 +6,7 @@
 //! per commit — a branch-wide claim would say nothing about the commit the
 //! integrator actually stops at.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use crate::affected;
@@ -376,8 +376,20 @@ fn current_branch(root: &Path) -> String {
     }
 }
 
-pub fn main(args: &[String]) -> ExitCode {
-    let root = affected::resolve_root();
+pub fn main(
+    args: &[String],
+    hosted: bool,
+    forward: impl FnOnce(&[String]) -> ExitCode,
+) -> ExitCode {
+    run_at(affected::resolve_root(), args, hosted, forward)
+}
+
+fn run_at(
+    root: PathBuf,
+    args: &[String],
+    hosted: bool,
+    forward: impl FnOnce(&[String]) -> ExitCode,
+) -> ExitCode {
     let mut base = "origin/main".to_string();
     let mut record_only = false;
 
@@ -534,12 +546,26 @@ pub fn main(args: &[String]) -> ExitCode {
         0
     } else {
         println!();
-        affected::run(&[
-            "--committed-only".to_string(),
-            "--run".to_string(),
-            "--base".to_string(),
-            base.clone(),
-        ])
+        let mut request = vec!["ready".to_string()];
+        request.extend_from_slice(args);
+        match affected::run_selected(
+            &root,
+            &[
+                "--committed-only".to_string(),
+                "--run".to_string(),
+                "--base".to_string(),
+                base.clone(),
+            ],
+            !hosted,
+        ) {
+            affected::RunOutcome::Complete(code) => code,
+            affected::RunOutcome::NeedsHost => {
+                println!(
+                    "ready: waiting for the shared check host; validation repeats there before checks"
+                );
+                return forward(&request);
+            }
+        }
     };
 
     println!();
@@ -580,6 +606,116 @@ pub fn main(args: &[String]) -> ExitCode {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn local_ready(root: PathBuf, args: &[String]) -> ExitCode {
+        run_at(root, args, false, |request| {
+            panic!("unexpected host handoff: {request:?}")
+        })
+    }
+
+    #[test]
+    fn empty_selection_still_checks_the_real_branch() {
+        let root = std::env::temp_dir().join(format!(
+            "td-ready-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("code.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "code.rs"]);
+        git(&["commit", "-qm", "seed"]);
+        git(&["switch", "-qc", "docs"]);
+        std::fs::write(root.join("notes.md"), "Notes\n").unwrap();
+        git(&["add", "notes.md"]);
+        git(&["commit", "-qm", "missing record"]);
+        assert_eq!(local_ready(root.clone(), &[]), ExitCode::FAILURE);
+        git(&[
+            "commit",
+            "--amend",
+            "-qm",
+            "docs: notes\n\nReview-waiver: docs-only\nChecks: prose checked\n",
+        ]);
+        // No origin: both ready and selection must use the main fallback.
+        assert_eq!(local_ready(root.clone(), &[]), ExitCode::SUCCESS);
+        let custom = vec!["--base".to_string(), "main".to_string()];
+        assert_eq!(local_ready(root.clone(), &custom), ExitCode::SUCCESS);
+        assert_eq!(
+            local_ready(root.clone(), &["--base".into(), "missing".into()]),
+            ExitCode::from(2)
+        );
+        assert_eq!(local_ready(root.clone(), &["--base".into()]), ExitCode::from(2));
+        std::fs::write(root.join("notes.md"), "Dirty\n").unwrap();
+        assert_eq!(local_ready(root.clone(), &[]), ExitCode::FAILURE);
+        git(&["checkout", "--", "notes.md"]);
+        std::fs::create_dir_all(root.join("builder/src")).unwrap();
+        std::fs::write(root.join("builder/src/untracked.rs"), "fn f() {}\n").unwrap();
+        assert_eq!(local_ready(root.clone(), &[]), ExitCode::FAILURE);
+        std::fs::remove_file(root.join("builder/src/untracked.rs")).unwrap();
+
+        // The same committed selection must defer a rename's source deletion,
+        // even though its destination and review waiver both claim Markdown.
+        git(&["mv", "code.rs", "code.md"]);
+        git(&[
+            "commit",
+            "-qm",
+            "move\n\nReview-waiver: docs-only\nChecks: prose\n",
+        ]);
+        assert_eq!(
+            affected::run_selected(
+                &root,
+                &[
+                    "--base".into(),
+                    "main".into(),
+                    "--committed-only".into(),
+                    "--run".into()
+                ],
+                true
+            ),
+            affected::RunOutcome::NeedsHost
+        );
+        assert_eq!(
+            local_ready(root.clone(), &["--record-only".into()]),
+            ExitCode::FAILURE
+        );
+        // Exercise the actual ready handoff with a bounded fake. A mapping
+        // regression above can only fail this test, never submit real work.
+        let forwarded = std::cell::Cell::new(false);
+        assert_eq!(
+            run_at(root.clone(), &custom, false, |request| {
+                assert_eq!(request, ["ready", "--base", "main"]);
+                forwarded.set(true);
+                ExitCode::from(23)
+            }),
+            ExitCode::from(23)
+        );
+        assert!(forwarded.get());
+    }
 
     const COMPLETE: &str = "\
 td-sh: something

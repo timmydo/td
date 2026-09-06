@@ -8250,6 +8250,23 @@ fn main() -> ExitCode {
         Some("flock") => return applet_exit("flock", run_flock_applet(&args)),
         _ => {}
     }
+    // Keep host scheduling in the dispatch: ready only owns branch validation.
+    // Empty selections finish before admission or run-record creation.
+    let early_exit: Option<ExitCode> = match args.get(1).map(String::as_str) {
+        Some("ready") => ready::main(
+            args.get(2..).unwrap_or(&[]),
+            std::env::var_os(check_memory::HOST_CHILD_ENV).is_some(),
+            |request| {
+                let _run = run_record::record_if_long_run(request);
+                check_host::forward(request)
+            },
+        )
+        .into(),
+        _ => None,
+    };
+    if let Some(code) = early_exit {
+        return code;
+    }
     // `record_if_long_run` owns both questions — which verbs are runs, and
     // which process should record — and declines inside the check host, where
     // a pid namespace makes this process pid 1: a number that names nothing
@@ -8302,10 +8319,6 @@ fn main() -> ExitCode {
         // Internal process-lifetime boundary. It is intentionally absent from
         // user-facing help; check-host and gate-run construct it themselves.
         Some("check-pidns-run") => sandbox::pid_namespace_cli(args.get(2..).unwrap_or(&[])),
-        // ready — the gate an agent runs before pushing a rolling branch: the
-        // bounded checks over the committed diff plus the per-commit review
-        // record AGENTS.md requires. See builder/src/ready.rs.
-        Some("ready") => ready::main(args.get(2..).unwrap_or(&[])),
         // Reconstruct only one exact commit's authenticated `files/' subtree
         // from a cache populated by `td-feed warm ostree'. The result is a
         // complete plain tree suitable for recursive content-addressed
