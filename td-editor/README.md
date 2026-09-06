@@ -67,6 +67,11 @@ td-editor/target/release/td-editor --help
 lossless file codec; `fill.rs` plans bounded reflow; `keys.rs` translates
 logical chords; `ui.rs` owns input/view state; and `replay.rs` feeds that same
 controller with framed commands.
+The safe `control` library supplies one-frame decoding and read-only
+controller state/text queries using the same serializers as replay. See
+[CONTROL.md](CONTROL.md) for exact fields and bounds. No control listener or
+`--control-socket` option is available yet; native state and remote mutation
+remain later work.
 `tests/core.rs` covers byte round trips, stale/invalid commands, limits,
 save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector

@@ -20,6 +20,7 @@ fn source_inventory_and_allowances_are_closed() {
     let expected: BTreeSet<_> = [
         "clipboard.rs",
         "command.rs",
+        "control.rs",
         "data.rs",
         "dialog.rs",
         "files.rs",

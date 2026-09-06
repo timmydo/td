@@ -5,6 +5,7 @@
 
 pub mod clipboard;
 mod command;
+pub mod control;
 mod data;
 mod dialog;
 pub use dialog::{Discard, Reload};

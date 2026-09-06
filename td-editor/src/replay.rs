@@ -7,61 +7,9 @@ use crate::ui::{Controller, Event, Outcome, PointerPhase};
 use crate::{Error, Result};
 use std::io::{self, Read, Write};
 
-pub const MAX_FRAME: usize = 1024 * 1024;
-pub const PAGE_BYTES: usize = 256 * 1024;
+use crate::control::{decimal as number, size};
+pub use crate::control::{hex, unhex, MAX_FRAME, PAGE_BYTES};
 
-pub fn hex(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return "-".into();
-    }
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        for index in [usize::from(byte >> 4), usize::from(byte & 15)] {
-            if let Some(&digit) = DIGITS.get(index) {
-                out.push(char::from(digit));
-            }
-        }
-    }
-    out
-}
-
-pub fn unhex(value: &str) -> Result<Vec<u8>> {
-    if value == "-" {
-        return Ok(Vec::new());
-    }
-    if value.is_empty() || value.len() > MAX_FRAME || !value.len().is_multiple_of(2) {
-        return Err(Error::Protocol);
-    }
-    let digit = |b: u8| -> Result<u8> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            _ => Err(Error::Protocol),
-        }
-    };
-    value
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let high = digit(*pair.first().ok_or(Error::Protocol)?)?;
-            let low = digit(*pair.get(1).ok_or(Error::Protocol)?)?;
-            Ok(high * 16 + low)
-        })
-        .collect()
-}
-
-fn number(value: &str) -> Result<u64> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Error::Protocol);
-    }
-    value.parse().map_err(|_| Error::Protocol)
-}
-fn size(value: &str) -> Result<usize> {
-    usize::try_from(number(value)?).map_err(|_| Error::Protocol)
-}
 fn boolean(value: &str) -> Result<bool> {
     match value {
         "0" => Ok(false),
@@ -80,38 +28,24 @@ pub struct Session {
 
 impl Session {
     /// Payload errors produce a framed error and allow the next request.
-    /// No valid request ID can be recovered from a bad envelope: use 0.
+    /// Errors before a recoverable request ID use 0.
     pub fn request(&mut self, input: &[u8]) -> String {
-        let mut request = 0u64;
-        let result = (|| {
-            if input.len() > MAX_FRAME {
-                return Err(Error::Limit);
-            }
-            let input = std::str::from_utf8(input).map_err(|_| Error::Protocol)?;
-            if !input.is_ascii() || input.bytes().any(|b| b < b' ' && b != b'\t' || b == 127) {
-                return Err(Error::Protocol);
-            }
-            let mut fields = input.split('\t');
-            if fields.next() != Some("1") {
-                return Err(Error::Protocol);
-            }
-            request = number(fields.next().ok_or(Error::Protocol)?)?;
-            let command = fields.next().ok_or(Error::Protocol)?;
-            // No command has more than six arguments. Refuse before collecting
-            // a hostile tab-delimited frame into hundreds of thousands of entries.
-            let args: Vec<&str> = fields.take(7).collect();
-            if args.len() > 6 {
-                return Err(Error::Protocol);
-            }
-            self.command(command, &args)
-        })();
+        let envelope = match crate::control::envelope(input) {
+            Ok(envelope) => envelope,
+            Err(refusal) => return refusal.response(),
+        };
+        let request = envelope.id;
+        // No command has more than six arguments. Never collect an unbounded
+        // number of tab-separated fields from an untrusted frame.
+        let args: Vec<&str> = envelope.args.take(7).collect();
+        let result = if args.len() > 6 {
+            Err(Error::Protocol)
+        } else {
+            self.command(envelope.name, &args)
+        };
         match result {
             Ok(body) => format!("1\t{request}\tok\t{body}"),
-            Err(error) => format!(
-                "1\t{request}\terror\t{}\t{}",
-                error.code(),
-                hex(error.code().as_bytes())
-            ),
+            Err(error) => crate::control::Refusal { id: request, error }.response(),
         }
     }
 
@@ -119,87 +53,14 @@ impl Session {
         match (name, args) {
             ("new", []) => reply(self.ui.dispatch(Event::New)?),
             ("load", [bytes]) => reply(self.ui.dispatch(Event::Load(&unhex(bytes)?))?),
-            ("state", []) => {
-                let mut out = format!(
-                    "active={}\tkeys={}\tprefix={}",
-                    self.ui.editor().active().unwrap_or(0),
-                    if self.ui.keys().profile() == Profile::Windows {
-                        "windows"
-                    } else {
-                        "emacs"
-                    },
-                    u8::from(self.ui.keys().pending())
-                );
-                for (id, doc) in self.ui.editor().tabs() {
-                    let sel = doc.selection();
-                    out.push_str(&format!(
-                        "\ttab={id},{},{},{},{},{},{},{},{},{}",
-                        doc.revision(),
-                        u8::from(doc.dirty()),
-                        doc.text().len(),
-                        sel.anchor,
-                        sel.caret,
-                        u8::from(doc.auto_fill()),
-                        doc.fill_column(),
-                        u8::from(doc.format().bom),
-                        if doc.format().ending == crate::text::LineEnding::Lf {
-                            "lf"
-                        } else {
-                            "crlf"
-                        }
-                    ));
-                }
-                let (width, height) = self.ui.geometry().dimensions();
-                out.push_str(&format!(
-                    "\tgeneration={}\twindow={width},{height},{}\tfocus={}",
-                    self.ui.generation(),
-                    self.ui.geometry().scale().value(),
-                    u8::from(self.ui.focused())
-                ));
-                for (id, _) in self.ui.editor().tabs() {
-                    let view = self.ui.tab_view(id)?;
-                    let origin = view.viewport.origin();
-                    let (columns, rows) = view.viewport.dimensions();
-                    out.push_str(&format!(
-                        "\tview={id},{},{},{columns},{rows},{},{},{}",
-                        origin.row,
-                        origin.column,
-                        u8::from(view.soft_wrap),
-                        if view.affinity == crate::layout::Affinity::Upstream {
-                            "upstream"
-                        } else {
-                            "downstream"
-                        },
-                        view.desired_column
-                            .map_or_else(|| "-".into(), |value| value.to_string())
-                    ));
-                }
-                Ok(out)
-            }
-            ("text", [tab, revision, offset, limit]) => {
-                let doc = self.ui.editor().document(number(tab)?)?;
-                if doc.revision() != number(revision)? {
-                    return Err(Error::StaleRevision);
-                }
-                let offset = size(offset)?;
-                let limit = size(limit)?;
-                if !(4..=PAGE_BYTES).contains(&limit) {
-                    return Err(Error::InvalidArgument);
-                }
-                doc.text().get(offset..).ok_or(Error::InvalidPosition)?;
-                let mut end = offset.saturating_add(limit).min(doc.text().len());
-                while !doc.text().is_char_boundary(end) {
-                    end = end.saturating_sub(1);
-                }
-                Ok(format!(
-                    "{end}\t{}",
-                    hex(doc
-                        .text()
-                        .get(offset..end)
-                        .ok_or(Error::InvalidPosition)?
-                        .as_bytes())
-                ))
-            }
+            ("state", []) => crate::control::state(&self.ui),
+            ("text", [tab, revision, offset, limit]) => crate::control::page(
+                &self.ui,
+                number(tab)?,
+                number(revision)?,
+                size(offset)?,
+                size(limit)?,
+            ),
             ("select-tab", [tab]) => reply(self.ui.dispatch(Event::SelectTab(number(tab)?))?),
             ("set-key-profile", [profile]) => {
                 let profile = match *profile {
@@ -354,10 +215,8 @@ pub fn run(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
         let mut bytes = vec![0; length];
         input.read_exact(&mut bytes)?;
         let reply = session.request(&bytes);
-        let length =
-            u32::try_from(reply.len()).map_err(|_| io::Error::other("response too large"))?;
-        output.write_all(&length.to_be_bytes())?;
-        output.write_all(reply.as_bytes())?;
+        let framed = crate::control::frame(reply.as_bytes()).map_err(io::Error::other)?;
+        output.write_all(&framed)?;
         output.flush()?;
     }
 }

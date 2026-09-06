@@ -2065,6 +2065,15 @@ that tmc's jail can launch the editor.
 
 ## Test and control architecture
 
+The safe `control` library now supplies the one-frame decoder/encoder and
+read-only `state`/`text` request subset. It shares controller snapshots,
+scalar-aligned text pages and byte codecs with replay. The exact implemented
+field order, errors, limits and conformance fixtures are recorded in
+[CONTROL.md](CONTROL.md). This is a transport prerequisite only: there is no
+listener, `--control-socket` option, worker/deadline handling, native job/dialog
+state or frame acknowledgement yet. The complete endpoint below remains the
+version-1 target; controller generations are not presentation evidence.
+
 One command dispatcher drives interactive input, menus, replay tests, and
 remote commands. A semantic snapshot exposes tab IDs, revisions, text,
 cursor/selection, dirty state, modes, pending dialogs, spelling marks, and
