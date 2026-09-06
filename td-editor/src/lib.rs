@@ -4,7 +4,7 @@
 //! the document core has no environment, clock or filesystem access.
 
 mod dialog;
-pub use dialog::Discard;
+pub use dialog::{Discard, Reload};
 pub mod files;
 pub mod fill;
 #[path = "../../td-compositor/src/font.rs"]

@@ -1,6 +1,6 @@
 //! Wayland presentation and input, with an optional asynchronous file session.
 
-use crate::dialog::{Close, Closed, Scope};
+use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
 use crate::keyboard::{Keymap, Modifiers};
 use crate::keys::Profile;
@@ -273,6 +273,8 @@ struct Window {
     prompt: Option<PathPrompt>,
     closing: Option<Close>,
     closing_save: bool,
+    conflict: Option<Conflict>,
+    reloading: Option<Target>,
 }
 
 enum PathAction {
@@ -354,6 +356,8 @@ impl Window {
             prompt: None,
             closing: None,
             closing_save: false,
+            conflict: None,
+            reloading: None,
         })
     }
 
@@ -759,6 +763,10 @@ impl Window {
             self.close_chord(chord, repeated);
             return Ok(false);
         }
+        if self.conflict.is_some() || self.reloading.is_some() {
+            self.conflict_chord(chord, repeated);
+            return Ok(false);
+        }
         if matches!(chord, "Escape" | "C-g") && self.notice.take().is_some() {
             self.dirty = true;
         }
@@ -849,6 +857,14 @@ impl Window {
                     self.close_failed();
                 }
             }
+            self.reloading = None;
+            if let Some(target) = self.files.as_mut().and_then(|files| files.take_conflict()) {
+                self.input.cancel_repeat();
+                match Conflict::new(self.ui.editor(), target) {
+                    Ok(conflict) => self.conflict = Some(conflict),
+                    Err(detail) => self.notify(format!("Conflict question unavailable: {detail}")),
+                }
+            }
         }
         let before = self.ui.generation();
         self.ui.dispatch(Event::Tick(now)).map_err(error)?;
@@ -914,6 +930,7 @@ impl Window {
         let close_notice = self.close_notice();
         let path_notice = self.path_notice();
         let closing_notice = self.closing_notice();
+        let conflict_notice = self.conflict_notice();
         let mut raster =
             Raster::new(&mut self.pixels, &self.font, geometry, width * 4).map_err(error)?;
         raster
@@ -925,6 +942,8 @@ impl Window {
             path_notice.as_deref()
         } else if closing_notice.is_some() {
             closing_notice.as_deref()
+        } else if conflict_notice.is_some() {
+            conflict_notice.as_deref()
         } else {
             self.notice.as_deref()
         };
@@ -1055,7 +1074,7 @@ impl Window {
         if self.closing.is_some() {
             return;
         }
-        if self.files.as_ref().is_some_and(|files| files.busy()) {
+        if self.reloading.is_some() || self.files.as_ref().is_some_and(|files| files.busy()) {
             self.notify(match scope {
                 Scope::Tab { .. } => "File operation pending; wait before closing tabs.",
                 Scope::Window => "File operation pending. Wait for completion, then close again; quitting does not cancel a write.",
@@ -1065,6 +1084,7 @@ impl Window {
         match Close::new(self.ui.editor(), scope) {
             Ok(close) => {
                 self.prompt = None;
+                self.conflict = None;
                 self.notice = None;
                 self.closing = Some(close);
                 self.advance_close();
@@ -1159,6 +1179,128 @@ impl Window {
         self.closing = None;
         let detail = self.notice.take().unwrap_or_default();
         self.notify(format!("Close cancelled; tabs retained. {detail}"));
+    }
+
+    fn conflict_chord(&mut self, chord: &str, repeated: bool) {
+        if repeated {
+            return;
+        }
+        if matches!(chord, "Escape" | "C-g") {
+            self.conflict = None;
+            if self.reloading.take().is_some() {
+                if let Some(files) = self.files.as_mut() {
+                    files.cancel_reload();
+                }
+                self.notify("Reload cancelled; pending read will finish without replacing text or baseline.");
+            } else {
+                // Keep the original file diagnostic available after dismissal.
+                self.dirty = true;
+            }
+            return;
+        }
+        if self.reloading.is_some() || !self.close_answer_visible() {
+            return;
+        }
+        let Some(conflict) = self.conflict.as_mut() else {
+            return;
+        };
+        let target = match conflict.target(self.ui.editor()) {
+            Ok(target) => target,
+            Err(detail) => {
+                self.conflict = None;
+                self.notify(format!(
+                    "Conflict question cancelled: {detail}; text retained. Retry Save."
+                ));
+                return;
+            }
+        };
+        if chord == "C-s" && !conflict.needs_discard() {
+            self.conflict = None;
+            self.file_request("save-as", target.tab, target.revision);
+            return;
+        }
+        let discard = match chord {
+            "C-r" => false,
+            "C-d" if conflict.needs_discard() => true,
+            _ => return,
+        };
+        match conflict.answer(self.ui.editor(), discard) {
+            Ok(Some(permit)) => {
+                self.conflict = None;
+                let result = self
+                    .files
+                    .as_mut()
+                    .ok_or_else(|| "File session unavailable".to_string())
+                    .and_then(|files| files.reload(&self.ui, permit));
+                match result {
+                    Ok(()) => {
+                        self.reloading = Some(target);
+                        self.dirty = true;
+                    }
+                    Err(detail) => self.notify(format!("Reload refused: {detail}; text retained")),
+                }
+            }
+            Ok(None) => self.dirty = true,
+            Err(detail) => {
+                self.conflict = None;
+                self.notify(format!("Reload refused: {detail}; text retained"));
+            }
+        }
+    }
+
+    fn conflict_notice(&self) -> Option<String> {
+        if let Some(target) = self.reloading {
+            return Some(format!("Tab {}\nReading Reload candidate...\nEscape/Ctrl+G cancels Reload.\nOld text kept until accepted.\nWait before closing the window.", target.tab));
+        }
+        let conflict = self.conflict.as_ref()?;
+        let target = match conflict.target(self.ui.editor()) {
+            Ok(target) => target,
+            Err(detail) => {
+                return Some(format!(
+                    "Conflict question changed.\n{detail}\nEscape/Ctrl+G cancels.\nRetry Save."
+                ))
+            }
+        };
+        let identity = format!("Tab {}", target.tab);
+        if self.device.is_none() || self.input.map.is_none() {
+            return Some(format!(
+                "{identity}\nInput unavailable.\nRestore the seat/keymap."
+            ));
+        }
+        if !self.input.focused || !self.input.synchronized {
+            return Some(format!("{identity}\nFocus editor.\nTap and release Shift."));
+        }
+        if !self.close_answer_visible() {
+            return Some(format!(
+                "{identity}\nEnlarge window to answer.\nEscape/Ctrl+G cancels."
+            ));
+        }
+        let title = self
+            .files
+            .as_ref()
+            .and_then(|files| {
+                files
+                    .labels()
+                    .find(|(tab, _)| *tab == target.tab)
+                    .map(|(_, title)| title)
+            })
+            .unwrap_or("Untitled");
+        let short: String = title.chars().take(27).collect();
+        let suffix = if short.len() < title.len() { "..." } else { "" };
+        if conflict.needs_discard() {
+            Some(format!("{identity}\n{short}{suffix}\nReload discards unsaved text.\nUndo history will be cleared.\nCtrl+D: Discard and reload\nEsc/Ctrl+G: Cancel entire Reload"))
+        } else {
+            let failure = if self
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Close cancelled;"))
+            {
+                "Close cancelled; Save failed."
+            } else {
+                "Disk conflict; Save failed."
+            };
+            Some(format!("{identity}\n{short}{suffix}\n{failure}\nCtrl+R: Reload\nCtrl+S: Save As (new path)\nEsc/Ctrl+G: Cancel, show error"))
+        }
     }
 
     fn close_answer_visible(&self) -> bool {
@@ -2063,6 +2205,206 @@ mod tests {
             .unwrap()
             .starts_with("Close cancelled; tabs retained."));
         assert_eq!(w.ui.editor().tabs().count(), 3);
+        assert!(w
+            .conflict_notice()
+            .unwrap()
+            .contains("Close cancelled; Save failed."));
+        w.chord("C-r", false).unwrap();
+        w.chord("C-d", false).unwrap();
+        finish_file(&mut w);
+        assert!(w.closing.is_none() && !w.closed);
+        assert_eq!(w.ui.editor().active(), Some(first));
+        assert_eq!(w.ui.editor().document(second).unwrap().text(), "external");
+        assert!(!w.ui.editor().document(second).unwrap().dirty());
+        assert_eq!(w.ui.editor().document(first).unwrap().text(), "afirst");
+    }
+
+    #[test]
+    fn conflict_reload_and_save_as_are_explicit_in_both_profiles() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let directory = DialogDirectory::new();
+            let path = directory.path("text");
+            std::fs::write(&path, b"old").unwrap();
+            let (mut w, peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            w.files
+                .as_mut()
+                .unwrap()
+                .initial_open(&mut w.ui, path.clone())
+                .unwrap();
+            let tab = w.ui.editor().active().unwrap();
+            w.chord("a", false).unwrap();
+            std::fs::write(&path, b"disk").unwrap();
+            let save = |w: &mut Window| {
+                if profile == Profile::Emacs {
+                    w.chord("C-x", false).unwrap();
+                }
+                w.chord("C-s", false).unwrap();
+                finish_file(w);
+            };
+            save(&mut w);
+            assert!(w.conflict.is_some());
+            let notice = w.conflict_notice().unwrap();
+            assert!(notice.starts_with(&format!("Tab {tab}\n")));
+            assert!(notice.lines().all(|line| line.chars().count() <= 32));
+            w.chord("C-d", false).unwrap(); // not a discard question yet
+            assert!(!w.files.as_ref().unwrap().busy());
+            w.chord("C-r", true).unwrap();
+            assert!(!w.conflict.as_ref().unwrap().needs_discard());
+            w.chord("C-r", false).unwrap();
+            assert!(w.conflict.as_ref().unwrap().needs_discard());
+            w.chord("Escape", false).unwrap();
+            assert!(w.conflict.is_none());
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "aold");
+            save(&mut w);
+            w.chord("C-r", false).unwrap();
+            w.chord("C-d", true).unwrap();
+            assert!(!w.files.as_ref().unwrap().busy());
+            w.chord("C-d", false).unwrap();
+            assert!(w.reloading.is_some() && w.conflict.is_none());
+            w.event(message(WM, 0, &[992])).unwrap();
+            assert!(drain(&peer).0.contains(&message(WM, 3, &[992])));
+            configure(&mut w, 640, 480);
+            w.chord("x", false).unwrap();
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "aold");
+            finish_file(&mut w);
+            assert!(w.reloading.is_none());
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "disk");
+            assert_eq!(w.ui.editor().document(tab).unwrap().history_depth(), (0, 0));
+            assert!(!w.ui.editor().document(tab).unwrap().dirty());
+            w.chord("b", false).unwrap();
+            save(&mut w); // the next job adopts the prepared baseline
+            assert_eq!(std::fs::read(&path).unwrap(), b"bdisk");
+            w.chord("c", false).unwrap();
+            std::fs::write(&path, b"outside").unwrap();
+            save(&mut w);
+            w.chord("C-s", false).unwrap(); // modal Save As in either profile
+            assert!(w.conflict.is_none() && w.prompt.is_some());
+            let copy = directory.path("copy");
+            path_text(&mut w, &copy);
+            finish_file(&mut w);
+            assert_eq!(std::fs::read(copy).unwrap(), b"bcdisk");
+            assert_eq!(std::fs::read(path).unwrap(), b"outside");
+        }
+    }
+
+    #[test]
+    fn conflict_captions_fit_and_unready_or_stale_questions_never_confirm() {
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let target = Target { tab, revision: 1 };
+        w.conflict = Some(Conflict::new(w.ui.editor(), target).unwrap());
+        let caption = |w: &Window| {
+            let notice = w.conflict_notice().unwrap();
+            assert!(notice.lines().count() <= 6, "{notice}");
+            assert!(
+                notice.lines().all(|line| line.chars().count() <= 32),
+                "{notice}"
+            );
+        };
+        caption(&w);
+        w.reloading = Some(Target {
+            tab: u64::MAX,
+            revision: 1,
+        });
+        caption(&w);
+        w.reloading = None;
+        w.input.synchronized = false;
+        caption(&w);
+        w.chord("C-r", false).unwrap();
+        assert!(!w.conflict.as_ref().unwrap().needs_discard());
+        w.input.synchronized = true;
+        w.input.focused = false;
+        caption(&w);
+        w.chord("C-r", false).unwrap();
+        assert!(!w.conflict.as_ref().unwrap().needs_discard());
+        w.input.focused = true;
+        let device = w.device.take();
+        caption(&w);
+        w.chord("C-r", false).unwrap();
+        assert!(!w.conflict.as_ref().unwrap().needs_discard());
+        w.device = device;
+        let map = w.input.map.take();
+        caption(&w);
+        w.chord("C-r", false).unwrap();
+        assert!(!w.conflict.as_ref().unwrap().needs_discard());
+        w.input.map = map;
+        w.ui.dispatch(Event::Resize {
+            width: 208,
+            height: 480,
+            scale: 1,
+        })
+        .unwrap();
+        caption(&w);
+        w.chord("C-r", false).unwrap();
+        assert!(!w.conflict.as_ref().unwrap().needs_discard());
+        w.ui.dispatch(Event::Resize {
+            width: 272,
+            height: 160,
+            scale: 1,
+        })
+        .unwrap();
+        w.chord("C-r", false).unwrap();
+        caption(&w);
+        assert!(w.conflict.as_ref().unwrap().needs_discard());
+        w.ui.dispatch(Event::Edit {
+            tab,
+            revision: 1,
+            command: crate::model::Command::Insert("b".into()),
+        })
+        .unwrap();
+        caption(&w);
+        w.chord("C-d", false).unwrap();
+        assert!(w.conflict.is_none() && !w.files.as_ref().unwrap().busy());
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), "ab");
+    }
+
+    #[test]
+    fn conflict_read_cancel_then_edits_keeps_text_and_old_baseline() {
+        let directory = DialogDirectory::new();
+        let path = directory.path("text");
+        std::fs::write(&path, b"old").unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        w.files
+            .as_mut()
+            .unwrap()
+            .initial_open(&mut w.ui, path.clone())
+            .unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        w.chord("a", false).unwrap();
+        std::fs::write(&path, b"disk").unwrap();
+        w.chord("C-s", false).unwrap();
+        finish_file(&mut w);
+        w.ui.dispatch(Event::Resize {
+            width: 208,
+            height: 480,
+            scale: 1,
+        })
+        .unwrap();
+        w.chord("C-r", false).unwrap();
+        assert!(!w.conflict.as_ref().unwrap().needs_discard());
+        w.ui.dispatch(Event::Resize {
+            width: 272,
+            height: 160,
+            scale: 1,
+        })
+        .unwrap();
+        w.chord("C-r", false).unwrap();
+        w.chord("C-d", false).unwrap();
+        assert!(w.reloading.is_some());
+        w.close();
+        assert!(w.closing.is_none() && !w.closed);
+        w.chord("Escape", false).unwrap();
+        assert!(w.reloading.is_none());
+        w.chord("b", false).unwrap();
+        finish_file(&mut w);
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), "abold");
+        assert!(w.ui.editor().document(tab).unwrap().dirty());
+        w.chord("C-s", false).unwrap();
+        finish_file(&mut w);
+        assert!(w.conflict.is_some());
+        assert_eq!(std::fs::read(path).unwrap(), b"disk");
     }
 
     #[test]

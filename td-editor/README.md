@@ -60,8 +60,8 @@ See DESIGN's file-safety section for metadata restrictions and race limits.
 
 The file adapter also exposes a prepared Reload: dropping it keeps the old
 baseline, while accepting it adopts validated replacement bytes under a new
-association ID. This prerequisite is tested but is not yet a window
-Reload command; model admission and explicit dirty-text discard come next.
+association ID. The window accepts it only for the still-current document
+revision and after explicit confirmation to discard dirty text.
 
 An optional kernel attribute test needs a dedicated UTF-8 fixture with an
 extended attribute (for example one created with `setfattr -n user.test -v x`).
@@ -133,8 +133,15 @@ Return submits, Escape/Ctrl+G cancels, Backspace deletes, Ctrl+U clears. Save
 As requires a new pathname. Put the mode flag `--window` first, and use `--`
 before dash-prefixed command-line paths.
 Switch tabs with Ctrl+Tab. An existing file opened again selects its current
-tab without reloading it. External disk changes refuse Save; use Save As to
-a new name to preserve your edits. There is no conflict Reload yet.
+tab without reloading it. External disk changes refuse Save and offer Ctrl+R
+Reload, Ctrl+S Save As to a new name, or Escape/Ctrl+G Cancel. These dialog
+keys are the same in both profiles. Dirty Reload asks for a separate Ctrl+D
+discard confirmation. Successful Reload clears that tab's undo history and
+starts at the document's beginning. Reload refuses a deleted destination and
+retains the document; use Save As to preserve it under a new name.
+Cancelling a pending Reload retains both
+the old text and its conflict baseline; the read may still finish.
+Resize small windows to at least 272x160 to answer close/conflict questions.
 
 Close asks about each dirty tab: Ctrl+S saves, Ctrl+D approves discarding that
 tab's edits, and Escape/Ctrl+G cancels closing. Untitled tabs enter Save As.

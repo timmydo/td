@@ -25,6 +25,11 @@ pub enum Event<'a> {
     Saved(crate::model::SavePoint),
     /// Single-use, editor/revision-bound approval from the dialog coordinator.
     Discard(crate::Discard),
+    Reload {
+        permit: crate::Reload,
+        bytes: &'a [u8],
+        missing: bool,
+    },
     SelectTab(TabId),
     Close {
         tab: TabId,
@@ -271,6 +276,19 @@ impl Controller {
             }
             Event::Saved(point) => {
                 self.editor.acknowledge_saved(point)?;
+                Ok(Outcome::Changed)
+            }
+            Event::Reload {
+                permit,
+                bytes,
+                missing,
+            } => {
+                let tab = permit.tab();
+                permit.apply(&mut self.editor, bytes, missing)?;
+                self.reset_input();
+                // Keep wrap preferences; the origin selection reveals row zero.
+                self.refresh(Some(tab))?;
+                self.wake_caret();
                 Ok(Outcome::Changed)
             }
             Event::SelectTab(id) => {

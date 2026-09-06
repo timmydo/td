@@ -38,7 +38,8 @@ contract below for its narrower scheduling and close/conflict behavior.
 
 File-window close now has per-document Save/Discard/Cancel decisions,
 including Save As for untitled tabs and cancellation during a pending save.
-Conflict Reload remains the next file-dialog increment.
+Save conflicts now offer Reload / Save As / Cancel. Dirty Reload requires
+a separate explicit discard answer and uses an atomic model/baseline handoff.
 
 The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
@@ -435,8 +436,8 @@ with Conflict; use explicit Open for that different path. A final symlink or
 special file is still refused. A candidate matching another live association's
 path or retained inode is refused with Exists, never merged into that tab.
 A missing destination produces an empty, explicitly missing candidate and
-does not create anything. These are file-adapter semantics; the window's
-Reload command and dirty-document confirmation are not connected yet.
+does not create anything. The window connects these file-adapter semantics
+through the conflict dialog and revision-bound document admission below.
 
 The returned `files::Reload` exclusively borrows its originating session.
 No Open, Save, forget, second preparation or other session mutation can
@@ -460,12 +461,12 @@ at the 64-association limit because it replaces one entry rather than adding
 a live association. The old baseline and its descriptors remain pinned until
 commit or cancellation. Preparation may transiently allocate the codec's
 additional at-most-16-MiB decoded validation string and retain one extra
-parent and regular-file handle. The future worker-to-model handoff may copy
-one at-most-16-MiB encoded result and decode it separately; it must not commit
+parent and regular-file handle. The worker-to-model handoff copies
+one at-most-16-MiB encoded result and decodes it separately; it must not commit
 the borrowed candidate when that admission is cancelled, stale or over budget.
 
-The window integration will keep this borrow inside the worker, not return
-it from the one-job executor or send it to the UI. The worker sends the
+The window integration keeps this borrow inside the worker, never returning
+it from the one-job executor or sending it to the UI. The worker sends the
 candidate's bytes/path/missing flag and fresh ID, then receives the next
 ordinary job while retaining the borrow. That job's live association set
 names the fresh ID only if model admission succeeded; otherwise it still
@@ -874,8 +875,8 @@ successful transaction dispatches `Event::Saved` with that snapshot's token;
 later edits remain dirty. Failures preserve model text, saved state and the
 old file association. Publication and cleanup warnings precede long path
 diagnostics so bounded notices retain those consequences. A disk conflict
-refuses the write and suggests Save As to a new path; Reload is not yet
-implemented. Save As never replaces an existing or already-associated path.
+refuses the write and opens the conflict dialog described below. Save As
+never replaces an existing or already-associated path.
 
 Open admission and clean tab close update the coordinator's live association
 set. Before each job, the worker forgets associations absent from that set,
@@ -889,6 +890,63 @@ Duplicate opens transfer no text, only association metadata.
 Save owns one at-most-16-MiB encoded snapshot, with the transaction adapter's
 validation/readback scratch as specified in its section. No other queued
 snapshot or file result can accumulate.
+
+An ordinary Save's typed Conflict or Exists failure creates a conflict
+question for that associated tab's current revision, including when newer
+edits arrived during Save. Save As failures do not suggest reloading its old
+association. Publication-attempt or residual-cleanup failures retain their
+full warning notice instead of opening a question over it; explicitly retry
+Save or use Save As after inspecting the warning. No diagnostic substring
+determines whether a failure is a disk conflict. A failed close-initiated
+Save first cancels the close plan; resolving its conflict never resumes
+closing, and the conflict caption states that closing was cancelled.
+
+In either key profile the conflict question offers Ctrl+R Reload, Ctrl+S
+Save As to a new path, or Escape/C-g Cancel (revealing the original error).
+Reload on dirty text opens a second question: Ctrl+D explicitly discards
+that revision's unsaved text and reloads; Escape/C-g cancels the entire
+conflict flow. A first-question Ctrl+D does nothing. Repeated keys cannot
+request or confirm either action. Each question begins with the stable tab
+ID and a shortened filename, uses at most six 32-scalar lines, and requires
+the close dialog's minimum dimensions and synchronized input for non-Cancel
+answers. Input loss or a smaller window retains the question and replaces
+choices with restoration/resize instructions. Window-manager close can
+replace an idle conflict question with the ordinary close flow.
+
+`dialog::Conflict` pins editor identity, tab and revision. Only a live answer
+can mint the opaque, single-use `Reload` permit; a dirty permit additionally
+requires the second discard answer. The file coordinator checks the permit
+before submitting one read job. While reading, the modal consumes ordinary
+keys, but protocol handling and redraw continue. Cancel drops the pending
+permit, not the read syscall: the eventual result is ignored and its prepared
+baseline rejected. The user may edit again after Cancel. A new close during
+the pending read is refused like other unrelated I/O. A stale completion,
+invalid file, exhausted counter or failed budget admission leaves text,
+history, selection, saved state and old file association unchanged.
+
+Successful `Event::Reload` keeps the same TabId, active-tab choice and that
+document's Auto Fill, fill column and soft-wrap preferences. It replaces
+text and BOM/line-ending format, sets selection to byte zero, increments
+revision and content-state IDs, clears that document's undo/redo history,
+and reveals the origin in its viewport. Existing-file text becomes clean;
+a missing destination is refused by the file-session coordinator before model
+replacement, retaining the old document, history and baseline and directing
+the user to Save As. The lower-level model can represent an authorized empty
+missing-file replacement, but the native Reload flow never admits one.
+Other documents and their history remain unchanged.
+Controller generation is admitted before mutation; codec, text budgets and
+both model counters are checked before replacement. No replay command can
+construct a permit or bypass the live discard question.
+
+Only accepted model replacement changes the UI association to the candidate's
+fresh FileId and returned path label. The worker keeps its borrowed candidate
+across completion delivery and receives the next ordinary job. It commits
+only when that job's live association set contains the fresh ID and excludes
+the old one; otherwise it drops the candidate. It resolves this decision
+before executing the next job, so a rejected/stale/cancelled Reload still
+uses the original conflict baseline on Save. While idle it may retain the
+one extra candidate already budgeted above. Disconnection drops it and ends
+the worker. There is no second acknowledgement queue or UI-thread wait.
 
 Untitled Save As first probes destination metadata on the worker and refuses
 an existing name without reading its contents. A name created between that

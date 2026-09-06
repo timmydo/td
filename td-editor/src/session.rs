@@ -13,6 +13,7 @@ type Result<T> = std::result::Result<T, String>;
 
 enum Operation {
     Open(PathBuf),
+    Reload(FileId),
     Save {
         file: Option<FileId>,
         path: Option<PathBuf>,
@@ -31,10 +32,13 @@ struct Loaded {
 }
 enum Completion {
     Open(Loaded),
+    Reload(Loaded),
+    Conflict(String),
     Saved { file: FileId, path: PathBuf },
 }
 enum Pending {
     Open,
+    Reload { permit: Option<crate::Reload> },
     Save { tab: TabId, point: SavePoint },
 }
 struct Association {
@@ -48,6 +52,7 @@ pub(crate) struct Session {
     pending: Option<Pending>,
     associations: BTreeMap<TabId, Association>,
     failed: bool,
+    conflict: Option<crate::dialog::Target>,
 }
 
 impl Session {
@@ -56,16 +61,7 @@ impl Session {
         let (results, receiver) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("td-editor-files".into())
-            .spawn(move || {
-                let mut files = Files::default();
-                let mut known = BTreeSet::new();
-                while let Ok(job) = jobs.recv() {
-                    let result = execute(&mut files, &mut known, job);
-                    if results.send(result).is_err() {
-                        break;
-                    }
-                }
-            })
+            .spawn(move || worker(jobs, results))
             .map_err(|e| e.to_string())?;
         Ok(Self {
             sender,
@@ -73,6 +69,7 @@ impl Session {
             pending: None,
             associations: BTreeMap::new(),
             failed: false,
+            conflict: None,
         })
     }
 
@@ -117,6 +114,31 @@ impl Session {
 
     pub(crate) fn associated(&self, tab: TabId) -> bool {
         self.associations.contains_key(&tab)
+    }
+    pub(crate) fn take_conflict(&mut self) -> Option<crate::dialog::Target> {
+        self.conflict.take()
+    }
+
+    pub(crate) fn reload(&mut self, ui: &Controller, permit: crate::Reload) -> Result<()> {
+        self.available()?;
+        permit.check(ui.editor()).map_err(|e| e.to_string())?;
+        let file = self
+            .associations
+            .get(&permit.tab())
+            .ok_or("Reload needs an associated file")?
+            .file;
+        self.submit(
+            Operation::Reload(file),
+            Pending::Reload {
+                permit: Some(permit),
+            },
+        )
+    }
+
+    pub(crate) fn cancel_reload(&mut self) {
+        if let Some(Pending::Reload { permit }) = self.pending.as_mut() {
+            *permit = None;
+        }
     }
     pub(crate) fn forget(&mut self, tab: TabId) {
         self.associations.remove(&tab);
@@ -180,6 +202,34 @@ impl Session {
         result: Result<Completion>,
     ) -> Result<String> {
         match (pending, result?) {
+            (Some(Pending::Save { tab, .. }), Completion::Conflict(detail)) => {
+                if let Ok(doc) = ui.editor().document(tab) {
+                    self.conflict = Some(crate::dialog::Target {
+                        tab,
+                        revision: doc.revision(),
+                    });
+                }
+                Err(detail)
+            }
+            (Some(Pending::Reload { permit }), Completion::Reload(loaded)) => {
+                let Some(permit) = permit else {
+                    return Ok("Reload cancelled; text and old baseline retained".into());
+                };
+                if loaded.missing {
+                    return Err("Reload refused: destination is missing. Text and old baseline retained; use Save As to a new path.".into());
+                }
+                let tab = permit.tab();
+                ui.dispatch(Event::Reload {
+                    permit,
+                    bytes: &loaded.bytes,
+                    missing: loaded.missing,
+                })
+                .map_err(|e| {
+                    format!("Reload not admitted ({e}); text and old baseline retained")
+                })?;
+                self.associate(tab, loaded.file, &loaded.path);
+                Ok("Reloaded disk snapshot; undo history cleared".into())
+            }
             (Some(Pending::Open), Completion::Open(loaded)) => {
                 if let Some((&tab, _)) = self
                     .associations
@@ -248,17 +298,65 @@ impl Session {
     }
 }
 
-fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<Completion> {
-    // Release closed tabs and rejected Open admissions before the next job.
+fn worker(jobs: Receiver<Job>, results: SyncSender<Result<Completion>>) {
+    let mut files = Files::default();
+    let mut known = BTreeSet::new();
+    let mut incoming = jobs.recv();
+    while let Ok(job) = incoming {
+        let result = if let Operation::Reload(original) = job.operation {
+            retain_files(&mut files, &mut known, &job.keep);
+            match files.prepare_reload(original) {
+                Ok(candidate) => {
+                    let replacement = candidate.file_id();
+                    let loaded = Loaded {
+                        file: replacement,
+                        path: candidate.path().to_owned(),
+                        bytes: candidate.bytes().to_vec(),
+                        missing: candidate.missing(),
+                    };
+                    if results.send(Ok(Completion::Reload(loaded))).is_err() {
+                        break;
+                    }
+                    incoming = jobs.recv();
+                    if incoming.as_ref().is_ok_and(|next| {
+                        next.keep.contains(&replacement) && !next.keep.contains(&original)
+                    }) {
+                        candidate.commit();
+                        known.remove(&original);
+                        known.insert(replacement);
+                    }
+                    // Otherwise dropping the borrowed candidate cancels it.
+                    continue;
+                }
+                Err(detail) => Err(file_error(detail)),
+            }
+        } else {
+            execute(&mut files, &mut known, job)
+        };
+        if results.send(result).is_err() {
+            break;
+        }
+        incoming = jobs.recv();
+    }
+}
+
+fn retain_files(files: &mut Files, known: &mut BTreeSet<FileId>, keep: &BTreeSet<FileId>) {
     known.retain(|id| {
-        if job.keep.contains(id) {
+        if keep.contains(id) {
             true
         } else {
             files.forget(*id);
             false
         }
     });
+}
+
+fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<Completion> {
+    // Release closed tabs and rejected Open admissions before the next job.
+    retain_files(files, known, &job.keep);
     match job.operation {
+        // The outer worker owns Reload's borrow across jobs; never adopt here.
+        Operation::Reload(_) => Err("Reload requires the worker's prepared handoff".into()),
         Operation::Open(path) => {
             let file = files.open(&path).map_err(file_error)?;
             known.insert(file);
@@ -280,7 +378,21 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
                     file
                 }
                 (Some(file), None) => {
-                    files.save(file, bytes).map_err(file_error)?;
+                    if let Err(detail) = files.save(file, bytes) {
+                        let conflict = !detail.published
+                            && !detail.publication_attempted
+                            && detail.residual.is_none()
+                            && matches!(
+                                detail.kind,
+                                crate::files::Kind::Conflict | crate::files::Kind::Exists
+                            );
+                        let detail = file_error(detail);
+                        return if conflict {
+                            Ok(Completion::Conflict(detail))
+                        } else {
+                            Err(detail)
+                        };
+                    }
                     file
                 }
                 (None, Some(path)) => {
@@ -338,7 +450,7 @@ fn file_error(error: crate::files::Failure) -> String {
             ""
         },
         if error.kind == crate::files::Kind::Conflict {
-            "Disk conflict: use Save As to a NEW path or cancel. Reload is not implemented. "
+            "Disk conflict; retry Save or use Save As to a new path. "
         } else {
             ""
         },
@@ -376,8 +488,110 @@ mod tests {
         }
     }
 
-    // The real job executor behind a manually advanced channel gives a
-    // deterministic delayed-I/O oracle without timing-dependent sleeps.
+    fn finish_worker(session: &mut Session, ui: &mut Controller) -> Result<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(result) = session.poll(ui) {
+                return result;
+            }
+            assert!(std::time::Instant::now() < deadline, "file worker timeout");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn reload_handoff_adopts_only_after_model_admission_and_cancellation_retains_baseline() {
+        for rejection in [None, Some("cancel"), Some("stale")] {
+            let directory = Directory::new();
+            let path = directory.path("text");
+            fs::write(&path, b"old").unwrap();
+            let mut session = Session::start().unwrap();
+            let mut ui = Controller::default();
+            session.initial_open(&mut ui, path.clone()).unwrap();
+            let tab = ui.editor().active().unwrap();
+            ui.dispatch(Event::Edit {
+                tab,
+                revision: 0,
+                command: Command::Insert("edit".into()),
+            })
+            .unwrap();
+            fs::write(&path, b"disk").unwrap();
+            session.save(&ui, tab, 1, None).unwrap();
+            assert!(finish_worker(&mut session, &mut ui).is_err());
+            let target = session.take_conflict().unwrap();
+            assert_eq!(target, crate::dialog::Target { tab, revision: 1 });
+            let mut conflict = crate::dialog::Conflict::new(ui.editor(), target).unwrap();
+            assert!(conflict.answer(ui.editor(), false).unwrap().is_none());
+            let permit = conflict.answer(ui.editor(), true).unwrap().unwrap();
+            let original_file = session.associations.get(&tab).unwrap().file;
+            session.reload(&ui, permit).unwrap();
+            assert!(session.busy());
+            assert!(session.open(path.clone()).is_err());
+            if rejection == Some("cancel") {
+                session.cancel_reload();
+            }
+            if rejection == Some("stale") {
+                ui.dispatch(Event::Edit {
+                    tab,
+                    revision: 1,
+                    command: Command::Insert("new".into()),
+                })
+                .unwrap();
+            }
+            let result = finish_worker(&mut session, &mut ui);
+            assert_eq!(result.is_err(), rejection == Some("stale"));
+            let file = session.associations.get(&tab).unwrap().file;
+            if rejection.is_some() {
+                assert_eq!(file, original_file);
+                assert!(ui.editor().document(tab).unwrap().text().contains("edit"));
+                assert!(ui.editor().document(tab).unwrap().dirty());
+                let revision = ui.editor().document(tab).unwrap().revision();
+                session.save(&ui, tab, revision, None).unwrap();
+                assert!(finish_worker(&mut session, &mut ui).is_err());
+                assert!(session.take_conflict().is_some());
+                assert_eq!(fs::read(&path).unwrap(), b"disk");
+            } else {
+                assert_ne!(file, original_file);
+                assert_eq!(ui.editor().document(tab).unwrap().text(), "disk");
+                assert!(!ui.editor().document(tab).unwrap().dirty());
+                ui.dispatch(Event::Edit {
+                    tab,
+                    revision: 2,
+                    command: Command::Insert("new".into()),
+                })
+                .unwrap();
+                session.save(&ui, tab, 3, None).unwrap();
+                finish_worker(&mut session, &mut ui).unwrap();
+                assert_eq!(fs::read(&path).unwrap(), b"newdisk");
+            }
+        }
+    }
+
+    #[test]
+    fn reload_failure_does_not_adopt_invalid_bytes_or_clear_dirty_text() {
+        let directory = Directory::new();
+        let path = directory.path("text");
+        fs::write(&path, b"old").unwrap();
+        let mut session = Session::start().unwrap();
+        let mut ui = Controller::default();
+        session.initial_open(&mut ui, path.clone()).unwrap();
+        let tab = ui.editor().active().unwrap();
+        let mut conflict =
+            crate::dialog::Conflict::new(ui.editor(), crate::dialog::Target { tab, revision: 0 })
+                .unwrap();
+        let permit = conflict.answer(ui.editor(), false).unwrap().unwrap();
+        fs::write(&path, b"\xff").unwrap();
+        session.reload(&ui, permit).unwrap();
+        assert!(finish_worker(&mut session, &mut ui).is_err());
+        assert_eq!(ui.editor().document(tab).unwrap().text(), "old");
+        session.save(&ui, tab, 0, None).unwrap();
+        assert!(finish_worker(&mut session, &mut ui).is_err());
+        assert!(session.take_conflict().is_some());
+        assert_eq!(fs::read(path).unwrap(), b"\xff");
+    }
+
+    // Manually advance ordinary jobs; Reload tests hold the prepared borrow
+    // across explicitly ordered completion delivery and admission instead.
     struct Harness {
         session: Session,
         jobs: Receiver<Job>,
@@ -397,6 +611,7 @@ mod tests {
                     pending: None,
                     associations: BTreeMap::new(),
                     failed: false,
+                    conflict: None,
                 },
                 jobs,
                 results,
@@ -429,6 +644,148 @@ mod tests {
         fn save(&mut self, tab: TabId, path: Option<PathBuf>) {
             let revision = self.ui.editor().document(tab).unwrap().revision();
             self.session.save(&self.ui, tab, revision, path).unwrap();
+        }
+    }
+
+    #[test]
+    fn reload_completion_cancel_is_deterministic_before_and_after_delivery() {
+        for timing in [
+            "before-read",
+            "before-send",
+            "after-send",
+            "accept",
+            "stale",
+        ] {
+            let directory = Directory::new();
+            let path = directory.path("text");
+            fs::write(&path, b"old").unwrap();
+            let mut h = Harness::new();
+            let tab = h.open(path.clone());
+            h.edit(tab, Command::Insert("edit".into()));
+            let original = h.session.associations.get(&tab).unwrap().file;
+            let mut conflict = crate::dialog::Conflict::new(
+                h.ui.editor(),
+                crate::dialog::Target { tab, revision: 1 },
+            )
+            .unwrap();
+            assert!(conflict.answer(h.ui.editor(), false).unwrap().is_none());
+            let permit = conflict.answer(h.ui.editor(), true).unwrap().unwrap();
+            h.session.reload(&h.ui, permit).unwrap();
+            let job = h.jobs.try_recv().unwrap();
+            assert!(matches!(job.operation, Operation::Reload(id) if id == original));
+            assert!(h.session.poll(&mut h.ui).is_none());
+            if timing == "before-read" {
+                h.session.cancel_reload();
+            }
+            fs::write(&path, b"disk").unwrap();
+            let candidate = h.files.prepare_reload(original).unwrap();
+            let fresh = candidate.file_id();
+            if timing == "before-send" {
+                h.session.cancel_reload();
+            }
+            h.results
+                .send(Ok(Completion::Reload(Loaded {
+                    file: fresh,
+                    path: candidate.path().to_owned(),
+                    bytes: candidate.bytes().to_vec(),
+                    missing: candidate.missing(),
+                })))
+                .ok()
+                .unwrap();
+            if timing == "after-send" {
+                h.session.cancel_reload();
+            }
+            if timing == "stale" {
+                h.ui.dispatch(Event::Edit {
+                    tab,
+                    revision: 1,
+                    command: Command::Insert("new".into()),
+                })
+                .unwrap();
+            }
+            let result = h.session.poll(&mut h.ui).unwrap();
+            assert_eq!(result.is_err(), timing == "stale");
+            let accepted = timing == "accept";
+            assert_eq!(
+                h.session.associations.get(&tab).unwrap().file == fresh,
+                accepted
+            );
+            assert_eq!(
+                h.ui.editor().document(tab).unwrap().text() == "disk",
+                accepted
+            );
+            let revision = h.ui.editor().document(tab).unwrap().revision();
+            h.session.save(&h.ui, tab, revision, None).unwrap();
+            let next = h.jobs.try_recv().unwrap();
+            assert_eq!(next.keep.contains(&fresh), accepted);
+            assert_eq!(next.keep.contains(&original), !accepted);
+            if accepted {
+                candidate.commit();
+                h.known.remove(&original);
+                h.known.insert(fresh);
+            } else {
+                drop(candidate);
+            }
+            let result = execute(&mut h.files, &mut h.known, next).unwrap();
+            assert_eq!(matches!(result, Completion::Saved { .. }), accepted);
+            assert_eq!(fs::read(&path).unwrap(), b"disk");
+        }
+    }
+
+    #[test]
+    fn reload_handles_newly_created_paths_and_refuses_deleted_destinations() {
+        for initially_missing in [false, true] {
+            let directory = Directory::new();
+            let path = directory.path("text");
+            if !initially_missing {
+                fs::write(&path, b"old").unwrap();
+            }
+            let mut session = Session::start().unwrap();
+            let mut ui = Controller::default();
+            session.initial_open(&mut ui, path.clone()).unwrap();
+            let tab = ui.editor().active().unwrap();
+            ui.dispatch(Event::Edit {
+                tab,
+                revision: 0,
+                command: Command::Insert("edit".into()),
+            })
+            .unwrap();
+            let original = session.associations.get(&tab).unwrap().file;
+            let before = format!("{:?}", ui.editor());
+            if initially_missing {
+                fs::write(&path, b"external").unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            session.save(&ui, tab, 1, None).unwrap();
+            let error = finish_worker(&mut session, &mut ui).unwrap_err();
+            assert!(error.contains(if initially_missing {
+                "Exists"
+            } else {
+                "Conflict"
+            }));
+            let mut conflict =
+                crate::dialog::Conflict::new(ui.editor(), session.take_conflict().unwrap())
+                    .unwrap();
+            assert!(conflict.answer(ui.editor(), false).unwrap().is_none());
+            session
+                .reload(&ui, conflict.answer(ui.editor(), true).unwrap().unwrap())
+                .unwrap();
+            let result = finish_worker(&mut session, &mut ui);
+            if initially_missing {
+                result.unwrap();
+                assert_eq!(ui.editor().document(tab).unwrap().text(), "external");
+                assert!(!ui.editor().document(tab).unwrap().dirty());
+                session.save(&ui, tab, 2, None).unwrap();
+                finish_worker(&mut session, &mut ui).unwrap();
+            } else {
+                assert!(result.unwrap_err().contains("destination is missing"));
+                assert_eq!(format!("{:?}", ui.editor()), before);
+                assert_eq!(session.associations.get(&tab).unwrap().file, original);
+                session.save(&ui, tab, 1, None).unwrap();
+                assert!(finish_worker(&mut session, &mut ui).is_err());
+                assert!(!path.exists());
+            }
         }
     }
 

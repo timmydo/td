@@ -16,6 +16,59 @@ impl Discard {
     }
 }
 
+/// Only an answer to a live conflict dialog can authorize replacement.
+pub struct Reload {
+    point: ClosePoint,
+}
+impl Reload {
+    pub(crate) fn check(&self, editor: &Editor) -> Result<()> {
+        editor.check_close(&self.point)
+    }
+    pub(crate) fn tab(&self) -> TabId {
+        self.point.tab
+    }
+    pub(crate) fn apply(self, editor: &mut Editor, bytes: &[u8], missing: bool) -> Result<()> {
+        editor.reload_bytes(self.point, bytes, missing)
+    }
+}
+
+pub(crate) struct Conflict {
+    point: Option<ClosePoint>,
+    discard: bool,
+}
+impl Conflict {
+    pub(crate) fn new(editor: &Editor, target: Target) -> Result<Self> {
+        Ok(Self {
+            point: Some(editor.close_point(target.tab, target.revision)?),
+            discard: false,
+        })
+    }
+    pub(crate) fn target(&self, editor: &Editor) -> Result<Target> {
+        let point = self.point.as_ref().ok_or(Error::InvalidArgument)?;
+        editor.check_close(point)?;
+        Ok(Target {
+            tab: point.tab,
+            revision: point.revision,
+        })
+    }
+    pub(crate) fn needs_discard(&self) -> bool {
+        self.discard
+    }
+    pub(crate) fn answer(&mut self, editor: &Editor, discard: bool) -> Result<Option<Reload>> {
+        let target = self.target(editor)?;
+        if discard && !self.discard {
+            return Err(Error::InvalidArgument);
+        }
+        if editor.document(target.tab)?.dirty() && !discard {
+            self.discard = true;
+            return Ok(None);
+        }
+        Ok(Some(Reload {
+            point: self.point.take().ok_or(Error::InvalidArgument)?,
+        }))
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Scope {
     Tab { tab: TabId, revision: u64 },
@@ -127,6 +180,86 @@ mod tests {
         })
         .unwrap();
         tab
+    }
+
+    #[test]
+    fn conflict_reload_requires_live_explicit_discard_and_cannot_repeat_a_permit() {
+        let mut ui = Controller::default();
+        let tab = dirty(&mut ui);
+        let target = Target { tab, revision: 1 };
+        let mut conflict = Conflict::new(ui.editor(), target).unwrap();
+        assert!(conflict.answer(ui.editor(), true).is_err());
+        assert!(conflict.answer(ui.editor(), false).unwrap().is_none());
+        assert!(conflict.needs_discard());
+        let permit = conflict.answer(ui.editor(), true).unwrap().unwrap();
+        assert!(conflict.answer(ui.editor(), true).is_err());
+        ui.dispatch(Event::Reload {
+            permit,
+            bytes: b"disk",
+            missing: false,
+        })
+        .unwrap();
+        assert_eq!(ui.editor().document(tab).unwrap().text(), "disk");
+        assert!(!ui.editor().document(tab).unwrap().dirty());
+        let target = Target { tab, revision: 2 };
+        let mut clean = Conflict::new(ui.editor(), target).unwrap();
+        assert!(clean.answer(ui.editor(), false).unwrap().is_some());
+        let mut stale = Conflict::new(ui.editor(), target).unwrap();
+        ui.dispatch(Event::Edit {
+            tab,
+            revision: 2,
+            command: Command::Insert("new".into()),
+        })
+        .unwrap();
+        assert!(stale.answer(ui.editor(), false).is_err());
+        assert_eq!(ui.editor().document(tab).unwrap().text(), "newdisk");
+    }
+
+    #[test]
+    fn reload_reveals_origin_preserves_wrap_and_leaves_other_views_alone() {
+        let mut ui = Controller::default();
+        let text = format!("{}\n", "x".repeat(120)).repeat(40);
+        ui.dispatch(Event::Load(text.as_bytes())).unwrap();
+        let tab = ui.editor().active().unwrap();
+        ui.dispatch(Event::Resize {
+            width: 272,
+            height: 160,
+            scale: 1,
+        })
+        .unwrap();
+        ui.dispatch(Event::Wrap {
+            tab,
+            revision: 0,
+            enabled: false,
+        })
+        .unwrap();
+        ui.dispatch(Event::Scroll {
+            tab,
+            revision: 0,
+            rows: 10,
+            columns: 10,
+        })
+        .unwrap();
+        assert!(ui.tab_view(tab).unwrap().viewport.origin().row > 0);
+        ui.dispatch(Event::New).unwrap();
+        let other = ui.editor().active().unwrap();
+        let other_view = ui.tab_view(other).unwrap();
+        let mut conflict = Conflict::new(ui.editor(), Target { tab, revision: 0 }).unwrap();
+        let permit = conflict.answer(ui.editor(), false).unwrap().unwrap();
+        ui.dispatch(Event::Reload {
+            permit,
+            bytes: b"new",
+            missing: false,
+        })
+        .unwrap();
+        let view = ui.tab_view(tab).unwrap();
+        assert!(!view.soft_wrap);
+        assert_eq!(
+            view.viewport.origin(),
+            crate::layout::Position { row: 0, column: 0 }
+        );
+        assert_eq!(ui.editor().active(), Some(other));
+        assert_eq!(ui.tab_view(other).unwrap(), other_view);
     }
 
     #[test]

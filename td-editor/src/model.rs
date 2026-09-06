@@ -334,6 +334,46 @@ impl Editor {
         Ok(())
     }
 
+    pub(crate) fn reload_bytes(
+        &mut self,
+        point: ClosePoint,
+        bytes: &[u8],
+        missing: bool,
+    ) -> Result<()> {
+        self.check_close(&point)?;
+        if bytes.len() > self.limits.file_bytes {
+            return Err(Error::Limit);
+        }
+        if missing && !bytes.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        let decoded = text::decode(bytes)?;
+        let old = self.document(point.tab)?;
+        if self.total_text_bytes() - old.text.len() + decoded.text.len() > self.limits.text_bytes {
+            return Err(Error::Limit);
+        }
+        let revision = old.revision.checked_add(1).ok_or(Error::Exhausted)?;
+        let next_state = self.next_state.checked_add(1).ok_or(Error::Exhausted)?;
+        let state = self.next_state;
+        let newlines = decoded.text.bytes().filter(|&b| b == b'\n').count();
+        let replacement = Document {
+            text: decoded.text,
+            format: decoded.format,
+            newlines,
+            selection: Selection::default(),
+            revision,
+            state,
+            saved: (!missing).then_some(state),
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            auto_fill: old.auto_fill,
+            fill_column: old.fill_column,
+        };
+        *self.document_mut(point.tab)? = replacement;
+        self.next_state = next_state;
+        Ok(())
+    }
+
     fn remove_tab(&mut self, id: TabId) {
         self.tabs.remove(&id);
         if self.active == Some(id) {
@@ -759,6 +799,105 @@ fn destination(text: &str, at: usize, motion: Motion) -> Result<usize> {
                 pos = at + index + c.len_utf8();
             }
             Ok(pos)
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod reload_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_reload_preserves_identity_preferences_and_other_tabs() {
+        let mut editor = Editor::default();
+        let tab = editor.load_bytes(b"old").unwrap();
+        editor
+            .dispatch(tab, 0, Command::Insert("edit".into()))
+            .unwrap();
+        editor.dispatch(tab, 1, Command::AutoFill(true)).unwrap();
+        editor.dispatch(tab, 1, Command::FillColumn(40)).unwrap();
+        let (old_save, _) = editor.save_snapshot(tab).unwrap();
+        let other = editor.load_bytes(b"other").unwrap();
+        let point = editor.close_point(tab, 1).unwrap();
+        editor
+            .reload_bytes(point, b"\xef\xbb\xbfnew\r\n", false)
+            .unwrap();
+        assert_eq!(editor.active(), Some(other));
+        assert_eq!(editor.document(other).unwrap().text(), "other");
+        let doc = editor.document(tab).unwrap();
+        assert_eq!(doc.text(), "new\n");
+        assert_eq!(doc.revision(), 2);
+        assert_eq!(doc.selection(), Selection::default());
+        assert_eq!(doc.history_depth(), (0, 0));
+        assert!(doc.auto_fill() && doc.fill_column() == 40 && !doc.dirty());
+        assert_eq!(editor.save_snapshot(tab).unwrap().1, b"\xef\xbb\xbfnew\r\n");
+        editor.acknowledge_saved(old_save).unwrap();
+        assert!(editor.document(tab).unwrap().dirty());
+        let point = editor.close_point(tab, 2).unwrap();
+        editor.reload_bytes(point, b"", true).unwrap();
+        let doc = editor.document(tab).unwrap();
+        assert!(doc.text().is_empty() && doc.dirty());
+        assert_eq!(doc.revision(), 3);
+        assert_eq!(doc.format(), text::Format::default());
+    }
+
+    #[test]
+    fn failed_reload_is_atomic_for_text_limits_identity_and_counter_exhaustion() {
+        let mut editor = Editor::with_limits(Limits {
+            text_bytes: 5,
+            file_bytes: 8,
+            ..Limits::default()
+        })
+        .unwrap();
+        let tab = editor.load_bytes(b"old").unwrap();
+        editor.load_bytes(b"xy").unwrap();
+        for (bytes, missing, error) in [
+            (b"four".as_slice(), false, Error::Limit),
+            (b"123456789", false, Error::Limit),
+            (b"x", true, Error::InvalidArgument),
+        ] {
+            let before = format!("{editor:?}");
+            let point = editor.close_point(tab, 0).unwrap();
+            assert_eq!(editor.reload_bytes(point, bytes, missing), Err(error));
+            assert_eq!(format!("{editor:?}"), before);
+        }
+        let before = format!("{editor:?}");
+        let point = editor.close_point(tab, 0).unwrap();
+        assert!(editor.reload_bytes(point, b"\xff", false).is_err());
+        assert_eq!(format!("{editor:?}"), before);
+        let mut foreign = Editor::default();
+        foreign.new_tab().unwrap();
+        let point = foreign.close_point(tab, 0).unwrap();
+        assert_eq!(
+            editor.reload_bytes(point, b"new", false),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(format!("{editor:?}"), before);
+        let stale = editor.close_point(tab, 0).unwrap();
+        editor.document_mut(tab).unwrap().revision = 1;
+        let before = format!("{editor:?}");
+        assert_eq!(
+            editor.reload_bytes(stale, b"new", false),
+            Err(Error::StaleRevision)
+        );
+        assert_eq!(format!("{editor:?}"), before);
+        for state_exhaustion in [true, false] {
+            if state_exhaustion {
+                editor.next_state = u64::MAX;
+            } else {
+                editor.next_state = 3;
+                editor.document_mut(tab).unwrap().revision = u64::MAX;
+            }
+            let before = format!("{editor:?}");
+            let point = editor
+                .close_point(tab, editor.document(tab).unwrap().revision())
+                .unwrap();
+            assert_eq!(
+                editor.reload_bytes(point, b"new", false),
+                Err(Error::Exhausted)
+            );
+            assert_eq!(format!("{editor:?}"), before);
         }
     }
 }
