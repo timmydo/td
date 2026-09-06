@@ -935,6 +935,30 @@ pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 /// rather than forcing a fresh probe.
 pub const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = "TD-COMPOSITOR-DRM-PROBE-OK";
 
+/// What `td-compositor probe-kms` prints when it has actually SET a mode.
+///
+/// A separate marker from the discovery one because it is a separate claim, and
+/// a much stronger one: discovery says a card exists and offers a mode, this
+/// says the mode was programmed onto a CRTC and the CRTC agreed. The probe
+/// takes DRM mastership, registers the dumb buffer it mapped as a framebuffer,
+/// drives the connector from its CRTC, reads the CRTC back, and then puts
+/// everything as it was.
+///
+/// Unlike the discovery probe, this one DISTURBS the display, and the reason
+/// is the modeset rather than the mastership. Once this probe's framebuffer is
+/// on the primary plane, the fbdev console's damage stops reaching the screen
+/// — `drm_atomic_helper_dirtyfb` skips every plane whose current framebuffer
+/// is not the one being damaged (`drm_damage_helper.c:168`) — so the console
+/// goes on committing updates to a buffer nothing is scanning out. Mastership
+/// alone would not do that; it only stops another process becoming master
+/// (`drm_auth.c:260`) and fails two fbdev ioctls this image never issues.
+///
+/// That is why this is a separate subcommand rather than more output from the
+/// same one, and why nothing in the boot's health verdict depends on the
+/// display during it. On the headless QEMU run there is nothing to disturb; on
+/// a machine with a monitor there would be, briefly.
+pub const TD_COMPOSITOR_KMS_PROBE_MARKER: &str = "TD-COMPOSITOR-KMS-PROBE-OK";
+
 /// APPLICATIONS.md §H item 12: `kill -KILL` of stage 1 reaped the whole
 /// instance.
 ///

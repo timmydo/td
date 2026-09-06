@@ -60,7 +60,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with fourteen value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped client-side clipboard descriptor adoption and one lifetime-carrying mapped region |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with nineteen value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped client-side clipboard descriptor adoption and one lifetime-carrying mapped region |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -401,9 +401,13 @@ authority this process is handed without asking for it. `drm_master_open` in
 `drivers/gpu/drm/drm_auth.c` makes the first opener of a PRIMARY node the DRM
 master whenever `dev->master` is NULL, and an in-kernel client — fbcon, fbdev
 emulation — never sets it, so on a td image the plain `open` of
-`/dev/dri/card0` IS the acquisition. While it is held,
-`drm_fb_helper_damage_work`'s `drm_master_internal_acquire` answers `-EBUSY`
-and the running compositor's damage is dropped until the descriptor closes.
+`/dev/dri/card0` IS the acquisition. What holding it costs was stated too
+strongly here for two landings and is now stated exactly: the framebuffer
+console keeps painting, because `drm_fb_helper_fb_dirty` discards the `-EBUSY`
+its vblank wait returns and commits the damage regardless
+(`drm_fb_helper.c:237`, `:249`); what a foreign master actually blocks is any
+OTHER process becoming master (`drm_auth.c:260`) plus the `setcmap` and
+`pan_display` fbdev ioctls (`:863`, `:1247`).
 An earlier revision of this section reasoned from the absence of
 `SET_MASTER` and concluded the probe took no mastership; that was exactly
 backwards, and two reviewers caught it. Dropping the mastership on the one
@@ -419,12 +423,34 @@ and free it. They are what makes `mmap` unavoidable and the mapping class
 below real; the section on it records what landed against the shape budgeted
 in advance.
 
-`MODE_SETCRTC`, `MODE_ADDFB2`, `MODE_PAGE_FLIP` and `MODE_ATOMIC` remain named
-in the confinement test as ABSENT rather than left unmentioned, so the backend
-landing adds each by amendment instead of arriving with a module that already
-has them. The line between them and the trio is what each increment may do:
-allocating a buffer and writing into it changes nothing on screen, and those
-four are what put pixels on glass.
+Five more joined for the MODESET landing that followed, and this is the group
+that CHANGES WHAT IS ON SCREEN. `SET_MASTER` (0x641e) is the authority for the
+rest: opening a primary node already grants mastership when `dev->master` is
+NULL and `open_card` gives it straight back, so this re-takes it deliberately
+for a bounded window — which is why `DROP_MASTER` was rostered two increments
+before its opposite, and why the asymmetry was worth keeping that long.
+`MODE_GETCRTC`/`MODE_SETCRTC` (0xc06864a1/0xc06864a2) read and write one CRTC's
+mode, framebuffer and connector set, both carrying the 104-byte
+`drm_mode_crtc`; `MODE_ADDFB2` (0xc06864b8) registers a buffer as a scanout
+framebuffer and `MODE_RMFB` (0xc00464af) unregisters one, and `RMFB`'s size
+field is 4 rather than a struct's because it takes a bare `unsigned int`.
+
+The modeset probe is a separate subcommand rather than more output from the
+discovery one, and the reason is the SETCRTC rather than the mastership. Once
+this probe's framebuffer is on the primary plane, the fbdev console's damage
+stops reaching the screen: `drm_atomic_helper_dirtyfb` skips every plane whose
+current framebuffer is not the one being damaged (`drm_damage_helper.c:168`),
+so the console commits its updates to a buffer nothing scans out. Discovery is
+safe to run beside a running compositor; this is not, and two claims that
+different must not share one name.
+
+`MODE_PAGE_FLIP` and `MODE_ATOMIC` remain named in the confinement test as
+ABSENT. A modeset puts ONE picture on a screen; a page flip is what makes a
+sequence of them a display, and it needs a completion path — an event on the
+card descriptor, matched to the frame that caused it — which no increment has
+built. The confinement test's stand-in for "not ours" moved from `SETCRTC` to
+those two in the same landing, because a test naming an admitted request as
+absent asserts nothing while still passing.
 
 Every rostered DRM request is pinned for `EVIOCGABS`'s reason, arriving at it
 a third way.
@@ -459,7 +485,7 @@ rather than believed, since the kernel copies a connector's mode and encoder
 arrays all-or-nothing.
 
 The request roster is enforced in code, not only in a test — one
-allow-list refuses anything outside the fourteen before either entry point
+allow-list refuses anything outside the nineteen before either entry point
 issues the syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.

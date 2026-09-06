@@ -241,7 +241,7 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::TD_COMPOSITOR_DRM_PROBE_MARKER;
+    use crate::ladder::{TD_COMPOSITOR_DRM_PROBE_MARKER, TD_COMPOSITOR_KMS_PROBE_MARKER};
     use super::super::system_x86_64::{ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME};
     use crate::ladder::{
         TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
@@ -565,6 +565,42 @@ mod tests {
         assert!(
             drm.contains(r#""buffer={}x{} pitch={} bytes={} mapping=ok""#),
             "DumbFrame::describe no longer emits the fields the boot check reads"
+        );
+    }
+
+    /// The KMS marker and its fields, held together the same way and for the
+    /// same reason the DRM ones are.
+    ///
+    /// This is the second copy of a lesson rather than a new one: a rename in
+    /// `Modeset::describe` passes every host test in both crates and then fails
+    /// every agent's `qemu-boot-system` with a report the check reads as a
+    /// broken card. The marker itself lives in `ladder.rs` so both sides share
+    /// one constant; the FIELDS cannot, so they are asserted here.
+    #[test]
+    fn the_kms_probe_marker_is_the_one_the_compositor_prints() {
+        assert!(
+            MAIN_RS.contains(&format!(
+                "\"{TD_COMPOSITOR_KMS_PROBE_MARKER} {{}} output={{}}x{{}} {{}} {{}}\""
+            )),
+            "td-compositor no longer prints {TD_COMPOSITOR_KMS_PROBE_MARKER} in the shape the \
+             boot check greps for"
+        );
+        assert!(MAIN_RS.contains("\"probe-kms\" => {"));
+        let drm = MODULES
+            .iter()
+            .find(|(name, _)| *name == "drm")
+            .map(|(_, source)| *source)
+            .expect("td-compositor no longer declares a drm module");
+        assert!(
+            drm.contains(r#""fb={} modeset=ok""#),
+            "Modeset::describe no longer emits the fields the boot check reads"
+        );
+        // And it does NOT emit a second `crtc=`, which `Discovery::describe`
+        // already puts on the same line: two fields of one name in one
+        // whitespace-split report are read by whichever comes first.
+        assert!(
+            !drm.contains(r#""crtc={} fb={}"#),
+            "Modeset::describe emits a crtc= field that collides with discovery's"
         );
     }
 }

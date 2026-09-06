@@ -138,6 +138,7 @@ const TD_PORTAL_CHANNEL_CONSOLE_MARKER: &str =
 /// rather than the first application to be jailed.
 const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
 const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_DRM_PROBE_MARKER;
+const TD_COMPOSITOR_KMS_PROBE_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_KMS_PROBE_MARKER;
 
 /// The longest DRM report this will read back, past which the line is not one
 /// this check understands.
@@ -465,6 +466,7 @@ struct ConsoleEvidence {
     /// a usable mode would satisfy a boolean while failing the thing the
     /// marker is for.
     td_compositor_drm: Option<String>,
+    td_compositor_kms: Option<String>,
     td_jail_kill_reaps: bool,
     td_firefox: bool,
     td_firefox_content: bool,
@@ -2118,6 +2120,64 @@ fn validate_system_boot(
                      {pitch}, which needs {}. A buffer shorter than its own stride demands is \
                      one a renderer writes past. Report was: {report}",
                     pitch * height
+                ));
+            }
+        }
+    }
+    match result.evidence.td_compositor_kms.as_deref() {
+        None => {
+            return Err(format!(
+                "td-compositor's KMS modeset marker ({TD_COMPOSITOR_KMS_PROBE_MARKER:?}) was \
+                 absent. Discovery having passed, the card exists and offers a driveable mode, \
+                 so this is the modeset itself failing: DRM mastership refused, ADDFB2 \
+                 rejecting the dumb buffer as a scanout framebuffer, SETCRTC refusing the mode \
+                 the connector advertised, or the CRTC reading back as something other than \
+                 what was asked for. §M's first row is a KMS output backend and this is the \
+                 half that proves a mode can actually be programmed. Last serial output:\n{}",
+                tail(&result.console, 80)
+            ));
+        }
+        Some(report) => {
+            // `modeset=ok` is printed only after the CRTC was read BACK and
+            // agreed: valid mode, our framebuffer id, our size. `SETCRTC`
+            // answering success is a weaker claim and is not what this asserts.
+            if !report.split_whitespace().any(|field| field == "modeset=ok") {
+                return Err(format!(
+                    "td-compositor reported a KMS probe without a completed modeset. The \
+                     probe takes mastership, registers the mapped dumb buffer with ADDFB2, \
+                     drives the connector from its CRTC with SETCRTC, and reads the CRTC back; \
+                     `modeset=ok` is printed only when the CRTC reports a valid mode, that \
+                     framebuffer and that size. Report was: {report}"
+                ));
+            }
+            // A CRTC and a framebuffer id, both non-zero. Zero is the kernel's
+            // "no object": a report naming crtc=0 or fb=0 would be describing
+            // a modeset onto nothing while still carrying the marker.
+            let id = |name: &str| -> u32 {
+                report
+                    .split_whitespace()
+                    .find_map(|entry| entry.strip_prefix(name))
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or_default()
+            };
+            let crtc = id("crtc=");
+            let fb = id("fb=");
+            if crtc == 0 || fb == 0 {
+                return Err(format!(
+                    "td-compositor reported a modeset onto crtc {crtc} with framebuffer {fb}, \
+                     and zero is the kernel's \"no such object\" for both. Report was: {report}"
+                ));
+            }
+            // The same driver as discovery. A modeset proven against some
+            // other card would say nothing about the one this image pins.
+            let driver = report
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("driver="))
+                .unwrap_or_default();
+            if driver != "virtio_gpu" {
+                return Err(format!(
+                    "td-compositor set a mode on a card behind {driver:?} rather than \
+                     \"virtio_gpu\". Report was: {report}"
                 ));
             }
         }
@@ -4980,6 +5040,13 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_LOGIN_RUNTIME_MARKER.len(),
         TD_BUSD_RUNTIME_MARKER.len(),
         TD_COMPOSITOR_DRM_PROBE_MARKER.len() + 1 + DRM_REPORT_MAX,
+        // Its own entry, not the DRM one doing double duty. The two marker
+        // strings happen to be the same length today, so omitting this changed
+        // nothing -- until someone renames one. A KMS report longer than the
+        // window is then dropped at a chunk boundary and surfaces as "the
+        // marker was absent", which reads as a broken card rather than as a
+        // retention bug.
+        TD_COMPOSITOR_KMS_PROBE_MARKER.len() + 1 + DRM_REPORT_MAX,
         exact_line_window(TD_PORTAL_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_REQUEST_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_CHANNEL_CONSOLE_MARKER),
@@ -5293,6 +5360,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_compositor_drm,
         buf,
         TD_COMPOSITOR_DRM_PROBE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_reported_line(
+        &mut evidence.td_compositor_kms,
+        buf,
+        TD_COMPOSITOR_KMS_PROBE_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -9177,6 +9250,12 @@ mod tests {
          buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok"
             .to_string(),
     );
+    evidence.td_compositor_kms = Some(
+        "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 \
+         mode=1280x800@60 name=1280x800 preferred=true mm=0x0 output=1280x800 \
+         buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok fb=7 modeset=ok"
+            .to_string(),
+    );
     evidence.td_jail_kill_reaps = true;
     evidence.td_jail_seccomp = true;
     evidence.td_jail_transition = true;
@@ -9400,6 +9479,61 @@ mod tests {
         );
     }
 
+    /// The same for the KMS report, because the same latch carries it and the
+    /// same overlap has to be wide enough.
+    ///
+    /// The twin of the DRM test above, with its limitation stated the same
+    /// way. Both markers are 26 bytes today, so the DRM entry in
+    /// `evidence_marker_max_len` sizes the window for both and deleting the
+    /// KMS entry alone leaves this green. The entry stays because that
+    /// coincidence is not a property anyone is maintaining -- rename either
+    /// marker and it is gone -- and this test stays because it is what fails
+    /// if the overlap ever drops below what a full KMS report needs, whoever
+    /// was providing it.
+    #[test]
+    fn drain_console_carries_a_longest_kms_report_across_a_read_boundary() {
+        const CHUNK: usize = 8192;
+        let prefix = " driver=virtio_gpu crtc=29 fb=7 modeset=ok pad=";
+        let field = format!(
+            "{prefix}{}",
+            "y".repeat(DRM_REPORT_MAX.saturating_sub(prefix.len()))
+        );
+        assert_eq!(field.len(), DRM_REPORT_MAX, "the widest report the latch takes");
+        let line = format!("{TD_COMPOSITOR_KMS_PROBE_MARKER}{field}");
+
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+
+        let pad = CHUNK.saturating_sub(line.len() + 1);
+        let mut bytes = vec![b'x'; pad];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(line.as_bytes());
+        assert_eq!(bytes.len(), CHUNK, "the newline must land on the seam");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[b'z'; 128]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            &mut evidence,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.td_compositor_kms.as_deref(),
+            Some(field.trim()),
+            "the retained tail did not carry a maximum-length KMS report - the rescan overlap \
+             regressed"
+        );
+    }
+
     /// Past the bound the line is skipped, not truncated: a truncated report
     /// reads as a shorter well-formed one, and its fields are then asserted.
     #[test]
@@ -9420,7 +9554,7 @@ mod tests {
     fn the_drm_row_is_what_rejects_a_boot_missing_its_marker() {
         let mut evidence = healthy_evidence();
         evidence.td_compositor_drm = None;
-        let complaint = drm_complaint(evidence);
+        let complaint = boot_complaint(evidence);
         assert!(
             complaint.contains(TD_COMPOSITOR_DRM_PROBE_MARKER),
             "the rejection must name the marker that was absent: {complaint}"
@@ -9433,7 +9567,7 @@ mod tests {
         let mut evidence = healthy_evidence();
         evidence.td_compositor_drm =
             Some("driver=bochs-drm output=1280x800".to_string());
-        let complaint = drm_complaint(evidence);
+        let complaint = boot_complaint(evidence);
         assert!(complaint.contains("bochs-drm"), "{complaint}");
         assert!(complaint.contains("virtio_gpu"), "{complaint}");
     }
@@ -9446,7 +9580,7 @@ mod tests {
             let mut evidence = healthy_evidence();
             evidence.td_compositor_drm =
                 Some(format!("driver=virtio_gpu {output}"));
-            let complaint = drm_complaint(evidence);
+            let complaint = boot_complaint(evidence);
             assert!(
                 complaint.contains("no usable scanout size"),
                 "{output} was accepted: {complaint}"
@@ -9468,7 +9602,7 @@ mod tests {
             "driver=virtio_gpu output=1280x800 buffer=1280x800 pitch=5120 bytes=4096000"
                 .to_string(),
         );
-        let complaint = drm_complaint(evidence);
+        let complaint = boot_complaint(evidence);
         assert!(complaint.contains("did not prove a dumb-buffer"), "{complaint}");
     }
 
@@ -9482,7 +9616,7 @@ mod tests {
             evidence.td_compositor_drm = Some(format!(
                 "driver=virtio_gpu output=1280x800 pitch=5120 bytes=4096000 {tail}"
             ));
-            let complaint = drm_complaint(evidence);
+            let complaint = boot_complaint(evidence);
             assert!(
                 complaint.contains("did not prove a dumb-buffer"),
                 "{tail} was accepted: {complaint}"
@@ -9502,7 +9636,7 @@ mod tests {
         evidence.td_compositor_drm = Some(
             "driver=virtio_gpu output=1280x800 pitch=4096 bytes=4096000 mapping=ok".to_string(),
         );
-        let complaint = drm_complaint(evidence);
+        let complaint = boot_complaint(evidence);
         assert!(complaint.contains("must cover"), "{complaint}");
         // 1280 * 4, named so the failure says what was expected.
         assert!(complaint.contains("5120"), "{complaint}");
@@ -9516,9 +9650,76 @@ mod tests {
         evidence.td_compositor_drm = Some(
             "driver=virtio_gpu output=1280x800 pitch=5120 bytes=4095999 mapping=ok".to_string(),
         );
-        let complaint = drm_complaint(evidence);
+        let complaint = boot_complaint(evidence);
         assert!(complaint.contains("writes past"), "{complaint}");
         assert!(complaint.contains("4096000"), "{complaint}");
+    }
+
+    /// Discovery passing does not mean a mode was set. The absent marker is
+    /// the modeset itself failing, and it is a separate row for that reason.
+    #[test]
+    fn a_boot_that_discovered_a_card_but_set_no_mode_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_kms = None;
+        let complaint = boot_complaint(evidence);
+        assert!(complaint.contains(TD_COMPOSITOR_KMS_PROBE_MARKER), "{complaint}");
+    }
+
+    /// `modeset=ok` is printed only after the CRTC was read back and agreed.
+    /// A probe that reached the modeset and stopped carries everything up to
+    /// it, which is exactly the report a weaker check would accept.
+    #[test]
+    fn a_kms_report_without_a_completed_modeset_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_kms =
+            Some("driver=virtio_gpu crtc=29 output=1280x800 fb=7".to_string());
+        let complaint = boot_complaint(evidence);
+        assert!(complaint.contains("without a completed modeset"), "{complaint}");
+    }
+
+    /// Whole-field, not substring: `modeset=okay` must not satisfy it.
+    #[test]
+    fn a_modeset_field_that_only_looks_right_is_rejected() {
+        for tail in ["modeset=okay", "modeset=failed", "xmodeset=ok"] {
+            let mut evidence = healthy_evidence();
+            evidence.td_compositor_kms =
+                Some(format!("driver=virtio_gpu crtc=29 fb=7 {tail}"));
+            let complaint = boot_complaint(evidence);
+            assert!(
+                complaint.contains("without a completed modeset"),
+                "{tail} was accepted: {complaint}"
+            );
+        }
+    }
+
+    /// Zero is the kernel's "no such object" for both ids, so a report naming
+    /// either is describing a modeset onto nothing.
+    #[test]
+    fn a_modeset_onto_object_zero_is_rejected() {
+        for report in [
+            "driver=virtio_gpu crtc=0 fb=7 modeset=ok",
+            "driver=virtio_gpu crtc=29 fb=0 modeset=ok",
+            "driver=virtio_gpu crtc=29 modeset=ok",
+        ] {
+            let mut evidence = healthy_evidence();
+            evidence.td_compositor_kms = Some(report.to_string());
+            let complaint = boot_complaint(evidence);
+            assert!(
+                complaint.contains("no such object"),
+                "{report} was accepted: {complaint}"
+            );
+        }
+    }
+
+    /// A modeset proven against some other card says nothing about the one
+    /// this image pins.
+    #[test]
+    fn a_modeset_on_another_driver_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_kms =
+            Some("driver=bochs-drm crtc=29 fb=7 modeset=ok".to_string());
+        let complaint = boot_complaint(evidence);
+        assert!(complaint.contains("bochs-drm"), "{complaint}");
     }
 
     /// A report whose numbers are too large to be real is rejected rather than
@@ -9538,7 +9739,7 @@ mod tests {
         ] {
             let mut evidence = healthy_evidence();
             evidence.td_compositor_drm = Some(report.to_string());
-            let complaint = drm_complaint(evidence);
+            let complaint = boot_complaint(evidence);
             assert!(
                 complaint.contains("must cover") || complaint.contains("writes past"),
                 "an impossible report was accepted: {complaint}"
@@ -9554,7 +9755,7 @@ mod tests {
         evidence.td_compositor_drm = Some(
             "driver=virtio_gpu output=1280x800 pitch=8192 bytes=6553600 mapping=ok".to_string(),
         );
-        let complaint = drm_complaint(evidence);
+        let complaint = boot_complaint(evidence);
         assert!(
             !complaint.contains("must cover") && !complaint.contains("writes past"),
             "a padded pitch was rejected: {complaint}"
@@ -9564,14 +9765,14 @@ mod tests {
     /// The healthy report passes this row and the walk moves on.
     #[test]
     fn a_virtio_gpu_report_with_a_mode_passes_this_row() {
-        let complaint = drm_complaint(healthy_evidence());
+        let complaint = boot_complaint(healthy_evidence());
         assert!(
             !complaint.contains("DRM"),
             "the DRM row must not be the complaint for a healthy report: {complaint}"
         );
     }
 
-    fn drm_complaint(evidence: ConsoleEvidence) -> String {
+    fn boot_complaint(evidence: ConsoleEvidence) -> String {
         let result = BootResult {
             evidence,
             exited_clean: true,

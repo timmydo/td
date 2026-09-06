@@ -8339,15 +8339,68 @@ check asserts `mapping=ok` together with a pitch that covers the scanout width
 and a size that covers pitch times height, so the claim is proven on a real
 card rather than in a unit test.
 
+Row 1's MODESET half has landed since, and with it the row is complete apart
+from the page flip. `Modeset::apply` takes DRM mastership, registers the mapped
+dumb buffer with `ADDFB2`, drives the discovered connector from its CRTC with
+`SETCRTC`, and then reads the CRTC BACK with `GETCRTC` — because `SETCRTC`
+answering success is a weaker claim than the CRTC showing what was asked for,
+and a driver that kept the previous framebuffer would answer success while
+displaying the old picture. Reading it back is the strongest statement about
+what is on a screen that a headless process can make.
+
+The routing that restore puts back is READ rather than assumed. No ioctl
+reports a CRTC's connector set, so the probe walks the reverse mapping —
+connector to encoder to CRTC — under the mastership it just took. An earlier
+revision substituted the connector it was about to drive, which is the same set
+only when one sink is connected; two reviewers caught it, and on a two-monitor
+card it would have restored the wrong one and left the other dark.
+
+Everything is restored on the way out, in an order the type carries: the CRTC
+stops scanning out this framebuffer, then the framebuffer is unregistered, then
+mastership is released. The reason is narrower than "the kernel would refuse
+the other order", which an earlier draft of this paragraph claimed. Only
+`SETCRTC` is flagged `DRM_MASTER`; `ADDFB2` and `RMFB` need no master, and
+`RMFB` on a live framebuffer does not fail — the kernel disables the CRTCs
+using it, as the DRM ABI requires. What the order buys is that the restore, a
+`SETCRTC`, still has mastership when it runs, and that the screen is not
+blanked and then repainted on the way out.
+
+What this half does NOT get is a display. `MODE_PAGE_FLIP` and `MODE_ATOMIC`
+stay absent: one picture on a screen is a modeset, a sequence of them is a page
+flip, and that needs the completion path row 3 already records as unbuilt — an
+event on the card descriptor, matched to the frame that caused it, through an
+identity neither `Submission` nor `OutputEvent` carries. Substituting the
+backend into `Runtime` waits on it too, so `Framebuffer` is still the only
+`OutputBackend` implementation.
+
+The probe that proves this DISTURBS the screen, which discovery's did not —
+and the mechanism is the modeset, not the mastership. Once this probe's
+framebuffer is on the primary plane, the fbdev console's damage stops reaching
+the screen, because the kernel skips every plane whose current framebuffer is
+not the one being damaged; the console goes on painting into a buffer nothing
+scans out. So `probe-kms` is a separate subcommand from `probe-drm` and nothing
+in the boot's health verdict depends on the display while it runs. On the
+headless QEMU check there is nothing to disturb; on a machine with a monitor
+there would be, briefly.
+
 It does, however, take DRM mastership, and saying otherwise was this
 increment's one real defect. Opening a PRIMARY node makes the opener master
 whenever `dev->master` is NULL, which is exactly the state fbcon leaves it in,
 so `SET_MASTER` never being issued proves nothing — the `open` is the
-acquisition, and while it is held the fbdev damage the running compositor
-depends on is refused with `-EBUSY`. `open_card` therefore drops mastership
-immediately, and the confinement test pins that release rather than the
-absence of `SET_MASTER`. What lets this probe run beside the compositor
-driving the same card is the drop, not an absence.
+acquisition. `open_card` therefore drops mastership immediately, and the
+confinement test pins that release rather than the absence of `SET_MASTER`.
+What lets this probe run beside the compositor driving the same card is the
+drop, not an absence.
+
+The modeset landing corrected the second half of that sentence, which had said
+the held mastership refuses the running compositor's fbdev damage. It does
+not: the kernel's fbdev helper asks for a vblank, is told `-EBUSY` while a
+foreign master exists, discards that answer and commits the damage anyway. A
+foreign master costs the console its vblank rate-limit, blocks any other
+process from becoming master, and fails the palette and panning ioctls — three
+real effects, none of them the one claimed. Dropping mastership promptly is
+still right, and the strongest reason is the second: while this descriptor is
+master, a genuine DRM compositor cannot take the card.
 
 The same correction applies to how the connector is read. `count_modes = 0` is
 the kernel's FORCE-PROBE request, which its own header says "can be slow,

@@ -12,6 +12,7 @@
 //! CRTC can drive it.
 
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -180,11 +181,10 @@ impl Drop for DumbHandle<'_> {
 /// compiler enforces for free.
 pub struct DumbFrame<'card> {
     region: sys::MappedRegion,
-    /// Never read, and that is the point: this field exists for its `Drop`,
-    /// which is what releases the GEM handle after `region` has unmapped it.
-    /// Held by value rather than released in a destructor here so the ordering
-    /// is the compiler's business rather than a comment's.
-    #[allow(dead_code)]
+    /// Held by value rather than released in a destructor here, so the release
+    /// ORDER is the compiler's business rather than a comment's. It is read
+    /// now, by `handle()`, which the modeset needs to name the buffer to
+    /// `ADDFB2`; before that it existed only for its `Drop`.
     handle: DumbHandle<'card>,
     width: u32,
     height: u32,
@@ -217,6 +217,38 @@ impl<'card> DumbFrame<'card> {
             height,
             pitch: buffer.pitch,
         })
+    }
+
+    /// The kernel's stride for this buffer, in bytes.
+    ///
+    /// The kernel's, never `width * 4`: a driver may align a scanline well past
+    /// the pixel width, and `ADDFB2` has to be told the real one or the
+    /// framebuffer it registers describes rows that are not where the pixels
+    /// are.
+    pub fn pitch(&self) -> u32 {
+        self.pitch
+    }
+
+    /// The GEM handle, for naming this buffer to `ADDFB2`.
+    pub fn handle(&self) -> u32 {
+        self.handle.handle
+    }
+
+    /// The size this buffer was ALLOCATED at.
+    ///
+    /// Read by the modeset so it can refuse to register a framebuffer whose
+    /// declared size is not the size of the memory behind it. `ADDFB2` is told
+    /// a width, a height, a pitch and a handle as four bare numbers, and the
+    /// kernel's own object-size check is the only thing that would catch a
+    /// mismatch -- which makes it an error reported from the wrong place, in
+    /// terms of a GEM object rather than of the two sizes that disagreed.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// The height this buffer was allocated at. See `width`.
+    pub fn height(&self) -> u32 {
+        self.height
     }
 
     /// The mapping's length.
@@ -258,6 +290,40 @@ impl<'card> DumbFrame<'card> {
             self.len()
         )
     }
+}
+
+/// Is this CRTC actually showing what was asked for?
+///
+/// Split out of `verify` so the three refusals are testable against recorded
+/// CRTC states rather than against a card. Each is a different failure with a
+/// different cause, which is why they are three checks and not one equality:
+/// a dark CRTC means the modeset did not take, a different framebuffer means
+/// the driver kept the old picture and answered success anyway, and a
+/// different size means the kernel validated the request into some other mode.
+fn crtc_shows(
+    live: &sys::DrmModeCrtc,
+    crtc_id: u32,
+    fb_id: u32,
+    wanted: &sys::DrmModeInfo,
+) -> Result<(), String> {
+    if live.mode_valid == 0 {
+        return Err(format!(
+            "CRTC {crtc_id} reports no valid mode after the modeset was accepted"
+        ));
+    }
+    if live.fb_id != fb_id {
+        return Err(format!(
+            "CRTC {crtc_id} is scanning out framebuffer {} rather than the {fb_id} just set",
+            live.fb_id
+        ));
+    }
+    if live.mode.hdisplay != wanted.hdisplay || live.mode.vdisplay != wanted.vdisplay {
+        return Err(format!(
+            "CRTC {crtc_id} settled on {}x{} rather than the {}x{} asked for",
+            live.mode.hdisplay, live.mode.vdisplay, wanted.hdisplay, wanted.vdisplay
+        ));
+    }
+    Ok(())
 }
 
 /// The first byte of the read-back pattern. Not zero and not `0xff`: a mapping
@@ -340,6 +406,301 @@ fn verify_pattern(pixels: &[u8], offsets: &[usize]) -> Result<(), String> {
     Ok(())
 }
 
+/// DRM mastership, taken for a bounded window and given back on drop.
+struct MasterGuard<'card> {
+    card: &'card File,
+}
+
+impl Drop for MasterGuard<'_> {
+    fn drop(&mut self) {
+        let _ = sys::drm_drop_master(self.card);
+    }
+}
+
+/// One registered scanout framebuffer, unregistered on drop.
+struct FbGuard<'card> {
+    card: &'card File,
+    fb_id: u32,
+}
+
+impl Drop for FbGuard<'_> {
+    fn drop(&mut self) {
+        let _ = sys::drm_rm_fb(self.card, self.fb_id);
+    }
+}
+
+/// The CRTC state as it was before this process touched it.
+///
+/// `GETCRTC` reports the mode, framebuffer and position but NOT the connector
+/// routing — the kernel fills neither `set_connectors_ptr` nor
+/// `count_connectors` on the way out (`drm_mode_getcrtc`, `drm_crtc.c:543`) —
+/// so the routing is read the long way instead, by `connectors_on_crtc`.
+///
+/// An earlier revision substituted the connector this code was about to drive
+/// and called it "the same connector fbcon was using". It is not the same
+/// thing. The connector is chosen by `select_scanout` on PREFERENCE and its
+/// CRTC by `crtc_for`, which falls back to the first CRTC the connector's
+/// encoder can reach — so on a card with two connected sinks, this can pick a
+/// CRTC that some OTHER connector is currently lit by, and restoring to the
+/// selected connector would then leave that sink dark. Reading the routing
+/// costs three ioctls this module already issues and removes the guess.
+///
+/// This is still best-effort, and the backstop is weaker than it looks:
+/// `drm_lastclose`'s `drm_client_dev_restore` puts the fbdev client back
+/// exactly, but `drm_release` calls it only when the device's open count
+/// reaches zero (`drm_file.c:440`). Nothing else opens the card today, so it
+/// does run; the moment §M row 1's backend holds the node open it stops
+/// running, and this restore becomes the only one there is.
+struct CrtcRestore<'card> {
+    card: &'card File,
+    saved: sys::DrmModeCrtc,
+    connectors: Vec<u32>,
+}
+
+impl<'card> CrtcRestore<'card> {
+    /// Capture a CRTC state as a request `SETCRTC` will actually accept.
+    ///
+    /// The saved state and a well-formed request are not the same thing, and
+    /// the gap is reachable. `drm_mode_getcrtc` fills `mode_valid` from
+    /// `crtc->state->enable` and `fb_id` from the primary plane INDEPENDENTLY
+    /// (`drm_crtc.c:577`, `:562`), so an enabled CRTC with no primary
+    /// framebuffer reads back as `mode_valid = 1, fb_id = 0`. Replaying that
+    /// asks the kernel to look up framebuffer 0, which answers `-ENOENT`
+    /// (`:773`). Two more shapes are refused outright: a mode with no
+    /// connectors (`:824`) and connectors with no mode or no framebuffer
+    /// (`:830`).
+    ///
+    /// So anything that would be refused is turned into the one request that
+    /// is always well-formed — switch the CRTC off — rather than sent and
+    /// silently failed. That is a worse restore than the real one and a better
+    /// one than none, and `drm_lastclose` is what makes it recoverable.
+    fn capture(card: &'card File, saved: sys::DrmModeCrtc, connectors: Vec<u32>) -> Self {
+        if is_restorable(&saved, &connectors) {
+            return CrtcRestore {
+                card,
+                saved,
+                connectors,
+            };
+        }
+        let mut off = saved;
+        off.mode_valid = 0;
+        off.fb_id = 0;
+        CrtcRestore {
+            card,
+            saved: off,
+            connectors: Vec::new(),
+        }
+    }
+}
+
+impl Drop for CrtcRestore<'_> {
+    fn drop(&mut self) {
+        // Reported rather than swallowed. A restore that failed leaves a
+        // screen this process is responsible for in a state it did not
+        // intend, and the old `let _ =` made that indistinguishable from
+        // success. stderr and never stdout: the probe marker is on stdout and
+        // the boot check reads that stream whole-line.
+        if let Err(error) = sys::drm_set_crtc(self.card, &self.saved, &mut self.connectors) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "td-compositor: restoring CRTC {} failed: {error}",
+                self.saved.crtc_id
+            );
+        }
+    }
+}
+
+/// Was this frame allocated at the size the mode is about to be set to?
+///
+/// Checked HERE rather than left to the kernel. `ADDFB2` is told a width, a
+/// height, a pitch and a handle as four bare numbers and validates them against
+/// the GEM object's size, so a frame allocated at some other size comes back as
+/// "object too small" — an error about a handle, raised inside the kernel, for
+/// a mistake that is visible right here as two sizes that disagree. Split out
+/// for `crtc_shows`'s reason: the refusal is then testable without a card.
+///
+/// `probe_kms` allocates from the same mode it sets, so nothing reaches this
+/// today. It is a precondition of `apply`, not of that one caller, and the
+/// backend §M row 1 still owes will have a buffer pool that outlives any single
+/// mode.
+fn frame_fits_mode(
+    frame_width: u32,
+    frame_height: u32,
+    mode_width: u32,
+    mode_height: u32,
+) -> Result<(), String> {
+    if frame_width != mode_width || frame_height != mode_height {
+        return Err(format!(
+            "the frame is {frame_width}x{frame_height} but the mode to be set is \
+             {mode_width}x{mode_height} — a framebuffer registered at the mode's size would \
+             describe rows this buffer does not have"
+        ));
+    }
+    Ok(())
+}
+
+/// Can this saved state be sent back as-is?
+///
+/// Split out of `capture` so the three shapes the kernel refuses are testable
+/// against recorded CRTC states rather than against a card, for the reason
+/// `crtc_shows` is split out of `verify`. All three have to hold at once: a
+/// mode to set, a framebuffer to set it onto, and at least one connector to
+/// send it to. Any one missing and `SETCRTC` answers `-EINVAL` or `-ENOENT`
+/// rather than restoring anything.
+fn is_restorable(saved: &sys::DrmModeCrtc, connectors: &[u32]) -> bool {
+    saved.mode_valid != 0 && saved.fb_id != 0 && !connectors.is_empty()
+}
+
+/// Which connectors the kernel is currently routing to `crtc_id`.
+///
+/// The long way round, because there is no short one: no ioctl reports a
+/// CRTC's connector set. What exists is the reverse mapping — each connector
+/// names the encoder it is bound to, and each encoder names its CRTC — so this
+/// walks every connector and keeps the ones that lead back here.
+///
+/// Read UNDER mastership and immediately before the modeset, which is the only
+/// time the answer is the one that will need restoring. Individual failures
+/// are skipped rather than propagated, for `select_scanout`'s reason: a
+/// connector can vanish between being listed and being read, and one that did
+/// is one this CRTC is certainly not scanning out.
+fn connectors_on_crtc(card: &File, crtc_id: u32) -> Result<Vec<u32>, String> {
+    let listed = sys::drm_resources(card)?;
+    let mut routed = Vec::with_capacity(listed.connectors.len());
+    for id in &listed.connectors {
+        let Ok(connector) = sys::drm_connector(card, *id) else {
+            continue;
+        };
+        if connector.encoder_id == 0 {
+            continue;
+        }
+        let Ok(encoder) = sys::drm_encoder(card, connector.encoder_id) else {
+            continue;
+        };
+        if encoder.crtc_id == crtc_id {
+            routed.push(connector.id);
+        }
+    }
+    Ok(routed)
+}
+
+/// One modeset: a framebuffer registered, a CRTC driving it, and mastership
+/// held for as long as both are true.
+///
+/// Release order is declaration order again, and the reason is narrower than
+/// it first looks. Only ONE of the three steps needs mastership: `SETCRTC`
+/// carries `DRM_MASTER` in the kernel's ioctl table, while `GETCRTC`, `ADDFB2`
+/// and `RMFB` carry no flag at all (`drm_ioctl.c:674`, `675`, `691`, `692`).
+/// So the load-bearing part is that the restore -- which is a `SETCRTC` --
+/// happens while mastership is still held, and mastership is therefore
+/// released last.
+///
+/// Unregistering first would not FAIL, and an earlier revision of this comment
+/// said it would. `drm_framebuffer_remove` scans the CRTCs and planes using a
+/// framebuffer and disables them, because "drm ABI mandates that we remove any
+/// deleted framebuffers from active usage" (`drm_framebuffer.c:1157`). The
+/// consequence of the wrong order is a CRTC the kernel blanked and this code
+/// then turned back on -- a flicker rather than an error, which is a weaker
+/// reason to keep the order but still a reason.
+///
+/// Written as three fields with no `Drop` on this type, for the reason
+/// `DumbFrame` records: a type's own destructor runs before its fields, so
+/// putting the sequence there would run it in exactly the wrong place.
+pub struct Modeset<'card, 'frame> {
+    /// None of these three is ever READ, and that is what they are for: each
+    /// exists so its `Drop` runs, and the order they run in is the order they
+    /// are declared. Annotated individually rather than with one allowance on
+    /// the type, so a fourth field has to say for itself why nothing reads it.
+    #[allow(dead_code)]
+    restore: CrtcRestore<'card>,
+    #[allow(dead_code)]
+    fb: FbGuard<'card>,
+    #[allow(dead_code)]
+    master: MasterGuard<'card>,
+    /// The fourth field, saying for itself. Nothing reads it and it has no
+    /// destructor; it is here so the COMPILER refuses a modeset that outlives
+    /// the buffer it is scanning out. Without it `Modeset` borrows only the
+    /// card, so dropping the frame first releases the GEM handle and unmaps
+    /// the memory while the framebuffer is still registered and still on
+    /// screen. The kernel survives that — a framebuffer holds its own
+    /// reference to the object — but it is the one place the module's
+    /// "released together and in that order" discipline stopped at a comment,
+    /// and a borrow is cheaper than a comment.
+    #[allow(dead_code)]
+    frame: &'frame DumbFrame<'card>,
+    fb_id: u32,
+    crtc_id: u32,
+}
+
+impl<'card, 'frame> Modeset<'card, 'frame> {
+    /// Take mastership, register `frame` as a framebuffer, and drive the
+    /// scanout's connector from its CRTC.
+    ///
+    /// Each guard is built BEFORE the step that needs undoing can fail, so an
+    /// early return unwinds exactly what was done: `?` after `drm_set_master`
+    /// drops the master guard, `?` after `drm_add_fb` drops the framebuffer
+    /// too, and so on. That is the same discipline `DumbFrame::allocate` uses
+    /// and the reason neither needs a cleanup path written by hand.
+    pub fn apply(
+        card: &'card File,
+        scanout: &Scanout,
+        frame: &'frame DumbFrame<'card>,
+    ) -> Result<Modeset<'card, 'frame>, String> {
+        let width = u32::from(scanout.mode.hdisplay);
+        let height = u32::from(scanout.mode.vdisplay);
+        frame_fits_mode(frame.width(), frame.height(), width, height)?;
+        sys::drm_set_master(card)
+            .map_err(|error| format!("take DRM mastership to modeset: {error}"))?;
+        let master = MasterGuard { card };
+        let saved = sys::drm_get_crtc(card, scanout.crtc_id)?;
+        // Read before anything is changed, and under the mastership just
+        // taken: this is the routing the restore has to put back.
+        let routed = connectors_on_crtc(card, scanout.crtc_id)?;
+        let fb_id = sys::drm_add_fb(card, width, height, frame.pitch(), frame.handle())?;
+        let fb = FbGuard { card, fb_id };
+        let restore = CrtcRestore::capture(card, saved, routed);
+        let mut connectors = vec![scanout.connector_id];
+        let mut wanted = sys::DrmModeCrtc::empty();
+        wanted.crtc_id = scanout.crtc_id;
+        wanted.fb_id = fb_id;
+        wanted.mode_valid = 1;
+        wanted.mode = scanout.mode;
+        sys::drm_set_crtc(card, &wanted, &mut connectors)?;
+        Ok(Modeset {
+            restore,
+            fb,
+            master,
+            frame,
+            fb_id,
+            crtc_id: scanout.crtc_id,
+        })
+    }
+
+    /// Ask the CRTC what it is actually doing, and refuse anything but what was
+    /// asked for.
+    ///
+    /// `SETCRTC` returning success is not the same claim. The kernel validates
+    /// and can land on a different mode than the one requested, and a driver
+    /// that quietly kept the previous framebuffer would report success while
+    /// showing the old picture. Reading the CRTC back is the only statement
+    /// about what is on the screen that this process can make without a camera.
+    pub fn verify(&self, card: &File, wanted: &sys::DrmModeInfo) -> Result<(), String> {
+        let live = sys::drm_get_crtc(card, self.crtc_id)?;
+        crtc_shows(&live, self.crtc_id, self.fb_id, wanted)
+    }
+
+    /// One line, for a proof to match and a person to read.
+    ///
+    /// Deliberately does NOT repeat `crtc=`: `Discovery::describe` already
+    /// emits that field, and a second one in the same whitespace-split line
+    /// would be read by whichever `strip_prefix` ran first. They carry the same
+    /// number today -- `apply` modesets the CRTC discovery chose -- so the
+    /// duplicate would have been invisible until the day they differed, which
+    /// is exactly when the check would need to be right.
+    pub fn describe(&self) -> String {
+        format!("fb={} modeset=ok", self.fb_id)
+    }
+}
+
 /// Open a card node and immediately give back the authority opening it took.
 ///
 /// Read-write because a DRM node is: the mode-setting requests the next
@@ -351,9 +712,16 @@ fn verify_pattern(pixels: &[u8], offsets: &[usize]) -> Result<(), String> {
 /// claim this module makes about not disturbing the screen. `drm_master_open`
 /// makes the first opener of a primary node the DRM master whenever
 /// `dev->master` is NULL, and fbcon — an in-kernel client — never sets it. So
-/// the plain `open` above IS the acquisition, and while it is held the running
-/// compositor's fbdev damage is dropped with `-EBUSY`. Dropping it here closes
-/// a window measured in the whole length of the probe down to the two syscalls
+/// the plain `open` above IS the acquisition.
+///
+/// What holding it costs is not what an earlier revision of this comment
+/// claimed. The fbdev console keeps painting under a foreign master — the
+/// vblank wait answers `-EBUSY` and `drm_fb_helper_fb_dirty` discards it
+/// (`drm_fb_helper.c:237`, `:249`) — so the screen does NOT go stale. What
+/// does happen is that no other process can become master while this
+/// descriptor is one (`drm_auth.c:260`), which on a machine running a real DRM
+/// compositor is the disturbance that matters. Dropping it here closes a
+/// window measured in the whole length of the probe down to the two syscalls
 /// between them.
 pub fn open_card(path: &Path) -> Result<File, String> {
     let card = OpenOptions::new()
@@ -592,6 +960,105 @@ mod tests {
         let error = buffer_covers_scanout(u32::MAX, 1, u32::MAX, 0).unwrap_err();
         assert!(error.contains("needs"), "{error}");
         assert!(error.contains("18446744065119617025"), "{error}");
+    }
+
+    fn live_crtc(fb_id: u32, width: u16, height: u16, valid: u32) -> sys::DrmModeCrtc {
+        let mut state = sys::DrmModeCrtc::empty();
+        state.crtc_id = 29;
+        state.fb_id = fb_id;
+        state.mode_valid = valid;
+        state.mode = mode(width, height, true, "1280x800");
+        state
+    }
+
+    /// A CRTC showing exactly what was asked for passes.
+    #[test]
+    fn a_crtc_showing_the_requested_framebuffer_and_mode_passes() {
+        let wanted = mode(1280, 800, true, "1280x800");
+        assert_eq!(
+            crtc_shows(&live_crtc(7, 1280, 800, 1), 29, 7, &wanted),
+            Ok(())
+        );
+    }
+
+    /// `SETCRTC` answering success is not the same claim as the CRTC being on.
+    #[test]
+    fn a_crtc_that_stayed_dark_is_refused() {
+        let wanted = mode(1280, 800, true, "1280x800");
+        let error = crtc_shows(&live_crtc(7, 1280, 800, 0), 29, 7, &wanted).unwrap_err();
+        assert!(error.contains("no valid mode"), "{error}");
+    }
+
+    /// The failure this check exists for: a driver that accepted the request,
+    /// answered success, and kept scanning out the picture that was already
+    /// there. Nothing else in the probe would notice.
+    #[test]
+    fn a_crtc_still_showing_the_previous_framebuffer_is_refused() {
+        let wanted = mode(1280, 800, true, "1280x800");
+        let error = crtc_shows(&live_crtc(3, 1280, 800, 1), 29, 7, &wanted).unwrap_err();
+        assert!(error.contains("framebuffer 3"), "{error}");
+        assert!(error.contains("the 7 just set"), "{error}");
+    }
+
+    /// The kernel validates a requested mode and may land on another one, so
+    /// the size that matters is the size the CRTC ended up at.
+    #[test]
+    fn a_crtc_that_settled_on_another_mode_is_refused() {
+        let wanted = mode(1280, 800, true, "1280x800");
+        let error = crtc_shows(&live_crtc(7, 1024, 768, 1), 29, 7, &wanted).unwrap_err();
+        assert!(error.contains("1024x768"), "{error}");
+        assert!(error.contains("1280x800"), "{error}");
+    }
+
+    /// A frame allocated at the mode's size is the only one that may be
+    /// registered at it.
+    #[test]
+    fn a_frame_the_size_of_its_mode_is_accepted() {
+        assert_eq!(frame_fits_mode(1280, 800, 1280, 800), Ok(()));
+    }
+
+    /// Either dimension is enough, and the two are checked separately rather
+    /// than by area: 1280x800 and 800x1280 hold the same pixels and describe
+    /// different rows.
+    #[test]
+    fn a_frame_that_is_not_the_size_of_its_mode_is_refused() {
+        let error = frame_fits_mode(1024, 768, 1280, 800).unwrap_err();
+        assert!(error.contains("1024x768"), "{error}");
+        assert!(error.contains("1280x800"), "{error}");
+        assert!(frame_fits_mode(800, 1280, 1280, 800).is_err());
+        assert!(frame_fits_mode(1280, 768, 1280, 800).is_err());
+        assert!(frame_fits_mode(1024, 800, 1280, 800).is_err());
+    }
+
+    /// A CRTC that was lit, onto a real framebuffer, with somewhere to send
+    /// it: the only shape that can be replayed as it stands.
+    #[test]
+    fn a_lit_crtc_is_restored_as_it_was() {
+        assert!(is_restorable(&live_crtc(7, 1280, 800, 1), &[31]));
+    }
+
+    /// A CRTC that was already off. Replaying it means switching it off, which
+    /// `capture` expresses as the empty request rather than as this one.
+    #[test]
+    fn a_dark_crtc_is_not_replayed() {
+        assert!(!is_restorable(&live_crtc(7, 1280, 800, 0), &[31]));
+    }
+
+    /// The edge `GETCRTC` makes reachable: `mode_valid` comes from
+    /// `crtc->state->enable` and `fb_id` from the primary plane, filled
+    /// INDEPENDENTLY, so an enabled CRTC with no primary framebuffer reads
+    /// back like this. Sent as-is the kernel looks up framebuffer 0 and
+    /// answers `-ENOENT`, which the old restore discarded.
+    #[test]
+    fn an_enabled_crtc_with_no_framebuffer_is_not_replayed() {
+        assert!(!is_restorable(&live_crtc(0, 1280, 800, 1), &[31]));
+    }
+
+    /// A mode with no connectors is refused outright by `drm_mode_setcrtc`
+    /// (`count_connectors == 0 && mode`), so it is never sent.
+    #[test]
+    fn a_mode_with_nowhere_to_send_it_is_not_replayed() {
+        assert!(!is_restorable(&live_crtc(7, 1280, 800, 1), &[]));
     }
 
     /// A zero-length mapping proves nothing, and is refused rather than given

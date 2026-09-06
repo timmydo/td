@@ -3775,13 +3775,43 @@ the kernel's conforming ancillary framing.
   two pinned `EVIOCGABS` requests that read an absolute pointer's declared
   axis range, and the four pinned DRM requests below that read a card.
 
-The DRM eight are reached only from `drm.rs`. Four READ — `DRM_IOCTL_VERSION`,
-`MODE_GETRESOURCES`, `MODE_GETCONNECTOR` and `MODE_GETENCODER`. Three ALLOCATE
-— `MODE_CREATE_DUMB`, `MODE_MAP_DUMB` and `MODE_DESTROY_DUMB` — which is what
-makes `mmap` unavoidable and the mapping class real. Nothing in this crate
-modesets; the confinement test names `MODE_SETCRTC`, `MODE_ADDFB2`,
-`MODE_PAGE_FLIP` and `MODE_ATOMIC` as absent so that `APPLICATIONS.md` §M's
-backend adds each by amendment.
+The DRM thirteen are reached only from `drm.rs`. Four READ —
+`DRM_IOCTL_VERSION`, `MODE_GETRESOURCES`, `MODE_GETCONNECTOR` and
+`MODE_GETENCODER`. Three ALLOCATE — `MODE_CREATE_DUMB`, `MODE_MAP_DUMB` and
+`MODE_DESTROY_DUMB` — which is what makes `mmap` unavoidable and the mapping
+class real. Five MODESET — `SET_MASTER`, `MODE_GETCRTC`, `MODE_SETCRTC`,
+`MODE_ADDFB2` and `MODE_RMFB` — and with `DROP_MASTER` that is the whole
+surface. The confinement test names `MODE_PAGE_FLIP` and `MODE_ATOMIC` as
+absent so that §M's backend adds them by amendment.
+
+A modeset unwinds in one order, for a narrower reason than it first appears.
+`SETCRTC` is the only one of the three steps the kernel flags `DRM_MASTER`
+(`drm_ioctl.c:675`); `GETCRTC`, `ADDFB2` and `RMFB` need no master at all. The
+restore is a `SETCRTC`, so mastership is released last. Unregistering the
+framebuffer first would not fail — `drm_framebuffer_remove` disables the CRTCs
+using it, as the DRM ABI requires — it would blank the CRTC and leave the
+restore to turn it back on, which is a flicker rather than an error.
+`Modeset` declares `CrtcRestore`, `FbGuard` and `MasterGuard` in that order and
+has no `Drop` of its own, for the reason recorded below. `apply`'s LOCALS are
+declared in the mirror-image order, because that is where an early return gets
+its unwind; the two orders are pinned by separate assertions because they are
+separate orders.
+
+`GETCRTC` reports the mode, framebuffer and position but NOT the connector
+routing, so the routing is read the other way round — every connector names its
+encoder and every encoder names its CRTC — under the mastership just taken and
+before anything is changed. An earlier revision substituted the connector the
+probe was about to drive; on a card with two connected sinks that is not the
+same set, and restoring to it would leave the other sink dark. A saved state
+that `SETCRTC` would refuse — an enabled CRTC with no primary framebuffer, or a
+mode with no connectors — is turned into a deliberate disable rather than sent
+and silently failed, and a restore that fails anyway says so on stderr.
+
+The kernel's own backstop is real but conditional: `drm_lastclose` puts the
+fbdev client back exactly, and `drm_release` reaches it only when the device's
+open count falls to zero (`drm_file.c:440`). Nothing else opens the card today.
+A backend that holds the node open removes that guarantee, and this restore
+becomes the only one.
 
 A dumb buffer is unmapped BEFORE its handle is freed, and that ordering is a
 property of declaration order rather than of a comment. `DumbFrame` holds its

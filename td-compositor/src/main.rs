@@ -64,6 +64,7 @@ fn usage() -> String {
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
      td-compositor probe-drm DEVICE | \
+     td-compositor probe-kms DEVICE | \
      td-compositor terminfo PATH | \
      td-compositor selftest"
         .into()
@@ -548,6 +549,52 @@ fn probe_drm(device: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Set a mode on a real card, read the CRTC back, and put it as it was.
+///
+/// The proof this increment owes. `SETCRTC` answering success says the kernel
+/// accepted the request; it does not say the CRTC is scanning out the buffer
+/// that was handed to it, and a driver that kept the previous framebuffer would
+/// answer success while showing the old picture. Reading the CRTC back is the
+/// strongest statement about what is on a screen that a headless process can
+/// make.
+///
+/// Everything is restored on the way out, in an order the type system carries:
+/// the CRTC stops scanning out this framebuffer, then the framebuffer is
+/// unregistered, then mastership is released. Closing the descriptor afterwards
+/// puts the fbdev client back exactly, through the kernel's own lastclose path.
+fn probe_kms(device: &Path) -> Result<(), String> {
+    let card = drm::open_card(device)?;
+    let discovery = drm::discover(&card)?;
+    let mode = discovery.scanout.mode;
+    let mut frame = drm::DumbFrame::allocate(
+        &card,
+        u32::from(mode.hdisplay),
+        u32::from(mode.vdisplay),
+    )?;
+    frame.prove_mapping()?;
+    // Filled before it is shown. A modeset onto a buffer nobody wrote is a
+    // modeset onto whatever the allocator left there, which on a headless run
+    // proves the same thing but describes a worse default for anyone who
+    // copies this path onto a machine with a monitor attached.
+    for byte in frame.pixels_mut() {
+        *byte = 0;
+    }
+    let modeset = drm::Modeset::apply(&card, &discovery.scanout, &frame)?;
+    modeset.verify(&card, &mode)?;
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "TD-COMPOSITOR-KMS-PROBE-OK {} output={}x{} {} {}",
+        discovery.describe(),
+        mode.hdisplay,
+        mode.vdisplay,
+        frame.describe(),
+        modeset.describe()
+    )
+    .map_err(|error| format!("write KMS probe marker: {error}"))?;
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let command = args.first().ok_or_else(usage)?;
     match command.as_str() {
@@ -563,6 +610,20 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err(usage());
             }
             probe_drm(Path::new(device))
+        }
+        // §M row 1's MODESET half, and unlike `probe-drm` this one DISTURBS
+        // the screen: it takes DRM mastership, which stops the in-kernel fbdev
+        // client's damage reaching the display for as long as it is held, sets
+        // a mode, reads the CRTC back, and puts everything as it was. A
+        // separate subcommand for exactly that reason -- discovery is safe to
+        // run beside a running compositor and this is not, so the two must not
+        // be reachable by one name.
+        "probe-kms" => {
+            let device = args.get(1).ok_or_else(usage)?;
+            if args.get(2).is_some() {
+                return Err(usage());
+            }
+            probe_kms(Path::new(device))
         }
         "probe" => {
             let socket = args.get(1).ok_or_else(usage)?;
@@ -1328,21 +1389,21 @@ fn syscall6(
     }
 
     /// `ioctl(2)`'s request number chooses the operation, so the roster is the
-    /// confinement: these fourteen values, one allow-list, and thirteen callers.
+    /// confinement: these nineteen values, one allow-list, and eighteen
+    /// callers.
     ///
-    /// Four DRM numbers READ a card. `DROP_MASTER` writes nothing to the
-    /// display -- it RELEASES authority that opening a primary node granted
-    /// without being asked. The dumb trio ALLOCATES, maps and frees, which is
-    /// the honest toll §M names: a dumb buffer has no `write(2)` path.
+    /// Four DRM numbers READ a card. `DROP_MASTER` releases authority that
+    /// opening a primary node granted without being asked, and `SET_MASTER` --
+    /// which this increment adds -- takes it back deliberately, for a bounded
+    /// window. The dumb trio allocates, maps and frees. The modeset four
+    /// register a framebuffer, read a CRTC, drive one, and unregister.
     ///
-    /// `MODE_SETCRTC`, `MODE_ADDFB2`, the page flip and `MODE_ATOMIC` remain
-    /// deliberately absent, and the line between them and the trio is exactly
-    /// what this increment may do: allocating a buffer and writing into it
-    /// changes nothing on screen, while those four are what put pixels on
-    /// glass. A request that modesets must not become reachable merely by
-    /// sharing a module with ten that do not.
+    /// `MODE_PAGE_FLIP` and `MODE_ATOMIC` remain deliberately absent, and the
+    /// line between them and what landed is exact: a modeset puts ONE picture
+    /// on a screen, a page flip is what makes a sequence of them a display, and
+    /// that needs a completion path this increment does not build.
     #[test]
-    fn the_ioctl_surface_is_fourteen_pinned_requests_and_thirteen_wrappers() {
+    fn the_ioctl_surface_is_nineteen_pinned_requests_and_eighteen_wrappers() {
         for request in [
             "const TIOCSPTLCK: usize = 0x4004_5431;",
             "const TIOCGPTPEER: usize = 0x5441;",
@@ -1358,12 +1419,17 @@ fn syscall6(
             "const DRM_IOCTL_MODE_CREATE_DUMB: usize = 0xc020_64b2;",
             "const DRM_IOCTL_MODE_MAP_DUMB: usize = 0xc010_64b3;",
             "const DRM_IOCTL_MODE_DESTROY_DUMB: usize = 0xc004_64b4;",
+            "const DRM_IOCTL_SET_MASTER: usize = 0x0000_641e;",
+            "const DRM_IOCTL_MODE_GETCRTC: usize = 0xc068_64a1;",
+            "const DRM_IOCTL_MODE_SETCRTC: usize = 0xc068_64a2;",
+            "const DRM_IOCTL_MODE_RMFB: usize = 0xc004_64af;",
+            "const DRM_IOCTL_MODE_ADDFB2: usize = 0xc068_64b8;",
         ] {
             assert!(SYS.contains(request), "{request}");
         }
         assert_eq!(occurrences(SYS, "const TIOC"), 4);
         assert_eq!(occurrences(SYS, "const EVIOCGABS"), 2);
-        assert_eq!(occurrences(SYS, "const DRM_IOCTL_"), 8);
+        assert_eq!(occurrences(SYS, "const DRM_IOCTL_"), 13);
         // No write-side DRM request is DECLARED, and none of their numbers
         // appears at all. The declaration is the thing to forbid rather than
         // the name: `DrmModeInfo`'s own doc says a mode is what `SETCRTC` takes
@@ -1377,17 +1443,10 @@ fn syscall6(
         // own test issues `SETCRTC` to prove the allow-list refuses it — a pin
         // that moved whenever a test did would pin nothing.
         for absent in [
-            "const DRM_IOCTL_MODE_SETCRTC",
-            "const DRM_IOCTL_MODE_ADDFB2",
             "const DRM_IOCTL_MODE_PAGE_FLIP",
             "const DRM_IOCTL_MODE_ATOMIC",
-            // Dropping mastership is rostered; TAKING it back is not, and
-            // that asymmetry is the claim. `DROP_MASTER` gives back what the
-            // open took; `SET_MASTER` would re-acquire it, which is the
-            // backend's decision to make and not this increment's.
-            "const DRM_IOCTL_SET_MASTER",
-            "0xc068_64a2",
             "0xc018_64b0",
+            "0xc038_64bc",
         ] {
             assert!(
                 !production(SYS).contains(absent),
@@ -1422,6 +1481,11 @@ fn syscall6(
             | DRM_IOCTL_MODE_CREATE_DUMB
             | DRM_IOCTL_MODE_MAP_DUMB
             | DRM_IOCTL_MODE_DESTROY_DUMB
+            | DRM_IOCTL_SET_MASTER
+            | DRM_IOCTL_MODE_GETCRTC
+            | DRM_IOCTL_MODE_SETCRTC
+            | DRM_IOCTL_MODE_RMFB
+            | DRM_IOCTL_MODE_ADDFB2
     ) {"#;
         assert_eq!(occurrences(SYS, guard), 1);
         let entry = r#"    Ok(syscall5(SYS_IOCTL, fd as usize, request, argument, 0, 0))"#;
@@ -1437,12 +1501,13 @@ fn syscall6(
         // evdev entry point: a SIXTH wrapper reusing a pinned request would
         // satisfy every other assertion here.
         assert_eq!(every - drm, 6);
-        // One definition plus the eleven requests the eight DRM wrappers issue:
-        // two each for the three that ask a count before they ask for data,
-        // one for the encoder, whose answer is a fixed-size struct, one to give
-        // back mastership, and one each to create, map and destroy a dumb
-        // buffer.
-        assert_eq!(drm, 12);
+        // One definition plus the sixteen requests the thirteen DRM wrappers
+        // issue: two each for the three that ask a count before they ask for
+        // data, one for the encoder, whose answer is a fixed-size struct, one
+        // each to take and give back mastership, one each to create, map and
+        // destroy a dumb buffer, and one each to read a CRTC, drive one,
+        // register a framebuffer and unregister it.
+        assert_eq!(drm, 17);
         // Both entry points reach the SAME allow-list, and it is defined once.
         // This is the assertion that stops a second `syscall5(SYS_IOCTL, ..)`
         // growing beside the roster instead of behind it.
@@ -1530,8 +1595,9 @@ fn syscall6(
         assert!(production(SYS).contains("probe.modes_ptr = address_of(&mut one_mode);"));
         assert_eq!(occurrences(production(DRM), "OpenOptions::new()"), 1);
         // And the policy module DECLARES no request of its own: the ABI lives
-        // in `sys.rs`, so the only requests `drm.rs` can cause are the eight
-        // the allow-list admits, reached through the calls pinned above. It may
+        // in `sys.rs`, so the only requests `drm.rs` can cause are the
+        // thirteen the allow-list admits, reached through the calls pinned
+        // above. It may
         // still NAME one in prose, so the claim is about a declaration.
         assert!(!production(DRM).contains("const DRM_IOCTL"));
         // No raw syscall of its own: named as the two forms that would be one,
@@ -1547,6 +1613,114 @@ fn syscall6(
         assert!(!production(DRM).contains("from_raw_parts"));
         assert!(!production(DRM).contains("SYS_MMAP"));
         assert!(!production(DRM).contains("SYS_MUNMAP"));
+    }
+
+    /// A modeset unwinds in the one order that works, and that order is field
+    /// declaration order.
+    ///
+    /// The restore is a `SETCRTC`, which is the ONE step of the three that
+    /// carries `DRM_MASTER` in the kernel's ioctl table -- `GETCRTC`, `ADDFB2`
+    /// and `RMFB` carry no flag (`drm_ioctl.c:674`, `675`, `691`, `692`). So
+    /// mastership has to outlive the restore, and is released last.
+    ///
+    /// An earlier revision of this comment claimed more: that `RMFB` on a
+    /// framebuffer still being scanned out is refused. It is not.
+    /// `drm_framebuffer_remove` disables the CRTCs using it instead, because
+    /// "drm ABI mandates that we remove any deleted framebuffers from active
+    /// usage". The wrong order therefore blanks the CRTC and then restores it,
+    /// which is a flicker and not a failure. The order is still worth pinning;
+    /// the claim about why is smaller than it was.
+    ///
+    /// No `impl Drop for Modeset`, for the reason recorded on `DumbFrame`: a
+    /// type's own destructor runs BEFORE its fields, so writing this sequence
+    /// there would run it in exactly the wrong place. Each release call is
+    /// reached from its guard's `Drop` and nowhere else, which is what stops an
+    /// early return from skipping one.
+    #[test]
+    fn a_modeset_unwinds_crtc_then_framebuffer_then_mastership() {
+        let drm = production(DRM);
+        assert!(
+            !drm.contains("impl Drop for Modeset"),
+            "Modeset grew a destructor, which runs before its fields drop"
+        );
+        for guard in [
+            "impl Drop for CrtcRestore",
+            "impl Drop for FbGuard",
+            "impl Drop for MasterGuard",
+        ] {
+            assert!(drm.contains(guard), "{guard} is gone");
+        }
+        // Each release is issued from exactly one place: its guard.
+        assert_eq!(occurrences(drm, "sys::drm_rm_fb("), 1);
+        assert_eq!(occurrences(drm, "sys::drm_set_master("), 1);
+        let start = drm
+            .find("pub struct Modeset<'card, 'frame> {")
+            .expect("drm.rs no longer declares Modeset");
+        let body = drm.get(start..).unwrap_or_default();
+        let end = body.find("\n}").unwrap_or(body.len());
+        let fields = body.get(..end).unwrap_or_default();
+        let restore = fields
+            .find("restore: CrtcRestore<'card>,")
+            .expect("Modeset no longer holds its CRTC restore by that name");
+        let fb = fields
+            .find("fb: FbGuard<'card>,")
+            .expect("Modeset no longer holds its framebuffer guard by that name");
+        let master = fields
+            .find("master: MasterGuard<'card>,")
+            .expect("Modeset no longer holds its master guard by that name");
+        assert!(
+            restore < fb && fb < master,
+            "Modeset's guards are declared out of order, so mastership is dropped \
+             before the restore that needs it, or the screen is blanked by the \
+             framebuffer's removal and then repainted by the restore"
+        );
+        // And the SAME order in `apply`'s locals, which is where the error
+        // paths get theirs. The field order above governs only the success
+        // path: a `?` between two of these unwinds whatever locals exist at
+        // that point, in their own declaration order. Hoisting `restore` above
+        // `fb` inverts the error-path unwind while every other test in this
+        // file stays green, so the two orders are pinned separately because
+        // they are two separate orders.
+        let apply = drm
+            .find("    pub fn apply(")
+            .expect("drm.rs no longer declares Modeset::apply");
+        let body = drm.get(apply..).unwrap_or_default();
+        let end = body.find("\n    }").unwrap_or(body.len());
+        let locals = body.get(..end).unwrap_or_default();
+        let master_local = locals
+            .find("let master = MasterGuard { card };")
+            .expect("apply no longer binds its master guard by that name");
+        let fb_local = locals
+            .find("let fb = FbGuard { card, fb_id };")
+            .expect("apply no longer binds its framebuffer guard by that name");
+        let restore_local = locals
+            .find("let restore = CrtcRestore::capture(")
+            .expect("apply no longer binds its CRTC restore by that name");
+        // The restore's connector set is READ rather than substituted. Pinned
+        // as the CALL, not merely as the function's existence: reverting this
+        // one line to `vec![scanout.connector_id]` leaves `connectors_on_crtc`
+        // defined, leaves every sys call site spelled, leaves the count at
+        // twenty, and silently restores the bug two reviewers caught.
+        assert!(
+            drm.contains("let routed = connectors_on_crtc(card, scanout.crtc_id)?;"),
+            "the modeset no longer reads the CRTC's real connector routing, so its \
+             restore is guessing again"
+        );
+        // The fourth field, pinned because its whole job is to make a mistake
+        // uncompilable: without it a modeset outlives the frame it scans out,
+        // and every test in this file still passes. Deleting it is a silent
+        // regression by construction, so the pin is the only thing that
+        // notices.
+        assert!(
+            fields.contains("frame: &'frame DumbFrame<'card>,"),
+            "Modeset no longer borrows its frame, so it may outlive the buffer \
+             it is scanning out"
+        );
+        assert!(
+            master_local < fb_local && fb_local < restore_local,
+            "apply's guard locals are declared out of order, so an early return \
+             unwinds them in an order the success path would never use"
+        );
     }
 
     /// A dumb buffer is unmapped BEFORE its handle is released, and that
@@ -1756,15 +1930,39 @@ pub struct MappedRegion {
             "let buffer = sys::drm_create_dumb(card, width, height)?;",
             "let region = sys::drm_map_dumb(card, &buffer)?;",
             "let _ = sys::drm_destroy_dumb(self.card, self.handle);",
+            "sys::drm_set_master(card)",
+            "let saved = sys::drm_get_crtc(card, scanout.crtc_id)?;",
+            "let fb_id = sys::drm_add_fb(card, width, height, frame.pitch(), frame.handle())?;",
+            "let listed = sys::drm_resources(card)?;",
+            "let Ok(connector) = sys::drm_connector(card, *id) else {",
+            "let Ok(encoder) = sys::drm_encoder(card, connector.encoder_id) else {",
+            "let live = sys::drm_get_crtc(card, self.crtc_id)?;",
+            "sys::drm_set_crtc(card, &wanted, &mut connectors)?;",
+            "if let Err(error) = sys::drm_set_crtc(self.card, &self.saved, &mut self.connectors) {",
+            "let _ = sys::drm_rm_fb(self.card, self.fb_id);",
+            "let _ = sys::drm_drop_master(self.card);",
         ] {
             assert!(drm.contains(call), "drm.rs no longer spells `{call}`");
         }
-        // Nine calls and no tenth: every reach into the syscall module from
-        // here is one of the nine above. The dumb trio is called ONCE each --
-        // create and map from `allocate`, destroy from `DumbHandle::drop` and
-        // nowhere else, which is what makes the release a field drop rather
-        // than a statement some path can miss.
-        assert_eq!(occurrences(drm, "sys::drm_"), 9);
+        // Twenty calls and no twenty-first. Three names are a take-and-
+        // give-back pair: `drop_master` from `open_card` and from
+        // `MasterGuard::drop`; `get_crtc` to save the state and again to read
+        // back what the modeset actually did; `set_crtc` to drive the scanout
+        // and again from `CrtcRestore::drop` to put it back. Three more are
+        // read twice for two different questions -- `drm_resources`,
+        // `drm_connector` and `drm_encoder` answer "what could be driven" for
+        // discovery and "what is being driven right now" for the restore, and
+        // `drm_encoder` a third time inside `crtc_for`'s fallback. Each of the
+        // four release calls is reached from a `Drop` and from nowhere else,
+        // which is what makes the unwind a property of field order rather than
+        // of a path some early return can miss.
+        assert_eq!(occurrences(drm, "sys::drm_"), 20);
+        // `drm_add_fb` is pinned by COUNT as well as by spelling, because it
+        // is the worst of these to get wrong: four bare `u32`s in a row, so
+        // swapping width for height, or pitch for handle, type-checks, passes
+        // this whole suite, and fails only on a real card.
+        assert_eq!(occurrences(drm, "sys::drm_add_fb("), 1);
+        assert_eq!(occurrences(drm, "sys::drm_resources("), 2);
         let production_main = production(MAIN);
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())

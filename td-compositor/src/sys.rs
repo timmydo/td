@@ -52,10 +52,24 @@ const DRM_IOCTL_VERSION: usize = 0xc040_6400;
 /// `drm_master_open` in `drivers/gpu/drm/drm_auth.c` makes the first opener of
 /// a PRIMARY node the DRM master whenever `dev->master` is NULL, and an
 /// in-kernel client — fbcon, fbdev emulation — never sets it. So merely opening
-/// `/dev/dri/card0` on a td image takes mastership away from the framebuffer
-/// console, `SET_MASTER` or no `SET_MASTER`: while it is held,
-/// `drm_fb_helper_damage_work`'s `drm_master_internal_acquire` returns `-EBUSY`
-/// and the running compositor's damage is dropped until the descriptor closes.
+/// `/dev/dri/card0` on a td image takes mastership, `SET_MASTER` or no
+/// `SET_MASTER`.
+///
+/// What that costs is narrower than an earlier revision of this comment said,
+/// and the correction is worth carrying because the wrong version is the
+/// plausible one. Holding mastership does NOT stop the framebuffer console
+/// painting: `drm_fb_helper_fb_dirty` asks
+/// `drm_client_modeset_wait_for_vblank` for a vblank, that call answers
+/// `-EBUSY` while a foreign master exists (`drm_client_modeset.c:1320`), and
+/// the helper DISCARDS the result (`drm_fb_helper.c:237`) and commits the
+/// damage anyway (`:249`). The console loses its vblank rate-limit and nothing
+/// else.
+///
+/// The real costs are two. Another process's `SET_MASTER` is refused outright
+/// — `if (dev->master) return -EBUSY;` (`drm_auth.c:260`) — so a genuine DRM
+/// compositor cannot take the card while this descriptor holds it. And two
+/// fbdev ioctls, `drm_fb_helper_setcmap` (`:863`) and
+/// `drm_fb_helper_pan_display` (`:1247`), fail for as long as it is held.
 ///
 /// Dropping it immediately is what makes "this probe does not disturb what is
 /// on the screen" a property of the code rather than a hope. An earlier
@@ -87,6 +101,39 @@ const DRM_IOCTL_MODE_GETCONNECTOR: usize = 0xc050_64a7;
 const DRM_IOCTL_MODE_CREATE_DUMB: usize = 0xc020_64b2;
 const DRM_IOCTL_MODE_MAP_DUMB: usize = 0xc010_64b3;
 const DRM_IOCTL_MODE_DESTROY_DUMB: usize = 0xc004_64b4;
+
+/// The modeset five. These are the ones that CHANGE WHAT IS ON SCREEN, and
+/// every earlier increment named them absent precisely so this one has to
+/// arrive by amendment rather than by sharing a module with requests that only
+/// read.
+///
+/// `SET_MASTER` (0x641e) is the authority to do any of it. Opening a primary
+/// node already grants mastership when `dev->master` is NULL, and `open_card`
+/// gives it straight back; this RE-TAKES it deliberately, for a bounded window,
+/// and the difference between those two is the whole reason `DROP_MASTER`
+/// landed on the roster two increments before its opposite.
+///
+/// `MODE_GETCRTC`/`MODE_SETCRTC` (0xc06864a1/0xc06864a2) read and write one
+/// CRTC's mode, framebuffer and connector set; both carry `drm_mode_crtc`,
+/// which is 104 bytes because it embeds a whole 68-byte `drm_mode_modeinfo`.
+/// `MODE_ADDFB2` (0xc06864b8) registers a buffer as a scanout framebuffer and
+/// `MODE_RMFB` (0xc00464af) unregisters one; `RMFB` takes a bare `unsigned int`,
+/// which is why its size field is 4 and not the struct the others carry.
+///
+/// `MODE_PAGE_FLIP` and `MODE_ATOMIC` remain ABSENT. A modeset puts a picture
+/// on a screen once; a page flip is what makes a SEQUENCE of them a display,
+/// and it needs a completion path this increment does not build.
+const DRM_IOCTL_SET_MASTER: usize = 0x0000_641e;
+const DRM_IOCTL_MODE_GETCRTC: usize = 0xc068_64a1;
+const DRM_IOCTL_MODE_SETCRTC: usize = 0xc068_64a2;
+const DRM_IOCTL_MODE_RMFB: usize = 0xc004_64af;
+const DRM_IOCTL_MODE_ADDFB2: usize = 0xc068_64b8;
+
+/// `DRM_FORMAT_XRGB8888`, the one pixel format this compositor scans out.
+///
+/// The same four characters `Fourcc` carries for the Wayland side, spelled here
+/// as the `__u32` `drm_mode_fb_cmd2` wants: 'X','R','2','4' little-endian.
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 
 /// `PROT_READ | PROT_WRITE` and `MAP_SHARED`, the only protection and
 /// visibility a scanout mapping may ask for. Shared because the entire point is
@@ -339,6 +386,11 @@ fn ioctl_checked(
             | DRM_IOCTL_MODE_CREATE_DUMB
             | DRM_IOCTL_MODE_MAP_DUMB
             | DRM_IOCTL_MODE_DESTROY_DUMB
+            | DRM_IOCTL_SET_MASTER
+            | DRM_IOCTL_MODE_GETCRTC
+            | DRM_IOCTL_MODE_SETCRTC
+            | DRM_IOCTL_MODE_RMFB
+            | DRM_IOCTL_MODE_ADDFB2
     ) {
         return Err(format!(
             "{operation}: refusing unreviewed ioctl request {request:#x}"
@@ -1062,6 +1114,158 @@ fn mappable_length(size: u64) -> Result<usize, String> {
     usize::try_from(size).map_err(|_| {
         format!("DRM_IOCTL_MODE_MAP_DUMB: a buffer of {size} bytes does not fit this address space")
     })
+}
+
+/// The kernel's `struct drm_mode_crtc`, 104 bytes: a `__u64` pointer, seven
+/// `__u32`s, and a whole embedded `drm_mode_modeinfo`.
+///
+/// One type for BOTH `GETCRTC` and `SETCRTC`, because it is one struct in the
+/// kernel too. That is what makes save-and-restore exact: the state read back
+/// is handed to the setter unchanged, with no field this code had to know to
+/// copy.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmModeCrtc {
+    pub set_connectors_ptr: u64,
+    pub count_connectors: u32,
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub gamma_size: u32,
+    pub mode_valid: u32,
+    pub mode: DrmModeInfo,
+}
+
+impl DrmModeCrtc {
+    pub fn empty() -> DrmModeCrtc {
+        DrmModeCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: 0,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: DrmModeInfo::empty(),
+        }
+    }
+}
+
+/// The kernel's `struct drm_mode_fb_cmd2`, 104 bytes.
+///
+/// Four planes' worth of handles, pitches, offsets and modifiers, of which a
+/// linear XRGB8888 dumb buffer uses exactly one. The other three stay zero,
+/// which is what the kernel reads as "not present" rather than as a plane at
+/// offset zero.
+#[repr(C)]
+struct DrmModeFbCmd2 {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    flags: u32,
+    handles: [u32; 4],
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+    modifier: [u64; 4],
+}
+
+/// Become the DRM master of this card.
+///
+/// The authority to modeset, and the reason it is separate from opening:
+/// `drm_ioctl.c` flags `MODE_SETCRTC` `DRM_MASTER` (`:675`), so without this
+/// the modeset is refused. A caller takes it for a bounded window and gives it
+/// back.
+///
+/// Holding it does not by itself blank anything — see `DRM_IOCTL_DROP_MASTER`
+/// above for what it does and does not cost. The screen changes at the
+/// `SETCRTC`, not here.
+pub fn drm_set_master(card: &impl AsRawFd) -> Result<(), String> {
+    drm_ioctl(card.as_raw_fd(), DRM_IOCTL_SET_MASTER, 0, "DRM_IOCTL_SET_MASTER")?;
+    Ok(())
+}
+
+/// Read one CRTC's current mode, framebuffer and position.
+pub fn drm_get_crtc(card: &impl AsRawFd, crtc_id: u32) -> Result<DrmModeCrtc, String> {
+    let mut request = DrmModeCrtc::empty();
+    request.crtc_id = crtc_id;
+    drm_ioctl(
+        card.as_raw_fd(),
+        DRM_IOCTL_MODE_GETCRTC,
+        std::ptr::from_mut(&mut request) as usize,
+        "DRM_IOCTL_MODE_GETCRTC",
+    )?;
+    Ok(request)
+}
+
+/// Drive `connectors` from `crtc` with `fb_id` at `mode`, or hand back a state
+/// read from `drm_get_crtc` to restore it.
+///
+/// `connectors` is borrowed for the call and its address handed to the kernel,
+/// so it must outlive the ioctl -- which is why it is a parameter rather than a
+/// temporary built inside. An empty list with `mode_valid` clear is how a CRTC
+/// is turned off, and is what a restore of a previously-dark CRTC sends.
+pub fn drm_set_crtc(
+    card: &impl AsRawFd,
+    state: &DrmModeCrtc,
+    connectors: &mut [u32],
+) -> Result<(), String> {
+    let mut request = *state;
+    request.count_connectors = u32::try_from(connectors.len())
+        .map_err(|_| format!("DRM_IOCTL_MODE_SETCRTC: {} connectors is not a u32", connectors.len()))?;
+    request.set_connectors_ptr = address_of(connectors);
+    drm_ioctl(
+        card.as_raw_fd(),
+        DRM_IOCTL_MODE_SETCRTC,
+        std::ptr::from_mut(&mut request) as usize,
+        "DRM_IOCTL_MODE_SETCRTC",
+    )?;
+    Ok(())
+}
+
+/// Register one linear XRGB8888 buffer as a scanout framebuffer.
+pub fn drm_add_fb(
+    card: &impl AsRawFd,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    handle: u32,
+) -> Result<u32, String> {
+    let mut request = DrmModeFbCmd2 {
+        fb_id: 0,
+        width,
+        height,
+        pixel_format: DRM_FORMAT_XRGB8888,
+        flags: 0,
+        handles: [handle, 0, 0, 0],
+        pitches: [pitch, 0, 0, 0],
+        offsets: [0; 4],
+        modifier: [0; 4],
+    };
+    drm_ioctl(
+        card.as_raw_fd(),
+        DRM_IOCTL_MODE_ADDFB2,
+        std::ptr::from_mut(&mut request) as usize,
+        "DRM_IOCTL_MODE_ADDFB2",
+    )?;
+    if request.fb_id == 0 {
+        return Err("DRM_IOCTL_MODE_ADDFB2: the driver returned framebuffer id 0".to_string());
+    }
+    Ok(request.fb_id)
+}
+
+/// Unregister a framebuffer id.
+pub fn drm_rm_fb(card: &impl AsRawFd, fb_id: u32) -> Result<(), String> {
+    let mut id = fb_id;
+    drm_ioctl(
+        card.as_raw_fd(),
+        DRM_IOCTL_MODE_RMFB,
+        std::ptr::from_mut(&mut id) as usize,
+        "DRM_IOCTL_MODE_RMFB",
+    )?;
+    Ok(())
 }
 
 /// Release one dumb buffer handle.
@@ -1983,18 +2187,37 @@ mod tests {
             DRM_IOCTL_MODE_GETENCODER,
             DRM_IOCTL_MODE_GETCONNECTOR,
             DRM_IOCTL_DROP_MASTER,
+            DRM_IOCTL_MODE_CREATE_DUMB,
+            DRM_IOCTL_MODE_MAP_DUMB,
+            DRM_IOCTL_MODE_DESTROY_DUMB,
+            DRM_IOCTL_SET_MASTER,
+            DRM_IOCTL_MODE_GETCRTC,
+            DRM_IOCTL_MODE_SETCRTC,
+            DRM_IOCTL_MODE_RMFB,
+            DRM_IOCTL_MODE_ADDFB2,
         ] {
             let error = drm_ioctl(-1, request, 0, "pinned").unwrap_err();
             assert!(error.contains("invalid descriptor -1"), "{error}");
         }
-        // DRM_IOCTL_MODE_SETCRTC. The next landing's, and not this one's: a
-        // request that modesets must not become reachable by sharing a module
-        // with the four that read.
-        let error = drm_ioctl(0, 0xc068_64a2, 0, "SETCRTC").unwrap_err();
-        assert!(
-            error.contains("refusing unreviewed ioctl request 0xc06864a2"),
-            "{error}"
-        );
+        // `DRM_IOCTL_MODE_PAGE_FLIP` and `DRM_IOCTL_MODE_ATOMIC`. The next
+        // landing's, and not this one's.
+        //
+        // This test previously named SETCRTC here, which this increment
+        // rosters; the request that stands for "not ours" has to move each time
+        // the roster grows, and a test that kept naming a now-admitted request
+        // would assert nothing while still passing. A modeset puts one picture
+        // on a screen, which is what landed; a page flip makes a sequence of
+        // them a display, and needs a completion path that does not exist yet.
+        for (request, spelled) in [
+            (0xc018_64b0usize, "0xc01864b0"),
+            (0xc038_64bcusize, "0xc03864bc"),
+        ] {
+            let error = drm_ioctl(0, request, 0, "absent").unwrap_err();
+            assert!(
+                error.contains(&format!("refusing unreviewed ioctl request {spelled}")),
+                "{error}"
+            );
+        }
     }
 
     /// `_IOC` packs the argument's SIZE into bits 16..30, and the kernel copies
@@ -2039,6 +2262,25 @@ mod tests {
             argument_size(DRM_IOCTL_MODE_DESTROY_DUMB),
             std::mem::size_of::<DrmModeDestroyDumb>()
         );
+        // The modeset requests. `GETCRTC` and `SETCRTC` share one struct
+        // because the kernel shares it, which is what makes save-and-restore
+        // exact rather than field-by-field.
+        assert_eq!(
+            argument_size(DRM_IOCTL_MODE_GETCRTC),
+            std::mem::size_of::<DrmModeCrtc>()
+        );
+        assert_eq!(
+            argument_size(DRM_IOCTL_MODE_SETCRTC),
+            std::mem::size_of::<DrmModeCrtc>()
+        );
+        assert_eq!(
+            argument_size(DRM_IOCTL_MODE_ADDFB2),
+            std::mem::size_of::<DrmModeFbCmd2>()
+        );
+        // `RMFB` carries a bare `unsigned int`, not a struct.
+        assert_eq!(argument_size(DRM_IOCTL_MODE_RMFB), std::mem::size_of::<u32>());
+        // `SET_MASTER` is a `DRM_IO`: no argument at all, so no size field.
+        assert_eq!(argument_size(DRM_IOCTL_SET_MASTER), 0);
     }
 
     /// The kernel's own byte counts for Linux 7.1.4 on x86-64, written out
@@ -2061,6 +2303,14 @@ mod tests {
         assert_eq!(std::mem::align_of::<DrmModeInfo>(), 4);
         // Six `__u32` then a `__u64`: 24 bytes of words, already 8-aligned, so
         // 32 with no padding between them.
+        // 104 each, and for different reasons. `drm_mode_crtc` embeds a whole
+        // 68-byte modeinfo after 36 bytes of ids; `drm_mode_fb_cmd2` reaches
+        // 104 only because its four `__u64` modifiers force 4 bytes of padding
+        // after the twelve `__u32`s of handles, pitches and offsets. Two
+        // structs of equal size whose layouts agree nowhere is exactly the
+        // case a shared request number would hide.
+        assert_eq!(std::mem::size_of::<DrmModeCrtc>(), 104);
+        assert_eq!(std::mem::size_of::<DrmModeFbCmd2>(), 104);
         assert_eq!(std::mem::size_of::<DrmModeCreateDumb>(), 32);
         assert_eq!(std::mem::size_of::<DrmModeMapDumb>(), 16);
         assert_eq!(std::mem::size_of::<DrmModeDestroyDumb>(), 4);
