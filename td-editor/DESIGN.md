@@ -650,7 +650,19 @@ them; cursor motion, tab switching and save acknowledgment do not. A scan
 that observes invalidation fails permanently even if supplied its old
 dictionary later. Dropping a scan cancels it without changing any document.
 
-This increment is the safe library only. Dictionary file loading, window
+`files::read_dictionary` reads the file at an explicitly supplied literal
+path. The path is limited to 4,096 bytes. This regular-file reader does not
+create a file association, reserve a missing path or retain a saved baseline.
+Final-component symlinks and nonregular files are refused. The parent is
+canonicalized and pinned; the existing 16 MiB stable-read ceiling bounds
+input before parsing. After parsing, the name, parent identity and file stamp
+are checked again before returning the dictionary. An observed replacement
+or mutation refuses the result without writing anything. These checks are
+race detection, not a filesystem snapshot or a guarantee against a writer
+changing the file after the final check. No system dictionary search occurs.
+This synchronous API belongs on the file worker, not the display loop.
+
+The spelling core and read-only loader are library APIs only. Window
 ownership/budgeting, F7/menu actions, status/underlines, result navigation
 and control queries are not connected yet. Native UI still reports spelling
 unavailable and must not claim these library tests are an interactive scan.

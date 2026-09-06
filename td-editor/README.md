@@ -12,8 +12,8 @@ acceptance tests, and independently landable increments. Version 1 uses
 Unicode-scalar editing and single-cell Unifont rendering, preserves UTF-8
 BOM and uniform LF/CRLF files, defaults to Windows-like bindings, and uses
 an explicitly selected local English word list. Spelling runs only on
-request; an edit clears marks without starting another scan. That spelling
-profile is designed but not implemented yet.
+request; an edit invalidates marks without starting another scan. The spelling
+library is implemented, but native spelling controls are not connected yet.
 
 ## Implemented core
 
@@ -66,6 +66,13 @@ selection-bound Cut/Paste admission through the controller. Paste collects
 at most 1 MiB of raw bytes; oversized, malformed or stale transfers cannot
 partially edit a document. The experimental native window now connects these
 operations to core Wayland data-device v3 when the compositor supplies it.
+
+`spelling.rs` supplies strict English word-list parsing and chunked,
+revision-bound whole-document scans. `files::read_dictionary` reads only a
+caller-selected regular file with bounded input and post-parse race checks;
+it never probes system word lists, writes files or creates a saved baseline.
+These are library APIs, not a working `--dictionary` option or native F7
+action yet. No word list is bundled or downloaded.
 
 `transfer.rs` adds the tested descriptor transport prerequisite: bounded
 nonblocking pipe/socket writes and private-socket reads, explicit clocks,

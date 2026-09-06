@@ -554,16 +554,20 @@ impl Session {
 }
 
 fn validate(bytes: &[u8]) -> Result<()> {
-    text::decode(bytes).map(|_| ()).map_err(|e| {
-        Failure::new(
-            if e == crate::Error::Limit {
-                Kind::Limit
-            } else {
-                Kind::InvalidText
-            },
-            e.to_string(),
-        )
-    })
+    text::decode(bytes)
+        .map(|_| ())
+        .map_err(|e| text_failure(e, e.to_string()))
+}
+
+fn text_failure(error: crate::Error, detail: impl Into<String>) -> Failure {
+    Failure::new(
+        if error == crate::Error::Limit {
+            Kind::Limit
+        } else {
+            Kind::InvalidText
+        },
+        detail,
+    )
 }
 
 fn metadata_error(error: io::Error) -> Failure {
@@ -571,6 +575,27 @@ fn metadata_error(error: io::Error) -> Failure {
         Kind::Metadata,
         format!("cannot preserve owner/group/mode; use Save As: {error}"),
     )
+}
+
+/// Synchronous, read-only dictionary input. Call outside the display loop.
+/// No file association, saved baseline or writable path is created.
+pub fn read_dictionary(path: &Path) -> Result<crate::spelling::Dictionary> {
+    read_dictionary_with(path, || Ok(()))
+}
+
+fn read_dictionary_with(
+    path: &Path,
+    before_check: impl FnOnce() -> io::Result<()>,
+) -> Result<crate::spelling::Dictionary> {
+    let location = Location::resolve(path)?;
+    let (file, stamp) = open_regular(&location.path)?
+        .ok_or_else(|| Failure::new(Kind::Io, "dictionary file does not exist"))?;
+    let bytes = read_stable(&file, &stamp)?;
+    let dictionary = crate::spelling::Dictionary::parse(&bytes)
+        .map_err(|error| text_failure(error, format!("dictionary refused: {error}")))?;
+    before_check()?;
+    check_name(&location, &stamp)?;
+    Ok(dictionary)
 }
 
 fn open_regular(path: &Path) -> Result<Option<(File, Stamp)>> {
@@ -851,6 +876,87 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn dictionary_read_is_read_only_and_preserves_filesystem_state() {
+        let directory = Directory::new();
+        let path = directory.write("words", b"\xef\xbb\xbfWord\r\n\nWORD\ncan't");
+        let before = fs::read(&path).unwrap();
+        let stamp = Stamp::read(&fs::metadata(&path).unwrap());
+        let dictionary = read_dictionary(&path).unwrap();
+        assert_eq!(dictionary.entry_count(), 2);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(Stamp::read(&fs::metadata(&path).unwrap()), stamp);
+        let missing = directory.path("missing");
+        assert_eq!(read_dictionary(&missing).err().unwrap().kind, Kind::Io);
+        assert!(!missing.exists());
+        assert_eq!(
+            read_dictionary(&directory.path(".")).err().unwrap().kind,
+            Kind::InvalidPath
+        );
+        directory.no_temporaries();
+    }
+
+    #[test]
+    fn dictionary_read_refuses_special_oversized_and_malformed_files() {
+        assert_eq!(text::MAX_FILE_BYTES, crate::spelling::DICTIONARY_BYTES);
+        let directory = Directory::new();
+        let path = directory.write("words", b"known");
+        let linked = directory.path("linked");
+        symlink(&path, &linked).unwrap();
+        assert_eq!(
+            read_dictionary(&linked).err().unwrap().kind,
+            Kind::NotRegular
+        );
+        let socket = directory.path("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(
+            read_dictionary(&socket).err().unwrap().kind,
+            Kind::NotRegular
+        );
+        let subdir = directory.path("dir");
+        fs::create_dir(&subdir).unwrap();
+        assert_eq!(
+            read_dictionary(&subdir).err().unwrap().kind,
+            Kind::NotRegular
+        );
+        for bytes in [b"".as_slice(), b"word word", b"\xff", b"word\r"] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                read_dictionary(&path).err().unwrap().kind,
+                Kind::InvalidText
+            );
+        }
+        fs::write(&path, "a".repeat(crate::spelling::WORD_SCALARS + 1)).unwrap();
+        assert_eq!(read_dictionary(&path).err().unwrap().kind, Kind::Limit);
+        File::create(&path)
+            .unwrap()
+            .set_len(crate::spelling::DICTIONARY_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(read_dictionary(&path).err().unwrap().kind, Kind::Limit);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            crate::spelling::DICTIONARY_BYTES as u64 + 1
+        );
+        directory.no_temporaries();
+    }
+
+    #[test]
+    fn dictionary_read_rechecks_the_name_after_parsing_without_overwriting_changes() {
+        let directory = Directory::new();
+        let path = directory.write("words", b"known");
+        let result = read_dictionary_with(&path, || fs::write(&path, b"changed\nlist"));
+        assert_eq!(result.err().unwrap().kind, Kind::Conflict);
+        assert_eq!(fs::read(&path).unwrap(), b"changed\nlist");
+        let replacement = directory.write("replacement", b"other");
+        let result = read_dictionary_with(&path, || fs::rename(&replacement, &path));
+        assert_eq!(result.err().unwrap().kind, Kind::Conflict);
+        assert_eq!(fs::read(&path).unwrap(), b"other");
+        let result = read_dictionary_with(&path, || fs::remove_file(&path));
+        assert_eq!(result.err().unwrap().kind, Kind::Io);
+        assert!(!path.exists());
+        directory.no_temporaries();
     }
 
     #[test]
