@@ -1,10 +1,10 @@
-//! td news (tn): a terminal RSS and Atom reader.
+//! td news (td-news): a terminal RSS and Atom reader.
 //!
 //! The crate is `std` and nothing else. Seven modules — `civil`, `html`,
 //! `json`, `kv`, `term_sys`, `toml`, `xml` — are td's shared std modules,
 //! copied in whole from one master each and never edited here, so the
-//! import into td can diff them byte for byte against tmc's copies. What
-//! tn does not call therefore stays, allowed on its `mod` line rather
+//! import into td can diff them byte for byte against td-mail's copies. What
+//! td-news does not call therefore stays, allowed on its `mod` line rather
 //! than trimmed: a binary crate exports nothing, so `dead_code` fires
 //! here and not in the module's own crate.
 //!
@@ -31,10 +31,10 @@ mod keybindings;
 #[allow(dead_code)]
 mod kv;
 mod log;
-// Shared with tmc, which reads response headers where tn does not.
+// Shared with td-mail, which reads response headers where td-news does not.
 #[allow(dead_code)]
 mod td_fetch;
-// The shared module carries a terminal surface wider than tn's one raw mode.
+// The shared module carries a terminal surface wider than td-news's one raw mode.
 #[allow(dead_code)]
 mod term_sys;
 /// `tempfile`'s replacement, test-only and shared with the integration
@@ -61,7 +61,7 @@ fn main() {
     };
 
     if opts.help {
-        eprintln!("Usage: tn [OPTIONS]");
+        eprintln!("Usage: td-news [OPTIONS]");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --help          Show this help message");
@@ -117,8 +117,8 @@ fn main() {
     if let Err(e) = log::init() {
         eprintln!("Failed to initialize logging: {}", e);
     } else {
-        log::info("tn starting");
-        log::news("tn session started");
+        log::info("td-news starting");
+        log::news("td-news session started");
     }
 
     if opts.clear_cache {
@@ -158,8 +158,8 @@ fn main() {
             eprintln!("CLI error: {}", e);
             std::process::exit(1);
         }
-        log::info("tn cli shutdown");
-        log::news("tn cli session ended");
+        log::info("td-news cli shutdown");
+        log::news("td-news cli session ended");
         return;
     }
 
@@ -226,8 +226,8 @@ fn main() {
     }
 
     let _ = cmd_tx.send(backend::BackendCommand::Shutdown);
-    log::info("tn shutdown");
-    log::news("tn session ended");
+    log::info("td-news shutdown");
+    log::news("td-news session ended");
 }
 
 #[derive(Default)]
@@ -298,7 +298,7 @@ fn print_help_config() {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{}/.config", home)
     });
-    eprintln!("Configuration file: {}/tn/config.toml", xdg);
+    eprintln!("Configuration file: {}/td-news/config.toml", xdg);
     eprintln!();
     eprintln!("[ui]");
     eprintln!("  page_size = 100              # max articles per page (default: 100)");

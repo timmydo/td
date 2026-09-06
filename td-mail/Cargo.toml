@@ -1,5 +1,5 @@
 [package]
-name = "tmc"
+name = "td-mail"
 version = "0.1.0"
 edition = "2021"
 description = "td's terminal JMAP mail client: mailbox/thread reading, triage rules, retention, spam scoring, and an NDJSON CLI"
@@ -10,14 +10,14 @@ license = "MIT"
 autotests = false
 
 [[bin]]
-name = "tmc"
+name = "td-mail"
 path = "src/main.rs"
 
 [[test]]
 name = "cli_integration"
 path = "tests/cli_integration.rs"
 
-# tmc is a TARGET-built application, NOT part of the control-plane engine
+# td-mail is a TARGET-built application, NOT part of the control-plane engine
 # workspace. It is standalone — its own workspace root — with its own
 # one-self-entry lock. Zero external dependencies: `std` plus td's shared
 # modules, and std is the pinned toolchain rather than a cargo dep (AGENTS.md
@@ -40,7 +40,7 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-# The shipped tmc is built by its recipe invoking rustc DIRECTLY, and that
+# The shipped td-mail is built by its recipe invoking rustc DIRECTLY, and that
 # recipe restates opt-level=s / panic=abort / strip. This profile governs only
 # local `cargo build --release`. lto is dropped: a single-crate direct rustc
 # build cannot mirror it, so declaring it here would be a contract the artifact

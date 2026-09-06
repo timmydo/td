@@ -23,6 +23,6 @@
 
 ## Future
 - [ ] Generate summary/digest file from cached articles (similar to `rss_digest.py` but reading from the cache and producing a standalone HTML or text summary)
-- [x] CLI mode (NDJSON protocol, like tmc's `--cli`)
+- [x] CLI mode (NDJSON protocol, like td-mail's `--cli`)
 - [ ] Feed-specific refresh intervals
 - [ ] OPML import/export

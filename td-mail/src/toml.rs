@@ -1802,7 +1802,7 @@ mod tests {
 
     #[test]
     fn a_legacy_section_sits_beside_named_accounts() {
-        // tmc reads `[jmap]` only when `[account.NAME]` produced nothing.
+        // td-mail reads `[jmap]` only when `[account.NAME]` produced nothing.
         let doc = t("[jmap]\nusername = \"legacy@example.com\"\n\n[account.personal]\nusername = \"me@example.com\"\n\n[account.work]\nusername = \"me@work.com\"\n");
         assert_eq!(doc.table_keys(), vec!["jmap", "account"]);
         let accounts = doc.require_table("account").unwrap().as_table().unwrap();
@@ -2182,14 +2182,14 @@ mod tests {
     fn shipped_tmc_configuration() {
         // td-firstboot's TMC_CONFIG, verbatim.
         let doc = t(concat!(
-            "# td mail (tmc). Provisioned on first boot; edit freely, it is never rewritten.\n",
+            "# td-mail. Provisioned on first boot; edit freely, it is never rewritten.\n",
             "# Paths are as the application sees them inside its jail. The client reads\n",
             "# this file when it starts.\n",
             "\n",
             "[account.main]\n",
             "well_known_url = \"https://mail.example.com/.well-known/jmap\"\n",
             "username = \"you@example.com\"\n",
-            "password_file = \"/home/td/.config/tmc/password\"\n",
+            "password_file = \"/home/td/.config/td-mail/password\"\n",
         ));
         assert_eq!(doc.table_keys(), vec!["account"]);
         let main = doc.get("account").and_then(|a| a.get("main")).unwrap();
@@ -2200,7 +2200,7 @@ mod tests {
         assert_eq!(main.require_str("username").unwrap(), "you@example.com");
         assert_eq!(
             main.require_str("password_file").unwrap(),
-            "/home/td/.config/tmc/password"
+            "/home/td/.config/td-mail/password"
         );
         assert_eq!(main.optional_str("password_command").unwrap(), None);
     }
@@ -2209,7 +2209,7 @@ mod tests {
     fn shipped_tn_configuration() {
         // td-firstboot's TN_CONFIG, verbatim.
         let doc = t(concat!(
-            "# td news (tn). Provisioned on first boot; edit freely, it is never rewritten.\n",
+            "# td-news. Provisioned on first boot; edit freely, it is never rewritten.\n",
             "# The client reads this file when it starts. The feeds below are public\n",
             "# starting points: replace or delete them, and nothing is fetched until you\n",
             "# name a feed of your own.\n",
@@ -2236,7 +2236,7 @@ mod tests {
         );
     }
 
-    /// tmc's documented configuration, with every section the application
+    /// td-mail's documented configuration, with every section the application
     /// reads.
     const TMC_FULL: &str = r##"
 [ui]
@@ -2281,7 +2281,7 @@ password_command = "pass show email/example.com"
 [account.work]
 well_known_url = "https://mx.work.com/.well-known/jmap"
 username = "me@work.com"
-password_file = "/home/td/.config/tmc/work-password"
+password_file = "/home/td/.config/td-mail/work-password"
 "##;
 
     #[test]
@@ -2335,13 +2335,13 @@ password_file = "/home/td/.config/tmc/work-password"
         assert_eq!(work.optional_str("password_command").unwrap(), None);
         assert_eq!(
             work.optional_str("password_file").unwrap(),
-            Some("/home/td/.config/tmc/work-password")
+            Some("/home/td/.config/td-mail/work-password")
         );
     }
 
-    /// A rules file exercising every condition shape tmc compiles.
+    /// A rules file exercising every condition shape td-mail compiles.
     const TMC_RULES: &str = r#"
-# tmc mail rules
+# td-mail mail rules
 
 [[rule]]
 name = "mark newsletters read"
@@ -2667,7 +2667,7 @@ confidence = 0.9
 
     #[test]
     fn an_unknown_section_is_caught_at_the_root() {
-        // tmc's `test_unknown_section_or_key_errors`, hand-mapped.
+        // td-mail's `test_unknown_section_or_key_errors`, hand-mapped.
         let doc = t("[bogus]\nfoo = \"bar\"\n\n[jmap]\nusername = \"u\"\n");
         let allowed = [
             "ui",

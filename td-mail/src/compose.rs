@@ -402,7 +402,7 @@ pub fn write_compose_draft(draft: &ComposeDraft) -> io::Result<PreparedDraft> {
     let attachment_dir = if draft.attachments.is_empty() {
         None
     } else {
-        let att_dir = dir.join(format!("tmc-att-{}", stamp));
+        let att_dir = dir.join(format!("td-mail-att-{}", stamp));
         fs::create_dir_all(&att_dir)?;
         fs::set_permissions(&att_dir, fs::Permissions::from_mode(0o700))?;
         for att in &draft.attachments {
@@ -417,7 +417,7 @@ pub fn write_compose_draft(draft: &ComposeDraft) -> io::Result<PreparedDraft> {
         Some(att_dir)
     };
 
-    let draft_path = dir.join(format!("tmc-draft-{}.eml", stamp));
+    let draft_path = dir.join(format!("td-mail-draft-{}.eml", stamp));
     write_secure_file(&draft_path, body.as_bytes())?;
 
     Ok(PreparedDraft {
@@ -493,7 +493,7 @@ fn draft_dir_from_env(
     if let Some(runtime_dir) = xdg_runtime_dir {
         let trimmed = runtime_dir.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("tmc").join("drafts");
+            return PathBuf::from(trimmed).join("td-mail").join("drafts");
         }
     }
 
@@ -505,7 +505,7 @@ fn draft_dir_from_env(
         PathBuf::from(".")
     };
 
-    state_dir.join("tmc").join("drafts")
+    state_dir.join("td-mail").join("drafts")
 }
 
 #[cfg(test)]
@@ -793,7 +793,7 @@ mod tests {
                 Some("/home/example".to_string())
             ),
             PathBuf::from("/tmp/runtime-test")
-                .join("tmc")
+                .join("td-mail")
                 .join("drafts")
         );
     }
@@ -806,7 +806,7 @@ mod tests {
                 Some("/tmp/state-test".to_string()),
                 Some("/home/example".to_string())
             ),
-            PathBuf::from("/tmp/state-test").join("tmc").join("drafts")
+            PathBuf::from("/tmp/state-test").join("td-mail").join("drafts")
         );
     }
 
@@ -817,7 +817,7 @@ mod tests {
             PathBuf::from("/home/example")
                 .join(".local")
                 .join("state")
-                .join("tmc")
+                .join("td-mail")
                 .join("drafts")
         );
     }

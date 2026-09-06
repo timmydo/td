@@ -6,7 +6,7 @@
 //! token store, and persists the store as a single JSON model file.
 //!
 //! The classifier never takes actions on its own. Callers obtain a numeric
-//! score and a [`Verdict`]; in tmc the verdict is surfaced as a synthetic
+//! score and a [`Verdict`]; in td-mail the verdict is surfaced as a synthetic
 //! `X-Tmc-Spam-Verdict` header so that the existing rules engine (rules.toml)
 //! decides what to do with the message.
 
@@ -291,7 +291,7 @@ impl SpamModel {
     }
 }
 
-/// Default model location: `$XDG_DATA_HOME/tmc/spam-model.json`.
+/// Default model location: `$XDG_DATA_HOME/td-mail/spam-model.json`.
 ///
 /// Lives under the *data* dir, not the cache: the trained store is curated by
 /// the user (via the J / un-junk training keys) and must survive cache clears.
@@ -303,7 +303,7 @@ pub fn model_path() -> PathBuf {
     } else {
         PathBuf::from(".")
     };
-    data_dir.join("tmc").join("spam-model.json")
+    data_dir.join("td-mail").join("spam-model.json")
 }
 
 // --- Tokenization ---
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_empty_model() {
-        let model = SpamModel::load(Path::new("/nonexistent/tmc/spam-model.json"));
+        let model = SpamModel::load(Path::new("/nonexistent/td-mail/spam-model.json"));
         assert_eq!(model.spam_messages(), 0);
         assert_eq!(model.ham_messages(), 0);
     }

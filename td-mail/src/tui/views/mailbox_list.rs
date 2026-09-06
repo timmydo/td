@@ -221,9 +221,9 @@ impl View for MailboxListView {
         term.set_header()?;
         let header = {
             let title = if self.account_names.len() > 1 {
-                format!("tmc - {}", self.current_account)
+                format!("td-mail - {}", self.current_account)
             } else {
-                "tmc - Timmy's Mail Console".to_string()
+                "td-mail - Timmy's Mail Console".to_string()
             };
             if let Some(ts) = self.last_refreshed {
                 format!("{} (refreshed {})", title, format_system_time(ts))

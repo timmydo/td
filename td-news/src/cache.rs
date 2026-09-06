@@ -15,8 +15,8 @@ const FEED_INDEX: &str = "feed_index";
 /// the point of the rename is that it is never opened at all.
 const CACHE_FILE: &str = "cache.tdkv";
 
-/// What tn kept before this: a redb database nothing here can read.
-const LEGACY_CACHE_FILE: &str = "tn.redb";
+/// What td-news kept before this: a redb database nothing here can read.
+const LEGACY_CACHE_FILE: &str = "td-news.redb";
 
 pub struct Cache {
     store: Arc<Store>,
@@ -311,10 +311,10 @@ fn cache_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{}/.cache", home)
     });
-    PathBuf::from(xdg).join("tn")
+    PathBuf::from(xdg).join("td-news")
 }
 
-/// Delete the redb cache tn used to keep. Nothing reads it now, and it
+/// Delete the redb cache td-news used to keep. Nothing reads it now, and it
 /// holds a copy of every article that was ever fetched.
 fn remove_legacy_cache() {
     remove_legacy_cache_in(&cache_dir());

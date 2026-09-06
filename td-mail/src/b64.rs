@@ -1,5 +1,5 @@
 //! Base64 encoding (RFC 4648 §4, the standard alphabet with `=` padding), the
-//! one direction tmc needs: an HTTP Basic credential is `base64(user:pass)`.
+//! one direction td-mail needs: an HTTP Basic credential is `base64(user:pass)`.
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 

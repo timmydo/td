@@ -1,5 +1,5 @@
 [package]
-name = "tn"
+name = "td-news"
 version = "0.1.0"
 edition = "2021"
 description = "Timmy's News: a terminal RSS and Atom reader, td's news application"
@@ -8,12 +8,12 @@ license = "MIT"
 # The SHIPPED reader is this one bin, compiled directly by rustc from td's
 # recipe (never `cargo build`) into a static executable.
 [[bin]]
-name = "tn"
+name = "td-news"
 path = "src/main.rs"
 
-# tn is a TARGET-built application, NOT part of td's control-plane engine
+# td-news is a TARGET-built application, NOT part of td's control-plane engine
 # workspace. It is standalone — its own workspace root — with its own
-# one-self-entry lock. No dependencies, and staying that way: tn is `std`
+# one-self-entry lock. No dependencies, and staying that way: td-news is `std`
 # alone (td's AGENTS.md "std, not no_std", and APPLICATIONS.md §W.8). What
 # ten crates used to supply is now seven shared td modules under `src/`,
 # copied whole and never edited, plus one unix socket to td's fetch service.
@@ -34,7 +34,7 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-# The shipped tn is built by td's recipe invoking rustc DIRECTLY with
+# The shipped td-news is built by td's recipe invoking rustc DIRECTLY with
 # +crt-static; that recipe restates opt-level=s / panic=abort / strip. This
 # profile governs only local `cargo build --release`. lto is not set: a
 # single-crate direct rustc build cannot mirror it, so declaring it here

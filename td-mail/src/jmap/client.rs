@@ -1,11 +1,11 @@
 use crate::json::{self, ToJson};
 
-/// The whole of tmc's transport is td's fetch service. It holds the TLS
+/// The whole of td-mail's transport is td's fetch service. It holds the TLS
 /// trust, the resolver, the timeouts and the body caps; this side holds a
 /// unix socket and the framing.
 ///
 /// `None` for a response limit asks for the service's own ceiling rather
-/// than a smaller one of tmc's: a JMAP `Email/get` for a hundred messages
+/// than a smaller one of td-mail's: a JMAP `Email/get` for a hundred messages
 /// with full body values runs past ten megabytes routinely, which is why
 /// this client never had a cap of its own.
 const RESPONSE_LIMIT: Option<u64> = None;
@@ -19,7 +19,7 @@ fn no_fetch_service() -> JmapError {
         _ => "$XDG_RUNTIME_DIR/td-fetch/socket (XDG_RUNTIME_DIR is unset)".to_string(),
     };
     JmapError::NoFetchService(format!(
-        "no td-fetch socket at {}: tmc fetches through td's fetch service; \
+        "no td-fetch socket at {}: td-mail fetches through td's fetch service; \
          on a host, serve one there",
         socket
     ))

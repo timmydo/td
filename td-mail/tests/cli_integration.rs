@@ -24,7 +24,7 @@ struct CliHarness {
     stdin: std::process::ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
     _server: MockJmapServer,
-    // tmc reaches the mock server through the fetch socket, as it reaches
+    // td-mail reaches the mock server through the fetch socket, as it reaches
     // every origin. Dropped before the directory that holds it.
     _fetch: MockFetchSocket,
     _runtime_dir: testing::TempDir,
@@ -70,7 +70,7 @@ password_command = "echo test"
         );
         std::fs::write(&config_path, config_content).expect("write config");
 
-        let tmc_bin = env!("CARGO_BIN_EXE_tmc");
+        let tmc_bin = env!("CARGO_BIN_EXE_td-mail");
         let mut command = Command::new(tmc_bin);
         command
             .arg("--cli")
@@ -90,7 +90,7 @@ password_command = "echo test"
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn tmc --cli");
+            .expect("spawn td-mail --cli");
 
         let stdin = child.stdin.take().expect("take stdin");
         let stdout = child.stdout.take().expect("take stdout");
@@ -498,8 +498,8 @@ fn test_train_spam_and_ham() {
     assert!(resp["ok"].is_true(), "train ham failed: {}", resp);
     assert_eq!(text(&resp["trained_as"]), "ham");
 
-    // The model is persisted under $XDG_DATA_HOME/tmc/spam-model.json.
-    let model_path = data_dir.path().join("tmc").join("spam-model.json");
+    // The model is persisted under $XDG_DATA_HOME/td-mail/spam-model.json.
+    let model_path = data_dir.path().join("td-mail").join("spam-model.json");
     let bytes = std::fs::read(&model_path).expect("model file should exist after training");
     let model = json::parse_slice(&bytes).expect("parse model JSON");
     assert_eq!(number(&model["spam_messages"]), 1, "model: {}", model);
@@ -540,7 +540,7 @@ fn test_connect_without_fetch_service_names_the_socket() {
     );
     std::fs::write(&config_path, config_content).expect("write config");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tmc"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_td-mail"))
         .arg("--cli")
         .arg(format!("--config={}", config_path.display()))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
@@ -548,7 +548,7 @@ fn test_connect_without_fetch_service_names_the_socket() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn tmc --cli");
+        .expect("spawn td-mail --cli");
     let mut stdin = child.stdin.take().expect("take stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("take stdout"));
     writeln!(
@@ -567,7 +567,7 @@ fn test_connect_without_fetch_service_names_the_socket() {
     assert!(!resp["ok"].is_true(), "connect should fail: {}", resp);
     let error = resp["error"].as_str().unwrap_or("");
     let expected = format!(
-        "no td-fetch socket at {}/td-fetch/socket: tmc fetches through \
+        "no td-fetch socket at {}/td-fetch/socket: td-mail fetches through \
          td's fetch service; on a host, serve one there",
         runtime_dir.path().display()
     );

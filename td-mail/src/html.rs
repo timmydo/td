@@ -2724,7 +2724,7 @@ mod tests {
         out
     }
 
-    /// tn's own filter for the link reference lines this renderer appends;
+    /// td-news's own filter for the link reference lines this renderer appends;
     /// copied from news-td so the format stays compatible.
     fn is_reference_link_def(line: &str) -> bool {
         let trimmed = line.trim();
@@ -3557,7 +3557,7 @@ mod tests {
 
     #[test]
     fn urls_survive_the_wide_scavenging_pass() {
-        // tn renders at width 200 purely to collect URLs from the text.
+        // td-news renders at width 200 purely to collect URLs from the text.
         let html = "<p><a href=\"https://example.com/one\">a</a> \
                     <a href=\"https://example.com/two?q=1&amp;r=2\">b</a></p>";
         let out = text(html, 200);

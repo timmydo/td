@@ -18,7 +18,7 @@ fn log_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{}/.cache", home)
     });
-    PathBuf::from(xdg).join("tn")
+    PathBuf::from(xdg).join("td-news")
 }
 
 /// Sends every log of this process to `dir`, once; a later call keeps the

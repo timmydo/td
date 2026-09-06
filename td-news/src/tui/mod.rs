@@ -114,7 +114,7 @@ pub fn run(
     );
     // After the screen is gone, so the message is not drawn over.
     if let Some(why) = screen::restore_failure() {
-        eprintln!("tn: {}", why);
+        eprintln!("td-news: {}", why);
     }
     outcome
 }
@@ -1017,7 +1017,7 @@ impl App {
         let mut html = String::new();
         html.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
         html.push_str(&format!(
-            "    <title>{} - tn digest</title>\n",
+            "    <title>{} - td-news digest</title>\n",
             html_escape(feed_name)
         ));
         html.push_str(concat!(
@@ -1035,7 +1035,7 @@ impl App {
         ));
         html.push_str("</head>\n<body>\n");
         html.push_str(&format!(
-            "    <h1>{} - tn digest</h1>\n    <ul>\n",
+            "    <h1>{} - td-news digest</h1>\n    <ul>\n",
             html_escape(feed_name)
         ));
 
@@ -1081,7 +1081,7 @@ impl App {
 
         // Write to temp file and open in browser
         let dir = std::env::temp_dir();
-        let path = dir.join("tn-digest.html");
+        let path = dir.join("td-news-digest.html");
         match std::fs::write(&path, &html) {
             Ok(()) => {
                 let url = format!("file://{}", path.display());

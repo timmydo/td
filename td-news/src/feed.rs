@@ -108,7 +108,7 @@ fn fetch_socket_location() -> String {
     }
 }
 
-/// tn holds no TLS, no trust store and no resolver: the network is
+/// td-news holds no TLS, no trust store and no resolver: the network is
 /// `td-fetchd`'s and this program holds a unix socket (td's
 /// APPLICATIONS.md §W.8). Off a td session there is no such service, and
 /// that is a missing component rather than a network failure, so it is
@@ -116,7 +116,7 @@ fn fetch_socket_location() -> String {
 /// it on a host (§X).
 fn no_fetch_service() -> String {
     format!(
-        "no td-fetch socket at {}: tn fetches through td's fetch service; \
+        "no td-fetch socket at {}: td-news fetches through td's fetch service; \
          on a host, serve one there",
         fetch_socket_location()
     )
@@ -464,7 +464,7 @@ fn parse_datetime_to_unix(input: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
-    /// Off a td session there is no fetch service, and tn cannot reach a
+    /// Off a td session there is no fetch service, and td-news cannot reach a
     /// feed at all. That is a missing component, so the message names it
     /// and says where it belongs, rather than reading as a network fault.
     #[test]
@@ -480,7 +480,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.ends_with("/td-fetch/socket: tn fetches through td's fetch service; on a host, serve one there"),
+            err.ends_with("/td-fetch/socket: td-news fetches through td's fetch service; on a host, serve one there"),
             "{err}"
         );
         assert!(fetch_socket_location().ends_with("/td-fetch/socket"));

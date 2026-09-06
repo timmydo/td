@@ -1,6 +1,6 @@
-//! Regular expressions for tmc: td-txt's POSIX engine UNCHANGED (its own header
+//! Regular expressions for td-mail: td-txt's POSIX engine UNCHANGED (its own header
 //! follows this one), plus a `UserRegex` adapter at the end of the file that
-//! reads the Rust-`regex` dialect tmc's rules files are written in. tmc compiles
+//! reads the Rust-`regex` dialect td-mail's rules files are written in. td-mail compiles
 //! user-authored patterns from `rules.toml`, the two `[mail]` config settings,
 //! and one hard-coded URL pattern; `find_urls` answers that last one without the
 //! engine at all.
@@ -24,7 +24,7 @@
 //!   character, and `\t \n \r` are the byte.
 //! - `(?i)` at the START of the pattern sets case folding and is consumed; no
 //!   `(?` reaches the engine.
-//! - `(?:…)` is a plain group. tmc reads no capture, so the numbering this
+//! - `(?:…)` is a plain group. td-mail reads no capture, so the numbering this
 //!   changes is unobservable.
 //! - A bracket expression is re-spelled rather than passed through, because the
 //!   two flavours disagree about escapes and placement — see
@@ -3444,11 +3444,11 @@ mod tests {
     }
 }
 
-// ---- tmc adapter ---------------------------------------------------------
+// ---- td-mail adapter ---------------------------------------------------------
 //
 // Everything above is td-txt's engine, unchanged. Everything below translates
-// the Rust-`regex` dialect tmc's users write into the ERE the engine reads, and
-// wraps the byte-oriented API in the `&str` one tmc calls.
+// the Rust-`regex` dialect td-mail's users write into the ERE the engine reads, and
+// wraps the byte-oriented API in the `&str` one td-mail calls.
 
 /// The largest user pattern accepted, in bytes. Patterns come from a
 /// user-authored rules file and run against untrusted headers; one larger than
@@ -3457,7 +3457,7 @@ pub const MAX_USER_PATTERN: usize = 4 << 10;
 
 /// A user-authored pattern, compiled for matching against untrusted text.
 ///
-/// `compile` accepts the Rust-`regex` spellings tmc's rules and documentation
+/// `compile` accepts the Rust-`regex` spellings td-mail's rules and documentation
 /// use and translates them; see the module header for the exact dialect. The
 /// match itself is the engine above: bytes, ASCII, POSIX leftmost-longest, and
 /// bounded by a step budget.
@@ -3565,7 +3565,7 @@ fn ceil_boundary(text: &str, i: usize) -> usize {
 
 /// `https?://[^\s<>\]\)"'`]+`, by hand.
 ///
-/// tmc runs this over every message body it renders, which is the one regex use
+/// td-mail runs this over every message body it renders, which is the one regex use
 /// hot enough to be worth not being a regex at all: the pattern is a literal
 /// prefix and a byte class, so a scan decides it without the engine. Equivalence
 /// with the compiled pattern is a test, not a comment.
@@ -3637,7 +3637,7 @@ enum ClassMember {
 }
 
 /// Refusal wording. Every one names the byte offset in the pattern AS WRITTEN,
-/// which is what tmc echoes back to whoever wrote the rules file.
+/// which is what td-mail echoes back to whoever wrote the rules file.
 fn refuse(what: &str, at: usize) -> Error {
     Error::new(format!(
         "{what} at byte {at} is not supported: patterns are POSIX ERE \
@@ -3818,7 +3818,7 @@ impl Translator<'_> {
     }
 
     /// `(` and the `(?…` forms. Only `(?:` survives translation: it groups
-    /// without capturing, which POSIX spells `(` — tmc reads no capture groups,
+    /// without capturing, which POSIX spells `(` — td-mail reads no capture groups,
     /// so the numbering that changes is unobservable.
     fn group(&mut self) -> Result<(), Error> {
         let at = self.here();
@@ -4112,7 +4112,7 @@ mod user_tests {
         }
     }
 
-    /// Every pattern tmc's `rules.rs` tests and its rules documentation write,
+    /// Every pattern td-mail's `rules.rs` tests and its rules documentation write,
     /// with the outcome the `regex` crate gives. GOLDEN against that crate's
     /// documented semantics: unanchored search, greedy repetition, `(?i)` for
     /// case folding, `\.` for a literal dot.
@@ -4263,7 +4263,7 @@ mod user_tests {
     /// with no placement rule.
     #[test]
     fn a_bracket_expression_is_respelled_for_posix() {
-        // tmc's URL class, character for character.
+        // td-mail's URL class, character for character.
         assert_eq!(ere(r#"[^\s<>\]\)"'`]+"#), "[^[:space:]<>[.].])\"'`]+");
         assert_eq!(ere("[a-z0-9_-]"), "[a-z0-9_[.-.]]");
         assert_eq!(ere(r"[\^\]\[-]"), "[[.^.][.].][.[.][.-.]]");
@@ -4337,7 +4337,7 @@ mod user_tests {
         }
     }
 
-    /// The malformed patterns tmc's own tests write, plus the shapes a rules
+    /// The malformed patterns td-mail's own tests write, plus the shapes a rules
     /// file gets wrong. The message matters less than the refusal, but it must
     /// not be empty.
     #[test]
@@ -4350,7 +4350,7 @@ mod user_tests {
         assert!(refused("[]").contains("empty"));
         assert!(refused(r"a\").contains("trailing backslash"));
         // Balance is the translator's own check: the engine's grep grammar
-        // reads a stray `)` as text, where the crate tmc used refused it.
+        // reads a stray `)` as text, where the crate td-mail used refused it.
         assert!(refused("a)").contains("unmatched `)` at byte 1"));
         assert!(refused("(a").contains("group opened at byte 0"));
         assert!(refused("(?:a").contains("group opened at byte 0"));
@@ -4457,7 +4457,7 @@ mod user_tests {
     /// `find_urls` is the compiled pattern's answer, without the engine.
     #[test]
     fn find_urls_agrees_with_the_engine() {
-        // tmc's pattern, character for character (email_view.rs and backend.rs).
+        // td-mail's pattern, character for character (email_view.rs and backend.rs).
         let re = compiled(r#"https?://[^\s<>\]\)"'`]+"#);
         let corpus = [
             "",
@@ -4508,7 +4508,7 @@ mod user_tests {
             find_urls("http://a.example/x http://b.example/y"),
             vec!["http://a.example/x", "http://b.example/y"]
         );
-        // tmc trims trailing punctuation itself; the pattern does not.
+        // td-mail trims trailing punctuation itself; the pattern does not.
         assert_eq!(
             find_urls("see http://a.example."),
             vec!["http://a.example."]
@@ -4550,7 +4550,7 @@ mod user_tests {
         assert!(compiled("{x}").is_match("{x}"));
     }
 
-    /// tmc prints a rule as `Header =~ /pattern/`, and the pattern it prints is
+    /// td-mail prints a rule as `Header =~ /pattern/`, and the pattern it prints is
     /// the one the user wrote -- never the translated ERE.
     #[test]
     fn as_str_is_the_pattern_as_written() {

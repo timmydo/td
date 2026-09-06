@@ -1007,13 +1007,13 @@ password_command = "pass show email/example.com"
 [account.td]
 well_known_url = "https://mx.example.com/.well-known/jmap"
 username = "user@example.com"
-password_file = "/home/td/.config/tmc/password"
+password_file = "/home/td/.config/td-mail/password"
 "#,
         )
         .unwrap();
         assert_eq!(
             config.accounts[0].password,
-            PasswordSource::File("/home/td/.config/tmc/password".to_string())
+            PasswordSource::File("/home/td/.config/td-mail/password".to_string())
         );
         let command = Config::parse(&jmap_config("")).unwrap();
         assert_eq!(
@@ -1039,17 +1039,17 @@ password_file = "/home/td/.config/tmc/password"
     }
 
     /// `TMC_CONFIG` from td's `td-firstboot/src/main.rs`, copied byte for
-    /// byte: the file a td image provisions at `~/.config/tmc/config.toml`
+    /// byte: the file a td image provisions at `~/.config/td-mail/config.toml`
     /// on first boot.
     const FIRSTBOOT_CONFIG: &str = "\
-# td mail (tmc). Provisioned on first boot; edit freely, it is never rewritten.
+# td-mail. Provisioned on first boot; edit freely, it is never rewritten.
 # Paths are as the application sees them inside its jail. The client reads
 # this file when it starts.
 
 [account.main]
 well_known_url = \"https://mail.example.com/.well-known/jmap\"
 username = \"you@example.com\"
-password_file = \"/home/td/.config/tmc/password\"
+password_file = \"/home/td/.config/td-mail/password\"
 ";
 
     /// The parser that reads that file is now td's own TOML, not serde's, so
@@ -1069,7 +1069,7 @@ password_file = \"/home/td/.config/tmc/password\"
         assert_eq!(account.username, "you@example.com");
         assert_eq!(
             account.password,
-            PasswordSource::File("/home/td/.config/tmc/password".to_string())
+            PasswordSource::File("/home/td/.config/td-mail/password".to_string())
         );
     }
 }

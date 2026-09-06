@@ -11,7 +11,7 @@ mod json;
 mod b64;
 mod backend;
 mod cache;
-// The shared module carries more of the calendar than tmc's clock needs, and
+// The shared module carries more of the calendar than td-mail's clock needs, and
 // its `Zone::from_local_*` are conversions from a local time, not constructors.
 #[allow(dead_code, clippy::wrong_self_convention)]
 mod civil;
@@ -21,21 +21,21 @@ mod config;
 mod html;
 mod jmap;
 mod keybindings;
-// The shared store carries more than tmc's five tables need.
+// The shared store carries more than td-mail's five tables need.
 #[allow(dead_code)]
 mod kv;
-// The shared module carries td-txt's whole engine; tmc reads one adapter.
+// The shared module carries td-txt's whole engine; td-mail reads one adapter.
 #[allow(dead_code)]
 mod regex;
 mod rules;
 mod spam;
 mod td_fetch;
-// The shared module carries a terminal surface wider than tmc's one raw mode.
+// The shared module carries a terminal surface wider than td-mail's one raw mode.
 #[allow(dead_code)]
 mod term_sys;
 #[cfg(test)]
 mod testing;
-// The shared module carries more of TOML than tmc's two files need.
+// The shared module carries more of TOML than td-mail's two files need.
 #[allow(dead_code)]
 mod toml;
 mod tui;
@@ -48,11 +48,11 @@ use std::process::Command;
 
 fn default_config_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("tmc").join("config.toml")
+        PathBuf::from(xdg).join("td-mail").join("config.toml")
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home)
             .join(".config")
-            .join("tmc")
+            .join("td-mail")
             .join("config.toml")
     } else {
         PathBuf::from("config.toml")
@@ -162,7 +162,7 @@ fn print_prompt(topic: &str) {
         "config" => {
             let config_path = default_config_path();
             print!(
-                r#"I need help generating a configuration file for tmc (Timmy's Mail Console), a terminal email client that connects via JMAP.
+                r#"I need help generating a configuration file for td-mail (Timmy's Mail Console), a terminal email client that connects via JMAP.
 
 The config file goes at: {}
 
@@ -218,8 +218,8 @@ Rules:
 - `archive_folder` and `deleted_folder` are mailbox targets for `a` and `d` in list views.
 - `rules_mailbox_regex` controls which mailbox names auto-run rules on refresh/fetch; default is `^INBOX$`.
 - `my_email_regex` is matched against combined To/Cc and used by rules with `skip_if_to_me = true`.
-- Both patterns are POSIX Extended Regular Expressions over bytes, with GNU `\w \W \b \B` and an optional leading `(?i)`; `\d \D \s \S` and `(?:...)` are accepted. Matching is leftmost-longest and ASCII. Lookaround, backreferences, named/comment groups, non-greedy quantifiers, `\uXXXX`/`\x..`/`\p{{...}}` and a pattern over 4 KiB are refused, and a refused pattern is a config error naming the pattern and the reason. See `tmc --prompt=rules`.
-- `[spam]` configures the built-in Bayesian classifier: it scores new INBOX mail and sets an `X-Tmc-Spam-Verdict` header that rules.toml can act on (train with `J`/`H` in the message view). See `tmc --prompt=rules`.
+- Both patterns are POSIX Extended Regular Expressions over bytes, with GNU `\w \W \b \B` and an optional leading `(?i)`; `\d \D \s \S` and `(?:...)` are accepted. Matching is leftmost-longest and ASCII. Lookaround, backreferences, named/comment groups, non-greedy quantifiers, `\uXXXX`/`\x..`/`\p{{...}}` and a pattern over 4 KiB are refused, and a refused pattern is a config error naming the pattern and the reason. See `td-mail --prompt=rules`.
+- `[spam]` configures the built-in Bayesian classifier: it scores new INBOX mail and sets an `X-Tmc-Spam-Verdict` header that rules.toml can act on (train with `J`/`H` in the message view). See `td-mail --prompt=rules`.
 - `[retention.NAME]` sections are optional folder retention policies used by `x` (preview) and `X` (expire) in mailbox view.
 - Retention policy fields:
   - `folder` (required): mailbox name, role, or path (e.g. "INBOX/Alerts")
@@ -237,7 +237,7 @@ Please ask me for my email provider, username, and how I store passwords, then g
                 .map(|p| p.join("rules.toml"))
                 .unwrap_or_else(|| PathBuf::from("rules.toml"));
             print!(
-                r#"I need help generating a rules file for tmc (Timmy's Mail Console), a terminal email client.
+                r#"I need help generating a rules file for td-mail (Timmy's Mail Console), a terminal email client.
 
 The rules file goes at: {}
 
@@ -374,7 +374,7 @@ fn print_help_config() {
     println!("  ham_threshold = 0.2          # Score <= this is verdict \"ham\"; between is \"unsure\" (default: 0.2)");
     println!("  min_training = 20            # Min trained messages per class before verdicts go live (default: 20)");
     println!("  # Train with J (spam) / H (not-spam) in the message view; act on the");
-    println!("  # X-Tmc-Spam-Verdict header from rules.toml (see: tmc --prompt=rules).");
+    println!("  # X-Tmc-Spam-Verdict header from rules.toml (see: td-mail --prompt=rules).");
     println!();
     println!("[account.NAME]                   # At least one account required");
     println!(
@@ -406,7 +406,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!("Usage: tmc [OPTIONS]");
+        eprintln!("Usage: td-mail [OPTIONS]");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --config=PATH    Use config file at PATH instead of default");
@@ -620,8 +620,8 @@ fn main() {
     // to report from. This is the exit, and the operator staring at a terminal
     // with no echo is the only one who can act on it.
     if let Some(why) = term_sys::take_restore_failure() {
-        eprintln!("tmc: {}", why);
-        eprintln!("tmc: run `stty sane` to put the terminal back.");
+        eprintln!("td-mail: {}", why);
+        eprintln!("td-mail: run `stty sane` to put the terminal back.");
         log_error!("[Exit] {}", why);
     }
 

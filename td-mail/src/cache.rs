@@ -48,11 +48,11 @@ pub struct Cache {
 
 fn cache_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("tmc")
+        PathBuf::from(xdg).join("td-mail")
     } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".cache").join("tmc")
+        PathBuf::from(home).join(".cache").join("td-mail")
     } else {
-        PathBuf::from("/tmp").join("tmc-cache")
+        PathBuf::from("/tmp").join("td-mail-cache")
     }
 }
 
@@ -95,7 +95,7 @@ impl Cache {
                 Store::open(&path)
                     .map_err(|e| format!("failed to open cache db at {}: {}", path.display(), e))?
             }
-            // Locked (a second tmc on the same account) and I/O errors both
+            // Locked (a second td-mail on the same account) and I/O errors both
             // reach the caller, which proceeds without a cache.
             Err(e) => {
                 return Err(format!(

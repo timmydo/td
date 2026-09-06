@@ -1,14 +1,14 @@
 # Timmy's News
 
-`tn` (Timmy's News) is a Rust terminal news reader for RSS/Atom feeds. It fetches feeds,
+`td-news` (Timmy's News) is a Rust terminal news reader for RSS/Atom feeds. It fetches feeds,
 caches articles in a small key/value store, and provides a keyboard/mouse-first TUI.
 
 ## Dependencies
 
-None. `tn` is the Rust standard library and nothing else: JSON, TOML, XML,
+None. `td-news` is the Rust standard library and nothing else: JSON, TOML, XML,
 HTML rendering, the cache, dates and the terminal are td's shared `std`
 modules under `src/`, copied whole from one master each. Fetching is not
-done here at all — `tn` asks td's fetch service over the unix socket at
+done here at all — `td-news` asks td's fetch service over the unix socket at
 `$XDG_RUNTIME_DIR/td-fetch/socket`, which holds the TLS, the resolver and
 the timeouts, and without it no feed can be fetched.
 
@@ -29,8 +29,8 @@ cargo fmt -- --check
 
 Default config path:
 
-- `$XDG_CONFIG_HOME/tn/config.toml`
-- or `~/.config/tn/config.toml`
+- `$XDG_CONFIG_HOME/td-news/config.toml`
+- or `~/.config/td-news/config.toml`
 
 Example:
 
@@ -61,7 +61,7 @@ below the current selection while moving in feed/article lists.
 
 ## Usage
 
-- CLI executable: `tn`
+- CLI executable: `td-news`
 
 - Main feed list includes virtual views:
 - `[All]` for all feeds combined
@@ -83,6 +83,6 @@ below the current selection while moving in feed/article lists.
 
 ## Cache
 
-- Database: `~/.cache/tn/cache.tdkv`
-- A `tn.redb` left by an earlier version is deleted on start-up; nothing
+- Database: `~/.cache/td-news/cache.tdkv`
+- A `td-news.redb` left by an earlier version is deleted on start-up; nothing
   reads it any more.

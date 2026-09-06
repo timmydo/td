@@ -1,15 +1,15 @@
-# tmc (Timmy's Mail Console)
+# td-mail (Timmy's Mail Console)
 
-`tmc` is a Rust terminal mail client (MUA) for reading and triaging email over JMAP.
+`td-mail` is a Rust terminal mail client (MUA) for reading and triaging email over JMAP.
 
 ## Goals
 
 - Fast, keyboard-first email workflow in a terminal UI.
 - Unix-friendly composition flow: drafts open in `$EDITOR`.
-- Clear separation of concerns: `tmc` reads/manages mail; message submission is external.
+- Clear separation of concerns: `td-mail` reads/manages mail; message submission is external.
 - Scriptable automation through a JSON-over-stdin/stdout CLI mode.
 
-## What tmc Does
+## What td-mail Does
 
 - Connects to one or more JMAP accounts.
 - Lists mailboxes and emails, opens message view, and shows threads.
@@ -20,13 +20,13 @@
 
 ## Requirements
 
-- Rust toolchain (stable) with Cargo. No crates at all: tmc is `std` alone,
-  and `Cargo.lock` lists one package, tmc itself.
+- Rust toolchain (stable) with Cargo. No crates at all: td-mail is `std` alone,
+  and `Cargo.lock` lists one package, td-mail itself.
 - A JMAP server/account.
-- td's fetch service, listening at `$XDG_RUNTIME_DIR/td-fetch/socket`. tmc
+- td's fetch service, listening at `$XDG_RUNTIME_DIR/td-fetch/socket`. td-mail
   opens no socket of its own: every request goes through the service, which
   holds the TLS trust, the resolver and the timeouts. Inside a td jail the
-  `sockets=fetch` grant provides it; elsewhere, serve one there or tmc
+  `sockets=fetch` grant provides it; elsewhere, serve one there or td-mail
   reports that it is missing and starts from its cache.
 - An editor available via `$EDITOR` (for compose/reply/forward flow).
 - A password source per account: a non-interactive credential command for
@@ -56,15 +56,15 @@ cargo install --path .
 Or use the compiled release binary directly:
 
 ```bash
-./target/release/tmc
+./target/release/td-mail
 ```
 
 ## Setup
 
 Default config path:
 
-- `$XDG_CONFIG_HOME/tmc/config.toml`
-- Fallback: `~/.config/tmc/config.toml`
+- `$XDG_CONFIG_HOME/td-mail/config.toml`
+- Fallback: `~/.config/td-mail/config.toml`
 
 Example config:
 
@@ -97,7 +97,7 @@ Each account sets exactly one of `password_command` or `password_file`.
 Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those.
 
 If the first account cannot be reached at startup (server down, network not
-up yet, placeholder credentials), tmc starts offline from its cache instead
+up yet, placeholder credentials), td-mail starts offline from its cache instead
 of exiting; selecting the account again retries the connection.
 
 Optional rules file path defaults to `rules.toml` next to your config; override with `--rules=PATH`.
@@ -135,7 +135,7 @@ cargo run
 For all command-line options, run:
 
 ```bash
-tmc --help
+td-mail --help
 ```
 
 ## Development

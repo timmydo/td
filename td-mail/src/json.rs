@@ -1877,7 +1877,7 @@ mod tests {
         );
     }
 
-    // Shapes taken from tmc's src/jmap/client.rs and src/cli.rs, and tn's
+    // Shapes taken from td-mail's src/jmap/client.rs and src/cli.rs, and td-news's
     // src/cli.rs: these must compile and evaluate exactly as they do under
     // serde_json's json!.
     #[test]

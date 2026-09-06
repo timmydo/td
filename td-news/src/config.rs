@@ -165,7 +165,7 @@ impl Config {
                     let home = std::env::var("HOME").unwrap_or_default();
                     format!("{}/.config", home)
                 });
-                PathBuf::from(xdg).join("tn").join("config.toml")
+                PathBuf::from(xdg).join("td-news").join("config.toml")
             }
         };
 
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn the_shipped_configuration_parses_into_its_two_feeds() {
         const TN_CONFIG: &str = "\
-# td news (tn). Provisioned on first boot; edit freely, it is never rewritten.
+# td-news. Provisioned on first boot; edit freely, it is never rewritten.
 # The client reads this file when it starts. The feeds below are public
 # starting points: replace or delete them, and nothing is fetched until you
 # name a feed of your own.

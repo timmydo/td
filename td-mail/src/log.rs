@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 
-/// Return the log file path: $XDG_STATE_HOME/tmc/tmc.log
+/// Return the log file path: $XDG_STATE_HOME/td-mail/td-mail.log
 pub fn log_path() -> PathBuf {
     let state_dir = if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
         PathBuf::from(xdg)
@@ -15,7 +15,7 @@ pub fn log_path() -> PathBuf {
     } else {
         PathBuf::from(".")
     };
-    state_dir.join("tmc").join("tmc.log")
+    state_dir.join("td-mail").join("td-mail.log")
 }
 
 /// Initialize the log file. Call once at startup.

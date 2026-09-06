@@ -1596,7 +1596,7 @@ pub fn run_cli(
 
 pub fn print_help_cli() {
     print!(
-        r#"tmc --cli: JSON-over-stdin/stdout CLI mode
+        r#"td-mail --cli: JSON-over-stdin/stdout CLI mode
 ==========================================
 
 Protocol: Newline-Delimited JSON (NDJSON)
@@ -1707,7 +1707,7 @@ Attachment Commands
 -------------------
 download_attachment: Download an attachment blob.
    > {{"command": "download_attachment", "blob_id": "blob-id", "name": "file.pdf", "content_type": "application/pdf"}}
-   < {{"ok": true, "name": "file.pdf", "path": "/tmp/tmc-attachments/file.pdf"}}
+   < {{"ok": true, "name": "file.pdf", "path": "/tmp/td-mail-attachments/file.pdf"}}
 
 Compose Commands
 ----------------

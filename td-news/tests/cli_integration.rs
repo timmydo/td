@@ -1,7 +1,7 @@
 //! The CLI protocol end to end: a seeded cache, the binary, and the NDJSON
 //! frames it writes back. The cache is seeded and the replies are read
 //! with the same `json` and `kv` modules the program uses, included here
-//! rather than linked, because `tn` is a binary crate.
+//! rather than linked, because `td-news` is a binary crate.
 
 #[path = "../src/json.rs"]
 #[allow(dead_code)]
@@ -25,10 +25,10 @@ const FEED_INDEX: &str = "feed_index";
 
 #[test]
 fn help_cli_includes_command_docs() {
-    let output = Command::new(env!("CARGO_BIN_EXE_tn"))
+    let output = Command::new(env!("CARGO_BIN_EXE_td-news"))
         .arg("--help-cli")
         .output()
-        .expect("run tn --help-cli");
+        .expect("run td-news --help-cli");
     assert!(output.status.success());
 
     let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
@@ -43,7 +43,7 @@ fn cli_mode_reads_json_commands_and_returns_json_lines() {
     let cache_path = dir.path().join("test.tdkv");
     seed_cache(&cache_path);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tn"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_td-news"))
         .args(["--cli", "--cache"])
         .arg(&cache_path)
         // Its logs go with the cache, not to whoever runs the tests.
@@ -51,7 +51,7 @@ fn cli_mode_reads_json_commands_and_returns_json_lines() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn tn --cli");
+        .expect("spawn td-news --cli");
 
     let input = concat!(
         "{\"cmd\":\"list_folders\"}\n",

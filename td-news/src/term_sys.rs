@@ -1233,7 +1233,7 @@ mod tests {
     }
 
     /// Every byte of a synthetic termios, so the arithmetic is checked without a
-    /// terminal. `KEYS_BLOCKING` is what tn asks for: ECHO|ICANON|ISIG off,
+    /// terminal. `KEYS_BLOCKING` is what td-news asks for: ECHO|ICANON|ISIG off,
     /// IXON|ICRNL off, OPOST off, VMIN 1, VTIME 0, and `c_cflag` untouched.
     #[test]
     fn the_keys_blocking_set_clears_what_tn_clears_and_nothing_else() {
@@ -1255,7 +1255,7 @@ mod tests {
         assert_eq!(
             read_u32(&want, CFLAG_AT),
             0x1234,
-            "c_cflag is not tn's to set"
+            "c_cflag is not td-news's to set"
         );
         assert_eq!(
             read_u32(&want, LFLAG_AT),
@@ -1270,7 +1270,7 @@ mod tests {
         assert_eq!(want.get(CC_AT + VINTR), Some(&0x03));
     }
 
-    /// The same for `BYTES_TENTH`, which is what tmc asks for:
+    /// The same for `BYTES_TENTH`, which is what td-mail asks for:
     /// BRKINT|ICRNL|INPCK|ISTRIP|IXON off, OPOST off, ECHO|ICANON|IEXTEN|ISIG
     /// off, CS8 on, VMIN 0, VTIME 1.
     #[test]
@@ -1291,7 +1291,7 @@ mod tests {
         assert_eq!(
             read_u32(&want, IFLAG_AT),
             0x1000,
-            "IXOFF is not tmc's to clear"
+            "IXOFF is not td-mail's to clear"
         );
         assert_eq!(read_u32(&want, OFLAG_AT), 0x4);
         assert_eq!(
@@ -1302,7 +1302,7 @@ mod tests {
         assert_eq!(
             read_u32(&want, LFLAG_AT),
             0x100,
-            "TOSTOP is not tmc's to clear"
+            "TOSTOP is not td-mail's to clear"
         );
         assert_eq!(want.get(CC_AT + VMIN), Some(&0));
         assert_eq!(want.get(CC_AT + VTIME), Some(&1), "a tenth of a second");

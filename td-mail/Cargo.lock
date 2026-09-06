@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "tmc"
+name = "td-mail"
 version = "0.1.0"
