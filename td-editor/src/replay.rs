@@ -287,6 +287,7 @@ impl Session {
                     ("fill-paragraph", []) => Command::FillParagraph,
                     ("set-auto-fill", [value]) => Command::AutoFill(boolean(value)?),
                     ("set-fill-column", [value]) => Command::FillColumn(size(value)?),
+                    ("go-to-line", [value]) => Command::GoToLine(size(value)?),
                     ("find", [needle, backward, wrap]) => Command::Find {
                         needle: string(needle)?,
                         backward: boolean(backward)?,

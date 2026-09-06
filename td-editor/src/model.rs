@@ -144,6 +144,7 @@ pub enum Command {
     FillParagraph,
     AutoFill(bool),
     FillColumn(usize),
+    GoToLine(usize),
     Find {
         needle: String,
         backward: bool,
@@ -492,6 +493,22 @@ impl Editor {
                     return Err(Error::InvalidArgument);
                 }
                 self.document_mut(id)?.fill_column = column;
+            }
+            Command::GoToLine(line) => {
+                let caret = if line == 1 {
+                    0
+                } else {
+                    let index = line.checked_sub(2).ok_or(Error::InvalidArgument)?;
+                    doc.text
+                        .match_indices('\n')
+                        .nth(index)
+                        .map(|(at, _)| at + 1)
+                        .ok_or(Error::InvalidPosition)?
+                };
+                self.document_mut(id)?.selection = Selection {
+                    anchor: caret,
+                    caret,
+                };
             }
             Command::Find {
                 needle,

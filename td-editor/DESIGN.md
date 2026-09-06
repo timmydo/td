@@ -1270,8 +1270,8 @@ or enabled format toggle. Undo/Redo availability reflects the captured
 history depth. Scratch mode disables Open/Save/Save As rather than pretending
 to persist its text. Only existing bindings are shown: Windows uses Ctrl+
 labels, Emacs uses its C-/M- chord notation, and unbound items have no shortcut.
-Find/Find Next/Find Previous use the native search contract below. Replace,
-Go To Line, fill-column entry and command completion remain later prompt
+Find/Find Next/Find Previous and Go To Line use the native contracts below.
+Replace, fill-column entry and command completion remain later prompt
 increments, not hidden implementations behind these menus.
 
 Menu actions dispatch the existing controller events, file-path requests and
@@ -1553,12 +1553,52 @@ selection-away-and-back from reviving it; focus/keymap loss also clears it.
 Successful matches reveal the selected range through the ordinary view
 controller and never create an undo entry or change text revision.
 
-The three menu entries extend the largest fixed menu to eleven rows, requiring
-at least 320 by 312 pixels at scale 1. Complete panel fitting and scale bounds
-remain unchanged. Tests cover native chords
+The three Find entries are followed by Go To Line. Complete panel fitting
+and scale bounds remain unchanged. Tests cover native chords
 in both profiles, query entry/cancel, both directions, explicit wrap,
 missing/stale/foreign targets, scalar byte limits and overlay-only pixels.
 The headless model/replay Find interface is unchanged.
+
+### Implemented Go To Line
+
+Edit > Go To Line or native F6 opens a numeric prompt in either key profile.
+F6 remains available when the complete Edit menu cannot fit; Ctrl+G retains
+its existing Cancel meaning, including inside this prompt. F10 and menu
+navigation also provide keyboard access. Entry
+starts empty and accepts at most 20 ASCII decimal digits, scalar Backspace
+and Ctrl+U to clear. Repeated keys do not type or submit. Return requires a
+positive, representable number naming an existing logical line. Empty, zero,
+overflow and out-of-range input retain the prompt and show an error so the
+user can correct it. Leading zeros are accepted; signs, whitespace and other
+characters are ignored. Escape/Ctrl+G cancel without moving selection.
+Error text precedes the ordinary prompt/help so it remains visible at the
+320-pixel menu minimum width even with a paused-input prefix. As with other
+overlays, extremely narrow windows may clip the six-row notice.
+The platform-independent 20-digit entry bound accommodates 64-bit numbers;
+values overflowing `usize`, including on 32-bit hosts, refuse normally.
+
+Logical lines are one-based and delimited only by normalized LF bytes,
+independent of soft wrapping or viewport width. Every document has line 1;
+a final LF creates a final empty line. A valid destination collapses selection
+at the first byte of that line and reveals the caret through the ordinary
+controller. Invalid destinations do not clamp or change selection, viewport,
+generation, text, revision, saved state or undo history. The model's
+`GoToLine` command scans at most the bounded document once without building
+a line index or copying text. Replay exposes `go-to-line TAB REVISION LINE`
+through the same controller command; the arguments are tab-separated on wire.
+
+The prompt captures editor identity, active tab, revision and directed
+selection. Submission refuses a changed target instead of moving another
+document. Opening cancels prefix/mark, drag, repeat, pending search wrap and
+native Paste while preserving selection. Document pointer actions are blocked
+and file/discard dialogs retain priority. Focus/keymap loss pauses entry
+visibly without losing digits. Window close cancels it before normal close
+handling. The largest fixed menu now has twelve rows (a 320 by 336 pixel
+minimum at scale 1) and is shown only when
+its complete panel fits, using the existing scale bounds. Native tests cover
+both profiles, real digit/Return events, invalid input, focus pause, stale
+targets, close cancellation and overlay restoration. The shared command is
+also tested through replay, including UTF-8 offsets and empty final lines.
 
 ### Version-1 compatibility target
 
@@ -1830,7 +1870,8 @@ dispatch. A response echoes version/request ID, then `ok`, `error`, or
 `pending`; errors carry a stable code and hex-encoded diagnostic.
 
 Version 1 exposes `state`, `text`, `new`, `open`, `select-tab`, `select-range`,
-`insert`, `delete`, `undo`, `redo`, `find`, `replace`, `fill-paragraph`,
+`insert`, `delete`, `undo`, `redo`, `find`, `go-to-line`, `replace`,
+`fill-paragraph`,
 `set-auto-fill`, `set-fill-column`, `set-key-profile`, `check-spelling`,
 `spelling-results`, `save`, `save-as`, `close-tab`, `quit`, `dialog-answer`,
 `key`, `pointer`, and `wait-frame`. Text mutations and close requests name a

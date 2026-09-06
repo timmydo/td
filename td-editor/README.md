@@ -33,6 +33,11 @@ F3 searches next and Shift+F3 previous; Emacs C-s/C-r open directional
 search. Type a literal case-sensitive query, Return to search, Ctrl+U to
 clear or Escape/Ctrl+G to cancel. Search reports the end before the next
 explicit search wraps. Entry is submitted, not incremental while typing.
+Edit > Go To Line or F6 accepts a one-based logical line in either profile;
+soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
+cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
+open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
+(tab-separated arguments).
 No GPU renderer, spelling, remote socket or tmc integration is
 claimed yet. Do not set
 `$EDITOR` to this binary yet.

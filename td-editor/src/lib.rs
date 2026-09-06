@@ -6,6 +6,7 @@
 pub mod clipboard;
 mod data;
 mod dialog;
+mod goto;
 pub use dialog::{Discard, Reload};
 pub mod files;
 pub mod fill;

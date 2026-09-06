@@ -38,6 +38,7 @@ impl Group {
                 Find,
                 FindNext,
                 FindPrevious,
+                GoToLine,
             ],
             Self::Format => &[Wrap, AutoFill, Fill, Spell],
             Self::Help => &[About],
@@ -69,6 +70,7 @@ pub(crate) enum Item {
     Find,
     FindNext,
     FindPrevious,
+    GoToLine,
 }
 
 impl Item {
@@ -96,6 +98,7 @@ impl Item {
             Self::Find => "Find...",
             Self::FindNext => "Find Next",
             Self::FindPrevious => "Find Previous",
+            Self::GoToLine => "Go To Line...",
         }
     }
     pub(crate) fn shortcut(self, profile: Profile) -> &'static str {
@@ -120,6 +123,7 @@ impl Item {
             (Self::Paste, Profile::Windows) => "Ctrl+V",
             (Self::Paste, Profile::Emacs) => "C-y",
             (Self::Spell, _) => "F7",
+            (Self::GoToLine, _) => "F6",
             (Self::SelectAll, Profile::Windows) => "Ctrl+A",
             (Self::Fill, Profile::Emacs) => "M-q",
             (Self::Find, Profile::Windows) => "Ctrl+F",
@@ -364,10 +368,7 @@ mod tests {
             Some(&Item::SelectAll)
         );
         menu.step(true);
-        assert_eq!(
-            menu.group.items().get(menu.selected),
-            Some(&Item::FindPrevious)
-        );
+        assert_eq!(menu.group.items().get(menu.selected), Some(&Item::GoToLine));
         for _ in 0..100 {
             menu.step(false);
             assert!(menu.enabled(*menu.group.items().get(menu.selected).unwrap()));

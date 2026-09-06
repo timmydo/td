@@ -23,6 +23,7 @@ fn source_inventory_and_allowances_are_closed() {
         "dialog.rs",
         "files.rs",
         "fill.rs",
+        "goto.rs",
         "keys.rs",
         "keyboard.rs",
         "layout.rs",
