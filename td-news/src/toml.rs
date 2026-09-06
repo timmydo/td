@@ -2189,7 +2189,7 @@ mod tests {
             "[account.main]\n",
             "well_known_url = \"https://mail.example.com/.well-known/jmap\"\n",
             "username = \"you@example.com\"\n",
-            "password_file = \"/home/td/.config/td-mail/password\"\n",
+            "secret = \"portal\"\n",
         ));
         assert_eq!(doc.table_keys(), vec!["account"]);
         let main = doc.get("account").and_then(|a| a.get("main")).unwrap();
@@ -2198,10 +2198,7 @@ mod tests {
             "https://mail.example.com/.well-known/jmap"
         );
         assert_eq!(main.require_str("username").unwrap(), "you@example.com");
-        assert_eq!(
-            main.require_str("password_file").unwrap(),
-            "/home/td/.config/td-mail/password"
-        );
+        assert_eq!(main.require_str("secret").unwrap(), "portal");
         assert_eq!(main.optional_str("password_command").unwrap(), None);
     }
 
@@ -2281,7 +2278,7 @@ password_command = "pass show email/example.com"
 [account.work]
 well_known_url = "https://mx.work.com/.well-known/jmap"
 username = "me@work.com"
-password_file = "/home/td/.config/td-mail/work-password"
+secret = "portal"
 "##;
 
     #[test]
@@ -2333,10 +2330,7 @@ password_file = "/home/td/.config/td-mail/work-password"
         assert_eq!(account.table_keys(), vec!["personal", "work"]);
         let work = account.require_table("work").unwrap();
         assert_eq!(work.optional_str("password_command").unwrap(), None);
-        assert_eq!(
-            work.optional_str("password_file").unwrap(),
-            Some("/home/td/.config/td-mail/work-password")
-        );
+        assert_eq!(work.optional_str("secret").unwrap(), Some("portal"));
     }
 
     /// A rules file exercising every condition shape td-mail compiles.
@@ -2615,17 +2609,12 @@ confidence = 0.9
         let doc =
             t("[jmap]\nwell_known_url = \"u\"\nusername = \"n\"\nbogus = 1\nalso_bogus = 2\n");
         let jmap = doc.require_table("jmap").unwrap();
-        let allowed = [
-            "well_known_url",
-            "username",
-            "password_command",
-            "password_file",
-        ];
+        let allowed = ["well_known_url", "username", "password_command", "secret"];
         assert_eq!(jmap.unknown_keys(&allowed), vec!["bogus", "also_bogus"]);
         assert!(doc.unknown_keys(&["jmap"]).is_empty());
         assert_eq!(
             jmap.check_known_keys(&allowed).unwrap_err().to_string(),
-            "unknown field `bogus`, expected one of `well_known_url`, `username`, `password_command`, `password_file`"
+            "unknown field `bogus`, expected one of `well_known_url`, `username`, `password_command`, `secret`"
         );
         assert!(jmap
             .check_known_keys(&["well_known_url", "username", "bogus", "also_bogus"])

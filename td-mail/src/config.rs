@@ -12,30 +12,66 @@ pub struct AccountConfig {
 }
 
 /// Where an account's password comes from. `Command` runs a shell command
-/// and takes its stdout; `File` reads a file directly, which needs no shell
-/// and suits a sandbox that has none. Exactly one is configured per account.
+/// and takes its stdout; `Portal` asks td's credential portal for the secret
+/// stored under the account's name, which needs no shell and no file in the
+/// jail. Exactly one is configured per account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasswordSource {
     Command(String),
-    File(String),
+    Portal(String),
 }
+
+/// The one value `secret` takes. td-secret stores the credential as
+/// mail/NAME for `[account.NAME]` and `td-secret get NAME` returns it.
+const PORTAL: &str = "portal";
 
 fn password_source(
     password_command: Option<String>,
-    password_file: Option<String>,
+    secret: Option<String>,
+    password_file: bool,
+    name: &str,
     section: &str,
 ) -> Result<PasswordSource, ConfigError> {
-    match (password_command, password_file) {
+    if password_file {
+        return Err(ConfigError::Parse(format!(
+            "password_file in {} is no longer a password source: store the password with `td-secret set mail/{} < file` and set secret = \"{}\"",
+            section, name, PORTAL
+        )));
+    }
+    match (password_command, secret.as_deref()) {
         (Some(command), None) => Ok(PasswordSource::Command(command)),
-        (None, Some(file)) => Ok(PasswordSource::File(file)),
+        (None, Some(PORTAL)) => portal_name(name, section).map(PasswordSource::Portal),
+        (None, Some(_)) => Err(ConfigError::Parse(format!(
+            "secret in {} takes only \"{}\"",
+            section, PORTAL
+        ))),
         (Some(_), Some(_)) => Err(ConfigError::Parse(format!(
-            "both password_command and password_file set in {}; choose one",
+            "both password_command and secret set in {}; choose one",
             section
         ))),
         (None, None) => Err(ConfigError::Parse(format!(
-            "missing password_command or password_file in {}",
+            "missing password_command or secret in {}",
             section
         ))),
+    }
+}
+
+/// The portal names a credential as td-secret does: 1 to 64 bytes of
+/// `[A-Za-z0-9_-]`. The account name is that name, so an account the portal
+/// cannot name is a configuration error here, not a failed lookup at connect.
+fn portal_name(name: &str, section: &str) -> Result<String, ConfigError> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if valid {
+        Ok(name.to_string())
+    } else {
+        Err(ConfigError::Parse(format!(
+            "{}: the portal cannot name this account; a credential name is 1 to 64 bytes of [A-Za-z0-9_-]",
+            section
+        )))
     }
 }
 
@@ -438,24 +474,30 @@ struct RawAccountFields {
     well_known_url: Option<String>,
     username: Option<String>,
     password_command: Option<String>,
-    password_file: Option<String>,
+    secret: Option<String>,
+    /// The retired key is recognised so its refusal can say what replaced it.
+    password_file: bool,
 }
 
-const ACCOUNT_KEYS: &[&str] = &[
-    "well_known_url",
-    "username",
-    "password_command",
-    "password_file",
-];
+const ACCOUNT_KEYS: &[&str] = &["well_known_url", "username", "password_command", "secret"];
 
 impl RawAccountFields {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
-        table.check_known_keys(ACCOUNT_KEYS)?;
+        // The retired key is recognised, so its refusal can say what replaced
+        // it, and not advertised: an unknown key is named against the four.
+        if let Some(key) = table
+            .unknown_keys(ACCOUNT_KEYS)
+            .iter()
+            .find(|key| key.as_str() != "password_file")
+        {
+            return Err(TomlError::unknown_field(key, ACCOUNT_KEYS));
+        }
         Ok(RawAccountFields {
             well_known_url: table.optional_str("well_known_url")?.map(str::to_string),
             username: table.optional_str("username")?.map(str::to_string),
             password_command: table.optional_str("password_command")?.map(str::to_string),
-            password_file: table.optional_str("password_file")?.map(str::to_string),
+            secret: table.optional_str("secret")?.map(str::to_string),
+            password_file: table.get("password_file").is_some(),
         })
     }
 }
@@ -585,7 +627,9 @@ impl Config {
                 )?,
                 password: password_source(
                     account.password_command,
+                    account.secret,
                     account.password_file,
+                    &account_name,
                     &format!("[account.{}]", account_name),
                 )?,
             });
@@ -607,7 +651,13 @@ impl Config {
                     jmap.username,
                     "missing username (in [jmap] or [account.NAME])",
                 )?,
-                password: password_source(jmap.password_command, jmap.password_file, "[jmap]")?,
+                password: password_source(
+                    jmap.password_command,
+                    jmap.secret,
+                    jmap.password_file,
+                    "default",
+                    "[jmap]",
+                )?,
             });
         }
 
@@ -1001,41 +1051,112 @@ password_command = "pass show email/example.com"
     }
 
     #[test]
-    fn test_password_file_is_one_of_two_sources() {
+    fn the_portal_is_one_of_two_password_sources() {
         let config = Config::parse(
             r#"
 [account.td]
 well_known_url = "https://mx.example.com/.well-known/jmap"
 username = "user@example.com"
-password_file = "/home/td/.config/td-mail/password"
+secret = "portal"
 "#,
         )
         .unwrap();
         assert_eq!(
             config.accounts[0].password,
-            PasswordSource::File("/home/td/.config/td-mail/password".to_string())
+            PasswordSource::Portal("td".to_string())
         );
         let command = Config::parse(&jmap_config("")).unwrap();
         assert_eq!(
             command.accounts[0].password,
             PasswordSource::Command("pass show email/example.com".to_string())
         );
+        // The legacy section has no name of its own; its credential is
+        // mail/default.
+        let legacy = Config::parse(
+            "[jmap]\nwell_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\nsecret = \"portal\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.accounts[0].password,
+            PasswordSource::Portal("default".to_string())
+        );
+        let jmap = Config::parse(
+            "[jmap]\nwell_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"/p\"\n",
+        )
+        .unwrap_err();
+        match jmap {
+            ConfigError::Parse(msg) => assert!(
+                msg.contains("password_file in [jmap] is no longer a password source: store the password with `td-secret set mail/default < file`"),
+                "got: {}",
+                msg
+            ),
+            _ => panic!("expected parse error"),
+        }
         for (body, needle) in [
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\n",
-                "missing password_command or password_file",
+                "missing password_command or secret",
             ),
             (
-                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_command = \"pass\"\npassword_file = \"/p\"\n",
-                "both password_command and password_file",
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\nsecret = \"portal\"\nbogus = 1\n",
+                "unknown field `bogus`, expected one of `well_known_url`, `username`, `password_command`, `secret`",
+            ),
+            (
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_command = \"pass\"\nsecret = \"portal\"\n",
+                "both password_command and secret",
+            ),
+            (
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\nsecret = \"hunter2\"\n",
+                "secret in [account.td] takes only \"portal\"",
+            ),
+            (
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"/home/td/.config/td-mail/password\"\n",
+                "store the password with `td-secret set mail/td < file` and set secret = \"portal\"",
             ),
         ] {
             let err = Config::parse(&format!("[account.td]\n{}", body)).unwrap_err();
             match err {
-                ConfigError::Parse(msg) => assert!(msg.contains(needle), "got: {}", msg),
+                ConfigError::Parse(msg) => {
+                    assert!(msg.contains(needle), "got: {}", msg);
+                    // A password typed into `secret` is the obvious mistake;
+                    // the refusal does not repeat it.
+                    assert!(!msg.contains("hunter2"), "the value is echoed: {}", msg);
+                }
                 _ => panic!("expected parse error"),
             }
         }
+    }
+
+    /// td-secret refuses a name outside `[A-Za-z0-9_-]{1,64}`; the account
+    /// name is the credential name, so the refusal is a configuration error.
+    #[test]
+    fn a_name_the_portal_cannot_store_is_a_configuration_error() {
+        let account = |name: &str| {
+            format!(
+                "[account.{}]\nwell_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\nsecret = \"portal\"\n",
+                name
+            )
+        };
+        let longest = "a".repeat(64);
+        let config = Config::parse(&account(&longest)).unwrap();
+        assert_eq!(config.accounts[0].password, PasswordSource::Portal(longest));
+        for name in ["a".repeat(65), "\"a b\"".to_string(), "\"\"".to_string()] {
+            let err = Config::parse(&account(&name)).unwrap_err();
+            match err {
+                ConfigError::Parse(msg) => assert!(
+                    msg.contains("the portal cannot name this account; a credential name is 1 to 64 bytes"),
+                    "{}: got: {}",
+                    name,
+                    msg
+                ),
+                _ => panic!("expected parse error for {}", name),
+            }
+        }
+        // The rule is td-secret's, byte for byte.
+        assert!(portal_name("a-b_C9", "[account.a-b_C9]").is_ok());
+        assert!(portal_name("", "[jmap]").is_err());
+        assert!(portal_name("a.b", "[account.a]").is_err());
+        assert!(portal_name("é", "[account.é]").is_err());
     }
 
     /// `MAIL_CONFIG` from td's `td-firstboot/src/main.rs`, copied byte for
@@ -1049,7 +1170,7 @@ password_file = "/home/td/.config/td-mail/password"
 [account.main]
 well_known_url = \"https://mail.example.com/.well-known/jmap\"
 username = \"you@example.com\"
-password_file = \"/home/td/.config/td-mail/password\"
+secret = \"portal\"
 ";
 
     /// The parser that reads that file is now td's own TOML, not serde's, so
@@ -1067,9 +1188,6 @@ password_file = \"/home/td/.config/td-mail/password\"
             "https://mail.example.com/.well-known/jmap"
         );
         assert_eq!(account.username, "you@example.com");
-        assert_eq!(
-            account.password,
-            PasswordSource::File("/home/td/.config/td-mail/password".to_string())
-        );
+        assert_eq!(account.password, PasswordSource::Portal("main".to_string()));
     }
 }

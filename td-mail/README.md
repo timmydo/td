@@ -29,9 +29,12 @@
   `sockets=fetch` grant provides it; elsewhere, serve one there or td-mail
   reports that it is missing and starts from its cache.
 - An editor available via `$EDITOR` (for compose/reply/forward flow).
-- A password source per account: a non-interactive credential command for
-  `password_command` (for example `pass`), or a file for `password_file`
-  (read directly, no shell involved; keep it mode 0600).
+- A password source per account: td's credential portal for
+  `secret = "portal"` (the secret stored as mail/NAME for `[account.NAME]`,
+  read through the `/app/bin/td-secret` helper packaged beside td-mail, so
+  inside a td jail only; store it with `td-secret set mail/NAME < file`), or
+  a non-interactive credential command for `password_command` (for example
+  `pass`).
 
 ## Build
 
@@ -85,7 +88,7 @@ deleted_folder = "Trash"
 [account.personal]
 well_known_url = "https://mx.example.com/.well-known/jmap"
 username = "me@example.com"
-password_command = "pass show email/example.com"
+secret = "portal"
 
 [account.work]
 well_known_url = "https://mx.work.com/.well-known/jmap"
@@ -93,8 +96,9 @@ username = "me@work.com"
 password_command = "pass show email/work.com"
 ```
 
-Each account sets exactly one of `password_command` or `password_file`.
-Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those.
+Each account sets exactly one of `secret = "portal"` or `password_command`.
+Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those;
+its portal credential is mail/default.
 
 If the first account cannot be reached at startup (server down, network not
 up yet, placeholder credentials), td-mail starts offline from its cache instead

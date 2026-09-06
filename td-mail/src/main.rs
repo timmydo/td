@@ -80,20 +80,93 @@ pub fn run_password_command(cmd: &str) -> Result<String, String> {
     Ok(password.trim_end_matches('\n').to_string())
 }
 
-/// Read a password file as `password_file` names it: the whole file with
-/// trailing newlines removed, so a file written by `echo` or an editor works.
-pub fn read_password_file(path: &str) -> Result<String, String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("failed to read password file {}: {}", path, e))?;
-    let password = String::from_utf8(bytes)
-        .map_err(|e| format!("password file {} is not valid UTF-8: {}", path, e))?;
-    Ok(password.trim_end_matches('\n').to_string())
+/// The credential portal's helper, where the `mail` package puts it: td-secret
+/// ships beside td-mail, so `secret = "portal"` is a source inside a td jail
+/// and nowhere else.
+pub const PORTAL_HELPER: &str = "/app/bin/td-secret";
+
+/// Ask the credential portal for the secret stored as mail/NAME. The helper
+/// receives the secret over D-Bus and an fd and prints it. Trailing newlines
+/// go as they do for a command's output, so a secret stored from a file an
+/// editor wrote works. A failure names the helper and the credential, never
+/// the bytes: the secret is not diagnostic text.
+pub fn read_portal_credential(name: &str) -> Result<String, String> {
+    read_portal_credential_from(PORTAL_HELPER, name)
+}
+
+fn read_portal_credential_from(helper: &str, name: &str) -> Result<String, String> {
+    // No terminal for the helper: it takes nothing from stdin, and td-mail's
+    // stdin is the screen's.
+    let output = Command::new(helper)
+        .args(["get", name])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("credential portal: {} did not run: {}", helper, e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!("credential portal: {} get {} failed with {}", helper, name, output.status)
+        } else {
+            format!("credential portal: {} get {}: {}", helper, name, stderr)
+        });
+    }
+    let mut password = String::from_utf8(output.stdout).map_err(|_| {
+        format!("credential portal: {} get {}: the credential is not valid UTF-8", helper, name)
+    })?;
+    // Trimmed in place: one buffer holds the secret, not a second copy.
+    let kept = password.trim_end_matches('\n').len();
+    password.truncate(kept);
+    Ok(password)
+}
+
+#[cfg(test)]
+mod portal_tests {
+    use super::read_portal_credential_from;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn helper(dir: &std::path::Path, body: &str) -> String {
+        let path = dir.join("td-secret");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The helper is asked `get NAME`, its stdin is the null device, and its
+    /// trailing newlines go; every failure names the helper and the
+    /// credential and never repeats what it printed. The stubs are `/bin/sh`
+    /// scripts, the one path a shebang can name.
+    #[test]
+    fn the_helper_is_run_as_the_portal_expects_and_its_failures_are_named() {
+        let dir = crate::testing::tempdir().unwrap();
+        let echo = helper(dir.path(), "printf '%s:%s:%s\\n\\n' \"$1\" \"$2\" \"$(readlink /proc/self/fd/0)\"");
+        assert_eq!(read_portal_credential_from(&echo, "main").unwrap(), "get:main:/dev/null");
+
+        let refused = helper(dir.path(), "echo 'no such credential' >&2; exit 3");
+        let err = read_portal_credential_from(&refused, "main").unwrap_err();
+        assert!(err.contains("get main: no such credential"), "{err}");
+        assert!(err.contains(&refused), "{err}");
+
+        let silent = helper(dir.path(), "exit 4");
+        let err = read_portal_credential_from(&silent, "main").unwrap_err();
+        assert!(err.contains("get main failed with exit status: 4"), "{err}");
+
+        let bytes = helper(dir.path(), "printf '\\377'");
+        let err = read_portal_credential_from(&bytes, "main").unwrap_err();
+        assert!(err.contains("get main: the credential is not valid UTF-8"), "{err}");
+        assert!(!err.contains('\u{fffd}'), "{err}");
+
+        let absent = dir.path().join("missing").to_string_lossy().into_owned();
+        let err = read_portal_credential_from(&absent, "main").unwrap_err();
+        assert!(err.contains("did not run"), "{err}");
+        assert!(err.contains(&absent), "{err}");
+    }
 }
 
 pub fn read_password(source: &PasswordSource) -> Result<String, String> {
     match source {
         PasswordSource::Command(command) => run_password_command(command),
-        PasswordSource::File(path) => read_password_file(path),
+        PasswordSource::Portal(name) => read_portal_credential(name),
     }
 }
 
@@ -200,7 +273,7 @@ days = 30                   # expire mail older than 30 days in Trash when press
 [account.personal]
 well_known_url = "https://mx.example.com/.well-known/jmap"
 username = "me@example.com"
-password_command = "pass show email/example.com"
+secret = "portal"
 
 [account.work]
 well_known_url = "https://mx.work.com/.well-known/jmap"
@@ -210,9 +283,9 @@ password_command = "pass show email/work.com"
 
 Rules:
 - At least one [account.NAME] section is required (or legacy [jmap] with the same three fields).
-- `well_known_url`, `username`, and exactly one of `password_command` or `password_file` are required per account.
+- `well_known_url`, `username`, and exactly one of `password_command` or `secret` are required per account.
+- `secret = "portal"` asks td's credential portal for the secret stored as mail/NAME for [account.NAME] (mail/default for a legacy [jmap] section); it needs no shell and no file, and it works inside a td jail only, where the helper is packaged. Store the secret with `td-secret set mail/NAME < file`. NAME is 1 to 64 bytes of [A-Za-z0-9_-].
 - `password_command` is a shell command that prints the password to stdout.
-- `password_file` is a path whose contents (minus trailing newlines) are the password; it needs no shell.
 - Quoted strings support \", \\, \n, \t escapes.
 - `scrolloff` controls how many lines of context are kept above and below the cursor in list views.
 - `archive_folder` and `deleted_folder` are mailbox targets for `a` and `d` in list views.
@@ -381,7 +454,8 @@ fn print_help_config() {
         "  well_known_url = \"https://.../.well-known/jmap\"  # JMAP discovery URL (required)"
     );
     println!("  username = \"user@example.com\"                    # Email address (required)");
-    println!("  password_command = \"pass show email/example\"     # Shell command returning password (required)");
+    println!("  secret = \"portal\"                                # The credential portal, mail/NAME (this or password_command)");
+    println!("  password_command = \"pass show email/example\"     # Shell command printing the password (or secret)");
     println!();
     println!("[retention.NAME]                 # Optional folder retention policies");
     println!("  folder = \"Archive\"            # Mailbox name to apply retention (required)");
@@ -484,7 +558,7 @@ fn main() {
             eprintln!("  [account.personal]");
             eprintln!("  well_known_url = \"https://your-server/.well-known/jmap\"");
             eprintln!("  username = \"you@example.com\"");
-            eprintln!("  password_command = \"pass show email/example.com\"");
+            eprintln!("  secret = \"portal\"");
             std::process::exit(1);
         }
     };
