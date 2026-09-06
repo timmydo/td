@@ -24,6 +24,7 @@ mod seat;
 mod session;
 mod sys;
 pub mod text;
+pub mod transfer;
 pub mod ui;
 pub mod wayland;
 #[allow(dead_code, clippy::new_without_default)]

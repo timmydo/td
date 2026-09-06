@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -13,6 +14,10 @@ const SYS_RECVMSG: usize = 47;
 const SYS_FCNTL: usize = 72;
 const SYS_FLISTXATTR: usize = 196;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const F_GETFL: usize = 3;
+const F_SETFL: usize = 4;
+const O_NONBLOCK: usize = 0o4000;
+const O_ACCMODE: usize = 3;
 const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 const MSG_CTRUNC: i32 = 8;
@@ -76,6 +81,82 @@ fn result(value: isize) -> io::Result<usize> {
         return Err(io::Error::from_raw_os_error((-value) as i32));
     }
     Ok(value as usize)
+}
+
+fn status(file: &File) -> io::Result<usize> {
+    result(syscall3(SYS_FCNTL, file.as_raw_fd() as usize, F_GETFL, 0))
+}
+
+fn set_status(file: &File, flags: usize) -> io::Result<()> {
+    result(syscall3(
+        SYS_FCNTL,
+        file.as_raw_fd() as usize,
+        F_SETFL,
+        flags,
+    ))
+    .map(|_| ())
+}
+
+/// One received clipboard write endpoint, never a regular file or device.
+/// Status flags are shared by SCM_RIGHTS; restore the exact original word.
+pub(super) struct Destination {
+    file: Option<File>,
+    original: usize,
+}
+
+impl Destination {
+    pub(super) fn new(fd: OwnedFd) -> io::Result<Self> {
+        let file = File::from(fd);
+        let kind = file.metadata()?.file_type();
+        if !kind.is_fifo() && !kind.is_socket() {
+            return Err(io::Error::other(
+                "clipboard destination must be a pipe or socket",
+            ));
+        }
+        let original = status(&file)?;
+        if !matches!(original & O_ACCMODE, 1 | 2) {
+            return Err(io::Error::other("clipboard destination is not writable"));
+        }
+        let destination = Self {
+            file: Some(file),
+            original,
+        };
+        let file = destination
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("closed clipboard destination"))?;
+        set_status(file, original | O_NONBLOCK)?;
+        if status(file)? != original | O_NONBLOCK {
+            return Err(io::Error::other("clipboard nonblocking readback differs"));
+        }
+        Ok(destination)
+    }
+
+    pub(super) fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        use std::io::Write;
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("closed clipboard destination"))?
+            .write(bytes)
+    }
+
+    pub(super) fn close(&mut self) -> io::Result<()> {
+        let Some(file) = self.file.take() else {
+            return Ok(());
+        };
+        set_status(&file, self.original)?;
+        if status(&file)? != self.original {
+            return Err(io::Error::other("clipboard status restore differs"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Destination {
+    fn drop(&mut self) {
+        // Explicit completion/cancellation reports errors; teardown is best effort.
+        let _ = self.close();
+    }
 }
 
 /// Query list size only: no caller pointer, name, value or mutation.

@@ -36,6 +36,7 @@ fn source_inventory_and_allowances_are_closed() {
         "session.rs",
         "sys.rs",
         "text.rs",
+        "transfer.rs",
         "ui.rs",
         "wayland.rs",
         "xkb.rs",
@@ -161,6 +162,7 @@ fn source_inventory_and_allowances_are_closed() {
                 "lib.rs" => 1,
                 "files.rs" => 1,
                 "wayland.rs" => 4,
+                "transfer.rs" => 2,
                 _ => 0,
             },
             "unrostered raw-module access in {name}"
@@ -176,7 +178,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x2afd9e3fab65d666,
+        hash, 0xc86720fafec319ae,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -186,6 +188,10 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         "const SYS_FLISTXATTR: usize = 196;",
         "syscall3(SYS_FLISTXATTR, file.as_raw_fd() as usize, 0, 0)",
         "const F_DUPFD_CLOEXEC: usize = 1030;",
+        "const F_GETFL: usize = 3;",
+        "const F_SETFL: usize = 4;",
+        "const O_NONBLOCK: usize = 0o4000;",
+        "const O_ACCMODE: usize = 3;",
         "#[allow(unsafe_code)]\nfn syscall3(",
         "#[allow(unsafe_code)]\nfn adopt(",
     ] {
@@ -194,6 +200,20 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert!(!raw.contains("#![allow("));
     assert_eq!(raw.matches("core::arch::asm!").count(), 1);
     assert_eq!(raw.matches("OwnedFd::from_raw_fd").count(), 1);
+    let transfer = include_str!("../src/transfer.rs");
+    assert_eq!(transfer.matches("crate::sys::").count(), 2);
+    assert_eq!(
+        transfer
+            .matches("crate::sys::Destination::new(fd)?")
+            .count(),
+        1
+    );
+    assert_eq!(
+        transfer
+            .matches("destination: crate::sys::Destination,")
+            .count(),
+        1
+    );
     let files = include_str!("../src/files.rs");
     assert_eq!(files.matches("crate::sys::has_attributes(file)").count(), 1);
     assert_eq!(files.matches("crate::sys::").count(), 1);

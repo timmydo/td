@@ -58,6 +58,12 @@ partially edit a document. This is a prerequisite, not system clipboard
 support: the native menu entries remain disabled until the Wayland adapter
 and its descriptor audit are connected.
 
+`transfer.rs` adds the tested descriptor transport prerequisite: bounded
+nonblocking pipe/socket writes and private-socket reads, explicit clocks,
+five-second deadlines and EOF-only Paste admission. Cancellation restores
+outgoing descriptor flags. This is a library adapter, not yet native
+Cut/Copy/Paste support.
+
 `src/files.rs` now supplies the synchronous file-transaction adapter: bounded
 regular-file Open and baselines, external-change detection, metadata-checked
 atomic Save, and no-clobber Save As. It preserves BOM/line endings through

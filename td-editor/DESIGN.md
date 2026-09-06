@@ -1377,6 +1377,63 @@ input, stale/foreign/inactive/selection-changed tokens, Undo, encoded-file
 budgets and generation exhaustion through the production controller.
 No new replay command, native clipboard claim or raw consumer is introduced.
 
+### Implemented clipboard transport prerequisite
+
+The public `transfer` module owns bounded descriptor I/O independently of
+the window loop. It does not bind Wayland data-device objects, consume the
+connection's received-rights FIFO, acquire a system selection or enable the
+native clipboard commands. Those are the next adapter increment.
+
+`Incoming::begin` captures Paste intent and creates a private UnixStream
+pair. It returns the producer endpoint as an owned File; the caller must
+drop its local copy after handing it off so EOF can arrive. The receiver
+uses std nonblocking mode, a reusable 16 KiB read buffer and Paste's 1 MiB
+raw-byte budget. A step makes at most four read attempts, counting EINTR,
+and checks the visible active tab/revision/selection before reading. This
+early guard is advisory: an editor replacement with identical visible
+values passes it, but final admission rejects its foreign instance. Any I/O,
+budget, changed-target or clock failure permanently poisons the transfer.
+Only successful EOF unlocks `finish`, which returns the Paste for final
+controller admission, including editor-instance identity and UTF-8 checks.
+No prefix from a failed or unfinished transfer can become an edit. Drop
+cancels and closes without editing. Final admission remains mandatory even
+after EOF; this helper is not authority to bypass the controller.
+
+`Outgoing::begin` retains an immutable Arc<str> of at most 1 MiB and owns
+exactly the supplied descriptor. The private raw Destination wrapper
+requires a writable pipe/socket, adds O_NONBLOCK to its existing status
+word and verifies readback before writing. Regular files, devices and
+read-only pipes are refused, never reopened through procfs. Each step
+makes at most four writes of at most 16 KiB each. Completion and explicit
+Cancel restore the exact original status word with readback before std
+closes the descriptor; errors are reported. Drop attempts restoration but
+cannot report failure. Descriptor duplicates share status flags: callers
+must supply an exclusively used write endpoint, with no other writer or
+concurrent flag changes. Peer loss is an I/O failure under Rust's default
+ignored SIGPIPE disposition; library embedders must retain that disposition
+for ordinary std pipe writes. Post-payload restoration failure is diagnosed
+as cleanup failure after sending, not a claim that no bytes arrived.
+Already sent prefixes
+cannot be retracted; this helper does not acknowledge remote paste success.
+
+Both owners take caller-supplied monotonic milliseconds and have an absolute
+five-second deadline from begin, never renewed by progress. Backward clock
+values and clock exhaustion are refused. Completion and failure are terminal;
+callers must keep stepping pending transfers, or drop them on cancellation.
+These are per-transfer bounds, not a process-wide allocator or scheduling
+guarantee. Metadata/flag queries are synchronous; no hard real-time guarantee
+is claimed. The window adapter will separately enforce focus, MIME, serial,
+object-lifetime and simultaneous-transfer admission rules.
+It must also prove interoperability with real toolkit sources: this endpoint
+is a socket, so a producer requiring a FIFO specifically is not supported.
+
+The raw amendment is limited to fcntl F_GETFL=3 and F_SETFL=4 in surface 14;
+there is no additional syscall, descriptor adoption site, worker or dependency.
+Confinement pins the complete raw source, constants and sole Destination
+consumer. Real pipe/socket tests cover byte-fragmented input, EOF-only
+admission, 1 MiB round trips, per-step work, deadlines, cancellation, broken
+pipes, non-endpoint refusal and restoration through shared descriptor aliases.
+
 ### Version-1 compatibility target
 
 Use core `wl_compositor`, `wl_shm`, `wl_seat`, and `xdg_wm_base`; clipboard

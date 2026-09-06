@@ -68,7 +68,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
-| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
+| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport for bounded credential replies |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -2059,14 +2059,32 @@ An unsupported query refuses saving, not just replacement. Attributes hidden
 from the calling credentials are not proven absent by Linux's listing API;
 the exact supported-file boundary is recorded in `td-editor/DESIGN.md`.
 
-`fcntl` is pinned to `F_DUPFD_CLOEXEC` (1030), minimum descriptor 3. Its only
-production caller duplicates the borrowed descriptor from `WAYLAND_SOCKET`;
+The inherited-stream `fcntl` caller is pinned to `F_DUPFD_CLOEXEC` (1030),
+minimum descriptor 3. It duplicates the borrowed `WAYLAND_SOCKET` descriptor;
 it never adopts or closes that original. The kernel's successful returned
 descriptor is adopted once and converted to `UnixStream`, then checked with
 safe `peer_addr`. Duplication works for sockets, where reopening procfs does
 not. The original remains open until its existing owner or process exit
 closes it. This mode requires exclusive use of the inherited stream; socket
 timeouts are shared with the original. Failed duplication adopts nothing.
+
+Clipboard destinations add only `F_GETFL` (3) and `F_SETFL` (4) to this
+surface. The private `Destination` owner converts a supplied `OwnedFd` into
+a safe File, refuses anything but a pipe/socket and writable access mode,
+captures the original status word, adds only `O_NONBLOCK` (0o4000), and reads
+the exact status back before writing. Safe File writes are bounded by the
+transfer adapter's chunk, work and deadline limits. No descriptor number,
+caller-selected command or flags word escapes the raw module. Only
+`transfer.rs` constructs and uses this owner. Explicit completion and Cancel
+restore the original word with readback and report restoration failures;
+Drop does the same best-effort cleanup on teardown. The owned File remains
+live until restoration has been attempted, then std closes it. No extra
+adoption site or close syscall is needed. Flags are shared with the sender's
+open-file description; the caller must supply an exclusively used write
+endpoint, not one concurrently used or reconfigured by another writer.
+The public `transfer` module exposes bounded transport owners for adapter
+and test use. It does not yet bind the window's descriptor FIFO to clipboard
+events, send a clipboard endpoint on that connection or acquire a selection.
 
 The one receive caller is the window connection. `recvmsg` always requests
 `MSG_CMSG_CLOEXEC` (0x40000000), with one borrowed byte slice and 128 aligned
@@ -2097,10 +2115,11 @@ if a subsequent map succeeds. A missing descriptor waits at most five seconds
 without assuming ancillary boundaries coincide with wire-message boundaries.
 A test-only reader uses the same ownership path to inspect sent SHM pools.
 
-The only production send caller is the connection's pool-request path.
+The only production send caller is the connection's SHM-pool request path.
 `sendmsg` carries exactly one borrowed `File` in a 24-byte ancillary extent,
 `cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies only its
-unlinked 0600 regular SHM backing file. `MSG_NOSIGNAL` (0x4000) makes peer loss
+unlinked 0600 regular SHM backing file.
+`MSG_NOSIGNAL` (0x4000) makes peer loss
 an error. A successful short write transfers the descriptor once; only the
 remaining ordinary bytes are retried. Interrupted calls transfer nothing.
 The complete message has one five-second write deadline, including retries.
@@ -2116,7 +2135,7 @@ control test checks cleanup beyond unrecognized records and invalid entries.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child exec,
 raw environment-fd adoption or other received-fd consumer is authorized here. A
-fifth syscall, another fcntl command, another caller, incoming descriptor
+fifth syscall, fourth fcntl command, another caller, incoming descriptor
 consumer, or additional allowance amends this section and
 `td-editor/DESIGN.md` in the same landing.
 
