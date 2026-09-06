@@ -1988,7 +1988,7 @@ mod tests {
     }
 
     #[test]
-    fn macro_matches_the_tmc_cli_call_sites() {
+    fn macro_matches_the_td_mail_cli_call_sites() {
         struct Addr {
             name: Option<String>,
             email: String,
@@ -2076,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn macro_matches_the_tn_cli_call_sites() {
+    fn macro_matches_the_td_news_cli_call_sites() {
         struct Meta {
             url: String,
             last_fetched: u64,

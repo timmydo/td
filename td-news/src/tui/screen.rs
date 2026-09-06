@@ -16,8 +16,18 @@ pub struct Terminal<'a> {
     /// back; nothing here reads it.
     _raw: Raw<'a>,
     out: BorrowedFd<'a>,
-    mouse_enabled: bool,
+    mouse_on: bool,
     base_seq: String,
+}
+
+/// What takes mouse reporting from `on` to `want`: nothing when it is
+/// there already.
+fn mouse_sequence(on: bool, want: bool) -> Option<&'static str> {
+    match (on, want) {
+        (false, true) => Some("\x1b[?1000h\x1b[?1006h"),
+        (true, false) => Some("\x1b[?1006l\x1b[?1000l"),
+        _ => None,
+    }
 }
 
 impl<'a> Terminal<'a> {
@@ -37,29 +47,28 @@ impl<'a> Terminal<'a> {
 
         let base_seq = base_theme_sequence(theme);
         print!("\x1b[?1049h\x1b[?25l");
-        if mouse {
-            print!("\x1b[?1000h\x1b[?1006h");
-        }
+        // Set either way: a run that died with reporting on left it on, and
+        // a session that wants none should not inherit it.
+        let seq = mouse_sequence(!mouse, mouse).unwrap_or("");
+        print!("{seq}");
         print!("\x1b[2J\x1b[H{}", base_seq);
         io::stdout().flush().map_err(|e| e.to_string())?;
 
         Ok(Self {
             _raw: raw,
             out,
-            mouse_enabled: mouse,
+            mouse_on: mouse,
             base_seq,
         })
     }
 
+    /// Turn mouse reporting on or off; the article view turns it off so
+    /// the terminal's own selection works, and the list turns it back on.
     pub fn set_mouse(&mut self, enabled: bool) {
-        if enabled && !self.mouse_enabled {
-            print!("\x1b[?1000h\x1b[?1006h");
+        if let Some(seq) = mouse_sequence(self.mouse_on, enabled) {
+            print!("{seq}");
             let _ = io::stdout().flush();
-            self.mouse_enabled = true;
-        } else if !enabled && self.mouse_enabled {
-            print!("\x1b[?1006l\x1b[?1000l");
-            let _ = io::stdout().flush();
-            // Keep mouse_enabled true so Drop still cleans up
+            self.mouse_on = enabled;
         }
     }
 
@@ -86,8 +95,8 @@ impl Drop for Terminal<'_> {
         // `Raw`'s own `Drop` puts the line discipline back and records a
         // restore that did not take; `take_restore_failure` is where the
         // caller reads that, after this whole value is gone.
-        if self.mouse_enabled {
-            let _ = write!(io::stdout(), "\x1b[?1006l\x1b[?1000l");
+        if let Some(seq) = mouse_sequence(self.mouse_on, false) {
+            let _ = write!(io::stdout(), "{seq}");
         }
         let _ = write!(io::stdout(), "\x1b[0m\x1b[?25h\x1b[?1049l");
         let _ = io::stdout().flush();
@@ -113,4 +122,21 @@ fn base_theme_sequence(theme: &Theme) -> String {
 
 fn parse_color_opt(v: &Option<String>) -> Option<(u8, u8, u8)> {
     v.as_deref().and_then(|hex| Theme::parse_color(hex).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mouse_sequence;
+
+    /// Leaving an article turns reporting back on: the transition table has
+    /// to go both ways, and say nothing when there is nothing to do.
+    #[test]
+    fn mouse_reporting_comes_back_after_it_was_turned_off() {
+        let off = mouse_sequence(true, false).expect("a way off");
+        let on = mouse_sequence(false, true).expect("a way back on");
+        assert!(off.contains("1000l") && off.contains("1006l"));
+        assert!(on.contains("1000h") && on.contains("1006h"));
+        assert_eq!(mouse_sequence(true, true), None);
+        assert_eq!(mouse_sequence(false, false), None);
+    }
 }

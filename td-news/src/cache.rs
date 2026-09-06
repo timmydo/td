@@ -15,9 +15,6 @@ const FEED_INDEX: &str = "feed_index";
 /// the point of the rename is that it is never opened at all.
 const CACHE_FILE: &str = "cache.tdkv";
 
-/// What td-news kept before this: a redb database nothing here can read.
-const LEGACY_CACHE_FILE: &str = "td-news.redb";
-
 pub struct Cache {
     store: Arc<Store>,
 }
@@ -56,7 +53,6 @@ pub struct FeedRefreshSummary {
 
 impl Cache {
     pub fn open() -> Result<Cache, String> {
-        remove_legacy_cache();
         let path = Self::default_db_path();
         Self::open_at(path)
     }
@@ -80,7 +76,6 @@ impl Cache {
     }
 
     pub fn clear() {
-        remove_legacy_cache();
         let path = Self::default_db_path();
         Self::clear_at(path);
     }
@@ -314,19 +309,6 @@ fn cache_dir() -> PathBuf {
     PathBuf::from(xdg).join("td-news")
 }
 
-/// Delete the redb cache td-news used to keep. Nothing reads it now, and it
-/// holds a copy of every article that was ever fetched.
-fn remove_legacy_cache() {
-    remove_legacy_cache_in(&cache_dir());
-}
-
-fn remove_legacy_cache_in(dir: &Path) {
-    let legacy = dir.join(LEGACY_CACHE_FILE);
-    if legacy.exists() {
-        let _ = std::fs::remove_file(&legacy);
-    }
-}
-
 fn insert_json(txn: &mut WriteTxn<'_>, table: &str, key: &str, value: &Json) {
     txn.insert(table, &Key::from_str(key), &value.to_vec());
 }
@@ -454,24 +436,6 @@ mod tests {
         drop(cache);
         let (_, replaced) = open_store(&path).expect("reopen");
         assert!(replaced.is_none());
-    }
-
-    /// The old cache is deleted rather than left behind holding a copy of
-    /// every article ever fetched. The default directory is the process
-    /// environment's, so what is exercised here is the part that takes a
-    /// directory.
-    #[test]
-    fn the_redb_cache_is_removed_from_the_cache_directory() {
-        let dir = tempdir().expect("tempdir");
-        let legacy = dir.path().join(LEGACY_CACHE_FILE);
-        std::fs::write(&legacy, b"old redb bytes").expect("write");
-        let kept = dir.path().join(CACHE_FILE);
-        std::fs::write(&kept, b"").expect("write");
-        remove_legacy_cache_in(dir.path());
-        assert!(!legacy.exists(), "the redb cache was left behind");
-        assert!(kept.is_file(), "the new cache was removed");
-        // Removing what is not there is not a failure.
-        remove_legacy_cache_in(dir.path());
     }
 
     fn article(hash: &str, read: bool) -> Article {

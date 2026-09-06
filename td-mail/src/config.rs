@@ -1038,7 +1038,7 @@ password_file = "/home/td/.config/td-mail/password"
         }
     }
 
-    /// `TMC_CONFIG` from td's `td-firstboot/src/main.rs`, copied byte for
+    /// `MAIL_CONFIG` from td's `td-firstboot/src/main.rs`, copied byte for
     /// byte: the file a td image provisions at `~/.config/td-mail/config.toml`
     /// on first boot.
     const FIRSTBOOT_CONFIG: &str = "\

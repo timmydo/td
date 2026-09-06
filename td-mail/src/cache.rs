@@ -1,7 +1,7 @@
 use crate::jmap::types::{Email, Mailbox};
 use crate::json::{self, ToJson};
 use crate::kv::{Error as KvError, Key, Store};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The five tables. `op_queue` is keyed by a big-endian `u64`, so iteration
 /// order is numeric order and replay is FIFO; the rest are keyed by text.
@@ -64,12 +64,6 @@ fn db_path(account_name: &str) -> PathBuf {
     cache_dir().join(format!("{}.tdkv", safe_account_name(account_name)))
 }
 
-/// The redb file this store replaced. A different format under a different
-/// name, so it is removed rather than read.
-fn legacy_db_path(account_name: &str) -> PathBuf {
-    cache_dir().join(format!("{}.redb", safe_account_name(account_name)))
-}
-
 impl Cache {
     pub fn open(account_name: &str) -> Result<Cache, String> {
         let path = db_path(account_name);
@@ -77,7 +71,6 @@ impl Cache {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create cache dir: {}", e))?;
         }
-        remove_legacy(&legacy_db_path(account_name));
         let store = match Store::open(&path) {
             Ok(store) => store,
             // The cache is derived from the server and rebuildable, so a log
@@ -484,10 +477,8 @@ impl Cache {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                // `.redb` too: a store this build replaced is still a cache
-                // file, and clearing the cache should take it away.
                 let extension = path.extension().and_then(|e| e.to_str());
-                if !matches!(extension, Some("tdkv") | Some("redb")) {
+                if extension != Some("tdkv") {
                     continue;
                 }
                 if let Err(e) = std::fs::remove_file(&path) {
@@ -499,20 +490,6 @@ impl Cache {
                 }
             }
         }
-    }
-}
-
-/// Remove the redb file an earlier build left behind, saying so if it will
-/// not go: it is dead weight in the cache directory, not an error.
-fn remove_legacy(path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => log_info!("[Cache] removed the redb cache at {}", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log_warn!(
-            "[Cache] failed to remove the redb cache at {}: {}",
-            path.display(),
-            e
-        ),
     }
 }
 
@@ -582,6 +559,7 @@ mod tests {
     #[test]
     fn test_cache_put_get() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("test_account").unwrap();
 
@@ -598,6 +576,7 @@ mod tests {
     #[test]
     fn test_cache_rules_processed() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("test_rules").unwrap();
 
@@ -619,6 +598,7 @@ mod tests {
     #[test]
     fn test_cache_mailboxes() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("test_mailboxes").unwrap();
 
@@ -658,6 +638,7 @@ mod tests {
     #[test]
     fn test_cache_mailbox_index() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("test_mbx_idx").unwrap();
 
@@ -690,6 +671,7 @@ mod tests {
     #[test]
     fn test_cache_clear() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("test_clear").unwrap();
 
@@ -706,6 +688,7 @@ mod tests {
     #[test]
     fn test_cache_update_email_seen() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("test_seen").unwrap();
 
@@ -731,6 +714,7 @@ mod tests {
     #[test]
     fn test_cache_update_email_flagged() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("test_flagged").unwrap();
 
@@ -752,6 +736,7 @@ mod tests {
     #[test]
     fn test_cache_move_and_destroy_updates_indexes_and_counts() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("test_move_destroy").unwrap();
 
@@ -819,6 +804,7 @@ mod tests {
     #[test]
     fn test_cache_queue_persistence() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
 
         let cache = Cache::open("test_queue").unwrap();

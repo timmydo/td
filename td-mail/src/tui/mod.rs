@@ -282,11 +282,16 @@ fn spawn_editor(draft: &compose::ComposeDraft, editor_cmd: &str) {
         attachment_dir,
     } = prepared;
 
-    // Spawn editor as a separate process
+    // Spawn editor as a separate process. The path is the shell's `$1`
+    // rather than part of the command: a temporary directory with a
+    // space in it is not unheard of, and this way the shell sees the
+    // path as one word whatever it holds.
     let path_str = draft_path.display().to_string();
     let child = std::process::Command::new("sh")
         .arg("-c")
-        .arg(format!("{} {}", editor_cmd, path_str))
+        .arg(format!("{} \"$1\"", editor_cmd))
+        .arg("sh")
+        .arg(&path_str)
         .spawn();
 
     match child {

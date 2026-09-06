@@ -36,13 +36,16 @@ struct Fetched {
     body: Vec<u8>,
 }
 
-fn get_with_auth(url: &str, auth: &str) -> Result<Fetched, JmapError> {
+/// GET `url`, with the credential when `auth` carries one. No redirects
+/// are followed for us: the service would drop the credential on the
+/// way, and the loops below follow with it or without it as the origin
+/// rule says.
+fn get_with_auth(url: &str, auth: Option<&str>) -> Result<Fetched, JmapError> {
     if !crate::td_fetch::available() {
         return Err(no_fetch_service());
     }
-    // No redirects followed for us: the service would drop the
-    // credential on the way, and the loops below follow with it.
-    let response = crate::td_fetch::get(url, &[("authorization", auth)], RESPONSE_LIMIT, Some(0))
+    let headers: Vec<(&str, &str)> = auth.map(|a| ("authorization", a)).into_iter().collect();
+    let response = crate::td_fetch::get(url, &headers, RESPONSE_LIMIT, Some(0))
         .map_err(|e| JmapError::Http(e.to_string()))?;
     Ok(Fetched {
         status: response.status,
@@ -52,6 +55,25 @@ fn get_with_auth(url: &str, auth: &str) -> Result<Fetched, JmapError> {
 }
 
 use super::types::*;
+
+/// Percent-encode a value for a URL template variable (RFC 8620 §1.5).
+/// A blob's name is chosen by whoever sent the message; unencoded it
+/// could carry a path, a query, or a line break into the request.
+fn uri_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            for nibble in [byte >> 4, byte & 0x0f] {
+                let digit = char::from_digit(u32::from(nibble), 16).unwrap_or('0');
+                out.push(digit.to_ascii_uppercase());
+            }
+        }
+    }
+    out
+}
 
 pub struct JmapClient {
     username: String,
@@ -96,11 +118,12 @@ impl JmapClient {
         max_redirects: u32,
     ) -> Result<(String, String), JmapError> {
         let mut current_url = url.to_string();
+        let mut carries = true;
 
         for i in 0..max_redirects {
             log_debug!("[JMAP] Request {} to: {}", i + 1, current_url);
 
-            let fetched = get_with_auth(&current_url, auth).map_err(|e| {
+            let fetched = get_with_auth(&current_url, carries.then_some(auth)).map_err(|e| {
                 log_error!("[JMAP] Connection error: {}", e);
                 e
             })?;
@@ -111,7 +134,7 @@ impl JmapClient {
                 match fetched.location {
                     Some(location) => {
                         log_debug!("[JMAP] Following redirect {} -> {}", status, location);
-                        current_url = Self::resolve_redirect(&current_url, &location);
+                        (current_url, carries) = Self::redirect_target(url, &current_url, &location);
                         continue;
                     }
                     None => {
@@ -127,6 +150,9 @@ impl JmapClient {
                 let body = String::from_utf8_lossy(&fetched.body).into_owned();
                 log_error!("[JMAP] HTTP error {}: {}", status, body);
 
+                if matches!(status, 401 | 403) && !carries {
+                    return Err(Self::left_the_origin(status, url, &current_url));
+                }
                 if status == 401 {
                     return Err(JmapError::Http(
                         "Authentication failed (401 Unauthorized)".to_string(),
@@ -161,27 +187,85 @@ impl JmapClient {
         Err(JmapError::Http("Too many redirects".to_string()))
     }
 
-    /// Resolve a redirect location against a base URL.
+    /// Where a redirect goes, and whether the credential goes with it.
+    /// The fetch service drops an `authorization` header on redirects;
+    /// this client sends it again itself, so it is the client that
+    /// decides, by the rule browsers and curl keep: the credential stays
+    /// within the origin the request was configured for (`trusted`, the
+    /// URL the loop started from), and a hop to any other origin — TLS
+    /// or not — is followed bare. A `.well-known/jmap` that sends the
+    /// client elsewhere and needs the credential there is configured by
+    /// that URL directly.
+    fn redirect_target(trusted: &str, base_url: &str, location: &str) -> (String, bool) {
+        let target = Self::resolve_redirect(base_url, location);
+        let carries = matches!(
+            (Self::origin(&target), Self::origin(trusted)),
+            (Some(a), Some(b)) if a == b
+        );
+        (target, carries)
+    }
+
+    /// A refusal from an origin the credential did not follow to.
+    fn left_the_origin(status: u16, trusted: &str, current: &str) -> JmapError {
+        JmapError::Http(format!(
+            "HTTP {status} from {} after a redirect left {}: the credential does not \
+             follow a redirect to another origin; configure that URL directly",
+            Self::origin(current).unwrap_or_else(|| current.to_string()),
+            Self::origin(trusted).unwrap_or_else(|| trusted.to_string()),
+        ))
+    }
+
+    /// `scheme://host[:port]` of a URL (RFC 6454 §4): the part that says
+    /// who receives the request. Lower-cased, since the scheme and the
+    /// host are case-insensitive, and without the scheme's default port,
+    /// which names the same receiver spelled or not.
+    fn origin(url: &str) -> Option<String> {
+        let scheme_end = url.find("://")?;
+        let rest = url.get(scheme_end + 3..)?;
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let mut origin = url.get(..scheme_end + 3 + end)?.to_ascii_lowercase();
+        for (scheme, port) in [("http://", ":80"), ("https://", ":443")] {
+            if origin.starts_with(scheme) && origin.ends_with(port) {
+                origin.truncate(origin.len().saturating_sub(port.len()));
+            }
+        }
+        Some(origin)
+    }
+
+    /// Resolve a redirect location against a base URL: absolute,
+    /// scheme-relative (`//host/p`), root-relative (`/p`), or relative to
+    /// the base's directory — where a base with no path (`https://host`)
+    /// is that directory itself, not `https:/` with `host` for a file.
     fn resolve_redirect(base_url: &str, location: &str) -> String {
         if location.starts_with("http://") || location.starts_with("https://") {
-            location.to_string()
-        } else if location.starts_with('/') {
-            if let Some(idx) = base_url.find("://") {
-                let after_scheme = &base_url[idx + 3..];
-                if let Some(path_start) = after_scheme.find('/') {
-                    let host_part = &base_url[..idx + 3 + path_start];
-                    format!("{}{}", host_part, location)
-                } else {
-                    format!("{}{}", base_url, location)
-                }
-            } else {
-                location.to_string()
-            }
-        } else if let Some(last_slash) = base_url.rfind('/') {
-            format!("{}/{}", &base_url[..last_slash], location)
-        } else {
-            location.to_string()
+            return location.to_string();
         }
+        let Some(scheme_end) = base_url.find("://") else {
+            return location.to_string();
+        };
+        if let Some(rest) = location.strip_prefix("//") {
+            let scheme = base_url.get(..scheme_end).unwrap_or("https");
+            return format!("{scheme}://{rest}");
+        }
+        // The query and fragment are not part of the directory.
+        let base = base_url
+            .find(['?', '#'])
+            .and_then(|at| base_url.get(..at))
+            .unwrap_or(base_url);
+        let authority_start = scheme_end + 3;
+        let path_start = base
+            .get(authority_start..)
+            .and_then(|rest| rest.find('/'))
+            .map(|at| authority_start + at);
+        let site = path_start.and_then(|at| base.get(..at)).unwrap_or(base);
+        if location.starts_with('/') {
+            return format!("{site}{location}");
+        }
+        let directory = path_start
+            .and_then(|_| base.rfind('/'))
+            .and_then(|last| base.get(..last))
+            .unwrap_or(site);
+        format!("{directory}/{location}")
     }
 
     pub fn discover(
@@ -1002,23 +1086,24 @@ impl JmapClient {
         };
 
         let url = download_url
-            .replace("{accountId}", &self.account_id)
-            .replace("{blobId}", blob_id)
-            .replace("{name}", name)
-            .replace("{type}", content_type);
+            .replace("{accountId}", &uri_encode(&self.account_id))
+            .replace("{blobId}", &uri_encode(blob_id))
+            .replace("{name}", &uri_encode(name))
+            .replace("{type}", &uri_encode(content_type));
 
         log_debug!("[JMAP] Downloading blob from: {}", url);
 
         let auth = Self::auth_header(&self.username, &self.password);
 
-        let mut current_url = url;
+        let mut current_url = url.clone();
+        let mut carries = true;
         for _ in 0..5 {
-            let fetched = get_with_auth(&current_url, &auth)?;
+            let fetched = get_with_auth(&current_url, carries.then_some(auth.as_str()))?;
             let status = fetched.status;
             if (300..400).contains(&status) {
                 match fetched.location {
                     Some(location) => {
-                        current_url = Self::resolve_redirect(&current_url, &location);
+                        (current_url, carries) = Self::redirect_target(&url, &current_url, &location);
                         continue;
                     }
                     None => {
@@ -1028,6 +1113,9 @@ impl JmapClient {
                         )));
                     }
                 }
+            }
+            if matches!(status, 401 | 403) && !carries {
+                return Err(Self::left_the_origin(status, &url, &current_url));
             }
             if status >= 400 {
                 return Err(JmapError::Http(format!("HTTP {} error", status)));
@@ -1204,10 +1292,10 @@ impl JmapClient {
         };
 
         let url = download_url
-            .replace("{accountId}", &self.account_id)
-            .replace("{blobId}", &blob_id)
-            .replace("{name}", "email.eml")
-            .replace("{type}", "message/rfc822");
+            .replace("{accountId}", &uri_encode(&self.account_id))
+            .replace("{blobId}", &uri_encode(&blob_id))
+            .replace("{name}", &uri_encode("email.eml"))
+            .replace("{type}", &uri_encode("message/rfc822"));
 
         log_debug!("[JMAP] Downloading blob from: {}", url);
 
@@ -1229,5 +1317,67 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
             end -= 1;
         }
         &s[..end]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The credential goes only where the request was configured to go:
+    /// a redirect within that origin carries it, one to any other origin,
+    /// TLS or not, is followed bare. The origin is scheme, host and
+    /// effective port, case-insensitively, and it is the configured one
+    /// that counts, not the last hop's.
+    #[test]
+    fn a_redirect_carries_the_credential_only_within_the_configured_origin() {
+        let trusted = "https://mail.example/.well-known/jmap";
+        for (location, target, carries) in [
+            ("/jmap/session", "https://mail.example/jmap/session", true),
+            ("session", "https://mail.example/.well-known/session", true),
+            ("https://MAIL.example:443/s", "https://MAIL.example:443/s", true),
+            ("https://api.example/session", "https://api.example/session", false),
+            ("http://mail.example/x", "http://mail.example/x", false),
+            ("//evil.example/x", "https://evil.example/x", false),
+        ] {
+            assert_eq!(
+                JmapClient::redirect_target(trusted, trusted, location),
+                (target.to_string(), carries),
+                "{location}"
+            );
+        }
+        assert_eq!(
+            JmapClient::redirect_target(trusted, "https://api.example/s", "https://mail.example/t"),
+            ("https://mail.example/t".to_string(), true)
+        );
+        let local = "http://127.0.0.1:8080/a";
+        assert!(JmapClient::redirect_target(local, local, "http://127.0.0.1:8080/b").1);
+        assert!(!JmapClient::redirect_target(local, local, "http://127.0.0.1:9090/b").1);
+        assert!(JmapClient::redirect_target("http://Local.Test:80/a", local, "http://local.test/b").1);
+        let err = JmapClient::left_the_origin(401, trusted, "https://api.example/s");
+        assert!(err.to_string().contains("configure that URL directly"), "{err}");
+    }
+
+    /// A base with no path is its own directory; the query is not part
+    /// of the directory; a scheme-relative location keeps the scheme.
+    #[test]
+    fn a_relative_redirect_resolves_against_the_base_it_came_from() {
+        let resolve = JmapClient::resolve_redirect;
+        assert_eq!(resolve("https://mail.example", "session"), "https://mail.example/session");
+        assert_eq!(resolve("https://mail.example", "/s"), "https://mail.example/s");
+        assert_eq!(resolve("https://mail.example/", "s"), "https://mail.example/s");
+        assert_eq!(resolve("https://h/a/b?q=/x", "c"), "https://h/a/c");
+        assert_eq!(resolve("https://h/a/b", "//other/c"), "https://other/c");
+        assert_eq!(resolve("https://h/a/b", "http://o/c"), "http://o/c");
+        assert_eq!(resolve("not a url", "c"), "c");
+    }
+
+    #[test]
+    fn a_template_value_is_encoded_before_it_joins_the_url() {
+        assert_eq!(uri_encode("a-b.c_d~E9"), "a-b.c_d~E9");
+        assert_eq!(uri_encode("message/rfc822"), "message%2Frfc822");
+        let hostile = uri_encode("x\nheader foo: bar?y#z");
+        assert!(!hostile.bytes().any(|b| b.is_ascii_control() || b"/?#: ".contains(&b)), "{hostile}");
+        assert_eq!(hostile, "x%0Aheader%20foo%3A%20bar%3Fy%23z");
     }
 }

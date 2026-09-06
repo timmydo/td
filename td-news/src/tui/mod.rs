@@ -1894,17 +1894,32 @@ impl App {
     }
 }
 
+/// The shell script that runs the configured browser command with the URL
+/// as its `$1`. The URL is not written into the script, so nothing a link
+/// carries is read as shell, however the command is written: a `{url}`
+/// becomes `"$1"` (quotes a person put around the placeholder are taken
+/// off first, since inside them the expansion would be unquoted); without
+/// a placeholder the URL is appended as one word. The caller runs it as
+/// `sh -f -c <script> sh <url>`, `-f` so a `?` or `*` in the link is not a
+/// pattern either.
+fn browser_script(cmd: &str) -> String {
+    let cmd = cmd.replace("\"{url}\"", "{url}").replace("'{url}'", "{url}");
+    if cmd.contains("{url}") {
+        cmd.replace("{url}", "\"$1\"")
+    } else {
+        format!("{cmd} \"$1\"")
+    }
+}
+
 fn open_in_browser(url: &str, browser_config: Option<&str>) -> Result<(), String> {
     // 1. Config browser command (supports {url} template, executed via sh -c)
     if let Some(cmd) = browser_config {
-        let shell_cmd = if cmd.contains("{url}") {
-            cmd.replace("{url}", url)
-        } else {
-            format!("{} {}", cmd, shell_quote(url))
-        };
         let status = std::process::Command::new("sh")
+            .arg("-f")
             .arg("-c")
-            .arg(&shell_cmd)
+            .arg(browser_script(cmd))
+            .arg("sh")
+            .arg(url)
             .status()
             .map_err(|e| e.to_string())?;
         if status.success() {
@@ -1934,10 +1949,6 @@ fn open_in_browser(url: &str, browser_config: Option<&str>) -> Result<(), String
     }
 
     Err("no browser opener available".to_string())
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Detect markdown reference link definitions like `[1]: https://example.com`
@@ -2237,6 +2248,35 @@ fn style_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link reaches the browser as one argument whichever way the command
+    /// is written, and none of it is read as shell: the script is run
+    /// through sh here, with a link that would print INJECTED if it were.
+    #[test]
+    fn a_link_reaches_the_browser_as_one_argument_however_the_command_is_written() {
+        let link = "https://x/$(printf INJECTED);'a\"b?*&c";
+        for (cmd, expected) in [
+            ("printf '%s\\n' {url}", link.to_string()),
+            ("printf '%s\\n' \"{url}\"", link.to_string()),
+            ("printf '%s\\n' '{url}'", link.to_string()),
+            ("printf '%s\\n' --url={url}", format!("--url={link}")),
+            ("printf '%s\\n'", link.to_string()),
+        ] {
+            let script = browser_script(cmd);
+            assert!(!script.contains("INJECTED"), "{cmd}: {script}");
+            let out = std::process::Command::new("sh")
+                .arg("-f")
+                .arg("-c")
+                .arg(&script)
+                .arg("sh")
+                .arg(link)
+                .output()
+                .expect("sh");
+            assert!(out.status.success(), "{cmd}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), expected, "{cmd}");
+        }
+    }
+
     use crate::cache::Cache;
     use crate::config::{Config, FeedConfig, Theme, UiConfig};
     use crate::feed::FeedMeta;

@@ -208,13 +208,13 @@ mod tests {
     }
 
     /// The configuration td's image actually ships, copied verbatim from
-    /// `td-firstboot/src/main.rs`'s `TN_CONFIG`. It is what the first
+    /// `td-firstboot/src/main.rs`'s `NEWS_CONFIG`. It is what the first
     /// window of a fresh install reads, and it is provisioned once and
     /// never rewritten, so a mapping that could not read it would leave a
     /// person with an error and no feeds.
     #[test]
     fn the_shipped_configuration_parses_into_its_two_feeds() {
-        const TN_CONFIG: &str = "\
+        const NEWS_CONFIG: &str = "\
 # td-news. Provisioned on first boot; edit freely, it is never rewritten.
 # The client reads this file when it starts. The feeds below are public
 # starting points: replace or delete them, and nothing is fetched until you
@@ -228,7 +228,7 @@ url = \"https://lwn.net/headlines/rss\"
 name = \"Rust Blog\"
 url = \"https://blog.rust-lang.org/feed.xml\"
 ";
-        let config = Config::parse(TN_CONFIG).expect("the shipped configuration must parse");
+        let config = Config::parse(NEWS_CONFIG).expect("the shipped configuration must parse");
         let feeds: Vec<(&str, &str)> = config
             .feeds
             .iter()

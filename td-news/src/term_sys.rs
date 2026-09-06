@@ -1102,40 +1102,77 @@ mod tests {
         assert_eq!(code_only(TERM_SYS).matches(lint).count(), 1);
         // Every other module in the crate, read from disk rather than included:
         // they are owned elsewhere, and a scan that only knew the files this
-        // module names could not see one that arrived later.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // module names could not see one that arrived later. The walk goes
+        // into subdirectories, since `tui/` and the like are modules too and
+        // a flat scan would have a blind spot exactly where the code is; and
+        // into `tests/`, `benches/` and `examples/`, whose crates sit outside
+        // the root's `deny`. A build script would too, and has no business
+        // in a std-only crate.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !base.join("build.rs").exists(),
+            "a build script appeared; it runs outside the root's deny and this scan"
+        );
         let mut checked = 0usize;
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            if name == "term_sys.rs" || name == root_name || !name.ends_with(".rs") {
-                continue;
+        let mut below_top = 0usize;
+        let mut pending = vec![base.join("src")];
+        for extra in ["tests", "benches", "examples"] {
+            if base.join(extra).is_dir() {
+                pending.push(base.join(extra));
             }
-            let code = code_only(&std::fs::read_to_string(&path).unwrap());
-            // The forms that INTRODUCE unsafe, rather than the bare word: a
-            // sibling module is free to hold `unsafe` inside a string literal
-            // -- test data, an error message -- and reding on that would be
-            // this test lying about somebody else's file.
-            for form in [
-                lint,
-                concat!("unsafe", " {"),
-                concat!("unsafe", " fn"),
-                concat!("unsafe", " impl"),
-                concat!("unsafe", " trait"),
-                concat!("unsafe", " extern"),
-            ] {
-                assert!(
-                    !code.contains(form),
-                    "{name} carries `{form}`; the crate's one unsafe surface is term_sys.rs"
-                );
-            }
-            checked += 1;
         }
-        assert!(checked > 0, "the sibling scan found no modules to check");
+        let root_path = format!("src/{root_name}");
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if name == "src/term_sys.rs" || name == root_path || !name.ends_with(".rs") {
+                    continue;
+                }
+                // Whitespace squeezed to one space, so a form split across a
+                // line reads as itself; and once with none, for the forms that
+                // need no space at all.
+                let code = code_only(&std::fs::read_to_string(&path).unwrap());
+                let spaced = code.split_whitespace().collect::<Vec<_>>().join(" ");
+                let packed = spaced.replace(' ', "");
+                // The forms that INTRODUCE unsafe, rather than the bare word: a
+                // sibling module is free to hold `unsafe` inside a string literal
+                // -- test data, an error message -- and reding on that would be
+                // this test lying about somebody else's file.
+                for (text, form) in [
+                    (&packed, lint),
+                    (&packed, concat!("unsafe", "{")),
+                    (&spaced, concat!("unsafe", " fn")),
+                    (&spaced, concat!("unsafe", " impl")),
+                    (&spaced, concat!("unsafe", " trait")),
+                    (&spaced, concat!("unsafe", " extern")),
+                ] {
+                    assert!(
+                        !text.contains(form),
+                        "{name} carries `{form}`; the crate's one unsafe surface is term_sys.rs"
+                    );
+                }
+                checked += 1;
+                if name.matches('/').count() > 1 || !name.starts_with("src/") {
+                    below_top += 1;
+                }
+            }
+        }
+        // Both crates keep modules below the top of `src/` and under
+        // `tests/`; a walk that found none of them has stopped at the top,
+        // however many files it counted there.
+        assert!(
+            below_top > 0,
+            "the sibling scan checked {checked} modules, none below the top of src/ or under tests/"
+        );
     }
 
     /// `struct pollfd`'s field order, which no observation of the syscall can
@@ -1236,7 +1273,7 @@ mod tests {
     /// terminal. `KEYS_BLOCKING` is what td-news asks for: ECHO|ICANON|ISIG off,
     /// IXON|ICRNL off, OPOST off, VMIN 1, VTIME 0, and `c_cflag` untouched.
     #[test]
-    fn the_keys_blocking_set_clears_what_tn_clears_and_nothing_else() {
+    fn the_keys_blocking_set_clears_what_td_news_clears_and_nothing_else() {
         // Bits the patch must NOT touch, chosen next door to ones it does:
         // IGNCR (0x80) beside ICRNL, IXOFF (0x1000) beside IXON, ONLCR (0x4)
         // beside OPOST, ECHOE (0x10) and IEXTEN (0x8000) beside ECHO.
@@ -1274,7 +1311,7 @@ mod tests {
     /// BRKINT|ICRNL|INPCK|ISTRIP|IXON off, OPOST off, ECHO|ICANON|IEXTEN|ISIG
     /// off, CS8 on, VMIN 0, VTIME 1.
     #[test]
-    fn the_bytes_tenth_set_is_what_tmc_asks_for() {
+    fn the_bytes_tenth_set_is_what_td_mail_asks_for() {
         let mut saved = [0u8; TERMIOS_LEN];
         write_u32(
             &mut saved,

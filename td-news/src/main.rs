@@ -1,4 +1,4 @@
-//! td news (td-news): a terminal RSS and Atom reader.
+//! td-news: a terminal RSS and Atom reader.
 //!
 //! The crate is `std` and nothing else. Seven modules — `civil`, `html`,
 //! `json`, `kv`, `term_sys`, `toml`, `xml` — are td's shared std modules,
@@ -220,14 +220,23 @@ fn main() {
 
     let offline = opts.offline;
     let (cmd_tx, resp_rx) = backend::spawn(&config, cache.clone());
-    if let Err(e) = tui::run(&config, &cache, &cmd_tx, &resp_rx, offline) {
-        log::error(format!("tui error: {}", e));
-        eprintln!("TUI error: {}", e);
-    }
+    let tui_failed = match tui::run(&config, &cache, &cmd_tx, &resp_rx, offline) {
+        Ok(()) => false,
+        Err(e) => {
+            log::error(format!("tui error: {}", e));
+            eprintln!("TUI error: {}", e);
+            true
+        }
+    };
 
     let _ = cmd_tx.send(backend::BackendCommand::Shutdown);
     log::info("td-news shutdown");
     log::news("td-news session ended");
+    // After the shutdown and the log lines, so the record is complete;
+    // a launcher still learns that the session did not end on purpose.
+    if tui_failed {
+        std::process::exit(1);
+    }
 }
 
 #[derive(Default)]

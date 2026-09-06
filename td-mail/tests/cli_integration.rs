@@ -70,8 +70,8 @@ password_command = "echo test"
         );
         std::fs::write(&config_path, config_content).expect("write config");
 
-        let tmc_bin = env!("CARGO_BIN_EXE_td-mail");
-        let mut command = Command::new(tmc_bin);
+        let mail_bin = env!("CARGO_BIN_EXE_td-mail");
+        let mut command = Command::new(mail_bin);
         command
             .arg("--cli")
             .arg(format!("--config={}", config_path.display()))

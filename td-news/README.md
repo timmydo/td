@@ -84,5 +84,3 @@ below the current selection while moving in feed/article lists.
 ## Cache
 
 - Database: `~/.cache/td-news/cache.tdkv`
-- A `td-news.redb` left by an earlier version is deleted on start-up; nothing
-  reads it any more.

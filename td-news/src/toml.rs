@@ -2179,8 +2179,8 @@ mod tests {
     // --- shipped configurations ------------------------------------------
 
     #[test]
-    fn shipped_tmc_configuration() {
-        // td-firstboot's TMC_CONFIG, verbatim.
+    fn shipped_td_mail_configuration() {
+        // td-firstboot's MAIL_CONFIG, verbatim.
         let doc = t(concat!(
             "# td-mail. Provisioned on first boot; edit freely, it is never rewritten.\n",
             "# Paths are as the application sees them inside its jail. The client reads\n",
@@ -2206,8 +2206,8 @@ mod tests {
     }
 
     #[test]
-    fn shipped_tn_configuration() {
-        // td-firstboot's TN_CONFIG, verbatim.
+    fn shipped_td_news_configuration() {
+        // td-firstboot's NEWS_CONFIG, verbatim.
         let doc = t(concat!(
             "# td-news. Provisioned on first boot; edit freely, it is never rewritten.\n",
             "# The client reads this file when it starts. The feeds below are public\n",
@@ -2238,7 +2238,7 @@ mod tests {
 
     /// td-mail's documented configuration, with every section the application
     /// reads.
-    const TMC_FULL: &str = r##"
+    const MAIL_FULL: &str = r##"
 [ui]
 editor = "nvim"
 browser = "firefox"
@@ -2285,8 +2285,8 @@ password_file = "/home/td/.config/td-mail/work-password"
 "##;
 
     #[test]
-    fn tmc_full_configuration() {
-        let doc = t(TMC_FULL);
+    fn mail_full_configuration() {
+        let doc = t(MAIL_FULL);
         assert_eq!(
             doc.table_keys(),
             vec!["ui", "mail", "spam", "theme", "retention", "account"]
@@ -2340,7 +2340,7 @@ password_file = "/home/td/.config/td-mail/work-password"
     }
 
     /// A rules file exercising every condition shape td-mail compiles.
-    const TMC_RULES: &str = r#"
+    const MAIL_RULES: &str = r#"
 # td-mail mail rules
 
 [[rule]]
@@ -2398,8 +2398,8 @@ confidence = 0.9
 "#;
 
     #[test]
-    fn tmc_rules_file() {
-        let doc = t(TMC_RULES);
+    fn mail_rules_file() {
+        let doc = t(MAIL_RULES);
         let rules = doc.require_arr("rule").unwrap();
         assert_eq!(rules.len(), 5);
 
@@ -2475,7 +2475,7 @@ confidence = 0.9
     }
 
     #[test]
-    fn tn_full_configuration() {
+    fn news_full_configuration() {
         let doc = t(concat!(
             "[ui]\n",
             "page_size = 50\n",
@@ -2687,11 +2687,11 @@ confidence = 0.9
 
     #[test]
     fn values_round_trip_through_the_writer() {
-        let doc = t(TMC_FULL);
+        let doc = t(MAIL_FULL);
         let text = doc.to_string();
         assert_eq!(parse(&text).unwrap(), doc);
 
-        let rules = t(TMC_RULES);
+        let rules = t(MAIL_RULES);
         assert_eq!(parse(&rules.to_string()).unwrap(), rules);
     }
 

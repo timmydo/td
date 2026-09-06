@@ -13,7 +13,7 @@ impl HelpView {
     pub fn new() -> Self {
         let lines = vec![
             "td-mail - Timmy's Mail Console".to_string(),
-            "=========================".to_string(),
+            "==============================".to_string(),
             String::new(),
             "Global".to_string(),
             "------".to_string(),

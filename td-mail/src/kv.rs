@@ -58,6 +58,10 @@ const MIN_COMPACT_BYTES: u64 = 1 << 20;
 const OP_INSERT: u8 = 0;
 const OP_REMOVE: u8 = 1;
 const TMP_SUFFIX: &str = ".compact";
+const REOPEN_ATTEMPTS: usize = 8;
+// What a filesystem with no directory fsync answers (Linux values).
+const EINVAL: i32 = 22;
+const EOPNOTSUPP: i32 = 95;
 
 type TableMap = BTreeMap<Vec<u8>, Arc<[u8]>>;
 type Tables = BTreeMap<String, Arc<TableMap>>;
@@ -402,17 +406,62 @@ fn replay(file: &File) -> Result<Replayed, Error> {
     })
 }
 
-fn sync_parent_dir(path: &Path) {
-    // Best effort: some filesystems refuse fsync on a directory handle.
+/// Make the directory entry durable: a created or renamed file whose
+/// directory was never synced can be missing after a crash, and a store
+/// that treated that as success would promise more than the disk holds.
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
     } else {
         parent
     };
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
+    match File::open(parent)?.sync_all() {
+        Ok(()) => Ok(()),
+        // A filesystem with no directory fsync cannot be asked for one:
+        // that is its limit, not a failed sync, and a store that refused
+        // to open there would lose the function without keeping the
+        // promise either way.
+        Err(e) if matches!(e.raw_os_error(), Some(EINVAL) | Some(EOPNOTSUPP)) => Ok(()),
+        Err(e) => Err(e),
     }
+}
+
+/// Whether `file` is the inode `path` names now. A compaction renames a
+/// fresh inode over the path and drops the old one, releasing its lock;
+/// a handle opened before that rename and locked after it holds an
+/// unlinked file, and a store built on it would write where nobody
+/// reads.
+fn names_this_inode(file: &File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata()?;
+    let named = fs::metadata(path)?;
+    Ok(held.ino() == named.ino() && held.dev() == named.dev())
+}
+
+/// Open `path` and take its lock, again if the locked inode turns out
+/// not to be the one the path names any more.
+fn open_locked(path: &Path) -> Result<File, Error> {
+    for _ in 0..REOPEN_ATTEMPTS {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.try_lock().map_err(lock_err)?;
+        match names_this_inode(&file, path) {
+            Ok(true) => return Ok(file),
+            Ok(false) => {}
+            // The path went away between the open and the stat (a clear
+            // racing this open); the next attempt creates it again.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Err(Error::Io(io::Error::other(
+        "the store was replaced under every attempt to open it",
+    )))
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {
@@ -426,11 +475,18 @@ struct Writer {
     file: File,
     end: u64,
     live: u64,
-    dir_synced: bool,
+    /// A compaction's rename whose directory sync failed: until it is
+    /// made durable, a crash could bring the old name back, so no commit
+    /// is acknowledged on the new inode before the sync is done.
+    dir_pending: bool,
 }
 
 impl Writer {
     fn append(&mut self, record: &[u8], path: &Path) -> Result<(), Error> {
+        if self.dir_pending {
+            sync_parent_dir(path)?;
+            self.dir_pending = false;
+        }
         self.file.seek(SeekFrom::Start(self.end))?;
         if let Err(e) = self
             .file
@@ -443,10 +499,6 @@ impl Writer {
             return Err(Error::Io(e));
         }
         self.end = self.end.saturating_add(as_u64(record.len()));
-        if !self.dir_synced {
-            sync_parent_dir(path);
-            self.dir_synced = true;
-        }
         Ok(())
     }
 
@@ -470,12 +522,23 @@ impl Writer {
             let _ = fs::remove_file(tmp);
             return Err(Error::Io(e));
         }
-        sync_parent_dir(path);
+        // The rename is done whichever way the sync goes: the writer
+        // follows the inode the path names now. If the directory entry
+        // is not durable yet, the caller hears so, and `append` syncs
+        // before the next commit is acknowledged.
         self.file = file;
         self.end = end;
         self.live = live;
-        self.dir_synced = true;
-        Ok(())
+        match sync_parent_dir(path) {
+            Ok(()) => {
+                self.dir_pending = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.dir_pending = true;
+                Err(Error::Io(e))
+            }
+        }
     }
 
     fn write_snapshot(tables: &Tables, tmp: &Path) -> Result<(File, u64, u64), Error> {
@@ -525,17 +588,16 @@ pub struct Store {
 impl Store {
     /// Open (creating if needed) the store at `path`, replaying its log.
     ///
-    /// Returns [`Error::Locked`] if another handle already owns the file, and
-    /// [`Error::Corrupt`] if the log cannot be replayed.
+    /// Returns [`Error::Locked`] if another handle already owns the file,
+    /// [`Error::Corrupt`] if the log cannot be replayed, and [`Error::Io`]
+    /// for the rest, a path replaced under every attempt to open it
+    /// included.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Store, Error> {
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-        file.try_lock().map_err(lock_err)?;
+        let mut file = open_locked(&path)?;
+        // Whether this open created the file or found it, its name is
+        // made durable once here rather than on the first commit.
+        sync_parent_dir(&path)?;
 
         let tmp_path = tmp_path_for(&path);
         match fs::remove_file(&tmp_path) {
@@ -548,7 +610,6 @@ impl Store {
         if replayed.repaired {
             file.set_len(replayed.end)?;
             file.sync_all()?;
-            sync_parent_dir(&path);
         }
         file.seek(SeekFrom::Start(replayed.end))?;
 
@@ -560,7 +621,7 @@ impl Store {
                 file,
                 end: replayed.end,
                 live: replayed.live,
-                dir_synced: false,
+                dir_pending: false,
             }),
             #[cfg(test)]
             snapshot_clones: std::sync::atomic::AtomicU64::new(0),
@@ -1189,6 +1250,33 @@ mod tests {
         drop(first);
         let second = Store::open(dir.db()).expect("open after drop");
         assert_eq!(get(&second, "t", b"k").as_deref(), Some(&b"v"[..]));
+    }
+
+    /// A handle opened before a compaction names the inode the rename
+    /// took out of the path: locking it later would own nothing. `open`
+    /// checks this after every lock and opens again.
+    #[test]
+    fn a_handle_from_before_compaction_is_not_the_store() {
+        let dir = TempDir::new("inode");
+        let store = Store::open(dir.db()).expect("open");
+        put(&store, "t", b"k", b"v");
+        let early = File::open(dir.db()).expect("open the log directly");
+        assert!(names_this_inode(&early, &dir.db()).expect("stat"));
+        store.compact().expect("compact");
+        assert!(
+            !names_this_inode(&early, &dir.db()).expect("stat"),
+            "compaction left the path on the inode it rewrote"
+        );
+        // The store's own handle moved with the rename, and still holds
+        // the lock on what the path names.
+        match Store::open(dir.db()) {
+            Err(Error::Locked) => {}
+            other => panic!("expected Locked, got {:?}", other.map(|_| "Ok")),
+        }
+        drop(early);
+        drop(store);
+        let reopened = Store::open(dir.db()).expect("reopen");
+        assert_eq!(get(&reopened, "t", b"k").as_deref(), Some(&b"v"[..]));
     }
 
     #[test]

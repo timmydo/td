@@ -28,6 +28,7 @@ const DEFAULT_LIMIT: u64 = 64 * 1024 * 1024;
 /// The service answers within its budgets (a minute for the head, five for
 /// the origin); this only bounds a service that has gone away mid-reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(420);
+const NO_REPLY: &str = "the service closed without a reply";
 
 #[derive(Debug)]
 pub struct Response {
@@ -119,18 +120,17 @@ fn request(
     limit: Option<u64>,
     redirects: Option<u32>,
 ) -> Result<Response, Error> {
+    check_head(url, headers)?;
     let path = socket_path().ok_or_else(|| Error::Io("no td-fetch socket".into()))?;
     let mut stream = UnixStream::connect(&path).map_err(|e| Error::Io(format!("connect: {e}")))?;
+    // Both directions: a service that stopped reading a large body would
+    // otherwise hold the writer past the reply's own bound.
     stream
         .set_read_timeout(Some(REPLY_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(REPLY_TIMEOUT)))
         .map_err(|e| Error::Io(e.to_string()))?;
     let mut head = format!("{PROTOCOL}\nmethod {method}\nurl {url}\n");
     for (name, value) in headers {
-        if value.bytes().any(|b| b.is_ascii_control()) {
-            return Err(Error::Malformed(format!(
-                "header {name:?} carries a control byte"
-            )));
-        }
         head.push_str("header ");
         head.push_str(name);
         head.push_str(": ");
@@ -149,12 +149,43 @@ fn request(
         .and_then(|()| stream.write_all(body))
         .and_then(|()| stream.flush());
     let mut reader = BufReader::new(stream);
-    let reply = read_reply(&mut reader);
+    let reply = read_reply(&mut reader, limit.unwrap_or(DEFAULT_LIMIT));
     match (reply, written) {
         (Ok(response), _) => Ok(response),
         (Err(error), Ok(())) => Err(error),
-        (Err(_), Err(write_error)) => Err(Error::Io(format!("write: {write_error}"))),
+        // The write broke because the service closed its end. If it said
+        // anything first, that is the answer; only silence leaves the
+        // broken pipe as the best account of what happened.
+        (Err(Error::Io(silence)), Err(write_error)) if silence == NO_REPLY => {
+            Err(Error::Io(format!("write: {write_error}")))
+        }
+        (Err(verdict), Err(_)) => Err(verdict),
     }
+}
+
+/// The head is newline-framed `key value` lines. A URL or header name
+/// carrying a line break would end its line early and write the next one
+/// itself; a name carrying the separators would be read as some other
+/// name with some other value.
+fn check_head(url: &str, headers: &[(&str, &str)]) -> Result<(), Error> {
+    if url.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::Malformed("the url carries a control byte".into()));
+    }
+    for (name, value) in headers {
+        if name.bytes().any(|b| b.is_ascii_control() || b == b':' || b == b' ') {
+            return Err(Error::Malformed(format!(
+                "header name {name:?} carries a separator or a control byte"
+            )));
+        }
+        // A tab is field content (RFC 9110 §5.5); the rest of the control
+        // range is not.
+        if value.bytes().any(|b| b.is_ascii_control() && b != b'\t') {
+            return Err(Error::Malformed(format!(
+                "header {name:?} carries a control byte"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_line(reader: &mut impl BufRead) -> Result<String, Error> {
@@ -165,7 +196,7 @@ fn read_line(reader: &mut impl BufRead) -> Result<String, Error> {
         .read_until(b'\n', &mut raw)
         .map_err(|e| Error::Io(format!("read: {e}")))?;
     if read == 0 {
-        return Err(Error::Io("the service closed without a reply".into()));
+        return Err(Error::Io(NO_REPLY.into()));
     }
     if raw.last() != Some(&b'\n') {
         return Err(Error::Io("a reply line past the bound".into()));
@@ -174,7 +205,7 @@ fn read_line(reader: &mut impl BufRead) -> Result<String, Error> {
     String::from_utf8(raw).map_err(|_| Error::Io("a reply line that is not UTF-8".into()))
 }
 
-fn read_reply(reader: &mut impl BufRead) -> Result<Response, Error> {
+fn read_reply(reader: &mut impl BufRead, limit: u64) -> Result<Response, Error> {
     let first = read_line(reader)?;
     if first != PROTOCOL {
         return Err(Error::Io(format!(
@@ -225,6 +256,13 @@ fn read_reply(reader: &mut impl BufRead) -> Result<Response, Error> {
         }
     }
     let status = status.ok_or_else(|| Error::Io("a reply with no status".into()))?;
+    // The service applies the limit; this is the client not taking its
+    // word for it.
+    if body_len > limit {
+        return Err(Error::Io(format!(
+            "the service announced {body_len} bytes past the {limit} asked for"
+        )));
+    }
     let mut body = Vec::new();
     reader
         .take(body_len)
@@ -248,7 +286,36 @@ mod tests {
     use super::*;
 
     fn reply(bytes: &[u8]) -> Result<Response, Error> {
-        read_reply(&mut BufReader::new(bytes))
+        read_reply(&mut BufReader::new(bytes), DEFAULT_LIMIT)
+    }
+
+    /// A body the service announces past what was asked for is refused
+    /// before it is read.
+    #[test]
+    fn a_body_past_the_limit_is_not_read() {
+        let wire = format!("{PROTOCOL}\nstatus 200\nbody 11\n\nhello world");
+        let err = read_reply(&mut BufReader::new(wire.as_bytes()), 10).unwrap_err();
+        assert!(matches!(err, Error::Io(ref m) if m.contains("11 bytes past the 10")), "{err}");
+        let ok = read_reply(&mut BufReader::new(wire.as_bytes()), 11).unwrap();
+        assert_eq!(ok.body, b"hello world");
+    }
+
+    /// What would frame a line of its own never reaches the head: a URL
+    /// with a line break, a header name with the separator, a value with
+    /// a control byte.
+    #[test]
+    fn the_head_refuses_what_would_write_its_own_line() {
+        assert!(check_head("https://h/p?q=1", &[("accept", "text/xml")]).is_ok());
+        assert!(check_head("https://h/p", &[("x-note", "a\tb")]).is_ok());
+        for (url, headers) in [
+            ("https://h/x\nheader a: b", &[][..]),
+            ("https://h/x", &[("a:b", "c")][..]),
+            ("https://h/x", &[("a b", "c")][..]),
+            ("https://h/x", &[("a", "c\r")][..]),
+        ] {
+            let err = check_head(url, headers).unwrap_err();
+            assert!(matches!(err, Error::Malformed(_)), "{url:?} {headers:?}: {err}");
+        }
     }
 
     #[test]
@@ -290,12 +357,13 @@ mod tests {
 
     #[test]
     fn the_socket_is_found_under_the_runtime_directory_only_as_a_socket() {
+        let _env = crate::testing::env_lock();
         let dir = std::env::temp_dir().join(format!("td-fetch-client-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(SOCKET_DIRECTORY)).unwrap();
         let socket = dir.join(SOCKET_DIRECTORY).join(SOCKET_FILE);
-        // This test owns the variable for its duration; the crate's other
-        // tests do not read it.
+        // This test owns the variable for its duration, under the guard the
+        // crate's other environment-setting tests hold.
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
         assert_eq!(socket_path(), None);
         std::fs::write(&socket, b"not a socket").unwrap();
@@ -319,6 +387,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err}");
+        server.join().unwrap();
+        // A service that refuses after the head closes without reading the
+        // body; the request write breaks on that, and what comes back is
+        // the verdict, not the broken pipe.
+        std::fs::remove_file(&socket).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(n) if n > 0 && line != "\n" => continue,
+                        _ => break,
+                    }
+                }
+                let verdict = format!("{PROTOCOL}\nerror refused: a body it will not read\n\n");
+                let _ = (&stream).write_all(verdict.as_bytes());
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        // Larger than a unix socket's send buffer, so the write is what
+        // breaks; on a host whose buffer held it all the write would
+        // succeed and the verdict would come back by the plainer arm.
+        let body = vec![b'x'; 8 << 20];
+        let err = post(
+            "https://example.invalid/",
+            &[("content-type", "text/plain")],
+            &body,
+            Some(10),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Refused(ref m) if m == "a body it will not read"),
+            "{err}"
+        );
         server.join().unwrap();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&dir);

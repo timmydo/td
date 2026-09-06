@@ -3189,7 +3189,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_lines_match_the_filter_tn_uses() {
+    fn reference_lines_match_the_filter_td_news_uses() {
         let out = text("<p>See <a href=\"https://example.com/x\">this</a>.</p>", 40);
         let refs: Vec<&str> = out.lines().filter(|l| is_reference_link_def(l)).collect();
         assert_eq!(refs, vec!["[1]: https://example.com/x"]);

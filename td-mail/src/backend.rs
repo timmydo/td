@@ -2991,6 +2991,7 @@ mod tests {
     #[test]
     fn apply_local_mark_thread_read_updates_seen_and_unread_counts() {
         let dir = crate::testing::tempdir().unwrap();
+        let _env = crate::testing::env_lock();
         std::env::set_var("XDG_CACHE_HOME", dir.path());
         let cache = Cache::open("backend_thread_mark_read").unwrap();
 
