@@ -352,6 +352,7 @@ struct Window {
     activation_serial: Option<u32>,
     search: Option<crate::search::Prompt>,
     number: Option<crate::number::Prompt>,
+    command: Option<crate::command::Prompt>,
     searches: crate::search::History,
     spelling: crate::spelling::WindowState,
 }
@@ -447,6 +448,7 @@ impl Window {
             activation_serial: None,
             search: None,
             number: None,
+            command: None,
             searches: crate::search::History::default(),
             spelling: crate::spelling::WindowState::default(),
         })
@@ -819,6 +821,7 @@ impl Window {
     fn close(&mut self) {
         self.search = None;
         self.number = None;
+        self.command = None;
         self.searches.cancel_wrap();
         self.clipboard.incoming = None;
         self.menu = None;
@@ -865,6 +868,7 @@ impl Window {
         self.quitting
             || self.search.is_some()
             || self.number.is_some()
+            || self.command.is_some()
             || self.prompt.is_some()
             || self.closing.is_some()
             || self.conflict.is_some()
@@ -1225,6 +1229,10 @@ impl Window {
             self.number_chord(chord, repeated)?;
             return Ok(false);
         }
+        if self.command.is_some() {
+            self.command_chord(chord, repeated)?;
+            return Ok(false);
+        }
         if self.search.is_some() {
             self.search_chord(chord, repeated)?;
             return Ok(false);
@@ -1277,6 +1285,16 @@ impl Window {
                 revision,
             }) => {
                 self.close_tab(tab, revision);
+                Ok(false)
+            }
+            Ok(Outcome::Request {
+                name: "command-prompt",
+                tab,
+                revision,
+            }) => {
+                if !repeated {
+                    self.command_request(tab, revision)?;
+                }
                 Ok(false)
             }
             Ok(Outcome::Request {
@@ -1458,6 +1476,7 @@ impl Window {
         let path_notice = self.path_notice();
         let search_notice = self.search_notice();
         let number_notice = self.number_notice();
+        let command_notice = self.command_notice();
         let closing_notice = self.closing_notice();
         let conflict_notice = self.conflict_notice();
         let mut raster =
@@ -1482,6 +1501,8 @@ impl Window {
             conflict_notice.as_deref()
         } else if number_notice.is_some() {
             number_notice.as_deref()
+        } else if command_notice.is_some() {
+            command_notice.as_deref()
         } else if search_notice.is_some() {
             search_notice.as_deref()
         } else {
@@ -1749,7 +1770,6 @@ impl Window {
     }
 
     fn activate_menu(&mut self, index: usize) -> Result<()> {
-        use crate::menu::Item;
         if !self.menu_valid() {
             self.menu = None;
             self.notify("Menu cancelled: document changed. Open the menu again.");
@@ -1767,11 +1787,26 @@ impl Window {
         let Target { tab, revision } = menu.target;
         let wrap = menu.wrap;
         let auto_fill = menu.auto_fill;
+        self.activate_item(item, Target { tab, revision }, wrap, auto_fill)
+    }
+
+    fn activate_item(
+        &mut self,
+        item: crate::menu::Item,
+        Target { tab, revision }: Target,
+        wrap: bool,
+        auto_fill: bool,
+    ) -> Result<()> {
+        use crate::menu::Item;
         self.menu = None;
         self.stop_pointer();
         self.input.cancel_repeat();
         self.dirty = true;
         let event = match item {
+            Item::Command => {
+                self.command_request(tab, revision)?;
+                return Ok(());
+            }
             Item::New => Event::New,
             Item::Open | Item::Save | Item::SaveAs => {
                 self.file_request(
@@ -2358,6 +2393,77 @@ impl Window {
 }
 
 impl Window {
+    fn command_notice(&self) -> Option<String> {
+        self.command.as_ref().map(|prompt| {
+            let paused = if self.device.is_none() || self.input.map.is_none() {
+                "Command paused: keyboard unavailable; restore the seat/keymap.\n"
+            } else if !self.input.focused || !self.input.synchronized {
+                "Command paused: focus the editor; tap and release Shift.\n"
+            } else {
+                ""
+            };
+            format!("{paused}{}", prompt.notice())
+        })
+    }
+
+    fn command_request(&mut self, tab: crate::model::TabId, revision: u64) -> Result<()> {
+        let prompt = match crate::command::Prompt::new(self.ui.editor(), tab, revision) {
+            Ok(prompt) => prompt,
+            Err(detail) => {
+                self.notify(format!("Command prompt refused: {detail}"));
+                return Ok(());
+            }
+        };
+        self.ui.dispatch(Event::CancelInput).map_err(error)?;
+        self.stop_pointer();
+        self.input.cancel_repeat();
+        self.clipboard.incoming = None;
+        self.searches.cancel_wrap();
+        self.menu = None;
+        self.search = None;
+        self.number = None;
+        self.command = Some(prompt);
+        self.notice = None;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn command_chord(&mut self, chord: &str, repeated: bool) -> Result<()> {
+        if repeated {
+            return Ok(());
+        }
+        let Some(mut prompt) = self.command.take() else {
+            return Ok(());
+        };
+        self.dirty = true;
+        if matches!(chord, "Escape" | "C-g") {
+            self.notice = None;
+            self.ui.dispatch(Event::CancelInput).map_err(error)?;
+            return Ok(());
+        }
+        if chord == "Return" {
+            let (tab, revision) = match prompt.target(self.ui.editor()) {
+                Ok(target) => target,
+                Err(detail) => {
+                    self.notify(format!(
+                        "Command cancelled: document or selection changed ({detail})."
+                    ));
+                    return Ok(());
+                }
+            };
+            if let Ok(item) = prompt.action() {
+                let auto_fill = self.ui.editor().document(tab).map_err(error)?.auto_fill();
+                let wrap = self.ui.tab_view(tab).map_err(error)?.soft_wrap;
+                return self.activate_item(item, Target { tab, revision }, wrap, auto_fill);
+            }
+            prompt.refused();
+        } else {
+            prompt.type_chord(chord);
+        }
+        self.command = Some(prompt);
+        Ok(())
+    }
+
     fn number_notice(&self) -> Option<String> {
         self.number.as_ref().map(|prompt| {
             let paused = if self.device.is_none() || self.input.map.is_none() {
@@ -2399,6 +2505,7 @@ impl Window {
         self.searches.cancel_wrap();
         self.number = Some(prompt);
         self.search = None;
+        self.command = None;
         self.clipboard.incoming = None;
         self.notice = None;
         self.dirty = true;
@@ -2509,6 +2616,7 @@ impl Window {
         }
         self.search = Some(prompt);
         self.clipboard.incoming = None;
+        self.command = None;
         self.notice = None;
         self.dirty = true;
         Ok(())
@@ -5038,6 +5146,136 @@ mod tests {
         let missing = directory.path("missing");
         assert!(file_window(Profile::Windows, Vec::new(), Some(missing.clone())).is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn native_command_prompt_completes_and_dispatches_shared_actions() {
+        let (mut w, peer) = file_dialog_fixture();
+        w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let device = w.device.unwrap();
+        w.chord("M-x", true).unwrap();
+        assert!(w.command.is_none());
+        w.event(message(device, 4, &[0, 8, 0, 0, 0])).unwrap(); // Mod1/Alt
+        key(&mut w, device, 45); // physical M-x
+        w.event(message(device, 4, &[0, 0, 0, 0, 0])).unwrap();
+        assert!(w.command.is_some());
+        assert!(w.pointer_modal());
+        w.chord("a", false).unwrap();
+        w.chord("Return", false).unwrap();
+        assert!(w.command_notice().unwrap().contains("Unknown/incomplete"));
+        assert!(!w.ui.editor().document(tab).unwrap().auto_fill());
+        w.chord("Tab", false).unwrap();
+        assert!(w.command_notice().unwrap().contains("auto-fill-mode|"));
+        w.chord("Return", true).unwrap();
+        assert!(!w.ui.editor().document(tab).unwrap().auto_fill());
+        w.chord("Return", false).unwrap();
+        assert!(w.command.is_none());
+        assert!(w.ui.editor().document(tab).unwrap().auto_fill());
+        assert_eq!(w.ui.editor().document(tab).unwrap().revision(), 0);
+        w.chord("M-x", false).unwrap();
+        for chord in ["s", "Tab", "Return"] {
+            w.chord(chord, false).unwrap();
+        }
+        assert!(w.command.is_none());
+        assert!(w.number_notice().unwrap().contains("Fill Column"));
+        for chord in ["4", "0", "Return"] {
+            w.chord(chord, false).unwrap();
+        }
+        assert_eq!(w.ui.editor().document(tab).unwrap().fill_column(), 40);
+        w.chord("M-x", false).unwrap();
+        for chord in ["i", "Tab", "Return"] {
+            w.chord(chord, false).unwrap();
+        }
+        assert!(w.command.is_none());
+        assert!(w.notice.as_deref().unwrap().contains("no dictionary"));
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), "");
+        assert!(!w.ui.editor().document(tab).unwrap().dirty());
+        drain(&peer);
+    }
+
+    #[test]
+    fn command_modal_cancel_focus_stale_target_and_close_do_not_execute() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            w.open_menu(crate::menu::Group::Help).unwrap();
+            w.activate_menu(1).unwrap();
+            for chord in ["a", "Tab"] {
+                w.chord(chord, false).unwrap();
+            }
+            let device = w.device.unwrap();
+            w.event(message(device, 2, &[2, SURFACE])).unwrap();
+            assert!(w.command_notice().unwrap().contains("Command paused"));
+            assert!(w.command_notice().unwrap().contains("auto-fill-mode|"));
+            focus(&mut w, device);
+            w.chord("Escape", false).unwrap();
+            assert!(w.command.is_none());
+            assert!(!w.ui.editor().document(1).unwrap().auto_fill());
+            w.command_request(1, 0).unwrap();
+            for chord in ["a", "Tab"] {
+                w.chord(chord, false).unwrap();
+            }
+            w.ui.dispatch(Event::New).unwrap();
+            w.chord("Return", false).unwrap();
+            assert!(w.command.is_none());
+            assert!(w.notice.as_deref().unwrap().contains("Command cancelled"));
+            assert!(!w.ui.editor().document(1).unwrap().auto_fill());
+            assert!(!w.ui.editor().document(2).unwrap().auto_fill());
+            w.command_request(2, 0).unwrap();
+            for chord in ["a", "Tab"] {
+                w.chord(chord, false).unwrap();
+            }
+            w.close();
+            assert!(w.command.is_none());
+            assert!(!w.ui.editor().document(2).unwrap().auto_fill());
+            drain(&peer);
+        }
+    }
+
+    #[test]
+    fn named_fill_line_and_spelling_navigation_execute_through_the_prompt() {
+        fn run(w: &mut Window, name: &str) {
+            w.chord("M-x", false).unwrap();
+            for scalar in name.chars() {
+                w.chord(&scalar.to_string(), false).unwrap();
+            }
+            w.chord("Return", false).unwrap();
+            assert!(w.command.is_none());
+        }
+        let (mut w, peer) = file_dialog_fixture();
+        w.ui.dispatch(Event::Load(b"known\nwrong wrong")).unwrap();
+        w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        run(&mut w, "fill-paragraph");
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().text(),
+            "known wrong wrong"
+        );
+        run(&mut w, "goto-line");
+        assert!(w.number_notice().unwrap().contains("Go To Line"));
+        for chord in ["1", "Return"] {
+            w.chord(chord, false).unwrap();
+        }
+        assert!(w.number.is_none());
+        assert_eq!(w.ui.editor().document(tab).unwrap().selection().caret, 0);
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        run(&mut w, "ispell-buffer");
+        w.end_turn(w.clock + 1, false).unwrap();
+        for (name, range) in [
+            ("next-misspelling", 6..11),
+            ("next-misspelling", 12..17),
+            ("previous-misspelling", 6..11),
+        ] {
+            run(&mut w, name);
+            assert_eq!(
+                w.ui.editor().document(tab).unwrap().selection().range(),
+                range
+            );
+        }
+        assert_eq!(w.ui.editor().document(tab).unwrap().history_depth(), (1, 0));
+        drain(&peer);
     }
 
     #[test]

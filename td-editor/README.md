@@ -82,8 +82,16 @@ clears all results. A failed replacement retains the old dictionary/results.
 Format > Next/Previous Misspelling selects marked words without wrapping.
 At most 10,000 ranges are stored across the window; omitted unknown words
 still count and status reports capped marks. No word list is bundled or
-downloaded, and no text leaves the machine. A separate results-list panel,
-M-x entry and remote spelling queries remain unimplemented.
+downloaded, and no text leaves the machine. A separate results-list panel
+and remote spelling queries remain unimplemented.
+
+Emacs `M-x` or Help > Command opens exact named editor actions. Type a prefix
+and Tab to complete; Return runs an exact name, Ctrl+U clears, and
+Escape/Ctrl+G cancels. The fixed list is `auto-fill-mode`, `fill-paragraph`,
+`goto-line`, `ispell-buffer`, `next-misspelling`, `previous-misspelling`, and
+`set-fill-column`. These use the same handlers as the menus; they are not
+shell commands, executable names or Lisp. Command entry works through the
+Help menu in either key profile.
 
 `transfer.rs` adds the tested descriptor transport prerequisite: bounded
 nonblocking pipe/socket writes and private-socket reads, explicit clocks,

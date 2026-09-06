@@ -712,7 +712,8 @@ Format > Next/Previous Misspelling selects the next stored range after the
 selection, or the previous range before it, and reveals it through the shared
 controller. Navigation does not wrap and cannot reach unknown words omitted
 by the budget; the status reports that truncation. A separate results-list
-panel, M-x command entry and control queries remain future increments.
+panel and control queries remain future increments. The named command
+prompt below now connects `M-x ispell-buffer` to the same scan request.
 
 ## Rendering and reuse
 
@@ -1373,8 +1374,8 @@ than pretending to persist its text. Only existing bindings are shown:
 Windows uses Ctrl+ labels, Emacs uses its C-/M- chord notation, and unbound
 items have no shortcut.
 Find/Find Next/Find Previous and Go To Line use the native contracts below.
-Replace and command completion remain later prompt increments, not hidden
-implementations behind these menus.
+Replace remains a later prompt increment, not a hidden implementation
+behind these menus. Help > Command shares the named command prompt below.
 
 Menu actions dispatch the existing controller events, file-path requests and
 close coordinators. Keyboard, tab-close marks and menus share one native
@@ -1660,6 +1661,52 @@ and scale bounds remain unchanged. Tests cover native chords
 in both profiles, query entry/cancel, both directions, explicit wrap,
 missing/stale/foreign targets, scalar byte limits and overlay-only pixels.
 The headless model/replay Find interface is unchanged.
+
+### Implemented named command prompt
+
+Emacs M-x and Help > Command open a bounded modal command-name prompt.
+The Help entry works in either key profile; no Windows key binding is added.
+The prompt starts empty and accepts at most 64 lowercase ASCII letters or
+hyphens, ignoring other chords rather than inserting text into the document.
+Backspace removes a character and Ctrl+U clears entry. Tab completes the
+longest common prefix of the registered names; a unique match completes its
+whole name. No match preserves input and shows an error. Empty or ambiguous
+completion never chooses a command. Return requires an exact registered name;
+an unknown or incomplete name remains editable with feedback. Repeated keys
+never enter, complete, cancel or run commands. No command runs while typing.
+
+The prompt shows the match count and at most the first three names in lexical
+order as hints. Type a prefix to narrow them. Like the other bitmap modals,
+it clips to six notice rows on narrow windows; resizing does not lose input.
+Help now needs 320 by 96 scaled pixels for its two complete rows, up from
+320 by 72 for About alone. M-x remains available without a fitting menu.
+
+The closed registry is exactly:
+
+| Name | Existing action |
+| --- | --- |
+| `auto-fill-mode` | Toggle the active tab's Auto Fill. |
+| `fill-paragraph` | Fill its current paragraph. |
+| `goto-line` | Open Go To Line. |
+| `ispell-buffer` | Check the whole active document on demand. |
+| `next-misspelling` | Select the next stored range, without wrapping. |
+| `previous-misspelling` | Select the previous stored range, without wrapping. |
+| `set-fill-column` | Open Fill Column. |
+
+These names dispatch the same native item handler as menu activation. Toggle
+commands use the setting at execution; this prompt does not display or imply
+a captured setting. Numeric commands open their own captured-setting/target
+prompt without editing text. There is no evaluation, argument syntax, shell,
+subprocess, executable lookup, dynamic registration, plugin or interpreter.
+
+Command entry pins editor identity, active tab, text revision and directed
+selection. Return refuses a changed target rather than applying to another
+document. Opening clears key prefix/mark, pointer drag/repeat state, pending
+Paste and search wrapping; it preserves text and selection. Document pointer
+input is blocked while modal. Escape/C-g cancels entry (and any active spelling
+scan under its window-wide cancellation rule). Focus/keymap loss pauses entry
+with visible guidance and preserves the name. Window close dismisses entry
+before the ordinary close flow. File/discard dialogs keep priority.
 
 ### Implemented numeric prompts: Go To Line and Fill Column
 

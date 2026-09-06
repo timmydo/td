@@ -50,7 +50,7 @@ impl Group {
                 NextMisspelling,
                 PreviousMisspelling,
             ],
-            Self::Help => &[About],
+            Self::Help => &[About, Command],
         }
     }
 }
@@ -77,6 +77,7 @@ pub(crate) enum Item {
     FillColumn,
     Spell,
     About,
+    Command,
     Find,
     FindNext,
     FindPrevious,
@@ -112,6 +113,7 @@ impl Item {
             Self::NextMisspelling => "Next Misspelling",
             Self::PreviousMisspelling => "Previous Misspelling",
             Self::About => "About td-editor",
+            Self::Command => "Command...",
             Self::Find => "Find...",
             Self::FindNext => "Find Next",
             Self::FindPrevious => "Find Previous",
@@ -120,6 +122,7 @@ impl Item {
     }
     pub(crate) fn shortcut(self, profile: Profile) -> &'static str {
         match (self, profile) {
+            (Self::Command, Profile::Emacs) => "M-x",
             (Self::New, Profile::Windows) => "Ctrl+N",
             (Self::Open, Profile::Windows) => "Ctrl+O",
             (Self::Open, Profile::Emacs) => "C-x C-f",

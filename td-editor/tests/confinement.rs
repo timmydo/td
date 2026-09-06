@@ -19,6 +19,7 @@ fn source_inventory_and_allowances_are_closed() {
     assert!(!root.join("build.rs").exists());
     let expected: BTreeSet<_> = [
         "clipboard.rs",
+        "command.rs",
         "data.rs",
         "dialog.rs",
         "files.rs",
