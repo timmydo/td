@@ -62,6 +62,7 @@ mod store_db;
 mod store_db_read;
 mod sys;
 mod tar;
+mod test_root;
 mod toolchain_x86_64;
 mod xz;
 
@@ -8290,6 +8291,7 @@ fn main() -> ExitCode {
         // runaway reds its test instead of taking the box down. Not user-facing:
         // cargo constructs the invocation. See builder/src/run_capped.rs.
         Some("run-capped") => run_capped::main(args.get(2..).unwrap_or(&[])),
+        Some("test-root-child") => test_root::child(args.get(2..).unwrap_or(&[])),
         // stop — end the long check run THIS worktree started. Every worktree
         // invokes the same relative path, so no `pkill -f` pattern can select
         // one; the run writes a record in its own worktree and this reads it.

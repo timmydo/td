@@ -3073,6 +3073,7 @@ fn dependency_free(lock: &str, text: &str, expected: usize) -> Result<(), String
 /// same reviewed act that adding a row used to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GateCrate {
+    trusted_test_root: bool,
     /// The directory name, which is also the crate name and the manifest path
     /// the commands are spelled with: `td-sh`.
     name: String,
@@ -3235,6 +3236,7 @@ fn resembles_gate_section(header: &str) -> bool {
 /// drop lint coverage, which is the failure this whole roster exists to stop.
 fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
     let mut out = GateCrate {
+        trusted_test_root: false,
         name: name.to_string(),
         clippy_all_targets: false,
         test_args: None,
@@ -3300,6 +3302,9 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
             return Err(format!("{name}: `{line}` is not `key = value`"));
         };
         match key.trim() {
+            "trusted-test-root" => {
+                out.trusted_test_root = gate_bool(name, "trusted-test-root", value.trim())?;
+            }
             "clippy-all-targets" => {
                 out.clippy_all_targets = gate_bool(name, "clippy-all-targets", value.trim())?;
             }
@@ -3757,7 +3762,7 @@ fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
     let crates = discover_gate_crates(root)?;
     let mut out = vec!["cargo test --frozen --workspace".to_string()];
     for k in &crates {
-        let mut cmd = format!("cargo test --frozen --manifest-path {}/Cargo.toml", k.name);
+        let mut cmd = crate_test_command(k);
         if let Some(args) = &k.test_args {
             cmd.push_str(" -- ");
             cmd.push_str(args);
@@ -3794,7 +3799,7 @@ pub(crate) fn gate_cargo_cmds(root: &Path) -> Result<Vec<String>, String> {
     }
     out.push("cargo test --frozen --workspace".to_string());
     for k in &crates {
-        let mut cmd = format!("cargo test --frozen --manifest-path {}/Cargo.toml", k.name);
+        let mut cmd = crate_test_command(k);
         if let Some(args) = &k.gate_test_args {
             cmd.push(' ');
             cmd.push_str(args);
@@ -3802,6 +3807,14 @@ pub(crate) fn gate_cargo_cmds(root: &Path) -> Result<Vec<String>, String> {
         out.push(cmd);
     }
     Ok(out)
+}
+
+fn crate_test_command(krate: &GateCrate) -> String {
+    let mut cmd = format!("cargo test --frozen --manifest-path {}/Cargo.toml", krate.name);
+    if krate.trusted_test_root {
+        cmd.push_str(" --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'");
+    }
+    cmd
 }
 
 /// The crate names gate 325 reports, in roster order.
@@ -4418,6 +4431,7 @@ mod tests {
             std::fs::write(&p, text).unwrap();
         }
         let krate = |name: &str| GateCrate {
+            trusted_test_root: false,
             name: name.to_string(),
             clippy_all_targets: false,
             test_args: None,
@@ -6730,7 +6744,9 @@ mod tests {
                     k.name
                 ),
                 None => assert!(
-                    test.ends_with("/Cargo.toml"),
+                    test.ends_with(if k.trusted_test_root {
+                        " --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'"
+                    } else { "/Cargo.toml" }),
                     "{}: undeclared arguments appeared in `{test}`",
                     k.name
                 ),
@@ -6768,6 +6784,56 @@ mod tests {
         assert_ne!(gate_review, host_review);
     }
 
+    #[test]
+    fn trusted_test_root_is_opt_in_and_both_test_legs_preserve_it() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "td-root-roster-{}-{stamp:x}", std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        for (name, option) in [("td-yes", "true"), ("td-no", "false")] {
+            let dir = root.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!("[package]\n[package.metadata.td-gate]\ntrusted-test-root = {option}\n"),
+            ).unwrap();
+        }
+        for commands in [
+            cargo_test_cmds_all(&root).unwrap(), gate_cargo_cmds(&root).unwrap(),
+        ] {
+            for command in commands {
+                assert_eq!(
+                    command.contains("TD_TEST_TRUSTED_ROOT"),
+                    command.starts_with("cargo test ") && command.contains("td-yes/Cargo.toml"),
+                );
+                if command.starts_with("cargo test ") && command.contains("td-yes/Cargo.toml") {
+                    assert_eq!(command, concat!(
+                        "cargo test --frozen --manifest-path td-yes/Cargo.toml",
+                        " --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"'",
+                        " --config 'env.TD_TEST_TRUSTED_ROOT.force=true'",
+                    ));
+                }
+            }
+        }
+        for invalid in ["1", "yes", "\"true\"", ""] {
+            assert!(parse_gate_crate(
+                "td-x",
+                &format!("[package.metadata.td-gate]\ntrusted-test-root = {invalid}\n"),
+            ).is_err());
+        }
+    }
+
     /// The declaration parser, over manifest TEXT so its cases are literals
     /// rather than a fixture tree.
     #[test]
@@ -6777,6 +6843,7 @@ mod tests {
         let bare = "[package]\nname = \"td-x\"\n\n[workspace]\n";
         let got = parse_gate_crate("td-x", bare).expect("defaults");
         assert!(!got.clippy_all_targets);
+        assert!(!got.trusted_test_root);
         assert_eq!(got.test_args, None);
         assert_eq!(got.gate_test_args, None);
 

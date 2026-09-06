@@ -255,6 +255,56 @@ main checkout's config instead and execs the main checkout's builder, so a
 `cargo clean` there makes its tests fail with `No such file or directory`.
 Build the release binary in whichever checkout supplies the config.
 
+## Trusted filesystem roots for permission tests
+
+A standalone `td-*` roster crate may declare `trusted-test-root = true` in its
+`[package.metadata.td-gate]`. Both derived cargo-test command lists force
+`TD_TEST_TRUSTED_ROOT=1` for that invocation; Clippy, other crates and ordinary
+`cargo run` are unchanged. To exercise the same fixture directly, use
+`TD_TEST_TRUSTED_ROOT=1 cargo test --manifest-path CRATE/Cargo.toml`.
+The root workspace's builder/recipes/engine command is not a roster-crate
+invocation and does not acquire this setting from member metadata.
+
+The existing `run-capped` runner applies its memory ceiling first, then runs
+each test artifact through `sandbox::host_shell` with caller-owned mode-1777
+root and private `/tmp`. This matches the editor's trusted-owner plus sticky
+ancestor policy; components requiring mode-0755 root or forbidding all shared
+write bits must not use this fixture unchanged. An internal builder supervisor
+is namespace PID 1 and starts the test as an ordinary child, preserving its
+default signal dispositions. The extra user/mount/PID namespaces are nested
+inside the check host's process-lifetime containment; parent-death handling
+and memory limits remain in force. Ordinary exit codes propagate; signal
+deaths propagate as nonzero `128 + signal` exit codes, not as a signaled
+outer process. Setup failure fails the test invocation, never skips it or
+falls back to an uncontained execution. The opt-in is read only for test
+artifacts; ordinary `cargo run` is unaffected even if the variable is set.
+
+This is an ownership fixture, not a new filesystem security sandbox. Ambient
+resolvable top-level paths remain bound with their existing access; `/proc` and `/dev`
+use the existing host-sandbox private/minimal implementations. The working
+directory and executable remain available, including when located below
+`/tmp`. `/tmp` itself cannot be the working directory; the host's `/oldroot`
+is omitted because that name is reserved for pivot cleanup. Dangling
+top-level symlinks are logged and omitted; other lookup failures refuse.
+Resolvable top-level symlink aliases become mountpoints, not symlinks, so
+this fixture is not an exact replica of host pathname identity.
+The helper requires UTF-8 paths/environment and replaces
+`TMPDIR` with `/tmp`; externally prepared temporary files and display sockets
+under the old `/tmp` are not retained unless inside the bound working tree.
+This includes contents of `HOME`, `CARGO_HOME` and `XDG_RUNTIME_DIR` beneath
+the old `/tmp`. Environment strings are retained, not silently rewritten
+to a different directory. Network, IPC and UTS namespaces are also private:
+host network services, abstract Unix sockets, SysV IPC and hostname are not
+shared. Pathname sockets in retained bound paths remain filesystem objects.
+The inner process does not inherit the opt-in variable, preventing recursive
+wrapping through another runner invocation. Other ancestor ownership is not
+rewritten, and no production permission predicate gains a test exception.
+
+This allows the editor's permission tests to run under the check host's identity
+map: host-root-owned directories otherwise appear as an unmapped overflow
+UID. Such an owner remains untrusted by production code. A real container
+must supply an identifiable trusted path or the optional endpoint refuses.
+
 # Code review: three per commit
 
 Every increment is read by three independent reviewers before it lands. They

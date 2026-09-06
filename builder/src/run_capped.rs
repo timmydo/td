@@ -9,9 +9,10 @@
 //!
 //! `.cargo/config.toml` points cargo's `target.<triple>.runner` here, which
 //! reaches invocations td does not launch. We set `RLIMIT_DATA` on ourselves
-//! and `exec` the target: rlimits survive `execve`, so the ceiling binds the
-//! test binary and everything it forks, and `exec` leaves no wrapper in the
-//! tree to get the exit status wrong.
+//! and normally `exec` the target: rlimits survive `execve`, so the ceiling
+//! binds the test binary and everything it forks. Opted-in trusted-root tests
+//! instead run beneath a namespace supervisor; their signal deaths become
+//! nonzero 128+signal exit codes. See DEVELOPMENT.md for the fixture contract.
 //!
 //! What this bounds is narrower than "memory", deliberately. `RLIMIT_DATA`
 //! makes covered `brk`/`mmap` requests fail with `ENOMEM`; the kernel does not
@@ -166,6 +167,23 @@ pub fn main(args: &[String]) -> ExitCode {
         // that used it, so an override says so where the reader is looking.
         if override_value.is_some() {
             eprintln!("td-builder run-capped: {OVERRIDE_ENV} in effect — ceiling {mib} MiB");
+        }
+        let trusted = crate::test_root::enabled(std::env::var_os(crate::test_root::ENV).as_deref());
+        match trusted {
+            Ok(false) => {}
+            Ok(true) => {
+                return match crate::test_root::run(program, rest) {
+                    Ok(status) => crate::test_root::exit_code(status),
+                    Err(error) => {
+                        eprintln!("td-builder run-capped: trusted test root: {error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            Err(error) => {
+                eprintln!("td-builder run-capped: {error}");
+                return ExitCode::FAILURE;
+            }
         }
     }
 
