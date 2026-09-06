@@ -9138,6 +9138,142 @@ files name no restart path at all, and the two units keep
 `restart=never`: a client that exits because its configuration is wrong
 must not be restarted into the same failure behind a flickering window.
 
+### W.8 td-mail and td-news: the terminal applications as td code
+
+**Decision.** `tmc` and `tn` come into this repository as `td-mail` and
+`td-news`: root crates that AGENTS.md's discovery rule gates as
+dependency-free, built as td-firstboot, td-sh and td-util are built, by
+rustc on a local source and linked static, and shipped through the same
+`mail` and `news` packages, `/bin` entries, units and provisioning as
+today. What goes with that: the two GitHub pins and their archive
+hashes, the `tn-source` and `tmc-source` seed rows, the two feed-index
+rows, the two vendor closures the Cargo runner builds, and
+`recipes/locks/tn` and `recipes/locks/tmc`; `local-source-digests`
+covers the two trees instead, cheaply. The two repositories are frozen
+after the import with a pointer here, and their `td` branches deleted
+once nothing pins them.
+
+**Std only is the condition, not the aim.** The gate asserts every
+`td-*` root crate's lock dependency-free (`builder/src/affected.rs`), so
+the crates cannot land at the root until they are. Today `tn` is 5,100
+lines with ten direct dependencies and a 142-crate closure; `tmc` is
+18,500 lines, ten and 135. Where the weight is, by the crates only each
+dependency brings: `ureq`, the HTTPS client, 42 to 44 exclusive and 87
+to 95 in all, including the closure's only C and hand-written assembly
+(`ring`) and the ICU tables `url` pulls in; `html2text` 23, a whole
+HTML5 parser; `chrono` 19 (tn only); `toml` 6; `tempfile` 4 exclusive
+but 46 to 54 in the lock, as a dev dependency; `regex` 4 (tmc only);
+`serde` and `serde_json` shared; `redb` and `libc` one each. Outside
+tests the two carry five and six `unwrap`s and six and nine `unsafe`
+blocks, every one of them terminal handling.
+
+**What each becomes.** HTTPS: the fetch service below. JSON: a copy of
+the engine's `json.rs`, which parses and serializes. TOML: a parser for
+the flat subset the two configurations use. HTML: one td-owned renderer
+both crates carry, block elements to lines, links as their text and URL,
+entities decoded, tables and nested lists rendered plainly; that is the
+one quality trade, and it can grow. Dates: a civil-date formatter over
+`SystemTime`, with no zone data, which is what the jail shows now in
+effect. Cache: files under the cache directory, one per item keyed by
+hash, and one state file, in place of `redb`. Terminal: the surface
+td-sh records in UNSAFE.md, raw mode, window size, a readable poll and
+signal dispositions over opaque termios bytes, copied into each crate as
+td's one-package locks require and recorded twice. Patterns: td-txt's
+engine where tmc's rules take user-written expressions, so that
+configuration contract does not narrow. Base64 by hand; `tempfile`
+replaced by a unique name under the std temporary directory. The
+`unwrap`s go in the import's rule pass.
+
+**The fetch service.** The one thing std cannot do is TLS, and td will
+not write one. AGENTS.md foresees the control-plane programs rebuilt as
+target recipes once the target toolchain exists, and the td-net tier is
+the one tier with an external closure; it already carries a bounded
+HTTPS client, `net/src/http.rs`, ureq over rustls, ring and
+webpki-roots, and no decoder. So:
+
+1. `td-fetchd`, an applet of the td-net multicall, built as a target
+   recipe through the Cargo runner from the checkout's `net/` and
+   `engine/` trees and the committed lock's vendor closure: the first
+   target-built control-plane program, and the one target network
+   client. It listens on `/run/user/1000/td-fetch` as the UI user under
+   a `[fetchd]` unit after `seat` and `netup`, `restart=always`; the
+   socket is mode 0600 under a runtime directory of mode 0700, and that
+   is the whole of the authentication: the tier forbids `unsafe`, so
+   peer credentials are not read, and only the UI user's processes, the
+   jails among them, can connect.
+2. The grant is `sockets=fetch`, beside `sockets=wayland`. §C's mount
+   plan step 12 binds `td-fetch` into the jail's runtime directory when
+   it is granted, read-only like the bus; the stage-2 readback's name
+   roster admits it; no environment variable is added, the path under
+   `XDG_RUNTIME_DIR` being the contract. `mail` and `news` take the
+   grant and lose `shared=network`, so their jails get the isolated
+   namespace with loopback alone, and the resolver and CA bundle are no
+   longer bound, nothing in the jail resolving or verifying. Firefox
+   keeps `shared=network`; it has its own TLS.
+3. One request per connection, a text header block and then the body.
+   The client writes `td-fetch 1`, `method GET` or `POST`, `url …`, zero
+   or more `header name: value` lines with the name in lower case,
+   `limit N` for the most response bytes it will take, `body N`, a blank
+   line, and N bytes. The service replies `td-fetch 1`, `status 200`,
+   `header` lines, `body N`, a blank line and N bytes, or `td-fetch 1`,
+   `error reason`, a blank line. A line is at most 8 KiB, a request at
+   most 64 headers. The service refuses any scheme but `http` and
+   `https`; a host that names, or resolves to, a loopback, link-local or
+   unspecified address, since td's own listeners are inside the shared
+   stack and the grant must not reach them; a request body over 32 MiB;
+   and a response over the client's limit or 64 MiB. It follows at most
+   five redirects and none for `POST`, sends `Accept-Encoding: identity`
+   because the tier's closure has no decoder and principle 2 makes one a
+   sign-off, and keeps `http.rs`'s connect, read and write timeouts. A
+   bounded number of connections are served at once; the rest wait.
+4. Evidence. The boot VM has no route out, so the evidence is the socket
+   and the policy: `[fetch-evidence]` connects as the UI user, asks for
+   a loopback URL and expects the exact refusal; inside the jail, the
+   stage-2 readback already requires every granted socket to be present
+   and mounted read-only, so `TD-MAIL-RUNNING` under the grant proves
+   the socket reached the instance; the marker `TD-FETCH-OK` is latched
+   as an exact line and required by the oracle. Host side, a recipe
+   check runs the applet against a std `TcpListener` on loopback under a
+   test-only allow flag and pins the framing, the caps, the header rules
+   and a redirect.
+5. What this buys, exactly: the applications hold no socket but a unix
+   one, resolve no names, carry no trust store, and their closures are
+   std; TLS trust, timeouts and body caps live in one reviewed place,
+   and a jail that lost its grant loses the network entirely rather than
+   its unmounted sockets. What it does not buy: a destination policy. An
+   application with the grant reaches any `http` or `https` host the
+   machine can, as `shared=network` allowed, less td's own listeners;
+   and a name that changes its answer after the policy check is not
+   defended. Both are recorded as gaps. §L's claim list gains the
+   sentence: `sockets=fetch` mediates the transport, not the
+   destinations. §B.6's row "Nothing on the target fetches" and §B.7's
+   "reuse only in the control plane" are amended by the landing that
+   ships the applet, in that landing.
+
+**Sequencing.** (1) The fetch service, proven in the boot with the
+current pinned `tn` and `tmc` switched to it: the last pin bump. (2) The
+rest of the conversion on the two repositories' `td` branches, checked
+offline against the shipped configurations as the refresh fix was
+(§W.4's `password_file` stays until the secret manager's first
+increment). (3) One import landing, principle 4: `git subtree add` for
+both so history and blame survive; the rename to `td-news` and `td-mail`
+in crates, binaries, td-jail's process-token program names and the
+configuration directories, `~/.config/td-news` and `~/.config/td-mail`,
+nothing persistent existing yet; the recipes moved to `Recipe::mesboot`
+local sources; the package tables and `/bin` entries repointed;
+td-firstboot's provisioning updated; and every pin, lock, vendor, index
+and digest artifact deleted. Then the boot, which the gate does not run
+(§H). W.6's `td-open` and W.7's relaunch are unchanged by any of this
+and land on the td crates.
+
+**Review of the import.** About 24,000 lines arrive at once, and the
+panel reviews diffs, not codebases. The subtree commit lands
+byte-identical to the two source commits it names, so a reviewer
+verifies identity rather than reads; it carries a waiver naming the
+approving human; and every change td's rules require, the `unwrap` pass,
+the UNSAFE.md entries, the renames, is an ordinary reviewed commit above
+it.
+
 ## X. Host mode — development only
 
 **The application layer runs on an ordinary Linux host, and that mode is
