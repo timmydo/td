@@ -23,9 +23,12 @@ const PIDS_MAX: u32 = 2048;
 /// has a pseudo-terminal of its own from `td-term --command` or is refused
 /// before anything runs (APPLICATIONS.md §C), and the system image's
 /// `claude-evidence` unit proves both halves at boot. Its updater is disabled
-/// because nothing in the private home may execute. Later increments add the
-/// caller's working directory, a launcher card that opens it, and the
-/// executable state subtree that lets the application update itself.
+/// because nothing in the private home may execute. The `~/src` grant is also
+/// what makes the caller's directory reachable: run from `~/src/td`, the entry
+/// starts there, because the jail maps the caller's directory through the
+/// grant that binds it (APPLICATIONS.md §A and rung 34). Later increments add
+/// a launcher card that opens it and the executable state subtree that lets
+/// the application update itself.
 pub fn recipe() -> Recipe {
     let Some(dynamic_policy) = dynamic_application_policy("claude", RUNTIME) else {
         return invalid_recipe("dynamic-policy");

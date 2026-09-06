@@ -626,6 +626,50 @@ mod confinement {
         assert_eq!(bootstrap.matches("sys::start_new_session()?").count(), 1);
         assert_eq!(watcher.matches("sys::start_new_session()?").count(), 1);
         assert_eq!(TRANSITION.matches(".current_dir(\"/\")").count(), 2);
+        // The entry is the ONLY thing that ever starts anywhere but stage
+        // 2's own `/`: three `current_dir` calls in the file, the two
+        // explicit `/` above and the entry's. A fourth reds this.
+        assert_eq!(TRANSITION.matches(".current_dir(").count(), 3);
+        assert_eq!(
+            TRANSITION.matches("command.current_dir(directory);").count(),
+            1
+        );
+        // The entry is started through the fallback rather than directly,
+        // so a directory that cannot be entered costs a fork and not the
+        // launch. Both halves are pinned: run_application goes through
+        // `spawn_entry`, and `spawn_entry` answers a failed first attempt
+        // with one that names no directory.
+        let run_application = TRANSITION
+            .split_once("fn run_application(")
+            .unwrap_or_else(|| panic!("run_application is absent"))
+            .1
+            .split_once("fn application_command(")
+            .unwrap_or_else(|| panic!("application_command is absent"))
+            .0;
+        assert!(run_application.contains("spawn_entry(working_directory, &mut start)"));
+        let spawn_entry = TRANSITION
+            .split_once("fn spawn_entry<")
+            .unwrap_or_else(|| panic!("spawn_entry is absent"))
+            .1
+            .split_once("fn run_application(")
+            .unwrap_or_else(|| panic!("run_application is absent"))
+            .0;
+        assert!(spawn_entry.contains("Err(_) => spawn(None),"));
+        // Stage 1 reads the caller's directory while it still stands in it:
+        // the unshare and the mount plan after it are what make the answer
+        // unreadable, so the read precedes them.
+        let launch_application = TRANSITION
+            .split_once("pub fn launch_application(")
+            .unwrap_or_else(|| panic!("launch_application is absent"))
+            .1;
+        assert!(
+            launch_application
+                .find("caller_working_directory(&application.filesystems)")
+                .unwrap_or_else(|| panic!("caller directory read is absent"))
+                < launch_application
+                    .find("sys::unshare_namespaces(")
+                    .unwrap_or_else(|| panic!("launch unshare is absent"))
+        );
         assert!(TRANSITION.contains("read_exact(&mut readiness)"));
         assert!(TRANSITION.contains("close_inherited_descriptors(cleanup_descriptor)?;"));
         assert!(managed.contains("None if self.instance.is_none() => Ok(None)"));

@@ -1101,6 +1101,18 @@ pub(crate) fn validate_environment_list(
     Ok(())
 }
 
+/// Stage 2's working directory: a path inside the jail, not a traversal.
+///
+/// Stage 1 derives it from a grant it already resolved, so the authority is
+/// the grant and this is a structural readback of the word — the same shape
+/// a grant target must have, since that is what it is built from. Stage 2
+/// still requires the directory to be present before it starts anything
+/// there, so a path that passes here is a request and not a promise.
+pub(crate) fn validate_stage2_working_directory(path: &Path) -> io::Result<()> {
+    validate_filesystem_target(path)
+        .map_err(|_| invalid("stage-2 working directory is not a bounded canonical path"))
+}
+
 pub(crate) fn validate_stage2_loader_library_path(value: Option<&str>) -> io::Result<()> {
     if value.is_none() || value == Some(FIREFOX_LIBRARY_PATH) {
         return Ok(());

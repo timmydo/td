@@ -48,6 +48,7 @@ const STAGE2_FETCH_SOCKET_ARG: &str = "--fetch-socket";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
 const STAGE2_RUNTIME_ALIASES_ARG: &str = "--runtime-aliases";
 const STAGE2_TERMINAL_ARG: &str = "--terminal";
+const STAGE2_WORKING_DIRECTORY_ARG: &str = "--working-directory";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
 const STAGE2_RESOURCES_ARG: &str = "--resources";
@@ -380,6 +381,12 @@ pub struct Stage2Launch {
     /// Stage 1 acquired the session's controlling terminal and passed it as
     /// this process's stdout; the entry gets it as all three stdio.
     terminal: bool,
+    /// Where the entry starts, as the jail spells it: the caller's own
+    /// directory mapped through the grant that binds it, or None when the
+    /// caller stood outside every grant. Stage 2 still requires the
+    /// directory to be there before it uses it, so this is a request and
+    /// not a promise.
+    working_directory: Option<PathBuf>,
     environment: Vec<(OsString, OsString)>,
     filesystems: Vec<Stage2Filesystem>,
     resources: ResolvedResourceLimits,
@@ -436,6 +443,7 @@ struct Stage2MountBinding<'a> {
     loader_library_path: Option<&'a str>,
     runtime_aliases: bool,
     terminal: bool,
+    working_directory: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -784,6 +792,18 @@ where
             Some("absent") => false,
             _ => return Err(usage_error()),
         };
+        if args.next().as_deref() != Some(STAGE2_WORKING_DIRECTORY_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let working_directory = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("absent") => None,
+            Some("present") => {
+                let value = PathBuf::from(args.next().ok_or_else(usage_error)?);
+                authority::validate_stage2_working_directory(&value)?;
+                Some(value)
+            }
+            _ => return Err(usage_error()),
+        };
         if args.next().as_deref() != Some(STAGE2_ENVIRONMENT_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -891,6 +911,7 @@ where
             fetch_socket,
             runtime_aliases,
             terminal,
+            working_directory,
             environment,
             filesystems,
             resources,
@@ -1019,6 +1040,16 @@ fn stage2_launch_arguments(
     stage2.extend([
         OsString::from(STAGE2_TERMINAL_ARG),
         OsString::from(if mounts.terminal { "present" } else { "absent" }),
+    ]);
+    stage2.push(OsString::from(STAGE2_WORKING_DIRECTORY_ARG));
+    match mounts.working_directory {
+        Some(value) => {
+            stage2.push(OsString::from("present"));
+            stage2.push(value.as_os_str().to_os_string());
+        }
+        None => stage2.push(OsString::from("absent")),
+    }
+    stage2.extend([
         OsString::from(STAGE2_ENVIRONMENT_ARG),
         OsString::from(environment.len().to_string()),
     ]);
@@ -5241,6 +5272,7 @@ pub fn run_stage2(
                 fetch_socket: _,
                 runtime_aliases: _,
                 terminal,
+                working_directory,
                 environment,
                 filesystems: _,
                 resources,
@@ -5262,6 +5294,7 @@ pub fn run_stage2(
                 &arguments,
                 firefox_seccomp_probe,
                 terminal,
+                working_directory.as_deref(),
             )
         }
     }
@@ -5470,41 +5503,76 @@ fn wait_for_stage1_end(reader: &mut impl Read) {
     }
 }
 
+/// One attempt in the caller's directory, then one without it.
+///
+/// The caller's directory is a request and not a promise, and a readback
+/// cannot make it one: `stat` succeeds without the search bit that `chdir`
+/// needs, so a directory the entry's identity cannot enter passes every
+/// check and then fails the spawn, and the directory can be replaced
+/// between the two calls anyway. So the attempt IS the check. A spawn that
+/// fails reports before the entry ever execs — the child writes its errno
+/// back and is reaped — so falling back costs one fork and can never run
+/// the entry twice.
+///
+/// A launch must not fail over where the operator started it, so ANY
+/// failure of the first attempt is answered by one from stage 2's own `/`,
+/// and its error is the one the caller sees.
+fn spawn_entry<T, E, F>(working_directory: Option<&Path>, spawn: &mut F) -> Result<T, E>
+where
+    F: FnMut(Option<&Path>) -> Result<T, E>,
+{
+    match working_directory {
+        None => spawn(None),
+        Some(directory) => match spawn(Some(directory)) {
+            Ok(started) => Ok(started),
+            Err(_) => spawn(None),
+        },
+    }
+}
+
 fn run_application(
     entry: &str,
     environment: &[(OsString, OsString)],
     arguments: &[OsString],
     firefox_seccomp_probe: bool,
     terminal: bool,
+    working_directory: Option<&Path>,
 ) -> io::Result<()> {
     // Under the grant, stage 2's stdout IS the controlling terminal
     // (`require_stage2_terminal` proved it), and the entry gets three
-    // clones of it; otherwise three null devices, as before.
-    let (input, output, error) = if terminal {
-        let stdout = io::stdout();
-        let terminal = stdout.as_fd();
-        (
-            Stdio::from(terminal.try_clone_to_owned()?),
-            Stdio::from(terminal.try_clone_to_owned()?),
-            Stdio::from(terminal.try_clone_to_owned()?),
-        )
-    } else {
-        (
-            Stdio::from(fs::File::open("/dev/null")?),
-            Stdio::from(OpenOptions::new().write(true).open("/dev/null")?),
-            Stdio::from(OpenOptions::new().write(true).open("/dev/null")?),
-        )
+    // clones of it; otherwise three null devices, as before. Built per
+    // attempt, since the descriptors are consumed by the command.
+    let mut start = |directory: Option<&Path>| -> io::Result<Child> {
+        let (input, output, error) = if terminal {
+            let stdout = io::stdout();
+            let terminal = stdout.as_fd();
+            (
+                Stdio::from(terminal.try_clone_to_owned()?),
+                Stdio::from(terminal.try_clone_to_owned()?),
+                Stdio::from(terminal.try_clone_to_owned()?),
+            )
+        } else {
+            (
+                Stdio::from(fs::File::open("/dev/null")?),
+                Stdio::from(OpenOptions::new().write(true).open("/dev/null")?),
+                Stdio::from(OpenOptions::new().write(true).open("/dev/null")?),
+            )
+        };
+        let mut command = application_command(entry, arguments, firefox_seccomp_probe);
+        command
+            .env_clear()
+            .envs(environment.iter().map(|(key, value)| (key, value)))
+            .stdin(input)
+            .stdout(output)
+            .stderr(error);
+        if let Some(directory) = directory {
+            command.current_dir(directory);
+        }
+        let child = command.spawn();
+        drop(command);
+        child
     };
-    let mut command = application_command(entry, arguments, firefox_seccomp_probe);
-    command
-        .env_clear()
-        .envs(environment.iter().map(|(key, value)| (key, value)))
-        .stdin(input)
-        .stdout(output)
-        .stderr(error);
-    let child = command.spawn();
-    drop(command);
-    let child = child
+    let child = spawn_entry(working_directory, &mut start)
         .map_err(|e| io::Error::other(format!("launch application entry {entry}: {e}")))?;
     let application_pid = i32::try_from(child.id())
         .map_err(|e| io::Error::other(format!("application PID is invalid: {e}")))?;
@@ -5810,6 +5878,66 @@ impl Drop for ManagedCgroup {
     }
 }
 
+/// The caller's own directory as the jail spells it, or None.
+///
+/// The operator runs the launcher from somewhere and expects the entry to
+/// start in that same place. This widens nothing: the directory is mapped
+/// through a grant the policy already resolved, so it can only ever name a
+/// path the mount plan itself places, and a caller standing outside every
+/// grant gets None and the entry keeps stage 2's `/` — which is where
+/// every launch started before this.
+///
+/// Only a directory grant can hold a working directory, and at most one
+/// admitted grant can contain the caller: `authority` merges an exact
+/// duplicate and otherwise REFUSES a policy whose grants overlap in
+/// source or target, so two admitted sources can never both be ancestors
+/// of one path, and no admitted target can nest inside another's. The
+/// deepest match is nonetheless taken rather than the first, so that a
+/// set handed straight to this function — a test's, or a resolver that
+/// later admits nesting — resolves to the innermost binding, which is the
+/// one that would have placed the caller's directory, instead of whichever
+/// happened to be listed first.
+///
+/// A caller whose directory cannot be read at all — it was removed under
+/// them, or is unreachable — is treated as one standing outside, because a
+/// launch that would otherwise succeed should not fail over where it was
+/// started from.
+fn caller_working_directory(grants: &[FilesystemGrant]) -> Option<PathBuf> {
+    mapped_caller_directory(&std::env::current_dir().ok()?, grants)
+}
+
+/// The mapping itself, apart from the process's own directory so the rule
+/// can be pinned without moving a shared cwd under the other tests.
+fn mapped_caller_directory(caller: &Path, grants: &[FilesystemGrant]) -> Option<PathBuf> {
+    let directory = grants
+        .iter()
+        .filter(|grant| matches!(grant.source_kind, FilesystemSourceKind::Directory))
+        .filter_map(|grant| {
+            let relative = caller.strip_prefix(&grant.source).ok()?;
+            // A caller standing at the grant's own root has nothing to
+            // append, and joining an empty path appends a SEPARATOR rather
+            // than nothing — a trailing slash stage 2 refuses as
+            // uncanonical, which would have made `cd ~/src && claude` a
+            // failed launch. Path equality normalizes that away, so only a
+            // byte-exact test sees it.
+            let directory = if relative.as_os_str().is_empty() {
+                grant.target.clone()
+            } else {
+                grant.target.join(relative)
+            };
+            Some((grant.source.components().count(), directory))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, directory)| directory)?;
+    // A directory the word cannot carry is no directory at all. A name
+    // outside the wire format — not UTF-8, or past the length bound — would
+    // be refused by stage 2 and take the launch down with it, and where the
+    // operator happened to stand must never do that. Stage 1 therefore
+    // holds itself to the same readback stage 2 will apply.
+    authority::validate_stage2_working_directory(&directory).ok()?;
+    Some(directory)
+}
+
 pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     let outside_identity = current_identity()?;
     if outside_identity.uid == 0 || outside_identity.gid == 0 {
@@ -5855,6 +5983,11 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     let before = NamespaceSnapshot::read()?;
     let token = random_token()?;
     let executable = std::env::current_exe()?;
+    // Read while this process still stands in the caller's own directory:
+    // the unshare below and the mount plan after it are what make the
+    // answer unreadable, so it is taken first and carried, like the
+    // executable above.
+    let working_directory = caller_working_directory(&application.filesystems);
 
     let instance = instance_name(&application.name)?;
     let application_cgroup = if application.enforce_cgroup {
@@ -5969,6 +6102,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 loader_library_path: application.loader_library_path.as_deref(),
                 runtime_aliases: application.runtime_aliases,
                 terminal: application.terminal,
+                working_directory: working_directory.as_deref(),
             },
             Stage2ResourceBinding {
                 limits: application.resources,
@@ -6161,6 +6295,7 @@ mod tests {
         require_grant_mount_identities, MountIdentity,
     };
     use std::io::BufRead;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6578,6 +6713,8 @@ mod tests {
                 "absent",
                 STAGE2_TERMINAL_ARG,
                 "absent",
+                STAGE2_WORKING_DIRECTORY_ARG,
+                "absent",
                 STAGE2_ENVIRONMENT_ARG,
                 "6",
                 "DBUS_SESSION_BUS_ADDRESS",
@@ -6620,6 +6757,7 @@ mod tests {
                 fetch_socket: false,
                 runtime_aliases: false,
                 terminal: false,
+                working_directory: None,
                 environment: [
                     ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
                     ("FLATPAK_ID", "org.td.App"),
@@ -6728,6 +6866,161 @@ mod tests {
     }
 
     #[test]
+    fn the_caller_directory_is_mapped_through_the_grant_that_binds_it() {
+        let grant = |source: &str, target: &str, source_kind| FilesystemGrant {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only: false,
+            source_kind,
+            source_device: 1,
+            source_inode: 2,
+        };
+        let grants = vec![
+            grant("/host/src", "/home/td/src", FilesystemSourceKind::Directory),
+            // Deliberately a set `authority` would REFUSE to admit — it
+            // rejects grants overlapping in source or target — so this
+            // pins the tie-break defensively rather than a shape a
+            // resolved policy can present. The deeper binding is the one
+            // that would have placed the caller's directory.
+            grant(
+                "/host/src/vendor",
+                "/home/td/vendor",
+                FilesystemSourceKind::Directory,
+            ),
+            grant(
+                "/host/notes.txt",
+                "/home/td/notes.txt",
+                FilesystemSourceKind::File,
+            ),
+        ];
+        // The common case: a directory under a grant keeps its own tail.
+        assert_eq!(
+            mapped_caller_directory(Path::new("/host/src/td"), &grants),
+            Some(PathBuf::from("/home/td/src/td"))
+        );
+        // The grant's own root is the target itself.
+        assert_eq!(
+            mapped_caller_directory(Path::new("/host/src"), &grants),
+            Some(PathBuf::from("/home/td/src"))
+        );
+        // The deepest grant wins, so the nested target spells it.
+        assert_eq!(
+            mapped_caller_directory(Path::new("/host/src/vendor/crate"), &grants),
+            Some(PathBuf::from("/home/td/vendor/crate"))
+        );
+        // A caller outside every grant gets nothing, and keeps stage 2's `/`.
+        assert_eq!(mapped_caller_directory(Path::new("/host"), &grants), None);
+        assert_eq!(mapped_caller_directory(Path::new("/etc"), &grants), None);
+        // A sibling whose name merely begins with a grant's is not inside it:
+        // the match is by component, not by text.
+        assert_eq!(
+            mapped_caller_directory(Path::new("/host/srcfoo"), &grants),
+            None
+        );
+        // A single-file grant can never be stood in, named exactly or not.
+        assert_eq!(
+            mapped_caller_directory(Path::new("/host/notes.txt"), &grants),
+            None
+        );
+        // No grants at all is the same answer as no matching grant.
+        assert_eq!(mapped_caller_directory(Path::new("/host/src"), &[]), None);
+    }
+
+    /// The grant's own root is the case `PathBuf` equality cannot see:
+    /// joining an empty relative path appends a separator, and
+    /// `Path::new("/a/b/") == Path::new("/a/b")` compares equal because
+    /// both sides normalize to the same components. Stage 2 does NOT
+    /// normalize — it splits on `/` and refuses an empty component — so
+    /// the mapped path is checked byte for byte here, and every mapping is
+    /// put through the readback stage 2 will apply.
+    #[test]
+    fn a_mapped_directory_is_exactly_what_stage_2_will_accept() {
+        let grant = |source: &str, target: &str| FilesystemGrant {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only: false,
+            source_kind: FilesystemSourceKind::Directory,
+            source_device: 1,
+            source_inode: 2,
+        };
+        let grants = vec![grant("/host/src", "/home/td/src")];
+        for caller in ["/host/src", "/host/src/td", "/host/src/td/deeper"] {
+            let mapped = mapped_caller_directory(Path::new(caller), &grants)
+                .unwrap_or_else(|| panic!("{caller} is inside the grant"));
+            // Byte-exact: no trailing separator, whatever the depth.
+            assert!(
+                !mapped.as_os_str().as_bytes().ends_with(b"/"),
+                "{caller} mapped to {mapped:?} with a trailing separator"
+            );
+            // And stage 2 accepts exactly what stage 1 produced.
+            authority::validate_stage2_working_directory(&mapped)
+                .unwrap_or_else(|error| panic!("{caller} mapped to {mapped:?}: {error}"));
+        }
+        assert_eq!(
+            mapped_caller_directory(Path::new("/host/src"), &grants)
+                .map(|mapped| mapped.into_os_string()),
+            Some(OsString::from("/home/td/src"))
+        );
+        // A name the word cannot carry is no directory rather than a launch
+        // stage 2 refuses: filenames are arbitrary bytes, and a non-UTF-8
+        // one under a grant must not take the launch down.
+        let awkward = PathBuf::from(OsString::from_vec(b"/host/src/\xff\xfe".to_vec()));
+        assert_eq!(mapped_caller_directory(&awkward, &grants), None);
+    }
+
+    /// A directory that cannot be entered costs a fork, never the launch.
+    #[test]
+    fn an_entry_that_cannot_start_in_the_caller_directory_starts_without_it() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        // The first attempt fails the way a directory without its search
+        // bit does; the fallback names none and succeeds.
+        let mut refusing = |directory: Option<&Path>| -> Result<&'static str, &'static str> {
+            attempts.borrow_mut().push(directory.map(Path::to_path_buf));
+            match directory {
+                Some(_) => Err("permission denied"),
+                None => Ok("started"),
+            }
+        };
+        assert_eq!(
+            spawn_entry(Some(Path::new("/home/td/src/td")), &mut refusing),
+            Ok("started")
+        );
+        assert_eq!(
+            attempts.into_inner(),
+            vec![Some(PathBuf::from("/home/td/src/td")), None]
+        );
+        // A caller with no directory is attempted once, without one.
+        let once = std::cell::RefCell::new(Vec::new());
+        let mut plain = |directory: Option<&Path>| -> Result<&'static str, &'static str> {
+            once.borrow_mut().push(directory.map(Path::to_path_buf));
+            Ok("started")
+        };
+        assert_eq!(spawn_entry(None, &mut plain), Ok("started"));
+        assert_eq!(once.into_inner(), vec![None]);
+        // A directory that works is used, and nothing is retried.
+        let kept = std::cell::RefCell::new(Vec::new());
+        let mut working = |directory: Option<&Path>| -> Result<&'static str, &'static str> {
+            kept.borrow_mut().push(directory.map(Path::to_path_buf));
+            Ok("started")
+        };
+        assert_eq!(
+            spawn_entry(Some(Path::new("/home/td/src/td")), &mut working),
+            Ok("started")
+        );
+        assert_eq!(
+            kept.into_inner(),
+            vec![Some(PathBuf::from("/home/td/src/td"))]
+        );
+        // When neither attempt can start, the failure is the one reported.
+        let mut hopeless =
+            |_: Option<&Path>| -> Result<&'static str, &'static str> { Err("no such entry") };
+        assert_eq!(
+            spawn_entry(Some(Path::new("/home/td/src/td")), &mut hopeless),
+            Err("no such entry")
+        );
+    }
+
+    #[test]
     fn stage2_launch_emitter_round_trips_through_the_parser() {
         let token = [7_u8; TOKEN_LEN];
         let identity = Identity {
@@ -6795,6 +7088,7 @@ mod tests {
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
                 runtime_aliases: true,
                 terminal: false,
+                working_directory: Some(Path::new("/home/td/src/td")),
             },
             Stage2ResourceBinding {
                 limits: resources,
@@ -6875,6 +7169,7 @@ mod tests {
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
                 runtime_aliases: true,
                 terminal: false,
+                working_directory: Some(Path::new("/home/td/src/td")),
             },
             Stage2ResourceBinding {
                 limits: resources,
@@ -6960,6 +7255,42 @@ mod tests {
         unstated.remove(terminal_index);
         unstated.remove(terminal_index);
         assert!(parse_mode(unstated.into_iter()).is_err());
+        // The caller's directory travels right after the terminal grant, as
+        // two words and its path. `emitted` carries one, which only a grant
+        // could have named, and it survives the round trip.
+        let directory_index = emitted
+            .iter()
+            .position(|argument| argument == STAGE2_WORKING_DIRECTORY_ARG)
+            .unwrap();
+        assert_eq!(directory_index, terminal_index + 2);
+        assert_eq!(emitted[directory_index + 1], "present");
+        assert_eq!(emitted[directory_index + 2], "/home/td/src/td");
+        // A caller who stood outside every grant says so in one word, and
+        // parses to no directory rather than to a guess.
+        let mut homeless = emitted.clone();
+        homeless[directory_index + 1] = OsString::from("absent");
+        homeless.remove(directory_index + 2);
+        assert!(matches!(
+            parse_mode(homeless.into_iter()).unwrap(),
+            Mode::Stage2 {
+                action: Stage2Action::Launch(launch),
+                ..
+            } if launch.working_directory.is_none()
+        ));
+        let mut bogus_directory = emitted.clone();
+        bogus_directory[directory_index + 1] = OsString::from("maybe");
+        assert!(parse_mode(bogus_directory.into_iter()).is_err());
+        // A relative path, an upward traversal, and root itself are refused
+        // rather than started in: stage 1 can only have derived the word
+        // from a grant target, and none of these is one.
+        for refused in ["home/td/src", "/home/td/../etc", "/", ""] {
+            let mut wrong = emitted.clone();
+            wrong[directory_index + 2] = OsString::from(refused);
+            assert!(parse_mode(wrong.into_iter()).is_err());
+        }
+        let mut unstated_directory = emitted.clone();
+        unstated_directory.drain(directory_index..directory_index + 3);
+        assert!(parse_mode(unstated_directory.into_iter()).is_err());
         let granted_emission = stage2_launch_arguments(
             &token,
             LaunchIdentityMap {
@@ -6979,6 +7310,7 @@ mod tests {
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
                 runtime_aliases: true,
                 terminal: true,
+                working_directory: Some(Path::new("/home/td/src/td")),
             },
             Stage2ResourceBinding {
                 limits: resources,
@@ -7004,6 +7336,7 @@ mod tests {
                     fetch_socket: false,
                     runtime_aliases: true,
                     terminal: false,
+                    working_directory: Some(PathBuf::from("/home/td/src/td")),
                     environment,
                     filesystems: vec![Stage2Filesystem {
                         target: PathBuf::from("/home/td/Downloads"),
