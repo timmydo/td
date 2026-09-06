@@ -21,7 +21,7 @@ use crate::ladder::{
     TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
     TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
     TD_APPLICATIONS_PLACED_MARKER, TD_COMPOSITOR_DRM_PROBE_MARKER,
-    TD_COMPOSITOR_KMS_PROBE_MARKER,
+    TD_COMPOSITOR_FLIP_PROBE_MARKER, TD_COMPOSITOR_KMS_PROBE_MARKER,
     TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
     TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER,
     TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
@@ -2740,6 +2740,11 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /bin/grep -q \"^{TD_COMPOSITOR_KMS_PROBE_MARKER} driver=\"; then \
          /bin/td-util printf \"%s\\n\" \"$k\"; \
          else echo \"td-compositor: KMS modeset failed: $k\"; fi\n\
+         if f=$(/bin/td-compositor probe-flip /dev/dri/card0 2>&1) && \
+         /bin/td-util printf \"%s\\n\" \"$f\" | \
+         /bin/grep -q \"^{TD_COMPOSITOR_FLIP_PROBE_MARKER} driver=\"; then \
+         /bin/td-util printf \"%s\\n\" \"$f\"; \
+         else echo \"td-compositor: page flip failed: $f\"; fi\n\
          if [ -e /var/lib/td-test/td-jail-seccomp-probe ]; then \
          mts=0; /bin/rm -rf /run/td-jail-seccomp-probe; \
          if [ -f /var/lib/td-test/td-jail-seccomp-probe ] \

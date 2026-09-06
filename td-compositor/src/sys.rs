@@ -128,6 +128,23 @@ const DRM_IOCTL_MODE_GETCRTC: usize = 0xc068_64a1;
 const DRM_IOCTL_MODE_SETCRTC: usize = 0xc068_64a2;
 const DRM_IOCTL_MODE_RMFB: usize = 0xc004_64af;
 const DRM_IOCTL_MODE_ADDFB2: usize = 0xc068_64b8;
+const DRM_IOCTL_MODE_PAGE_FLIP: usize = 0xc018_64b0;
+
+/// Ask the kernel to send a completion event when the flip takes effect.
+///
+/// The flip is asynchronous either way; this flag is what makes it
+/// OBSERVABLE. Without it a caller has queued a frame and has no moment at
+/// which it may say the frame is on glass, which is the distinction
+/// `Submission` exists to keep.
+pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+
+/// The event type a completed page flip arrives as, on the card descriptor.
+///
+/// `DRM_EVENT_VBLANK` (0x01) shares the same 32-byte payload and is NOT this:
+/// a vblank says the scanout passed a boundary, a flip completion says the
+/// frame this process queued is the one being scanned out. Matching on the
+/// type is what keeps the two apart.
+pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 
 /// `DRM_FORMAT_XRGB8888`, the one pixel format this compositor scans out.
 ///
@@ -391,6 +408,7 @@ fn ioctl_checked(
             | DRM_IOCTL_MODE_SETCRTC
             | DRM_IOCTL_MODE_RMFB
             | DRM_IOCTL_MODE_ADDFB2
+            | DRM_IOCTL_MODE_PAGE_FLIP
     ) {
         return Err(format!(
             "{operation}: refusing unreviewed ioctl request {request:#x}"
@@ -1221,6 +1239,133 @@ pub fn drm_set_crtc(
         DRM_IOCTL_MODE_SETCRTC,
         std::ptr::from_mut(&mut request) as usize,
         "DRM_IOCTL_MODE_SETCRTC",
+    )?;
+    Ok(())
+}
+
+/// `struct drm_mode_crtc_page_flip`, 24 bytes: four `u32` then a `u64`.
+///
+/// The kernel's handler actually takes `drm_mode_crtc_page_flip_target`,
+/// which is the SAME 24 bytes with `reserved` repurposed as `sequence`, so
+/// either name describes the identical wire layout and the UAPI request number
+/// (0x18 in its size field) is right for both.
+///
+/// The reserved word must be zero, and the reason is the opposite of what an
+/// earlier revision of this comment said. It claimed the field is read only
+/// under a `TARGET` flag; in fact `drm_mode_page_flip_ioctl` reads it
+/// UNCONDITIONALLY — `u32 target_vblank = page_flip->sequence;`
+/// (`drm_plane.c:1389`) — and then refuses the request outright if it is
+/// non-zero without a `TARGET` flag (`:1399`). Zero is required precisely
+/// BECAUSE the field is always read, which is a reason to keep it zero rather
+/// than a reason it would not matter.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DrmModeCrtcPageFlip {
+    crtc_id: u32,
+    fb_id: u32,
+    flags: u32,
+    reserved: u32,
+    user_data: u64,
+}
+
+/// What a completed page flip reports back.
+///
+/// `user_data` is the whole reason this type exists. The kernel copies the
+/// `u64` a flip was queued with into the event it delivers, so the completion
+/// is self-identifying: a caller that queued frames 7 and 8 can tell which one
+/// arrived without keeping a side table and without assuming the events come
+/// back in order. `td-compositor/DESIGN.md` recorded "an identity neither
+/// `Submission` nor `OutputEvent` carries" as the blocker for consuming these;
+/// the identity was in the ABI the whole time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrmFlipCompletion {
+    pub user_data: u64,
+    pub sequence: u32,
+    pub crtc_id: u32,
+}
+
+/// The fixed length of `struct drm_event_vblank`: an 8-byte `drm_event`
+/// header, a `u64`, and four `u32`.
+pub const DRM_EVENT_VBLANK_LEN: usize = 32;
+
+/// Read one event out of a buffer of bytes read from the card.
+///
+/// Returns how many bytes the event occupied, and the completion if it was a
+/// flip completion rather than some other event. A `None` completion with a
+/// non-zero length is an event this crate does not consume — a vblank, a CRTC
+/// sequence — which is SKIPPED by its own declared length rather than by this
+/// code's idea of how long it should be. That is the difference between a
+/// parser and an assumption: the kernel may deliver an event type this build
+/// has never heard of, and the only safe way past it is the length it came
+/// with.
+///
+/// `None` overall means the buffer does not yet hold a whole event, which on a
+/// non-blocking descriptor is the ordinary answer and not an error.
+pub fn parse_drm_event(bytes: &[u8]) -> Option<(usize, Option<DrmFlipCompletion>)> {
+    let kind = read_u32(bytes, 0)?;
+    let length = read_u32(bytes, 4)?;
+    let length = usize::try_from(length).ok()?;
+    // A length that does not cover its own header, or that the buffer does not
+    // hold yet, is not something to advance past: the first would loop forever
+    // on a zero and the second would read the next event's bytes as this one's.
+    if length < 8 || bytes.len() < length {
+        return None;
+    }
+    if kind != DRM_EVENT_FLIP_COMPLETE || length < DRM_EVENT_VBLANK_LEN {
+        return Some((length, None));
+    }
+    let completion = DrmFlipCompletion {
+        user_data: read_u64(bytes, 8)?,
+        sequence: read_u32(bytes, 24)?,
+        crtc_id: read_u32(bytes, 28)?,
+    };
+    Some((length, Some(completion)))
+}
+
+/// Read a little-endian `u32` at `offset`, or `None` if it is not all there.
+///
+/// Byte-at-a-time through `get` rather than a cast over the buffer: the read
+/// is from a `Vec<u8>` with no alignment guarantee, and a slice that is one
+/// byte short must answer `None` rather than read the byte after it.
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let field: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(field))
+}
+
+/// Read a little-endian `u64` at `offset`. See `read_u32`.
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let field: [u8; 8] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(field))
+}
+
+/// Queue a page flip on `crtc_id` to `fb_id`, tagged with `user_data`.
+///
+/// The CRTC must already be scanning out a framebuffer: `drm_mode_page_flip_ioctl`
+/// answers `-EBUSY` when the primary plane has none (`drm_plane.c:1473`), so a
+/// flip is a thing done to an established modeset rather than a way to
+/// establish one. It also needs mastership — `drm_ioctl.c:694` flags it
+/// `DRM_MASTER` — and the new framebuffer must cover the plane's source
+/// rectangle.
+pub fn drm_page_flip(
+    card: &impl AsRawFd,
+    crtc_id: u32,
+    fb_id: u32,
+    user_data: u64,
+) -> Result<(), String> {
+    let mut request = DrmModeCrtcPageFlip {
+        crtc_id,
+        fb_id,
+        flags: DRM_MODE_PAGE_FLIP_EVENT,
+        reserved: 0,
+        user_data,
+    };
+    drm_ioctl(
+        card.as_raw_fd(),
+        DRM_IOCTL_MODE_PAGE_FLIP,
+        std::ptr::from_mut(&mut request) as usize,
+        "DRM_IOCTL_MODE_PAGE_FLIP",
     )?;
     Ok(())
 }
@@ -2179,6 +2324,115 @@ mod tests {
 
     /// The DRM requests share that one roster, and reach the kernel only
     /// through the retrying entry point.
+    /// Build one `struct drm_event_vblank` the way the kernel writes it.
+    fn flip_event(kind: u32, length: u32, user_data: u64, sequence: u32, crtc_id: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.extend_from_slice(&user_data.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // tv_sec
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // tv_usec
+        bytes.extend_from_slice(&sequence.to_le_bytes());
+        bytes.extend_from_slice(&crtc_id.to_le_bytes());
+        bytes
+    }
+
+    /// The completion carries back the cookie the flip was queued with, which
+    /// is the whole correlation channel.
+    #[test]
+    fn a_flip_completion_reports_the_cookie_it_was_queued_with() {
+        let bytes = flip_event(DRM_EVENT_FLIP_COMPLETE, 32, 0xdead_beef, 41, 29);
+        let (length, completion) = parse_drm_event(&bytes).expect("a whole event");
+        assert_eq!(length, 32);
+        assert_eq!(
+            completion,
+            Some(DrmFlipCompletion {
+                user_data: 0xdead_beef,
+                sequence: 41,
+                crtc_id: 29,
+            })
+        );
+    }
+
+    /// A vblank shares the payload and is NOT a flip completion. Skipped by
+    /// its own length rather than refused: the kernel had something else to
+    /// say, which is not evidence that a flip failed.
+    #[test]
+    fn a_vblank_is_skipped_rather_than_read_as_a_completion() {
+        let bytes = flip_event(DRM_EVENT_VBLANK_KIND, 32, 0xdead_beef, 41, 29);
+        let (length, completion) = parse_drm_event(&bytes).expect("a whole event");
+        assert_eq!(length, 32);
+        assert_eq!(completion, None);
+    }
+
+    /// An event type this build has never heard of is stepped over by the
+    /// length it declared, not by this code's idea of how long it should be.
+    /// That is what lets a newer kernel deliver something unknown without the
+    /// parser losing its place in the stream.
+    #[test]
+    fn an_unknown_event_is_stepped_over_by_its_own_length() {
+        let mut bytes = vec![0u8; 48];
+        bytes.splice(..4, 0x99u32.to_le_bytes());
+        bytes.splice(4..8, 48u32.to_le_bytes());
+        let (length, completion) = parse_drm_event(&bytes).expect("a whole event");
+        assert_eq!(length, 48);
+        assert_eq!(completion, None);
+    }
+
+    /// A buffer holding less than a whole event is not yet an event. On a
+    /// non-blocking descriptor this is the ordinary answer between reads.
+    #[test]
+    fn a_partial_event_is_not_yet_an_event() {
+        let bytes = flip_event(DRM_EVENT_FLIP_COMPLETE, 32, 7, 1, 29);
+        assert_eq!(parse_drm_event(bytes.get(..20).unwrap_or_default()), None);
+        assert_eq!(parse_drm_event(&[]), None);
+        assert_eq!(parse_drm_event(&[0u8; 7]), None);
+    }
+
+    /// A truncated event that is NOT a completion must not report a length
+    /// either, and this is the case the buffer-length check actually guards.
+    ///
+    /// A truncated completion is already caught by its own field reads running
+    /// off the end. A truncated vblank is not: every field this parser reads
+    /// of it is in the header, so without the length check it would answer
+    /// "skip 32 bytes" over a buffer holding 20, and the caller would resume
+    /// parsing in the middle of the next event. Found by a mutation that
+    /// survived the partial-completion test, which is what that test was
+    /// wrongly assumed to cover.
+    #[test]
+    fn a_partial_non_completion_does_not_report_a_length_to_skip() {
+        let bytes = flip_event(DRM_EVENT_VBLANK_KIND, 32, 0x1111, 1, 29);
+        assert_eq!(parse_drm_event(bytes.get(..20).unwrap_or_default()), None);
+    }
+
+    /// A length that does not cover its own header would advance the cursor by
+    /// zero and spin forever. Refused rather than trusted.
+    #[test]
+    fn an_event_shorter_than_its_header_is_refused() {
+        for absurd in [0u32, 1, 7] {
+            let bytes = flip_event(DRM_EVENT_FLIP_COMPLETE, absurd, 7, 1, 29);
+            assert_eq!(parse_drm_event(&bytes), None, "length {absurd} was accepted");
+        }
+    }
+
+    /// One read can deliver several events, and the completion may be behind
+    /// something else. Consuming by declared length is what finds it.
+    #[test]
+    fn a_completion_behind_another_event_is_still_found() {
+        let mut stream = flip_event(DRM_EVENT_VBLANK_KIND, 32, 0x1111, 1, 29);
+        stream.extend(flip_event(DRM_EVENT_FLIP_COMPLETE, 32, 0x2222, 2, 29));
+        let (first, none) = parse_drm_event(&stream).expect("the vblank");
+        assert_eq!((first, none), (32, None));
+        let (_, completion) = parse_drm_event(stream.get(first..).unwrap_or_default())
+            .expect("the completion behind it");
+        assert_eq!(completion.map(|c| c.user_data), Some(0x2222));
+    }
+
+    /// `DRM_EVENT_VBLANK`, named here rather than in the production roster:
+    /// this crate never asks for one, and the parser's job is only to step
+    /// over it.
+    const DRM_EVENT_VBLANK_KIND: u32 = 0x01;
+
     #[test]
     fn a_drm_request_is_rostered_and_an_unrostered_one_is_refused() {
         for request in [
@@ -2199,17 +2453,18 @@ mod tests {
             let error = drm_ioctl(-1, request, 0, "pinned").unwrap_err();
             assert!(error.contains("invalid descriptor -1"), "{error}");
         }
-        // `DRM_IOCTL_MODE_PAGE_FLIP` and `DRM_IOCTL_MODE_ATOMIC`. The next
+        // `DRM_IOCTL_MODE_SETPLANE` and `DRM_IOCTL_MODE_ATOMIC`. The next
         // landing's, and not this one's.
         //
-        // This test previously named SETCRTC here, which this increment
-        // rosters; the request that stands for "not ours" has to move each time
-        // the roster grows, and a test that kept naming a now-admitted request
-        // would assert nothing while still passing. A modeset puts one picture
-        // on a screen, which is what landed; a page flip makes a sequence of
-        // them a display, and needs a completion path that does not exist yet.
+        // This pin has now moved twice: it named SETCRTC until the modeset
+        // landing rostered it, then PAGE_FLIP until this one did. That is the
+        // pin doing its job rather than drifting — a request named "not ours"
+        // after it is admitted asserts nothing while still passing, so it must
+        // move to something genuinely unissued each time the roster grows.
+        // SETPLANE is what an overlay plane needs and ATOMIC is what replaces
+        // this legacy pair; neither is issued anywhere in this crate.
         for (request, spelled) in [
-            (0xc018_64b0usize, "0xc01864b0"),
+            (0xc030_64b7usize, "0xc03064b7"),
             (0xc038_64bcusize, "0xc03864bc"),
         ] {
             let error = drm_ioctl(0, request, 0, "absent").unwrap_err();

@@ -8299,13 +8299,15 @@ answered as a `Fourcc` newtype, which is what actually keeps the DRM namespace
 apart from `wl_shm`'s — an alias would have left both as `u32` and prevented
 nothing.
 
-Two things that row does NOT get, recorded because assuming otherwise is the
+Two things that row did NOT get, recorded because assuming otherwise is the
 expensive mistake: `Runtime` still holds a concrete `Framebuffer`, so
-substituting a backend remains the KMS landing's work; and `poll_events` has
-no caller, because the delivery path is asynchronous, a completion cannot be
-matched to its frame without an identity neither type carries, and the
-presentation-dependent evidence published on submit today would announce a
-frame that is not yet on glass. `td-compositor/DESIGN.md` carries the list.
+substituting a backend remains outstanding; and `poll_events` has no caller,
+because the delivery path is asynchronous and the presentation-dependent
+evidence published on submit today would announce a frame that is not yet on
+glass. The third reason listed here — that a completion could not be matched to
+its frame — has since been removed by the page-flip landing: both `Submission`
+and `OutputEvent` now carry a `FrameId`, and it is the `u64` the flip ioctl
+already round-trips through the kernel. `td-compositor/DESIGN.md` carries the list.
 
 Row 6: `Output` names the screen — an `OutputId`, the scanout dimensions, an
 `OutputScale` and an `OutputTransform` — and a backend answers it rather than
@@ -8328,11 +8330,12 @@ current count.
 Nothing in it modesets, and the confinement test named `MODE_SETCRTC`,
 `MODE_ADDFB2`, `MODE_PAGE_FLIP` and `MODE_ATOMIC` as ABSENT so the backend
 added each by amendment rather than arriving with a module that already had
-them. Two of those four have since been admitted: the modeset half below
-takes `SETCRTC` and `ADDFB2`, and the stand-in for "not ours" moved to the
-remaining pair in the same landing, because a test naming an admitted request
-as absent asserts nothing while still passing. Read that pair, not this
-sentence, for what the test pins today.
+them. THREE of those four have since been admitted: the modeset half below
+takes `SETCRTC` and `ADDFB2`, and the page-flip half after it takes
+`PAGE_FLIP`. The stand-in for "not ours" moved each time, because a test naming
+an admitted request as absent asserts nothing while still passing; it is
+`SETPLANE` and `ATOMIC` today. Read those, not this sentence, for what the test
+pins.
 
 Row 1's MAPPING half has landed since, and it is the honest toll this section
 names rather than the backend itself. `td-compositor/src/drm.rs` allocates a
@@ -8352,8 +8355,7 @@ check asserts `mapping=ok` together with a pitch that covers the scanout width
 and a size that covers pitch times height, so the claim is proven on a real
 card rather than in a unit test.
 
-Row 1's MODESET half has landed since, and with it the row is complete apart
-from the page flip. `Modeset::apply` takes DRM mastership, registers the mapped
+Row 1's MODESET half has landed since. `Modeset::apply` takes DRM mastership, registers the mapped
 dumb buffer with `ADDFB2`, drives the discovered connector from its CRTC with
 `SETCRTC`, and then reads the CRTC BACK with `GETCRTC` — because `SETCRTC`
 answering success is a weaker claim than the CRTC showing what was asked for,
@@ -8378,13 +8380,32 @@ using it, as the DRM ABI requires. What the order buys is that the restore, a
 `SETCRTC`, still has mastership when it runs, and that the screen is not
 blanked and then repainted on the way out.
 
-What this half does NOT get is a display. `MODE_PAGE_FLIP` and `MODE_ATOMIC`
-stay absent: one picture on a screen is a modeset, a sequence of them is a page
-flip, and that needs the completion path row 3 already records as unbuilt — an
-event on the card descriptor, matched to the frame that caused it, through an
-identity neither `Submission` nor `OutputEvent` carries. Substituting the
-backend into `Runtime` waits on it too, so `Framebuffer` is still the only
-`OutputBackend` implementation.
+Row 1's PAGE-FLIP half has landed after it. The row is NOT complete: it is
+specified as "atomic modeset, dumb buffers, page-flip vsync", and what landed
+is the LEGACY `SETCRTC`-plus-`PAGE_FLIP` pair. `MODE_ATOMIC` is still absent
+and is what replaces both once more than one plane is in play. `probe-flip` sets a mode, allocates a second frame, queues
+it with `MODE_PAGE_FLIP`, waits for the completion on the card descriptor, and
+reads the CRTC back showing the flipped framebuffer. That is what makes a
+sequence of pictures a display rather than one modeset.
+
+The identity problem this section recorded as the blocker turned out not to
+need solving so much as noticing. Row 3 said a completion could not be matched
+to its frame "through an identity neither `Submission` nor `OutputEvent`
+carries" — but `DRM_IOCTL_MODE_PAGE_FLIP` takes a `u64 user_data` and the
+kernel copies it verbatim into the completion event, so the correlation channel
+is the ABI's. `FrameId` is that `u64` as a type, both variants carry one, and
+the boot check asserts the cookie that comes back is the one that went out. The
+probe deliberately queues the SECOND id rather than the first, because a probe
+that sent 1 and got 1 back could not distinguish a round-trip from a constant.
+
+What is still missing is the delivery path, and it is worth being exact about
+which half. A one-shot probe can wait for its own flip; a compositor cannot,
+because a flip arrives asynchronously and draining only from a repaint means an
+idle screen never observes one — the client waits for a frame callback that
+waits for a completion that waits for a repaint that waits for the client. The
+card descriptor has to join the event loop, and that is `poll_events`'
+remaining half. Substituting the backend into `Runtime` waits on it, so
+`Framebuffer` is still the only `OutputBackend` implementation.
 
 The probe that proves this DISTURBS the screen, which discovery's did not —
 and the mechanism is the modeset, not the mastership. Once this probe's

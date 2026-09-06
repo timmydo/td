@@ -12,9 +12,10 @@
 //! CRTC can drive it.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::output::{Output, OutputDimensions, OutputId, OutputScale, OutputTransform};
 use crate::sys;
@@ -510,6 +511,272 @@ impl Drop for CrtcRestore<'_> {
     }
 }
 
+/// How long to wait for a flip the kernel accepted.
+///
+/// A queued flip completes at the next vblank, so this is orders of magnitude
+/// longer than it needs to be — a 60Hz output is 17ms and even a slow virtual
+/// one is far inside this. It is a bound on a HANG, not a schedule: without
+/// it a driver that accepted the flip and never delivered would park the probe
+/// on a blocking read, and a boot that never finishes reports as a timeout
+/// blaming whatever ran last rather than as the flip that did not arrive.
+///
+/// Five seconds rather than the two an earlier revision used, for one reason:
+/// this runs inside every agent's `qemu-boot-system`, under TCG, on a host
+/// that may be running several other agents' VMs at once. virtio-gpu delivers
+/// the completion from an hrtimer that needs the guest scheduled, so the
+/// number that matters is not the frame interval but how long the guest might
+/// go unscheduled. The extra three seconds cost nothing — they are only ever
+/// spent on a flip that is already failing — and an intermittent red on a row
+/// every agent runs is expensive to diagnose.
+const FLIP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to sleep between reads while waiting.
+///
+/// The descriptor is made non-blocking for the wait, so this is a poll
+/// interval rather than a latency floor. Small enough that the wait costs one
+/// interval on average, large enough not to spin a core for the whole vblank.
+const FLIP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// One page flip: a second framebuffer, queued onto a live modeset and waited
+/// for.
+///
+/// A flip is not a modeset and does not unwind like one. It changes which
+/// framebuffer a CRTC scans out and changes nothing else, so what it owns is
+/// the framebuffer registration — the CRTC's own restoration stays the
+/// `Modeset`'s, which is why this borrows one rather than replacing it.
+pub struct Flip<'card, 'frame> {
+    /// Unregistered on drop, like the modeset's. This runs BEFORE the
+    /// modeset's restore, since a `Flip` is created after one and dropped
+    /// first, so the kernel blanks the CRTC on the way out and the restore
+    /// then turns it back on — the flicker `Modeset` records, not an error.
+    #[allow(dead_code)]
+    fb: FbGuard<'card>,
+    /// For `Modeset`'s reason: the compiler refuses a flip that outlives the
+    /// buffer the kernel is scanning out.
+    #[allow(dead_code)]
+    frame: &'frame DumbFrame<'card>,
+    /// And the modeset it was queued onto, for the same reason one step out.
+    /// A flip that outlived its modeset would unregister its framebuffer after
+    /// mastership had been given back, and `verify` would read a CRTC that had
+    /// already been restored. Nothing reads this field; holding the borrow is
+    /// the whole point, exactly as with `frame` above.
+    #[allow(dead_code)]
+    modeset: &'frame Modeset<'card, 'frame>,
+    fb_id: u32,
+    crtc_id: u32,
+    completion: sys::DrmFlipCompletion,
+}
+
+impl<'card, 'frame> Flip<'card, 'frame> {
+    /// Register `frame`, queue it on the modeset's CRTC, and wait for the
+    /// kernel to say it is on glass.
+    ///
+    /// `cookie` is carried through the kernel and compared on the way back.
+    /// That comparison is the point of the whole increment: a completion that
+    /// cannot be matched to the frame that caused it is not a completion path,
+    /// and a caller with two frames in flight would otherwise be guessing.
+    pub fn queue_and_wait(
+        card: &'card File,
+        modeset: &'frame Modeset<'card, 'frame>,
+        scanout: &Scanout,
+        frame: &'frame DumbFrame<'card>,
+        cookie: u64,
+    ) -> Result<Flip<'card, 'frame>, String> {
+        let width = u32::from(scanout.mode.hdisplay);
+        let height = u32::from(scanout.mode.vdisplay);
+        // The flip's framebuffer has to cover the plane's source rectangle,
+        // which the kernel checks and refuses. Checked here for `apply`'s
+        // reason: the two sizes that disagree are visible right here.
+        frame_fits_mode(frame.width(), frame.height(), width, height)?;
+        let fb_id = sys::drm_add_fb(card, width, height, frame.pitch(), frame.handle())?;
+        let fb = FbGuard { card, fb_id };
+        sys::drm_page_flip(card, modeset.crtc_id(), fb_id, cookie)?;
+        // Queued. From here the framebuffer must stay registered until the
+        // completion arrives, which is what `fb` living to the end of this
+        // function and then into the returned value achieves.
+        let completion = await_flip(card, cookie)?;
+        // The completion names its CRTC (`drm_plane.c:1526` fills it from
+        // `crtc->base.id`), and matching on the cookie alone would accept a
+        // completion for the right frame on the wrong CRTC. Cheap, and the
+        // field is already parsed.
+        if completion.crtc_id != modeset.crtc_id() {
+            return Err(format!(
+                "the flip completion for {cookie:#x} named CRTC {} rather than the {} it was \
+                 queued on",
+                completion.crtc_id,
+                modeset.crtc_id()
+            ));
+        }
+        Ok(Flip {
+            fb,
+            frame,
+            modeset,
+            fb_id,
+            crtc_id: modeset.crtc_id(),
+            completion,
+        })
+    }
+
+    /// Ask the CRTC which framebuffer it has been COMMITTED to.
+    ///
+    /// Weaker than an earlier revision of this comment claimed, and the
+    /// difference matters. That revision said a driver which reported
+    /// completion but kept the previous framebuffer would fail here. It would
+    /// not: `drm_mode_getcrtc` reports `plane->state->fb` (`drm_crtc.c:561`),
+    /// and for an atomic driver `drm_atomic_helper_commit` swaps the software
+    /// state at `drm_atomic_helper.c:2284` — BEFORE it queues the work that
+    /// performs the flip at `:2309`, with the kernel's own comment saying "we
+    /// can commit the new state on the software side now". So this field
+    /// reads as the new framebuffer the moment `PAGE_FLIP` returns, whatever
+    /// the hardware is scanning out.
+    ///
+    /// What it does prove is worth keeping anyway: the CRTC is the one that
+    /// was asked, it is still enabled, it is at the size that was asked for,
+    /// and the framebuffer it is committed to is this flip's rather than the
+    /// modeset's. The claim that the frame REACHED the screen rests on the
+    /// completion event, which the kernel sends from the vblank handler, and
+    /// not on this.
+    pub fn verify(&self, card: &File, wanted: &sys::DrmModeInfo) -> Result<(), String> {
+        let live = sys::drm_get_crtc(card, self.crtc_id)?;
+        crtc_shows(&live, self.crtc_id, self.fb_id, wanted)
+    }
+
+    /// The frame this completion belongs to.
+    ///
+    /// The one place a `u64` from the kernel becomes a `FrameId`, which is
+    /// what `FrameId`'s own doc claims and what an earlier revision left
+    /// unenforced: `from_cookie` had no production caller at all, so the
+    /// stated single-conversion-point discipline was a comment rather than a
+    /// property.
+    pub fn frame(&self) -> crate::output::FrameId {
+        crate::output::FrameId::from_cookie(self.completion.user_data)
+    }
+
+    /// One line, for a proof to match and a person to read.
+    ///
+    /// The framebuffer field is `flipfb=` rather than `fb=`, because
+    /// `Modeset::describe` already emits `fb=` on the same line and two fields
+    /// of one name in one whitespace-split report are read by whichever comes
+    /// first. The same collision `Modeset::describe` avoids by not emitting
+    /// `crtc=`, one increment later and one field along.
+    pub fn describe(&self) -> String {
+        format!(
+            "flipfb={} cookie={:#x} seq={} flip=ok",
+            self.fb_id,
+            self.frame().cookie(),
+            self.completion.sequence
+        )
+    }
+}
+
+/// Wait for the flip tagged `cookie`, or say why it did not arrive.
+///
+/// The descriptor is made non-blocking for the duration and its prior status
+/// word restored afterwards, including on the error paths — the card outlives
+/// this call and a retained `O_NONBLOCK` would change how every later read
+/// behaves.
+///
+/// Events that are not this flip's completion are SKIPPED rather than
+/// refused. A vblank event, or a completion carrying some other cookie,
+/// means the kernel had something else to say first; it is not evidence that
+/// this flip failed, and treating it as such would make the probe fail on a
+/// card that merely reported more than one thing.
+fn await_flip(card: &File, cookie: u64) -> Result<sys::DrmFlipCompletion, String> {
+    let saved_flags = sys::make_nonblocking(card)?;
+    let outcome = read_until_flip(card, cookie);
+    // Restored before the result is examined, so an error path cannot leave
+    // the descriptor non-blocking.
+    let restored = sys::restore_status_flags(card, saved_flags);
+    // Both are reported when both fail. An earlier revision wrote
+    // `outcome?; restored?;`, which DISCARDED the restore failure whenever the
+    // flip had also failed -- and a card left non-blocking is the more
+    // consequential of the two, because it changes how every later read on
+    // this descriptor behaves.
+    match (outcome, restored) {
+        (Ok(completion), Ok(())) => Ok(completion),
+        (Err(flip), Ok(())) => Err(flip),
+        (Ok(_), Err(restore)) => Err(restore),
+        (Err(flip), Err(restore)) => Err(format!(
+            "{flip}; and the card's status flags could not be restored afterwards: {restore}"
+        )),
+    }
+}
+
+fn read_until_flip(card: &File, cookie: u64) -> Result<sys::DrmFlipCompletion, String> {
+    // `checked_add` rather than `+`, which panics on overflow. Unreachable on
+    // `CLOCK_MONOTONIC`, but every other deadline in this crate is written this
+    // way and a new production `panic!` is what the rule forbids.
+    let deadline = Instant::now().checked_add(FLIP_TIMEOUT);
+    let mut pending: Vec<u8> = Vec::with_capacity(sys::DRM_EVENT_VBLANK_LEN * 4);
+    // 4 KiB because the kernel says so: `drm_read` will not split an event
+    // across reads, and if the next one does not fit in the buffer it is put
+    // BACK on the queue and the read answers zero (`drm_file.c:581`). The
+    // documentation's recommendation is a page, and a smaller buffer takes on
+    // a forward-progress contract this code has no reason to accept.
+    let mut chunk = [0u8; 4096];
+    // Set when the deadline passes, and the loop then gets exactly ONE more
+    // read before it gives up. Without it the sequence "read answers
+    // WouldBlock, sleep, deadline passes, report timeout" never looks at the
+    // descriptor again — so a completion delivered DURING that sleep is
+    // sitting there unread while this reports that none arrived. On a loaded
+    // TCG guest that is a false rejection of a flip that worked, on a row
+    // every agent's boot runs.
+    let mut expired = false;
+    loop {
+        // Parse everything already buffered before reading more: one read can
+        // deliver several events, and a completion sitting behind a vblank in
+        // the same read must not wait for another read to be noticed.
+        let mut consumed = 0usize;
+        while let Some((length, completion)) =
+            sys::parse_drm_event(pending.get(consumed..).unwrap_or_default())
+        {
+            consumed = consumed.saturating_add(length);
+            if let Some(completion) = completion {
+                if completion.user_data == cookie {
+                    return Ok(completion);
+                }
+            }
+        }
+        pending.drain(..consumed.min(pending.len()));
+        // Only after the final drain above has had its chance to parse.
+        if expired {
+            return Err(format!(
+                "the page flip tagged {cookie:#x} was accepted by the kernel but no completion \
+                 arrived within {FLIP_TIMEOUT:?} — the flip was queued and the CRTC never \
+                 reported it reaching the screen"
+            ));
+        }
+        expired = deadline.is_none_or(|deadline| Instant::now() >= deadline);
+        match (&*card).read(&mut chunk) {
+            // NOT end-of-file, which an earlier revision called it. `drm_read`
+            // answers zero when the next event does not fit in the buffer it
+            // was given, having put that event back on the queue
+            // (`drm_file.c:581`). With a page-sized buffer no in-tree DRM
+            // event can provoke it, so reaching here means the kernel grew an
+            // event larger than a page and this loop would spin forever
+            // re-reading it. Refused with the reason rather than retried.
+            Ok(0) => {
+                return Err(
+                    "the DRM card returned a short read while waiting for a flip completion: \
+                     the next event does not fit in a 4 KiB buffer, so it was put back and \
+                     re-reading it would not make progress"
+                        .to_string(),
+                )
+            }
+            Ok(read) => pending.extend_from_slice(chunk.get(..read).unwrap_or_default()),
+            // No sleep once expired: the next pass reports the timeout, and
+            // sleeping first would only delay saying so.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if !expired {
+                    std::thread::sleep(FLIP_POLL_INTERVAL);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("read a flip completion from the card: {error}")),
+        }
+    }
+}
+
 /// Was this frame allocated at the size the mode is about to be set to?
 ///
 /// Checked HERE rather than left to the kernel. `ADDFB2` is told a width, a
@@ -673,6 +940,11 @@ impl<'card, 'frame> Modeset<'card, 'frame> {
             fb_id,
             crtc_id: scanout.crtc_id,
         })
+    }
+
+    /// The CRTC this modeset is driving, for a flip to name.
+    pub fn crtc_id(&self) -> u32 {
+        self.crtc_id
     }
 
     /// Ask the CRTC what it is actually doing, and refuse anything but what was

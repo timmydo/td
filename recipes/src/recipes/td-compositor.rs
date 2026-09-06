@@ -305,7 +305,10 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::{TD_COMPOSITOR_DRM_PROBE_MARKER, TD_COMPOSITOR_KMS_PROBE_MARKER};
+    use crate::ladder::{
+        TD_COMPOSITOR_DRM_PROBE_MARKER, TD_COMPOSITOR_FLIP_PROBE_MARKER,
+        TD_COMPOSITOR_KMS_PROBE_MARKER,
+    };
     use super::super::system_x86_64::{ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME};
     use crate::ladder::{
         TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
@@ -747,6 +750,52 @@ mod tests {
         assert!(
             !drm.contains(r#""crtc={} fb={}"#),
             "Modeset::describe emits a crtc= field that collides with discovery's"
+        );
+    }
+
+    /// The flip marker and its fields, held together the same way and for the
+    /// same reason the other two are.
+    ///
+    /// Third copy of one lesson: a rename in `Flip::describe` passes every
+    /// host test in both crates and then fails every agent's
+    /// `qemu-boot-system` with a report the check reads as a card that cannot
+    /// flip. The marker lives in `ladder.rs` so both sides share one constant;
+    /// the FIELDS cannot, so they are asserted here.
+    #[test]
+    fn the_flip_probe_marker_is_the_one_the_compositor_prints() {
+        assert!(
+            MAIN_RS.contains(&format!(
+                "\"{TD_COMPOSITOR_FLIP_PROBE_MARKER} {{}} output={{}}x{{}} {{}} {{}}\""
+            )),
+            "td-compositor no longer prints {TD_COMPOSITOR_FLIP_PROBE_MARKER} in the shape the \
+             boot check greps for"
+        );
+        assert!(MAIN_RS.contains("\"probe-flip\" => {"));
+        let drm = MODULES
+            .iter()
+            .find(|(name, _)| *name == "drm")
+            .map(|(_, source)| *source)
+            .expect("td-compositor no longer declares a drm module");
+        assert!(
+            drm.contains(r#""flipfb={} cookie={:#x} seq={} flip=ok""#),
+            "Flip::describe no longer emits the fields the boot check reads"
+        );
+        // The framebuffer field is `flipfb=` and NOT `fb=`, because
+        // `Modeset::describe` already puts `fb=` on this same line. A rename to
+        // `fb=` would make the boot check read the modeset's framebuffer and
+        // call the flip proven.
+        assert!(
+            !drm.contains(r#""fb={} cookie="#),
+            "Flip::describe emits an fb= field that collides with the modeset's"
+        );
+        // The cookie the probe queues is `FrameId::FIRST.next()`, and the boot
+        // check asserts the kernel handed back `0x2`. Sending `FIRST` would
+        // make a round-trip indistinguishable from a constant, and the check
+        // would still pass -- so which id is queued is pinned here, beside the
+        // field names it travels with.
+        assert!(
+            MAIN_RS.contains("output::FrameId::FIRST.next()"),
+            "probe-flip no longer queues the id the boot check expects back"
         );
     }
 }

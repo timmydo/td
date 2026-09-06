@@ -66,6 +66,7 @@ fn usage() -> String {
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
      td-compositor probe-drm DEVICE | \
      td-compositor probe-kms DEVICE | \
+     td-compositor probe-flip DEVICE | \
      td-compositor terminfo PATH | \
      td-compositor selftest\n\
      --terminal-authority requires --launcher-application."
@@ -623,6 +624,67 @@ fn probe_kms(device: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Put one frame on a screen, then FLIP to another and wait for the kernel to
+/// say the second one arrived.
+///
+/// The claim this makes and `probe-kms` does not: a frame can be exchanged for
+/// the next one and the compositor can learn WHEN. That is what makes a
+/// sequence of pictures a display rather than a single modeset, and it is the
+/// completion path §M row 3 recorded as unbuilt.
+///
+/// The two frames are filled differently on purpose. A flip between two
+/// identical buffers completes exactly the same way and would prove the same
+/// ioctl sequence while showing nothing; filling the second differently means
+/// a machine with a monitor attached shows a visibly different picture at the
+/// flip, which is the thing being claimed.
+fn probe_flip(device: &Path) -> Result<(), String> {
+    let card = drm::open_card(device)?;
+    let discovery = drm::discover(&card)?;
+    let mode = discovery.scanout.mode;
+    let width = u32::from(mode.hdisplay);
+    let height = u32::from(mode.vdisplay);
+
+    let mut first = drm::DumbFrame::allocate(&card, width, height)?;
+    first.prove_mapping()?;
+    for byte in first.pixels_mut() {
+        *byte = 0;
+    }
+    let modeset = drm::Modeset::apply(&card, &discovery.scanout, &first)?;
+    modeset.verify(&card, &mode)?;
+
+    let mut second = drm::DumbFrame::allocate(&card, width, height)?;
+    second.prove_mapping()?;
+    for byte in second.pixels_mut() {
+        *byte = 0xff;
+    }
+    // The cookie is a `FrameId`, not a bare number, and it is the identity the
+    // completion is matched on. `FIRST.next()` rather than `FIRST` because a
+    // cookie of 1 is the value a zeroed or defaulted `user_data` is likeliest
+    // to collide with; 2 rules that out.
+    //
+    // It does NOT rule out a compositor printing a constant, and an earlier
+    // revision of this comment claimed it did. The round-trip is proven by the
+    // marker EXISTING: `await_flip` returns only on a completion whose
+    // `user_data` equals the cookie, so a kernel that echoed the wrong value
+    // produces no marker at all rather than a marker with a wrong field.
+    let id = output::FrameId::FIRST.next();
+    let flip = drm::Flip::queue_and_wait(&card, &modeset, &discovery.scanout, &second, id.cookie())?;
+    flip.verify(&card, &mode)?;
+
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "TD-COMPOSITOR-FLIP-PROBE-OK {} output={}x{} {} {}",
+        discovery.describe(),
+        mode.hdisplay,
+        mode.vdisplay,
+        modeset.describe(),
+        flip.describe()
+    )
+    .map_err(|error| format!("write flip probe marker: {error}"))?;
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let command = args.first().ok_or_else(usage)?;
     match command.as_str() {
@@ -652,6 +714,18 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err(usage());
             }
             probe_kms(Path::new(device))
+        }
+        // A page flip: a modeset, then a SECOND frame put on the same CRTC
+        // and waited for. Separate from `probe-kms` for the reason that one is
+        // separate from `probe-drm` -- it disturbs the screen for longer and
+        // proves a strictly stronger claim, and a name that covered both would
+        // make the weaker run imply the stronger.
+        "probe-flip" => {
+            let device = args.get(1).ok_or_else(usage)?;
+            if args.get(2).is_some() {
+                return Err(usage());
+            }
+            probe_flip(Path::new(device))
         }
         "probe" => {
             let socket = args.get(1).ok_or_else(usage)?;
@@ -1504,12 +1578,20 @@ fn syscall6(
     /// window. The dumb trio allocates, maps and frees. The modeset four
     /// register a framebuffer, read a CRTC, drive one, and unregister.
     ///
-    /// `MODE_PAGE_FLIP` and `MODE_ATOMIC` remain deliberately absent, and the
-    /// line between them and what landed is exact: a modeset puts ONE picture
-    /// on a screen, a page flip is what makes a sequence of them a display, and
-    /// that needs a completion path this increment does not build.
+    /// `MODE_SETPLANE` and `MODE_ATOMIC` remain deliberately absent, and the
+    /// stand-in has moved AGAIN: this increment rosters `MODE_PAGE_FLIP`, which
+    /// the last one named here as absent. That movement is the test working
+    /// rather than the test churning — a request named absent after it is
+    /// admitted asserts nothing while still passing, so each landing that grows
+    /// the roster must hand the role to something it genuinely does not issue.
+    ///
+    /// The two that inherit it are the next two real steps and not arbitrary:
+    /// `SETPLANE` puts a second buffer on an overlay plane, which is what
+    /// direct scanout of a dmabuf needs (§M row 2), and `ATOMIC` commits a
+    /// whole display state at once, which is what replaces this legacy
+    /// modeset-and-flip pair when more than one plane is in play.
     #[test]
-    fn the_ioctl_surface_is_nineteen_pinned_requests_and_eighteen_wrappers() {
+    fn the_ioctl_surface_is_twenty_pinned_requests_and_nineteen_wrappers() {
         for request in [
             "const TIOCSPTLCK: usize = 0x4004_5431;",
             "const TIOCGPTPEER: usize = 0x5441;",
@@ -1530,12 +1612,13 @@ fn syscall6(
             "const DRM_IOCTL_MODE_SETCRTC: usize = 0xc068_64a2;",
             "const DRM_IOCTL_MODE_RMFB: usize = 0xc004_64af;",
             "const DRM_IOCTL_MODE_ADDFB2: usize = 0xc068_64b8;",
+            "const DRM_IOCTL_MODE_PAGE_FLIP: usize = 0xc018_64b0;",
         ] {
             assert!(SYS.contains(request), "{request}");
         }
         assert_eq!(occurrences(SYS, "const TIOC"), 4);
         assert_eq!(occurrences(SYS, "const EVIOCGABS"), 2);
-        assert_eq!(occurrences(SYS, "const DRM_IOCTL_"), 13);
+        assert_eq!(occurrences(SYS, "const DRM_IOCTL_"), 14);
         // No write-side DRM request is DECLARED, and none of their numbers
         // appears at all. The declaration is the thing to forbid rather than
         // the name: `DrmModeInfo`'s own doc says a mode is what `SETCRTC` takes
@@ -1549,9 +1632,9 @@ fn syscall6(
         // own test issues `SETCRTC` to prove the allow-list refuses it — a pin
         // that moved whenever a test did would pin nothing.
         for absent in [
-            "const DRM_IOCTL_MODE_PAGE_FLIP",
+            "const DRM_IOCTL_MODE_SETPLANE",
             "const DRM_IOCTL_MODE_ATOMIC",
-            "0xc018_64b0",
+            "0xc030_64b7",
             "0xc038_64bc",
         ] {
             assert!(
@@ -1592,6 +1675,7 @@ fn syscall6(
             | DRM_IOCTL_MODE_SETCRTC
             | DRM_IOCTL_MODE_RMFB
             | DRM_IOCTL_MODE_ADDFB2
+            | DRM_IOCTL_MODE_PAGE_FLIP
     ) {"#;
         assert_eq!(occurrences(SYS, guard), 1);
         let entry = r#"    Ok(syscall5(SYS_IOCTL, fd as usize, request, argument, 0, 0))"#;
@@ -1607,13 +1691,13 @@ fn syscall6(
         // evdev entry point: a SIXTH wrapper reusing a pinned request would
         // satisfy every other assertion here.
         assert_eq!(every - drm, 6);
-        // One definition plus the sixteen requests the thirteen DRM wrappers
+        // One definition plus the seventeen requests the fourteen DRM wrappers
         // issue: two each for the three that ask a count before they ask for
         // data, one for the encoder, whose answer is a fixed-size struct, one
         // each to take and give back mastership, one each to create, map and
-        // destroy a dumb buffer, and one each to read a CRTC, drive one,
-        // register a framebuffer and unregister it.
-        assert_eq!(drm, 17);
+        // destroy a dumb buffer, one each to read a CRTC, drive one, register a
+        // framebuffer and unregister it, and one to queue a page flip.
+        assert_eq!(drm, 18);
         // Both entry points reach the SAME allow-list, and it is defined once.
         // This is the assertion that stops a second `syscall5(SYS_IOCTL, ..)`
         // growing beside the roster instead of behind it.
@@ -2045,6 +2129,7 @@ pub struct MappedRegion {
             "let live = sys::drm_get_crtc(card, self.crtc_id)?;",
             "sys::drm_set_crtc(card, &wanted, &mut connectors)?;",
             "if let Err(error) = sys::drm_set_crtc(self.card, &self.saved, &mut self.connectors) {",
+            "sys::drm_page_flip(card, modeset.crtc_id(), fb_id, cookie)?;",
             "let _ = sys::drm_rm_fb(self.card, self.fb_id);",
             "let _ = sys::drm_drop_master(self.card);",
         ] {
@@ -2062,13 +2147,20 @@ pub struct MappedRegion {
         // four release calls is reached from a `Drop` and from nowhere else,
         // which is what makes the unwind a property of field order rather than
         // of a path some early return can miss.
-        assert_eq!(occurrences(drm, "sys::drm_"), 20);
+        assert_eq!(occurrences(drm, "sys::drm_"), 23);
         // `drm_add_fb` is pinned by COUNT as well as by spelling, because it
         // is the worst of these to get wrong: four bare `u32`s in a row, so
         // swapping width for height, or pitch for handle, type-checks, passes
         // this whole suite, and fails only on a real card.
-        assert_eq!(occurrences(drm, "sys::drm_add_fb("), 1);
+        // TWO registrations now, and both are spelled the same way because
+        // they are the same call: a modeset registers the frame it sets, and a
+        // flip registers the frame it flips to. Each is followed immediately by
+        // its own `FbGuard`, which is the property that matters and the reason
+        // a second one is not a smell.
+        assert_eq!(occurrences(drm, "sys::drm_add_fb("), 2);
         assert_eq!(occurrences(drm, "sys::drm_resources("), 2);
+        // One queue, and no second: a page flip is issued from `Flip` alone.
+        assert_eq!(occurrences(drm, "sys::drm_page_flip("), 1);
         let production_main = production(MAIN);
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())

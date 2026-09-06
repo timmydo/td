@@ -63,7 +63,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with nineteen value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped client-side clipboard descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped client-side clipboard descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -449,13 +449,41 @@ so the console commits its updates to a buffer nothing scans out. Discovery is
 safe to run beside a running compositor; this is not, and two claims that
 different must not share one name.
 
-`MODE_PAGE_FLIP` and `MODE_ATOMIC` remain named in the confinement test as
-ABSENT. A modeset puts ONE picture on a screen; a page flip is what makes a
-sequence of them a display, and it needs a completion path — an event on the
-card descriptor, matched to the frame that caused it — which no increment has
-built. The confinement test's stand-in for "not ours" moved from `SETCRTC` to
-those two in the same landing, because a test naming an admitted request as
-absent asserts nothing while still passing.
+`MODE_PAGE_FLIP` (0xc018_64b0) joined for the landing after that, and it is
+the twentieth and last of the roster. It carries the 24-byte
+`drm_mode_crtc_page_flip`, which is four `u32` and a `u64`; the kernel's own
+handler takes the wider `drm_mode_crtc_page_flip_target`, but the request
+number is sized for the narrower struct and the repurposed field is read only
+under a `TARGET` flag this crate never sets, so the narrower one is what must
+be sent and its reserved word must be zero.
+
+The `u64` is the whole reason this request was worth an increment of its own.
+`user_data` goes in with the flip and comes back in the completion event, so a
+page flip is SELF-IDENTIFYING: a caller with two frames in flight can tell
+which one completed without keeping a side table and without assuming
+completions arrive in the order frames were queued. The compositor's
+`OutputEvent`/`Submission` pair recorded "an identity neither carries" as the
+blocker for consuming completions; the identity was in the ABI the whole time,
+and `FrameId` is the newtype that keeps it from being a bare integer.
+
+Reading those completions adds NO syscall surface. They arrive on the card
+descriptor as ordinary readable bytes, so `File`'s own `read` serves, and the
+bounded wait uses the `fcntl` `O_NONBLOCK` pair already rostered for the
+clipboard. The parser is byte-at-a-time through `get` rather than a cast over
+the buffer: the bytes come from a `Vec<u8>` with no alignment guarantee, an
+event shorter than its header must be refused rather than advanced past, and
+an event type this build has never heard of is stepped over by the length it
+declared rather than by any assumption here.
+
+`MODE_SETPLANE` and `MODE_ATOMIC` now hold the ABSENT role. That stand-in has
+moved twice — `SETCRTC` until the modeset landing rostered it, `PAGE_FLIP`
+until this one did — and the movement is the test working rather than
+churning: a request named "not ours" after it is admitted asserts nothing while
+still passing. The two that inherit it are the next real steps, not arbitrary:
+`SETPLANE` puts a buffer on an overlay plane, which is what direct scanout of a
+dmabuf needs, and `ATOMIC` commits a whole display state at once, which is what
+replaces this legacy modeset-and-flip pair once more than one plane is in
+play.
 
 Every rostered DRM request is pinned for `EVIOCGABS`'s reason, arriving at it
 a third way.
@@ -490,7 +518,7 @@ rather than believed, since the kernel copies a connector's mode and encoder
 arrays all-or-nothing.
 
 The request roster is enforced in code, not only in a test — one
-allow-list refuses anything outside the nineteen before either entry point
+allow-list refuses anything outside the twenty before either entry point
 issues the syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.

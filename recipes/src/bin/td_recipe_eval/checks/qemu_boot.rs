@@ -140,6 +140,22 @@ const TD_PORTAL_CHANNEL_CONSOLE_MARKER: &str =
 const TD_SANDBOX_KERNEL_MARKER: &str = td_recipe::ladder::TD_SANDBOX_KERNEL_MARKER;
 const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_DRM_PROBE_MARKER;
 const TD_COMPOSITOR_KMS_PROBE_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_KMS_PROBE_MARKER;
+const TD_COMPOSITOR_FLIP_PROBE_MARKER: &str = td_recipe::ladder::TD_COMPOSITOR_FLIP_PROBE_MARKER;
+
+/// The cookie `probe-flip` queues its page flip with, and the one the kernel
+/// must hand back.
+///
+/// `FrameId::FIRST.next()`, so 2 rather than 1, because 1 is what a zeroed or
+/// defaulted `user_data` is likeliest to collide with.
+///
+/// Be exact about what asserting this field buys, because it is less than it
+/// looks: the probe only prints its marker after a completion whose
+/// `user_data` matched, so given the marker at all, this field follows. A
+/// mismatched round-trip shows up as the marker's ABSENCE — the probe waits
+/// out its timeout — and the row above is what catches that. This assertion is
+/// a guard against the report being composed from something other than the
+/// completion, not the round-trip proof itself.
+const FLIP_COOKIE: &str = "cookie=0x2";
 
 /// The longest DRM report this will read back, past which the line is not one
 /// this check understands.
@@ -471,6 +487,7 @@ struct ConsoleEvidence {
     /// marker is for.
     td_compositor_drm: Option<String>,
     td_compositor_kms: Option<String>,
+    td_compositor_flip: Option<String>,
     td_jail_kill_reaps: bool,
     td_firefox: bool,
     td_firefox_content: bool,
@@ -2190,6 +2207,94 @@ fn validate_system_boot(
             if driver != "virtio_gpu" {
                 return Err(format!(
                     "td-compositor set a mode on a card behind {driver:?} rather than \
+                     \"virtio_gpu\". Report was: {report}"
+                ));
+            }
+        }
+    }
+    match result.evidence.td_compositor_flip.as_deref() {
+        None => {
+            return Err(format!(
+                "td-compositor's page-flip marker ({TD_COMPOSITOR_FLIP_PROBE_MARKER:?}) was \
+                 absent. The modeset row passed, so a mode was programmed and the CRTC agreed; \
+                 this is the FLIP itself failing: PAGE_FLIP refused the second framebuffer, or \
+                 the kernel accepted the flip and never delivered its completion, or the \
+                 completion arrived carrying an identity that was not the one queued. §M's \
+                 first row is a KMS output backend and this is the half that makes a sequence \
+                 of frames a display rather than one picture. Last serial output:\n{}",
+                tail(&result.console, 80)
+            ));
+        }
+        Some(report) => {
+            // `flip=ok` is printed only after the completion arrived AND the
+            // CRTC read back committed to this flip's framebuffer at the size
+            // asked for. The completion is the part that says the frame
+            // reached the screen; the read-back says the CRTC is the one that
+            // was asked and is committed to the right buffer. An earlier
+            // revision of this comment said the read-back would catch a driver
+            // that completed the flip and kept the old picture -- it would
+            // not, because `GETCRTC` reports committed software state, which
+            // an atomic driver swaps before the flip executes.
+            if !report.split_whitespace().any(|field| field == "flip=ok") {
+                return Err(format!(
+                    "td-compositor reported a flip probe without a completed page flip. The \
+                     probe sets a mode, queues a second framebuffer with PAGE_FLIP, waits for \
+                     the completion event on the card descriptor, and reads the CRTC back; \
+                     `flip=ok` is printed only when all three happened. Report was: {report}"
+                ));
+            }
+            // The completion carried back the identity the flip was queued
+            // with. This is the whole point of the increment: without it a
+            // completion cannot be attributed to a frame, and a compositor
+            // with two frames in flight would be guessing.
+            if !report.split_whitespace().any(|field| field == FLIP_COOKIE) {
+                return Err(format!(
+                    "td-compositor's flip completion did not carry the identity it was queued \
+                     with ({FLIP_COOKIE}). The kernel copies a page flip's `user_data` into the \
+                     event it delivers, which is what lets a completion be matched to the frame \
+                     that caused it; a different value means the probe matched some other \
+                     event, or the round-trip does not hold. Report was: {report}"
+                ));
+            }
+            // The flipped-to framebuffer, non-zero. Named `flipfb=` and not
+            // `fb=` because the modeset's own `fb=` is on this same line, and
+            // two fields of one name are read by whichever comes first.
+            let flipped = report
+                .split_whitespace()
+                .find_map(|entry| entry.strip_prefix("flipfb="))
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default();
+            if flipped == 0 {
+                return Err(format!(
+                    "td-compositor reported a flip to framebuffer 0, which is the kernel's \
+                     \"no such object\". Report was: {report}"
+                ));
+            }
+            // And it must be a DIFFERENT framebuffer from the modeset's. A
+            // flip onto the buffer already being scanned out completes
+            // normally and satisfies every other assertion here while
+            // exchanging nothing, which is the row's headline claim. Both
+            // numbers are already on the line.
+            let modeset_fb = report
+                .split_whitespace()
+                .find_map(|entry| entry.strip_prefix("fb="))
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default();
+            if flipped == modeset_fb {
+                return Err(format!(
+                    "td-compositor flipped to framebuffer {flipped}, which is the one the \
+                     modeset was already scanning out — a flip onto the current buffer \
+                     completes normally and exchanges nothing. Report was: {report}"
+                ));
+            }
+            // The same driver as the two rows above it.
+            let driver = report
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("driver="))
+                .unwrap_or_default();
+            if driver != "virtio_gpu" {
+                return Err(format!(
+                    "td-compositor flipped a frame on a card behind {driver:?} rather than \
                      \"virtio_gpu\". Report was: {report}"
                 ));
             }
@@ -5061,6 +5166,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         // marker was absent", which reads as a broken card rather than as a
         // retention bug.
         TD_COMPOSITOR_KMS_PROBE_MARKER.len() + 1 + DRM_REPORT_MAX,
+        TD_COMPOSITOR_FLIP_PROBE_MARKER.len() + 1 + DRM_REPORT_MAX,
         exact_line_window(TD_SECRET_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_REQUEST_CONSOLE_MARKER),
@@ -5392,6 +5498,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_compositor_kms,
         buf,
         TD_COMPOSITOR_KMS_PROBE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_reported_line(
+        &mut evidence.td_compositor_flip,
+        buf,
+        TD_COMPOSITOR_FLIP_PROBE_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -9284,6 +9396,12 @@ mod tests {
          buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok fb=7 modeset=ok"
             .to_string(),
     );
+    evidence.td_compositor_flip = Some(
+        "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 \
+         mode=1280x800@60 name=1280x800 preferred=true mm=0x0 output=1280x800 \
+         fb=7 modeset=ok flipfb=8 cookie=0x2 seq=41 flip=ok"
+            .to_string(),
+    );
     evidence.td_jail_kill_reaps = true;
     evidence.td_jail_seccomp = true;
     evidence.td_jail_transition = true;
@@ -9588,6 +9706,54 @@ mod tests {
         );
     }
 
+    /// And the flip report, which is the one that actually needs its own
+    /// entry: `TD-COMPOSITOR-FLIP-PROBE-OK` is 27 bytes against the other
+    /// two markers' 26, so it is the LONGEST of the three and no other entry
+    /// covers it. The DRM and KMS twins record that their entries are carried
+    /// by a coincidence of equal lengths; this one is not.
+    #[test]
+    fn drain_console_carries_a_longest_flip_report_across_a_read_boundary() {
+        const CHUNK: usize = 8192;
+        let prefix = " driver=virtio_gpu flipfb=8 cookie=0x2 flip=ok pad=";
+        let field = format!(
+            "{prefix}{}",
+            "y".repeat(DRM_REPORT_MAX.saturating_sub(prefix.len()))
+        );
+        assert_eq!(field.len(), DRM_REPORT_MAX, "the widest report the latch takes");
+        let line = format!("{TD_COMPOSITOR_FLIP_PROBE_MARKER}{field}");
+
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+
+        let pad = CHUNK.saturating_sub(line.len() + 1);
+        let mut bytes = vec![b'x'; pad];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(line.as_bytes());
+        assert_eq!(bytes.len(), CHUNK, "the newline must land on the seam");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[b'z'; 128]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            &mut evidence,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.td_compositor_flip.as_deref(),
+            Some(field.trim()),
+            "the retained tail did not carry a maximum-length flip report"
+        );
+    }
+
     /// Past the bound the line is skipped, not truncated: a truncated report
     /// reads as a shorter well-formed one, and its fields are then asserted.
     #[test]
@@ -9772,6 +9938,127 @@ mod tests {
         let mut evidence = healthy_evidence();
         evidence.td_compositor_kms =
             Some("driver=bochs-drm crtc=29 fb=7 modeset=ok".to_string());
+        let complaint = boot_complaint(evidence);
+        assert!(complaint.contains("bochs-drm"), "{complaint}");
+    }
+
+    /// A mode being set does not mean a frame can be exchanged for the next
+    /// one. The absent marker is the flip itself failing, and it is a separate
+    /// row for that reason.
+    #[test]
+    fn a_boot_that_set_a_mode_but_flipped_nothing_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_flip = None;
+        let complaint = boot_complaint(evidence);
+        assert!(
+            complaint.contains(TD_COMPOSITOR_FLIP_PROBE_MARKER),
+            "{complaint}"
+        );
+    }
+
+    /// `flip=ok` is printed only after the completion arrived AND the CRTC
+    /// read back showing the flipped framebuffer. A probe that queued the flip
+    /// and stopped carries everything up to it, which is exactly the report a
+    /// weaker check would accept.
+    #[test]
+    fn a_flip_report_without_a_completed_flip_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_flip =
+            Some("driver=virtio_gpu crtc=29 fb=7 flipfb=8 cookie=0x2 seq=41".to_string());
+        let complaint = boot_complaint(evidence);
+        assert!(
+            complaint.contains("without a completed page flip"),
+            "{complaint}"
+        );
+    }
+
+    /// Whole-field, not substring: `flip=okay` must not satisfy it, and
+    /// neither must the `modeset=ok` already on the same line.
+    #[test]
+    fn a_flip_field_that_only_looks_right_is_rejected() {
+        for tail in ["flip=okay", "flip=failed", "xflip=ok", "modeset=ok"] {
+            let mut evidence = healthy_evidence();
+            evidence.td_compositor_flip =
+                Some(format!("driver=virtio_gpu flipfb=8 cookie=0x2 {tail}"));
+            let complaint = boot_complaint(evidence);
+            assert!(
+                complaint.contains("without a completed page flip"),
+                "{tail} was accepted: {complaint}"
+            );
+        }
+    }
+
+    /// The row this increment exists for. A completion that did not carry
+    /// back the identity it was queued with is not a completion PATH, however
+    /// complete the flip was: a compositor with two frames in flight could not
+    /// attribute it.
+    #[test]
+    fn a_flip_completion_carrying_the_wrong_identity_is_rejected() {
+        for cookie in ["cookie=0x1", "cookie=0x0", "cookie=0xdead", ""] {
+            let mut evidence = healthy_evidence();
+            evidence.td_compositor_flip = Some(format!(
+                "driver=virtio_gpu flipfb=8 {cookie} seq=41 flip=ok"
+            ));
+            let complaint = boot_complaint(evidence);
+            assert!(
+                complaint.contains("did not carry the identity"),
+                "{cookie:?} was accepted: {complaint}"
+            );
+        }
+    }
+
+    /// Zero is the kernel's "no such object", so a flip onto it is a flip onto
+    /// nothing while still carrying the marker.
+    #[test]
+    fn a_flip_onto_framebuffer_zero_is_rejected() {
+        for report in [
+            "driver=virtio_gpu flipfb=0 cookie=0x2 flip=ok",
+            "driver=virtio_gpu cookie=0x2 flip=ok",
+        ] {
+            let mut evidence = healthy_evidence();
+            evidence.td_compositor_flip = Some(report.to_string());
+            let complaint = boot_complaint(evidence);
+            assert!(
+                complaint.contains("no such object"),
+                "{report} was accepted: {complaint}"
+            );
+        }
+    }
+
+    /// `flipfb=` and not `fb=`: the modeset's own `fb=` is on this same line,
+    /// and a check reading `fb=` would find the modeset's framebuffer and
+    /// call the flip proven. This is the collision the field was named to
+    /// avoid, asserted rather than assumed.
+    #[test]
+    fn the_flip_row_does_not_read_the_modesets_framebuffer() {
+        let mut evidence = healthy_evidence();
+        // A flip onto nothing, beside a perfectly good modeset framebuffer.
+        evidence.td_compositor_flip =
+            Some("driver=virtio_gpu fb=7 flipfb=0 cookie=0x2 flip=ok".to_string());
+        let complaint = boot_complaint(evidence);
+        assert!(complaint.contains("no such object"), "{complaint}");
+    }
+
+    /// A flip onto the framebuffer already being scanned out exchanges
+    /// nothing. It completes normally and satisfies every other assertion in
+    /// this row, which is why it is checked separately: the row's headline
+    /// claim is that a frame was EXCHANGED, not that a flip succeeded.
+    #[test]
+    fn a_flip_onto_the_framebuffer_already_shown_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_flip =
+            Some("driver=virtio_gpu fb=7 modeset=ok flipfb=7 cookie=0x2 flip=ok".to_string());
+        let complaint = boot_complaint(evidence);
+        assert!(complaint.contains("exchanges nothing"), "{complaint}");
+    }
+
+    /// A flip proven against some other card says nothing about the one this
+    /// image pins.
+    #[test]
+    fn a_flip_on_another_driver_is_rejected() {
+        let mut evidence = healthy_evidence();
+        evidence.td_compositor_flip =
+            Some("driver=bochs-drm flipfb=8 cookie=0x2 flip=ok".to_string());
         let complaint = boot_complaint(evidence);
         assert!(complaint.contains("bochs-drm"), "{complaint}");
     }

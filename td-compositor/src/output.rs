@@ -263,6 +263,53 @@ pub struct FrameTarget<'a> {
     pub stride: usize,
 }
 
+/// Which frame — minted when one is queued, compared when it completes.
+///
+/// This is the identity `poll_events` recorded as missing. It is NOT invented
+/// out of band: `DRM_IOCTL_MODE_PAGE_FLIP` takes a `u64 user_data` and the
+/// kernel copies it into the completion event, so the correlation channel is
+/// the ABI's and this newtype is what keeps it from being a bare integer that
+/// any other number could be passed as.
+///
+/// A backend mints these; nothing else may. That is why there is no
+/// `From<u64>`: a value arriving from the kernel is turned back into one by
+/// `from_cookie` at exactly one place, the completion parser, and a `FrameId`
+/// appearing anywhere else came from a backend that queued a frame.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FrameId(u64);
+
+impl FrameId {
+    /// The first frame a backend queues.
+    ///
+    /// One rather than zero, because zero is what an uninitialised `user_data`
+    /// reads as. A completion carrying zero should be distinguishable from a
+    /// completion for the first frame, and starting at one is the whole cost
+    /// of that.
+    pub const FIRST: FrameId = FrameId(1);
+
+    /// The next frame's id.
+    ///
+    /// Wrapping rather than checked: a `u64` at sixty frames a second wraps
+    /// after about ten billion years, so the overflow branch could never be
+    /// taken and a `Result` here would be a lie the caller has to handle.
+    pub fn next(self) -> FrameId {
+        FrameId(self.0.wrapping_add(1))
+    }
+
+    /// This id as the `u64` the kernel carries.
+    pub fn cookie(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild an id from a completion's `user_data`.
+    ///
+    /// Called from exactly one place, `Flip::frame`, which is what makes the
+    /// paragraph above a property rather than a wish.
+    pub fn from_cookie(cookie: u64) -> FrameId {
+        FrameId(cookie)
+    }
+}
+
 /// What `present` did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Submission {
@@ -270,14 +317,17 @@ pub enum Submission {
     /// moment for it to report.
     Presented,
     /// Submitted, and not yet visible. Completion arrives later as
-    /// `OutputEvent::Presented` — a KMS page flip. No caller may read this as
-    /// pixels on glass, which is the whole reason the two are distinguished
-    /// before either backend that needs the distinction exists.
-    // Constructed by the KMS backend §M plans, not by fbdev. Named now so
-    // that `paint`'s contract is submit from the start rather than being
-    // widened later, under callers written against the narrower one.
+    /// `OutputEvent::Presented` carrying THE SAME `FrameId`. No caller may
+    /// read this as pixels on glass, which is the whole reason the two are
+    /// distinguished before either backend that needs the distinction exists.
+    ///
+    /// The id is what makes the pair usable rather than merely present: a
+    /// caller with two frames in flight can tell which completion is which,
+    /// instead of assuming completions arrive in the order frames were
+    /// queued.
+    // Constructed by the KMS backend §M plans, not by fbdev.
     #[allow(dead_code)]
-    Queued,
+    Queued(FrameId),
 }
 
 /// Something the backend originates rather than something a caller asked for.
@@ -286,9 +336,9 @@ pub enum Submission {
 /// third one has to justify itself rather than inheriting an exemption.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputEvent {
-    /// A submission that answered `Queued` reached the screen.
+    /// The submission that answered `Queued` with this id reached the screen.
     #[allow(dead_code)]
-    Presented,
+    Presented(FrameId),
     /// The mode or connection changed; `output()` must be read again, and
     /// every value computed from a previous one is stale. Not only the
     /// sizes: the scale and the transform are `output()`'s own fields and
@@ -348,9 +398,11 @@ pub trait OutputBackend {
     ///   one — the client waits for a frame callback that waits for a flip
     ///   completion that waits for a repaint that waits for the client. The
     ///   descriptor has to join the event loop.
-    /// - neither `Submission` nor `OutputEvent` carries a frame identity, so
-    ///   a completion drained after submitting frame N cannot be told apart
-    ///   from N-1's. Pairing them needs an identity that does not exist yet.
+    /// - a completion drained after submitting frame N could not be told
+    ///   apart from N-1's, because neither `Submission` nor `OutputEvent`
+    ///   carried a frame identity. SOLVED since: both carry a `FrameId`, and
+    ///   it is the `u64` the page-flip ioctl already round-trips through the
+    ///   kernel rather than a correlation invented beside it.
     /// - `Changed` invalidates everything computed from a previous
     ///   `output()`, not just the damage: the shadow copy, the frame storage
     ///   and the layout. The scale and the transform change with it too, and
@@ -376,6 +428,24 @@ pub trait OutputBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zero is what an uninitialised `user_data` reads as, so the first id a
+    /// backend mints must not be zero — a completion carrying zero has to be
+    /// distinguishable from a completion for the first frame.
+    #[test]
+    fn the_first_frame_id_is_not_zero() {
+        assert_eq!(FrameId::FIRST.cookie(), 1);
+    }
+
+    /// Ids advance, and the cookie is what advances with them.
+    #[test]
+    fn frame_ids_advance_and_round_trip_through_a_cookie() {
+        let first = FrameId::FIRST;
+        let second = first.next();
+        assert_ne!(first, second);
+        assert!(second > first);
+        assert_eq!(FrameId::from_cookie(second.cookie()), second);
+    }
 
     /// The trait is the seam, so it has to be usable as one. A second backend
     /// that cannot be held behind a `dyn` would make every caller generic

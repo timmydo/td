@@ -719,9 +719,12 @@ KMS author must not rediscover:
   from a repaint means an idle screen never observes one. The client waits for
   a frame callback, which waits for a completion, which waits for a repaint,
   which waits for the client. The descriptor has to join the input event loop.
-- neither `Submission` nor `OutputEvent` carries a frame identity, so a
-  completion drained after submitting frame N cannot be distinguished from
-  N-1's. The draft marked the just-queued frame as on glass.
+- a completion drained after submitting frame N could not be distinguished
+  from N-1's, because neither `Submission` nor `OutputEvent` carried a frame
+  identity. The draft marked the just-queued frame as on glass. SOLVED by the
+  page-flip landing: both now carry a `FrameId`, and it is the `u64` the flip
+  ioctl already round-trips through the kernel rather than a correlation kept
+  beside it.
 - `Changed` invalidates everything computed from a previous `output()`, not
   only the damage: the shadow copy, the frame storage, and the layout the
   views were configured against. The scale and the transform change with it
@@ -3775,14 +3778,32 @@ the kernel's conforming ancillary framing.
   two pinned `EVIOCGABS` requests that read an absolute pointer's declared
   axis range, and the four pinned DRM requests below that read a card.
 
-The DRM thirteen are reached only from `drm.rs`. Four READ —
+The DRM fourteen are reached only from `drm.rs`. Four READ —
 `DRM_IOCTL_VERSION`, `MODE_GETRESOURCES`, `MODE_GETCONNECTOR` and
 `MODE_GETENCODER`. Three ALLOCATE — `MODE_CREATE_DUMB`, `MODE_MAP_DUMB` and
 `MODE_DESTROY_DUMB` — which is what makes `mmap` unavoidable and the mapping
 class real. Five MODESET — `SET_MASTER`, `MODE_GETCRTC`, `MODE_SETCRTC`,
 `MODE_ADDFB2` and `MODE_RMFB` — and with `DROP_MASTER` that is the whole
-surface. The confinement test names `MODE_PAGE_FLIP` and `MODE_ATOMIC` as
-absent so that §M's backend adds them by amendment.
+surface, plus `MODE_PAGE_FLIP` — the fourteenth — which exchanges the
+framebuffer a CRTC is scanning out for another and reports when. The
+confinement test names `MODE_SETPLANE` and `MODE_ATOMIC` as absent so that §M's
+remaining rows add them by amendment.
+
+A page flip is the completion path this document recorded as missing, and it
+needed no invented correlation: `DRM_IOCTL_MODE_PAGE_FLIP` carries a `u64`
+`user_data` that the kernel copies into the completion event. `FrameId` is that
+value as a type, `Submission::Queued` and `OutputEvent::Presented` both carry
+one, and the probe proves the round-trip by queuing a cookie that is not the
+first id a backend would mint — a probe sending 1 and receiving 1 could not
+tell a round-trip from a constant.
+
+What this does NOT do is join the card descriptor to the event loop. The probe
+waits for its own flip with a bounded non-blocking poll, which is right for one
+shot and wrong for a compositor: a flip arrives asynchronously, so draining
+only from a repaint means an idle screen never observes one, and the client
+waits for a frame callback that waits for a completion that waits for a
+repaint. That remains `poll_events`' unsolved half and the reason `Runtime`
+still holds a concrete `Framebuffer`.
 
 A modeset unwinds in one order, for a narrower reason than it first appears.
 `SETCRTC` is the only one of the three steps the kernel flags `DRM_MASTER`

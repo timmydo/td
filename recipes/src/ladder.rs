@@ -963,6 +963,27 @@ pub const TD_COMPOSITOR_DRM_PROBE_MARKER: &str = "TD-COMPOSITOR-DRM-PROBE-OK";
 /// a machine with a monitor there would be, briefly.
 pub const TD_COMPOSITOR_KMS_PROBE_MARKER: &str = "TD-COMPOSITOR-KMS-PROBE-OK";
 
+/// `td-compositor probe-flip` exchanged one frame for another and the kernel
+/// said when.
+///
+/// The third and strongest of the three card claims, and each is strictly
+/// stronger than the last: discovery says a card exists and offers a mode; the
+/// modeset says that mode was programmed and the CRTC agreed; this says a
+/// SECOND frame replaced the first and the completion for it came back
+/// carrying the identity it was queued with.
+///
+/// That last clause is the increment. A page flip whose completion cannot be
+/// matched to the frame that caused it is not a completion path — a caller
+/// with two frames in flight would be guessing — and the identity is the
+/// `u64` `DRM_IOCTL_MODE_PAGE_FLIP` round-trips through the kernel, not
+/// something td keeps beside it.
+///
+/// It disturbs the display for the same reason `probe-kms` does and for
+/// slightly longer, so it is a third subcommand rather than more output from
+/// the second, and nothing in the boot's health verdict depends on the display
+/// while it runs.
+pub const TD_COMPOSITOR_FLIP_PROBE_MARKER: &str = "TD-COMPOSITOR-FLIP-PROBE-OK";
+
 /// APPLICATIONS.md §H item 12: `kill -KILL` of stage 1 reaped the whole
 /// instance.
 ///
