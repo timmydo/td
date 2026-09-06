@@ -4,6 +4,7 @@
 //! the document core has no environment, clock or filesystem access.
 
 pub mod clipboard;
+mod data;
 mod dialog;
 pub use dialog::{Discard, Reload};
 pub mod files;

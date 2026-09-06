@@ -19,6 +19,7 @@ fn source_inventory_and_allowances_are_closed() {
     assert!(!root.join("build.rs").exists());
     let expected: BTreeSet<_> = [
         "clipboard.rs",
+        "data.rs",
         "dialog.rs",
         "files.rs",
         "fill.rs",
@@ -178,7 +179,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0xc86720fafec319ae,
+        hash, 0xc1b0a580e9da8ee8,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -237,7 +238,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert_eq!(adapter.matches("crate::sys::").count(), 4);
     for call in [
         "crate::sys::inherited(fd)",
-        "crate::sys::send_pool(&self.stream, suffix, file)",
+        "crate::sys::send_file(&self.stream, suffix, file)",
         "crate::sys::receive(&self.stream, &mut self.read)",
         "crate::sys::receive_for_test(peer, &mut buf)",
     ] {

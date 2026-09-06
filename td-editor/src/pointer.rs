@@ -14,6 +14,7 @@ pub(crate) enum Event {
     Leave(u32),
     Motion(i32, i32),
     Button {
+        serial: u32,
         button: u32,
         pressed: bool,
     },
@@ -42,7 +43,7 @@ pub(crate) fn decode(message: &Message) -> Result<Event, String> {
             Event::Motion(c.i32()?, c.i32()?)
         }
         3 => {
-            c.u32()?;
+            let serial = c.u32()?;
             c.u32()?;
             let button = c.u32()?;
             let pressed = match c.u32()? {
@@ -50,7 +51,11 @@ pub(crate) fn decode(message: &Message) -> Result<Event, String> {
                 1 => true,
                 _ => return Err("invalid pointer button state".into()),
             };
-            Event::Button { button, pressed }
+            Event::Button {
+                serial,
+                button,
+                pressed,
+            }
         }
         4 => {
             c.u32()?;

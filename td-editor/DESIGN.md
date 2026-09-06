@@ -861,7 +861,7 @@ When input is unavailable or not synchronized, the prompt instead prefixes
 readiness instructions without erasing the entered path.
 Path and confirmation dialogs remain keyboard-only. Native pointer selection,
 tab clicks and scrolling follow the pointer contract below. Menus use the
-native menu contract; clipboard remains unimplemented.
+native menu contract; clipboard uses the data-device contract below.
 
 `session::Session` keeps FileId-to-TabId associations and an opaque model save
 token per pending save. One `std::thread::Builder` worker exclusively owns
@@ -1166,8 +1166,8 @@ Keyboard capability loss releases the keyboard, clears input, and retains
 text. Reacquisition creates a fresh object, waiting for delete_id before ID
 reuse. Bound-seat removal also releases the seat and leaves a notice, without
 disconnecting or silently moving to another seat. Dynamic new-seat selection
-and multi-seat editing are deferred. Clipboard remains an unapproved incoming
-descriptor consumer under this crate's raw-boundary contract.
+and multi-seat editing are deferred. The clipboard descriptor consumer is
+separately rostered under this crate's data-device contract below.
 
 Automated socket tests inspect the actual received pool descriptor and pixels,
 exercise fragmented events, ping/close, version/ID limits, both release/callback
@@ -1261,8 +1261,9 @@ held/repeat/wheel state, preserving the document and selection. The new
 controller CancelInput event performs this reset without a fake focus loss.
 
 File exposes New, Open, Save, Save As, Close Tab and Quit. Edit exposes Undo,
-Redo, Select All and the two key profiles, with clipboard commands visibly
-disabled as unavailable. Format exposes Soft Wrap, Auto Fill and Fill
+Redo, Select All and the two key profiles, with clipboard commands enabled
+according to the data-device contract below. Format exposes Soft Wrap,
+Auto Fill and Fill
 Paragraph; Spelling is visibly disabled until its adapter exists. Help
 shows an experimental-build About notice. A plus marks the active key profile
 or enabled format toggle. Undo/Redo availability reflects the captured
@@ -1315,14 +1316,13 @@ shortcut widths and header mapping. Controller tests pin prefix/mark/drag
 cancellation with selection retained. Fake-compositor tests drive physical
 F10, mouse menus, disabled/outside/repeated input, profile/format changes,
 Save and dirty-close flows, stale targets, resize and late file completion.
-This is not a clipboard, remote-control socket, GPU or jail milestone.
+Menus do not imply a remote-control socket, GPU or jail milestone.
 
 ### Implemented clipboard admission prerequisite
 
 The safe `clipboard` module captures clipboard intent independently of any
 display, descriptor, clock or worker. It does not claim system clipboard
-ownership. Native Cut/Copy/Paste remain unavailable until their transport
-adapter is implemented and the descriptor contract is amended.
+ownership; the native adapter below supplies protocol and descriptor policy.
 
 `Snapshot::capture` requires the active tab and expected text revision.
 It captures the directed selection, editor-instance identity and at most
@@ -1375,14 +1375,13 @@ library API does not impose a process-wide allocator limit on callers.
 Tests exercise byte-at-a-time Unicode/CRLF, cancellation, malformed/oversized
 input, stale/foreign/inactive/selection-changed tokens, Undo, encoded-file
 budgets and generation exhaustion through the production controller.
-No new replay command, native clipboard claim or raw consumer is introduced.
+This pure layer introduces no replay command or raw consumer.
 
 ### Implemented clipboard transport prerequisite
 
 The public `transfer` module owns bounded descriptor I/O independently of
-the window loop. It does not bind Wayland data-device objects, consume the
-connection's received-rights FIFO, acquire a system selection or enable the
-native clipboard commands. Those are the next adapter increment.
+the window loop. The native adapter below binds Wayland data-device objects,
+received rights and selection ownership to these transport primitives.
 
 `Incoming::begin` captures Paste intent and creates a private UnixStream
 pair. It returns the producer endpoint as an owned File; the caller must
@@ -1433,6 +1432,80 @@ Confinement pins the complete raw source, constants and sole Destination
 consumer. Real pipe/socket tests cover byte-fragmented input, EOF-only
 admission, 1 MiB round trips, per-step work, deadlines, cancellation, broken
 pipes, non-endpoint refusal and restoration through shared descriptor aliases.
+
+### Implemented experimental native clipboard
+
+At initial registry synchronization, a seat plus optional core
+wl_data_device_manager v3 enables one seat-bound data device. Higher versions
+are capped at 3; missing/older globals leave clipboard commands disabled.
+Late-added globals are not rebound. Removing the manager or seat releases
+the device and retained source, cancels I/O and preserves documents. A
+removed manager object has no destructor and remains inert until disconnect.
+
+Windows Ctrl+C/Ctrl+X/Ctrl+V, Emacs M-w/C-w/C-y and Edit menu Copy/Cut/Paste
+reach the same adapter. Copy/Cut require keyboard focus and the serial from
+the current actual translated key press or left-button menu press. Synthetic
+requests without that serial refuse ownership changes. Repeats never acquire
+ownership or start transfers. Empty selection preserves the existing source;
+oversized selection refuses before copying. A fresh source advertises only
+`text/plain;charset=utf-8` and `text/plain`, both UTF-8. After sending
+set_selection with that input serial, retain the immutable snapshot and then
+admit Cut through the controller. Wayland provides no ownership acknowledgement;
+feedback says the selection was offered. Undo restores a successful Cut.
+
+The window owns at most one source snapshot, one outgoing writer and one
+incoming transfer. Copy/Cut refuse while a writer is pending, bounding retained
+copy bytes to 1 MiB even when ownership changes. Cancellation of a source
+retires that object while an already-started writer may finish its retained
+snapshot. Busy, unsupported-MIME and retired source sends consume and drop
+exactly their descriptor. Device/source v3 schemas, including unused drag
+events, are fully validated; retired client IDs drain until delete_id.
+
+Server-created offers use a separate bounded map, never the client ID array.
+There are at most 32 retained offers. Inspect only the first 64 MIME
+announcements per offer and retain at most two supported strings, each at
+most 256 bytes. Extra or longer valid MIME announcements are drained and
+ignored rather than disconnecting the editor. Unsupported source sends,
+including long MIME strings, drop their exact descriptor; transient decoded
+strings remain bounded by the wire-frame budget. There is one outstanding
+retirement barrier covering at
+most 32 ID/generation pairs. Retirements after that barrier was sent coalesce
+until its callback, then receive the next barrier. Prefer the explicit UTF-8
+MIME; accept text/plain only as UTF-8. ASCII case variants of these two
+spellings are accepted, preserving the exact offered spelling in receive.
+Unknown encodings or other parameter forms are not guessed.
+Selection replacement, null selection and focus loss cancel incoming Paste
+and destroy obsolete offers. Destroyed server IDs retain schema tombstones
+through a display-sync barrier; a generation tag prevents an old barrier
+from deleting a new offer that reuses the same ID. Drag offers are destroyed
+without accepting or finishing a drop and cannot replace the clipboard.
+There is no PRIMARY selection, middle-click paste or drag-and-drop editing.
+Selection may arrive immediately before keyboard enter, as the protocol
+specifies: retain that offer while unfocused, but refuse Paste until focus.
+Keyboard leave still invalidates and retires the previous selection.
+
+Paste passes the fresh socket producer endpoint to offer.receive, drops its
+local copy and collects through Incoming. It checks queued protocol events
+before admitting EOF, then uses the same revision/selection-bound controller
+Paste as headless tests. Focus loss, keymap replacement, target/selection
+change, file/discard modal entry, offer replacement and Escape/Ctrl+G cancel.
+Cancellation is checked after each native event, so selection-away-and-back
+events cannot revive a pending paste. Empty EOF leaves the selection intact;
+malformed, oversized and timed-out input never inserts a prefix. Nonempty
+paste is one ordinary Insert transaction, with the documented identical-text
+exception; no Auto Fill or file-format change is applied.
+
+The event loop services pings/input while bounded transfers are pending and
+caps its receive wait at 10 ms. Transfers retain their absolute five-second
+clock and four-I/O-attempt step budgets. Missing keymap or source-send rights
+use one five-second descriptor deadline after full-schema validation, not
+assumptions about ancillary-message boundaries. Socketpair producers are an
+experimental compatibility boundary: FIFO-specific writers are unsupported.
+Tests use actual SCM_RIGHTS and pipe/socket endpoints, exact native input
+serials in both key profiles, menu activation, fragmented UTF-8/CRLF, terminal
+cancellation, immutable source data and repeated offer-ID retirement/reuse.
+This does not claim live third-party toolkit clipboard interoperability yet.
+The software window is still experimental, not the default $EDITOR path.
 
 ### Version-1 compatibility target
 

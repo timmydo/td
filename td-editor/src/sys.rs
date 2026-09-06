@@ -192,7 +192,7 @@ fn header(iov: &mut IoVec, control: &mut Control, length: usize) -> MsgHdr {
 }
 
 /// Adopt every delivered right before any policy refusal. The connection
-/// owns the returned descriptors until the sole keymap consumer takes them.
+/// owns the returned descriptors until a keymap or clipboard event takes them.
 pub(super) fn receive(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
     if bytes.is_empty() {
         return Err(io::Error::other("empty Wayland receive buffer"));
@@ -279,10 +279,10 @@ pub(super) fn receive_for_test(
     receive(stream, bytes)
 }
 
-/// Send exactly one borrowed pool file. A short write's suffix carries no fd.
-pub(super) fn send_pool(stream: &UnixStream, bytes: &[u8], file: &File) -> io::Result<usize> {
+/// Send one borrowed SHM file or clipboard endpoint; a short suffix has no fd.
+pub(super) fn send_file(stream: &UnixStream, bytes: &[u8], file: &File) -> io::Result<usize> {
     if bytes.is_empty() {
-        return Err(io::Error::other("empty pool request"));
+        return Err(io::Error::other("empty descriptor request"));
     }
     let mut control = Control([0; CONTROL]);
     for (offset, value) in [
@@ -352,7 +352,7 @@ mod tests {
     fn received_descriptor_is_owned_and_closed_on_drop() {
         let (a, b) = UnixStream::pair().unwrap();
         let (mut peer, file) = endpoint_file();
-        assert_eq!(send_pool(&a, b"bytes", &file).unwrap(), 5);
+        assert_eq!(send_file(&a, b"bytes", &file).unwrap(), 5);
         drop(file);
         let (count, fds) = receive(&b, &mut [0; 32]).unwrap();
         assert_eq!(count, 5);
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(&bytes, b"abc");
         drop(a);
         assert_eq!(receive(&b, &mut bytes).unwrap().0, 0);
-        assert!(send_pool(&b, b"x", &File::open("/dev/null").unwrap()).is_err());
+        assert!(send_file(&b, b"x", &File::open("/dev/null").unwrap()).is_err());
         assert!(receive(&b, &mut []).is_err());
     }
 }

@@ -38,6 +38,11 @@ enum TransferState {
 }
 
 impl Incoming {
+    /// Whether a pending transfer must time out without reading any more bytes.
+    pub fn expired(&self, now: u64) -> bool {
+        self.state == TransferState::Pending && now >= self.deadline
+    }
+
     /// Return a receiver and its peer endpoint, to pass to a text producer.
     /// Drop the local peer after handing it off so successful EOF is observable.
     pub fn begin(editor: &Editor, tab: TabId, revision: u64, now: u64) -> io::Result<(Self, File)> {
@@ -149,6 +154,11 @@ pub struct Outgoing {
 }
 
 impl Outgoing {
+    /// Whether a pending transfer must time out without writing any more bytes.
+    pub fn expired(&self, now: u64) -> bool {
+        self.state == TransferState::Pending && now >= self.deadline
+    }
+
     /// Own the exact destination, reject non-pipe/socket or read-only endpoints,
     /// and enable/read back nonblocking mode before any writes.
     pub fn begin(fd: OwnedFd, text: Arc<str>, now: u64) -> io::Result<Self> {

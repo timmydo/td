@@ -67,9 +67,9 @@ impl Item {
             Self::Quit => "Quit",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
-            Self::Cut => "Cut (unavailable)",
-            Self::Copy => "Copy (unavailable)",
-            Self::Paste => "Paste (unavailable)",
+            Self::Cut => "Cut",
+            Self::Copy => "Copy",
+            Self::Paste => "Paste",
             Self::SelectAll => "Select All",
             Self::Windows => "Windows key bindings",
             Self::Emacs => "Emacs key bindings",
@@ -119,12 +119,16 @@ pub(crate) struct Menu {
     pub(crate) redo: bool,
     pub(crate) wrap: bool,
     pub(crate) auto_fill: bool,
+    pub(crate) copy: bool,
+    pub(crate) paste: bool,
 }
 
 impl Menu {
     pub(crate) fn enabled(&self, item: Item) -> bool {
         match item {
-            Item::Cut | Item::Copy | Item::Paste | Item::Spell => false,
+            Item::Cut | Item::Copy => self.copy,
+            Item::Paste => self.paste,
+            Item::Spell => false,
             Item::Open | Item::Save | Item::SaveAs => self.file_window,
             Item::Undo => self.undo,
             Item::Redo => self.redo,
@@ -273,6 +277,8 @@ mod tests {
             redo: false,
             wrap: true,
             auto_fill: false,
+            copy: false,
+            paste: false,
         }
     }
 

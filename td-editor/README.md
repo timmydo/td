@@ -28,7 +28,7 @@ close marks and scrolls with wheels/touchpads. A small bitmap arrow supplies
 the cursor. Click File/Edit/Format/Help or press F10 for menus; arrow keys
 navigate, Return activates and Escape/Ctrl+G cancels. Edit switches key
 profiles; Format exposes Soft Wrap, Auto Fill and Fill Paragraph.
-No GPU renderer, clipboard, spelling, remote socket or tmc integration is
+No GPU renderer, spelling, remote socket or tmc integration is
 claimed yet. Do not set
 `$EDITOR` to this binary yet.
 
@@ -54,15 +54,18 @@ reference. It also launches the real replay executable without a display.
 `clipboard.rs` supplies tested, display-independent copy snapshots and
 selection-bound Cut/Paste admission through the controller. Paste collects
 at most 1 MiB of raw bytes; oversized, malformed or stale transfers cannot
-partially edit a document. This is a prerequisite, not system clipboard
-support: the native menu entries remain disabled until the Wayland adapter
-and its descriptor audit are connected.
+partially edit a document. The experimental native window now connects these
+operations to core Wayland data-device v3 when the compositor supplies it.
 
 `transfer.rs` adds the tested descriptor transport prerequisite: bounded
 nonblocking pipe/socket writes and private-socket reads, explicit clocks,
 five-second deadlines and EOF-only Paste admission. Cancellation restores
-outgoing descriptor flags. This is a library adapter, not yet native
-Cut/Copy/Paste support.
+outgoing descriptor flags. Windows Ctrl+C/X/V, Emacs M-w/C-w/C-y and the
+Edit menu use these transfers. Copy/Cut require a focused physical input
+event; Paste accepts UTF-8 text only. Escape cancels pending paste. There is
+no PRIMARY selection or drag-and-drop editing, and FIFO-specific clipboard
+producers are not supported by the current socketpair receiver. Live
+third-party toolkit interoperability is not yet claimed.
 
 `src/files.rs` now supplies the synchronous file-transaction adapter: bounded
 regular-file Open and baselines, external-change detection, metadata-checked
@@ -186,7 +189,8 @@ It starts with two editable scratch tabs and follows window-manager resizing.
 Type, navigate, select with Shift, undo, and switch tabs with Ctrl+Tab.
 Windows-like bindings are the default; the second command selects Emacs.
 Mouse selection, tab clicks, scrolling and menus work. Open/Save remain
-disabled in the scratch preview; clipboard and spelling are not connected.
+disabled in the scratch preview; spelling is not connected. Clipboard
+commands require an available data-device v3 and keyboard focus.
 Unavailable commands show a notice; Escape/Ctrl+G dismisses it. Closing a
 dirty tab refuses; undo to clean or close the window to discard all scratch
 text. Dirty window close asks for Ctrl+D to discard everything, or

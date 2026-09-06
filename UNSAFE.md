@@ -2082,9 +2082,9 @@ live until restoration has been attempted, then std closes it. No extra
 adoption site or close syscall is needed. Flags are shared with the sender's
 open-file description; the caller must supply an exclusively used write
 endpoint, not one concurrently used or reconfigured by another writer.
-The public `transfer` module exposes bounded transport owners for adapter
-and test use. It does not yet bind the window's descriptor FIFO to clipboard
-events, send a clipboard endpoint on that connection or acquire a selection.
+The public `transfer` module exposes bounded transport owners. The window
+binds its descriptor FIFO to the exact data-source send schema below and
+passes a fresh private socket endpoint for receiving selected UTF-8 text.
 
 The one receive caller is the window connection. `recvmsg` always requests
 `MSG_CMSG_CLOEXEC` (0x40000000), with one borrowed byte slice and 128 aligned
@@ -2099,7 +2099,7 @@ descriptors. Valid rights move into the window connection's FIFO, bounded to
 eight pending descriptors independently of its byte queue. Queue overflow,
 parse failure, disconnect and window teardown drop all remaining owners.
 
-The sole production consumer is `wayland::read_keymap`: one descriptor per
+The keymap production consumer is `wayland::read_keymap`: one descriptor per
 `wl_keyboard.keymap`, including unsupported formats and events queued on a
 retired keyboard. Retired events drop their descriptor without reading it.
 Active text-v1 maps convert the owner to `File` with safe `From`, require a
@@ -2115,10 +2115,22 @@ if a subsequent map succeeds. A missing descriptor waits at most five seconds
 without assuming ancillary boundaries coincide with wire-message boundaries.
 A test-only reader uses the same ownership path to inspect sent SHM pools.
 
-The only production send caller is the connection's SHM-pool request path.
+The second production consumer is a data-source send event: exactly one
+descriptor moves to `transfer::Outgoing`, or is dropped on unsupported MIME,
+stale/retired source or an occupied outgoing slot. Complete event schemas
+are validated before waiting for or consuming a descriptor. Missing rights
+use the same five-second FIFO wait as keymap events; unknown events never
+consume arbitrary queued rights. No clipboard endpoint is reopened through
+procfs or admitted as a regular file. Destination writes use std and assume
+Rust's ignored SIGPIPE disposition, as documented by the transfer API.
+
+The only production send caller is the connection's descriptor-send path.
 `sendmsg` carries exactly one borrowed `File` in a 24-byte ancillary extent,
 `cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies only its
-unlinked 0600 regular SHM backing file.
+unlinked 0600 regular SHM backing file, or the producer side of a fresh
+private UnixStream pair for `wl_data_offer.receive`. The receiving side uses
+safe std nonblocking mode, is bounded to 1 MiB and is never mapped or written
+to disk. The local producer owner is dropped after the request is sent.
 `MSG_NOSIGNAL` (0x4000) makes peer loss
 an error. A successful short write transfers the descriptor once; only the
 remaining ordinary bytes are retried. Interrupted calls transfer nothing.
