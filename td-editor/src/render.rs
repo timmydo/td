@@ -18,6 +18,7 @@ pub const CHROME: u32 = 0xe1dbcf;
 pub const BORDER: u32 = 0xb5ada0;
 pub const SELECTED: u32 = 0x536b73;
 pub const INACTIVE_SELECTION: u32 = 0xc8c4bb;
+pub(crate) const MISSPELLED: u32 = 0x9c5548;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Weight {
@@ -396,6 +397,8 @@ pub struct Scene<'a> {
     labels: &'a [Label<'a>],
     status: String,
     caret: Option<Position>,
+    spelling: &'a [std::ops::Range<usize>],
+    spelling_status: Option<String>,
 }
 
 impl<'a> Scene<'a> {
@@ -433,7 +436,7 @@ impl<'a> Scene<'a> {
             let current_line = before.rsplit_once('\n').map_or(before, |(_, tail)| tail);
             let column = text::column(current_line) + 1;
             status = format!(
-                "Ln {line}, Col {column}   {}   Fill:{}   {}   Spelling: not checked",
+                "Ln {line}, Col {column}   {}   Fill:{}   {}",
                 if doc.format().ending == text::LineEnding::Lf {
                     "LF"
                 } else {
@@ -463,7 +466,19 @@ impl<'a> Scene<'a> {
             labels,
             status,
             caret,
+            spelling: &[],
+            spelling_status: None,
         })
+    }
+
+    pub(crate) fn spelling(mut self, state: &'a crate::spelling::WindowState) -> Self {
+        if self.editor.active().is_none() {
+            return self;
+        }
+        let (status, marks) = state.view(self.editor);
+        self.spelling_status = Some(status);
+        self.spelling = marks;
+        self
     }
 
     /// Streams operations: the backend need not allocate a retained scene list.
@@ -583,8 +598,18 @@ impl<'a> Scene<'a> {
             BORDER,
             sink,
         );
+        let spelling = if self.editor.active().is_some() {
+            self.spelling_status
+                .as_deref()
+                .unwrap_or("Spelling: not checked")
+        } else {
+            ""
+        };
         self.label(
-            self.status.chars(),
+            self.status
+                .chars()
+                .chain(if spelling.is_empty() { "" } else { "   " }.chars())
+                .chain(spelling.chars()),
             (8 * s, status_rect.y + 4 * s),
             status_rect,
             GlyphStyle::medium(INK, CHROME),
@@ -620,6 +645,7 @@ impl<'a> Scene<'a> {
             self.view.origin.column
         };
         let selection = doc.selection().range();
+        let mut mark = 0;
         for (index, row) in layout
             .rows()
             .skip(self.view.origin.row)
@@ -678,6 +704,33 @@ impl<'a> Scene<'a> {
                                     PAPER
                                 },
                             ),
+                        },
+                    });
+                }
+                while self
+                    .spelling
+                    .get(mark)
+                    .is_some_and(|range| range.end <= cell.bytes.start)
+                {
+                    mark += 1;
+                }
+                if self.spelling.get(mark).is_some_and(|range| {
+                    range.start <= cell.bytes.start && cell.bytes.end <= range.end
+                }) {
+                    sink(Draw {
+                        clip,
+                        primitive: Primitive::Fill {
+                            rect: Rect {
+                                x,
+                                y: y + ch as i64 - s as i64,
+                                width: (cell.width * cw) as u32,
+                                height: s as u32,
+                            },
+                            color: if selected && self.view.focused {
+                                PAPER
+                            } else {
+                                MISSPELLED
+                            },
                         },
                     });
                 }

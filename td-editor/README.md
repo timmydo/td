@@ -13,7 +13,7 @@ Unicode-scalar editing and single-cell Unifont rendering, preserves UTF-8
 BOM and uniform LF/CRLF files, defaults to Windows-like bindings, and uses
 an explicitly selected local English word list. Spelling runs only on
 request; an edit invalidates marks without starting another scan. The spelling
-library is implemented, but native spelling controls are not connected yet.
+library and native F7/Format controls are implemented.
 
 ## Implemented core
 
@@ -38,7 +38,7 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-No GPU renderer, spelling, remote socket or tmc integration is
+No GPU renderer, remote socket or tmc integration is
 claimed yet. Do not set
 `$EDITOR` to this binary yet.
 
@@ -71,8 +71,16 @@ operations to core Wayland data-device v3 when the compositor supplies it.
 revision-bound whole-document scans. `files::read_dictionary` reads only a
 caller-selected regular file with bounded input and post-parse race checks;
 it never probes system word lists, writes files or creates a saved baseline.
-These are library APIs, not a working `--dictionary` option or native F7
-action yet. No word list is bundled or downloaded.
+Use `--window --dictionary PATH [FILE...]` or Format > Dictionary to load a
+word list. F7 or Format > Check Spelling checks the whole active document;
+Escape/Ctrl+G cancels. Underlines and counts appear together on completion.
+Edits clear that tab's results without rechecking, and dictionary replacement
+clears all results. A failed replacement retains the old dictionary/results.
+Format > Next/Previous Misspelling selects marked words without wrapping.
+At most 10,000 ranges are stored across the window; omitted unknown words
+still count and status reports capped marks. No word list is bundled or
+downloaded, and no text leaves the machine. A separate results-list panel,
+M-x entry and remote spelling queries remain unimplemented.
 
 `transfer.rs` adds the tested descriptor transport prerequisite: bounded
 nonblocking pipe/socket writes and private-socket reads, explicit clocks,
@@ -206,7 +214,8 @@ It starts with two editable scratch tabs and follows window-manager resizing.
 Type, navigate, select with Shift, undo, and switch tabs with Ctrl+Tab.
 Windows-like bindings are the default; the second command selects Emacs.
 Mouse selection, tab clicks, scrolling and menus work. Open/Save remain
-disabled in the scratch preview; spelling is not connected. Clipboard
+disabled in the scratch preview, as is dictionary loading. F7 reports no
+dictionary there. Clipboard
 commands require an available data-device v3 and keyboard focus.
 Unavailable commands show a notice; Escape/Ctrl+G dismisses it. Closing a
 dirty tab refuses; undo to clean or close the window to discard all scratch

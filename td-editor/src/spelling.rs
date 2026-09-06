@@ -156,7 +156,7 @@ impl Token {
         }
     }
 
-    fn finish(&mut self, dictionary: &Dictionary, report: &mut Report) {
+    fn finish(&mut self, dictionary: &Dictionary, report: &mut Report, limit: usize) {
         if self.scalars == 0 {
             return;
         }
@@ -166,7 +166,7 @@ impl Token {
             report.counts.checked += 1;
             if !dictionary.contains(&self.normalized) {
                 report.counts.unknown += 1;
-                if report.marks.len() < MARKS {
+                if report.marks.len() < limit {
                     report.marks.push(self.start..self.end);
                 } else {
                     report.counts.truncated = true;
@@ -193,6 +193,7 @@ pub struct Scan {
     offset: usize,
     token: Token,
     state: State,
+    mark_limit: usize,
 }
 
 impl Scan {
@@ -202,12 +203,25 @@ impl Scan {
         revision: u64,
         dictionary: &Dictionary,
     ) -> Result<Self> {
+        Self::limited(editor, tab, revision, dictionary, MARKS)
+    }
+
+    fn limited(
+        editor: &Editor,
+        tab: TabId,
+        revision: u64,
+        dictionary: &Dictionary,
+        mark_limit: usize,
+    ) -> Result<Self> {
+        if mark_limit > MARKS {
+            return Err(Error::Limit);
+        }
         Ok(Self {
             report: Report {
                 point: editor.revision_point(tab, revision)?,
                 dictionary: dictionary.identity.clone(),
                 counts: Counts::default(),
-                marks: Vec::with_capacity(MARKS),
+                marks: Vec::with_capacity(mark_limit),
             },
             offset: 0,
             token: Token {
@@ -215,6 +229,7 @@ impl Scan {
                 ..Token::default()
             },
             state: State::Pending,
+            mark_limit,
         })
     }
 
@@ -255,11 +270,13 @@ impl Scan {
             if c.is_alphanumeric() || internal_apostrophe {
                 self.token.push(at, c);
             } else {
-                self.token.finish(dictionary, &mut self.report);
+                self.token
+                    .finish(dictionary, &mut self.report, self.mark_limit);
             }
         }
         if self.offset == text.len() {
-            self.token.finish(dictionary, &mut self.report);
+            self.token
+                .finish(dictionary, &mut self.report, self.mark_limit);
             self.state = State::Complete;
         }
         Ok(self.state == State::Complete)
@@ -271,6 +288,158 @@ impl Scan {
         }
         self.report.validate(editor, dictionary)?;
         Ok(self.report)
+    }
+}
+
+/// Window ownership: one dictionary, one scan, one shared mark budget.
+#[derive(Default)]
+pub(crate) struct WindowState {
+    dictionary: Option<Dictionary>,
+    reports: std::collections::BTreeMap<TabId, Report>,
+    scan: Option<Scan>,
+}
+
+impl WindowState {
+    pub(crate) fn install(&mut self, dictionary: Dictionary) {
+        self.scan = None;
+        self.reports.clear();
+        self.dictionary = Some(dictionary);
+    }
+
+    pub(crate) fn cancel(&mut self) -> bool {
+        self.scan.take().is_some()
+    }
+
+    pub(crate) fn running(&self) -> bool {
+        self.scan.is_some()
+    }
+
+    pub(crate) fn dictionary_entries(&self) -> Option<usize> {
+        self.dictionary.as_ref().map(Dictionary::entry_count)
+    }
+
+    pub(crate) fn checking_active(&self, editor: &Editor) -> bool {
+        self.scan.as_ref().is_some_and(|scan| {
+            editor.active() == Some(scan.report.tab())
+                && self
+                    .dictionary
+                    .as_ref()
+                    .is_some_and(|dictionary| scan.report.validate(editor, dictionary).is_ok())
+        })
+    }
+
+    fn current(&self, editor: &Editor) -> Option<(Counts, &[Range<usize>])> {
+        if self.checking_active(editor) {
+            return None;
+        }
+        self.reports
+            .get(&editor.active()?)?
+            .results(editor, self.dictionary.as_ref()?)
+            .ok()
+    }
+
+    pub(crate) fn observe(&mut self, editor: &Editor) -> bool {
+        let Some(dictionary) = &self.dictionary else {
+            return false;
+        };
+        let before = self.reports.len();
+        self.reports
+            .retain(|_, report| report.validate(editor, dictionary).is_ok());
+        let stale = self
+            .scan
+            .as_ref()
+            .is_some_and(|scan| scan.report.validate(editor, dictionary).is_err());
+        if stale {
+            self.scan = None;
+        }
+        stale || self.reports.len() != before
+    }
+
+    pub(crate) fn start(&mut self, editor: &Editor, tab: TabId, revision: u64) -> Result<bool> {
+        self.observe(editor);
+        editor.revision_point(tab, revision)?;
+        let Some(dictionary) = &self.dictionary else {
+            return Ok(false);
+        };
+        let used: usize = self
+            .reports
+            .iter()
+            .filter(|(id, _)| **id != tab)
+            .map(|(_, report)| report.marks.len())
+            .sum();
+        let remaining = MARKS.checked_sub(used).ok_or(Error::Limit)?;
+        let scan = Scan::limited(editor, tab, revision, dictionary, remaining)?;
+        self.reports.remove(&tab);
+        self.scan = Some(scan);
+        Ok(true)
+    }
+
+    /// Exactly one chunk, even if a timer or input batch contains many events.
+    pub(crate) fn step(&mut self, editor: &Editor) -> Result<bool> {
+        let changed = self.observe(editor);
+        let Some(scan) = self.scan.as_mut() else {
+            return Ok(changed);
+        };
+        let dictionary = self.dictionary.as_ref().ok_or(Error::InvalidArgument)?;
+        let complete = match scan.step(editor, dictionary) {
+            Ok(complete) => complete,
+            Err(error) => {
+                self.scan = None;
+                return Err(error);
+            }
+        };
+        if !complete {
+            return Ok(changed);
+        }
+        let scan = self.scan.take().ok_or(Error::InvalidArgument)?;
+        let mut report = scan.finish(editor, dictionary)?;
+        report.marks.shrink_to_fit();
+        self.reports.insert(report.tab(), report);
+        Ok(true)
+    }
+
+    pub(crate) fn view<'a>(&'a self, editor: &Editor) -> (String, &'a [Range<usize>]) {
+        if self.dictionary.is_none() {
+            return ("Spelling: no dictionary".into(), &[]);
+        }
+        if editor.active().is_none() {
+            return ("Spelling: no document".into(), &[]);
+        }
+        if self.checking_active(editor) {
+            return ("Spelling: checking (Escape cancels)".into(), &[]);
+        }
+        match self.current(editor) {
+            Some((counts, marks)) => (
+                format!(
+                    "Spelling: {} unknown / {} checked; {} skipped{}",
+                    counts.unknown,
+                    counts.checked,
+                    counts.skipped,
+                    if counts.truncated {
+                        "; marks capped"
+                    } else {
+                        ""
+                    },
+                ),
+                marks,
+            ),
+            None => ("Spelling: not checked".into(), &[]),
+        }
+    }
+
+    pub(crate) fn select(&self, editor: &Editor, previous: bool) -> Result<Option<Range<usize>>> {
+        let tab = editor.active().ok_or(Error::MissingTab)?;
+        let selection = editor.document(tab)?.selection().range();
+        let marks = self.current(editor).map_or(&[][..], |(_, marks)| marks);
+        Ok(if previous {
+            marks
+                .partition_point(|range| range.end <= selection.start)
+                .checked_sub(1)
+                .and_then(|index| marks.get(index))
+        } else {
+            marks.get(marks.partition_point(|range| range.start < selection.end))
+        }
+        .cloned())
     }
 }
 
@@ -291,6 +460,124 @@ mod tests {
         let mut scan = Scan::begin(ui.editor(), 1, 0, dictionary).unwrap();
         while !scan.step(ui.editor(), dictionary).unwrap() {}
         scan.finish(ui.editor(), dictionary).unwrap()
+    }
+
+    fn finish_window(state: &mut WindowState, ui: &Controller) {
+        let mut turns = 0;
+        while state.running() {
+            state.step(ui.editor()).unwrap();
+            turns += 1;
+            assert!(turns < 1000);
+        }
+    }
+
+    #[test]
+    fn window_scans_are_explicit_atomic_cancellable_and_revision_bound() {
+        let mut ui = document(&format!("{}known wrong", " ".repeat(STEP_SCALARS)));
+        let mut state = WindowState::default();
+        assert!(!state.start(ui.editor(), 1, 0).unwrap());
+        assert!(state.view(ui.editor()).0.contains("no dictionary"));
+        state.install(Dictionary::parse(b"known").unwrap());
+        assert!(!state.running());
+        assert!(state.start(ui.editor(), 1, 0).unwrap());
+        assert!(!state.step(ui.editor()).unwrap());
+        assert!(state.view(ui.editor()).1.is_empty());
+        assert!(state.view(ui.editor()).0.contains("checking"));
+        assert!(state.cancel());
+        assert!(!state.cancel());
+        assert!(state.view(ui.editor()).0.contains("not checked"));
+        state.start(ui.editor(), 1, 0).unwrap();
+        finish_window(&mut state, &ui);
+        assert_eq!(
+            state.view(ui.editor()).1,
+            std::slice::from_ref(&(STEP_SCALARS + 6..STEP_SCALARS + 11))
+        );
+        assert!(state.view(ui.editor()).0.contains("1 unknown / 2 checked"));
+        assert_eq!(state.start(ui.editor(), 1, 99), Err(Error::StaleRevision));
+        assert_eq!(state.view(ui.editor()).1.len(), 1);
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: Command::Select(Selection {
+                anchor: 0,
+                caret: 0,
+            }),
+        })
+        .unwrap();
+        assert!(!state.observe(ui.editor()));
+        let range = state.select(ui.editor(), false).unwrap().unwrap();
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: Command::Select(Selection {
+                anchor: range.start,
+                caret: range.end,
+            }),
+        })
+        .unwrap();
+        assert!(state.select(ui.editor(), false).unwrap().is_none());
+        assert!(state.select(ui.editor(), true).unwrap().is_none());
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: Command::Insert("changed".into()),
+        })
+        .unwrap();
+        assert!(state.view(ui.editor()).1.is_empty());
+        assert!(state.observe(ui.editor()));
+        assert!(!state.running());
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 1,
+            command: Command::Undo,
+        })
+        .unwrap();
+        assert!(state.view(ui.editor()).1.is_empty());
+        state.start(ui.editor(), 1, 2).unwrap();
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 2,
+            command: Command::Insert("x".into()),
+        })
+        .unwrap();
+        assert!(state.step(ui.editor()).unwrap());
+        assert!(!state.running());
+    }
+
+    #[test]
+    fn window_budget_counts_all_tabs_and_keeps_nonactive_results() {
+        let mut ui = document(&"wrong ".repeat(MARKS));
+        let mut state = WindowState::default();
+        state.install(Dictionary::parse(b"known").unwrap());
+        state.start(ui.editor(), 1, 0).unwrap();
+        finish_window(&mut state, &ui);
+        assert_eq!(state.view(ui.editor()).1.len(), MARKS);
+        ui.dispatch(Event::Load(b"also wrong")).unwrap();
+        state.start(ui.editor(), 2, 0).unwrap();
+        ui.dispatch(Event::SelectTab(1)).unwrap();
+        finish_window(&mut state, &ui);
+        assert_eq!(state.view(ui.editor()).1.len(), MARKS);
+        ui.dispatch(Event::SelectTab(2)).unwrap();
+        let (status, marks) = state.view(ui.editor());
+        assert!(marks.is_empty());
+        assert!(status.contains("2 unknown / 2 checked"));
+        assert!(status.contains("marks capped"));
+        assert_eq!(
+            state.reports.values().map(|r| r.marks.len()).sum::<usize>(),
+            MARKS
+        );
+        ui.dispatch(Event::Close {
+            tab: 1,
+            revision: 0,
+        })
+        .unwrap();
+        state.start(ui.editor(), 2, 0).unwrap();
+        finish_window(&mut state, &ui);
+        assert_eq!(state.view(ui.editor()).1, &[0..4, 5..10]);
+        assert!(!state.view(ui.editor()).0.contains("marks capped"));
+        state.install(Dictionary::parse(b"known").unwrap());
+        assert!(state.view(ui.editor()).1.is_empty());
+        assert!(state.reports.is_empty());
     }
 
     #[test]

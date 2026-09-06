@@ -12,6 +12,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 type Result<T> = std::result::Result<T, String>;
 
 enum Operation {
+    Dictionary(PathBuf),
     Open(PathBuf),
     Reload(FileId),
     Save {
@@ -31,12 +32,14 @@ struct Loaded {
     missing: bool,
 }
 enum Completion {
+    Dictionary(crate::spelling::Dictionary),
     Open(Loaded),
     Reload(Loaded),
     Conflict(String),
     Saved { file: FileId, path: PathBuf },
 }
 enum Pending {
+    Dictionary,
     Open,
     Reload { permit: Option<crate::Reload> },
     Save { tab: TabId, point: SavePoint },
@@ -53,6 +56,7 @@ pub(crate) struct Session {
     associations: BTreeMap<TabId, Association>,
     failed: bool,
     conflict: Option<crate::dialog::Target>,
+    dictionary: Option<crate::spelling::Dictionary>,
 }
 
 impl Session {
@@ -70,6 +74,7 @@ impl Session {
             associations: BTreeMap::new(),
             failed: false,
             conflict: None,
+            dictionary: None,
         })
     }
 
@@ -102,6 +107,29 @@ impl Session {
             return Err("Path exceeds 4096 bytes".into());
         }
         self.submit(Operation::Open(path), Pending::Open)
+    }
+
+    pub(crate) fn dictionary(&mut self, path: PathBuf) -> Result<()> {
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.is_empty() || bytes.len() > 4096 || bytes.contains(&0) {
+            return Err("Dictionary path must contain 1..=4096 non-NUL bytes".into());
+        }
+        if self.dictionary.is_some() {
+            return Err("Dictionary completion must be consumed first".into());
+        }
+        self.submit(Operation::Dictionary(path), Pending::Dictionary)
+    }
+
+    pub(crate) fn take_dictionary(&mut self) -> Option<crate::spelling::Dictionary> {
+        self.dictionary.take()
+    }
+
+    /// Startup only, before connecting the display.
+    pub(crate) fn initial_dictionary(&mut self, ui: &mut Controller, path: PathBuf) -> Result<()> {
+        self.dictionary(path)?;
+        let result = self.receiver.recv().map_err(|e| e.to_string())?;
+        let pending = self.pending.take();
+        self.finish(ui, pending, result).map(|_| ())
     }
 
     /// Only before connecting the display; the event loop uses poll instead.
@@ -202,6 +230,13 @@ impl Session {
         result: Result<Completion>,
     ) -> Result<String> {
         match (pending, result?) {
+            (Some(Pending::Dictionary), Completion::Dictionary(dictionary)) => {
+                let count = dictionary.entry_count();
+                self.dictionary = Some(dictionary);
+                Ok(format!(
+                    "Dictionary loaded: {count} entries. F7 checks the whole document."
+                ))
+            }
             (Some(Pending::Save { tab, .. }), Completion::Conflict(detail)) => {
                 if let Ok(doc) = ui.editor().document(tab) {
                     self.conflict = Some(crate::dialog::Target {
@@ -355,6 +390,11 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
     // Release closed tabs and rejected Open admissions before the next job.
     retain_files(files, known, &job.keep);
     match job.operation {
+        Operation::Dictionary(path) => crate::files::read_dictionary(&path)
+            .map(Completion::Dictionary)
+            .map_err(|detail| {
+                format!("Dictionary load refused; dictionary selection unchanged: {detail}")
+            }),
         // The outer worker owns Reload's borrow across jobs; never adopt here.
         Operation::Reload(_) => Err("Reload requires the worker's prepared handoff".into()),
         Operation::Open(path) => {
@@ -500,6 +540,46 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_worker_is_bounded_and_never_creates_document_associations() {
+        let directory = Directory::new();
+        let path = directory.path("words");
+        fs::write(&path, b"known\nknown\r\nother").unwrap();
+        let mut session = Session::start().unwrap();
+        let mut ui = Controller::default();
+        ui.dispatch(Event::New).unwrap();
+        let before = format!("{:?}", ui.editor());
+        for invalid in [
+            PathBuf::new(),
+            PathBuf::from("a\0b"),
+            PathBuf::from("x".repeat(4097)),
+        ] {
+            assert!(session.dictionary(invalid).is_err());
+            assert!(!session.busy());
+        }
+        session.dictionary(path.clone()).unwrap();
+        assert!(session.busy());
+        assert!(session.open(directory.path("text")).is_err());
+        assert!(session.dictionary(path.clone()).is_err());
+        assert!(finish_worker(&mut session, &mut ui)
+            .unwrap()
+            .contains("2 entries"));
+        assert!(!session.busy());
+        assert!(session.dictionary(path.clone()).is_err());
+        assert_eq!(session.take_dictionary().unwrap().entry_count(), 2);
+        assert!(session.take_dictionary().is_none());
+        assert_eq!(format!("{:?}", ui.editor()), before);
+        assert!(session.associations.is_empty());
+        fs::write(&path, b"not a word").unwrap();
+        session.dictionary(path).unwrap();
+        assert!(finish_worker(&mut session, &mut ui)
+            .unwrap_err()
+            .contains("dictionary selection unchanged"));
+        assert!(session.take_dictionary().is_none());
+        assert_eq!(format!("{:?}", ui.editor()), before);
+        assert!(session.associations.is_empty());
+    }
+
+    #[test]
     fn reload_handoff_adopts_only_after_model_admission_and_cancellation_retains_baseline() {
         for rejection in [None, Some("cancel"), Some("stale")] {
             let directory = Directory::new();
@@ -612,6 +692,7 @@ mod tests {
                     associations: BTreeMap::new(),
                     failed: false,
                     conflict: None,
+                    dictionary: None,
                 },
                 jobs,
                 results,

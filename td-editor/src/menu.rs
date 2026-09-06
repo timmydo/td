@@ -40,7 +40,15 @@ impl Group {
                 FindPrevious,
                 GoToLine,
             ],
-            Self::Format => &[Wrap, AutoFill, Fill, Spell],
+            Self::Format => &[
+                Wrap,
+                AutoFill,
+                Fill,
+                Spell,
+                Dictionary,
+                NextMisspelling,
+                PreviousMisspelling,
+            ],
             Self::Help => &[About],
         }
     }
@@ -71,6 +79,9 @@ pub(crate) enum Item {
     FindNext,
     FindPrevious,
     GoToLine,
+    Dictionary,
+    NextMisspelling,
+    PreviousMisspelling,
 }
 
 impl Item {
@@ -93,7 +104,10 @@ impl Item {
             Self::Wrap => "Soft Wrap",
             Self::AutoFill => "Auto Fill",
             Self::Fill => "Fill Paragraph",
-            Self::Spell => "Spelling (unavailable)",
+            Self::Spell => "Check Spelling",
+            Self::Dictionary => "Dictionary...",
+            Self::NextMisspelling => "Next Misspelling",
+            Self::PreviousMisspelling => "Previous Misspelling",
             Self::About => "About td-editor",
             Self::Find => "Find...",
             Self::FindNext => "Find Next",
@@ -154,8 +168,7 @@ impl Menu {
         match item {
             Item::Cut | Item::Copy => self.copy,
             Item::Paste => self.paste,
-            Item::Spell => false,
-            Item::Open | Item::Save | Item::SaveAs => self.file_window,
+            Item::Dictionary | Item::Open | Item::Save | Item::SaveAs => self.file_window,
             Item::Undo => self.undo,
             Item::Redo => self.redo,
             _ => true,

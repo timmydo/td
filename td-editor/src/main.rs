@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 const HELP: &str = concat!(
     "td-editor --window [--keys=windows|emacs] [--] [FILE...]\n",
+    "Window option: --dictionary PATH loads an explicit local English word list.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -24,7 +25,11 @@ const HELP: &str = concat!(
     "Return searches, Ctrl+U clears, Escape/Ctrl+G cancels.\n",
     "At the start/end, repeat the same search to wrap.\n",
     "Go To Line: F6 or Edit menu in both profiles; enter a one-based logical line.\n",
-    "No GPU renderer, spelling UI, control socket, crash recovery or tmc integration.\n",
+    "F7 checks the whole document on demand; Escape/Ctrl+G cancels.\n",
+    "Format: Dictionary, Check Spelling, Next/Previous Misspelling (no wrapping).\n",
+    "Spelling underlines appear at completion; edits clear them without rechecking.\n",
+    "Word list: UTF-8, one ASCII word per line; 16 MiB / 250,000 unique words.\n",
+    "No bundled word list, GPU renderer, control socket, recovery or tmc integration.\n",
     "Fixtures: --replay | --preview\n",
     "Scratch: --window-preview [--keys=windows|emacs]\n",
     "Scratch window has no file I/O.\n",
@@ -58,20 +63,42 @@ fn main() -> ExitCode {
     }
 }
 
-fn window_args(
-    args: &[std::ffi::OsString],
-) -> io::Result<(td_editor::keys::Profile, Vec<std::path::PathBuf>)> {
+struct WindowArgs {
+    profile: td_editor::keys::Profile,
+    paths: Vec<std::path::PathBuf>,
+    dictionary: Option<std::path::PathBuf>,
+}
+
+fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
     use std::os::unix::ffi::OsStrExt;
     let mut profile = td_editor::keys::Profile::Windows;
     let mut literal = false;
     let mut paths = Vec::new();
-    for arg in args {
+    let mut dictionary = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         if !literal && arg == "--" {
             literal = true;
         } else if !literal && arg == "--keys=emacs" {
             profile = td_editor::keys::Profile::Emacs;
         } else if !literal && arg == "--keys=windows" {
             profile = td_editor::keys::Profile::Windows;
+        } else if !literal && arg == "--dictionary" {
+            if dictionary.is_some() {
+                return Err(io::Error::other("--dictionary may be specified only once"));
+            }
+            let path = args
+                .next()
+                .ok_or_else(|| io::Error::other("--dictionary needs a literal path"))?;
+            if path.as_bytes().is_empty()
+                || path.as_bytes().len() > 4096
+                || path.as_bytes().contains(&0)
+            {
+                return Err(io::Error::other(
+                    "dictionary path must contain 1..=4096 non-NUL bytes",
+                ));
+            }
+            dictionary = Some(path.into());
         } else if !literal && arg.as_bytes().starts_with(b"-") {
             return Err(io::Error::other(
                 "unknown window option; use -- before dash-prefixed paths",
@@ -88,12 +115,16 @@ fn window_args(
             paths.push(std::path::PathBuf::from(arg));
         }
     }
-    Ok((profile, paths))
+    Ok(WindowArgs {
+        profile,
+        paths,
+        dictionary,
+    })
 }
 
 fn file_window(args: &[std::ffi::OsString]) -> io::Result<()> {
-    let (profile, paths) = window_args(args)?;
-    td_editor::wayland::file_window(profile, paths)
+    let args = window_args(args)?;
+    td_editor::wayland::file_window(args.profile, args.paths, args.dictionary)
 }
 
 #[cfg(test)]
@@ -115,7 +146,8 @@ mod tests {
             "not incremental",
             "At the start/end, repeat the same search to wrap",
             "Do not use as $EDITOR yet",
-            "No GPU renderer, spelling UI",
+            "F7 checks the whole document on demand",
+            "No bundled word list, GPU renderer",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }
@@ -126,6 +158,37 @@ mod tests {
             .contains("Scratch close: Ctrl+D discards ALL scratch edits; Escape/Ctrl+G cancels."));
     }
     #[test]
+    fn dictionary_option_is_explicit_bounded_literal_and_not_a_document() {
+        let raw = OsString::from_vec(b"words-\xff".to_vec());
+        let parsed = window_args(&["--dictionary".into(), raw.clone(), "text".into()]).unwrap();
+        assert_eq!(parsed.dictionary, Some(raw.into()));
+        assert_eq!(parsed.paths, vec![std::path::PathBuf::from("text")]);
+        let parsed = window_args(&[
+            "--dictionary".into(),
+            "-words".into(),
+            "--".into(),
+            "--dictionary".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.dictionary, Some("-words".into()));
+        assert_eq!(parsed.paths, vec![std::path::PathBuf::from("--dictionary")]);
+        for args in [
+            vec!["--dictionary".into()],
+            vec!["--dictionary".into(), "".into()],
+            vec!["--dictionary".into(), "x".repeat(4097).into()],
+            vec!["--dictionary".into(), OsString::from_vec(b"a\0b".to_vec())],
+            vec![
+                "--dictionary".into(),
+                "a".into(),
+                "--dictionary".into(),
+                "b".into(),
+            ],
+        ] {
+            assert!(window_args(&args).is_err());
+        }
+    }
+
+    #[test]
     fn literal_paths_and_options() {
         let raw = OsString::from_vec(b"file-\xff".to_vec());
         let args = vec![
@@ -134,7 +197,12 @@ mod tests {
             "-file".into(),
             raw.clone(),
         ];
-        let (profile, paths) = window_args(&args).unwrap();
+        let WindowArgs {
+            profile,
+            paths,
+            dictionary,
+        } = window_args(&args).unwrap();
+        assert!(dictionary.is_none());
         assert_eq!(profile, td_editor::keys::Profile::Emacs);
         assert_eq!(paths, vec![std::path::PathBuf::from("-file"), raw.into()]);
         assert!(window_args(&["--keys=other".into()]).is_err());

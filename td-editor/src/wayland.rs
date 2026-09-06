@@ -353,10 +353,12 @@ struct Window {
     search: Option<crate::search::Prompt>,
     goto: Option<crate::goto::Prompt>,
     searches: crate::search::History,
+    spelling: crate::spelling::WindowState,
 }
 
 enum PathAction {
     Open,
+    Dictionary,
     Save {
         tab: crate::model::TabId,
         revision: u64,
@@ -370,6 +372,7 @@ impl PathPrompt {
     fn notice(&self) -> String {
         let action = match self.action {
             PathAction::Open => "Open",
+            PathAction::Dictionary => "Dictionary (read only)",
             PathAction::Save { .. } => "Save As (new path only)",
         };
         // Keep the insertion end visible even for a long path. The full literal
@@ -445,6 +448,7 @@ impl Window {
             search: None,
             goto: None,
             searches: crate::search::History::default(),
+            spelling: crate::spelling::WindowState::default(),
         })
     }
 
@@ -538,6 +542,7 @@ impl Window {
         let result = self.event_inner(message);
         self.cancel_stale_paste();
         self.searches.observe(self.ui.editor());
+        self.dirty |= self.spelling.observe(self.ui.editor());
         result
     }
 
@@ -1189,6 +1194,7 @@ impl Window {
         if matches!(chord, "Escape" | "C-g") && !repeated {
             self.clipboard.incoming = None;
             self.searches.cancel_wrap();
+            self.dirty |= self.spelling.cancel();
         }
         if self.quitting {
             if !repeated {
@@ -1240,6 +1246,12 @@ impl Window {
             return Ok(false);
         };
         let revision = self.ui.editor().document(tab).map_err(error)?.revision();
+        if chord == "F7" {
+            if !repeated {
+                self.spelling_request(tab, revision);
+            }
+            return Ok(false);
+        }
         if chord == "F6" {
             if !repeated {
                 self.goto_request(tab, revision)?;
@@ -1330,6 +1342,14 @@ impl Window {
                 self.input.cancel_repeat();
             }
             let succeeded = result.is_ok();
+            if let Some(dictionary) = self
+                .files
+                .as_mut()
+                .and_then(|files| files.take_dictionary())
+            {
+                self.spelling.install(dictionary);
+                self.dirty = true;
+            }
             self.notify(match result {
                 Ok(notice) => notice,
                 Err(detail) => format!("File operation failed: {detail}"),
@@ -1379,6 +1399,19 @@ impl Window {
         }
         self.cancel_stale_paste();
         self.searches.observe(self.ui.editor());
+        self.dirty |= self.spelling.observe(self.ui.editor());
+        Ok(())
+    }
+
+    fn end_turn(&mut self, now: u64, repeat: bool) -> Result<()> {
+        self.tick(now, repeat)?;
+        match self.spelling.step(self.ui.editor()) {
+            Ok(changed) => self.dirty |= changed,
+            Err(detail) => self.notify(format!("Spelling cancelled: {detail}")),
+        }
+        if self.spelling.running() {
+            self.connection.wait = self.connection.wait.min(Duration::from_millis(1));
+        }
         Ok(())
     }
 
@@ -1430,7 +1463,14 @@ impl Window {
         let mut raster =
             Raster::new(&mut self.pixels, &self.font, geometry, width * 4).map_err(error)?;
         raster
-            .paint(&self.ui.scene(&labels).map_err(error)?, geometry.bounds())
+            .paint(
+                &self
+                    .ui
+                    .scene(&labels)
+                    .map_err(error)?
+                    .spelling(&self.spelling),
+                geometry.bounds(),
+            )
             .map_err(error)?;
         let notice = if self.quitting {
             Some(close_notice)
@@ -1549,7 +1589,7 @@ impl Window {
                 }
             }
             // Process queued releases/focus changes before a repeat can fire.
-            self.tick(now()?, processed < 256 && waiting.is_none())?;
+            self.end_turn(now()?, processed < 256 && waiting.is_none())?;
             self.draw()?;
             if !self.closed && processed < 256 {
                 if let Some((_, deadline)) = &waiting {
@@ -1801,10 +1841,21 @@ impl Window {
                 command: crate::model::Command::FillParagraph,
             },
             Item::About => {
-                self.notify("td-editor: experimental Wayland text editor. Pure std Rust; bitmap Unifont, warm palette. UTF-8 clipboard needs data-device v3. No spelling or recovery yet. Do not use as $EDITOR. F10 opens menus.");
+                self.notify("td-editor: experimental Wayland text editor. Pure std Rust; bitmap Unifont, warm palette. UTF-8 clipboard needs data-device v3. F7 checks spelling with an explicit local word list. No recovery. Do not use as $EDITOR. F10 opens menus.");
                 return Ok(());
             }
-            Item::Spell => return Ok(()),
+            Item::Spell => {
+                self.spelling_request(tab, revision);
+                return Ok(());
+            }
+            Item::Dictionary => {
+                self.file_request("dictionary", tab, revision);
+                return Ok(());
+            }
+            Item::NextMisspelling | Item::PreviousMisspelling => {
+                self.spelling_selection(item == Item::PreviousMisspelling)?;
+                return Ok(());
+            }
             Item::GoToLine => {
                 self.goto_request(tab, revision)?;
                 return Ok(());
@@ -2140,6 +2191,58 @@ impl Window {
         Some(format!("{readiness}{closing}{}", prompt.notice()))
     }
 
+    fn spelling_request(&mut self, tab: crate::model::TabId, revision: u64) {
+        self.menu = None;
+        self.stop_pointer();
+        self.input.cancel_repeat();
+        self.clipboard.incoming = None;
+        self.searches.cancel_wrap();
+        if let Err(detail) = self.ui.dispatch(Event::CancelInput) {
+            self.notify(format!("Spelling request refused: {detail}"));
+            return;
+        }
+        self.dirty = true;
+        match self.spelling.start(self.ui.editor(), tab, revision) {
+            Ok(true) => self.notice = None,
+            Ok(false) => self.notify(if self.files.is_some() {
+                "Spelling: no dictionary. Use Format > Dictionary to load a local English word list."
+            } else {
+                "Spelling: no dictionary. Scratch preview cannot load dictionaries; use --window."
+            }),
+            Err(detail) => self.notify(format!("Spelling request refused: {detail}")),
+        }
+    }
+
+    fn spelling_selection(&mut self, previous: bool) -> Result<()> {
+        if self.spelling.checking_active(self.ui.editor()) {
+            self.notify("Spelling is still checking this document. Wait for results, or Escape/Ctrl+G to cancel.");
+            return Ok(());
+        }
+        let Some(range) = self
+            .spelling
+            .select(self.ui.editor(), previous)
+            .map_err(error)?
+        else {
+            self.notify("No stored misspelling in that direction. Check Spelling with F7; navigation does not wrap.");
+            return Ok(());
+        };
+        let tab = self.ui.editor().active().ok_or("no document")?;
+        let revision = self.ui.editor().document(tab).map_err(error)?.revision();
+        self.ui
+            .dispatch(Event::Edit {
+                tab,
+                revision,
+                command: crate::model::Command::Select(crate::model::Selection {
+                    anchor: range.start,
+                    caret: range.end,
+                }),
+            })
+            .map_err(error)?;
+        self.dirty = true;
+        self.cancel_stale_paste();
+        Ok(())
+    }
+
     fn file_request(&mut self, name: &str, tab: crate::model::TabId, revision: u64) -> bool {
         self.menu = None;
         self.stop_pointer();
@@ -2163,6 +2266,8 @@ impl Window {
             self.prompt = Some(PathPrompt {
                 action: if name == "open" {
                     PathAction::Open
+                } else if name == "dictionary" {
+                    PathAction::Dictionary
                 } else {
                     PathAction::Save { tab, revision }
                 },
@@ -2202,6 +2307,7 @@ impl Window {
                 let path = PathBuf::from(&prompt.text);
                 let result = match prompt.action {
                     PathAction::Open => files.open(path),
+                    PathAction::Dictionary => files.dictionary(path),
                     PathAction::Save { tab, revision } => {
                         files.save(&self.ui, tab, revision, Some(path))
                     }
@@ -3042,22 +3148,46 @@ pub fn preview_with_profile(profile: Profile) -> io::Result<()> {
     work().map_err(io::Error::other)
 }
 
+fn prepare_files(
+    profile: Profile,
+    paths: Vec<PathBuf>,
+    dictionary: Option<PathBuf>,
+) -> Result<(
+    Controller,
+    crate::session::Session,
+    crate::spelling::WindowState,
+)> {
+    if paths.len() > 64 {
+        return Err("at most 64 input paths".into());
+    }
+    let mut files = crate::session::Session::start()?;
+    let mut ui = Controller::default();
+    for path in paths {
+        files.initial_open(&mut ui, path)?;
+    }
+    if let Some(path) = dictionary {
+        files.initial_dictionary(&mut ui, path)?;
+    }
+    if ui.editor().active().is_none() {
+        ui.dispatch(Event::New).map_err(error)?;
+    }
+    ui.dispatch(Event::Profile(profile)).map_err(error)?;
+    ui.dispatch(Event::Focus(false)).map_err(error)?;
+    let mut spelling = crate::spelling::WindowState::default();
+    if let Some(dictionary) = files.take_dictionary() {
+        spelling.install(dictionary);
+    }
+    Ok((ui, files, spelling))
+}
+
 /// Experimental file window; ordinary $EDITOR invocation remains unavailable.
-pub fn file_window(profile: Profile, paths: Vec<PathBuf>) -> io::Result<()> {
+pub fn file_window(
+    profile: Profile,
+    paths: Vec<PathBuf>,
+    dictionary: Option<PathBuf>,
+) -> io::Result<()> {
     let work = || -> Result<()> {
-        if paths.len() > 64 {
-            return Err("at most 64 input paths".into());
-        }
-        let mut files = crate::session::Session::start()?;
-        let mut ui = Controller::default();
-        for path in paths {
-            files.initial_open(&mut ui, path)?;
-        }
-        if ui.editor().active().is_none() {
-            ui.dispatch(Event::New).map_err(error)?;
-        }
-        ui.dispatch(Event::Profile(profile)).map_err(error)?;
-        ui.dispatch(Event::Focus(false)).map_err(error)?;
+        let (ui, files, spelling) = prepare_files(profile, paths, dictionary)?;
         let endpoint = endpoint(
             std::env::var_os("WAYLAND_SOCKET"),
             std::env::var_os("WAYLAND_DISPLAY"),
@@ -3066,8 +3196,13 @@ pub fn file_window(profile: Profile, paths: Vec<PathBuf>) -> io::Result<()> {
         let mut window = Window::new(connect(endpoint)?, std::env::temp_dir())?;
         window.ui = ui;
         window.labels.clear();
+        let dictionary_notice = spelling.dictionary_entries().map_or_else(
+            || "No dictionary selected. ".into(),
+            |count| format!("Dictionary loaded: {count} entries. "),
+        );
+        window.spelling = spelling;
         window.files = Some(files);
-        window.notify("Experimental file window. Files, mouse and menus work; UTF-8 clipboard needs data-device v3. No spelling or recovery. Not ready for $EDITOR.");
+        window.notify(format!("{dictionary_notice}Experimental file window. UTF-8 clipboard needs data-device v3. F7 checks spelling; Format > Dictionary selects a local word list. No recovery. Not ready for $EDITOR."));
         let result = window.run();
         if result.is_err() && window.files.as_ref().is_some_and(|files| files.busy()) {
             return Err(format!("{}; file operation was pending and may have published. Verify the destination; unsaved edits are not recovered.", result.err().unwrap_or_default()));
@@ -4849,6 +4984,214 @@ mod tests {
             w.chord(&c.to_string(), false).unwrap();
         }
         w.chord("Return", false).unwrap();
+    }
+
+    #[test]
+    fn startup_dictionary_and_documents_share_worker_without_scanning_or_mutation() {
+        let directory = DialogDirectory::new();
+        let words = directory.path("words");
+        let text = directory.path("text");
+        std::fs::write(&words, b"known\nother").unwrap();
+        std::fs::write(&text, b"known wrong").unwrap();
+        let (ui, files, spelling) =
+            prepare_files(Profile::Emacs, vec![text.clone()], Some(words.clone())).unwrap();
+        assert_eq!(spelling.dictionary_entries(), Some(2));
+        assert!(!spelling.running());
+        assert!(spelling.view(ui.editor()).0.contains("not checked"));
+        assert_eq!(files.labels().count(), 1);
+        assert!(!files.busy());
+        assert_eq!(ui.editor().document(1).unwrap().text(), "known wrong");
+        assert!(!ui.editor().document(1).unwrap().dirty());
+        assert_eq!(std::fs::read(&text).unwrap(), b"known wrong");
+        assert_eq!(std::fs::read(&words).unwrap(), b"known\nother");
+        let (ui, files, spelling) = prepare_files(Profile::Windows, Vec::new(), None).unwrap();
+        assert_eq!(spelling.dictionary_entries(), None);
+        assert!(ui.editor().active().is_some());
+        assert_eq!(files.labels().count(), 0);
+        std::fs::write(&words, b"bad data").unwrap();
+        assert!(
+            prepare_files(Profile::Windows, Vec::new(), Some(words.clone()))
+                .err()
+                .unwrap()
+                .contains("dictionary selection unchanged")
+        );
+        let missing = directory.path("missing");
+        assert!(file_window(Profile::Windows, Vec::new(), Some(missing.clone())).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn spelling_dictionary_menu_loads_explicitly_and_failed_replacement_keeps_marks() {
+        use crate::menu::Group;
+        let directory = DialogDirectory::new();
+        let path = directory.path("words");
+        std::fs::write(&path, b"known").unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        w.ui.dispatch(Event::Load(b"known wrong")).unwrap();
+        let before = format!("{:?}", w.ui.editor());
+        w.chord("F7", false).unwrap();
+        assert!(w.notice.as_deref().unwrap().contains("no dictionary"));
+        w.open_menu(Group::Format).unwrap();
+        w.activate_menu(4).unwrap();
+        assert!(matches!(
+            w.prompt.as_ref().unwrap().action,
+            PathAction::Dictionary
+        ));
+        w.chord("F7", false).unwrap();
+        assert!(!w.spelling.running());
+        path_text(&mut w, &path);
+        finish_file(&mut w);
+        assert!(!w.spelling.running());
+        assert!(w.spelling.view(w.ui.editor()).0.contains("not checked"));
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+        assert_eq!(w.files.as_ref().unwrap().labels().count(), 0);
+        w.open_menu(Group::Format).unwrap();
+        w.activate_menu(3).unwrap();
+        w.end_turn(w.clock + 1, false).unwrap();
+        assert_eq!(
+            w.spelling.view(w.ui.editor()).1,
+            std::slice::from_ref(&(6..11))
+        );
+        std::fs::write(&path, b"bad data").unwrap();
+        w.open_menu(Group::Format).unwrap();
+        w.activate_menu(4).unwrap();
+        path_text(&mut w, &path);
+        finish_file(&mut w);
+        assert!(w
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("dictionary selection unchanged"));
+        assert_eq!(
+            w.spelling.view(w.ui.editor()).1,
+            std::slice::from_ref(&(6..11))
+        );
+        std::fs::write(&path, b"known").unwrap();
+        w.open_menu(Group::Format).unwrap();
+        w.activate_menu(4).unwrap();
+        path_text(&mut w, &path);
+        finish_file(&mut w);
+        assert!(w.spelling.view(w.ui.editor()).1.is_empty());
+        assert!(!w.spelling.running());
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+    }
+
+    #[test]
+    fn native_f7_paints_underlines_and_navigation_never_edits_or_wraps() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Load(b"known wrong\nwrong")).unwrap();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            let tab = w.ui.editor().active().unwrap();
+            w.spelling
+                .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+            let device = w.device.unwrap();
+            configure(&mut w, 800, 600);
+            w.event(message(SHM, 0, &[1])).unwrap();
+            w.chord("F7", true).unwrap();
+            assert!(!w.spelling.running());
+            key(&mut w, device, 65); // Physical F7 in both key profiles.
+            assert!(w.spelling.running());
+            assert!(w.spelling.view(w.ui.editor()).1.is_empty());
+            w.end_turn(1, false).unwrap();
+            assert_eq!(w.spelling.view(w.ui.editor()).1, &[6..11, 12..17]);
+            w.draw().unwrap();
+            drain(&peer);
+            let area = w.ui.geometry().document();
+            let offset = ((area.y as usize + 15) * 800 + area.x as usize + 6 * 8) * 4;
+            assert_eq!(
+                w.pixels.get(offset..offset + 4).unwrap(),
+                (crate::render::MISSPELLED | 0xff000000).to_le_bytes()
+            );
+            for expected in [6..11, 12..17] {
+                w.open_menu(crate::menu::Group::Format).unwrap();
+                w.activate_menu(5).unwrap();
+                assert_eq!(
+                    w.ui.editor().document(tab).unwrap().selection().range(),
+                    expected
+                );
+            }
+            w.spelling_selection(false).unwrap();
+            assert_eq!(
+                w.ui.editor().document(tab).unwrap().selection().range(),
+                12..17
+            );
+            assert!(w.notice.as_deref().unwrap().contains("does not wrap"));
+            w.spelling_selection(true).unwrap();
+            assert_eq!(
+                w.ui.editor().document(tab).unwrap().selection().range(),
+                6..11
+            );
+            assert_eq!(w.ui.editor().document(tab).unwrap().revision(), 0);
+            assert!(!w.ui.editor().document(tab).unwrap().dirty());
+            key(&mut w, device, 30); // Editing invalidates without starting work.
+            assert!(w.spelling.view(w.ui.editor()).1.is_empty());
+            // Editing must not automatically start a replacement scan.
+            assert!(!w.spelling.running());
+        }
+    }
+
+    #[test]
+    fn native_spelling_is_chunked_and_escape_or_edit_cancels_without_partial_marks() {
+        for cancel in ["Escape", "C-g", "x"] {
+            let (mut w, _peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Load("wrong ".repeat(2000).as_bytes()))
+                .unwrap();
+            w.spelling
+                .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+            w.chord("F7", false).unwrap();
+            for _ in 0..256 {
+                w.tick(1, false).unwrap();
+            }
+            assert!(w.spelling.running());
+            assert!(w.spelling.view(w.ui.editor()).1.is_empty());
+            w.end_turn(1, false).unwrap();
+            assert!(w.spelling.running());
+            for previous in [false, true] {
+                w.spelling_selection(previous).unwrap();
+                let notice = w.notice.as_deref().unwrap();
+                assert!(notice.contains("still checking"));
+                assert!(!notice.contains("F7"));
+                assert!(w.spelling.running());
+            }
+            assert!(w.spelling.view(w.ui.editor()).1.is_empty());
+            assert!(w.connection.wait <= Duration::from_millis(1));
+            w.chord(cancel, false).unwrap();
+            w.end_turn(2, false).unwrap();
+            assert!(!w.spelling.running());
+            assert!(w.spelling.view(w.ui.editor()).1.is_empty());
+            w.end_turn(3, false).unwrap();
+            assert!(!w.spelling.running());
+        }
+    }
+
+    #[test]
+    fn scratch_spelling_notice_does_not_recommend_disabled_dictionary_loading() {
+        let (mut w, _peer, _) = seat_fixture();
+        w.chord("F7", false).unwrap();
+        let notice = w.notice.as_deref().unwrap();
+        assert!(notice.contains("no dictionary"));
+        assert!(notice.contains("use --window"));
+        assert!(!notice.contains("Format > Dictionary"));
+        assert!(!w.spelling.running());
+    }
+
+    #[test]
+    fn spelling_cancel_is_window_wide_while_dismissing_a_menu() {
+        let (mut w, _peer) = file_dialog_fixture();
+        w.ui.dispatch(Event::Load("wrong ".repeat(2000).as_bytes()))
+            .unwrap();
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        w.chord("F7", false).unwrap();
+        w.end_turn(1, false).unwrap();
+        assert!(w.spelling.running());
+        let before = format!("{:?}", w.ui.editor());
+        w.open_menu(crate::menu::Group::Format).unwrap();
+        w.chord("Escape", false).unwrap();
+        assert!(w.menu.is_none());
+        assert!(!w.spelling.running());
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
     }
 
     #[test]

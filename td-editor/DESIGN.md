@@ -17,10 +17,11 @@ files and reads no environment or clocks. The synchronous `files::Session`
 adapter now implements bounded file baselines and atomic save I/O, separately
 from the model. `--window` now connects it through one file worker to
 file-backed tabs and keyboard Open/Save/Save As path prompts. Native pointer
-selection, tab clicks and scrolling are connected. The safe spelling library
-now parses explicit word-list bytes and scans in bounded chunks, but native
-dictionary loading/marking, GPU rendering and the control socket are not
-implemented yet.
+selection, tab clicks and scrolling are connected. Native spelling loads an
+explicit local dictionary through the file worker, scans on F7 in bounded
+chunks, and publishes underlines and counts together. Format supplies
+dictionary selection and next/previous marked-word navigation. GPU rendering
+and the control socket are not implemented yet.
 Key bindings for those absent adapters
 produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -356,7 +357,7 @@ Version 1 resource ceilings are part of the API:
 | Saved baselines | At most 64 MiB encoded file bytes across tabs, charged separately from live text; refuse an open/save needing more. |
 | Clipboard | 1 MiB per transfer; reject an oversized paste atomically. |
 | Dictionary | 16 MiB input, 250,000 distinct entries, 64 ASCII letters/apostrophes per entry; reject an oversized or malformed load. |
-| Spelling results | 10,000 stored ranges; finish scanning, count additional unknown words, and report that only the first 10,000 are marked. |
+| Spelling results | 10,000 stored ranges across the window, including a running scan; finish scanning and count additional unknown words, reporting when marks are capped. |
 | Frames | 8,192 pixels per axis, 32 MiB per XRGB buffer, three live buffers; defer redraw/resize until a buffer can be retired. |
 | Wayland input | 1 MiB keymap, 128 KiB buffered wire bytes, eight pending descriptors; byte/descriptor overflow closes the display connection, an over-limit map disables input. |
 | Control | One active connection, 16 queued commands, 1 MiB request/response frame, 256 KiB raw text per response page, five-second whole-request deadline. |
@@ -662,11 +663,56 @@ race detection, not a filesystem snapshot or a guarantee against a writer
 changing the file after the final check. No system dictionary search occurs.
 This synchronous API belongs on the file worker, not the display loop.
 
-The spelling core and read-only loader are library APIs only. Window
-ownership/budgeting, F7/menu actions, status/underlines, result navigation
-and control queries are not connected yet. Native UI still reports spelling
-unavailable and must not claim these library tests are an interactive scan.
-No automatic trigger, word-list source, subprocess or dependency is added.
+### Implemented native spelling
+
+`--window --dictionary PATH` loads one literal word-list path on the existing
+file worker before connecting the display. The option may appear once;
+its next argument is always the literal path, including a leading dash.
+After `--`, all arguments are document paths. Invalid startup dictionaries
+fail startup without writing any file. Format > Dictionary uses the same
+keyboard path prompt and worker after startup, without blocking display
+dispatch. Dictionary loads share the single pending-file-job admission guard;
+they create no editable file association. The old dictionary, marks and scan
+remain selected until a successful replacement is delivered. Failure leaves
+them intact; success clears all results and cancels any scan, including when
+the bytes are identical. Loading never starts a scan. No dictionary search,
+download, subprocess or dependency is added. Scratch preview has no file I/O
+and disables Dictionary; F7 there reports no dictionary.
+
+F7 and Format > Check Spelling start a check in both profiles. Held-key repeat
+does not start or restart work. Admission clears input prefixes, drag/repeat
+state and pending Paste. There is one explicit `Scan::step` at the end of
+each native event-loop turn, at most 4,096 scalars, with a 1 ms maximum idle
+wait while work remains. The ticks before individual events only invalidate
+stale state; even a full 256-event batch cannot multiply the scan allowance.
+The scan may finish after a tab switch or focus loss; only text revisions,
+tab removal, dictionary replacement, a new check or Escape/C-g cancel it.
+Escape/C-g cancels an active scan even when also dismissing a menu, search,
+path or close dialog; cancellation is window-wide, not only document input.
+No partial counts or marks are exposed. Input-event and tick observers prune
+stale reports, and rendering independently checks their revision identity.
+Undo cannot resurrect old marks. Successful completion does not change text,
+selection, dirty state or undo history.
+
+The 10,000 stored-range budget is window-wide. Starting a check discards the
+previous report for that tab and cancels the previous scan, retaining other
+tabs' reports. Its mark allowance is the remaining budget at that instant;
+freed space during the check does not expand that allowance. Even with no
+remaining slots it finishes counting all words, reporting `marks capped`.
+Completion releases unused vector reservation before retaining its report.
+Checking again can use space released by edited or closed tabs. No automatic
+eviction of another tab's valid results occurs.
+
+After EOF, status shows unknown/checked/skipped counts and marks are drawn
+as a one-scaled-pixel underline in muted brick `0x9c5548`, or paper-colored
+over focused selection. Underlines follow the same clipped cell geometry as
+text, including wrapping and horizontal scrolling; the glyph rasterizer is
+unchanged. Narrow windows clip status rather than resize or wrap the chrome.
+Format > Next/Previous Misspelling selects the next stored range after the
+selection, or the previous range before it, and reveals it through the shared
+controller. Navigation does not wrap and cannot reach unknown words omitted
+by the budget; the status reports that truncation. A separate results-list
+panel, M-x command entry and control queries remain future increments.
 
 ## Rendering and reuse
 
@@ -1318,13 +1364,14 @@ controller CancelInput event performs this reset without a fake focus loss.
 File exposes New, Open, Save, Save As, Close Tab and Quit. Edit exposes Undo,
 Redo, Select All and the two key profiles, with clipboard commands enabled
 according to the data-device contract below. Format exposes Soft Wrap,
-Auto Fill and Fill
-Paragraph; Spelling is visibly disabled until its adapter exists. Help
+Auto Fill, Fill Paragraph, Check Spelling, Dictionary and Next/Previous
+Misspelling under the native spelling contract above. Help
 shows an experimental-build About notice. A plus marks the active key profile
 or enabled format toggle. Undo/Redo availability reflects the captured
-history depth. Scratch mode disables Open/Save/Save As rather than pretending
-to persist its text. Only existing bindings are shown: Windows uses Ctrl+
-labels, Emacs uses its C-/M- chord notation, and unbound items have no shortcut.
+history depth. Scratch mode disables Open/Save/Save As/Dictionary rather
+than pretending to persist its text. Only existing bindings are shown:
+Windows uses Ctrl+ labels, Emacs uses its C-/M- chord notation, and unbound
+items have no shortcut.
 Find/Find Next/Find Previous and Go To Line use the native contracts below.
 Replace, fill-column entry and command completion remain later prompt
 increments, not hidden implementations behind these menus.
