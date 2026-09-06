@@ -1,11 +1,12 @@
-//! Safe control framing and read-only controller queries. No listener or I/O.
+//! Safe control framing, queries and revision-checked edits. No listener or I/O.
 
-use crate::model::TabId;
-use crate::ui::Controller;
+use crate::model::{Command, Selection, TabId};
+use crate::ui::{Controller, Event};
 use crate::{Error, Result};
 
 pub const MAX_FRAME: usize = 1024 * 1024;
 pub const PAGE_BYTES: usize = 256 * 1024;
+pub const INSERT_BYTES: usize = 256 * 1024;
 
 /// One length-prefixed frame. Any refusal poisons it and drops partial text.
 #[derive(Default)]
@@ -89,8 +90,8 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(framed)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Query {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Operation {
     State,
     Text {
         tab: TabId,
@@ -98,12 +99,49 @@ pub enum Query {
         offset: usize,
         limit: usize,
     },
+    Edit {
+        tab: TabId,
+        revision: u64,
+        edit: Edit,
+    },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
+pub enum Edit {
+    SelectTab,
+    SelectRange(Selection),
+    Insert { expected: Selection, text: String },
+    Delete { expected: Selection },
+    Undo,
+    Redo,
+    FillParagraph { expected: Selection },
+}
+
+impl std::fmt::Debug for Edit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Debugging transport jobs must not disclose document text.
+        match self {
+            Self::Insert { expected, text } => f
+                .debug_struct("Insert")
+                .field("expected", expected)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::SelectTab => f.write_str("SelectTab"),
+            Self::SelectRange(selection) => f.debug_tuple("SelectRange").field(selection).finish(),
+            Self::Delete { expected } => f.debug_tuple("Delete").field(expected).finish(),
+            Self::Undo => f.write_str("Undo"),
+            Self::Redo => f.write_str("Redo"),
+            Self::FillParagraph { expected } => {
+                f.debug_tuple("FillParagraph").field(expected).finish()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Request {
     pub id: u64,
-    pub query: Query,
+    pub operation: Operation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,47 +162,144 @@ impl Refusal {
 }
 
 impl Request {
-    /// Parse the implemented read-only subset. Recoverable IDs echo on errors;
+    /// Parse only the implemented operations. Recoverable IDs echo on errors;
     /// errors before a recoverable ID use zero, matching replay.
     pub fn parse(input: &[u8]) -> std::result::Result<Self, Refusal> {
         let Envelope { id, name, mut args } = envelope(input)?;
         let result = (|| {
-            let query = match name {
-                "state" => Query::State,
-                "text" => Query::Text {
+            let operation = match name {
+                "state" => Operation::State,
+                "text" => Operation::Text {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
                     revision: decimal(args.next().ok_or(Error::Protocol)?)?,
                     offset: size(args.next().ok_or(Error::Protocol)?)?,
                     limit: size(args.next().ok_or(Error::Protocol)?)?,
                 },
+                "select-tab" | "select-range" | "insert" | "delete" | "undo" | "redo"
+                | "fill-paragraph" => {
+                    let tab = decimal(args.next().ok_or(Error::Protocol)?)?;
+                    let revision = decimal(args.next().ok_or(Error::Protocol)?)?;
+                    let mut selection = || -> Result<Selection> {
+                        Ok(Selection {
+                            anchor: size(args.next().ok_or(Error::Protocol)?)?,
+                            caret: size(args.next().ok_or(Error::Protocol)?)?,
+                        })
+                    };
+                    let edit = match name {
+                        "select-tab" => Edit::SelectTab,
+                        "select-range" => Edit::SelectRange(selection()?),
+                        "insert" => {
+                            let expected = selection()?;
+                            let encoded = args.next().ok_or(Error::Protocol)?;
+                            if encoded.len() > INSERT_BYTES * 2 {
+                                return Err(Error::Limit);
+                            }
+                            let text = String::from_utf8(unhex(encoded)?)
+                                .map_err(|_| Error::InvalidText)?;
+                            Edit::Insert { expected, text }
+                        }
+                        "delete" => Edit::Delete {
+                            expected: selection()?,
+                        },
+                        "undo" => Edit::Undo,
+                        "redo" => Edit::Redo,
+                        "fill-paragraph" => Edit::FillParagraph {
+                            expected: selection()?,
+                        },
+                        _ => return Err(Error::Protocol),
+                    };
+                    Operation::Edit {
+                        tab,
+                        revision,
+                        edit,
+                    }
+                }
                 _ => return Err(Error::Protocol),
             };
             if args.next().is_some() {
                 return Err(Error::Protocol);
             }
-            Ok(query)
+            Ok(operation)
         })();
         result
-            .map(|query| Self { id, query })
+            .map(|operation| Self { id, operation })
             .map_err(|error| Refusal { id, error })
     }
 
     /// State is a controller snapshot only. A future window endpoint must add
     /// its dialogs, jobs and submitted/callback-completed frame generations.
-    pub fn response(self, ui: &Controller) -> String {
-        let result = match self.query {
-            Query::State => state(ui),
-            Query::Text {
+    pub fn response(&self, ui: &Controller) -> String {
+        let result = match &self.operation {
+            Operation::State => state(ui),
+            Operation::Text {
                 tab,
                 revision,
                 offset,
                 limit,
-            } => page(ui, tab, revision, offset, limit),
+            } => page(ui, *tab, *revision, *offset, *limit),
+            Operation::Edit { .. } => Err(Error::Unavailable),
         };
         match result {
             Ok(body) => format!("1\t{}\tok\t{body}", self.id),
             Err(error) => Refusal { id: self.id, error }.response(),
         }
+    }
+
+    pub fn is_edit(&self) -> bool {
+        matches!(self.operation, Operation::Edit { .. })
+    }
+
+    /// Native modal/liveness admission belongs to the adapter. No file or
+    /// clipboard authority is available here. Refusals preserve all UI state.
+    pub fn execute(&self, ui: &mut Controller) -> Result<()> {
+        let Operation::Edit {
+            tab,
+            revision,
+            edit,
+        } = &self.operation
+        else {
+            return Err(Error::InvalidArgument);
+        };
+        let doc = ui.editor().document(*tab)?;
+        if doc.revision() != *revision {
+            return Err(Error::StaleRevision);
+        }
+        if matches!(edit, Edit::SelectTab) {
+            ui.dispatch(Event::SelectTab(*tab))?;
+            return Ok(());
+        }
+        if ui.editor().active() != Some(*tab) {
+            return Err(Error::InvalidArgument);
+        }
+        if let Edit::Insert { expected, .. }
+        | Edit::Delete { expected }
+        | Edit::FillParagraph { expected } = edit
+        {
+            if doc.selection() != *expected {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        let command = match edit {
+            Edit::SelectTab => return Err(Error::InvalidArgument),
+            Edit::SelectRange(selection) => Command::Select(*selection),
+            Edit::Insert { text, .. } => {
+                // Public requests can also be constructed without the parser.
+                if text.len() > INSERT_BYTES {
+                    return Err(Error::Limit);
+                }
+                Command::Insert(text.clone())
+            }
+            Edit::Delete { .. } => Command::Delete,
+            Edit::Undo => Command::Undo,
+            Edit::Redo => Command::Redo,
+            Edit::FillParagraph { .. } => Command::FillParagraph,
+        };
+        ui.dispatch(Event::Edit {
+            tab: *tab,
+            revision: *revision,
+            command,
+        })?;
+        Ok(())
     }
 }
 
@@ -366,7 +501,7 @@ mod tests {
             Request::parse(&decoder.finish().unwrap()).unwrap(),
             Request {
                 id: 17,
-                query: Query::Text {
+                operation: Operation::Text {
                     tab: 1,
                     revision: 0,
                     offset: 0,
@@ -409,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_read_only_request_grammar_rejects_mutation_and_recovers_only_valid_ids() {
+    fn strict_request_grammar_rejects_unknown_or_incomplete_commands_and_recovers_ids() {
         for (input, id) in [
             ("", 0),
             ("2\t12\tstate", 0),
@@ -544,7 +679,7 @@ mod tests {
             .unwrap();
         let response = Request {
             id: u64::MAX,
-            query: Query::Text {
+            operation: Operation::Text {
                 tab: 1,
                 revision: 0,
                 offset: 0,
@@ -559,7 +694,7 @@ mod tests {
         }
         let response = Request {
             id: 1,
-            query: Query::State,
+            operation: Operation::State,
         }
         .response(&ui);
         assert_eq!(response.matches("\ttab=").count(), 64);
@@ -629,5 +764,234 @@ mod tests {
             assert_eq!(replay.ui.generation(), 0);
             assert_eq!(replay.ui.editor().tabs().count(), 0);
         }
+    }
+
+    #[test]
+    fn remote_edits_match_replay_controller_state_views_and_undo_history() {
+        let mut ui = Controller::default();
+        let mut replay = crate::replay::Session::default();
+        for controller in [&mut ui, &mut replay.ui] {
+            controller
+                .dispatch(Event::Load(b"one   two\nthree"))
+                .unwrap();
+            controller.dispatch(Event::New).unwrap();
+        }
+        for (remote, local) in [
+            ("select-tab\t1\t0", "select-tab\t1"),
+            ("select-range\t1\t0\t6\t3", "select-range\t1\t0\t6\t3"),
+            ("insert\t1\t0\t6\t3\tcebb0d0a", "insert\t1\t0\tcebb0d0a"),
+            ("undo\t1\t1", "undo\t1\t1"),
+            ("redo\t1\t2", "redo\t1\t2"),
+            ("delete\t1\t3\t6\t6", "delete\t1\t3"),
+            ("undo\t1\t4", "undo\t1\t4"),
+            ("select-range\t1\t5\t0\t0", "select-range\t1\t5\t0\t0"),
+            ("fill-paragraph\t1\t5\t0\t0", "fill-paragraph\t1\t5"),
+        ] {
+            Request::parse(format!("1\t1\t{remote}").as_bytes())
+                .unwrap()
+                .execute(&mut ui)
+                .unwrap();
+            assert!(
+                replay
+                    .request(format!("1\t1\t{local}").as_bytes())
+                    .starts_with("1\t1\tok\t"),
+                "{local}"
+            );
+            assert_eq!(state(&ui), state(&replay.ui), "{remote}");
+            assert_eq!(
+                format!("{:?}", ui.editor()),
+                format!("{:?}", replay.ui.editor()),
+                "{remote}"
+            );
+            for (id, _) in ui.editor().tabs() {
+                assert_eq!(ui.tab_view(id), replay.ui.tab_view(id));
+            }
+        }
+    }
+
+    #[test]
+    fn remote_refusals_preserve_selection_prefix_view_text_and_history() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::New).unwrap();
+        ui.dispatch(Event::Load("aλ".as_bytes())).unwrap();
+        ui.dispatch(Event::Profile(crate::keys::Profile::Emacs))
+            .unwrap();
+        ui.dispatch(Event::Key {
+            tab: 2,
+            revision: 0,
+            chord: "C-x",
+        })
+        .unwrap();
+        for (command, expected) in [
+            ("select-tab\t99\t0", Error::MissingTab),
+            ("select-tab\t1\t9", Error::StaleRevision),
+            ("select-range\t1\t0\t0\t0", Error::InvalidArgument),
+            ("select-range\t2\t1\t0\t0", Error::StaleRevision),
+            ("select-range\t2\t0\t2\t3", Error::InvalidPosition),
+            ("select-range\t2\t0\t4\t0", Error::InvalidPosition),
+            ("insert\t2\t0\t3\t3\t62", Error::InvalidArgument),
+            ("delete\t2\t0\t3\t3", Error::InvalidArgument),
+            ("fill-paragraph\t2\t0\t3\t3", Error::InvalidArgument),
+            ("insert\t2\t0\t0\t0\t00", Error::InvalidText),
+            ("insert\t2\t0\t0\t0\tefbbbf", Error::InvalidText),
+            ("undo\t2\t1", Error::StaleRevision),
+            ("redo\t2\t1", Error::StaleRevision),
+        ] {
+            let before = (state(&ui), format!("{:?}", ui.editor()), ui.tab_view(2));
+            let request = Request::parse(format!("1\t9\t{command}").as_bytes()).unwrap();
+            assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+            assert_eq!(request.execute(&mut ui), Err(expected), "{command}");
+            assert_eq!(
+                (state(&ui), format!("{:?}", ui.editor()), ui.tab_view(2)),
+                before,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_grammar_has_closed_allowlist_and_bounded_private_text() {
+        for command in [
+            "select-tab\t1",
+            "select-tab\t1\t0\textra",
+            "select-range\t1\t0\t0",
+            "insert\t1\t0\t0\t0",
+            "insert\t1\t0\t0\t0\t",
+            "insert\t1\t0\t0\t0\t6A",
+            "delete\t1\t0",
+            "undo\t1\t0\t0",
+            "redo\t1\t-1",
+            "fill-paragraph\t1\t0",
+            "new",
+            "open\t2f746d702f78",
+            "close-tab\t1\t0",
+            "quit",
+            "save\t1\t0",
+            "save-as\t1\t0\t78",
+            "dialog-answer\t1\t0\tdiscard",
+            "key\t1\t0\tC-s",
+            "load\t61",
+            "pointer\t1\t0\tpress\t0\t0\t0",
+            "set-auto-fill\t1\t0\t1",
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t13\t{command}").as_bytes()).unwrap_err(),
+                Refusal {
+                    id: 13,
+                    error: Error::Protocol
+                },
+                "{command}"
+            );
+        }
+        assert_eq!(
+            Request::parse(b"1\t13\tinsert\t1\t0\t0\t0\tff")
+                .unwrap_err()
+                .error,
+            Error::InvalidText
+        );
+        let request = Request::parse(
+            format!("1\t13\tinsert\t1\t0\t0\t0\t{}", "61".repeat(INSERT_BYTES)).as_bytes(),
+        )
+        .unwrap();
+        let mut ui = Controller::default();
+        ui.dispatch(Event::New).unwrap();
+        request.execute(&mut ui).unwrap();
+        assert_eq!(ui.editor().document(1).unwrap().text().len(), INSERT_BYTES);
+        assert_eq!(
+            Request::parse(
+                format!(
+                    "1\t13\tinsert\t1\t0\t0\t0\t{}",
+                    "61".repeat(INSERT_BYTES + 1)
+                )
+                .as_bytes()
+            )
+            .unwrap_err()
+            .error,
+            Error::Limit
+        );
+        let private = Request::parse(b"1\t14\tinsert\t1\t0\t0\t0\t736563726574").unwrap();
+        assert!(!format!("{private:?}").contains("secret"));
+    }
+
+    #[test]
+    fn remote_insert_is_one_normalized_transaction_without_auto_fill() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load(b"one two three four five six"))
+            .unwrap();
+        for command in [
+            Command::AutoFill(true),
+            Command::FillColumn(20),
+            Command::Select(Selection {
+                anchor: 27,
+                caret: 27,
+            }),
+        ] {
+            ui.dispatch(Event::Edit {
+                tab: 1,
+                revision: 0,
+                command,
+            })
+            .unwrap();
+        }
+        let request = Request::parse(b"1\t1\tinsert\t1\t0\t27\t27\t200d0a").unwrap();
+        request.execute(&mut ui).unwrap();
+        assert_eq!(
+            ui.editor().document(1).unwrap().text(),
+            "one two three four five six \n"
+        );
+        Request::parse(b"1\t1\tundo\t1\t1")
+            .unwrap()
+            .execute(&mut ui)
+            .unwrap();
+        assert_eq!(
+            ui.editor().document(1).unwrap().text(),
+            "one two three four five six"
+        );
+        assert!(!ui.editor().document(1).unwrap().dirty());
+        assert_eq!(request.execute(&mut ui), Err(Error::StaleRevision));
+    }
+
+    #[test]
+    fn empty_insert_decodes_dash_and_undo_restores_the_directed_selection() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load("aλz".as_bytes())).unwrap();
+        Request::parse(b"1\t1\tselect-range\t1\t0\t3\t1")
+            .unwrap()
+            .execute(&mut ui)
+            .unwrap();
+        Request::parse(b"1\t2\tinsert\t1\t0\t3\t1\t-")
+            .unwrap()
+            .execute(&mut ui)
+            .unwrap();
+        assert_eq!(ui.editor().document(1).unwrap().text(), "az");
+        Request::parse(b"1\t3\tundo\t1\t1")
+            .unwrap()
+            .execute(&mut ui)
+            .unwrap();
+        let doc = ui.editor().document(1).unwrap();
+        assert_eq!(doc.text(), "aλz");
+        assert_eq!(
+            doc.selection(),
+            Selection {
+                anchor: 3,
+                caret: 1
+            }
+        );
+        assert!(!doc.dirty());
+        let oversized = Request {
+            id: 4,
+            operation: Operation::Edit {
+                tab: 1,
+                revision: 2,
+                edit: Edit::Insert {
+                    expected: doc.selection(),
+                    text: "x".repeat(INSERT_BYTES + 1),
+                },
+            },
+        };
+        let before = state(&ui);
+        assert_eq!(oversized.execute(&mut ui), Err(Error::Limit));
+        assert_eq!(state(&ui), before);
+        assert_eq!(ui.editor().document(1).unwrap().text(), "aλz");
     }
 }

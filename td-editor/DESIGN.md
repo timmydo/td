@@ -22,8 +22,8 @@ explicit local dictionary through the file worker, scans on F7 in bounded
 chunks, and publishes underlines and counts together. Format supplies
 dictionary selection and next/previous marked-word navigation. GPU rendering
 is not implemented yet. The optional native control socket now exposes
-read-only state/text queries; remote edits and frame acknowledgement remain
-unimplemented.
+state/text queries and revision/selection-checked edits; remote file operations,
+dialog answers and frame acknowledgement remain unimplemented.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -362,8 +362,8 @@ Version 1 resource ceilings are part of the API:
 | Spelling results | 10,000 stored ranges across the window, including a running scan; finish scanning and count additional unknown words, reporting when marks are capped. |
 | Frames | 8,192 pixels per axis, 32 MiB per XRGB buffer, three live buffers; defer redraw/resize until a buffer can be retired. |
 | Wayland input | 1 MiB keymap, 128 KiB buffered wire bytes, eight pending descriptors; byte/descriptor overflow closes the display connection, an over-limit map disables input. |
-| Control | Eight admitted connections, eight queued read-only jobs, 1 MiB request/response frame, 256 KiB raw text per response page, five-second whole-request deadline. |
-| Control commands (version 1 target) | Sixteen queued typed command descriptors; refuse additional commands. Remote mutation is not implemented by the current read-only worker. |
+| Control | Eight admitted connections, eight queued query/edit jobs, 1 MiB request/response frame, 256 KiB raw text per response page or insertion, five-second whole-request deadline. |
+| Control commands (version 1 target) | Sixteen queued typed command descriptors; refuse additional commands. The current subset admits only eight jobs under CONTROL.md's transport contract. |
 
 Undo stores edit deltas and cursor/selection before and after the transaction.
 The core uses one contiguous replacement span per transaction, trimming
@@ -2070,8 +2070,9 @@ that td-mail's jail can launch the editor.
 
 ## Test and control architecture
 
-The safe `control` library now supplies the one-frame decoder/encoder and
-read-only `state`/`text` request subset. It shares controller snapshots,
+The safe `control` library now supplies the one-frame decoder/encoder,
+`state`/`text` queries and a bounded revision-checked editing subset. It
+shares controller snapshots,
 scalar-aligned text pages and byte codecs with replay. The exact implemented
 field order, errors, limits and conformance fixtures are recorded in
 [CONTROL.md](CONTROL.md). The separate `control_socket` library implements
@@ -2082,9 +2083,14 @@ contract and same-UID race boundary are in that reference. The
 nonblocking transport, typed bounded UI jobs and five-second acceptance-based
 deadlines under CONTROL.md's exact scheduling contract. The experimental
 `--window --control-socket PATH` adapter now connects read-only state/text
-requests, including coarse native modal/job/spelling flags. Its exact
+requests, including coarse native modal/job/spelling flags, plus Select
+Tab/Range, Insert, Delete, Undo, Redo and Fill Paragraph. Dispatch requires live
+job admission and target revision; selection-relative operations additionally
+pin the directed selection. Native modals refuse edits without dismissal.
+All edits use the ordinary controller, including history, view refresh and
+native search/spelling/Paste/repeat invalidation. Its exact
 implemented subset, startup/cleanup behavior and two-job-per-turn budget
-are specified in CONTROL.md. Remote mutations, dialog answers, spelling
+are specified in CONTROL.md. Remote file operations, dialog answers, spelling
 range queries and frame acknowledgement remain unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.

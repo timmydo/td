@@ -1,4 +1,4 @@
-//! Bounded read-only control transport. The worker never owns editor state.
+//! Bounded control transport. The worker never owns editor state.
 
 use crate::control::{frame, Decoder, Refusal, Request};
 use crate::control_socket::Socket;
@@ -29,8 +29,8 @@ impl Live {
     }
 }
 
-/// One read-only request. Dropping it without replying closes its connection.
-/// Liveness does not authorize future mutation commands or retain a snapshot.
+/// One request. Dropping it without replying closes its connection.
+/// Liveness neither retains a snapshot nor replaces UI target admission.
 #[derive(Debug)]
 pub struct Job {
     request: Request,
@@ -40,12 +40,22 @@ pub struct Job {
 }
 
 impl Job {
-    pub fn request(&self) -> Request {
-        self.request
+    pub fn request(&self) -> &Request {
+        &self.request
     }
 
     pub fn is_live(&self) -> bool {
         self.live.at(Instant::now())
+    }
+
+    /// Invoke at most once, only if live immediately before UI admission.
+    /// Expiry/disconnect during execution cannot roll back an accepted edit.
+    pub fn respond_with(self, dispatch: impl FnOnce(&Request) -> String) -> crate::Result<bool> {
+        if !self.is_live() {
+            return Ok(false);
+        }
+        let payload = dispatch(&self.request);
+        self.respond(payload.as_bytes())
     }
 
     /// Copies only a valid bounded payload. Success means queued, not delivered.
@@ -296,7 +306,7 @@ fn run(socket: Socket, requests: SyncSender<Job>, stop: &AtomicBool) -> io::Resu
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::control::{Query, MAX_FRAME};
+    use crate::control::{Operation, MAX_FRAME};
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::PathBuf;
@@ -332,9 +342,9 @@ mod tests {
         let job = rx.try_recv().unwrap();
         assert_eq!(
             job.request(),
-            Request {
+            &Request {
                 id: 42,
-                query: Query::State
+                operation: Operation::State
             }
         );
         peer.write_all(&frame(b"1\t43\tstate").unwrap()).unwrap();
@@ -610,6 +620,78 @@ mod tests {
     }
 
     #[test]
+    fn mutation_dispatch_checks_liveness_before_execution_and_never_replays_later_frames() {
+        for cancelled in [false, true] {
+            let now = Instant::now();
+            let (mut connection, mut peer) = connection(now);
+            let (tx, rx) = mpsc::sync_channel(CONNECTIONS);
+            let bytes = frame(b"1\t7\tinsert\t1\t0\t0\t0\t61").unwrap();
+            for byte in bytes {
+                peer.write_all(&[byte]).unwrap();
+                assert!(connection.step(now, &mut [0; IO_BYTES], &tx));
+            }
+            let job = rx.try_recv().unwrap();
+            assert!(job.request().is_edit());
+            peer.write_all(&frame(b"1\t8\tinsert\t1\t1\t1\t1\t62").unwrap())
+                .unwrap();
+            assert!(connection.step(now, &mut [0; IO_BYTES], &tx));
+            assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+            if cancelled {
+                assert!(!connection.step(now + DEADLINE, &mut [0; IO_BYTES], &tx));
+                drop(connection);
+            }
+            let mut ui = crate::ui::Controller::default();
+            ui.dispatch(crate::ui::Event::New).unwrap();
+            let mut called = false;
+            let queued = job
+                .respond_with(|request| {
+                    called = true;
+                    request.execute(&mut ui).unwrap();
+                    "1\t7\tok\t".into()
+                })
+                .unwrap();
+            assert_eq!(called, !cancelled);
+            assert_eq!(queued, !cancelled);
+            assert_eq!(
+                ui.editor().document(1).unwrap().text(),
+                if cancelled { "" } else { "a" }
+            );
+        }
+    }
+
+    #[test]
+    fn expired_held_job_skips_dispatch_without_waiting_for_worker_cleanup() {
+        let now = Instant::now();
+        let (mut connection, mut peer) = connection(now - DEADLINE);
+        // Decode at its injected acceptance time, then hand off at real expiry.
+        let job = request(&mut connection, &mut peer, now - DEADLINE);
+        let mut called = false;
+        assert!(!job
+            .respond_with(|_| {
+                called = true;
+                "reply".into()
+            })
+            .unwrap());
+        assert!(!called);
+    }
+
+    #[test]
+    fn disconnect_during_dispatch_does_not_claim_a_reply() {
+        let now = Instant::now();
+        let (mut connection, mut peer) = connection(now);
+        let job = request(&mut connection, &mut peer, now);
+        let mut called = false;
+        assert!(!job
+            .respond_with(|_| {
+                called = true;
+                drop(connection);
+                "reply".into()
+            })
+            .unwrap());
+        assert!(called);
+    }
+
+    #[test]
     fn text_request_and_large_reply_resume_to_completion_with_a_draining_peer() {
         let now = Instant::now();
         let (mut connection, mut peer) = connection(now);
@@ -618,7 +700,7 @@ mod tests {
             .unwrap();
         assert!(connection.step(now, &mut [0; IO_BYTES], &tx));
         let job = rx.try_recv().unwrap();
-        assert!(matches!(job.request().query, Query::Text { .. }));
+        assert!(matches!(job.request().operation, Operation::Text { .. }));
         let payload = vec![b'x'; IO_BYTES * 3 + 5];
         let expected = frame(&payload).unwrap();
         assert!(job.respond(&payload).unwrap());

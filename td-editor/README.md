@@ -49,8 +49,8 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-Read-only native control is available explicitly; remote edits, GPU rendering
-and td-mail integration remain unimplemented. Do not set
+Native query/edit control is available explicitly; remote file operations,
+GPU rendering and td-mail integration remain unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
@@ -67,18 +67,21 @@ td-editor/target/release/td-editor --help
 lossless file codec; `fill.rs` plans bounded reflow; `keys.rs` translates
 logical chords; `ui.rs` owns input/view state; and `replay.rs` feeds that same
 controller with framed commands.
-The safe `control` library supplies one-frame decoding and read-only
-controller state/text queries using the same serializers as replay. See
+The safe `control` library supplies one-frame decoding, controller state/text
+queries and revision-checked edits through the shared controller. See
 [CONTROL.md](CONTROL.md) for exact fields and bounds. The experimental
 `--window --control-socket PATH` option connects state/text inspection and
-coarse native modal/job/spelling flags; remote mutation remains later work.
+coarse native modal/job/spelling flags. It also supports Select Tab/Range,
+Insert, Delete, Undo, Redo and Fill Paragraph. Insert/Delete/Fill check the
+expected directed selection as well as the tab revision; native modals refuse
+remote edits. File operations and dialog answers remain later work.
 The separate `control_socket` library publishes a private Linux Unix
 listener only when explicitly requested. It checks directory
 ownership/permissions, refuses symlinks and existing endpoints, and pins
 parent/socket inodes for checked cleanup. It has no request worker or editor
 access itself; CONTROL.md specifies the
 absolute-path limits and trust boundary.
-The `control_worker` library adds a bounded read-only request thread with
+The `control_worker` library adds a bounded request thread with
 eight connection slots, typed nonblocking UI queues, whole-request deadlines
 and joined shutdown. The native adapter polls at most two jobs per outer
 event-loop turn without performing socket I/O on the UI thread. Opting in
@@ -95,9 +98,12 @@ td-editor/target/release/td-editor --window --control-socket "$editor_control_di
 The parent must already be caller-owned mode 0700, with caller/root-owned
 trusted ancestors. Unknown owners in a rootless container remain refused;
 there is no environment override. No endpoint is enabled without the option.
-Its mode-0600 socket permits reading all open tabs, including unsaved text.
+Its mode-0600 socket permits reading and editing open tabs, including
+unsaved text.
 Sharing it across a jail boundary is a separate grant. Socket existence is
 not readiness; ask for state, and do not treat its generation as frame proof.
+Mutation replies confirm controller admission, not persistence or presentation.
+A lost reply means an unknown outcome: inspect state/text before retrying.
 Normal shutdown removes only the owned endpoint, not its parent directory.
 After abnormal termination, inspect any stale endpoint before removing it.
 

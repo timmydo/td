@@ -1,16 +1,17 @@
 # Control protocol reference
 
 The experimental `--window --control-socket PATH` endpoint implements the
-read-only subset below. It is off by default; scratch preview and replay do
-not accept the option. Remote edits, dialog answers, spelling result pages
-and frame acknowledgement remain unimplemented. This is not the complete
+query and revision-checked editing subset below. It is off by default;
+scratch preview and replay do not accept the option. Remote file operations,
+dialog answers, spelling result pages and frame acknowledgement remain
+unimplemented. This is not the complete
 version-1 endpoint specified in [DESIGN.md](DESIGN.md#test-and-control-architecture).
 
 `control` has no listener, thread, filesystem access, clock or Wayland access.
 The separate `control_socket` library publishes a private Unix listener
 under the contract below.
 `control_worker` owns that listener on a bounded transport thread and hands
-read-only requests to the native window's UI thread.
+typed requests to the native window's UI thread.
 
 ## Framing
 
@@ -40,7 +41,7 @@ Private socket publication is implemented separately below. Replay retains
 its consecutive-frame stdin/stdout runner; the one-frame decoder serves the
 one-request-per-connection worker.
 
-## Read-only requests
+## Requests
 
 Payloads are ASCII tab-separated records. Literal control bytes other than
 field-separating Tab, DEL and non-ASCII payload bytes are refused. Decimal
@@ -59,11 +60,12 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID state` | Snapshot the current controller. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 
-These are the only names accepted by `control::Request::parse`. In particular,
-`new`, `load`, editing, file I/O, physical-input simulation and dialog answers
-are refused; this parser is not a route into replay's broader command set.
+The editing subset is specified below. `new`, `load`, file I/O,
+physical-input simulation and dialog answers remain refused; this parser is
+not a route into replay's broader command set.
 `Request::response` borrows `&Controller`, so it cannot dispatch an edit or
-change selection, views, history or generation.
+change selection, views, history or generation. It returns `unavailable`
+for an editing request; only `Request::execute` admits those operations.
 
 An error response is `1 ID error CODE HEX_DIAGNOSTIC`. A recoverable request
 ID is echoed even if the command name is missing or later arguments are
@@ -75,6 +77,77 @@ lowercase hex. Empty byte strings use `-`; nonempty hex has two lowercase
 digits per byte. `hex`/`unhex` and the frame/page limits are shared with
 replay, whose old public helper names remain re-exports, not duplicate codecs.
 Replay also uses the bounded response-frame encoder.
+
+## Revision-checked editing
+
+All requests below name a stable tab ID and its expected text revision.
+Arguments are tab-separated, and selection endpoints are directed UTF-8
+byte offsets, not scalar indices or a sorted range.
+
+| Payload fields | Meaning |
+| --- | --- |
+| `1 ID select-tab TAB REVISION` | Activate that tab after checking its revision. |
+| `1 ID select-range TAB REVISION ANCHOR CARET` | Set the active tab's selection to these scalar-aligned byte offsets. |
+| `1 ID insert TAB REVISION EXPECTED_ANCHOR EXPECTED_CARET HEX_TEXT` | Replace the expected selection with decoded text. |
+| `1 ID delete TAB REVISION EXPECTED_ANCHOR EXPECTED_CARET` | Delete the expected selection, or the following scalar when empty. |
+| `1 ID undo TAB REVISION` | Undo one transaction in the active tab. |
+| `1 ID redo TAB REVISION` | Redo one transaction in the active tab. |
+| `1 ID fill-paragraph TAB REVISION EXPECTED_ANCHOR EXPECTED_CARET` | Fill the paragraph at the expected caret through the ordinary controller. |
+
+Success is `1 ID ok` followed by one trailing Tab (an empty body).
+It means controller admission completed, not saved bytes, client receipt,
+a frame callback or physical presentation. Query state afterward to obtain
+the current revision/selection; another input may intervene before that query.
+No history to undo/redo and no text-changing work follow the existing model's
+no-op rules; an admitted command can advance controller generation without
+advancing text revision or adding history.
+
+The native adapter first refuses with `unavailable` while closed, quitting,
+or any path, close, conflict, pending-Reload, menu, Find, numeric, command or
+Replace modal is present. It neither dismisses nor answers the modal, and a
+refusal does not replace the visible notice. Queries remain available.
+Outside modals, a missing tab is `missing-tab`, a differing text revision is
+`stale-revision`, and all operations other than `select-tab` require that tab
+to be active (`invalid-argument` otherwise). Insert/Delete/Fill additionally
+require the exact expected directed selection (`invalid-argument` on mismatch).
+These checks run on the UI thread immediately before dispatch. A selection
+that moved away and back without text edits passes the value check; Undo
+cannot resurrect an old text revision. Select Range deliberately specifies
+its destination, rather than capturing an earlier selection.
+
+Insert accepts at most 262,144 raw decoded UTF-8 bytes before normalization.
+Oversize is `limit`, malformed hex is `protocol`, and invalid UTF-8 or
+unsupported text is `invalid-text`. CRLF normalizes to LF; existing BOM and
+line-ending flags are unchanged. An empty `-` replacement deletes a nonempty
+selection. Insert never invokes typing's Auto Fill. Each text-changing
+Insert/Delete/Fill is one ordinary undo transaction, with the model's
+document/history budgets and no-op rules. Invalid boundaries return
+`invalid-position`, exhausted budgets return `limit`, and counter exhaustion
+returns `exhausted`, without changing model, input or view state.
+No intermediate Select is dispatched to implement an insertion.
+
+Accepted operations use the existing `Controller::dispatch` path, reset its
+prefix/mark/drag, cancel native repeat/wheel/drag and pending Paste, observe
+search-wrap and spelling invalidation immediately, and request redraw.
+Cancelling an in-flight Paste emits a visible cancellation notice; other
+accepted edits do not replace an existing notice.
+Selection-only changes retain spelling marks; edits and Undo clear stale
+marks without starting a scan. Semantic commands do not require keyboard
+focus or a physical-input serial; they cannot acquire clipboard ownership.
+Ordinary file jobs may remain active while editing, as with keyboard input;
+this subset neither initiates file I/O nor acknowledges a save.
+
+One accepted connection dispatches at most once. `Job::respond_with` checks
+its deadline/liveness immediately before invoking the UI handler, in addition
+to queue admission and reply checks. A job already expired or cancelled there
+does not execute. Expiry, transport failure or disconnect during/after
+execution cannot roll back an accepted command; losing its reply means the
+outcome is unknown to the client. Peer disappearance is not synchronously
+detectable and the worker does not read further input after the first frame.
+Request IDs correlate replies only: there is no cross-connection deduplication,
+retry guarantee or cancellation RPC. Do not blindly retry a mutation after a
+missing reply; inspect fresh state/text first. A deadline bounds transport
+admission and output, not the duration of a synchronous admitted model command.
 
 ## Text response
 
@@ -117,15 +190,15 @@ frame callback or scanout. The native extension below adds coarse flags; a
 complete native endpoint must add its own state under the
 full design contract before claiming complete remote control.
 
-## Experimental native read-only adapter
+## Experimental native adapter
 
 `--control-socket PATH` may appear once after `--window`, before the literal
 `--` delimiter. Its next argument is one literal OS-byte pathname, not shell
 text. It must satisfy the complete private-socket contract below. The caller
 creates the private parent; no directory or endpoint is discovered, adopted
-or repaired automatically. Giving access to the endpoint grants read access
-to every tab's current in-memory text, including unsaved text and inactive
-tabs. It does not grant remote writes in this increment.
+or repaired automatically. Giving access to the endpoint grants read/write
+access to every tab's current in-memory text, including unsaved and inactive
+tabs within the implemented operation subset above.
 
 Startup binds before opening document/dictionary files or connecting to
 Wayland, so an invalid endpoint fails startup without those operations.
@@ -146,7 +219,9 @@ This opt-in latency tradeoff can wake an otherwise idle window 100 times per
 second; the default window adds no control polling. All socket reads and
 writes stay on the worker. Two maximum pages can allocate about one MiB of
 hex response text per turn; this is a byte/work bound, not a real-time latency
-guarantee. State/text serialization only borrows the controller immutably.
+guarantee. Edits may scan bounded whole documents and recompute layout;
+there is no event-loop latency ceiling. State/text serialization only borrows
+the controller immutably.
 Queries neither answer nor dismiss a modal, move selection, start I/O, mark
 a document saved nor invoke an edit.
 
@@ -156,7 +231,7 @@ this order. Error responses are unchanged:
 
 | Field | Comma-separated values |
 | --- | --- |
-| `adapter=native-read-only` | Explicit implemented adapter identity. |
+| `adapter=native-edit` | Explicit implemented adapter identity. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |
@@ -177,30 +252,36 @@ If the transport thread fails while the editor is live, disable control and
 show a retained diagnostic without discarding documents or stopping editing.
 Any cleanup failure remains recorded for eventual nonzero exit status.
 Invalid response frames report a notice; ordinary expired/disconnected reply
-admission is silent and cannot change text or overwrite a user-facing notice.
+admission is silent and cannot overwrite a user-facing notice. A missing
+mutation reply does not undo its already admitted edit.
 No automatic rebinding or restart occurs. A reply that was queued but not
 delivered is not a claim of client receipt.
 
 Tests use actual private pathname sockets with the native window fixture,
-exercise state/text and mutation refusals, preserve modal state, reject stale
-pages after edit/Undo, answer Wayland pings with requests outstanding, and
+exercise state/text, revision-checked edits and out-of-subset refusals,
+preserve modal state, reject stale pages after edit/Undo, answer Wayland
+pings with requests outstanding, and
 check startup-failure cleanup, timed shutdown with partial/nonreading peers,
 and retained cleanup errors without deleting replacement names. A separate
 source confinement assertion pins the two-job per-turn budget; the socket
 progress fixture does not count exact per-turn admissions.
-These are fake-compositor and local
-kernel tests, not a live independent-compositor or td-jail/tmc oracle.
+Editing tests compare shared state/history with replay, native keyboard
+edits in both profiles and rendered pixels; they cover expected-selection
+races, expired jobs, pending-Paste/repeat cancellation, unchanged disk bytes,
+and spelling invalidation without rescanning. These are fake-compositor and
+local kernel tests, not a live independent-compositor or td-jail/td-mail oracle.
 
 ## Conformance
 
-Shared control-library tests pin exact request/error/text payloads, matching state/text responses
-through replay, immutable controller state, maximum pages and 64-tab output,
+Shared control-library tests pin exact request/error/text payloads, matching
+state/text responses through replay, immutable controller state, maximum
+pages and 64-tab output,
 stale-after-Undo rejection, every frame split, single-byte delivery, premature
 EOF, zero/oversized/trailing frames, poisoned decoder behavior and arbitrary
 byte input both as raw headers and as correctly framed payloads. Invalid
 envelopes/read-only command refusals are compared with replay, separately
-from the intentionally different mutation allowlists. These library tests need no display,
-socket, dictionary or external process.
+from the intentionally different mutation allowlists/selection guards.
+These library tests need no display, socket, dictionary or external process.
 
 ## Private socket publication prerequisite
 
@@ -315,7 +396,7 @@ publication hook proves a replaced visible parent refuses and only the
 pinned candidate is cleaned. These are transport-ownership tests, not a
 native editor-control endpoint or an adversarial same-UID race proof.
 
-## Bounded read-only worker prerequisite
+## Bounded worker
 
 `control_worker::Worker::start` takes an already admitted `Socket`. One named
 thread owns the listener and every accepted connection; no socket I/O occurs
@@ -354,7 +435,7 @@ ID. Transport failures, deadline expiry or exhausted UI admission close the
 connection without a guaranteed error frame. Successful output closes after
 its one complete frame, without waiting for the peer to close.
 
-Only `state` and revision-pinned `text` pass `Request::parse`. Eight typed jobs
+Only the query/edit subset above passes `Request::parse`. Eight typed jobs
 fit in the UI queue; submission is nonblocking and a full/disconnected queue
 closes that connection. Each job has a one-element response channel and a
 liveness token combining the acceptance deadline and connection lifetime.
@@ -365,19 +446,23 @@ worker reports an error once that bounded expired prefix has been drained.
 Dropping a job without a response disconnects its response channel before
 waking the worker to close the client.
 
-The caller reads `Job::request`, serializes against its current controller
-with the shared `Request::response`, then calls consuming `Job::respond`.
-The latter checks liveness and frame limits before copying/queuing the payload;
+The native caller consumes `Job::respond_with`, which checks liveness before
+passing the borrowed request to its query/edit handler. The handler applies
+the modal/target guards above and returns one payload. The underlying
+`Job::respond` checks liveness and frame limits before copying/queuing it;
 success means queued, not delivered or rendered. It does not validate the
 caller's response fields. A disconnected or expired job returns false; invalid
 payload size returns the shared frame error. Closing a connection cancels its
 queued/held job; a deadline never reserves an old document snapshot. This
-read-only API is not authorization for future mutation dispatch: a native
-mutation adapter must additionally enforce its own live IDs/revisions.
+transport API does not replace live UI modal/ID/revision admission.
 
 Request payload allocation is at most one MiB per reading connection. Parsing
-retains only the fixed-size typed request and drops that payload when moving
-to UI wait. Each response channel/connection owns at most one framed reply
+retains a fixed-size descriptor plus at most 256 KiB of decoded Insert text
+and drops the wire payload when moving to UI wait. Parsing may briefly hold
+both. UI insertion clones that bounded text for the owned controller command;
+the model separately normalizes/adopts it within its existing edit budgets.
+Job debug output reports byte counts, never inserted text.
+Each response channel/connection owns at most one framed reply
 of one MiB plus four bytes. A UI reply may briefly coexist with its original
 request allocation during handoff; there are at most eight such connections
 and eight queued jobs. One reusable 16-KiB scratch buffer serves the thread.

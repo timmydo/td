@@ -339,7 +339,7 @@ fn control_worker_keeps_bounded_nonblocking_transport_separate_from_editor_state
 }
 
 #[test]
-fn native_control_is_opt_in_read_only_and_bounded_per_outer_turn() {
+fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     let source = include_str!("../src/wayland.rs");
     let production = source.split("#[cfg(test)]").next().unwrap();
     assert_eq!(production.matches("self.control_tick();").count(), 1);
@@ -354,8 +354,7 @@ fn native_control_is_opt_in_read_only_and_bounded_per_outer_turn() {
         "Duration::from_millis(10)",
         "for _ in 0..CONTROL_JOBS_PER_TURN",
         "worker.try_request()",
-        "self.control_response(job.request())",
-        "job.respond(response.as_bytes())",
+        "job.respond_with(|request| self.control_response(request))",
     ] {
         assert!(poll.contains(pin), "{pin}");
     }
@@ -363,8 +362,14 @@ fn native_control_is_opt_in_read_only_and_bounded_per_outer_turn() {
         assert!(!poll.contains(forbidden), "{forbidden}");
     }
     assert!(production.contains("control: None"));
-    assert!(production.contains("fn control_response(&self,"));
+    assert!(production.contains("fn control_response(&mut self,"));
     assert!(production.contains("let response = request.response(&self.ui);"));
+    let dispatch = production.split("fn control_response(").nth(1).unwrap();
+    let dispatch = dispatch.split("\n    fn ").next().unwrap();
+    assert!(dispatch.contains("self.closed || self.pointer_modal() || self.menu.is_some()"));
+    assert!(dispatch.contains("request.execute(&mut self.ui)"));
+    assert!(!dispatch.contains("Event::Discard"));
+    assert!(!dispatch.contains("Event::Saved"));
     let startup = production.split("pub fn file_window(").nth(1).unwrap();
     assert!(startup.find("Socket::bind").unwrap() < startup.find("prepare_files(").unwrap());
     assert!(startup.contains("window.finish_control(result)"));

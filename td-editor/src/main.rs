@@ -6,8 +6,9 @@ use std::process::ExitCode;
 const HELP: &str = concat!(
     "td-editor --window [--keys=windows|emacs] [--] [FILE...]\n",
     "Window option: --dictionary PATH loads an explicit local English word list.\n",
-    "Window option: --control-socket PATH enables private read-only state/text.\n",
-    "Control can read every tab, including unsaved text; it cannot edit.\n",
+    "Window option: --control-socket PATH enables private state/text and edits.\n",
+    "Control edits check revision/selection; remote Save/Close remain unavailable.\n",
+    "Control can read/edit tabs, including unsaved text.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -37,7 +38,7 @@ const HELP: &str = concat!(
     "Format: Dictionary, Check Spelling, Next/Previous Misspelling (no wrapping).\n",
     "Spelling underlines appear at completion; edits clear them without rechecking.\n",
     "Word list: UTF-8, one ASCII word per line; 16 MiB / 250,000 unique words.\n",
-    "No bundled word list, GPU renderer, remote editing, recovery or td-mail link.\n",
+    "No bundled word list, GPU renderer, remote file I/O, recovery or td-mail link.\n",
     "Fixtures: --replay | --preview\n",
     "Scratch: --window-preview [--keys=windows|emacs]\n",
     "Scratch window has no file I/O.\n",
@@ -173,7 +174,8 @@ mod tests {
             "Do not use as $EDITOR yet",
             "F7 checks the whole document on demand",
             "No bundled word list, GPU renderer",
-            "private read-only state/text",
+            "private state/text and edits",
+            "remote Save/Close remain unavailable",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }
