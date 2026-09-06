@@ -70,6 +70,8 @@ pub enum Event<'a> {
         y: i64,
         extend: bool,
     },
+    /// End a native drag without changing focus, selection or key prefixes.
+    CancelPointer,
     Focus(bool),
     /// Milliseconds since controller creation. Supply a tick immediately before
     /// each timed input event as well as on timer wakes; there is no ambient clock.
@@ -386,6 +388,11 @@ impl Controller {
                 y,
                 extend,
             } => self.pointer(tab, revision, phase, x, y, extend),
+            Event::CancelPointer => Ok(if self.drag.take().is_some() {
+                Outcome::Changed
+            } else {
+                Outcome::Ignored
+            }),
             Event::Focus(focused) => {
                 if focused == self.focused {
                     return Ok(Outcome::Ignored);

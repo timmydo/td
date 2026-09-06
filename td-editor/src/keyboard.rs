@@ -231,6 +231,10 @@ impl Keymap {
     pub fn virtual_mask(&self, name: &str) -> Option<u32> {
         self.virtuals.get(name).copied()
     }
+    pub(crate) fn pointer_extend(&self, modifiers: Modifiers) -> bool {
+        self.state(modifiers)
+            .is_ok_and(|state| state & self.role(Role::Shift) != 0)
+    }
     /// Declared Wayland/evdev key numbers with symbols, including out-of-profile keys.
     pub fn keycodes(&self) -> impl Iterator<Item = u32> + '_ {
         self.keys.keys().filter_map(|code| code.checked_sub(8))

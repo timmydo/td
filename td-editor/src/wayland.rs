@@ -36,6 +36,47 @@ const INITIAL_DEADLINE: Duration = Duration::from_secs(20);
 const WRITE_DEADLINE: Duration = Duration::from_secs(5);
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
+fn cursor_pixels() -> [u8; 16 * 24 * 4] {
+    let rows = [
+        "#",
+        "##",
+        "#+#",
+        "#++#",
+        "#+++#",
+        "#++++#",
+        "#+++++#",
+        "#++++++#",
+        "#+++++++#",
+        "#++++++++#",
+        "#+++++++++#",
+        "#++++++++++#",
+        "#+++++++#####",
+        "#++++#++#",
+        "#+++# #++#",
+        "#++#  #++#",
+        "#+#    #++#",
+        "##     #++#",
+        "#      ####",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ];
+    let mut pixels = [0; 16 * 24 * 4];
+    for (row, output) in rows.iter().zip(pixels.as_chunks_mut::<64>().0) {
+        for (cell, pixel) in row.bytes().zip(output.as_chunks_mut::<4>().0) {
+            let value: u32 = match cell {
+                b'#' => 0xff48453f,
+                b'+' => 0xfff0eadf,
+                _ => 0,
+            };
+            pixel.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    pixels
+}
+
 fn error(value: impl std::fmt::Display) -> String {
     value.to_string()
 }
@@ -235,6 +276,10 @@ enum Kind {
     Keyboard,
     RetiredKeyboard,
     RetiredSeat,
+    Pointer,
+    RetiredPointer,
+    CursorSurface,
+    CursorBuffer,
 }
 
 struct Buffer {
@@ -242,6 +287,24 @@ struct Buffer {
     file: File,
     geometry: Geometry,
     busy: bool,
+}
+
+struct CursorImage {
+    surface: u32,
+    buffer: u32,
+    busy: bool,
+}
+
+#[derive(Default)]
+struct Pointer {
+    device: Option<u32>,
+    enter: Option<u32>,
+    x: i32,
+    y: i32,
+    held: bool,
+    wheel: crate::pointer::Wheel,
+    wheel_target: Option<Target>,
+    wheel_context: Option<Target>,
 }
 
 struct Window {
@@ -257,6 +320,9 @@ struct Window {
     configured: bool,
     pending_size: Option<(i32, i32)>,
     xrgb: bool,
+    argb: bool,
+    pointer: Pointer,
+    cursor_image: Option<CursorImage>,
     dirty: bool,
     callback: Option<u32>,
     presented: bool,
@@ -310,7 +376,7 @@ impl PathPrompt {
 impl Window {
     fn new(stream: UnixStream, temporary: PathBuf) -> Result<Self> {
         let mut ui = Controller::default();
-        let first = match ui.dispatch(Event::Load(b"td-editor scratch preview -- NO SAVE\n\nYou can type, select, undo and switch tabs with the keyboard.\nCtrl+Tab switches tabs. Emacs: M-q fills a paragraph.\n\nOpen, Save, mouse input, menus, clipboard and spelling are not connected.\nUse --keys=emacs or --keys=windows at startup.\n\nUnicode scalars: caf\xc3\xa9, na\xc3\xafve, \xce\xbb.\n\tTabs advance to eight-column stops.\n\nClosing dirty text asks for explicit discard. Do not use as $EDITOR.\nProcess termination still loses scratch text; keep nothing important here.\n")).map_err(error)? {
+        let first = match ui.dispatch(Event::Load(b"td-editor scratch preview -- NO SAVE\n\nYou can type, select, undo and switch tabs with the keyboard.\nCtrl+Tab switches tabs. Emacs: M-q fills a paragraph.\n\nMouse selection, tab clicks and scrolling work. Open, Save, menus, clipboard and spelling are not connected.\nUse --keys=emacs or --keys=windows at startup.\n\nUnicode scalars: caf\xc3\xa9, na\xc3\xafve, \xce\xbb.\n\tTabs advance to eight-column stops.\n\nClosing dirty text asks for explicit discard. Do not use as $EDITOR.\nProcess termination still loses scratch text; keep nothing important here.\n")).map_err(error)? {
             Outcome::Created(tab) => tab, _ => return Err("preview fixture creation".into()),
         };
         let second = match ui
@@ -340,6 +406,9 @@ impl Window {
             configured: false,
             pending_size: None,
             xrgb: false,
+            argb: false,
+            pointer: Pointer::default(),
+            cursor_image: None,
             dirty: true,
             callback: None,
             presented: false,
@@ -461,7 +530,11 @@ impl Window {
                 let id = cursor.u32()?;
                 if !matches!(
                     self.kind(id)?,
-                    Kind::Retired | Kind::RetiredBuffer | Kind::RetiredKeyboard | Kind::RetiredSeat
+                    Kind::Retired
+                        | Kind::RetiredBuffer
+                        | Kind::RetiredKeyboard
+                        | Kind::RetiredSeat
+                        | Kind::RetiredPointer
                 ) {
                     return Err("unexpected delete_id".into());
                 }
@@ -492,6 +565,7 @@ impl Window {
                     && self.required.contains(&id)
                 {
                     self.release_keyboard()?;
+                    self.release_pointer()?;
                     if let Some(seat) = self.seat.take() {
                         self.connection.words(seat, 3, &[])?;
                         self.set_kind(seat, Kind::RetiredSeat)?;
@@ -518,7 +592,14 @@ impl Window {
                 self.connection.words(WM, 3, &[serial])?;
             }
             (SHM, 0) if self.bound => {
-                self.xrgb |= cursor.u32()? == 1;
+                let format = cursor.u32()?;
+                cursor.finish()?;
+                self.xrgb |= format == 1;
+                self.argb |= format == 0;
+                if format == 0 {
+                    return self.show_cursor();
+                }
+                return Ok(());
             }
             (TOPLEVEL, 0) if self.bound => {
                 let width = cursor.i32()?;
@@ -572,6 +653,13 @@ impl Window {
                         if self.seat != Some(id) {
                             return Ok(());
                         }
+                        if capabilities & 1 == 0 {
+                            self.release_pointer()?;
+                        } else if self.pointer.device.is_none() {
+                            let device = self.allocate(Kind::Pointer)?;
+                            self.connection.words(id, 0, &[device])?;
+                            self.pointer.device = Some(device);
+                        }
                         if capabilities & 2 == 0 {
                             self.release_keyboard()?;
                             self.notify("Seat has no keyboard; scratch text retained");
@@ -592,6 +680,22 @@ impl Window {
             }
             (id, _) if matches!(self.kind(id)?, Kind::Keyboard | Kind::RetiredKeyboard) => {
                 return self.keyboard_event(message);
+            }
+            (id, _) if matches!(self.kind(id)?, Kind::Pointer | Kind::RetiredPointer) => {
+                return self.pointer_event(message);
+            }
+            (id, 0 | 1) if self.kind(id)? == Kind::CursorSurface => {
+                cursor.u32()?;
+            }
+            (id, 0) if self.kind(id)? == Kind::CursorBuffer => {
+                cursor.finish()?;
+                let image = self
+                    .cursor_image
+                    .as_mut()
+                    .filter(|image| image.buffer == id && image.busy)
+                    .ok_or("unexpected cursor buffer release")?;
+                image.busy = false;
+                return Ok(());
             }
             (id, 0) if self.kind(id)? == Kind::Frame && self.callback == Some(id) => {
                 cursor.u32()?;
@@ -634,6 +738,7 @@ impl Window {
     }
 
     fn close(&mut self) {
+        self.stop_pointer();
         self.input.cancel_repeat();
         if self.files.is_some() {
             self.start_close(Scope::Window);
@@ -657,6 +762,224 @@ impl Window {
         self.ui.dispatch(Event::Focus(false)).map_err(error)?;
         self.dirty = true;
         Ok(())
+    }
+
+    fn release_pointer(&mut self) -> Result<()> {
+        if let Some(device) = self.pointer.device {
+            self.connection.words(device, 1, &[])?;
+            self.set_kind(device, Kind::RetiredPointer)?;
+        }
+        self.pointer = Pointer::default();
+        self.ui.dispatch(Event::CancelPointer).map_err(error)?;
+        Ok(())
+    }
+
+    fn pointer_modal(&self) -> bool {
+        self.quitting
+            || self.prompt.is_some()
+            || self.closing.is_some()
+            || self.conflict.is_some()
+            || self.reloading.is_some()
+    }
+
+    fn stop_pointer(&mut self) {
+        self.pointer.held = false;
+        self.pointer.wheel = crate::pointer::Wheel::default();
+        self.pointer.wheel_target = None;
+        self.pointer.wheel_context = None;
+        if let Err(e) = self.ui.dispatch(Event::CancelPointer) {
+            self.notify(format!("Pointer reset refused: {e}"));
+        }
+    }
+
+    fn pointer_event(&mut self, message: Message) -> Result<()> {
+        use crate::pointer::Event as P;
+        let event = crate::pointer::decode(&message)?;
+        if self.pointer.device != Some(message.object) {
+            return Ok(());
+        }
+        if let P::Enter { surface, .. } | P::Leave(surface) = event {
+            if surface != SURFACE {
+                return Err("pointer event for unknown surface".into());
+            }
+        }
+        if self.pointer_modal() {
+            self.stop_pointer();
+        }
+        match event {
+            P::Enter { serial, x, y, .. } => {
+                self.pointer.enter = Some(serial);
+                self.pointer.x = x;
+                self.pointer.y = y;
+                self.stop_pointer();
+                self.show_cursor()?;
+            }
+            P::Leave(_) => {
+                self.pointer.enter = None;
+                self.stop_pointer();
+            }
+            P::Motion(x, y) => {
+                self.pointer.x = x;
+                self.pointer.y = y;
+                if self.pointer.held {
+                    self.pointer_action(crate::ui::PointerPhase::Move)?;
+                }
+            }
+            P::Button {
+                button: 0x110,
+                pressed,
+            } if self.pointer.enter.is_some() && !self.pointer_modal() => {
+                if pressed != self.pointer.held {
+                    self.pointer.held = pressed;
+                    self.pointer_action(if pressed {
+                        crate::ui::PointerPhase::Press
+                    } else {
+                        crate::ui::PointerPhase::Release
+                    })?;
+                }
+            }
+            P::Axis(..) | P::Source(_) | P::Stop(_) | P::Discrete(..)
+                if self.pointer.enter.is_some() && !self.pointer_modal() =>
+            {
+                if self.pointer.wheel_target.is_none() {
+                    let target = self.ui.editor().active().and_then(|tab| {
+                        self.ui.editor().document(tab).ok().map(|doc| Target {
+                            tab,
+                            revision: doc.revision(),
+                        })
+                    });
+                    if target != self.pointer.wheel_context {
+                        self.pointer.wheel = crate::pointer::Wheel::default();
+                        self.pointer.wheel_context = target;
+                    }
+                    self.pointer.wheel_target = target;
+                }
+                self.pointer.wheel.update(event)?;
+            }
+            P::Frame => {
+                let (rows, columns) = self.pointer.wheel.frame();
+                if let Some(Target { tab, revision }) = self.pointer.wheel_target.take() {
+                    if (rows != 0 || columns != 0)
+                        && !self.pointer_modal()
+                        && self.ui.editor().active() == Some(tab)
+                    {
+                        let before = self.ui.generation();
+                        match self.ui.dispatch(Event::Scroll {
+                            tab,
+                            revision,
+                            rows,
+                            columns,
+                        }) {
+                            Ok(_) | Err(crate::Error::MissingTab | crate::Error::StaleRevision) => {
+                            }
+                            Err(e) => self.notify(format!("Scroll refused: {e}")),
+                        }
+                        self.dirty |= before != self.ui.generation();
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn pointer_action(&mut self, phase: crate::ui::PointerPhase) -> Result<()> {
+        let Some(tab) = self.ui.editor().active() else {
+            return Ok(());
+        };
+        let revision = self.ui.editor().document(tab).map_err(error)?.revision();
+        let geometry = self.ui.geometry();
+        let x = i64::from(self.pointer.x).div_euclid(256);
+        let y = i64::from(self.pointer.y).div_euclid(256);
+        let area = geometry.document();
+        // Keep chrome hit boxes on integer pixels; inside text preserve strict
+        // midpoint ties even for signed 24.8 subpixel coordinates.
+        let text = x >= area.x
+            && x < area.x + i64::from(area.width)
+            && y >= area.y
+            && y < area.y + i64::from(area.height);
+        let x = if text || phase != crate::ui::PointerPhase::Press {
+            let ceil = x + i64::from(self.pointer.x.rem_euclid(256) != 0);
+            if text {
+                ceil.min(area.x + i64::from(area.width) - 1)
+            } else {
+                ceil
+            }
+        } else {
+            x
+        };
+        let extend = self.input.focused
+            && self.input.synchronized
+            && self
+                .input
+                .map
+                .as_ref()
+                .is_some_and(|map| map.pointer_extend(self.input.modifiers));
+        let before = self.ui.generation();
+        let outcome = match self.ui.dispatch(Event::Pointer {
+            tab,
+            revision,
+            phase,
+            x,
+            y,
+            extend,
+        }) {
+            Ok(outcome) => outcome,
+            Err(detail) => {
+                self.stop_pointer();
+                self.notify(format!("Pointer refused: {detail}"));
+                return Ok(());
+            }
+        };
+        self.dirty |= before != self.ui.generation();
+        if !matches!(outcome, Outcome::Ignored) {
+            self.input.cancel_repeat();
+        }
+        if let Outcome::Request {
+            name: "close-tab",
+            tab,
+            revision,
+        } = outcome
+        {
+            self.close_tab(tab, revision);
+        }
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> Result<()> {
+        let (Some(device), Some(serial)) = (self.pointer.device, self.pointer.enter) else {
+            return Ok(());
+        };
+        if !self.argb {
+            return Ok(());
+        }
+        if self.cursor_image.is_none() {
+            let file = backing_file(&self.temporary, 16 * 24 * 4)?;
+            file.write_all_at(&cursor_pixels(), 0).map_err(error)?;
+            let surface = self.allocate(Kind::CursorSurface)?;
+            let pool = self.allocate(Kind::Pool)?;
+            let buffer = self.allocate(Kind::CursorBuffer)?;
+            self.connection.words(COMPOSITOR, 0, &[surface])?;
+            let mut body = Builder::new();
+            body.u32(pool);
+            body.u32(16 * 24 * 4);
+            self.connection.send(SHM, 0, body, Some(&file))?;
+            self.connection
+                .words(pool, 0, &[buffer, 0, 16, 24, 64, 0])?;
+            self.connection.words(pool, 1, &[])?;
+            self.set_kind(pool, Kind::Retired)?;
+            self.connection.words(surface, 1, &[buffer, 0, 0])?;
+            self.connection.words(surface, 2, &[0, 0, 16, 24])?;
+            self.connection.words(surface, 6, &[])?;
+            self.cursor_image = Some(CursorImage {
+                surface,
+                buffer,
+                busy: true,
+            });
+        }
+        let image = self.cursor_image.as_ref().ok_or("cursor image missing")?;
+        self.connection
+            .words(device, 0, &[serial, image.surface, 0, 0])
     }
 
     fn keyboard_event(&mut self, message: Message) -> Result<()> {
@@ -792,19 +1115,7 @@ impl Window {
                 tab,
                 revision,
             }) => {
-                if self.files.is_some() {
-                    self.start_close(Scope::Tab { tab, revision });
-                    return Ok(false);
-                }
-                match self.ui.dispatch(Event::Close { tab, revision }) {
-                    Ok(_) => {
-                        self.labels.retain(|(id, _)| *id != tab);
-                        if self.ui.editor().active().is_none() { self.closed = true; }
-                        self.dirty = true;
-                    }
-                    Err(crate::Error::Dirty) => self.notify("Tab has unsaved scratch text. Undo to clean, or close the window to discard all."),
-                    Err(detail) => self.notify(detail.to_string()),
-                }
+                self.close_tab(tab, revision);
                 Ok(false)
             }
             Ok(Outcome::Request {
@@ -861,7 +1172,10 @@ impl Window {
             if let Some(target) = self.files.as_mut().and_then(|files| files.take_conflict()) {
                 self.input.cancel_repeat();
                 match Conflict::new(self.ui.editor(), target) {
-                    Ok(conflict) => self.conflict = Some(conflict),
+                    Ok(conflict) => {
+                        self.stop_pointer();
+                        self.conflict = Some(conflict);
+                    }
                     Err(detail) => self.notify(format!("Conflict question unavailable: {detail}")),
                 }
             }
@@ -1069,7 +1383,26 @@ impl Window {
 }
 
 impl Window {
+    fn close_tab(&mut self, tab: crate::model::TabId, revision: u64) {
+        if self.files.is_some() {
+            self.start_close(Scope::Tab { tab, revision });
+            return;
+        }
+        match self.ui.dispatch(Event::Close { tab, revision }) {
+            Ok(_) => {
+                self.labels.retain(|(id, _)| *id != tab);
+                self.closed |= self.ui.editor().active().is_none();
+                self.dirty = true;
+            }
+            Err(crate::Error::Dirty) => self.notify(
+                "Tab has unsaved scratch text. Undo to clean, or close the window to discard all.",
+            ),
+            Err(detail) => self.notify(detail.to_string()),
+        }
+    }
+
     fn start_close(&mut self, scope: Scope) {
+        self.stop_pointer();
         self.input.cancel_repeat();
         if self.closing.is_some() {
             return;
@@ -1362,6 +1695,7 @@ impl Window {
     }
 
     fn file_request(&mut self, name: &str, tab: crate::model::TabId, revision: u64) -> bool {
+        self.stop_pointer();
         let Some(files) = &mut self.files else {
             return false;
         };
@@ -1792,7 +2126,13 @@ mod tests {
         assert!(w.device.is_none());
         w.event(message(seat, 0, &[3])).unwrap();
         let device = w.device.unwrap();
-        assert_eq!(drain(&b).0, [message(seat, 1, &[device])]);
+        assert_eq!(
+            drain(&b).0,
+            [
+                message(seat, 0, &[w.pointer.device.unwrap()]),
+                message(seat, 1, &[device])
+            ]
+        );
         (w, b, device)
     }
 
@@ -1801,6 +2141,305 @@ mod tests {
         let file = backing_file(&std::env::temp_dir(), source.len() + 1).unwrap();
         file.write_all_at(source.as_bytes(), 0).unwrap();
         file
+    }
+
+    fn pointer_move(w: &mut Window, x: i64, y: i64) {
+        let pointer = w.pointer.device.unwrap();
+        w.event(message(
+            pointer,
+            2,
+            &[0, (x * 256) as u32, (y * 256) as u32],
+        ))
+        .unwrap();
+    }
+    fn pointer_button(w: &mut Window, pressed: bool) {
+        let pointer = w.pointer.device.unwrap();
+        w.event(message(pointer, 3, &[1, 0, 0x110, u32::from(pressed)]))
+            .unwrap();
+    }
+    fn pointer_enter(w: &mut Window) {
+        let pointer = w.pointer.device.unwrap();
+        w.event(message(pointer, 0, &[19, SURFACE, 0, 0])).unwrap();
+    }
+
+    #[test]
+    fn pointer_selects_scalars_drags_and_leaves_without_keyboard_focus() {
+        let (mut w, _peer, _) = seat_fixture();
+        w.ui = Controller::default();
+        w.ui.dispatch(Event::Load("abé中z\nnext".as_bytes()))
+            .unwrap();
+        w.ui.dispatch(Event::Focus(false)).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let area = w.ui.geometry().document();
+        pointer_enter(&mut w);
+        let pointer = w.pointer.device.unwrap();
+        // Exact midpoint chooses the preceding boundary; one 24.8 unit past
+        // it chooses the following boundary without waiting for keyboard focus.
+        w.event(message(
+            pointer,
+            2,
+            &[0, ((area.x + 4) * 256) as u32, (area.y * 256) as u32],
+        ))
+        .unwrap();
+        pointer_button(&mut w, true);
+        assert_eq!(w.ui.editor().document(tab).unwrap().selection().caret, 0);
+        pointer_button(&mut w, false);
+        w.event(message(
+            pointer,
+            2,
+            &[0, ((area.x + 4) * 256 + 1) as u32, (area.y * 256) as u32],
+        ))
+        .unwrap();
+        pointer_button(&mut w, true);
+        assert_eq!(w.ui.editor().document(tab).unwrap().selection().anchor, 1);
+        pointer_move(&mut w, area.x + 24, area.y);
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().selection(),
+            crate::model::Selection {
+                anchor: 1,
+                caret: 4
+            }
+        );
+        // Implicit grabs can report signed out-of-surface motion without leave.
+        w.event(message(pointer, 2, &[0, i32::MIN as u32, i32::MIN as u32]))
+            .unwrap();
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().selection(),
+            crate::model::Selection {
+                anchor: 1,
+                caret: 0
+            }
+        );
+        w.event(message(pointer, 2, &[0, i32::MAX as u32, i32::MAX as u32]))
+            .unwrap();
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().selection().caret,
+            w.ui.editor().document(tab).unwrap().text().len()
+        );
+        w.event(message(pointer, 1, &[20, SURFACE])).unwrap();
+        let selection = w.ui.editor().document(tab).unwrap().selection();
+        pointer_move(&mut w, area.x, area.y + 16);
+        pointer_button(&mut w, false);
+        assert_eq!(w.ui.editor().document(tab).unwrap().selection(), selection);
+        assert!(!w.ui.focused());
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), "abé中z\nnext");
+    }
+
+    #[test]
+    fn pointer_cursor_is_one_immutable_argb_pool_and_reuses_enter_serials() {
+        let (mut w, peer, _) = seat_fixture();
+        pointer_enter(&mut w);
+        assert!(w.cursor_image.is_none());
+        w.event(message(SHM, 0, &[0])).unwrap();
+        let image = w.cursor_image.as_ref().unwrap();
+        let (surface, buffer) = (image.surface, image.buffer);
+        let pointer = w.pointer.device.unwrap();
+        let (requests, files) = drain(&peer);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            requests.last().unwrap(),
+            &message(pointer, 0, &[19, surface, 0, 0])
+        );
+        let file = &files[0];
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        assert_eq!(file.metadata().unwrap().nlink(), 0);
+        let mut bytes = [0; 1536];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, cursor_pixels());
+        assert!(bytes.as_chunks::<4>().0.contains(&[0, 0, 0, 0]));
+        assert!(bytes.as_chunks::<4>().0.contains(&[0x3f, 0x45, 0x48, 0xff]));
+        assert!(w.buffers.is_empty());
+        w.event(message(SHM, 0, &[1])).unwrap();
+        w.event(message(SHM, 0, &[0x34325258])).unwrap();
+        assert!(drain(&peer).0.is_empty());
+        w.event(message(buffer, 0, &[])).unwrap();
+        assert!(w.event(message(buffer, 0, &[])).is_err());
+        w.event(message(pointer, 1, &[20, SURFACE])).unwrap();
+        w.event(message(pointer, 0, &[21, SURFACE, 0, 0])).unwrap();
+        let (requests, files) = drain(&peer);
+        assert!(files.is_empty());
+        assert_eq!(requests, [message(pointer, 0, &[21, surface, 0, 0])]);
+    }
+
+    #[test]
+    fn pointer_wheel_is_framed_and_does_not_retarget_across_tabs() {
+        let (mut w, _peer, _) = seat_fixture();
+        w.ui = Controller::default();
+        let text = "abcdefghijklmnopqrstuvwxyz\n".repeat(100);
+        w.ui.dispatch(Event::Load(text.as_bytes())).unwrap();
+        let first = w.ui.editor().active().unwrap();
+        w.ui.dispatch(Event::Load(text.as_bytes())).unwrap();
+        let second = w.ui.editor().active().unwrap();
+        w.ui.dispatch(Event::Resize {
+            width: 280,
+            height: 160,
+            scale: 1,
+        })
+        .unwrap();
+        pointer_enter(&mut w);
+        let pointer = w.pointer.device.unwrap();
+        w.event(message(pointer, 8, &[0, 1])).unwrap();
+        w.event(message(pointer, 4, &[0, 0, 10000])).unwrap();
+        assert_eq!(w.ui.tab_view(second).unwrap().viewport.origin().row, 0);
+        w.event(message(pointer, 5, &[])).unwrap();
+        assert_eq!(w.ui.tab_view(second).unwrap().viewport.origin().row, 3);
+        w.event(message(pointer, 4, &[0, 0, 15 * 256])).unwrap();
+        w.event(message(pointer, 5, &[])).unwrap();
+        w.ui.dispatch(Event::SelectTab(first)).unwrap();
+        w.event(message(pointer, 4, &[0, 0, 256])).unwrap();
+        w.event(message(pointer, 5, &[])).unwrap();
+        assert_eq!(w.ui.tab_view(first).unwrap().viewport.origin().row, 0);
+        w.event(message(pointer, 4, &[0, 0, 16 * 256])).unwrap();
+        w.ui.dispatch(Event::SelectTab(second)).unwrap();
+        w.event(message(pointer, 5, &[])).unwrap();
+        assert_eq!(w.ui.tab_view(second).unwrap().viewport.origin().row, 3);
+        assert_eq!(w.ui.tab_view(first).unwrap().viewport.origin().row, 0);
+    }
+
+    #[test]
+    fn pointer_shift_selection_and_capability_replacement_are_independent_of_keyboard() {
+        let (mut w, peer, device) = seat_fixture();
+        send_map(&mut w, &peer, device, &map_file());
+        focus(&mut w, device);
+        w.ui = Controller::default();
+        w.ui.dispatch(Event::Load(b"abcdef")).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let area = w.ui.geometry().document();
+        pointer_enter(&mut w);
+        pointer_move(&mut w, area.x + 8, area.y);
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        w.event(message(device, 4, &[22, 1, 0, 0, 0])).unwrap();
+        pointer_move(&mut w, area.x + 32, area.y);
+        pointer_button(&mut w, true);
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().selection(),
+            crate::model::Selection {
+                anchor: 1,
+                caret: 4
+            }
+        );
+        let old = w.pointer.device.unwrap();
+        let seat = w.seat.unwrap();
+        w.event(message(seat, 0, &[2])).unwrap();
+        assert!(w.pointer.device.is_none());
+        assert!(w.ui.focused());
+        assert!(w.input.focused && w.input.synchronized);
+        let selection = w.ui.editor().document(tab).unwrap().selection();
+        w.event(message(old, 2, &[0, 0, 0])).unwrap();
+        assert_eq!(w.ui.editor().document(tab).unwrap().selection(), selection);
+        assert!(w.event(message(old, 3, &[0, 0, 0x110, 2])).is_err());
+        w.event(message(seat, 0, &[3])).unwrap();
+        assert_ne!(w.pointer.device, Some(old));
+        w.event(message(DISPLAY, 1, &[old])).unwrap();
+        assert_eq!(w.kind(old).unwrap(), Kind::Free);
+        assert!(drain(&peer).0.iter().any(|m| *m == message(old, 1, &[])));
+        pointer_enter(&mut w);
+        w.input.synchronized = false;
+        pointer_move(&mut w, area.x + 16, area.y);
+        pointer_button(&mut w, true);
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().selection(),
+            crate::model::Selection {
+                anchor: 2,
+                caret: 2
+            }
+        );
+    }
+
+    #[test]
+    fn pointer_tab_close_is_revision_bound_and_modal_clicks_never_confirm() {
+        let (mut w, _peer) = file_dialog_fixture();
+        w.ui.dispatch(Event::New).unwrap();
+        let active = w.ui.editor().active().unwrap();
+        w.ui.dispatch(Event::Edit {
+            tab: active,
+            revision: 0,
+            command: crate::model::Command::Insert("keep".into()),
+        })
+        .unwrap();
+        pointer_enter(&mut w);
+        let close = w.ui.geometry().tab_close(1, 1, 2).unwrap();
+        pointer_move(&mut w, close.x, close.y);
+        pointer_button(&mut w, true);
+        assert!(w.closing.is_some());
+        let before = format!("{:?}", w.ui.editor());
+        for _ in 0..2 {
+            pointer_button(&mut w, false);
+            pointer_button(&mut w, true);
+        }
+        let area = w.ui.geometry().document();
+        pointer_move(&mut w, area.x, area.y);
+        pointer_button(&mut w, false);
+        pointer_button(&mut w, true);
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+        assert!(!w.closed);
+        w.chord("Escape", false).unwrap();
+        pointer_move(&mut w, 799, 599);
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+    }
+
+    #[test]
+    fn opening_a_dialog_cancels_controller_drag_before_another_pointer_event() {
+        let (mut w, _peer) = file_dialog_fixture();
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        pointer_move(&mut w, area.x, area.y);
+        pointer_button(&mut w, true);
+        w.close();
+        let tab = w.ui.editor().active().unwrap();
+        let revision = w.ui.editor().document(tab).unwrap().revision();
+        assert_eq!(
+            w.ui.dispatch(Event::Pointer {
+                tab,
+                revision,
+                phase: crate::ui::PointerPhase::Move,
+                x: 799,
+                y: 599,
+                extend: false,
+            })
+            .unwrap(),
+            Outcome::Ignored
+        );
+    }
+
+    #[test]
+    fn pointer_clicks_switch_tabs_and_close_an_inactive_dirty_tab_without_selecting_it() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, _peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            let first = w.ui.editor().active().unwrap();
+            w.chord("x", false).unwrap();
+            w.ui.dispatch(Event::New).unwrap();
+            let second = w.ui.editor().active().unwrap();
+            pointer_enter(&mut w);
+            let rect = w.ui.geometry().tab(0, 1, 2).unwrap();
+            pointer_move(&mut w, rect.x, rect.y);
+            pointer_button(&mut w, true);
+            pointer_button(&mut w, false);
+            assert_eq!(w.ui.editor().active(), Some(first));
+            let rect = w.ui.geometry().tab(1, 0, 2).unwrap();
+            pointer_move(&mut w, rect.x, rect.y);
+            pointer_button(&mut w, true);
+            pointer_button(&mut w, false);
+            assert_eq!(w.ui.editor().active(), Some(second));
+            let rect = w.ui.geometry().tab_close(0, 1, 2).unwrap();
+            pointer_move(&mut w, rect.x, rect.y);
+            pointer_button(&mut w, true);
+            assert_eq!(w.ui.editor().active(), Some(second));
+            assert_eq!(
+                w.closing.as_ref().unwrap().next(w.ui.editor()).unwrap(),
+                Some(Target {
+                    tab: first,
+                    revision: 1
+                })
+            );
+            w.chord("C-d", false).unwrap();
+            assert_eq!(w.ui.editor().active(), Some(second));
+            assert!(w.ui.editor().document(first).is_err());
+            assert!(!w.closed);
+        }
     }
 
     fn send_map(w: &mut Window, peer: &UnixStream, device: u32, file: &File) {
@@ -2763,11 +3402,16 @@ mod tests {
         let tab = w.ui.editor().active().unwrap();
         let text = w.ui.editor().document(tab).unwrap().text().to_owned();
         let seat = w.seat.unwrap();
+        let pointer = w.pointer.device.unwrap();
         w.event(message(REGISTRY, 1, &[4])).unwrap();
         assert!(w.seat.is_none() && w.device.is_none() && !w.closed);
         assert_eq!(
             drain(&peer).0,
-            [message(device, 0, &[]), message(seat, 3, &[])]
+            [
+                message(device, 0, &[]),
+                message(pointer, 1, &[]),
+                message(seat, 3, &[])
+            ]
         );
         w.event(message(seat, 0, &[2])).unwrap();
         send_map(&mut w, &peer, device, &map_file());

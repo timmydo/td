@@ -23,8 +23,10 @@ literal search/replace, paragraph filling and Auto Fill. Logical Windows and
 Emacs keys share those commands. The controller also handles visual navigation
 and pointer selection. The experimental `--window` connects file Open/Save
 and Save As through one worker, with literal keyboard path prompts and both
-key profiles. No native pointer input, GPU renderer, clipboard, spelling,
-remote socket or tmc integration is claimed yet. Do not set
+key profiles. Native mouse input selects/drags text, switches tabs, uses their
+close marks and scrolls with wheels/touchpads. A small bitmap arrow supplies
+the cursor. No GPU renderer, clipboard, spelling, remote socket or tmc
+integration is claimed yet. Do not set
 `$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
@@ -167,7 +169,8 @@ td-editor/target/release/td-editor --window-preview --keys=emacs
 It starts with two editable scratch tabs and follows window-manager resizing.
 Type, navigate, select with Shift, undo, and switch tabs with Ctrl+Tab.
 Windows-like bindings are the default; the second command selects Emacs.
-Open, Save, pointer input, menus, clipboard and spelling are not connected.
+Mouse selection, tab clicks and scrolling work. Open, Save, menus, clipboard
+and spelling are not connected in the scratch preview.
 Unavailable commands show a notice; Escape/Ctrl+G dismisses it. Closing a
 dirty tab refuses; undo to clean or close the window to discard all scratch
 text. Dirty window close asks for Ctrl+D to discard everything, or

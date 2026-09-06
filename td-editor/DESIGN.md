@@ -16,8 +16,9 @@ filling, Auto Fill, and logical Windows/Emacs key dispatch. The core opens no
 files and reads no environment or clocks. The synchronous `files::Session`
 adapter now implements bounded file baselines and atomic save I/O, separately
 from the model. `--window` now connects it through one file worker to
-file-backed tabs and keyboard Open/Save/Save As path prompts. Pointer input,
-GPU rendering, spelling and the control socket are not implemented yet.
+file-backed tabs and keyboard Open/Save/Save As path prompts. Native pointer
+selection, tab clicks and scrolling are connected. GPU rendering, spelling
+and the control socket are not implemented yet.
 Key bindings for those absent adapters
 produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -856,8 +857,9 @@ prompt and displays pending/success/failure; retry starts a fresh prompt.
 Prompts and notices share the existing clipped top-six-document-row overlay.
 When input is unavailable or not synchronized, the prompt instead prefixes
 readiness instructions without erasing the entered path.
-This is keyboard-only: pointer input, clickable menus and clipboard remain
-unimplemented.
+Path and confirmation dialogs remain keyboard-only. Native pointer selection,
+tab clicks and scrolling follow the pointer contract below; clickable menus
+and clipboard remain unimplemented.
 
 `session::Session` keeps FileId-to-TabId associations and an opaque model save
 token per pending save. One `std::thread::Builder` worker exclusively owns
@@ -1036,8 +1038,8 @@ milestone below. It opens one 800x600 scale-1 xdg toplevel and two initially
 clean fixture tabs through `ui::Controller` and the reference renderer.
 `--window-preview --keys=windows|emacs` selects the profile (Windows default).
 The title and fixture say NO SAVE. Typing, selection, visual motion, undo,
-tab switching and core commands are connected. Pointer input and menus are
-not connected; unavailable commands produce a visible, bounded notice,
+tab switching, native pointer input and core commands are connected. Menus
+are not connected; unavailable commands produce a visible, bounded notice,
 retained until Escape/C-g or another explicit notice-producing action.
 Notices wrap over the document's top six rows and clip on small surfaces;
 they do not mutate document text. The binary refuses filenames and ordinary
@@ -1068,8 +1070,8 @@ explicit-input contract is unchanged.
 It binds compositor v4, SHM v1 and xdg shell v1, requiring those minimum
 versions and capping higher advertisements. At startup it also binds the
 lowest-global-ID seat offering v5 or newer, capped to v7, and requests its
-keyboard only after the capability event. A missing/old seat leaves a
-presentation-only window with a notice; this scratch-mode exception does not
+keyboard and pointer only after their capability events. A missing/old seat
+leaves a presentation-only window with a notice; this scratch-mode exception does not
 weaken the version-1 required-seat contract below. Other globals are ignored,
 subject to 128 live registry entries and 256 bytes per interface name.
 Client IDs are dense in a 128-slot table and are reused only after delete_id;
@@ -1101,7 +1103,8 @@ preferred; otherwise a free wrong-size buffer is destroyed and replaced.
 Busy old-size buffers
 remain immutable until release. When all three are busy, only the latest
 configured geometry is retained for the next free slot. One scratch raster
-allocation is reused. This is CPU SHM presentation, not GPU rendering.
+allocation is reused. The immutable pointer image has a separate 1536-byte
+ARGB8888 pool, described below. This is CPU SHM presentation, not GPU rendering.
 
 Pool files use `create_new`, mode 0600, in Rust's temporary directory (TMPDIR
 or `/tmp`); a checked process-local serial and 64 collision attempts bound
@@ -1172,6 +1175,76 @@ not live keyboard delivery, compositor screenshots, GPU rendering or td-jail
 integration. Socket tests separately exercise real keymap transfers, both
 profiles' edits/undo and changed raster pixels, map replacement and rejection,
 held/focus/modifier/repeat state, and dirty-window discard/cancel.
+
+### Implemented native pointer contract
+
+The bound v5-v7 seat independently supplies a pointer. Capability loss sends
+release, clears pointer state and ends the controller drag without changing
+keyboard focus or selection. In-flight retired events are schema-checked but
+not applied; IDs wait for delete_id. Seat removal releases both devices.
+Pointer enter/leave must name the main surface. Unknown opcodes, truncated or
+trailing payloads, invalid axis/source numbers and invalid button states are
+errors. Right/middle/unknown buttons are otherwise ignored; only BTN_LEFT
+press/move/release is connected. Duplicate presses and unmatched releases
+do nothing. Enter never invents a held button; leave cancels dragging and
+pending wheel motion without changing keyboard focus.
+
+Mouse input works before keyboard focus. Shift extends selection only when
+the compiled map validates the focused, synchronized modifier snapshot and
+its declared Shift role is active. Otherwise a press starts a fresh anchor.
+Chrome uses floor-rounded signed 24.8 coordinates. Text x coordinates round
+up within their already-hit region, preserving strict midpoint ties; y rounds
+down. Out-of-surface presses stay outside and drag endpoints clamp through
+the controller. Native presentation is still scale 1. Selection, tab switching
+and close-mark hit testing use the same controller as headless replay. A tab
+close request goes through the revision-bound file close dialog, including
+when the clicked tab was not active. Scratch dirty-tab close still refuses.
+Accepted pointer actions cancel keyboard repeat. No double-click word select,
+drag autoscroll, selection clipboard or context menu is implemented.
+
+Path, close, conflict and pending-Reload modals consume pointer actions:
+clicks cannot answer a question, activate obscured tabs or edit text. Starting
+one of these flows clears native held-button/wheel state. Cancelling it does
+not resume an old drag. The pointer remains visible over modal overlays.
+
+Motion/buttons are dispatched in wire order; wheel axes accumulate until
+wl_pointer.frame. One fixed-size two-axis accumulator accepts at most 256
+axis-related events per frame, with no heap event queue. Discrete steps take
+precedence over their paired continuous distance and scroll three rows or
+columns per notch. A zero discrete value carries no notch and is ignored.
+Without discrete steps, signed distance accumulates at
+16 surface units per row or eight per column, retaining fractional remainder
+between frames. Stop clears that axis's remainder after the frame; a changed
+source clears both remainders. Each frame's output clamps to +/-16 Mi cells
+before the viewport applies its document limits. Soft wrap disables horizontal
+scrolling through the existing controller policy. There is no kinetic scroll.
+The first axis event pins the active tab/revision: a changed tab/revision
+before frame prevents applying that frame to a different document. Fractional
+carry resets when the next frame targets a different tab or revision.
+
+On enter, after ARGB8888 is advertised, one code-defined 16x24 charcoal/warm
+arrow is installed with that enter's serial and hotspot (0,0). It uses a
+separate surface and one unlinked 0600 backing file through the existing
+SHM pool request. The local file closes after transfer; the server-owned
+pool/buffer retains its bytes. Its 1536 bytes are immutable for the connection
+lifetime, never rewritten while busy or reattached on enter. A release is
+accepted exactly once for the sole attachment; subsequent enters reuse the
+surface with the new enter serial. This relies on core wl_surface content
+remaining attached across pointer leave/unmapping: enter makes the pointer
+image association undefined, not the cursor surface's committed contents.
+No cursor theme, font, host library,
+frame callback, raw syscall or incoming descriptor consumer is added.
+
+Controller pointer/scroll refusals show a notice instead of being classified
+as malformed Wayland transport. Protocol/schema failures still disconnect.
+
+Pure pointer tests cover exact schemas, signed/extreme coordinates, discrete
+versus smooth diagonal frames, fractional carry and the event budget. Fake
+compositor tests cover pre-focus scalar selection, dragging/leave, Shift
+readiness, capability removal/reacquisition, retired events, modal safety,
+tab close, frame target binding and cursor requests/descriptor bytes. The
+cursor follows the core [Wayland pointer protocol](https://wayland.freedesktop.org/docs/html/apa.html#protocol-spec-wl_pointer).
+These are not yet a live hardware pointer or jail integration oracle.
 
 ### Version-1 compatibility target
 

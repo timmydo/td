@@ -27,6 +27,7 @@ fn source_inventory_and_allowances_are_closed() {
         "lib.rs",
         "main.rs",
         "model.rs",
+        "pointer.rs",
         "render.rs",
         "replay.rs",
         "seat.rs",
