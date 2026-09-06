@@ -3,6 +3,35 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+const HELP: &str = concat!(
+    "td-editor --window [--keys=windows|emacs] [--] [FILE...]\n",
+    "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
+    "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
+    "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
+    "Paths are literal; Save As requires a new destination. No shell expansion.\n",
+    "Close asks per dirty tab: Ctrl+S saves, Ctrl+D discards, Escape/Ctrl+G cancels.\n",
+    "Cancelling close does not cancel a pending write; completed saves stay saved.\n",
+    "Save conflict: Ctrl+R Reload, Ctrl+S Save As, Escape/Ctrl+G Cancel.\n",
+    "Dirty Reload additionally requires Ctrl+D and clears undo history.\n",
+    "Mouse: select/drag, tab clicks/close marks, wheel/touchpad scrolling.\n",
+    "Menus: click a header or F10; arrows navigate, Return selects, Escape cancels.\n",
+    "Edit switches key profiles. Format: Soft Wrap, Auto Fill, Fill Paragraph.\n",
+    "UTF-8 clipboard requires Wayland data-device v3 and window focus; limit 1 MiB.\n",
+    "Windows clipboard: Ctrl+C/X/V. Emacs: M-w/C-w/C-y. Edit also has Copy/Cut/Paste.\n",
+    "Copy/Cut needs a physical key or pointer press. Escape/Ctrl+G cancels Paste.\n",
+    "Find: Windows Ctrl+F, F3, Shift+F3; Emacs C-s/C-r opens a directional prompt.\n",
+    "Find is submitted literal, case-sensitive search, not incremental while typing.\n",
+    "Return searches, Ctrl+U clears, Escape/Ctrl+G cancels.\n",
+    "At the start/end, repeat the same search to wrap.\n",
+    "Go To Line: F6 or Edit menu in both profiles; enter a one-based logical line.\n",
+    "No GPU renderer, spelling UI, control socket, crash recovery or tmc integration.\n",
+    "Fixtures: --replay | --preview\n",
+    "Scratch: --window-preview [--keys=windows|emacs]\n",
+    "Scratch window has no file I/O.\n",
+    "Scratch close: Ctrl+D discards ALL scratch edits; Escape/Ctrl+G cancels.\n",
+    "Other: --font-license | --help\n",
+);
+
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match args.as_slice() {
@@ -17,7 +46,7 @@ fn main() -> ExitCode {
             [td_editor::render::FONT_PROVENANCE, td_editor::render::FONT_COPYING,
                 td_editor::render::FONT_LICENSE].iter().try_for_each(|notice| output.write_all(notice.as_bytes()))
         }
-        [arg] if arg == "--help" => io::stdout().lock().write_all(b"td-editor --window [--keys=windows|emacs] [--] [FILE...]\nExperimental file editing: Open, Save and Save As to a new path.\nWindows: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\nPath entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears. No shell expansion.\nClose asks per dirty tab: Ctrl+S saves, Ctrl+D discards, Escape/Ctrl+G cancels closing.\nCancelling close during Save does not cancel the write; completed saves stay saved.\nSave conflict: Ctrl+R Reload, Ctrl+S Save As, Escape/Ctrl+G Cancel.\nDirty Reload additionally requires Ctrl+D; it clears undo history.\nMouse: select/drag, tab clicks/close marks, wheel/touchpad scrolling.\nMenus: click a header or F10; arrows navigate, Return selects, Escape/Ctrl+G cancels.\nNo clipboard, spelling or recovery yet. Do not use as $EDITOR.\nFixtures: --replay | --preview | --window-preview [--keys=windows|emacs]\nScratch window close: Ctrl+D discards ALL scratch edits; Escape/Ctrl+G cancels.\nOther: --font-license | --help\n"),
+        [arg] if arg == "--help" => io::stdout().lock().write_all(HELP.as_bytes()),
         _ => Err(io::Error::other("use --window, --replay, --preview, --window-preview, --font-license or --help; ordinary $EDITOR invocation is not ready")),
     };
     match result {
@@ -73,6 +102,29 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn help_describes_native_adapters_without_claiming_editor_integration() {
+        assert_eq!(td_editor::clipboard::MAX_BYTES, 1024 * 1024);
+        for feature in [
+            "data-device v3",
+            "limit 1 MiB",
+            "physical key or pointer press",
+            "Ctrl+F, F3, Shift+F3",
+            "F6 or Edit menu",
+            "not incremental",
+            "At the start/end, repeat the same search to wrap",
+            "Do not use as $EDITOR yet",
+            "No GPU renderer, spelling UI",
+        ] {
+            assert!(HELP.contains(feature), "{feature}");
+        }
+        assert!(!HELP.contains("No clipboard"));
+        assert!(HELP.ends_with('\n'));
+        assert!(HELP.lines().all(|line| line.len() <= 80));
+        assert!(HELP
+            .contains("Scratch close: Ctrl+D discards ALL scratch edits; Escape/Ctrl+G cancels."));
+    }
     #[test]
     fn literal_paths_and_options() {
         let raw = OsString::from_vec(b"file-\xff".to_vec());
