@@ -28,6 +28,11 @@ close marks and scrolls with wheels/touchpads. A small bitmap arrow supplies
 the cursor. Click File/Edit/Format/Help or press F10 for menus; arrow keys
 navigate, Return activates and Escape/Ctrl+G cancels. Edit switches key
 profiles; Format exposes Soft Wrap, Auto Fill and Fill Paragraph.
+Edit also exposes Find/Find Next/Find Previous. Windows Ctrl+F opens Find,
+F3 searches next and Shift+F3 previous; Emacs C-s/C-r open directional
+search. Type a literal case-sensitive query, Return to search, Ctrl+U to
+clear or Escape/Ctrl+G to cancel. Search reports the end before the next
+explicit search wraps. Entry is submitted, not incremental while typing.
 No GPU renderer, spelling, remote socket or tmc integration is
 claimed yet. Do not set
 `$EDITOR` to this binary yet.

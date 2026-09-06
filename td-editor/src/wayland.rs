@@ -350,6 +350,8 @@ struct Window {
     menu: Option<crate::menu::Menu>,
     clipboard: crate::data::Clipboard,
     activation_serial: Option<u32>,
+    search: Option<crate::search::Prompt>,
+    searches: crate::search::History,
 }
 
 enum PathAction {
@@ -439,6 +441,8 @@ impl Window {
             menu: None,
             clipboard: crate::data::Clipboard::default(),
             activation_serial: None,
+            search: None,
+            searches: crate::search::History::default(),
         })
     }
 
@@ -531,6 +535,7 @@ impl Window {
     fn event(&mut self, message: Message) -> Result<()> {
         let result = self.event_inner(message);
         self.cancel_stale_paste();
+        self.searches.observe(self.ui.editor());
         result
     }
 
@@ -805,6 +810,8 @@ impl Window {
     }
 
     fn close(&mut self) {
+        self.search = None;
+        self.searches.cancel_wrap();
         self.clipboard.incoming = None;
         self.menu = None;
         self.stop_pointer();
@@ -823,6 +830,7 @@ impl Window {
     }
 
     fn release_keyboard(&mut self) -> Result<()> {
+        self.searches.cancel_wrap();
         self.clipboard_focus_lost()?;
         self.menu = None;
         if let Some(device) = self.device.take() {
@@ -847,6 +855,7 @@ impl Window {
 
     fn pointer_modal(&self) -> bool {
         self.quitting
+            || self.search.is_some()
             || self.prompt.is_some()
             || self.closing.is_some()
             || self.conflict.is_some()
@@ -1099,6 +1108,7 @@ impl Window {
             self.menu = None;
             self.clipboard.incoming = None;
             self.input.map = None;
+            self.searches.cancel_wrap();
             self.input.cancel_repeat();
             self.input.synchronized = false;
             self.ui.dispatch(Event::Focus(false)).map_err(error)?;
@@ -1137,6 +1147,7 @@ impl Window {
                     return Err("keyboard leave for unknown surface".into());
                 }
                 self.input.focus(&[], false)?;
+                self.searches.cancel_wrap();
                 self.clipboard_focus_lost()?;
                 self.menu = None;
                 self.ui.dispatch(Event::Focus(false)).map_err(error)?;
@@ -1173,6 +1184,7 @@ impl Window {
     fn chord(&mut self, chord: &str, repeated: bool) -> Result<bool> {
         if matches!(chord, "Escape" | "C-g") && !repeated {
             self.clipboard.incoming = None;
+            self.searches.cancel_wrap();
         }
         if self.quitting {
             if !repeated {
@@ -1197,6 +1209,10 @@ impl Window {
         }
         if self.conflict.is_some() || self.reloading.is_some() {
             self.conflict_chord(chord, repeated);
+            return Ok(false);
+        }
+        if self.search.is_some() {
+            self.search_chord(chord, repeated)?;
             return Ok(false);
         }
         if self.menu.is_some() {
@@ -1235,6 +1251,20 @@ impl Window {
                 revision,
             }) => {
                 self.close_tab(tab, revision);
+                Ok(false)
+            }
+            Ok(Outcome::Request {
+                name,
+                tab,
+                revision,
+            }) if matches!(
+                name,
+                "find" | "find-backward" | "find-next" | "find-previous"
+            ) =>
+            {
+                if !repeated {
+                    self.search_request(name, tab, revision)?;
+                }
                 Ok(false)
             }
             Ok(Outcome::Request {
@@ -1334,6 +1364,7 @@ impl Window {
             self.connection.wait = self.connection.wait.min(Duration::from_millis(10));
         }
         self.cancel_stale_paste();
+        self.searches.observe(self.ui.editor());
         Ok(())
     }
 
@@ -1378,6 +1409,7 @@ impl Window {
             .collect();
         let close_notice = self.close_notice();
         let path_notice = self.path_notice();
+        let search_notice = self.search_notice();
         let closing_notice = self.closing_notice();
         let conflict_notice = self.conflict_notice();
         let mut raster =
@@ -1393,6 +1425,8 @@ impl Window {
             closing_notice.as_deref()
         } else if conflict_notice.is_some() {
             conflict_notice.as_deref()
+        } else if search_notice.is_some() {
+            search_notice.as_deref()
         } else {
             self.notice.as_deref()
         };
@@ -1754,6 +1788,18 @@ impl Window {
                 return Ok(());
             }
             Item::Spell => return Ok(()),
+            Item::Find | Item::FindNext | Item::FindPrevious => {
+                self.search_request(
+                    match item {
+                        Item::Find => "find",
+                        Item::FindNext => "find-next",
+                        _ => "find-previous",
+                    },
+                    tab,
+                    revision,
+                )?;
+                return Ok(());
+            }
         };
         if let Err(detail) = self.ui.dispatch(event) {
             self.notify(format!("Menu command refused: {detail}"));
@@ -2181,6 +2227,119 @@ impl Window {
 }
 
 impl Window {
+    fn search_notice(&self) -> Option<String> {
+        self.search.as_ref().map(|prompt| {
+            let paused = if self.device.is_none() || self.input.map.is_none() {
+                "Find paused: keyboard unavailable; restore the seat/keymap.\n"
+            } else if !self.input.focused || !self.input.synchronized {
+                "Find paused: focus the editor; tap and release Shift.\n"
+            } else {
+                ""
+            };
+            format!("{paused}{}", prompt.notice())
+        })
+    }
+
+    fn search_request(
+        &mut self,
+        name: &str,
+        tab: crate::model::TabId,
+        revision: u64,
+    ) -> Result<()> {
+        self.menu = None;
+        self.stop_pointer();
+        self.input.cancel_repeat();
+        let backward = matches!(name, "find-backward" | "find-previous");
+        if matches!(name, "find-next" | "find-previous") && !self.searches.query().is_empty() {
+            let query = self.searches.query().to_owned();
+            self.find(tab, revision, &query, backward);
+            return Ok(());
+        }
+        let doc = self.ui.editor().document(tab).map_err(error)?;
+        let selected = doc.text().get(doc.selection().range()).unwrap_or_default();
+        let query = if !selected.is_empty()
+            && selected.len() <= crate::search::QUERY_BYTES
+            && !selected.chars().any(char::is_control)
+        {
+            selected.to_owned()
+        } else {
+            self.searches.query().to_owned()
+        };
+        let prompt =
+            match crate::search::Prompt::new(self.ui.editor(), tab, revision, query, backward) {
+                Ok(prompt) => prompt,
+                Err(e) => {
+                    self.notify(format!("Find refused: {e}"));
+                    return Ok(());
+                }
+            };
+        if let Err(e) = self.ui.dispatch(Event::CancelInput) {
+            self.notify(format!("Find refused: {e}"));
+            return Ok(());
+        }
+        self.search = Some(prompt);
+        self.clipboard.incoming = None;
+        self.notice = None;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn find(&mut self, tab: crate::model::TabId, revision: u64, query: &str, backward: bool) {
+        use crate::search::Found;
+        let result = self
+            .searches
+            .find(&mut self.ui, tab, revision, query, backward);
+        self.notify(match result {
+            Ok(Found::Match) => "Match found.".into(),
+            Ok(Found::Wrapped) => "Search wrapped; match found.".into(),
+            Ok(Found::End) => format!(
+                "Reached {}; repeat this search to wrap.",
+                if backward { "start" } else { "end" }
+            ),
+            Ok(Found::Missing) => "No matches in this document.".into(),
+            Err(e) => format!("Find refused: {e}"),
+        });
+    }
+
+    fn search_chord(&mut self, chord: &str, repeated: bool) -> Result<()> {
+        if repeated {
+            return Ok(());
+        }
+        let Some(mut prompt) = self.search.take() else {
+            return Ok(());
+        };
+        self.dirty = true;
+        if matches!(chord, "Escape" | "C-g") {
+            self.searches.cancel_wrap();
+            self.notice = None;
+            if let Err(e) = self.ui.dispatch(Event::CancelInput) {
+                self.notify(format!("Find cancellation refused: {e}"));
+            }
+            return Ok(());
+        }
+        let emacs_search =
+            self.ui.keys().profile() == Profile::Emacs && matches!(chord, "C-s" | "C-r");
+        if chord == "Return" || emacs_search {
+            if emacs_search {
+                prompt.backward = chord == "C-r";
+            }
+            if prompt.text.is_empty() {
+                self.search = Some(prompt);
+                return Ok(());
+            }
+            match prompt.target(self.ui.editor()) {
+                Ok((tab, revision)) => self.find(tab, revision, &prompt.text, prompt.backward),
+                Err(e) => self.notify(format!(
+                    "Find cancelled: document or selection changed ({e})."
+                )),
+            }
+            return Ok(());
+        }
+        prompt.type_chord(chord);
+        self.search = Some(prompt);
+        Ok(())
+    }
+
     fn initialize_clipboard(&mut self) -> Result<()> {
         let Some(seat) = self.seat else { return Ok(()) };
         let Some(name) = self
@@ -3277,6 +3436,251 @@ mod tests {
         wire::take(&mut body.message(object, opcode).unwrap())
             .unwrap()
             .unwrap()
+    }
+
+    fn find_fixture(profile: Profile) -> (Window, UnixStream, u32) {
+        let (mut w, peer, keyboard) = seat_fixture();
+        w.ui = Controller::default();
+        w.labels.clear();
+        w.ui.dispatch(Event::Load(b"one two one")).unwrap();
+        w.ui.dispatch(Event::Profile(profile)).unwrap();
+        send_map(&mut w, &peer, keyboard, &map_file());
+        focus(&mut w, keyboard);
+        w.notice = None;
+        (w, peer, keyboard)
+    }
+
+    #[test]
+    fn native_find_keys_submit_in_both_profiles_and_windows_f3_reports_end_before_wrap() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, _peer, keyboard) = find_fixture(profile);
+            w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
+            key(
+                &mut w,
+                keyboard,
+                if profile == Profile::Windows { 33 } else { 31 },
+            );
+            assert!(w.search.is_some());
+            w.event(message(keyboard, 4, &[0, 0, 0, 0, 0])).unwrap();
+            for code in [24, 49, 18] {
+                key(&mut w, keyboard, code);
+            }
+            assert_eq!(w.search.as_ref().unwrap().text, "one");
+            assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..0);
+            key(&mut w, keyboard, 28);
+            assert!(w.search.is_none());
+            assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..3);
+            if profile == Profile::Windows {
+                key(&mut w, keyboard, 61);
+                assert_eq!(
+                    w.ui.editor().document(1).unwrap().selection().range(),
+                    8..11
+                );
+                key(&mut w, keyboard, 61);
+                assert!(w.notice.as_ref().unwrap().contains("Reached end"));
+                assert_eq!(
+                    w.ui.editor().document(1).unwrap().selection().range(),
+                    8..11
+                );
+                key(&mut w, keyboard, 61);
+                assert!(w.notice.as_ref().unwrap().contains("wrapped"));
+                assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..3);
+                w.event(message(keyboard, 4, &[0, 1, 0, 0, 0])).unwrap();
+                key(&mut w, keyboard, 61); // Shift+F3
+                assert!(w.notice.as_ref().unwrap().contains("Reached start"));
+                key(&mut w, keyboard, 61);
+                assert_eq!(
+                    w.ui.editor().document(1).unwrap().selection().range(),
+                    8..11
+                );
+            } else {
+                w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
+                key(&mut w, keyboard, 31);
+                assert_eq!(w.search.as_ref().unwrap().text, "one");
+                key(&mut w, keyboard, 31); // explicit C-s submits, no live incremental edits
+                assert_eq!(
+                    w.ui.editor().document(1).unwrap().selection().range(),
+                    8..11
+                );
+                key(&mut w, keyboard, 19);
+                assert!(w.search.as_ref().unwrap().backward);
+                key(&mut w, keyboard, 19);
+                assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..3);
+            }
+            assert!(!w.ui.editor().document(1).unwrap().dirty());
+            assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (0, 0));
+            assert!(w.input.repeat(1000).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn find_prompt_cancel_repeat_staleness_and_input_loss_do_not_edit_or_retarget() {
+        let (mut w, _peer, keyboard) = find_fixture(Profile::Emacs);
+        w.search_request("find", 1, 0).unwrap();
+        w.chord("x", true).unwrap();
+        assert!(w.search.as_ref().unwrap().text.is_empty());
+        w.chord("Return", false).unwrap();
+        assert!(w.search.is_some());
+        w.chord("C-r", false).unwrap();
+        assert!(w.search.as_ref().unwrap().backward);
+        w.chord("λ", false).unwrap();
+        w.chord("C-g", false).unwrap();
+        assert!(w.search.is_none());
+        assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..0);
+        w.search_request("find", 1, 0).unwrap();
+        w.chord("o", false).unwrap();
+        w.event(message(keyboard, 2, &[0, SURFACE])).unwrap();
+        assert!(w.search_notice().unwrap().contains("paused"));
+        assert_eq!(w.search.as_ref().unwrap().text, "o");
+        focus(&mut w, keyboard);
+        w.ui.dispatch(Event::New).unwrap();
+        w.chord("Return", false).unwrap();
+        assert!(w.notice.as_ref().unwrap().contains("Find cancelled"));
+        assert_eq!(w.ui.editor().active(), Some(2));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "one two one");
+        assert_eq!(w.ui.editor().document(2).unwrap().text(), "");
+    }
+
+    #[test]
+    fn find_menu_prompt_changes_only_overlay_pixels_and_restores_them_on_cancel() {
+        let (mut w, peer, _) = find_fixture(Profile::Windows);
+        configure(&mut w, 800, 600);
+        w.event(message(SHM, 0, &[1])).unwrap();
+        w.draw().unwrap();
+        let original = w.pixels.clone();
+        done(&mut w);
+        drain(&peer);
+        w.open_menu(crate::menu::Group::Edit).unwrap();
+        let index = crate::menu::Group::Edit
+            .items()
+            .iter()
+            .position(|item| *item == crate::menu::Item::Find)
+            .unwrap();
+        w.activate_menu(index).unwrap();
+        assert!(w.search.is_some());
+        w.draw().unwrap();
+        assert!(w.pixels != original);
+        done(&mut w);
+        drain(&peer);
+        w.chord("Escape", false).unwrap();
+        w.draw().unwrap();
+        assert!(w.pixels == original);
+        assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (0, 0));
+    }
+
+    #[test]
+    #[allow(clippy::unreachable)]
+    fn native_find_wrap_is_invalidated_by_event_tick_focus_keymap_cancel_and_close() {
+        for transition in [
+            "event", "tick", "focus", "keymap", "seat", "cancel", "close",
+        ] {
+            let (mut w, peer, keyboard) = find_fixture(Profile::Windows);
+            w.find(1, 0, "zzz", false);
+            assert!(w.notice.as_ref().unwrap().contains("Reached end"));
+            match transition {
+                "event" => {
+                    key(&mut w, keyboard, 106); // Right then Left through native event wrapper
+                    key(&mut w, keyboard, 105);
+                }
+                "tick" => {
+                    for (at, now) in [(1, 1), (0, 2)] {
+                        w.ui.dispatch(Event::Edit {
+                            tab: 1,
+                            revision: 0,
+                            command: crate::model::Command::Select(crate::model::Selection {
+                                anchor: at,
+                                caret: at,
+                            }),
+                        })
+                        .unwrap();
+                        w.tick(now, false).unwrap();
+                    }
+                }
+                "focus" => {
+                    w.event(message(keyboard, 2, &[0, SURFACE])).unwrap();
+                    focus(&mut w, keyboard);
+                }
+                "keymap" => send_map(&mut w, &peer, keyboard, &map_file()),
+                "seat" => w.release_keyboard().unwrap(),
+                "cancel" => {
+                    w.chord("Escape", false).unwrap();
+                }
+                "close" => w.close(),
+                _ => unreachable!(),
+            }
+            assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..0);
+            w.find(1, 0, "zzz", false);
+            assert!(
+                w.notice.as_ref().unwrap().contains("Reached end"),
+                "{transition}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_find_prompt_blocks_pointer_and_repeats_and_cancels_on_close() {
+        let (mut w, _peer, keyboard) = find_fixture(Profile::Windows);
+        w.chord("C-f", true).unwrap();
+        assert!(w.search.is_none());
+        w.find(1, 0, "zzz", false);
+        let notice = w.notice.clone();
+        w.chord("F3", true).unwrap();
+        assert_eq!(w.notice, notice);
+        w.search_request("find", 1, 0).unwrap();
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        pointer_move(&mut w, area.x + 56, area.y);
+        pointer_button(&mut w, true);
+        pointer_move(&mut w, area.x + 72, area.y);
+        pointer_button(&mut w, false);
+        assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..0);
+        assert!(w.search.is_some());
+        key(&mut w, keyboard, 1); // Escape
+        w.search_request("find", 1, 0).unwrap();
+        w.close();
+        assert!(w.search.is_none());
+    }
+
+    #[test]
+    fn native_find_open_cancels_prefix_drag_repeat_and_pending_paste_and_rejects_multiline_seed() {
+        let (mut w, _peer, keyboard) = find_fixture(Profile::Emacs);
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        pointer_move(&mut w, area.x, area.y);
+        pointer_button(&mut w, true);
+        assert!(w.pointer.held);
+        w.ui.dispatch(Event::Key {
+            tab: 1,
+            revision: 0,
+            chord: "C-x",
+        })
+        .unwrap();
+        assert!(w.ui.keys().pending());
+        w.input.key(106, true).unwrap();
+        w.input.arm(106, 0);
+        let (incoming, _producer) =
+            crate::transfer::Incoming::begin(w.ui.editor(), 1, 0, 0).unwrap();
+        w.clipboard.incoming = Some(incoming);
+        w.search_request("find", 1, 0).unwrap();
+        assert!(!w.ui.keys().pending());
+        assert!(!w.pointer.held);
+        assert!(w.input.repeat(1000).unwrap().is_none());
+        assert!(w.clipboard.incoming.is_none());
+        w.chord("Escape", false).unwrap();
+        w.ui.dispatch(Event::Load(b"one\ntwo")).unwrap();
+        w.ui.dispatch(Event::Edit {
+            tab: 2,
+            revision: 0,
+            command: crate::model::Command::Select(crate::model::Selection {
+                anchor: 0,
+                caret: 7,
+            }),
+        })
+        .unwrap();
+        w.search_request("find", 2, 0).unwrap();
+        assert!(w.search.as_ref().unwrap().text.is_empty());
+        w.event(message(keyboard, 2, &[0, SURFACE])).unwrap();
+        assert!(w.search.is_some());
     }
 
     fn clipboard_fixture() -> (Window, UnixStream, u32, u32) {

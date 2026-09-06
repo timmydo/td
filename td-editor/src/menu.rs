@@ -26,7 +26,19 @@ impl Group {
         use Item::*;
         match self {
             Self::File => &[New, Open, Save, SaveAs, Close, Quit],
-            Self::Edit => &[Undo, Redo, Cut, Copy, Paste, SelectAll, Windows, Emacs],
+            Self::Edit => &[
+                Undo,
+                Redo,
+                Cut,
+                Copy,
+                Paste,
+                SelectAll,
+                Windows,
+                Emacs,
+                Find,
+                FindNext,
+                FindPrevious,
+            ],
             Self::Format => &[Wrap, AutoFill, Fill, Spell],
             Self::Help => &[About],
         }
@@ -54,6 +66,9 @@ pub(crate) enum Item {
     Fill,
     Spell,
     About,
+    Find,
+    FindNext,
+    FindPrevious,
 }
 
 impl Item {
@@ -78,6 +93,9 @@ impl Item {
             Self::Fill => "Fill Paragraph",
             Self::Spell => "Spelling (unavailable)",
             Self::About => "About td-editor",
+            Self::Find => "Find...",
+            Self::FindNext => "Find Next",
+            Self::FindPrevious => "Find Previous",
         }
     }
     pub(crate) fn shortcut(self, profile: Profile) -> &'static str {
@@ -104,6 +122,10 @@ impl Item {
             (Self::Spell, _) => "F7",
             (Self::SelectAll, Profile::Windows) => "Ctrl+A",
             (Self::Fill, Profile::Emacs) => "M-q",
+            (Self::Find, Profile::Windows) => "Ctrl+F",
+            (Self::Find, Profile::Emacs) => "C-s / C-r",
+            (Self::FindNext, Profile::Windows) => "F3",
+            (Self::FindPrevious, Profile::Windows) => "Shift+F3",
             _ => "",
         }
     }
@@ -342,7 +364,10 @@ mod tests {
             Some(&Item::SelectAll)
         );
         menu.step(true);
-        assert_eq!(menu.group.items().get(menu.selected), Some(&Item::Emacs));
+        assert_eq!(
+            menu.group.items().get(menu.selected),
+            Some(&Item::FindPrevious)
+        );
         for _ in 0..100 {
             menu.step(false);
             assert!(menu.enabled(*menu.group.items().get(menu.selected).unwrap()));

@@ -1270,8 +1270,9 @@ or enabled format toggle. Undo/Redo availability reflects the captured
 history depth. Scratch mode disables Open/Save/Save As rather than pretending
 to persist its text. Only existing bindings are shown: Windows uses Ctrl+
 labels, Emacs uses its C-/M- chord notation, and unbound items have no shortcut.
-Find/Replace, Go To Line, fill-column entry and command completion remain
-later prompt increments, not hidden implementations behind these menus.
+Find/Find Next/Find Previous use the native search contract below. Replace,
+Go To Line, fill-column entry and command completion remain later prompt
+increments, not hidden implementations behind these menus.
 
 Menu actions dispatch the existing controller events, file-path requests and
 close coordinators. Keyboard, tab-close marks and menus share one native
@@ -1304,7 +1305,7 @@ popup and displays an enlargement notice; invisible/clipped rows can never
 be activated. A clipped-menu refusal does not reset pending prefix/mark/drag.
 A new physical key press still cancels native repeat before menu admission,
 as it does for every key. Escape/C-g with a menu open dismisses both the
-menu and any underlying notice; F10 only toggles the menu. At most eight
+menu and any underlying notice; F10 only toggles the menu. At most eleven
 rows exist, with static bounded labels, and painting and hit tests use the
 same panel geometry. Header geometry derives
 from the reference renderer's single menu-bar string. Colors remain warm
@@ -1506,6 +1507,58 @@ serials in both key profiles, menu activation, fragmented UTF-8/CRLF, terminal
 cancellation, immutable source data and repeated offer-ID retirement/reuse.
 This does not claim live third-party toolkit clipboard interoperability yet.
 The software window is still experimental, not the default $EDITOR path.
+
+### Implemented native Find
+
+Edit exposes Find, Find Next and Find Previous. Windows Ctrl+F opens a
+forward query prompt, F3 searches next and Shift+F3 searches previous.
+Emacs C-s/C-r open forward/backward query prompts; Return searches, and
+C-s/C-r inside that prompt explicitly submit in the chosen direction.
+This is submitted literal search, not incremental isearch while typing.
+Find Next/Previous without a prior query open the corresponding prompt.
+
+The query is case-sensitive UTF-8, at most 4096 bytes, without regex or
+escape interpretation. The native single-line entry accepts printable
+translated scalars, Space, scalar Backspace and Ctrl+U to clear. Repeated
+keys do not type or submit, and empty Return leaves the prompt open. Seed
+entry with a nonempty printable selection within the limit; otherwise use
+the last submitted query. Queries persist across tabs for the window's
+lifetime, not on disk. Prompt plus history retain at most 8 KiB of query
+bytes. The notice includes at most the final 160 scalars, an ellipsis and
+caret; the six-row overlay can clip this text on narrow windows, especially
+while the input-readiness prefix is present.
+Clipboard paste into query/path entry is not implemented in this increment.
+
+Opening cancels prefix, mark, pointer drag, repeat and pending native Paste
+without changing the document selection. Entry captures editor identity,
+active tab, revision and directed selection. Submission after a changed
+target refuses instead of retargeting. Focus/keymap loss pauses entry with
+readiness text; restoring input preserves the query. Escape/Ctrl+G cancel
+entry, clear pending wrap and leave document text/selection unchanged.
+File/discard dialogs keep priority and pointer document actions are blocked
+while entering a query. Window close cancels entry before ordinary close.
+
+Each submitted search dispatches the existing controller Find command.
+It starts after the current selection for forward search and before it for
+backward search. A missing match changes neither selection, undo history,
+dirty state nor viewport: report the end/start and record that search intent.
+Only the next explicit search of the same query, direction, editor instance,
+active tab, revision and selection may wrap. Matching anywhere after wrap
+reports that it wrapped; no match reports absence from the whole document.
+That attempt consumes wrap permission even when no match exists; another
+search must report the boundary again before a further wrap.
+Changing query/direction, editing, switching tabs, selection motion or
+cancellation invalidates pending wrap. Per-event observation prevents
+selection-away-and-back from reviving it; focus/keymap loss also clears it.
+Successful matches reveal the selected range through the ordinary view
+controller and never create an undo entry or change text revision.
+
+The three menu entries extend the largest fixed menu to eleven rows, requiring
+at least 320 by 312 pixels at scale 1. Complete panel fitting and scale bounds
+remain unchanged. Tests cover native chords
+in both profiles, query entry/cancel, both directions, explicit wrap,
+missing/stale/foreign targets, scalar byte limits and overlay-only pixels.
+The headless model/replay Find interface is unchanged.
 
 ### Version-1 compatibility target
 

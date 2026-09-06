@@ -22,6 +22,7 @@ mod pointer;
 pub mod render;
 pub mod replay;
 mod seat;
+mod search;
 mod session;
 mod sys;
 pub mod text;
