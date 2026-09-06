@@ -69,9 +69,15 @@ logical chords; `ui.rs` owns input/view state; and `replay.rs` feeds that same
 controller with framed commands.
 The safe `control` library supplies one-frame decoding and read-only
 controller state/text queries using the same serializers as replay. See
-[CONTROL.md](CONTROL.md) for exact fields and bounds. No control listener or
-`--control-socket` option is available yet; native state and remote mutation
-remain later work.
+[CONTROL.md](CONTROL.md) for exact fields and bounds. No native control
+listener or `--control-socket` option is available yet; native state and remote
+mutation remain later work.
+The separate `control_socket` prerequisite publishes a private Linux Unix
+listener only when explicitly called by a library user. It checks directory
+ownership/permissions, refuses symlinks and existing endpoints, and pins
+parent/socket inodes for checked cleanup. It has no request worker or editor
+access and is not connected to the executable yet; CONTROL.md specifies the
+absolute-path limits and trust boundary.
 `tests/core.rs` covers byte round trips, stale/invalid commands, limits,
 save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector

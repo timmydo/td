@@ -2071,10 +2071,14 @@ The safe `control` library now supplies the one-frame decoder/encoder and
 read-only `state`/`text` request subset. It shares controller snapshots,
 scalar-aligned text pages and byte codecs with replay. The exact implemented
 field order, errors, limits and conformance fixtures are recorded in
-[CONTROL.md](CONTROL.md). This is a transport prerequisite only: there is no
-listener, `--control-socket` option, worker/deadline handling, native job/dialog
-state or frame acknowledgement yet. The complete endpoint below remains the
-version-1 target; controller generations are not presentation evidence.
+[CONTROL.md](CONTROL.md). The separate `control_socket` library implements
+explicit private Unix listener publication with descriptor-pinned paths,
+owner/mode admission and identity-checked cleanup; its complete path/trust
+contract and same-UID race boundary are in that reference. These are transport
+prerequisites only: there is no `--control-socket` option, worker/deadline
+handling, native job/dialog state or frame acknowledgement yet.
+The complete endpoint below remains the version-1 target; controller
+generations are not presentation evidence.
 
 One command dispatcher drives interactive input, menus, replay tests, and
 remote commands. A semantic snapshot exposes tab IDs, revisions, text,
@@ -2094,11 +2098,14 @@ spelling underlines, dialogs, and extreme resize/clipping.
 
 `--control-socket PATH` enables remote control. It is off by default, binds
 a local Unix socket with mode 0600 under a caller-owned mode-0700 directory,
-and has no TCP listener or compositor control dependency. Refuse symlinked
+and has no TCP listener or compositor control dependency. The implemented
+publication prerequisite additionally requires trusted ancestors and bounded
+absolute paths, as specified in CONTROL.md. Refuse symlinked
 socket parents and any existing endpoint, including stale sockets; the caller
-removes stale endpoints explicitly. Cleanup removes only the socket inode
-this invocation created. A control worker handles framing and deadlines,
-sending bounded typed messages to the UI thread; socket reads and writes
+removes stale endpoints explicitly. Cleanup checks the owned socket inode
+under CONTROL.md's publication trust boundary. A control worker handles
+framing and deadlines, sending bounded typed messages to the UI thread;
+socket reads and writes
 never hold the model lock or stop Wayland dispatch.
 
 Each connection carries one request and one response, then closes. A frame

@@ -21,6 +21,7 @@ fn source_inventory_and_allowances_are_closed() {
         "clipboard.rs",
         "command.rs",
         "control.rs",
+        "control_socket.rs",
         "data.rs",
         "dialog.rs",
         "files.rs",
@@ -163,8 +164,16 @@ fn source_inventory_and_allowances_are_closed() {
                 assert!(!shared.contains("cfg_attr"));
             }
         }
+        // The pinned procfs pathname's sys segment is not raw-module access.
+        let raw_tokens = if name == "control_socket.rs" {
+            let literal = "\"/proc/sys/kernel/overflowuid\"";
+            assert_eq!(text.matches(literal).count(), 1);
+            raw_module_tokens(&text.replacen(literal, "\"\"", 1))
+        } else {
+            raw_module_tokens(&text)
+        };
         assert_eq!(
-            raw_module_tokens(&text),
+            raw_tokens,
             match name.as_str() {
                 "lib.rs" => 1,
                 "files.rs" => 1,
@@ -250,4 +259,43 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     ] {
         assert_eq!(adapter.matches(call).count(), 1, "{call}");
     }
+}
+
+#[test]
+fn control_socket_publication_keeps_kernel_path_and_identity_checks_explicit() {
+    let source = include_str!("../src/control_socket.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    for pin in [
+        "const O_DIRECTORY: i32 = 0o200000;",
+        "const O_NOFOLLOW: i32 = 0o400000;",
+        "const O_PATH: i32 = 0o10000000;",
+        "const PATH_BYTES: usize = 107;",
+        "const NAME_BYTES: usize = 80;",
+        "const STATUS_BYTES: usize = 64 * 1024;",
+        "UnixListener::bind(&pinned_path)",
+        "custom_flags(O_PATH | O_DIRECTORY | O_NOFOLLOW)",
+        "custom_flags(O_PATH | O_NOFOLLOW)",
+        "File::open(\"/proc/self/status\")",
+        "File::open(\"/proc/sys/kernel/overflowuid\")",
+        "const UID_BYTES: usize = 11;",
+        ".take(UID_BYTES as u64 + 1)",
+        "unambiguous_uid(uid, overflow_uid(&bytes)?)",
+        "overflow == uid || overflow == 0",
+        "Permissions::from_mode(0o600)",
+        "identity(&named) != identity(&self.node.metadata()?)",
+        "fs::metadata(descriptor_path(&self.parent)).map_err",
+        "control cleanup parent is unavailable",
+        "trusted_ancestor(&current.metadata()?, uid)?",
+        "metadata.uid() != uid && metadata.uid() != 0",
+        "metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0",
+    ] {
+        assert!(production.contains(pin), "{pin}");
+    }
+    assert_eq!(production.matches("UnixListener::bind(").count(), 1);
+    assert!(!production.contains("UnixStream::connect"));
+    assert!(!production.contains("std::env"));
+    assert!(!production.contains("env::"));
+    assert!(!production.contains("canonicalize"));
+    assert!(!production.contains("65534"));
+    assert!(!production.contains("TD_TEST_TRUSTED_ROOT"));
 }
