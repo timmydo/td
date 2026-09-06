@@ -96,6 +96,10 @@ byte offsets, not scalar indices or a sorted range.
 | `1 ID undo TAB REVISION` | Undo one transaction in the active tab. |
 | `1 ID redo TAB REVISION` | Redo one transaction in the active tab. |
 | `1 ID fill-paragraph TAB REVISION EXPECTED_ANCHOR EXPECTED_CARET` | Fill the paragraph at the expected caret through the ordinary controller. |
+| `1 ID set-auto-fill TAB REVISION ENABLED` | Set this tab's Auto Fill mode; `ENABLED` is exactly `0` or `1`. |
+| `1 ID set-fill-column TAB REVISION COLUMN` | Set this tab's fill column, 20..=240. |
+| `1 ID go-to-line TAB REVISION LINE` | Collapse selection at the start of the one-based logical line. |
+| `1 ID set-key-profile TAB REVISION PROFILE` | Set the whole window's key profile to `windows` or `emacs`. |
 
 Success is `1 ID ok` followed by one trailing Tab (an empty body).
 It means controller admission completed, not saved bytes, client receipt,
@@ -139,6 +143,25 @@ marks without starting a scan. Semantic commands do not require keyboard
 focus or a physical-input serial; they cannot acquire clipboard ownership.
 Ordinary file jobs may remain active while editing, as with keyboard input;
 this subset neither initiates file I/O nor acknowledges a save.
+
+Mode setters and Go To Line share that modal, active-tab, revision and input
+invalidation policy. They do not change text, text revision, dirty state or
+undo/redo history, and retain spelling results. Profile selection affects
+the whole window but still requires a live active tab/revision as its
+admission guard; it cancels the old key prefix through ordinary dispatch.
+Repeated setters are allowed: even an already-current value advances the
+ordinary controller/native generation, cancels pending Paste with its visible
+notice, and requests redraw. Admission is an explicit input boundary, not
+a value-change-only notification. Flags other than literal `0|1` are `protocol`.
+Unknown/case-mismatched profiles are parse-time `invalid-argument` before
+tab/revision/modal admission. Column bounds are checked by the model after
+those guards; an out-of-range column on a missing tab is `missing-tab`, not
+`invalid-argument`. Go To Line counts LF-delimited logical lines in normalized
+document text (also returned by `text`), not on-disk CRLF offsets or wrapped
+display rows: line zero is `invalid-argument`, past the last logical
+line is `invalid-position`, and a trailing LF introduces an empty final line
+at EOF. No expected old mode/selection is needed for these explicit setters
+and absolute navigation. These are not typing events and never run Auto Fill.
 
 One accepted connection dispatches at most once. `Job::respond_with` checks
 its deadline/liveness immediately before invoking the UI handler, in addition

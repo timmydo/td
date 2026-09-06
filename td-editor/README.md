@@ -74,7 +74,9 @@ queries and revision-checked edits through the shared controller. See
 coarse native modal/job/spelling flags. It also supports Select Tab/Range,
 Insert, Delete, Undo, Redo and Fill Paragraph. Insert/Delete/Fill check the
 expected directed selection as well as the tab revision; native modals refuse
-remote edits. `spelling-results` exposes status, whole-scan counts and bounded
+remote edits. Auto Fill, fill-column and key-profile setters and Go To Line
+also use revision-checked native control dispatch without changing text or
+history. `spelling-results` exposes status, whole-scan counts and bounded
 range pages pinned to both text revision and scan ID. Checking still starts
 with ordinary F7; pending scans expose no partial marks. File operations,
 dialog answers and Check Spelling admission remain later work. Native state

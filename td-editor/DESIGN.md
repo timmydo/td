@@ -2087,8 +2087,9 @@ nonblocking transport, typed bounded UI jobs and five-second acceptance-based
 deadlines under CONTROL.md's exact scheduling contract. The experimental
 `--window --control-socket PATH` adapter now connects read-only state/text
 requests, including coarse native modal/job/spelling flags, plus Select
-Tab/Range, Insert, Delete, Undo, Redo and Fill Paragraph. Dispatch requires live
-job admission and target revision; selection-relative operations additionally
+Tab/Range, Insert, Delete, Undo, Redo, Fill Paragraph, Auto Fill/fill-column
+setters, Go To Line and whole-window key-profile selection. Dispatch requires
+live job admission and target revision; selection-relative operations additionally
 pin the directed selection. Native modals refuse edits without dismissal.
 All edits use the ordinary controller, including history, view refresh and
 native search/spelling/Paste/repeat invalidation. Its exact

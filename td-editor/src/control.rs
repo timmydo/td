@@ -125,6 +125,10 @@ pub enum Edit {
     Undo,
     Redo,
     FillParagraph { expected: Selection },
+    AutoFill(bool),
+    FillColumn(usize),
+    GoToLine(usize),
+    Profile(crate::keys::Profile),
 }
 
 impl std::fmt::Debug for Edit {
@@ -144,6 +148,10 @@ impl std::fmt::Debug for Edit {
             Self::FillParagraph { expected } => {
                 f.debug_tuple("FillParagraph").field(expected).finish()
             }
+            Self::AutoFill(value) => f.debug_tuple("AutoFill").field(value).finish(),
+            Self::FillColumn(value) => f.debug_tuple("FillColumn").field(value).finish(),
+            Self::GoToLine(value) => f.debug_tuple("GoToLine").field(value).finish(),
+            Self::Profile(value) => f.debug_tuple("Profile").field(value).finish(),
         }
     }
 }
@@ -194,7 +202,8 @@ impl Request {
                     limit: size(args.next().ok_or(Error::Protocol)?)?,
                 },
                 "select-tab" | "select-range" | "insert" | "delete" | "undo" | "redo"
-                | "fill-paragraph" => {
+                | "fill-paragraph" | "set-auto-fill" | "set-fill-column" | "go-to-line"
+                | "set-key-profile" => {
                     let tab = decimal(args.next().ok_or(Error::Protocol)?)?;
                     let revision = decimal(args.next().ok_or(Error::Protocol)?)?;
                     let mut selection = || -> Result<Selection> {
@@ -224,6 +233,20 @@ impl Request {
                         "fill-paragraph" => Edit::FillParagraph {
                             expected: selection()?,
                         },
+                        "set-auto-fill" => {
+                            Edit::AutoFill(boolean(args.next().ok_or(Error::Protocol)?)?)
+                        }
+                        "set-fill-column" => {
+                            Edit::FillColumn(size(args.next().ok_or(Error::Protocol)?)?)
+                        }
+                        "go-to-line" => Edit::GoToLine(size(args.next().ok_or(Error::Protocol)?)?),
+                        "set-key-profile" => {
+                            Edit::Profile(match args.next().ok_or(Error::Protocol)? {
+                                "windows" => crate::keys::Profile::Windows,
+                                "emacs" => crate::keys::Profile::Emacs,
+                                _ => return Err(Error::InvalidArgument),
+                            })
+                        }
                         _ => return Err(Error::Protocol),
                     };
                     Operation::Edit {
@@ -352,6 +375,10 @@ impl Request {
         if ui.editor().active() != Some(*tab) {
             return Err(Error::InvalidArgument);
         }
+        if let Edit::Profile(profile) = edit {
+            ui.dispatch(Event::Profile(*profile))?;
+            return Ok(());
+        }
         if let Edit::Insert { expected, .. }
         | Edit::Delete { expected }
         | Edit::FillParagraph { expected } = edit
@@ -361,7 +388,8 @@ impl Request {
             }
         }
         let command = match edit {
-            Edit::SelectTab => return Err(Error::InvalidArgument),
+            // Exhaustiveness for variants already dispatched above; never panic.
+            Edit::SelectTab | Edit::Profile(_) => return Err(Error::InvalidArgument),
             Edit::SelectRange(selection) => Command::Select(*selection),
             Edit::Insert { text, .. } => {
                 // Public requests can also be constructed without the parser.
@@ -374,6 +402,9 @@ impl Request {
             Edit::Undo => Command::Undo,
             Edit::Redo => Command::Redo,
             Edit::FillParagraph { .. } => Command::FillParagraph,
+            Edit::AutoFill(enabled) => Command::AutoFill(*enabled),
+            Edit::FillColumn(column) => Command::FillColumn(*column),
+            Edit::GoToLine(line) => Command::GoToLine(*line),
         };
         ui.dispatch(Event::Edit {
             tab: *tab,
@@ -422,6 +453,14 @@ pub(crate) fn decimal(text: &str) -> Result<u64> {
 
 pub(crate) fn size(text: &str) -> Result<usize> {
     usize::try_from(decimal(text)?).map_err(|_| Error::Protocol)
+}
+
+pub(crate) fn boolean(value: &str) -> Result<bool> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(Error::Protocol),
+    }
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -557,6 +596,119 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn remote_mode_and_line_commands_match_replay_without_text_history() {
+        let mut ui = Controller::default();
+        let mut replay = crate::replay::Session::default();
+        for controller in [&mut ui, &mut replay.ui] {
+            controller
+                .dispatch(Event::Load("é\nsecond\n".as_bytes()))
+                .unwrap();
+        }
+        for (remote, local) in [
+            ("set-auto-fill\t1\t0\t1", "set-auto-fill\t1\t0\t1"),
+            ("set-fill-column\t1\t0\t20", "set-fill-column\t1\t0\t20"),
+            ("set-key-profile\t1\t0\temacs", "set-key-profile\temacs"),
+            ("go-to-line\t1\t0\t2", "go-to-line\t1\t0\t2"),
+            ("go-to-line\t1\t0\t3", "go-to-line\t1\t0\t3"),
+            ("go-to-line\t1\t0\t1", "go-to-line\t1\t0\t1"),
+            ("set-fill-column\t1\t0\t240", "set-fill-column\t1\t0\t240"),
+            ("set-auto-fill\t1\t0\t0", "set-auto-fill\t1\t0\t0"),
+            ("set-key-profile\t1\t0\twindows", "set-key-profile\twindows"),
+        ] {
+            Request::parse(format!("1\t1\t{remote}").as_bytes())
+                .unwrap()
+                .execute(&mut ui)
+                .unwrap();
+            assert!(replay
+                .request(format!("1\t1\t{local}").as_bytes())
+                .starts_with("1\t1\tok\t"));
+            assert_eq!(state(&ui), state(&replay.ui));
+            assert_eq!(
+                format!("{:?}", ui.editor()),
+                format!("{:?}", replay.ui.editor())
+            );
+            let doc = ui.editor().document(1).unwrap();
+            assert_eq!(doc.text(), "é\nsecond\n");
+            assert_eq!(doc.revision(), 0);
+            assert!(!doc.dirty());
+            assert_eq!(doc.history_depth(), (0, 0));
+        }
+        assert_eq!(
+            ui.editor().document(1).unwrap().selection(),
+            Selection {
+                anchor: 0,
+                caret: 0
+            }
+        );
+    }
+
+    #[test]
+    fn remote_mode_refusals_preserve_modes_prefix_and_selection() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load("é\nsecond\n".as_bytes())).unwrap();
+        ui.dispatch(Event::Profile(crate::keys::Profile::Emacs))
+            .unwrap();
+        ui.dispatch(Event::Key {
+            tab: 1,
+            revision: 0,
+            chord: "C-x",
+        })
+        .unwrap();
+        let before = state(&ui);
+        for (command, error) in [
+            ("set-fill-column\t1\t0\t19", Error::InvalidArgument),
+            ("set-fill-column\t1\t0\t241", Error::InvalidArgument),
+            ("go-to-line\t1\t0\t0", Error::InvalidArgument),
+            ("go-to-line\t1\t0\t4", Error::InvalidPosition),
+            ("set-auto-fill\t1\t1\t1", Error::StaleRevision),
+            ("set-key-profile\t1\t1\twindows", Error::StaleRevision),
+            ("set-key-profile\t99\t0\twindows", Error::MissingTab),
+            ("set-fill-column\t99\t0\t999", Error::MissingTab),
+            ("set-fill-column\t1\t1\t999", Error::StaleRevision),
+        ] {
+            let request = Request::parse(format!("1\t1\t{command}").as_bytes()).unwrap();
+            assert!(request.is_edit());
+            assert_eq!(request.execute(&mut ui), Err(error));
+            assert_eq!(state(&ui), before);
+        }
+        ui.dispatch(Event::New).unwrap();
+        let before = state(&ui);
+        for command in [
+            "set-auto-fill\t1\t0\t1",
+            "set-fill-column\t1\t0\t40",
+            "go-to-line\t1\t0\t2",
+            "set-key-profile\t1\t0\twindows",
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t1\t{command}").as_bytes())
+                    .unwrap()
+                    .execute(&mut ui),
+                Err(Error::InvalidArgument)
+            );
+            assert_eq!(state(&ui), before);
+        }
+        for (command, error) in [
+            ("set-auto-fill\t2\t0\t2", Error::Protocol),
+            ("set-auto-fill\t2\t0\t01", Error::Protocol),
+            ("set-fill-column\t2\t0", Error::Protocol),
+            ("go-to-line\t2\t0\t1\t2", Error::Protocol),
+            ("set-key-profile\t2\t0\tEmacs", Error::InvalidArgument),
+            ("set-key-profile\t99\t0\tEmacs", Error::InvalidArgument),
+            ("set-auto-fill\t2\t0", Error::Protocol),
+            ("set-auto-fill\t2\t0\t1\textra", Error::Protocol),
+            ("set-fill-column\t2\t0\t20\textra", Error::Protocol),
+            ("go-to-line\t2\t0", Error::Protocol),
+            ("set-key-profile\t2\t0", Error::Protocol),
+            ("set-key-profile\t2\t0\temacs\textra", Error::Protocol),
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t9\t{command}").as_bytes()).unwrap_err(),
+                Refusal { id: 9, error }
+            );
+        }
+    }
 
     #[test]
     fn wait_frame_parser_keeps_native_fences_out_of_controller_dispatch() {
@@ -1182,7 +1334,11 @@ mod tests {
             "key\t1\t0\tC-s",
             "load\t61",
             "pointer\t1\t0\tpress\t0\t0\t0",
-            "set-auto-fill\t1\t0\t1",
+            "set-auto-fill\t1\t0",
+            "auto-fill\t1\t0\t1",
+            "fill-column\t1\t0\t20",
+            "goto-line\t1\t0\t1",
+            "key-profile\t1\t0\temacs",
         ] {
             assert_eq!(
                 Request::parse(format!("1\t13\t{command}").as_bytes()).unwrap_err(),

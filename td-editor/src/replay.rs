@@ -7,16 +7,9 @@ use crate::ui::{Controller, Event, Outcome, PointerPhase};
 use crate::{Error, Result};
 use std::io::{self, Read, Write};
 
-use crate::control::{decimal as number, size};
+use crate::control::{boolean, decimal as number, size};
 pub use crate::control::{hex, unhex, MAX_FRAME, PAGE_BYTES};
 
-fn boolean(value: &str) -> Result<bool> {
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(Error::Protocol),
-    }
-}
 fn string(value: &str) -> Result<String> {
     String::from_utf8(unhex(value)?).map_err(|_| Error::InvalidText)
 }

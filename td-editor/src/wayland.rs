@@ -5444,6 +5444,10 @@ mod tests {
                 "undo\t1\t1",
                 "redo\t1\t1",
                 "fill-paragraph\t1\t1\t1\t1",
+                "set-auto-fill\t1\t1\t1",
+                "set-fill-column\t1\t1\t40",
+                "go-to-line\t1\t1\t1",
+                "set-key-profile\t1\t1\temacs",
             ] {
                 let request =
                     crate::control::Request::parse(format!("1\t1\t{command}").as_bytes()).unwrap();
@@ -5504,6 +5508,134 @@ mod tests {
         assert!(!w.spelling.running());
         assert_eq!(std::fs::read(path).unwrap(), b"wrong");
         assert!(w.ui.editor().document(tab).unwrap().dirty());
+    }
+
+    #[test]
+    fn native_control_modes_drive_key_bindings_without_changing_text_or_spelling() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        let text = "one two three four five\nbad";
+        w.ui.dispatch(Event::Load(text.as_bytes())).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        w.chord("F7", false).unwrap();
+        w.end_turn(w.clock, false).unwrap();
+        let marks = w.spelling.view(w.ui.editor()).1.to_vec();
+        assert!(!marks.is_empty());
+        w.event(message(SHM, 0, &[1])).unwrap();
+        configure(&mut w, 800, 600);
+        w.draw().unwrap();
+        drain(&peer);
+        let pixels = w.pixels.clone();
+        let generation = w.frames.generation().unwrap();
+        for (id, command, value) in [
+            (1, "set-auto-fill", "1"),
+            (2, "set-fill-column", "20"),
+            (3, "go-to-line", "2"),
+            (4, "set-key-profile", "emacs"),
+        ] {
+            let mut client = control_client(
+                &path,
+                format!("1\t{id}\t{command}\t{tab}\t0\t{value}").as_bytes(),
+            );
+            assert_eq!(
+                control_answer(&mut w, &mut client, &peer),
+                format!("1\t{id}\tok\t")
+            );
+        }
+        let doc = w.ui.editor().document(tab).unwrap();
+        assert!(doc.auto_fill());
+        assert_eq!(doc.fill_column(), 20);
+        assert_eq!(
+            doc.selection(),
+            crate::model::Selection {
+                anchor: 24,
+                caret: 24
+            }
+        );
+        assert_eq!(doc.text(), text);
+        assert_eq!(doc.revision(), 0);
+        assert_eq!(doc.history_depth(), (0, 0));
+        assert!(!doc.dirty());
+        assert!(w.frames.generation().unwrap() > generation);
+        done(&mut w);
+        w.draw().unwrap();
+        drain(&peer);
+        assert_ne!(w.pixels, pixels); // No physical chord has intervened.
+        w.chord("Right", false).unwrap();
+        w.chord("Right", false).unwrap();
+        assert_eq!(w.ui.editor().document(tab).unwrap().selection().caret, 26);
+        w.chord("C-a", false).unwrap(); // Emacs: logical line beginning.
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().selection(),
+            crate::model::Selection {
+                anchor: 24,
+                caret: 24
+            }
+        );
+        w.chord("C-x", false).unwrap();
+        assert!(crate::control::state(&w.ui)
+            .unwrap()
+            .contains("\tprefix=1\t"));
+        let mut client = control_client(
+            &path,
+            format!("1\t5\tset-key-profile\t{tab}\t0\twindows").as_bytes(),
+        );
+        assert_eq!(control_answer(&mut w, &mut client, &peer), "1\t5\tok\t");
+        assert!(crate::control::state(&w.ui)
+            .unwrap()
+            .contains("\tprefix=0\t"));
+        w.chord("C-a", false).unwrap(); // Windows: select all.
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().selection(),
+            crate::model::Selection {
+                anchor: 0,
+                caret: text.len()
+            }
+        );
+        assert_eq!(w.spelling.view(w.ui.editor()).1, marks);
+        assert!(!w.spelling.running());
+        let mut client = control_client(
+            &path,
+            format!("1\t6\tselect-range\t{tab}\t0\t23\t23").as_bytes(),
+        );
+        assert_eq!(control_answer(&mut w, &mut client, &peer), "1\t6\tok\t");
+        w.chord("Space", false).unwrap(); // The remote Auto Fill/column controls affect typing.
+        let doc = w.ui.editor().document(tab).unwrap();
+        assert_eq!(doc.text(), "one two three four\nfive \nbad");
+        assert_eq!(doc.history_depth(), (1, 0));
+        w.stop_control();
+    }
+
+    #[test]
+    fn native_idempotent_mode_admission_cancels_paste_and_requests_redraw() {
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        assert!(!w.ui.editor().document(1).unwrap().auto_fill());
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        w.clipboard_request("paste", 1, 0).unwrap();
+        let (_, _writer) = drain(&peer);
+        assert!(w.clipboard.incoming.is_some());
+        let generation = w.frames.generation().unwrap();
+        let request = crate::control::Request::parse(b"1\t1\tset-auto-fill\t1\t0\t0").unwrap();
+        assert_eq!(w.control_response(&request), "1\t1\tok\t");
+        assert!(w.clipboard.incoming.is_none());
+        assert_eq!(
+            w.notice.as_deref(),
+            Some("Paste cancelled: remote control command accepted.")
+        );
+        assert!(w.frames.generation().unwrap() > generation);
+        assert!(!w.ui.editor().document(1).unwrap().auto_fill());
+        assert_eq!(w.ui.editor().document(1).unwrap().revision(), 0);
     }
 
     #[test]
