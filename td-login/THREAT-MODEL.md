@@ -244,7 +244,7 @@ Consequences worth stating plainly:
   account passwordless to satisfy ordinary `exec-as` would therefore red both
   the image contract and the credential policy.
 
-  The shipped image has four locked service identities. OpenSSH's `sshd`
+  The shipped image has five locked service identities. OpenSSH's `sshd`
   privilege-separation account and `td-profiler`'s `profiler` account are not
   td-svc `exec-as` targets; each daemon performs its own fixed-purpose drop.
   The `sshd` account has a `/bin/false` shell and an empty root-owned
@@ -252,7 +252,9 @@ Consequences worth stating plainly:
   account has a `/bin/false` shell and a volatile `/run/td-audio` home and is
   an `exec-service-as` target. The compositor account `tdc1000` has UID/GID
   993, a `/bin/false` shell and `/run/td-compositor/1000` home; its paired
-  service uses the same checked service path. None can be entered through
+  service uses the same checked service path. The broker account `tdb1000`
+  has UID/GID 992, a `/bin/false` shell and `/run/td-bus/1000` home, and
+  also uses `exec-service-as`. None can be entered through
   td-login's human forced modes or an interactive login.
 - **A class is a property of a name; the uid is what the kernel
   enforces.** `classify` reads one account's shadow field, so
@@ -305,25 +307,28 @@ the current auto-login and credential-switching behavior below is unchanged.
 TPM credential-store enrollment and boot release are separate root-owned
 operations in td-secret and td-firstboot, specified by
 `td-secret/DESIGN.md`. They do not switch process credentials or
-authenticate a human. Firstboot unseals an explicitly enrolled store into
-volatile storage before the existing auto-login path runs; the TPM policy
-authenticates selected platform state, not that login's user. td-login's
-session authorization table is unchanged. Firstboot reserves compositor,
-broker, portal, and per-app identities in a persistent ledger, and refuses
-account records that alias a reservation. The image activates the compositor
-assignment as service account `tdc1000` at UID/GID 993; broker, portal and app
-assignments remain reserved. Activation consumes the same service-only class
-defined here. `td-authd/DESIGN.md` specifies that reservation contract. The
-image's paired td-authd terminal launcher
-uses ordinary `exec-as` after a read-only reservation check and
-private-channel authentication. It fixes the human account in root-owned
-service configuration and replaces every standard descriptor before spawning
-this helper. Its unprivileged terminal-exec wrapper refuses a failed
-session-cgroup placement before terminal code runs, and a new process group
-keeps the user terminal independent of the authority generation. This adds
-no credential-switch mechanism or human authentication policy here. FIDO2
-release must wait for secure attention and trusted input; no login or `su`
-behavior is a substitute for that future authorization.
+authenticate a human. Firstboot unseals an explicitly enrolled store
+into volatile storage before the existing auto-login path runs; the TPM
+policy authenticates selected platform state, not that login's user.
+td-login's session authorization table is unchanged. Firstboot reserves
+compositor, broker, portal, and per-app identities in a persistent
+ledger, and refuses account records that alias a reservation. The image
+activates the compositor assignment as service account `tdc1000` at
+UID/GID 993 and the broker as `tdb1000` at UID/GID 992. Firstboot
+prepares the broker runtime after durable enrollment, whose success
+td-svc requires before broker startup. Portal and app assignments remain
+reserved. Activation consumes the same service-only class defined here.
+`td-authd/DESIGN.md` specifies that reservation contract. The image's
+paired td-authd terminal launcher uses ordinary `exec-as` after a
+read-only reservation check and private-channel authentication. It fixes
+the human account in root-owned service configuration and replaces every
+standard descriptor before spawning this helper. Its unprivileged
+terminal-exec wrapper refuses a failed session-cgroup placement before
+terminal code runs, and a new process group keeps the user terminal
+independent of the authority generation. This adds no credential-switch
+mechanism or human authentication policy here. FIDO2 release must wait
+for secure attention and trusted input; no login or `su` behavior is a
+substitute for that future authorization.
 
 ## 4. Privilege can only be dropped, never gained
 

@@ -2271,17 +2271,11 @@ fn prepare_mount_plan(
         // `mnt_want_write()` on the write paths. So `connect(2)` works, and
         // `SCM_RIGHTS` is socket-layer and untouched by mount flags.
         //
-        // What it BUYS is `chmod`/`chown`, which do call `mnt_want_write()`. The
-        // app owns this inode — uid 1000, mode 0600, and the jail maps
-        // `1000 1000 1` — so without `MS_RDONLY` it could `chmod 0000` the
-        // socket through its own bind and change the HOST's real bus socket,
-        // denying `connect(2)` to the compositor, the portal and
-        // `/etc/bootsuccess`'s probe. A draft of this comment said instead that
-        // read-only stops the app replacing the socket: it does not, and nothing
-        // here needs it to. Unlink is governed by the parent directory — the
-        // jail's own rw tmpfs — and is refused because the path is a mountpoint
-        // (`is_local_mountpoint` -> `EBUSY`) and the app has no `CAP_SYS_ADMIN`
-        // to unmount it.
+        // chmod/chown take a mount write reference too. The broker owns the
+        // host inode at UID 992, outside this application's map, so the bind's
+        // read-only flag is defence in depth for those operations. Unlink is
+        // governed by the private tmpfs parent, but the path is a mountpoint
+        // (EBUSY) and the app has no CAP_SYS_ADMIN to unmount it.
         mount_private_bind(&application.bus_socket, &bus, true)?;
         // Read-only for the bus's reason: the grant is connect(2), not chmod
         // of the host's socket inode.

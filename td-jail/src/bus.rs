@@ -457,8 +457,9 @@ impl Connection {
     /// `budget` is for the WHOLE exchange — connect, handshake, `Hello` and
     /// the one call — not for each read. Two things made that necessary. A
     /// draft set the socket options after `connect`, which does not return
-    /// until the peer accepts: a listener that binds `/run/user/1000/bus`,
-    /// fills its backlog and never accepts held stage 1 for ever, and since
+    /// until the peer accepts: a listener that binds the protected host
+    /// session bus, fills its backlog and never accepts held stage 1 for
+    /// ever, and since
     /// stage 1 never EXITED the fixture's `restart=always` could not recover
     /// it either. And `SO_RCVTIMEO` bounds one read, so a peer sending a byte
     /// every nineteen seconds stretched a 512-byte handshake line into hours
@@ -573,7 +574,7 @@ impl Connection {
 ///
 /// # A serial is not an authenticator
 ///
-/// The bus is a shared session bus and every peer on it is uid 1000. Directed
+/// Unprivileged peers share uid 1000 on the session bus. Directed
 /// routing means any of them may send a `METHOD_RETURN` to this connection's
 /// unique name, and serials here are 1 then 2 on a fresh connection — so a
 /// peer that wants to answer for the broker can, and a first draft of this
@@ -1538,7 +1539,7 @@ mod tests {
 
     /// A reply from a peer that is not the broker is not this call's reply.
     ///
-    /// The attack this closes: every peer on the session bus is uid 1000,
+    /// The attack this closes: unprivileged session peers share uid 1000,
     /// routing to a unique name is directed, and a fresh connection's serials
     /// are 1 then 2. So a hostile peer can address a `METHOD_RETURN` to this
     /// connection carrying serial 2 and have the broker deliver it.
@@ -1624,7 +1625,7 @@ mod tests {
     ///
     /// This is what stands behind `connect(2)`, which `std` cannot bound on a
     /// Unix socket and which blocks until the peer accepts. A listener that
-    /// binds `/run/user/1000/bus`, fills its backlog and never accepts would
+    /// binds the host session socket, fills its backlog and never accepts would
     /// otherwise hold stage 1 for ever — and because stage 1 never EXITS, the
     /// fixture's `restart=always` would have nothing to restart. A draft
     /// installed the socket timeouts after connecting, which bounded every

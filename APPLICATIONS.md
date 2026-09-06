@@ -492,27 +492,29 @@ and give the new units a literal argv:
 ```ini
 [busd]
 type=daemon
-exec=/bin/td-login exec-as tester -- /bin/td-busd run --socket /run/user/1000/bus
+cgroup=service
+exec=/bin/td-login exec-service-as tdb1000 -- /bin/td-busd run-session
 after=seat
-ready=/bin/td-login exec-as tester -- /bin/td-busd probe /run/user/1000/bus
+requires=seat,td-firstboot
+ready=/bin/td-login exec-as tester -- /bin/td-busd probe /run/td-bus/1000/bus
 ready-timeout=30
 restart=always
 
 [portal]
 type=daemon
-exec=/bin/td-portal supervise --bus /run/user/1000/bus \
+exec=/bin/td-portal supervise --bus /run/td-bus/1000/bus \
      --settings /etc/td-portal-settings
 after=busd
 requires=busd
 ready=/bin/td-login exec-as tester -- /bin/td-portal probe \
-      --bus /run/user/1000/bus --settings /etc/td-portal-settings
+      --bus /run/td-bus/1000/bus --settings /etc/td-portal-settings
 ready-timeout=30
 restart=always
 
 [portal-evidence]
 type=oneshot
 exec=/bin/td-login exec-as tester -- /bin/td-portal probe \
-     --bus /run/user/1000/bus --settings /etc/td-portal-settings
+     --bus /run/td-bus/1000/bus --settings /etc/td-portal-settings
 after=portal
 requires=portal
 timeout=30
@@ -526,27 +528,21 @@ writes raw dot progress to the shared console without line framing; waiting
 for it to settle lets td-svc's single-write `portal-evidence:` prefix remain
 an exact attributable line. This edge does not couple portal health to TLS.
 
-`busd` needs `/run/user/1000` (td-seatd's product). Settings and the denied
-Background request need only that bus and the immutable settings file; later
-UI portals add the private compositor socket. Both daemons are
+`busd` needs its broker-owned `/run/td-bus/1000` runtime, published by
+firstboot after durable identity enrollment. Settings and the denied
+Background request need that bus and the immutable settings file; UI
+portals also use the private compositor socket. Both daemons use
 `restart=always`, so td-svc's backoff bounds crash loops.
 
-**The `busd` unit has LANDED**, with two things this sketch did not
-settle. It `requires=seat` as well as ordering after it, and not for the
-reason a first draft gave: there is no race. td-svc will not start a
-unit until every `after=` dependency has SETTLED, so `after=seat` alone
-already keeps the broker behind td-seatd. What `requires=` adds is that
-a FAILED seat settles too — with ordering alone the broker is released
-onto a session that does not exist, binds a socket in a
-`/run/user/1000` td-seatd never made, and prints a healthy marker on a
-machine with no seat, no compositor and no way to run anything. The
-marker would then mean less than it appears to, which is the one thing
-this design is careful about everywhere else. (`requires=` supplies the
-ordering edge by itself; the `after=` is kept because the declared edge
-set is pinned by a test and reads better stated than inferred.) And the
-boot asserts the outcome rather than trusting the unit: `/etc/bootsuccess`
-probes the RUNNING broker in its health farm and prints a marker the
-image oracle requires — §D below.
+The broker requires successful seat setup and firstboot enrollment.
+`requires=` supplies ordering as well as the success condition; the
+explicit `after=seat` remains part of the unit table. Missing or altered
+runtime state refuses startup. Requiring the seat also prevents reporting
+a healthy session bus when seat setup failed; this is a session-health
+dependency, independent of who creates the runtime. `/etc/bootsuccess`
+probes the running
+broker as the human UID and prints the marker the image oracle requires;
+§D states the exact endpoint-evidence boundary.
 
 **The Settings/Request `[portal]` and `[portal-evidence]` units have now
 LANDED.**
@@ -2648,12 +2644,12 @@ permission, which is what step 12 has said since it was written. It is
 also the one landed row whose enclosing claim — that the broker is the
 policy — is now PARTLY a description of what runs rather than wholly a
 target: today's td-busd resolves a per-jail identity at accept, filters
-what each caller may see, address and own, honours the `own` entries this row
-forwards, and filters matched broadcasts per recipient. Its PRESENCE is a
-launch precondition as well:
-`plan_launch` resolves the socket before the jail unshares, so a missing
-or non-socket `/run/user/1000/bus` fails the launch of every application,
-including one that never opens D-Bus. §D records what all of that costs.
+what each caller may see, address and own, honours the `own` entries
+this row forwards, and filters matched broadcasts per recipient. Its
+PRESENCE is a launch precondition as well: `plan_launch` resolves the
+socket before the jail unshares, so a missing or non-socket
+`/run/td-bus/1000/bus` fails the launch of every application, including
+one that never opens D-Bus. §D records what all of that costs.
 
 The compiled application environment crosses the internal exec only as
 bounded, canonical argv data:
@@ -3501,9 +3497,28 @@ The quoted block mirrors the resulting implemented roster in `UNSAFE.md`;
 
 ## D. `td-busd` — the D-Bus broker
 
-One **session** bus at `/run/user/1000/bus`, parent directory 0700,
-socket 0600. There is no system bus: nothing on td speaks one, and the
-first thing that wants one is a design review rather than a config file.
+One **session** bus at `/run/td-bus/1000/bus`, owned by the reserved
+broker UID/GID 992 (`tdb1000`). Firstboot creates `/run/td-bus` as
+root-owned 0755 and its `1000` child as broker-owned 0755 after durable
+identity enrollment. The socket is 0666; the listener admits only kernel
+UID 0 (portal supervision) and UID 1000 (current human, portal and jail
+clients), before connection quota reservation or authentication. Other
+reserved service and application UIDs remain refused. Refusals allocate
+no connection worker and share the existing first-and-every-64 log
+sampling. The public socket does not promise availability against local
+connection floods. `run-session` requires UID 992 and checks every
+directory's owner and type; it cannot create a missing runtime. The
+`td-bus` directories require exact mode 0755. Root and `/run` must be
+traversable, without special mode bits or group/other writers; a read-only
+0555 root remains valid. Firstboot repairs only a root-owned
+creation interrupted before ownership publication; a broker-owned child
+with altered permissions is refused. This profile is fixed to the stock
+human owner 1000. Generic `run --socket PATH` retains its private 0600
+host/test endpoint and never widens a caller's parent. The stock jail
+binds the protected host endpoint at its own `/run/user/1000/bus`;
+clients inside keep their existing bus address. There is no system bus:
+nothing on td speaks one, and the first thing that wants one is a design
+review rather than a config file.
 
 `td-busd` also **absorbs `xdg-dbus-proxy`**. Upstream starts a filtering
 proxy per sandbox and bind-mounts the proxied socket; td bind-mounts the
@@ -3855,7 +3870,7 @@ having registered is a refusal rather than an unregistered instance.
 
 **What the broker CANNOT check is the app id itself, and §L.1 has to be
 read in that light.** Registration is authenticated by uid, and in v1
-every session peer is uid 1000 — so nothing distinguishes a genuine
+every unprivileged application registrant is uid 1000 — so nothing distinguishes a genuine
 `td-jail` performing this protocol from any other uid-1000 process
 performing it, and the app id is a string the registrant supplies. The
 lineage walk is sound about *which instance a connection belongs to* and
@@ -4052,9 +4067,11 @@ deadline on completing the handshake. Second, `inbox` and `frame` retain
 their high-water capacity per connection, so peers each sending one
 near-maximum message pin their size in memory charged to `td-busd` rather
 than to the app cgroup; the descriptor budget above is the pattern a byte
-budget would follow. Third, the socket is umask-wide between `bind` and the
-`chmod` that makes it 0600 — a window the 0700 parent covers, and one that
-`umask(2)` would close at the cost of a syscall this roster does not have.
+budget would follow. Third, the generic host/test socket is umask-wide
+between `bind` and the `chmod` that makes it 0600. A private 0700 parent
+covers that window. The stock session socket deliberately permits every
+UID to connect and applies its kernel-UID guard before reading protocol
+bytes; it does not depend on a private socket mode.
 Fourth, the descriptor budget charges a receive after `recvmsg` has
 installed its descriptors, so one message's worth per connection sits
 outside every count for the length of one pump; across every connection
@@ -4671,7 +4688,7 @@ reports `td.AppId`; everything else on the session bus still resolves
 `Unconfined`, which is right — the compositor and the terminal are not
 in jails. The app-id caveat below is unchanged and is the reason the
 filter still cannot land on this alone: registration is authenticated by
-uid, every session peer is uid 1000, and the app id is a string the
+uid, every unprivileged application registrant is uid 1000, and the app id is a string the
 registrant supplies. The walk is sound about WHICH instance a connection
 belongs to and says nothing about whether that instance is what it calls
 itself. Per-app uids are the fix and this is the third argument for
@@ -5270,9 +5287,9 @@ broker is the only td code involved.
 ### What is landed of the bus on the image
 
 **The broker is a boot job, and the boot proves it.** `[busd]` runs
-`/bin/td-busd run --socket /run/user/1000/bus` through `td-login
-exec-as tester`, and its `ready=` is a real `td-busd probe`: a client
-that connects, completes `AUTH EXTERNAL` under the uid the kernel
+`/bin/td-busd run-session` through `td-login
+exec-service-as tdb1000`, and its `ready=` is a real `td-busd probe`: a
+client that connects, completes `AUTH EXTERNAL` under the uid the kernel
 reports for it, and reads back a well-formed `OK <guid>`. A broker that
 bound the path and cannot serve it therefore never reaches ready, and
 td-svc marks the unit failed rather than reporting it up.
@@ -5284,25 +5301,12 @@ changes the unit's PHASE and leaves the process running, while
 a broker that dies, which is the common case, and not one that is up and
 not serving. Nothing re-probes a unit once it has failed that way.
 
-It `requires=seat`, and that is the load-bearing half rather than the
-`after=` — but not because ordering is weak. A unit does not start until
-every `after=` dependency has settled, so `after=seat` alone already
-keeps the broker behind td-seatd; a draft of this section described a
-race that td-svc does not have. What `requires=` adds is that a FAILED
-seat settles too. With ordering alone the broker is released onto a
-machine whose seat assignment did not happen: `bind` creates a missing
-parent 0700 rather than refusing — deliberately, so a caller that made
-its own directory is not turned away from a path it owns — so the broker
-comes up, serves, and prints a healthy marker on a system with no seat,
-no compositor and nothing that could use a bus. That is a marker saying
-more than it knows, which is the failure this whole section is written
-against. It also leaves `/run/user` itself created by an unprivileged
-process rather than by the component whose job that is.
-
-The same draft claimed clients would "look in the right place and find
-nothing". They would not: td-seatd adopts an existing runtime directory,
-`chown`s and `chmod`s it rather than replacing it, and the path is the
-same literal string on both sides. The problem was never the path.
+It `requires=seat,td-firstboot`: seat setup and durable identity
+enrollment must both succeed. Firstboot prepares the protected broker
+runtime before its marker; a missing runtime is a broker startup
+refusal. The service stays in its root-owned system cgroup. Its
+readiness probe runs as the human, so it tests cross-UID access to the
+actual listener.
 
 `/etc/bootsuccess` then probes the RUNNING broker in its health farm and
 prints `TD-BUSD-RUN-OK`, which the image oracle requires. What that adds
@@ -5401,11 +5405,10 @@ libdbus and GDBus, and the portal is what will hold them up here.
 
 It also checks a PATH and not a pid. The probe has no association with
 the unit's process or generation, so what it establishes is that
-something at `/run/user/1000/bus` completed the handshake as the login
+something at `/run/td-bus/1000/bus` completed the handshake as the login
 user — not that the process td-svc supervises is the one that answered.
-Nothing else on this image binds that path, which is what makes the
-marker worth having; the day something else could, this is the
-assumption to re-check rather than a claim to keep repeating.
+Only root and the broker UID can replace that path. The probe remains
+endpoint evidence, without a supervised-generation assertion.
 
 **It shipped before anything consumed it, and now the jail does.** The
 argument for booting a broker with no clients was that the parts most
@@ -5421,8 +5424,8 @@ named.
 
 **The socket is bound in, always.** §C's mount plan, step 12, has said
 `bus <- bind, ALWAYS (the broker is the policy, not the mount)` since it
-was written; the jail now does it. `/run/user/1000/bus` is bound
-read-only into the jail's own `/run/user/1000` exactly the way
+was written; the jail now does it. `/run/td-bus/1000/bus` is bound
+read-only at the jail's own `/run/user/1000/bus` exactly the way
 `wayland-0` is: a socket inode made by binding a listener and dropping
 it, a private bind over that inode, then a `require_bind_source` at
 preparation time and a `require_mount` the confined process checks
@@ -5433,18 +5436,16 @@ refusal rather than a surprise.
 
 Read-only costs the app nothing, and it is worth writing down exactly
 what it buys, because a draft of this paragraph named the wrong thing.
-`connect(2)` is unaffected: read-only here is a vfsmount flag enforced by
-`mnt_want_write()` on the write paths, not by `inode_permission`, and
+`connect(2)` is unaffected: read-only here is a vfsmount flag enforced
+by `mnt_want_write()` on the write paths, not by `inode_permission`, and
 `SCM_RIGHTS` is socket-layer and sees no mount flags at all. It does NOT
 stop the app replacing the socket — unlink is governed by the parent
 directory, which is the jail's own writable tmpfs; what refuses it is
 that the path is a mountpoint (`EBUSY`) and the app has no
 `CAP_SYS_ADMIN` to unmount it. What `MS_RDONLY` actually buys is `chmod`
-and `chown`, which do take a write reference. The app owns that inode —
-uid 1000, mode 0600, and the jail maps `1000 1000 1` — so without the
-flag it could `chmod 0000` the HOST's real bus socket through its own
-bind and deny `connect(2)` to the compositor, the portal and the
-`/etc/bootsuccess` probe.
+and `chown`, which do take a write reference. The broker owns that inode
+at UID 992, outside the application's mapping. Applications cannot
+change its mode or owner; the read-only bind remains defence in depth.
 
 **`DBUS_SESSION_BUS_ADDRESS` was already compiled and never checked.**
 The engine has put `unix:path=/run/user/1000/bus` into every application
@@ -7919,7 +7920,7 @@ middle.
 | `td-svc` | root | the supervisor |
 | `td-seatd` | root, oneshot | assigns `/dev/fb0` and `/dev/input/*`; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
 | `td-compositor` | 993 (`tdc1000`) | owns display/input devices and the private root authority endpoint |
-| `td-busd` | 1000 | **required**, see below |
+| `td-busd` | 992 (`tdb1000`) | protected runtime and explicit kernel-UID admission |
 | `td-portal` | 1000 | reads the user's files in order to show them |
 | `td-jail` (stage 0/1) | 1000 | fully unprivileged — resolve, register, unshare. It writes only under `~/.td/app` (§B.4), where `td-firstboot` may already have placed a first configuration as the user's own files; packages are read-only store paths (§B.1) |
 | `td-authd` | root | fixed terminal launcher; §L.1 elevation remains unimplemented |
@@ -7927,16 +7928,15 @@ middle.
 | `td-audio` | **`audio`** | §K.5 — dedicated audio uid |
 | the app | 1000, identity-mapped | upstream's model; see below |
 
-**`td-busd` must be uid 1000**, and the reasons are mechanical rather
-than conventional. Its socket lives in a 0700 uid-1000 directory, so any
-other uid requires opening that directory up — trading a theoretical
-containment for a real exposure. And the baseline's lineage identity
-(§D) reads
-`/proc/<pid>/root/.flatpak-info` and `/proc/<pid>/stat`, which needs
-ptrace-read permission — same uid or root — so a `nobody` broker could
-not authenticate a sandboxed caller at all, and a root broker would be
-strictly worse. It also buys nothing: every client is uid 1000, and a
-compromised broker forges session messages whatever uid it holds.
+The broker runs separately from the human account. Its lineage walk
+reads non-ptrace-gated PID/PPID/start-time fields and retained pidfds,
+without opening a peer's root or application files. The mapped EXTERNAL
+claim is only an authentication spelling; authorization retains the
+external kernel UID and proven lineage. A broker compromise still
+controls bus routing. UID 992 does not grant access to the human's private
+files or credential store. Publicly readable content in immutable `/td/store`
+remains accessible; its immutability prevents modification. The portal still
+shares the human UID and can read those private files and secrets.
 
 **The app runs as uid 1000 in v1, and the consequence is stated rather
 than buried.** `SO_PEERCRED` distinguishes a confined client only while
@@ -7963,10 +7963,11 @@ ACL-compatible. The retained AUTH EXTERNAL rules below account for uid 1000
 inside differing from the external kernel identity.
 
 The compositor identity, devices, sockets and terminal launcher cut over
-atomically to UID 993. Broker, portal and application assignments remain
-reservations. Activating those requires an atomic migration of application
-state, cgroups, socket permissions and peer credential checks. Their current
-same-uid model still prevents a secure consent claim.
+atomically to UID 993. The broker also consumes UID 992. Portal and
+application assignments remain reservations. Activating those requires
+an atomic migration of application state, cgroups, socket permissions
+and peer credential checks. Their current same-uid model still prevents
+a secure consent claim.
 
 **Two consequences must be designed for now even though the work is
 v2**, because both are silent breakages rather than missing features:
@@ -8060,12 +8061,12 @@ than a compromise.
 
 #### The prerequisite, without which none of it works
 
-The compositor now runs at dedicated UID 993, while broker, portal and
-applications retain UID 1000. The root authority pins the compositor's kernel
-sender over its private channel. Unprivileged human-UID processes cannot
-ptrace that service
-or read its input/display devices. Per-application identity and trusted input
-remain prerequisites for consent.
+The compositor now runs at dedicated UID 993, while portal and
+applications retain UID 1000 and the broker runs at UID 992. The root
+authority pins the compositor's kernel sender over its private channel.
+Unprivileged human-UID processes cannot ptrace that service or read its
+input/display devices. Per-application identity and trusted input remain
+prerequisites for consent.
 
 > **`td-compositor` must NOT share a uid with anything an application can
 > become.** That means per-app uids (§L, v2) *and* the compositor at its
@@ -8173,7 +8174,7 @@ requester ──request──▶ td-authd (root)
    walk, `Unknown` denied. A rogue application cannot present itself as
    another *process*, because the pid is the kernel's answer rather than
    its own. **It can still present itself under another NAME while v1
-   runs every peer at uid 1000**, since §D's registration authenticates
+   runs every application registrant at uid 1000**, since §D's registration authenticates
    by uid and the app id is supplied by the registrant — so the prompt's
    "firefox is asking to publish a deployment" is only as good as
    per-app uids, which is the prerequisite this section already refuses
@@ -8274,7 +8275,7 @@ has, which is the other reason it is primary.
 | **Input-focus theft** | Exclusive input for the prompt's lifetime; no client receives those events at all |
 | **Elevate-a-shell** | Structurally impossible — no operation returns a process, and the table is enumerated |
 | **Replay of a captured approval** | The assertion covers requester, operation, pinned arguments and a nonce, **length-prefixed rather than concatenated** (or `("a","bc")` and `("ab","c")` collide), and the nonce is consumed before the operation starts |
-| **The requester lies about what it is** | It never says which PROCESS it is — that is `SO_PEERCRED` plus lineage. It does say which APPLICATION, since §D's registration is authenticated by uid and v1 runs every peer at uid 1000, so the name in the prompt is only as good as per-app uids. A draft wrote this row the other way round, claiming an escaped app is "promoted to `Unconfined`" where the prompt can only say "a process"; under §E's own definition that is wrong, because an escapee is still a descendant of a live registered stage-2 pid and resolves `Jailed` — the filter denies `unshare`, `setns` and `clone(CLONE_NEWUSER)`, and killing PID 1 of a pid namespace kills the namespace. The exposure is the id, not the lineage |
+| **The requester lies about what it is** | It never says which PROCESS it is — that is `SO_PEERCRED` plus lineage. It does say which APPLICATION, since §D's registration is authenticated by uid and v1 runs every application registrant at uid 1000, so the name in the prompt is only as good as per-app uids. A draft wrote this row the other way round, claiming an escaped app is "promoted to `Unconfined`" where the prompt can only say "a process"; under §E's own definition that is wrong, because an escapee is still a descendant of a live registered stage-2 pid and resolves `Jailed` — the filter denies `unshare`, `setns` and `clone(CLONE_NEWUSER)`, and killing PID 1 of a pid namespace kills the namespace. The exposure is the id, not the lineage |
 | **Walk-up attacker at an unlocked session** | **Out of scope by decision.** A password model would resist it and this one does not; that is the accepted trade. A screen lock is where to address it, and it belongs to the session rather than to elevation |
 | **Prompt spam from an unidentifiable requester** | **Partly unanswerable as specified.** Rate-limiting assumes a stable requester identity, and `Unconfined` code can fork a fresh process per request. Rate-limit the jailed case per app id; for `Unconfined` the limit can only be global, which degrades into denying elevation to everyone while an attacker spams |
 
@@ -9190,14 +9191,15 @@ measurements, a different TPM and actual store migration; it is separate from
 the desktop boot check.
 
 The secure-attention prerequisites reserve distinct compositor, broker,
-portal, and application identities in immutable `/etc/td-principals.tsv`.
-Firstboot checks those reservations against all account databases and
-persists their union in `/var/lib/td/principals.tsv`, retaining retired
-assignments so updates cannot reuse their UIDs. The image consumes the
-compositor assignment at UID/GID 993 and reserves the broker, portal and
-application assignments. Their remaining activation must migrate state and
-socket authorization together. `td-authd/DESIGN.md`
-specifies the canonical table, account classes, and durable ledger.
+portal, and application identities in immutable
+`/etc/td-principals.tsv`. Firstboot checks those reservations against
+all account databases and persists their union in
+`/var/lib/td/principals.tsv`, retaining retired assignments so updates
+cannot reuse their UIDs. The image consumes the compositor assignment at
+UID/GID 993 and broker assignment at UID/GID 992, reserving the portal
+and application assignments. Their remaining activation must migrate
+state and socket authorization together. `td-authd/DESIGN.md` specifies
+the canonical table, account classes, and durable ledger.
 
 **Remaining increments, in order on the rolling workstream.** (c) Gate release
 on FIDO2 user presence at session start, after the compositor provides secure

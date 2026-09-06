@@ -339,14 +339,21 @@ dependency comes back is the control socket's job.
 
 `after=` is **ordering**. A dependent waits for its dependency to reach a
 *decision*, not to succeed: a failed dependency is logged and skips nothing
-— matching today's `sysinit`, where a failed job is reported and later jobs
-run anyway. `requires=` is the opt-in strict form. The shipped table uses it where a
-dependency's failure makes the dependent meaningless rather than merely
-degraded — the graphical chain (`wayland requires=seat`,
-`terminal requires=wayland`, `bootsuccess requires=terminal`) and the session
-bus (`busd requires=seat`) — and per **I5** it can never apply to a `tty=`
-service. An earlier version of this paragraph said no shipped unit needed it,
-which the graphical chain already contradicted.
+— matching today's `sysinit`, where a failed job is reported and later
+jobs run anyway. `requires=` is the opt-in strict form. The shipped
+table uses it where a dependency's failure makes the dependent
+meaningless rather than merely degraded — the graphical chain (`wayland
+requires=seat`, `terminal requires=wayland`, `bootsuccess
+requires=terminal`) and the session bus (`busd
+requires=seat,td-firstboot`) — and per **I5** it can never apply to a
+`tty=` service. An earlier version of this paragraph said no shipped
+unit needed it, which the graphical chain already contradicted.
+
+The broker runs through `exec-service-as tdb1000` in its system service
+leaf. Firstboot reserves its UID and prepares its protected runtime;
+`requires=td-firstboot` withholds the broker when enrollment fails. Its
+readiness probe runs as the human UID and checks the live cross-UID
+listener.
 
 The first desktop portal follows the same distinction. `portal requires=busd`
 because activation and name ownership are meaningless without the broker, and

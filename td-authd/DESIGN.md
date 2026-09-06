@@ -189,33 +189,37 @@ IDs, and noncanonical numeric IDs are refused. These are immutable generated
 account databases, not the unrelated mutable `/etc` identity symlinks. An
 invalid account edit therefore fails image construction and firstboot.
 
-The current consumer is td-firstboot's explicit `--enroll-principals` mode.
-It requires the default persistent state directory and all four root uid and
-gid fields. Before reporting machine identity or provisioning applications,
-it loads the immutable table and reserves its identities in
-`/var/lib/td/principals.tsv`. The image enables this mode at sysinit. These
-are reservations only: it creates no accounts and changes no running uid.
-Every reserved uid/gid is checked against the complete current passwd,
-group, and shadow tables, including retired assignments. A future activated
-account must use the canonical name `tdc<owner>`, `tdb<owner>`, or
-`tdp<owner>` for compositor, broker, or portal, and `tda<uid>` for an
-application. Its primary gid equals uid, shell is `/bin/false`, and shadow
-field is exactly `!td-service`; it has no supplementary membership and its
-primary group exists and admits no other members. Orphan shadow records for
-reserved names are refused. Aliases, shared primary gids, missing active
-human owners, duplicate account records, and human-login shadow classes fail
-enrollment. The image generator validates these same tables with the
-provisioner's parser. A registry row alone does not activate a service. The
-image consumes the compositor assignment through its paired root authority;
-broker, portal and application accounts remain reserved. Each atomic identity
-cutover consumes these assignments. The paired compositor may enter its
-inert credential and channel startup at its reserved UID before ledger
-admission; the authority verifies the ledger before allowing device access,
-worker creation, or human terminal launch. A failed firstboot unit settles
-service ordering but does not block later units; ordering is not
-authorization. The boot oracle requires the exact `TD-PRINCIPALS-ENROLLED`
-line on every successful boot. Retired human accounts may disappear while
-their service and application reservations remain.
+The current consumer is td-firstboot's explicit `--enroll-principals`
+mode. It requires the default persistent state directory and all four
+root uid and gid fields. Before reporting machine identity or
+provisioning applications, it loads the immutable table and reserves its
+identities in `/var/lib/td/principals.tsv`. The image enables this mode
+at sysinit. These are reservations only: it creates no accounts and
+changes no running uid. Every reserved uid/gid is checked against the
+complete current passwd, group, and shadow tables, including retired
+assignments. A future activated account must use the canonical name
+`tdc<owner>`, `tdb<owner>`, or `tdp<owner>` for compositor, broker, or
+portal, and `tda<uid>` for an application. Its primary gid equals uid,
+shell is `/bin/false`, and shadow field is exactly `!td-service`; it has
+no supplementary membership and its primary group exists and admits no
+other members. Orphan shadow records for reserved names are refused.
+Aliases, shared primary gids, missing active human owners, duplicate
+account records, and human-login shadow classes fail enrollment. The
+image generator validates these same tables with the provisioner's
+parser. A registry row alone does not activate a service. The image
+consumes the compositor assignment through its paired root authority;
+the broker consumes UID 992 through its service-only login path and
+protected runtime. Portal and application accounts remain reserved. Each
+atomic identity cutover consumes these assignments. The paired
+compositor may enter its inert credential and channel startup at its
+reserved UID before ledger admission; the authority verifies the ledger
+before allowing device access, worker creation, or human terminal
+launch. A failed firstboot unit settles ordinary service ordering; the
+broker requires its success explicitly. Ordering alone is not
+authorization. The boot oracle requires the exact
+`TD-PRINCIPALS-ENROLLED` line on every successful boot. Retired human
+accounts may disappear while their service and application reservations
+remain.
 
 The canonical table parser and reservation union live in
 `engine/src/principals.rs`. td-firstboot includes that dependency-free source

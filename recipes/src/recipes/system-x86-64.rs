@@ -204,7 +204,9 @@ const COMPOSITOR_RESERVED_UID: u32 = td_engine::permissions::TD_COMPOSITOR_UID;
 const COMPOSITOR_USER: &str = "tdc1000";
 const COMPOSITOR_RUNTIME: &str = td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH;
 const WAYLAND_SOCKET: &str = td_engine::permissions::TD_WAYLAND_SOCKET_PATH;
-const BROKER_RESERVED_UID: u32 = 992;
+const BROKER_RESERVED_UID: u32 = td_engine::permissions::TD_BROKER_UID;
+const BROKER_USER: &str = "tdb1000";
+const BROKER_RUNTIME: &str = td_engine::permissions::TD_BUS_RUNTIME_PATH;
 const PORTAL_RESERVED_UID: u32 = 991;
 const PROFILER_USER: &str = "profiler";
 const PROFILER_UID: u32 = 997;
@@ -227,7 +229,7 @@ const PROFILER_ATTRIBUTION_EVIDENCE_TIMEOUT_SECS: u16 =
 const PROFILER_EVIDENCE_SERVICE_TIMEOUT_SECS: u16 = 915;
 const FIREFOX_NAME: &str = "firefox";
 const FIREFOX_APP_ID: &str = "org.mozilla.firefox";
-const SESSION_BUS_SOCKET: &str = "/run/user/1000/bus";
+const SESSION_BUS_SOCKET: &str = td_engine::permissions::TD_BUS_SOCKET_PATH;
 const FIREFOX_CONTENT_RGB_A: &str = "ff00ff";
 const FIREFOX_CONTENT_RGB_B: &str = "00ff00";
 const FIREFOX_HTTPS_DOCUMENT: &str = concat!(
@@ -464,6 +466,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == AUDIO_UID {
         return home == AUDIO_RUNTIME;
     }
+    if uid == BROKER_RESERVED_UID {
+        return home == BROKER_RUNTIME;
+    }
     if uid == COMPOSITOR_RESERVED_UID {
         return home == COMPOSITOR_RUNTIME;
     }
@@ -514,6 +519,17 @@ const SYSTEM: SystemDef = SystemDef {
             groups: &[],
             passwordless: false,
             service_only: false,
+        },
+        User {
+            name: BROKER_USER,
+            uid: BROKER_RESERVED_UID,
+            gid: BROKER_RESERVED_UID,
+            gecos: "Session Bus Broker",
+            home: BROKER_RUNTIME,
+            shell: "/bin/false",
+            groups: &[],
+            passwordless: false,
+            service_only: true,
         },
         User {
             name: COMPOSITOR_USER,
@@ -1419,24 +1435,15 @@ fn build_td_svc_conf() -> String {
          after=rootcheck\n\
          timeout={netup}\n\
          \n\
-         # The session bus. `after=seat` AND `requires=seat` because td-seatd is\n\
-         # what makes the /run/user/{ui_uid} the broker binds inside: without it\n\
-         # `bind` would create that directory itself, 0700 and owned by whoever\n\
-         # ran first, which is a different machine from the one this table\n\
-         # describes. td-jail is the first consumer: it registers each launch\n\
-         # with this broker and refuses to release the application if that\n\
-         # fails, so Firefox below now depends on this unit answering and\n\
-         # not merely on its socket existing. `after` and not `requires`, for\n\
-         # the reason recorded at Firefox.\n\
-         # `exec-as` rather than `su -c`, so the argv is literal and the\n\
-         # environment is the unit's rather than the boot path's.\n\
+         # Firstboot reserves the broker identity and prepares its protected\n\
+         # runtime. Human clients cannot replace this service's socket.\n\
          [busd]\n\
          type=daemon\n\
-         cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-busd run --socket /run/user/{ui_uid}/bus\n\
+         cgroup=service\n\
+         exec=/bin/td-login exec-service-as {broker_user} -- /bin/td-busd run-session\n\
          after=seat\n\
-         requires=seat\n\
-         ready=/bin/td-login exec-as {ui_user} -- /bin/td-busd probe /run/user/{ui_uid}/bus\n\
+         requires=seat,td-firstboot\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-busd probe {bus_socket}\n\
          ready-timeout=30\n\
          restart=always\n\
          \n\
@@ -1479,10 +1486,10 @@ fn build_td_svc_conf() -> String {
          # portal landing is ordered only after the bus it serves on.\n\
          [portal]\n\
          type=daemon\n\
-         exec=/bin/td-portal supervise --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
+         exec=/bin/td-portal supervise --bus {bus_socket} --settings {portal_settings}\n\
          after=busd\n\
          requires=busd\n\
-         ready=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus {bus_socket} --settings {portal_settings}\n\
          ready-timeout=30\n\
          restart=always\n\
          log={portal_service_log}\n\
@@ -1502,7 +1509,7 @@ fn build_td_svc_conf() -> String {
          [portal-evidence]\n\
          type=oneshot\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus /run/user/{ui_uid}/bus --settings {portal_settings}\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus {bus_socket} --settings {portal_settings}\n\
          after=portal,firefox-tls-setup\n\
          requires=portal\n\
          timeout=30\n\
@@ -1846,6 +1853,7 @@ fn build_td_svc_conf() -> String {
         ui_user = UI_USER,
         ui_uid = UI_UID,
         ui_home = UI_HOME,
+        broker_user = BROKER_USER,
         compositor_uid = COMPOSITOR_RESERVED_UID,
         compositor_user = COMPOSITOR_USER,
         wayland_socket = WAYLAND_SOCKET,
@@ -3065,8 +3073,8 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          '{td_txt_probes}[ \"$t\" = 1 ]'; then \
          [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
          if /bin/su -s /bin/sh {} -c \
-         'b=$(/bin/td-busd probe /run/user/{UI_UID}/bus 2>&1) || \
-         {{ echo \"td-busd: the session bus did not answer on /run/user/{UI_UID}/bus: \
+         'b=$(/bin/td-busd probe {SESSION_BUS_SOCKET} 2>&1) || \
+         {{ echo \"td-busd: the session bus did not answer on {SESSION_BUS_SOCKET}: \
          $b\"; \
          exit 1; }}'; then \
          [ \"$mtb\" = 1 ] || {{ echo {TD_BUSD_RUNTIME_MARKER}; mtb=1; }}; \
@@ -4591,7 +4599,7 @@ fn shape_check() -> String {
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$pc\" ] && [ \"$ts\" -lt \"$pc\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$ff\" ] && [ \"$ff\" -lt \"$fe\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland plus TLS setup -> private portal-channel evidence, wayland -> terminal + Firefox evidence, and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
      [ \"$st\" -lt \"$au\" ] && [ \"$au\" -lt \"$ff\" ] || { echo 'td-svc would not serialize seat -> audio -> Firefox' >&2; exit 1; }; \
-     [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds inside the runtime directory td-seatd makes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
+     [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds in the UID-992 runtime td-firstboot publishes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
      [ \"$bd\" -lt \"$po\" ] && [ \"$po\" -lt \"$pv\" ] && [ \"$po\" -lt \"$ff\" ] || { echo 'td-svc would not serialize busd -> portal -> live portal evidence and Firefox' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
@@ -6558,7 +6566,10 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             .filter(|user| user.service_only)
             .map(|user| user.name)
             .collect();
-        assert_eq!(private_runtime_accounts, [COMPOSITOR_USER, AUDIO_USER]);
+        assert_eq!(
+            private_runtime_accounts,
+            [BROKER_USER, COMPOSITOR_USER, AUDIO_USER]
+        );
         assert_eq!(unit_key("wayland", "exec"), Some(format!(
             "/bin/td-authd terminal-serve --user {UI_USER} --uid {UI_UID} --peer-uid {COMPOSITOR_RESERVED_UID}"
         )));
@@ -6895,7 +6906,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     /// review tripwire on a second packaged bus-policy surface, not a proof
     /// that the bus has one peer.
     ///
-    /// td-jail binds `/run/user/1000/bus` into every jail because the broker is
+    /// td-jail binds `/run/td-bus/1000/bus` into every jail because the broker is
     /// the policy boundary. Well-known names, match rules, per-caller filtering
     /// and per-instance admission have landed, a jailed caller is told no
     /// host pid, and the descriptor budget is charged per admission key. What
@@ -7082,50 +7093,49 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         )));
     }
 
-    /// The session bus is a unit, runs as the UI user, and binds where the seat
-    /// assignment put the runtime directory.
-    ///
-    /// Every path is spelled out rather than derived at boot: `exec-as` empties the
-    /// environment, so nothing here can come from `XDG_RUNTIME_DIR` or from
-    /// whatever the boot path happened to export. The `ready=` line is `td-busd
-    /// probe`, which completes the `EXTERNAL` handshake under the uid the kernel
-    /// reports for it — so a broker that bound the path and cannot serve it never
-    /// reaches ready, and td-svc marks the unit FAILED and says so on the console
-    /// rather than leaving /etc/bootsuccess to probe a socket with nothing behind
-    /// it.
-    ///
-    /// It does not RESTART it, and an earlier version of this comment said it
-    /// did. A readiness probe that never succeeds changes the unit's phase and
-    /// leaves the process running, while `restart=` is evaluated when a process
-    /// EXITS. So `restart=always` below covers a broker that dies, which is the
-    /// common case, and not one that is up and not serving; nothing re-probes a
-    /// unit once it has failed that way. APPLICATIONS.md §D says the same thing,
-    /// and this comment contradicting it is what made the error findable.
+    /// The broker runs as a service identity in its protected runtime. Its
+    /// readiness probe is an actual human-UID EXTERNAL client.
     #[test]
-    fn the_session_bus_runs_unprivileged_where_the_seat_put_its_runtime_dir() {
+    fn the_session_bus_uses_its_reserved_identity_and_protected_runtime() {
+        assert_eq!(SESSION_BUS_SOCKET, format!("{BROKER_RUNTIME}/bus"));
         assert_eq!(
             unit_key("busd", "exec"),
             Some(format!(
-                "/bin/td-login exec-as {UI_USER} -- /bin/td-busd run \
-                 --socket /run/user/{UI_UID}/bus"
+                "/bin/td-login exec-service-as {BROKER_USER} -- /bin/td-busd run-session"
             )),
-            "the broker must be started by literal argv as the UI user"
+            "the broker must be started by literal argv as its service identity"
         );
         assert_eq!(
             unit_key("busd", "ready"),
             Some(format!(
                 "/bin/td-login exec-as {UI_USER} -- /bin/td-busd probe \
-                 /run/user/{UI_UID}/bus"
+                 {SESSION_BUS_SOCKET}"
             )),
             "readiness must be a real client completing the handshake"
         );
+        assert_eq!(unit_key("busd", "cgroup").as_deref(), Some("service"));
+        let profile = include_str!("../../../td-busd/src/session.rs");
+        assert!(profile.contains(&format!(
+            "pub(crate) const UID: u32 = {BROKER_RESERVED_UID};"
+        )));
+        assert!(profile.contains(&format!(
+            "pub(crate) const SOCKET: &str = \"{SESSION_BUS_SOCKET}\";"
+        )));
+        assert!(profile.contains(&format!("pub(crate) const HUMAN_UID: u32 = {UI_UID};")));
+        let provisioner = include_str!("../../../td-firstboot/src/principal_store.rs");
+        assert!(provisioner.contains(r#"const RUNTIME_NAME: &str = "td-bus";"#));
+        assert!(provisioner.contains(r#"Directory::open(Path::new("/run"), 0, 0)?"#));
+        assert!(provisioner.contains("runtime_child(&run, RUNTIME_NAME, (0, 0))?"));
+        assert!(provisioner.contains("&session.owner.to_string(),"));
+        assert!(provisioner.contains("(session.broker, session.broker),"));
+        assert_eq!(BROKER_RUNTIME, format!("/run/td-bus/{UI_UID}"));
+        assert!(ordered_before("td-firstboot", "busd"));
         assert_eq!(unit_key("busd", "type").as_deref(), Some("daemon"));
         assert_eq!(unit_key("busd", "restart").as_deref(), Some("always"));
         assert_eq!(
             unit_key("busd", "requires").as_deref(),
-            Some("seat"),
-            "without the seat there is no /run/user/{UI_UID} to bind in, and `bind` \
-             would silently make one"
+            Some("seat,td-firstboot"),
+            "runtime publication must follow successful identity enrollment"
         );
         assert!(
             ordered_before("busd", "bootsuccess"),
@@ -7138,12 +7148,12 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     fn settings_portal_activation_and_live_probe_are_exact() {
         let probe = format!(
             "/bin/td-login exec-as {UI_USER} -- /bin/td-portal probe \
-             --bus /run/user/{UI_UID}/bus --settings {TD_PORTAL_SETTINGS_PATH}"
+             --bus {SESSION_BUS_SOCKET} --settings {TD_PORTAL_SETTINGS_PATH}"
         );
         assert_eq!(
             unit_key("portal", "exec"),
             Some(format!(
-                "/bin/td-portal supervise --bus /run/user/{UI_UID}/bus \
+                "/bin/td-portal supervise --bus {SESSION_BUS_SOCKET} \
                  --settings {TD_PORTAL_SETTINGS_PATH}"
             )),
             "root must retain the broker capability while supervising its direct child"
@@ -7362,10 +7372,10 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         );
         // ORDERED after the bus, and STRICT on the compositor plus the two
         // finite QEMU setup authorities, and the asymmetry is the point.
-        // td-jail RESOLVES /run/user/1000/bus before
+        // td-jail RESOLVES /run/td-bus/1000/bus before
         // it unshares and fails the launch if it is not a socket owned by the
-        // login user, so Firefox needs that socket to EXIST — `busd` and
-        // `wayland` are siblings, each requiring only `seat`, so without an
+        // broker UID, so Firefox needs that socket to EXIST. `busd` and
+        // `wayland` are siblings in the graphical chain, so without an
         // ordering edge td-svc may release Firefox the moment the
         // compositor is ready, onto a bus that has not bound.
         //
@@ -7390,9 +7400,9 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         // broker that is up but not yet serving as well as the one that never
         // bound, since a registration that fails is a failed launch and a
         // failed launch is a restart. The diagnostic that made the strict edge
-        // tempting is no longer the argument for it either: `session_socket`
+        // tempting is no longer the argument for it either: `resolved_socket`
         // labels its errors, so Firefox dying on an absent bus says "session
-        // bus /run/user/1000/bus" rather than a bare ENOENT, and one dying on
+        // bus /run/td-bus/1000/bus" rather than a bare ENOENT, and one dying on
         // a wedged broker names the instance it could not register.
         assert_eq!(
             unit_key("firefox", "requires").as_deref(),
@@ -10035,7 +10045,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 && bootsuccess.contains("[ ! -w /run/td-jail-seccomp-probe/filter.bpf ]")
                 && bootsuccess.contains(TD_JAIL_SECCOMP_PROBE_MARKER)
                 && bootsuccess.contains(&format!(
-                    "/bin/td-busd probe /run/user/{UI_UID}/bus"
+                    "/bin/td-busd probe {SESSION_BUS_SOCKET}"
                 ))
                 && bootsuccess.contains(TD_BUSD_RUNTIME_MARKER)
                 // The GATE, and the whole leg, not merely that the command
@@ -10080,7 +10090,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 // only the probe knows which of those it was: a leg that
                 // redirected the diagnostic to /dev/null would leave one fixed
                 // sentence on ttyS0 for five different faults.
-                && bootsuccess.contains("/run/user/1000/bus: $b\"; exit 1; }")
+                && bootsuccess.contains(&format!("{SESSION_BUS_SOCKET}: $b\"; exit 1; }}"))
                 && bootsuccess.contains("[ \"$mtj\" = 1 ] || healthy=0")
                 && bootsuccess.contains("[ \"$mtk\" = 1 ] || healthy=0")
                 && bootsuccess.contains("[ \"$mts\" = 1 ] || healthy=0")

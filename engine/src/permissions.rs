@@ -68,6 +68,13 @@ pub const TD_COMPOSITOR_RUNTIME_PATH: &str = "/run/td-compositor/1000";
 /// Public display endpoint within that compositor-owned runtime.
 pub const TD_WAYLAND_SOCKET_PATH: &str = "/run/td-compositor/1000/wayland-0";
 
+/// Stock broker identity, mirrored by td-busd and pinned by the image recipe.
+pub const TD_BROKER_UID: u32 = 992;
+/// Published by firstboot; the image pins its directory composition.
+pub const TD_BUS_RUNTIME_PATH: &str = "/run/td-bus/1000";
+/// Protected host endpoint, bound at the existing private path inside jails.
+pub const TD_BUS_SOCKET_PATH: &str = "/run/td-bus/1000/bus";
+
 /// Fixed target-side audio service and the path presented to applications.
 /// td-jail includes this module directly, while the image recipe links the
 /// engine crate, so the two sides cannot drift onto different sockets.

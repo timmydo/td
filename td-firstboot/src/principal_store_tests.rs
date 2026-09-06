@@ -275,3 +275,41 @@ fn interrupted_staging_with_masked_owner_permissions_is_removed() {
     fixture.directory.enroll(&app("mail", 65536)).unwrap();
     assert!(fixture.directory.read(STAGED).unwrap().is_none());
 }
+
+#[test]
+fn broker_runtimes_repeat_without_following_links_or_accepting_other_writers() {
+    let fixture = Fixture::new();
+    let parent = &fixture.directory;
+    let owner = (parent.uid, parent.gid);
+    let first = runtime_child(parent, "bus", owner).unwrap();
+    let before = first.file.metadata().unwrap().ino();
+    drop(first);
+    assert_eq!(
+        runtime_child(parent, "bus", owner)
+            .unwrap()
+            .file
+            .metadata()
+            .unwrap()
+            .ino(),
+        before
+    );
+    fs::set_permissions(parent.path("bus"), Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        runtime_child(parent, "bus", owner)
+            .unwrap()
+            .file
+            .metadata()
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    fs::set_permissions(parent.path("bus"), Permissions::from_mode(0o777)).unwrap();
+    assert!(runtime_child(parent, "bus", owner).is_err());
+    fs::set_permissions(parent.path("bus"), Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(parent.path("bus"), parent.path("redirected")).unwrap();
+    assert!(runtime_child(parent, "redirected", owner).is_err());
+    fs::write(parent.path("file"), b"untouched").unwrap();
+    assert!(runtime_child(parent, "file", owner).is_err());
+    assert_eq!(fs::read(parent.path("file")).unwrap(), b"untouched");
+}

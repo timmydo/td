@@ -258,6 +258,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
     if config.enroll_principals {
         let desired = principals::Registry::load().map_err(Failure::Failed)?;
         principal_store::provision(&desired).map_err(Failure::Failed)?;
+        principal_store::prepare_broker_runtimes(&desired).map_err(Failure::Failed)?;
         emit(&format!("{PRINCIPALS_MARKER}\n")).map_err(Failure::Failed)?;
     }
 

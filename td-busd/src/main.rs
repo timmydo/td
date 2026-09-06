@@ -38,6 +38,7 @@ mod name;
 mod policy;
 mod recorded;
 mod registry;
+mod session;
 mod sys;
 mod transport;
 mod wire;
@@ -49,7 +50,7 @@ use std::sync::Arc;
 use std::thread;
 
 fn usage() -> String {
-    "usage: td-busd selftest | run --socket PATH | probe PATH | application PATH APP_ID".into()
+    "usage: td-busd selftest | run --socket PATH | run-session | probe PATH | application PATH APP_ID".into()
 }
 
 /// How long to wait after a failed accept before trying again, and how many
@@ -82,9 +83,20 @@ fn report_admission_refusal(quota: &transport::Quota, pid: i32, why: &str) {
 /// Bind the bus and serve it. Never returns while the listener is good: a
 /// broker that exited zero having served nothing would satisfy its supervision
 /// unit and leave every portal call hanging.
-fn run(socket: &Path) -> Result<String, String> {
-    let bound = transport::bind(socket)
-        .map_err(|error| format!("cannot listen on {}: {error}", socket.display()))?;
+fn run(socket: &Path, session: bool) -> Result<String, String> {
+    if session {
+        session::check(current_uid()?)?;
+    }
+    let bound = if session {
+        transport::bind_session(socket)
+    } else {
+        transport::bind(socket)
+    }
+    .map_err(|error| format!("cannot listen on {}: {error}", socket.display()))?;
+    serve_bound(bound, session)
+}
+
+fn serve_bound(bound: transport::Bound, session: bool) -> Result<String, String> {
     let text = transport::guid_text().map_err(|error| format!("cannot make a guid: {error}"))?;
     // Validated once HERE, so a guid this bus cannot use fails at startup
     // rather than once per peer in a thread whose failure nobody is reading.
@@ -149,6 +161,14 @@ fn run(socket: &Path) -> Result<String, String> {
                 continue;
             }
         };
+        if session && !session::admits(credential.uid) {
+            report_admission_refusal(
+                &quota,
+                credential.pid,
+                &format!("uid {} has no session bus role", credential.uid),
+            );
+            continue;
+        }
         let reservation = match quota.try_reserve(credential.pid) {
             Ok(reservation) => reservation,
             // Refusing is a CLOSE: there is nothing to say before a handshake,
@@ -255,11 +275,14 @@ fn dispatch(args: &[String]) -> Result<String, String> {
         }
         Some("selftest") => Err(format!("selftest takes no arguments\n{}", usage())),
         Some("run") => match args.get(1).map(String::as_str) {
-            Some("--socket") if args.len() == 3 => {
-                run(Path::new(args.get(2).map(String::as_str).unwrap_or("")))
-            }
+            Some("--socket") if args.len() == 3 => run(
+                Path::new(args.get(2).map(String::as_str).unwrap_or("")),
+                false,
+            ),
             _ => Err(format!("run needs --socket PATH\n{}", usage())),
         },
+        Some("run-session") if args.len() == 1 => run(Path::new(session::SOCKET), true),
+        Some("run-session") => Err(format!("run-session takes no arguments\n{}", usage())),
         Some("probe") if args.len() == 2 => {
             let path = Path::new(args.get(1).map(String::as_str).unwrap_or(""));
             transport::probe(path, current_uid()?)
@@ -305,6 +328,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("policy", include_str!("policy.rs")),
     ("recorded", include_str!("recorded.rs")),
     ("registry", include_str!("registry.rs")),
+    ("session", include_str!("session.rs")),
     ("wire", include_str!("wire.rs")),
 ];
 
@@ -339,6 +363,11 @@ mod tests {
     /// it never contacted.
     #[test]
     fn the_supervised_subcommands_need_their_arguments() {
+        assert!(
+            dispatch(&["run-session".into(), "--socket".into(), "/x".into()])
+                .unwrap_err()
+                .starts_with("run-session takes no arguments")
+        );
         for wrong in [
             vec!["run"],
             vec!["run", "/run/user/1000/bus"],
@@ -382,6 +411,45 @@ mod tests {
             thread::sleep(std::time::Duration::from_millis(50));
         }
         false
+    }
+
+    fn test_runtime_path(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("td-busd-{name}-{}-{nonce}", process::id()))
+    }
+
+    #[test]
+    fn session_bind_never_creates_a_missing_runtime() {
+        let dir = test_runtime_path("missing");
+        assert!(!dir.exists());
+        assert!(transport::bind_session(&dir.join("bus")).is_err());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn session_listener_enforces_kernel_admission_before_authentication() {
+        let dir = test_runtime_path("session");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("bus");
+        let bound = transport::bind_session(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o666
+        );
+        thread::spawn(move || {
+            let _ = serve_bound(bound, true);
+        });
+        let stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        assert_eq!(
+            handshake(&stream).is_some(),
+            session::admits(current_uid().unwrap())
+        );
+        drop(stream);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Complete the client half of EXTERNAL and return the bus's guid. `None`
@@ -443,7 +511,7 @@ mod tests {
         // `run` never returns while its listener is good, so it stays parked
         // on this thread for the life of the test binary.
         thread::spawn(move || {
-            let _ = run(&serving);
+            let _ = run(&serving, false);
         });
         let mut waited = 0;
         while !path.exists() && waited < 200 {

@@ -138,21 +138,14 @@ mod tests {
         xs.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// The form APPLICATIONS.md's units are written in.
+    /// The shared argv grammar for APPLICATIONS.md's service broker unit.
+    /// The service-only account gate is tested by `authorize_service`.
     #[test]
     fn the_designs_own_unit_line_parses() {
-        let o = parse(&argv(&[
-            "tester",
-            "--",
-            "/bin/td-busd",
-            "run",
-            "--socket",
-            "/run/user/1000/bus",
-        ]))
-        .unwrap();
-        assert_eq!(o.user, "tester");
+        let o = parse(&argv(&["tdb1000", "--", "/bin/td-busd", "run-session"])).unwrap();
+        assert_eq!(o.user, "tdb1000");
         assert_eq!(o.program, "/bin/td-busd");
-        assert_eq!(o.args, argv(&["run", "--socket", "/run/user/1000/bus"]));
+        assert_eq!(o.args, argv(&["run-session"]));
     }
 
     /// A program with NO arguments is the ordinary case, not an edge one.

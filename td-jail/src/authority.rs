@@ -476,7 +476,11 @@ where
         let (display, compositor_uid, runtime_root) = stock_session(outside_identity.0)?;
         (
             resolved_socket(display, compositor_uid, "Wayland authority")?,
-            session_socket("bus", "session bus", outside_identity.0)?,
+            resolved_socket(
+                Path::new(crate::permissions::TD_BUS_SOCKET_PATH),
+                crate::permissions::TD_BROKER_UID,
+                "session bus",
+            )?,
             runtime_root,
         )
     };
@@ -2919,7 +2923,7 @@ fn canonical_child_directory(parent: &Path, name: &str, label: &str) -> io::Resu
     Ok(canonical)
 }
 
-/// One uid-owned socket under the login user's runtime directory, resolved.
+/// One socket owned by the caller-selected service identity, resolved.
 ///
 /// Checked before and after `canonicalize`, and it is worth being exact about
 /// what each check does and does not buy, because a draft of this comment
@@ -2944,13 +2948,9 @@ fn canonical_child_directory(parent: &Path, name: &str, label: &str) -> io::Resu
 /// checks and before the `mount`. What holds the bind to its source afterwards
 /// is `require_bind_source`, which compares mount IDENTITIES out of
 /// `/proc/self/mountinfo` once the bind exists rather than pathnames before it.
-/// The residual is bounded by who can write `/run/user/<uid>`, which is 0700
-/// and owned by the login user — the principal the session belongs to.
-fn session_socket(name: &str, what: &str, uid: u32) -> io::Result<PathBuf> {
-    let path = PathBuf::from(format!("/run/user/{uid}/{name}"));
-    resolved_socket(&path, uid, what)
-}
-
+/// For stock service runtimes, those writers are root and the owning
+/// service; human processes cannot replace the entries. Host-mode sockets,
+/// including PulseAudio under XDG_RUNTIME_DIR, retain their human writer.
 fn resolved_socket(path: &Path, uid: u32, what: &str) -> io::Result<PathBuf> {
     require_session_socket(path, uid, what)?;
     // Labelled rather than propagated bare. The likeliest failure on this path

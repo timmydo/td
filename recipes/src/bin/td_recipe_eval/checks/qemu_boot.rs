@@ -113,7 +113,7 @@ const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER
 /// login user, completed the `EXTERNAL` handshake against the session bus td-svc
 /// started and read back a well-formed `OK <guid>`. The broker's own tests bind a
 /// socket inside one process; this is the only place the UNIT, the uid it runs as
-/// and the runtime directory td-seatd made are all exercised at once.
+/// and the broker-owned runtime firstboot published are exercised at once.
 const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
 /// Printed by the unprivileged live portal probe after a routed Properties.Get
 /// and Settings.ReadAll return the exact immutable session policy.
@@ -1988,7 +1988,7 @@ fn validate_system_boot(
         return Err(format!(
             "the root/userland/sshd/td-util/td-init/td-login health checks passed, but the \
              session-bus marker ({TD_BUSD_RUNTIME_MARKER:?}) was absent — no client completed \
-             the `EXTERNAL` handshake against `/run/user/1000/bus`. Read the console line \
+             the `EXTERNAL` handshake against `/run/td-bus/1000/bus`. Read the console line \
              first: it carries the PROBE's own words (`td-busd: the session bus did not \
              answer on …: …`), which is what tells a refused bind from a refused uid from a \
              bus that accepted and then said nothing. \
@@ -1998,7 +1998,8 @@ fn validate_system_boot(
              `bootsuccess requires=terminal`, `terminal requires=wayland`, \
              `wayland requires=seat`; a seat that failed would have stopped the chain and \
              this validation would have ended at the uutils marker long before here. \
-             So this is the broker: `bind` refused the path (a stale socket with a live \
+             So this is the broker: `run-session` refused a missing, redirected or wrongly \
+             owned/mode runtime directory; `bind` refused the path (a stale socket with a live \
              listener, or a non-socket sitting on it), the process crashed and `restart=` \
              could not keep it up, or the handshake refused the uid the kernel reported for \
              the probe. Note what td-svc does NOT do — a readiness probe that never succeeds \
@@ -2007,7 +2008,7 @@ fn validate_system_boot(
              restarted and never re-probed. \
              td-busd-test covers the codec, the handshake and a bind/probe loopback in the \
              build sandbox; what only this can see is that the path the unit names answers, \
-             as the login user, in the runtime directory the seat assignment made. That is a \
+             as the login user, in the UID-992 runtime firstboot published. That is a \
              PATH and not a pid: strictly it says a broker is reachable there, not that this \
              unit's process is the one answering — nothing else on this image binds it, which \
              is what makes the marker worth having and is also the assumption to re-check the \

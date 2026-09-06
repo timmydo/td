@@ -867,14 +867,14 @@ pub const TD_LOGIN_RUNTIME_MARKER: &str = "TD-LOGIN-RUN-OK";
 
 /// Printed by `/etc/bootsuccess` only after the session bus answered a real
 /// client on the real socket: `td-busd probe`, as the unprivileged login user,
-/// connects to `/run/user/1000/bus`, completes `AUTH EXTERNAL` under the uid the
+/// connects to `/run/td-bus/1000/bus`, completes `AUTH EXTERNAL` under the uid the
 /// kernel reports for it, and reads back a well-formed `OK <guid>` line.
 ///
 /// This is evidence for the DAEMON, which the broker's own tests are not: those
 /// bind a socket in a temporary directory and probe it inside one process, so
 /// they hold up the transport and say nothing about the unit. What only the image
 /// can show is that the socket the unit names is reachable, as the login user, in
-/// the `/run/user/1000` td-seatd made, by a SEPARATE process.
+/// the UID-992 `/run/td-bus/1000` firstboot published, by a SEPARATE process.
 ///
 /// Said that way deliberately. The probe checks a PATH, not a pid: it has no
 /// association with the unit's process or generation, so what it strictly proves

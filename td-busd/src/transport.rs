@@ -465,9 +465,10 @@ impl Drop for QuotaPlace {
     }
 }
 
-/// The kernel's cheap account of the peer. The listener uses it only for the
-/// provisional global/per-process reservation; the pidfd lineage answer that
-/// establishes authority is taken by the bounded worker afterwards.
+/// The kernel's cheap account of the peer. The listener uses its UID for
+/// session admission and its PID for provisional process reservations;
+/// the pidfd lineage answer that establishes authority is taken by the
+/// bounded worker afterwards.
 pub fn peer_of(stream: &UnixStream) -> io::Result<PeerCredential> {
     sys::peer_credential(stream)
 }
@@ -643,16 +644,21 @@ impl Bound {
     }
 }
 
-/// Prepare the socket. §D puts the session bus at `/run/user/1000/bus` with its
-/// parent at 0700 and the socket itself at 0600.
-///
-/// BOTH, and the second is set explicitly rather than left to `bind`: a bind
-/// creates the socket fresh and umask decides what it lands as, so under the
-/// 022 umask `td-login` preserves it lands 0755. The parent is what actually
-/// keeps another uid out, and the socket mode is defence behind it — but a
-/// design document that says 0600 and a broker that produces 0755 disagree,
-/// and that disagreement is the kind this file exists to prevent.
+/// Prepare a private host/test socket with a 0600 ceiling. Newly created
+/// parents get mode 0700; an existing parent keeps its caller-chosen mode.
+/// Explicitly setting the socket mode removes dependence on the umask.
+/// The stock profile checks its protected runtime and uses `bind_session`.
 pub fn bind(path: &Path) -> io::Result<Bound> {
+    bind_mode(path, 0o600, true)
+}
+
+/// Bind the public endpoint after the caller checks its protected runtime.
+/// This never creates a parent; peer admission is enforced by the serve loop.
+pub fn bind_session(path: &Path) -> io::Result<Bound> {
+    bind_mode(path, 0o666, false)
+}
+
+fn bind_mode(path: &Path, mode: u32, create_parent: bool) -> io::Result<Bound> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -666,15 +672,15 @@ pub fn bind(path: &Path) -> io::Result<Bound> {
     //
     // An existing parent is left exactly as it is, rather than narrowed OR
     // refused. Refusing a parent that is not already private was the first
-    // attempt and is wrong twice over: `/run/user/1000` is td-init's to make
-    // (§D's boot table sets it 0700), and any caller that creates its own
-    // directory first — the selftest below does — would be turned away from a
-    // path it owns. The socket's own 0600 is what defends it where the parent
-    // was somebody else's to make.
-    let existed = parent.exists();
-    fs::create_dir_all(parent)?;
-    if !existed {
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    // attempt and would reject a host/test caller that creates its own
+    // directory first — the selftest below does — even at a path it owns.
+    // The socket's 0600 defends it where the caller owns the parent mode.
+    if create_parent {
+        let existed = parent.exists();
+        fs::create_dir_all(parent)?;
+        if !existed {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
     }
 
     // A stale socket from a previous boot would make `bind` fail with
@@ -709,7 +715,7 @@ pub fn bind(path: &Path) -> io::Result<Bound> {
     }
 
     let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(Bound {
         listener,
         path: path.to_path_buf(),
@@ -1926,7 +1932,7 @@ impl<'a> Connection<'a> {
     ///
     /// Called by stage 0 before it unshares anything, because the pid the
     /// record needs does not exist yet. §D is explicit that this is
-    /// authenticated by uid and that in v1 every session peer is uid 1000 — so
+    /// authenticated by uid; all unprivileged app registrants use uid 1000, so
     /// the app id is a string the registrant supplies, the walk is sound about
     /// WHICH instance a connection belongs to and says nothing about whether
     /// that instance is what it calls itself, and per-app uids are the fix.
@@ -13213,7 +13219,7 @@ mod tests {
         drop(spare);
     }
 
-    /// §D asks for the socket at 0600 as well as the parent at 0700. A bind
+    /// Generic host/test sockets use 0600 and a new parent gets 0700. A bind
     /// creates the socket fresh and umask decides its mode, so under the 022
     /// umask `td-login` preserves it lands 0755 unless something says
     /// otherwise. The parent is the real boundary; this is the second lock,

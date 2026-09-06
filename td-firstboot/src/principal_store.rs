@@ -4,14 +4,69 @@ use crate::principals::{Registry, MAX_BYTES, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const PATH_ONLY: i32 = 0x200000;
 const LIMIT: u64 = MAX_BYTES as u64;
+const RUNTIME_NAME: &str = "td-bus";
 const LEDGER: &str = "principals.tsv";
 const STAGED: &str = ".principals.next";
 const LOCK: &str = ".principals.lock";
+
+/// Publish broker runtimes only after the durable identity reservation passed.
+pub(crate) fn prepare_broker_runtimes(registry: &Registry) -> Result<(), String> {
+    let run = Directory::open(Path::new("/run"), 0, 0)?;
+    let base = runtime_child(&run, RUNTIME_NAME, (0, 0))?;
+    for session in registry.sessions() {
+        runtime_child(
+            &base,
+            &session.owner.to_string(),
+            (session.broker, session.broker),
+        )?;
+    }
+    Ok(())
+}
+
+fn runtime_child(parent: &Directory, name: &str, owner: (u32, u32)) -> Result<Directory, String> {
+    let path = parent.path(name);
+    match fs::DirBuilder::new().mode(0o755).create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("create broker runtime {}: {error}", path.display())),
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("inspect broker runtime {}: {error}", path.display()))?;
+    if !metadata.is_dir() || metadata.mode() & 0o7022 != 0 {
+        return Err(format!(
+            "broker runtime {} must be an unredirected directory without other writers",
+            path.display()
+        ));
+    }
+    if (metadata.uid(), metadata.gid()) == (parent.uid, parent.gid) {
+        // The parent is root-controlled; resume a creation interrupted before
+        // chown. The service cannot replace its entry in that parent.
+        fs::set_permissions(&path, Permissions::from_mode(0o755))
+            .map_err(|error| format!("finish broker runtime mode {}: {error}", path.display()))?;
+        std::os::unix::fs::lchown(&path, Some(owner.0), Some(owner.1))
+            .map_err(|error| format!("assign broker runtime {}: {error}", path.display()))?;
+    }
+    let child = Directory::open(&path, owner.0, owner.1)?;
+    if child
+        .file
+        .metadata()
+        .map_err(|error| format!("inspect broker runtime {}: {error}", path.display()))?
+        .mode()
+        & 0o7777
+        != 0o755
+    {
+        return Err(format!(
+            "broker runtime {} must have mode 0755",
+            path.display()
+        ));
+    }
+    Ok(child)
+}
 
 struct Directory {
     file: File,
