@@ -44,7 +44,7 @@ flowchart LR
     Host[Host settings and account adapter] --> Bridge[Private VM bridge]
     Bridge --> Guest[td guest provisioning helper]
     Guest --> Agent
-    Repo[Configured Git origin] <--> Bridge
+    Agent <-->|Git over SSH| Repo[Host test account: /srv/git/td.git]
 ```
 
 The guest owns terminal rendering, scrollback, input, and application launch.
@@ -119,8 +119,9 @@ host-wide finite resources even though build locks are isolated.
 The image producer owns these requirements:
 
 - Source-built Rust, Cargo, linker/compiler tools, td control-plane tools,
-  Git, required build/test utilities, CA certificates, and declared offline
-  dependency sources. A clean checkout must build its builder and run the
+  Git, the source-built OpenSSH client and key generator, required build/test
+  utilities, CA certificates, and declared offline dependency sources.
+  A clean checkout must build its builder and run the
   repository's actual checks with no host executables entering the target.
 - A private writable build store and caches backed by the instance disk.
   Keep the deployed root immutable. Use the builder's declared store-prefix
@@ -234,16 +235,17 @@ still be necessary for a managed credential; no per-image repetition is planned.
 ## The host/guest bridge
 
 Use a dedicated virtio-serial port per VM connected to its supervisor through
-a private Unix socket. QMP is a separate host-only control socket. No SSH
-daemon, host port-forward, shared writable filesystem, or tmux is needed for
-management, credential delivery, or Git transport. Existing distro SSH tooling
-is outside this design's removal scope.
+a private Unix socket. QMP is a separate host-only control socket. The bridge
+handles provisioning, agent credentials, status, and power operations. Git uses
+ordinary outbound SSH to the host; neither an SSH daemon in the guest nor a
+host-to-guest port-forward is required. Interactive sessions use the QEMU
+window, with no shared writable filesystem or tmux.
 
 The host binds identity to the socket/QEMU pair it launched, not to an instance
 name supplied by the guest. A versioned, bounded protocol carries fixed requests
 for provisioning/status, selected settings generations, selected provider
-credentials, Git streams, and power operations. Separate streams and limits
-keep a Git transfer from blocking credential renewal or shutdown. The detailed
+credentials, Git public-key enrollment/branch reservations, and power operations.
+Git objects and pack-protocol streams never travel over this bridge. The
 protocol increment must specify framing, lengths, deadlines, backpressure,
 generation checks, and reconnect behavior before exposing a parser.
 
@@ -269,42 +271,116 @@ authentication; [td-login's threat model](../td-login/THREAT-MODEL.md) and
 ### One shared bare origin, independent working copies
 
 The host's existing bare repository is the submission point. For this repo,
-the host profile maps repository id `td` to `/srv/git/td.git`. Both VM pushes
-and the integrator's fetches reach that exact repository. There is no second
+the host profile selects `ssh://test@td-host/srv/git/td.git` as the guest's
+origin URL. `td-host` is a provisioned SSH alias for the reachable host address
+and port, not a required public DNS name. Both VM pushes and the integrator's
+fetches reach the existing `/srv/git/td.git` bare repository. There is no second
 per-VM remote that someone must export, synchronize, or discover before review.
-The mapping is configured once on the host and validated as an accessible bare
-Git repository with `main` as its default branch. Opening td-vm from a host
-checkout can discover this local origin, but must not silently create or
+The URL and its corresponding local repository are configured once on the host
+and validated as an accessible bare Git repository with `main` as its default
+branch. Opening td-vm from a host checkout can discover this local origin,
+but must not silently create or
 replace a repository when the configured origin is absent or inaccessible.
 
 | Location | Repository and purpose |
 | --- | --- |
 | Host `/srv/git/td.git` | Shared bare origin: `refs/heads/main` and submitted topic branches. No working tree. |
-| Each guest `/home/tester/src/td` | Full private clone, with `origin` addressing the host through the VM bridge. |
+| Each guest `/home/tester/src/td` | Full private clone, with `origin` addressing the host as `test` over SSH. |
 | Each guest `/home/tester/src/work/<branch>` | Private task worktree on a descriptive branch, where the agent runs. |
 | Host integrator checkout | Separate ordinary clone whose `origin` is `/srv/git/td.git`; td-review fetches and reviews its remote-tracking branches. |
 
 ```mermaid
 flowchart LR
-    A[VM A: private clone and task branch] -->|git push origin branch-a| B[Host: /srv/git/td.git]
-    C[VM B: private clone and task branch] -->|git push origin branch-b| B
+    A[VM A: private clone and task branch] -->|Git over SSH: push branch-a| B[Host: /srv/git/td.git]
+    C[VM B: private clone and task branch] -->|Git over SSH: push branch-b| B
     B -->|git fetch origin| I[Host integrator clone: td-review]
     I -->|review, land, push main| B
     B -->|git fetch origin| A
     B -->|git fetch origin| C
 ```
 
-Only Git objects and ref transactions cross the bridge. A guest does not mount
-the bare repository, host checkout, or another guest's `.git` directory. Locks,
+Only Git objects and ref transactions cross the SSH connection. A guest does
+not mount the bare repository, host checkout, or another guest's `.git` directory. Locks,
 working-tree indexes, build caches, and check-host state stay within each VM.
 The shared origin still takes Git's ordinary brief ref locks during pushes.
 
+### Host accounts and authorized keys
+
+`timmy` is the host operator running td-vm. `test` is the existing host account
+used for Git SSH connections and access to `/srv/git/td.git`. Reuse that
+account's repository ACLs; create no additional `git` account and do not
+recursively change repository ownership. Check that files written through
+SSH as `test` remain accessible to the integrator under the existing group/ACL
+and umask policy. `timmy`'s local manager permissions and a VM's SSH permission
+to act as `test` are different grants.
+Codex/Claude settings and login reuse still come from `timmy`'s selected host
+profiles. Selecting `test` for Git does not select `test`'s AI accounts.
+
+The default authorized-key location is **`~test/.ssh/authorized_keys`**
+(normally `/home/test/.ssh/authorized_keys`). It remains owned and managed
+under `test`'s authority. Keep existing human/automation key entries unchanged;
+only td-vm's registered VM entries carry the restrictions below. Do not apply
+an account-wide forced command, disable `test`'s ordinary logins, or replace
+its existing SSH configuration to implement this feature.
+
+Each VM generates its own Ed25519 Git key on first boot. Its private half
+stays in that instance's private persistent user state, mode 0600. Firstboot
+sends only its public key through the instance-bound provisioning channel.
+The host enrolls it for `test` and acknowledges enrollment before cloning.
+Templates contain no Git private keys. Do not copy `timmy`'s or `test`'s personal
+private key, or forward either user's SSH agent into guests.
+
+Automated enrollment is a narrow host operation, not permission for `timmy`
+or the guest to edit arbitrary files in `test`'s home. A local registrar runs
+as `test`, accepts requests from the configured operator UID (`timmy`) over
+an authenticated Unix socket, and manages only its own key records and branch
+reservations. The manager associates guest public-key requests with its own
+instance identity. The registrar accepts a validated public key and opaque
+instance id, constructs the restrictions itself, and journals updates to its
+records and authorized_keys while preserving unrelated entries. Publish each
+file atomically; enable a key only when both records agree, and recover an
+interrupted update without widening access. Reject
+unexpected file metadata and conflicting edits rather than overwriting them.
+Never accept caller-supplied authorized_keys options or a destination path.
+
+One-time host integration installs/enables that registrar and establishes
+`timmy`'s socket access under `test`'s authority. Existing ACLs may already
+provide the necessary repository access; they do not automatically authorize
+editing `test`'s SSH keys. This setup must complete before the profile is Ready,
+so creating later instances needs neither per-VM sudo nor hand-edited keys.
+The registrar and Git dispatcher are dependency-free host code; the registrar
+is not a network service or a general command runner.
+
+Each VM key receives OpenSSH's `restrict` option plus a fixed forced command
+naming a trusted Git dispatcher and the registrar-assigned instance identity.
+`restrict` disables PTYs, forwarding, and user rc execution; the forced command
+restricts execution itself. The dispatcher validates SSH_ORIGINAL_COMMAND as
+an allowed Git operation on this exact repository and invokes Git with fixed
+argv and a sanitized environment. It never evaluates the supplied command
+through a shell. Arbitrary commands, alternate paths, and SFTP are refused.
+The identity comes from the authorized key's forced command, not a key comment
+or client-supplied environment. See the
+[OpenSSH authorized-key contract](https://man.openbsd.org/sshd.8).
+
+Firstboot also installs the host's verified public host key in the guest's
+known_hosts and an SSH profile selecting the instance key, `IdentitiesOnly`,
+strict host-key checking, and no agent forwarding. Obtain that host key through
+the trusted host setup/provisioning path, not an unauthenticated first network
+connection. A host-key change requires updating the trusted profile. The SSH
+address must work from QEMU's configured network; a LAN address can serve other
+machines too. No inbound guest SSH listener is part of this arrangement.
+
+Deleting or revoking an instance removes its enrolled key and stops accepting
+new Git sessions. Track active sessions by registrar identity so explicit
+revocation can terminate that instance's sessions too; removing a key alone
+is not termination of an already authenticated connection. Posted Git branches
+remain in the bare origin. Stopping and later booting a VM retains its key.
+
 ### First boot creates the clone automatically
 
-The development image includes a source-built `git-remote-tdvm` helper. The
-guest URL `tdvm::td` selects that helper and the host-configured repository id;
-it is not a hostname or a path inside the guest. The helper and protocol are
-implementation requirements, not commands already supplied by the stock image.
+The development image uses ordinary Git and its source-built OpenSSH client.
+After key enrollment and host-key provisioning, the selected origin is ready
+for an ordinary SSH clone. No custom Git remote helper is required.
 
 On New, the manager selects a starting branch, normally `main`, records its
 commit id, and reserves a unique descriptive task branch. The instance name
@@ -319,7 +395,7 @@ commands illustrate the provisioner's fixed argv operations, not manual setup
 or a generated shell script:
 
 ```text
-git clone --no-checkout --origin origin tdvm::td /home/tester/src/td
+git clone --no-checkout --origin origin ssh://test@td-host/srv/git/td.git /home/tester/src/td
 git -C /home/tester/src/td fetch origin
 git -C /home/tester/src/td worktree add -b terminal-scroll-fix /home/tester/src/work/terminal-scroll-fix <selected-commit-id>
 ```
@@ -333,8 +409,8 @@ moved during provisioning. Record the resolved commit rather than checking out
 whatever `main` happens to name later. Set the mapped Git author name/email and
 open td-term at the task worktree. This completes before workspace readiness.
 
-Clone directly through the live bridge. There is no separate initial-bundle
-transport or bundle-backed `origin` to replace later. The image itself contains
+Clone directly over SSH. There is no separate initial-bundle transport or
+bundle-backed `origin` to replace later. The image itself contains
 no repository snapshot. Uncommitted host work is not cloned; show that exclusion
 when selecting a source checkout. Continuing an existing host topic requires
 its committed revision to be available in the configured origin and explicit
@@ -346,23 +422,27 @@ reuse the clone and worktree; they never reclone, reset, or silently rebase work
 
 ### Normal guest Git commands reach the host
 
-`git-remote-tdvm` implements Git's `capabilities` and `connect` interface and
-carries a full-duplex pack-protocol stream over the dedicated VM bridge. The
-host supervisor resolves `td` against its own configuration and invokes only
-`git-upload-pack` for clone/fetch or `git-receive-pack` for push, with the fixed
-bare-repository path. Git retains responsibility for object transfer,
-negotiation, connectivity checks, and ref updates. Helper protocol details are
-specified by [Git's remote-helper contract](https://git-scm.com/docs/gitremote-helpers).
-This is a local transport adapter, with no SSH login or network Git server.
+Git invokes SSH to connect as `test`; sshd authenticates the VM key and
+executes its forced Git dispatcher. The dispatcher invokes only
+`git-upload-pack` for clone/fetch or `git-receive-pack` for push against the
+configured bare repository. SSH carries the standard full-duplex Git protocol.
+Git retains responsibility for object transfer, negotiation, connectivity
+checks, and ref updates. The local VM bridge is not on this data path.
 
-The bridge cannot accept a guest-supplied repository path, executable, hook,
-environment, or Git configuration option for the host process. Its host-owned
-receive policy binds requests to the VM's reserved branches, refusing updates
-to `main`, tags, other VMs' branches, and internal retention refs. Enforce that
-at the receive transaction, not merely in the guest helper or TUI. A guest can
-read submitted topic branches for dependent work. Reserving additional task
-branches is an atomic host metadata operation that rejects ownership conflicts.
-Guest push deletion is refused; branch cleanup remains the integrator's job.
+The host-owned receive policy binds the authenticated instance identity to its
+reserved branches, refusing updates to `main`, tags, other VMs' branches, and
+internal retention refs. A trusted pre-receive check validates proposed ref
+transactions before accepting a VM push; an SSH forced command alone does not
+restrict branch updates. The dispatcher supplies that identity under host
+control, and the guest cannot substitute environment or Git configuration to
+bypass the policy. Preserve existing trusted repository hooks when integrating
+this check. See [Git receive hooks](https://git-scm.com/docs/githooks).
+
+A guest can read submitted topic branches for dependent work. Reserving
+additional task branches is an atomic registrar operation that rejects
+ownership conflicts. Guest push deletion is refused; branch cleanup remains
+the integrator's job. Ordinary host access to the origin and the integrator's
+separate credentials retain their existing authority to update main.
 
 From the task worktree, the agent follows DEVELOPMENT.md: commit with the
 required review record, run the real ready gate, then submit its branch:
@@ -405,7 +485,7 @@ review trailers the agent pushed. Its existing `r` replay and `p` publication
 flow lands the work onto `main` and pushes it back to `/srv/git/td.git`. No
 VM-specific discovery API, review inbox, namespace translation, or td-review
 change is required. The guest then fetches `origin/main` through the same
-bridge and follows the normal rebase or next-task workflow.
+SSH origin and follows the normal rebase or next-task workflow.
 
 Stopping or deleting a VM does not delete any branch already pushed to the
 host origin. Before deleting its disk, report commits and dirty files that
@@ -415,10 +495,11 @@ existing integrator workflow. Removing a landed ordinary branch releases its
 name reservation; recreating it requires a new reservation. Rolling branches
 retain their existing workflow semantics.
 
-The host-origin path is the initial supported repository mode. A future
-network-origin adapter must preserve this same review handoff and use separately
-selected Git credentials; Codex/Claude login never implies access to the host's
-entire SSH agent or keys.
+The host integrator may keep its local-path origin. Another development or
+review machine can use an SSH URL reaching the same bare repository, with its
+own enrolled key and role. An integrator using SSH needs a separately authorized
+integrator key; a VM-restricted key cannot publish main. Codex/Claude account
+credentials remain separate from these Git SSH keys.
 
 ## Working through td-term and td-compositor
 
@@ -457,12 +538,17 @@ Required evidence includes:
 
 - Two instances from one template simultaneously edit, build, and run ready
   with private Git/build/store/runtime state, then submit distinct branches.
-- Each first boot clones over `tdvm::td` and opens its selected task worktree.
-  Push through the real bridge, fetch in a separate host integrator clone, and
-  require td-review to list both branch tips with matching commit ids and review
+- Each first boot enrolls its own key for host user `test`, verifies the host
+  key, clones over SSH, and opens its selected task worktree. Push over real
+  SSH, fetch in a separate host integrator clone, and require td-review to list
+  both branch tips with matching commit ids and review
   trailers. Land one through td-review, then fetch its new main in both guests.
   Cover clone interruption, a moving source ref, stale push leases, forbidden
-  ref updates, and VM deletion preserving pushed branches.
+  ref updates, and VM deletion preserving pushed branches. Verify that the
+  `timmy` operator can enroll/revoke VM keys through the registrar while existing
+  `test` login keys and repository ACLs remain intact. Require shell, forwarding,
+  alternate-repository, forged-instance, and wrong-host-key refusals. Revoking
+  one VM must leave sibling access and the integrator's main publication working.
 - Both guest CLIs work inside td-term without installation or per-VM login;
   settings, permission intent, checkout, model, and provider identity agree.
 - Concurrent credential use crosses expiry/refresh, host CLI activity, account
