@@ -2622,15 +2622,18 @@ The landed application path implements both the closed static/empty-runtime
 subset and the reviewed Firefox/Freedesktop 25.08 dynamic pair. It provides
 `/app`, `/usr`, fresh `/proc`,
 the minimal `/dev`, a selective immutable `/etc`, tmpfs `/run`, the exact
-Wayland socket, the session bus socket of step 12 and the five persistent state
-directories, and either a read-back-up loopback interface in an otherwise-empty
+Wayland socket, the session bus socket of step 12, the fetch service's
+directory under `sockets=fetch`, the five persistent state directories, and
+either a read-back-up loopback interface in an otherwise-empty
 network namespace or the unchanged td network namespace selected by
 `shared=network`. It deliberately
 leaves `/sys`, `/var/lib`, `/var/cache`, `.flatpak-info`, extension
 mounts, and mutable permission overrides absent. It accepts exactly optional
-`shared=network`, `sockets=wayland`, the closed filesystem subset below,
-resource limits, and `[Session Bus Policy]` `own` entries, which it forwards
-to the broker at registration and does not itself act on; any other policy is
+`shared=network`, `sockets=wayland`, `sockets=pulseaudio` (§K),
+`sockets=fetch` (§W.8), `devices=tty`, the closed filesystem subset below,
+resource limits, and `[Session Bus Policy]` `own`
+entries, which it forwards to the broker at registration and does not itself
+act on; any other policy is
 refused, and the refusal names the request so an operator holding a permission
 file learns which line to change. Sharing is direct access to td's network
 stack, not mediation. A shared-network launch binds td-netd's direct regular
@@ -2788,6 +2791,7 @@ on a load-bearing bind is fatal, never degraded:
 12  /run   tmpfs, 64 MiB ceiling;  /run/user/1000 mode 0700
         wayland-0 <- bind, when sockets=wayland
         bus       <- bind, ALWAYS (the broker is the policy, not the mount)
+        td-fetch/ <- bind, when sockets=fetch (td-fetchd's directory, §W.8)
 13  /.flatpak-info  <- ro bind of a file on a jail-created tmpfs, written
         and remounted ro BEFORE pivot_root;  /run/flatpak-info -> it.
         NOT a file under the rw $HOME bind of step 14: a read-only bind
@@ -5361,7 +5365,8 @@ it, a private bind over that inode, then a `require_bind_source` at
 preparation time and a `require_mount` the confined process checks
 against its own `/proc/self/mountinfo` after `pivot_root`. The runtime
 directory's name roster becomes exactly `td-app`, `bus` and `wayland-0`,
-so a fourth entry there is a refusal rather than a surprise.
+plus `td-fetch` under `sockets=fetch` (§W.8), so any other entry there is a
+refusal rather than a surprise.
 
 Read-only costs the app nothing, and it is worth writing down exactly
 what it buys, because a draft of this paragraph named the wrong thing.
@@ -9323,9 +9328,12 @@ webpki-roots, and no decoder. So:
    not read, and only the UI user's processes, the jails among them,
    can connect.
 2. The grant is `sockets=fetch`, beside `sockets=wayland`. §C's mount
-   plan step 12 binds `td-fetch` into the jail's runtime directory when
-   it is granted, read-only like the bus; the stage-2 readback's name
-   roster admits it; no environment variable is added, the path under
+   plan step 12 binds the `td-fetch` directory into the jail's runtime
+   directory when it is granted, read-only like the bus and as a
+   directory like Pulse's runtime, so the socket a restarted service
+   makes is the one a running jail connects to; the stage-2 readback's
+   name roster admits it and requires the socket under it; no
+   environment variable is added, the path under
    `XDG_RUNTIME_DIR` being the contract. `mail` and `news` take the
    grant and lose `shared=network`, so their jails get the isolated
    namespace with loopback alone, and the resolver and CA bundle are no
@@ -9631,7 +9639,8 @@ mode buys A and D their parallelism by adding work to the bottleneck.
   of which td withholds deliberately (§M), and nothing short of proxying
   Wayland filters them. `sockets=pulseaudio` is coarse the same way: the
   protocol carries recording as well as playback, and its monitor sources
-  are capture of the desktop's own audio. So the rule is operational:
+  are capture of the desktop's own audio. `sockets=fetch` mediates the
+  transport, not the destinations (§W.8). So the rule is operational:
   **`td-jail` enumerates, per launch, the restrictions it could not
   enforce on this host, and prints them.** Host mode may degrade; it may
   not degrade silently.

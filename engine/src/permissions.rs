@@ -78,6 +78,10 @@ pub const APPLICATION_PULSE_CONFIG: &str = "autospawn = no\nenable-shm = no\n";
 pub enum PermissionSocket {
     Wayland,
     PulseAudio,
+    /// The fetch service's socket (APPLICATIONS.md §W.8): td-fetchd's
+    /// `td-fetch` under the runtime directory, bound read-only beside the
+    /// bus. It mediates the transport, not the destinations.
+    Fetch,
 }
 
 impl PermissionSocket {
@@ -85,6 +89,7 @@ impl PermissionSocket {
         match value {
             "wayland" => Ok(PermissionSocket::Wayland),
             "pulseaudio" => Ok(PermissionSocket::PulseAudio),
+            "fetch" => Ok(PermissionSocket::Fetch),
             _ => Err(format!("unknown application socket {value:?}")),
         }
     }
@@ -93,6 +98,7 @@ impl PermissionSocket {
         match self {
             PermissionSocket::Wayland => "wayland",
             PermissionSocket::PulseAudio => "pulseaudio",
+            PermissionSocket::Fetch => "fetch",
         }
     }
 }
@@ -568,7 +574,9 @@ impl PermissionPolicy {
         // refused here.
         for socket in sockets {
             match socket {
-                PermissionSocket::Wayland | PermissionSocket::PulseAudio => {}
+                PermissionSocket::Wayland
+                | PermissionSocket::PulseAudio
+                | PermissionSocket::Fetch => {}
             }
         }
         if *allow_devel {
@@ -1458,6 +1466,37 @@ mod tests {
             let got = error(text);
             assert!(got.contains(reason), "{text:?}: {got}");
         }
+    }
+
+    #[test]
+    fn fetch_is_a_socket_grant_beside_wayland() {
+        let text = "format=1\n\n[Context]\nsockets=wayland;fetch\n";
+        let parsed = PermissionPolicy::parse(text).unwrap();
+        assert_eq!(
+            parsed.sockets().collect::<Vec<_>>(),
+            [PermissionSocket::Wayland, PermissionSocket::Fetch]
+        );
+        assert!(!parsed.network());
+        assert_eq!(parsed.to_keyfile(), text);
+        assert_eq!(parsed.unhonoured_request(), None);
+        assert_eq!(
+            PermissionPolicy::new()
+                .with_socket(PermissionSocket::Fetch)
+                .unwrap()
+                .with_socket(PermissionSocket::Wayland)
+                .unwrap()
+                .to_keyfile(),
+            text
+        );
+        let alone = "format=1\n\n[Context]\nsockets=fetch\n";
+        let parsed = PermissionPolicy::parse(alone).unwrap();
+        assert_eq!(
+            parsed.sockets().collect::<Vec<_>>(),
+            [PermissionSocket::Fetch]
+        );
+        assert_eq!(parsed.to_keyfile(), alone);
+        assert!(error("format=1\n\n[Context]\nsockets=fetch;fetch\n")
+            .contains("duplicate value"));
     }
 
     #[test]

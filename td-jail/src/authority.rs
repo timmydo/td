@@ -25,6 +25,13 @@ const APPLICATION_UID: u32 = 1000;
 const APPLICATION_GID: u32 = 1000;
 pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup/td-user-1000";
 pub(crate) const RUNTIME_ROOT_NAME: &str = "td-app";
+/// td-fetchd's directory under the runtime directory (APPLICATIONS.md
+/// §W.8), bound into a jail only under `sockets=fetch`, and as a directory
+/// rather than a socket inode, Pulse's shape, so the socket a restarted
+/// service makes is the one a running jail connects to.
+pub(crate) const FETCH_RUNTIME_NAME: &str = "td-fetch";
+/// The socket td-fetchd serves under that directory.
+pub(crate) const FETCH_SOCKET_FILE: &str = "socket";
 const CONFIG: &str = "format=1\npackage-root=/td/store\nstate-root=.td/app\nregistry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\ncgroup-root=/sys/fs/cgroup/td-user-1000\n";
 const HOST_ARG: &str = "--host";
 const HOST_CGROUP_ROOT: &str = "none";
@@ -121,6 +128,17 @@ pub(crate) struct LaunchPlan {
     pub(crate) state: StatePlan,
     pub(crate) wayland_socket: PathBuf,
     pub(crate) bus_socket: PathBuf,
+    /// Present only when the authenticated permission file requests the
+    /// fetch service (`sockets=fetch`): td-fetchd's directory under the
+    /// runtime directory, bound read-only beside the bus as a directory,
+    /// as Pulse's is, rather than the socket inode, so a client reconnects
+    /// after the supervised service replaces its socket. No environment
+    /// variable derives from it; the path under `XDG_RUNTIME_DIR` is the
+    /// contract.
+    pub(crate) fetch_runtime: Option<PathBuf>,
+    /// The exact socket resolved under `fetch_runtime`, retained so stage 1
+    /// can prove a listener before it creates any namespaces.
+    pub(crate) fetch_socket: Option<PathBuf>,
     /// Present only when the authenticated permission file requests Pulse.
     /// Mounting the stable directory, rather than today's socket inode, lets
     /// a client reconnect after the supervised daemon replaces a stale socket.
@@ -433,6 +451,10 @@ where
         .permissions
         .sockets()
         .any(|socket| socket == PermissionSocket::PulseAudio);
+    let fetch_requested = spec
+        .permissions
+        .sockets()
+        .any(|socket| socket == PermissionSocket::Fetch);
     validate_environment_list(
         &environment,
         inside_identity.0,
@@ -503,6 +525,64 @@ where
         Some((runtime, socket)) => (Some(runtime), Some(socket)),
         None => (None, None),
     };
+    // Resolved as Pulse is: the directory validated and canonicalized, the
+    // socket under it, and its liveness proved in stage 1 before any
+    // namespace exists, so a jail that asked for the service never launches
+    // without it. The directory is what the jail binds; the socket is what
+    // stage 1 proves. Last of the session sockets, so it is compared with
+    // all three. Host mode resolves it under the validated runtime root,
+    // which is the same join.
+    let fetch = if fetch_requested {
+        let what = if config.host_mode {
+            "host td-fetch authority"
+        } else {
+            "td-fetch authority"
+        };
+        let runtime = runtime_root.join(FETCH_RUNTIME_NAME);
+        require_owned_directory(&runtime, outside_identity, true).map_err(|error| {
+            invalid(format!("{what} runtime {}: {error}", runtime.display()))
+        })?;
+        let runtime = fs::canonicalize(&runtime).map_err(|error| {
+            invalid(format!("{what} runtime {}: {error}", runtime.display()))
+        })?;
+        require_owned_directory(&runtime, outside_identity, true).map_err(|error| {
+            invalid(format!("{what} runtime {}: {error}", runtime.display()))
+        })?;
+        let socket = resolved_socket(
+            &runtime.join(FETCH_SOCKET_FILE),
+            outside_identity.0,
+            what,
+        )?;
+        // Mode 0600 is the whole of the service's authentication (§W.8),
+        // checked here as Pulse's mode is, and required again by the
+        // readback.
+        require_exact_mode(&socket, 0o600, what)?;
+        if socket.parent() != Some(runtime.as_path()) {
+            return Err(invalid(format!(
+                "{what} socket does not belong to its validated runtime directory"
+            )));
+        }
+        if socket == wayland_socket
+            || socket == bus_socket
+            || pulse_socket.as_deref() == Some(socket.as_path())
+        {
+            return Err(invalid(format!(
+                "{what} resolves to another session authority socket"
+            )));
+        }
+        if pulse_runtime.as_deref() == Some(runtime.as_path()) {
+            return Err(invalid(format!(
+                "{what} runtime is another session authority's runtime"
+            )));
+        }
+        Some((runtime, socket))
+    } else {
+        None
+    };
+    let (fetch_runtime, fetch_socket) = match fetch {
+        Some((runtime, socket)) => (Some(runtime), Some(socket)),
+        None => (None, None),
+    };
     // Unconditional, like the mount it feeds: APPLICATIONS.md §C's mount plan,
     // step 12, binds the bus ALWAYS, because the BROKER is the policy. A jail
     // that omitted it when a manifest asked for no bus would put that decision
@@ -529,6 +609,7 @@ where
         &runtime_files,
         &wayland_socket,
         &bus_socket,
+        &runtime_root.join(FETCH_RUNTIME_NAME),
     )?;
     let resources = ResolvedResourceLimits::from_policy(spec.permissions.resources())?;
     let isolate_network = !spec.permissions.network();
@@ -579,6 +660,8 @@ where
         state,
         wayland_socket,
         bus_socket,
+        fetch_runtime,
+        fetch_socket,
         pulse_runtime,
         pulse_socket,
         filesystems,
@@ -1166,6 +1249,7 @@ fn resolve_filesystem_grants(
     runtime_files: &Path,
     wayland_socket: &Path,
     bus_socket: &Path,
+    fetch_runtime: &Path,
 ) -> io::Result<Vec<FilesystemGrant>> {
     resolve_filesystem_grants_with_boundary(
         permissions,
@@ -1178,6 +1262,7 @@ fn resolve_filesystem_grants(
                 runtime_files,
                 wayland_socket,
                 bus_socket,
+                fetch_runtime,
             )
         },
     )
@@ -1613,6 +1698,7 @@ impl GrantBoundary {
         runtime_files: &Path,
         wayland_socket: &Path,
         bus_socket: &Path,
+        fetch_runtime: &Path,
     ) -> io::Result<Self> {
         let mut reserved = vec![
             state.state_root.clone(),
@@ -1622,6 +1708,16 @@ impl GrantBoundary {
             runtime_files.to_path_buf(),
             wayland_socket.to_path_buf(),
             bus_socket.to_path_buf(),
+            // Reserved whether or not the grant is present, as the sockets
+            // are: no `[Filesystem]` line aliases the service's directory.
+            // Labelled, since this runs for every launch and a dangling
+            // link at the path would otherwise refuse them all bare.
+            canonical_candidate(fetch_runtime).map_err(|error| {
+                invalid(format!(
+                    "fetch service directory {}: {error}",
+                    fetch_runtime.display()
+                ))
+            })?,
         ];
         let mut home_roots = Vec::new();
         for path in RESERVED_FILESYSTEM_TREES {
@@ -1682,6 +1778,9 @@ impl GrantBoundary {
             runtime_files.to_path_buf(),
             wayland_socket.to_path_buf(),
             bus_socket.to_path_buf(),
+            // The fetch service's directory beside the sockets, as `new`
+            // reserves it.
+            canonical_candidate(&wayland_socket.with_file_name(FETCH_RUNTIME_NAME))?,
         ];
         Ok(Self {
             reserved_mounts: mount_identities_for_roots(mountinfo, &reserved)?,

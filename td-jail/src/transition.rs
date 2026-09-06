@@ -44,6 +44,7 @@ const STAGE2_FIREFOX_AUTOTEST_POLICY_ARG: &str =
     "--firefox-autotest-policy";
 const STAGE2_FIREFOX_SECCOMP_PROBE_ARG: &str =
     "--firefox-seccomp-probe";
+const STAGE2_FETCH_SOCKET_ARG: &str = "--fetch-socket";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
 const STAGE2_TERMINAL_ARG: &str = "--terminal";
 const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
@@ -157,6 +158,7 @@ const SURVIVOR_TERM_TIMEOUT: Duration = Duration::from_secs(2);
 const SURVIVOR_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const SURVIVOR_PROBE_LIFETIME: Duration = Duration::from_secs(30);
 const PULSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STAGE2_OUTPUT_LIMIT: usize = 4096;
 const FIREFOX_SECCOMP_AUDIT_LIMIT: u64 = 32 * 1024 * 1024;
 const WRITE_PROBE_PREFIX: &str = ".td-jail-write-probe-";
@@ -367,6 +369,10 @@ pub struct Stage2Launch {
     timezone: Option<String>,
     firefox_autotest_policy: bool,
     firefox_seccomp_probe: bool,
+    /// The fetch service's directory is bound under the runtime directory
+    /// (`sockets=fetch`), and the readback requires it there, its socket
+    /// under it.
+    fetch_socket: bool,
     runtime_aliases: bool,
     /// Stage 1 acquired the session's controlling terminal and passed it as
     /// this process's stdout; the entry gets it as all three stdio.
@@ -423,6 +429,7 @@ struct Stage2MountBinding<'a> {
     timezone: Option<&'a str>,
     firefox_autotest_policy: bool,
     firefox_seccomp_probe: bool,
+    fetch_socket: bool,
     loader_library_path: Option<&'a str>,
     terminal: bool,
 }
@@ -730,6 +737,14 @@ where
                 Some("absent") => false,
                 _ => return Err(usage_error()),
             };
+        if args.next().as_deref() != Some(STAGE2_FETCH_SOCKET_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let fetch_socket = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("present") => true,
+            Some("absent") => false,
+            _ => return Err(usage_error()),
+        };
         if args.next().as_deref() != Some(STAGE2_LOADER_LIBRARY_PATH_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -856,6 +871,7 @@ where
             timezone,
             firefox_autotest_policy,
             firefox_seccomp_probe,
+            fetch_socket,
             runtime_aliases: loader_library_path.is_some(),
             terminal,
             environment,
@@ -956,6 +972,12 @@ fn stage2_launch_arguments(
         }),
         OsString::from(STAGE2_FIREFOX_SECCOMP_PROBE_ARG),
         OsString::from(if mounts.firefox_seccomp_probe {
+            "present"
+        } else {
+            "absent"
+        }),
+        OsString::from(STAGE2_FETCH_SOCKET_ARG),
+        OsString::from(if mounts.fetch_socket {
             "present"
         } else {
             "absent"
@@ -2160,6 +2182,17 @@ fn prepare_mount_plan(
         let listener = UnixListener::bind(&bus)
             .map_err(|e| io::Error::other(format!("create session bus bind target: {e}")))?;
         drop(listener);
+        // The fetch service's directory, not its socket inode, for Pulse's
+        // reason: the supervised service replaces its socket on a restart,
+        // and a jail bound to the directory connects to the new one.
+        let fetch = match &application.fetch_runtime {
+            Some(source) => {
+                let target = format!("{runtime}/{}", crate::authority::FETCH_RUNTIME_NAME);
+                create_dir(&target, 0o700)?;
+                Some((source.clone(), target))
+            }
+            None => None,
+        };
         let pulse = pulse_mount_plan(application.pulse_runtime.as_deref());
         if let Some(pulse) = &pulse {
             create_dir(&format!("{run}/flatpak"), 0o755)?;
@@ -2225,6 +2258,11 @@ fn prepare_mount_plan(
         // (`is_local_mountpoint` -> `EBUSY`) and the app has no `CAP_SYS_ADMIN`
         // to unmount it.
         mount_private_bind(&application.bus_socket, &bus, true)?;
+        // Read-only for the bus's reason: the grant is connect(2), not chmod
+        // of the host's socket inode.
+        if let Some((source, target)) = &fetch {
+            mount_private_bind(source, target, true)?;
+        }
         if let Some(pulse) = &pulse {
             mount_private_bind(pulse.source, &pulse.runtime_target, true)?;
         }
@@ -2265,6 +2303,9 @@ fn prepare_mount_plan(
             (application.wayland_socket.clone(), wayland),
             (application.bus_socket.clone(), bus),
         ];
+        if let Some((source, target)) = fetch {
+            mounted.push((source, target));
+        }
         if let Some(probe) = &application.firefox_seccomp_probe {
             mounted.push((
                 probe.path.clone(),
@@ -3263,6 +3304,7 @@ struct Stage2MountExpectation<'a> {
     pulse: bool,
     pulse_socket_mode: Option<u32>,
     firefox_seccomp_probe: bool,
+    fetch_socket: bool,
     terminal: bool,
 }
 
@@ -3278,6 +3320,7 @@ fn require_mount_plan(
         pulse,
         pulse_socket_mode,
         firefox_seccomp_probe,
+        fetch_socket,
         terminal,
     } = expected;
     let application = filesystems.is_some();
@@ -3394,10 +3437,11 @@ fn require_mount_plan(
         let runtime = format!("/run/user/{}", identity.uid);
         require_mode(&runtime, 0o700)?;
         require_names("/run/user", &[&identity.uid.to_string()])?;
-        require_names(
-            &runtime,
-            &[crate::authority::RUNTIME_ROOT_NAME, "bus", "wayland-0"],
-        )?;
+        let mut runtime_names = vec![crate::authority::RUNTIME_ROOT_NAME, "bus", "wayland-0"];
+        if fetch_socket {
+            runtime_names.push(crate::authority::FETCH_RUNTIME_NAME);
+        }
+        require_names(&runtime, &runtime_names)?;
         for path in ["/app", "/usr"] {
             require_mount(
                 &mountinfo,
@@ -3473,6 +3517,22 @@ fn require_mount_plan(
             &["ro", "nosuid", "nodev", "noexec"],
             &["rw"],
         )?;
+        if fetch_socket {
+            let fetch = format!("{runtime}/{}", crate::authority::FETCH_RUNTIME_NAME);
+            require_mount(
+                &mountinfo,
+                &fetch,
+                None,
+                &["ro", "nosuid", "nodev", "noexec"],
+                &["rw"],
+            )?;
+            require_mode(&fetch, 0o700)?;
+            let socket = format!("{fetch}/{}", crate::authority::FETCH_SOCKET_FILE);
+            if !fs::metadata(&socket)?.file_type().is_socket() {
+                return Err(io::Error::other("fetch service endpoint is not a socket"));
+            }
+            require_mode(&socket, 0o600)?;
+        }
         if pulse {
             require_names("/run/flatpak", &["pulse"])?;
             require_names("/run/flatpak/pulse", &["config", "native", "server"])?;
@@ -5070,6 +5130,7 @@ pub fn run_stage2(
         runtime_aliases,
         pulse,
         firefox_seccomp_probe,
+        fetch_socket,
     ) = match &action {
         Stage2Action::Probe | Stage2Action::KillHold { .. } => (
             None,
@@ -5080,6 +5141,7 @@ pub fn run_stage2(
                 machine_id: None,
                 terminal: None,
             },
+            false,
             false,
             false,
             false,
@@ -5107,6 +5169,7 @@ pub fn run_stage2(
                 .iter()
                 .any(|(key, _)| key == "PULSE_SERVER"),
             launch.firefox_seccomp_probe,
+            launch.fetch_socket,
         ),
     };
     require_mount_plan(
@@ -5117,6 +5180,7 @@ pub fn run_stage2(
             pulse,
             pulse_socket_mode: pulse_socket_mode(pulse, host_mode),
             firefox_seccomp_probe,
+            fetch_socket,
             terminal,
         },
         &mount_probe_token,
@@ -5155,6 +5219,7 @@ pub fn run_stage2(
                 timezone: _,
                 firefox_autotest_policy: _,
                 firefox_seccomp_probe,
+                fetch_socket: _,
                 runtime_aliases: _,
                 terminal,
                 environment,
@@ -5756,6 +5821,14 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
         };
         crate::bus::require_accepting_endpoint(socket, PULSE_CONNECT_TIMEOUT, what)?;
     }
+    if let Some(socket) = &application.fetch_socket {
+        let what = if application.host_mode {
+            "host td-fetch authority"
+        } else {
+            "td-fetch authority"
+        };
+        crate::bus::require_accepting_endpoint(socket, FETCH_CONNECT_TIMEOUT, what)?;
+    }
     let inside_identity = Identity {
         uid: application.inside_uid,
         gid: application.inside_gid,
@@ -5873,6 +5946,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 firefox_seccomp_probe: application
                     .firefox_seccomp_probe
                     .is_some(),
+                fetch_socket: application.fetch_socket.is_some(),
                 loader_library_path: application.loader_library_path.as_deref(),
                 terminal: application.terminal,
             },
@@ -6476,6 +6550,8 @@ mod tests {
                 "present",
                 STAGE2_FIREFOX_SECCOMP_PROBE_ARG,
                 "present",
+                STAGE2_FETCH_SOCKET_ARG,
+                "absent",
                 STAGE2_LOADER_LIBRARY_PATH_ARG,
                 "absent",
                 STAGE2_TERMINAL_ARG,
@@ -6519,6 +6595,7 @@ mod tests {
                 timezone: Some("Europe/Berlin".into()),
                 firefox_autotest_policy: true,
                 firefox_seccomp_probe: true,
+                fetch_socket: false,
                 runtime_aliases: false,
                 terminal: false,
                 environment: [
@@ -6688,6 +6765,7 @@ mod tests {
                 timezone: Some("Europe/Berlin"),
                 firefox_autotest_policy: true,
                 firefox_seccomp_probe: true,
+                fetch_socket: false,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
                 terminal: false,
             },
@@ -6727,6 +6805,65 @@ mod tests {
         mismatched[loader_index + 1] = OsString::from("absent");
         mismatched.remove(loader_index + 2);
         assert!(parse_mode(mismatched.into_iter()).is_err());
+        // The fetch grant travels right before the loader path, as one of
+        // exactly two words; `present` is a launch with the grant, and
+        // nothing but the two words is accepted.
+        let fetch_index = emitted
+            .iter()
+            .position(|argument| argument == STAGE2_FETCH_SOCKET_ARG)
+            .unwrap();
+        assert_eq!(fetch_index + 2, loader_index);
+        assert_eq!(emitted[fetch_index + 1], "absent");
+        let mut fetched = emitted.clone();
+        fetched[fetch_index + 1] = OsString::from("present");
+        assert!(matches!(
+            parse_mode(fetched.into_iter()).unwrap(),
+            Mode::Stage2 {
+                action: Stage2Action::Launch(launch),
+                ..
+            } if launch.fetch_socket
+        ));
+        let mut bogus = emitted.clone();
+        bogus[fetch_index + 1] = OsString::from("maybe");
+        assert!(parse_mode(bogus.into_iter()).is_err());
+        let mut unstated = emitted.clone();
+        unstated.remove(fetch_index);
+        unstated.remove(fetch_index);
+        assert!(parse_mode(unstated.into_iter()).is_err());
+        let fetched_emission = stage2_launch_arguments(
+            &token,
+            LaunchIdentityMap {
+                inside: identity,
+                outside: outside_identity,
+            },
+            "/app/bin/app",
+            &environment,
+            Stage2MountBinding {
+                filesystems: &filesystems,
+                resolv_conf: false,
+                machine_id,
+                timezone: Some("Europe/Berlin"),
+                firefox_autotest_policy: true,
+                firefox_seccomp_probe: true,
+                fetch_socket: true,
+                loader_library_path: Some("/app/lib:/app/lib/firefox"),
+                terminal: false,
+            },
+            Stage2ResourceBinding {
+                limits: resources,
+                membership,
+            },
+            &arguments,
+        );
+        assert_eq!(fetched_emission[fetch_index], STAGE2_FETCH_SOCKET_ARG);
+        assert_eq!(fetched_emission[fetch_index + 1], "present");
+        assert!(matches!(
+            parse_mode(fetched_emission.into_iter()).unwrap(),
+            Mode::Stage2 {
+                action: Stage2Action::Launch(launch),
+                ..
+            } if launch.fetch_socket
+        ));
         // The terminal grant travels right after the loader path, as one
         // of exactly two words; a launch without it says so rather than
         // omitting the flag, and stage 2 refuses anything else.
@@ -6791,6 +6928,7 @@ mod tests {
                 timezone: Some("Europe/Berlin"),
                 firefox_autotest_policy: true,
                 firefox_seccomp_probe: false,
+                fetch_socket: false,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
                 terminal: true,
             },
@@ -6815,6 +6953,7 @@ mod tests {
                     timezone: Some("Europe/Berlin".into()),
                     firefox_autotest_policy: true,
                     firefox_seccomp_probe: true,
+                    fetch_socket: false,
                     runtime_aliases: true,
                     terminal: false,
                     environment,
