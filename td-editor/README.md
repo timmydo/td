@@ -22,8 +22,8 @@ scalar edits and selection, tabs, bounded undo/redo with saved-state tracking,
 literal search/replace, paragraph filling and Auto Fill. Logical Windows and
 Emacs keys share those commands. The controller also handles visual navigation
 and pointer selection. Dialogs, clipboard, spelling and actual file I/O produce
-an explicit adapter request. A read-only Wayland preview is available; no
-interactive window input, GPU renderer, filesystem
+an explicit adapter request. The Wayland scratch preview accepts keyboard
+editing with both profiles; no pointer input, GPU renderer, filesystem
 Open/Save, remote socket or tmc integration is claimed yet. Do not set
 `$EDITOR` to this binary yet.
 
@@ -91,12 +91,19 @@ Try the actual window from a terminal in your Linux x86-64 Wayland session:
 
 ```text
 td-editor/target/release/td-editor --window-preview
+td-editor/target/release/td-editor --window-preview --keys=emacs
 ```
 
-It shows a fixed read-only document and follows window-manager resizing.
-Keyboard, pointer, menus and file editing are not connected yet. Close it
-through your window manager or press Ctrl+C in the launching terminal.
-This tests presentation, not a usable `$EDITOR`. No td compositor, GPU node,
+It starts with two editable scratch tabs and follows window-manager resizing.
+Type, navigate, select with Shift, undo, and switch tabs with Ctrl+Tab.
+Windows-like bindings are the default; the second command selects Emacs.
+Open, Save, pointer input, menus, clipboard and spelling are not connected.
+Unavailable commands show a notice; Escape/Ctrl+G dismisses it. Closing a
+dirty tab refuses; undo to clean or close the window to discard all scratch
+text. Dirty window close asks for Ctrl+D to discard everything, or
+Escape/Ctrl+G to cancel. Killing the process still loses text: do not keep
+anything important in this preview. It is not a usable `$EDITOR`.
+No td compositor, GPU node,
 libwayland, toolkit or installed font is needed. The normal WAYLAND_DISPLAY,
 XDG_RUNTIME_DIR and inherited WAYLAND_SOCKET conventions are supported.
 The latter is borrowed and duplicated; give this process exclusive use of it.
@@ -121,9 +128,14 @@ eligibility. Tests cover the td map, all 26 types of a compiled ordinary US
 map across 256 real-modifier combinations, and 106 US keys across the 32
 supported states using independent libxkbcommon results. Fixture provenance
 and oracle procedures are in [tests/fixtures/README.md](tests/fixtures/README.md).
-This is a library compiler and translator, not connected window input.
-Keymap descriptor handling, focus/held-key state and repeat scheduling remain
-pending. The read-only preview and `$EDITOR` warning above still apply.
+The window now consumes keymap descriptors and calls this compiler before
+accepting input. `seat.rs` supplies explicit-clock held-key and repeat policy.
+Focus loss, modifier changes, map replacement and capability withdrawal cancel
+repeat. Enter's already-held keys never synthesize presses. Protocol tests
+send real descriptors and key events through both profiles, then check model
+bytes and submitted pixels. This is not yet a live Weston input/pixel proof;
+the optional Weston test above proves presentation only. The `$EDITOR`
+warning still applies.
 
 Editor-only changes are routed by `td-builder ready` to this crate's tests
 and Clippy alongside the workspace Rust suite, whose tests validate every

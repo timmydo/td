@@ -14,6 +14,7 @@ pub mod layout;
 pub mod model;
 pub mod render;
 pub mod replay;
+mod seat;
 mod sys;
 pub mod text;
 pub mod ui;

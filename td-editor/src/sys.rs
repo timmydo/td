@@ -104,21 +104,9 @@ fn header(iov: &mut IoVec, control: &mut Control, length: usize) -> MsgHdr {
     }
 }
 
-/// No admitted preview event carries a descriptor. Still receive ancillary
-/// data so unexpected installed descriptors are closed before refusal.
-pub(super) fn receive(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<usize> {
-    let (count, fds, ancillary) = receive_packet(stream, bytes)?;
-    drop(fds);
-    if ancillary {
-        return Err(io::Error::other("unexpected Wayland ancillary data"));
-    }
-    Ok(count)
-}
-
-fn receive_packet(
-    stream: &UnixStream,
-    bytes: &mut [u8],
-) -> io::Result<(usize, Vec<OwnedFd>, bool)> {
+/// Adopt every delivered right before any policy refusal. The connection
+/// owns the returned descriptors until the sole keymap consumer takes them.
+pub(super) fn receive(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
     if bytes.is_empty() {
         return Err(io::Error::other("empty Wayland receive buffer"));
     }
@@ -135,28 +123,34 @@ fn receive_packet(
         MSG_CMSG_CLOEXEC,
     ))?;
     let used = message.control_len.min(CONTROL);
-    let fds = harvest(control.0.get(..used).unwrap_or(&[]));
+    let (fds, valid) = harvest(control.0.get(..used).unwrap_or(&[]));
     if message.flags & MSG_CTRUNC != 0 {
         return Err(io::Error::other("truncated Wayland ancillary data"));
     }
-    Ok((count, fds, used != 0))
+    if !valid || message.control_len > CONTROL {
+        return Err(io::Error::other("invalid Wayland ancillary data"));
+    }
+    Ok((count, fds))
 }
 
-fn harvest(bytes: &[u8]) -> Vec<OwnedFd> {
+fn harvest(bytes: &[u8]) -> (Vec<OwnedFd>, bool) {
     let mut fds = Vec::new();
     let mut at = 0usize;
+    let mut valid = true;
     while let Some(head) = bytes.get(at..at.saturating_add(HEADER)) {
         let Some(length) = head
             .get(..8)
             .and_then(|v| v.try_into().ok())
             .map(usize::from_ne_bytes)
         else {
+            valid = false;
             break;
         };
         let Some(end) = at
             .checked_add(length)
             .filter(|end| length >= HEADER && *end <= bytes.len())
         else {
+            valid = false;
             break;
         };
         let word = |offset| {
@@ -166,22 +160,28 @@ fn harvest(bytes: &[u8]) -> Vec<OwnedFd> {
         };
         if word(8) == Some(SOL_SOCKET) && word(12) == Some(SCM_RIGHTS) {
             if let Some(payload) = bytes.get(at + HEADER..end) {
+                valid &= !payload.is_empty() && payload.len() % 4 == 0;
                 for raw in payload.as_chunks::<4>().0 {
                     let fd = i32::from_ne_bytes(*raw);
                     if fd >= 0 {
                         fds.push(adopt(fd));
+                    } else {
+                        valid = false;
                     }
                 }
             }
+        } else {
+            valid = false;
         }
         // Continue after unknown ancillary kinds: later rights are installed
         // too. Structural corruption cannot establish another boundary.
         let Some(next) = end.checked_add(7).map(|n| n & !7) else {
+            valid = false;
             break;
         };
         at = next;
     }
-    fds
+    (fds, valid && (at >= bytes.len() || bytes.is_empty()))
 }
 
 #[cfg(test)]
@@ -189,8 +189,7 @@ pub(super) fn receive_for_test(
     stream: &UnixStream,
     bytes: &mut [u8],
 ) -> io::Result<(usize, Vec<OwnedFd>)> {
-    let (count, fds, _) = receive_packet(stream, bytes)?;
-    Ok((count, fds))
+    receive(stream, bytes)
 }
 
 /// Send exactly one borrowed pool file. A short write's suffix carries no fd.
@@ -263,15 +262,15 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_received_descriptor_is_closed_before_error() {
+    fn received_descriptor_is_owned_and_closed_on_drop() {
         let (a, b) = UnixStream::pair().unwrap();
         let (mut peer, file) = endpoint_file();
         assert_eq!(send_pool(&a, b"bytes", &file).unwrap(), 5);
         drop(file);
-        assert!(receive(&b, &mut [0; 32])
-            .unwrap_err()
-            .to_string()
-            .contains("ancillary"));
+        let (count, fds) = receive(&b, &mut [0; 32]).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(fds.len(), 1);
+        drop(fds);
         assert_eq!(peer.read(&mut [0]).unwrap(), 0, "received endpoint leaked");
     }
 
@@ -288,7 +287,8 @@ mod tests {
         bytes[36..40].copy_from_slice(&(-1i32).to_ne_bytes());
         bytes[40..44].copy_from_slice(&file_b.into_raw_fd().to_ne_bytes());
         bytes[48..56].copy_from_slice(&usize::MAX.to_ne_bytes()); // structural stop
-        let fds = harvest(&bytes);
+        let (fds, valid) = harvest(&bytes);
+        assert!(!valid);
         assert_eq!(fds.len(), 2);
         drop(fds);
         assert_eq!(a.read(&mut [0]).unwrap(), 0);
@@ -350,10 +350,10 @@ mod tests {
         let (mut a, b) = UnixStream::pair().unwrap();
         a.write_all(b"abc").unwrap();
         let mut bytes = [0; 3];
-        assert_eq!(receive(&b, &mut bytes).unwrap(), 3);
+        assert_eq!(receive(&b, &mut bytes).unwrap().0, 3);
         assert_eq!(&bytes, b"abc");
         drop(a);
-        assert_eq!(receive(&b, &mut bytes).unwrap(), 0);
+        assert_eq!(receive(&b, &mut bytes).unwrap().0, 0);
         assert!(send_pool(&b, b"x", &File::open("/dev/null").unwrap()).is_err());
         assert!(receive(&b, &mut []).is_err());
     }

@@ -2034,7 +2034,7 @@ literal and constants declared under the
 option, a second scoped allowance, or any descriptor adoption is an
 amendment here and in `APPLICATIONS.md` §K in the same landing.
 
-## 14. `td-editor` — the read-only Wayland preview
+## 14. `td-editor` — the Wayland scratch editor
 
 The editor's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
 function-scoped instruction: `recvmsg` (47), `sendmsg` (46), and `fcntl` (72).
@@ -2060,13 +2060,28 @@ ancillary bytes. The bounded walk adopts every recognizable nonnegative
 `SOL_SOCKET` (1) / `SCM_RIGHTS` (1) descriptor before checking truncation or
 policy, continuing past unknown records and invalid descriptor entries while
 record boundaries remain trustworthy. A broken boundary stops the walk;
-Linux supplies conforming framing and closes rights that do not fit. Both
-truncation and every nonempty ancillary result are refused after ownership
-has been established, so drops close all delivered descriptors. This preview
-does not bind a seat and has no descriptor-bearing incoming event or retained
-descriptor queue. A test-only reader retains the same owned results to inspect
-the pool sent by the real transport. Adding keyboard/clipboard fd consumers
-requires an amendment, not a relaxation of this refusal.
+Linux supplies conforming framing and closes rights that do not fit.
+Truncation, unknown control kinds, invalid entries and broken framing are
+refused after ownership has been established, so drops close all delivered
+descriptors. Valid rights move into the window connection's FIFO, bounded to
+eight pending descriptors independently of its byte queue. Queue overflow,
+parse failure, disconnect and window teardown drop all remaining owners.
+
+The sole production consumer is `wayland::read_keymap`: one descriptor per
+`wl_keyboard.keymap`, including unsupported formats and events queued on a
+retired keyboard. Retired events drop their descriptor without reading it.
+Active text-v1 maps convert the owner to `File` with safe `From`, require a
+regular file covering the advertised 1..=1 MiB extent, and read exactly that
+extent with `FileExt::read_exact_at` at offset zero. This does not move the
+compositor's shared offset. The payload must be UTF-8 with one trailing NUL;
+the complete bounded compiler must accept it before text input is activated.
+No mapping or procfs reopen is used; a concurrent truncation returns an I/O
+error, not SIGBUS. Reads of an admitted regular file are synchronous; no
+hard latency claim is made for a stalled filesystem. A failed replacement
+map disables input and cancels repeat, but leaves scratch text accessible
+if a subsequent map succeeds. A missing descriptor waits at most five seconds
+without assuming ancillary boundaries coincide with wire-message boundaries.
+A test-only reader uses the same ownership path to inspect sent SHM pools.
 
 The only production send caller is the connection's pool-request path.
 `sendmsg` carries exactly one borrowed `File` in a 24-byte ancillary extent,
@@ -2086,7 +2101,7 @@ duplication, refusal cleanup and truncated rights; a byte-level synthetic
 control test checks cleanup beyond unrecognized records and invalid entries.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child exec,
-raw environment-fd adoption or received-fd consumer is authorized here. A
+raw environment-fd adoption or other received-fd consumer is authorized here. A
 fourth syscall, another fcntl command, another caller, incoming descriptor
 consumer, or additional allowance amends this section and
 `td-editor/DESIGN.md` in the same landing.

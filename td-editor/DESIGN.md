@@ -14,7 +14,7 @@ UTF-8/file-format conversion, scalar edits and selection, bounded tabs and
 undo/redo, save-snapshot state tracking, literal search/replace, paragraph
 filling, Auto Fill, and logical Windows/Emacs key dispatch. The core opens no
 files and reads no environment or clocks. File baselines/metadata, actual
-save I/O, interactive Wayland input, GPU rendering, spelling and the
+save I/O, pointer input, GPU rendering, spelling and the
 control socket are not implemented yet. Key bindings for those adapters
 produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -25,9 +25,11 @@ The safe reference renderer streams bitmap scene operations into a
 caller-owned XRGB8888 buffer. `--preview` emits a fixed headless PPM fixture;
 it is not an interactive window. Menus and status are drawn; tab clicks select
 tabs and close marks emit typed requests, but visible menus/dialogs and the
-interactive adapters remain future work. `--window-preview` now presents a
-read-only fixture through the real Wayland transport and SHM buffer lifecycle.
-It does not accept keyboard or pointer input and cannot open user documents.
+remaining adapters remain future work. `--window-preview` now presents
+editable scratch tabs through the real Wayland transport and SHM lifecycle.
+It accepts keyboard input in both profiles, but cannot save or open user
+documents. Dirty window close requires explicit discard; process termination
+still loses scratch text. It is not yet suitable for important text.
 
 The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
@@ -168,7 +170,7 @@ input event as well as on timer wakes. Events occur at the last supplied tick;
 the controller does not infer time between them. Backward ticks are refused.
 The caret is visible for 500 ms, hidden for 500 ms, and hidden when unfocused;
 accepted keys and selection/edit actions restart its visible interval. Repeat
-scheduling still belongs to the future keyboard adapter, not this blink clock.
+scheduling belongs to the seat adapter, not this blink clock.
 Every successful command conservatively advances a checked window generation;
 ignored input and ticks that do not change caret visibility do not. Rejected
 events do not advance it. Generations describe local state only: no committed
@@ -322,7 +324,7 @@ Version 1 resource ceilings are part of the API:
 | Dictionary | 16 MiB input, 250,000 distinct entries, 64 ASCII letters/apostrophes per entry; reject an oversized or malformed load. |
 | Spelling results | 10,000 stored ranges; finish scanning, count additional unknown words, and report that only the first 10,000 are marked. |
 | Frames | 8,192 pixels per axis, 32 MiB per XRGB buffer, three live buffers; defer redraw/resize until a buffer can be retired. |
-| Wayland input | 4 MiB keymap, 256 KiB buffered wire bytes, eight pending descriptors; exceeding a bound closes the display connection with an error. |
+| Wayland input | 1 MiB keymap, 128 KiB buffered wire bytes, eight pending descriptors; byte/descriptor overflow closes the display connection, an over-limit map disables input. |
 | Control | One active connection, 16 queued commands, 1 MiB request/response frame, 256 KiB raw text per response page, five-second whole-request deadline. |
 
 Undo stores edit deltas and cursor/selection before and after the transaction.
@@ -656,29 +658,53 @@ updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
 
-### Implemented presentation-only adapter
+### Implemented scratch-window adapter
 
-`--window-preview` is an explicit read-only milestone, not the usable-editor
-milestone below. It opens one 800x600 scale-1 xdg toplevel, renders two clean
-fixture tabs through `ui::Controller` and the reference renderer, and follows
-configure changes. The title and fixture identify the mode; menus, tabs and
-close marks are drawing only. No seat is bound, so there is no keymap or input
-translation claim. Close is handled by the compositor's window-management
-action; terminal Ctrl+C also ends the process. Neither path can lose user text.
-The binary still refuses filenames and ordinary `$EDITOR` invocation.
+`--window-preview` is an explicit scratch milestone, not the usable-editor
+milestone below. It opens one 800x600 scale-1 xdg toplevel and two initially
+clean fixture tabs through `ui::Controller` and the reference renderer.
+`--window-preview --keys=windows|emacs` selects the profile (Windows default).
+The title and fixture say NO SAVE. Typing, selection, visual motion, undo,
+tab switching and core commands are connected. Pointer input and menus are
+not connected; unavailable commands produce a visible, bounded notice,
+retained until Escape/C-g or another explicit notice-producing action.
+Notices wrap over the document's top six rows and clip on small surfaces;
+they do not mutate document text. The binary refuses filenames and ordinary
+`$EDITOR` invocation.
+
+Closing a clean tab removes it, and closing the last clean tab exits. Dirty
+tab close refuses with a notice; there is no tab-discard operation in this
+increment. Window-manager close or Emacs Quit exits only if every tab is
+clean. Otherwise it cancels repeat and displays a modal, window-wide discard
+question. Only a fresh Ctrl+D press discards all and exits; Escape/C-g cancels
+and other keys cannot edit. The question explicitly states that Save is
+unavailable, rather than offering a nonfunctional Save button. When keyboard
+input is unavailable the question instead says confirmation is unavailable,
+text is retained, and terminating the process loses it. A pending focus or
+modifier snapshot gets a readiness instruction, not an unconditional claim
+that Ctrl+D works. No repeated window-manager close silently discards text.
+Protocol pings
+and resize continue during the question. Process termination, transport
+failure and keyboard failure are not recovery mechanisms: scratch text is
+memory-only and may be lost. Users must not keep important text here.
 
 The adapter shares `td-compositor/src/wire.rs` without copying it. That sixth
 shared input must be staged beside the five font/license inputs when the
 future source recipe is added. Only this adapter reads the environment or
 uses files and clocks; the core's explicit-input contract is unchanged.
 
-It binds only compositor v4, SHM v1 and xdg shell v1, requiring those minimum
-versions and capping higher advertisements. Unknown globals are ignored,
+It binds compositor v4, SHM v1 and xdg shell v1, requiring those minimum
+versions and capping higher advertisements. At startup it also binds the
+lowest-global-ID seat offering v5 or newer, capped to v7, and requests its
+keyboard only after the capability event. A missing/old seat leaves a
+presentation-only window with a notice; this scratch-mode exception does not
+weaken the version-1 required-seat contract below. Other globals are ignored,
 subject to 128 live registry entries and 256 bytes per interface name.
 Client IDs are dense in a 128-slot table and are reused only after delete_id;
 object exhaustion produces a diagnostic. A 16 KiB read buffer feeds a 128 KiB
 pending-byte budget and at most 256 messages are processed before checking
-redraw/close again. Invalid events and required-global removal disconnect
+redraw/close again. Invalid events and removal of the bound compositor, SHM
+or xdg-shell global disconnect
 with a diagnostic. The first buffer must be submitted within 20 seconds of
 the initial registry requests; connect separately has a five-second deadline.
 After submission a hidden surface may wait indefinitely for a frame callback;
@@ -689,6 +715,9 @@ capped by the remaining startup deadline until the first commit. Temporary
 backpressure retries within that deadline. Reads also use the remaining
 startup budget. The idle reader uses a 100 ms socket timeout or elapsed-time
 backoff for an inherited nonblocking socket, without changing shared flags.
+An armed repeat shortens that wait to its next due time. Caret ticks use
+monotonic milliseconds since the loop starts, immediately before each event
+and on timer wakes; server timestamps are never compared to this clock.
 
 The controller receives complete acknowledged configure sizes: zero axes
 retain the previous configured axis even while a frame is outstanding.
@@ -716,15 +745,59 @@ until its owner or process exit closes it. The caller must give the adapter
 exclusive use of the stream because socket timeouts are shared. Otherwise an
 absolute WAYLAND_DISPLAY works without XDG_RUNTIME_DIR, and a relative display
 (default `wayland-0`) is joined to an absolute XDG_RUNTIME_DIR. Invalid explicit
-socket values fail without trying another display. Every incoming descriptor
-is closed and refused: this mode binds no descriptor-bearing event. Keyboard
-and clipboard ownership must extend the roster before enabling those consumers.
+socket values fail without trying another display. Incoming descriptors are
+immediately owned and queued in a bounded FIFO, independent of byte-message
+boundaries. Only `wl_keyboard.keymap` consumes one. An event waiting for its
+descriptor has a five-second deadline and retains wire order. Waiting cancels
+repeat and uses the ordinary idle wait, capped to that deadline. Overflow,
+malformed control data, protocol failure and disconnect close all retained
+owners. Retired keyboard events are schema-validated and their keymap rights
+dropped until delete_id, never applied to the replacement keyboard.
+
+Keymap format must be text-v1; the file must be regular and cover the declared
+1..=1 MiB extent. Positioned reads copy exactly that extent without advancing
+the compositor's shared file offset. The wire payload requires a trailing
+NUL (the standalone compiler's optional-NUL API is unchanged), valid UTF-8
+and successful whole-map compilation. There is no mmap, host include lookup,
+or fallback physical US translation. Regular-file reads and compilation are
+synchronous and bounded in bytes/work, not a hard filesystem-latency promise.
+A refused initial or replacement map disables input and cancels prefixes and
+repeat, retaining all text. A valid later map restores keyboard access after
+the authoritative modifier snapshot. The notice reports waiting until that
+snapshot arrives (a focus transition or pressing/releasing a modifier can
+provide it); compilation alone is not announced as ready input.
+Event-local translation refusals show a
+notice and ignore that event without invalidating the map.
+
+`seat::Input` retains at most 768 held key numbers. Enter installs held keys
+without typing or arming repeat; presses wait for enter's modifier snapshot.
+Duplicate presses and unmatched releases are ignored. Focus loss clears held
+state, modifiers, prefixes and repeat. Modifier changes and any new press
+cancel the old repeat; a release cancels only its matching repeat. Map changes
+cancel repeat and require a new modifier snapshot. Only a repeatable stroke
+accepted as a controller change arms repeat; requests, prefixes, ignored or
+rejected strokes do not. Negative rate/delay is malformed; zero disables
+repeat. Rates above 1000 Hz clamp, intervals round upward to milliseconds,
+and a new positive rate/delay retimes the current repeat from the current
+tick. At most one repetition is dispatched per loop turn; missed repetitions
+are dropped, never burst after a stall. Buffered release/focus events run
+before timer repeats. Timer arithmetic is checked; exhaustion disarms repeat.
+
+Keyboard capability loss releases the keyboard, clears input, and retains
+text. Reacquisition creates a fresh object, waiting for delete_id before ID
+reuse. Bound-seat removal also releases the seat and leaves a notice, without
+disconnecting or silently moving to another seat. Dynamic new-seat selection
+and multi-seat editing are deferred. Clipboard remains an unapproved incoming
+descriptor consumer under this crate's raw-boundary contract.
 
 Automated socket tests inspect the actual received pool descriptor and pixels,
 exercise fragmented events, ping/close, version/ID limits, both release/callback
 orders and resize storms. The opt-in Weston test waits for a callback from the
 real compositor after the real reference buffer commit. It proves presentation,
-not keyboard, compositor screenshots, GPU rendering or td-jail integration.
+not live keyboard delivery, compositor screenshots, GPU rendering or td-jail
+integration. Socket tests separately exercise real keymap transfers, both
+profiles' edits/undo and changed raster pixels, map replacement and rejection,
+held/focus/modifier/repeat state, and dirty-window discard/cancel.
 
 ### Version-1 compatibility target
 
@@ -874,11 +947,10 @@ function-key system-action levels are ignored. Other out-of-profile symbols
 are diagnosed on use, never substituted with physical US text.
 
 `TypeCatalog::parse` alone remains insufficient for keyboard activation.
-The existing window remains read-only and does not bind a seat. Confinement
-tests pin the absence of compiler callers outside its six modules and of
-seat/keyboard bindings. Next add the audited keymap-descriptor consumer,
-focus/repeat scheduling and editable-window close safeguards, replacing these
-temporary guards together. Repeat metadata is not a timer or held-key state.
+The scratch-window adapter calls the whole compiler at its sole descriptor
+consumer. Confinement tests pin that consumer, the raw boundary, and the
+compiler/seat access roster. `seat::Input` owns repeat scheduling separately;
+the compiler's repeat metadata alone is not a timer or held-key state.
 
 `tests/fixtures/us.xkb` is a complete libxkbcommon-compiled evdev/pc105/US map
 with upstream license/provenance, not a captured Weston keymap. All 26 type

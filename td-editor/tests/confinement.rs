@@ -27,6 +27,7 @@ fn source_inventory_and_allowances_are_closed() {
         "model.rs",
         "render.rs",
         "replay.rs",
+        "seat.rs",
         "sys.rs",
         "text.rs",
         "ui.rs",
@@ -58,6 +59,8 @@ fn source_inventory_and_allowances_are_closed() {
                 | "xkb_keys.rs"
                 | "xkb_symbols.rs"
                 | "xkb_compat.rs"
+                | "seat.rs"
+                | "wayland.rs"
         ) {
             for module in [
                 "keyboard",
@@ -69,20 +72,14 @@ fn source_inventory_and_allowances_are_closed() {
             ] {
                 assert_eq!(
                     identifier_count(&text, module),
-                    usize::from(name == "lib.rs" || (name == "wayland.rs" && module == "keyboard")),
-                    "compiler must not activate input before the seat adapter: {name}"
+                    usize::from(name == "lib.rs"),
+                    "compiler access outside input adapter: {name}"
                 );
-                if name == "wayland.rs" && module == "keyboard" {
-                    // The fixed preview document mentions keyboard input once.
-                    assert!(text.contains(
-                        "Read-only fixture: keyboard and pointer input are not connected."
-                    ));
-                }
             }
             for interface in ["wl_seat", "wl_keyboard"] {
                 assert!(
                     !text.contains(interface),
-                    "input binding before full validation: {name}"
+                    "input binding outside the adapter: {name}"
                 );
             }
         }
@@ -172,7 +169,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x99a7658ec563e32c,
+        hash, 0x9c3db6af4d495727,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -189,6 +186,10 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert_eq!(raw.matches("core::arch::asm!").count(), 1);
     assert_eq!(raw.matches("OwnedFd::from_raw_fd").count(), 1);
     let adapter = include_str!("../src/wayland.rs");
+    assert_eq!(adapter.matches("Keymap::parse(source)").count(), 1);
+    assert_eq!(adapter.matches("File::from(fd)").count(), 1);
+    assert_eq!(adapter.matches("read_keymap(fd, format, size)").count(), 1);
+    assert!(adapter.contains("file.read_exact_at(&mut bytes, 0)"));
     assert_eq!(adapter.matches("crate::sys::").count(), 4);
     for call in [
         "crate::sys::inherited(fd)",

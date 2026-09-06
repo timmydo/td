@@ -1,13 +1,17 @@
-//! Read-only presentation milestone; no seat, document paths or edit input.
+//! Scratch editing milestone; no document paths or persistence.
 
 use crate::font::Font;
-use crate::render::{Geometry, Label, Raster};
+use crate::keyboard::{Keymap, Modifiers};
+use crate::keys::Profile;
+use crate::render::{Draw, Geometry, GlyphStyle, Label, Primitive, Raster, Rect, CHROME, INK};
+use crate::seat::Input;
 use crate::ui::{Controller, Event, Outcome};
 use crate::wire::{self, Builder, Cursor, Message};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -99,6 +103,8 @@ struct Connection {
     pending: Vec<u8>,
     read: [u8; READ_BYTES],
     startup_deadline: Option<Instant>,
+    descriptors: VecDeque<OwnedFd>,
+    wait: Duration,
 }
 
 impl Connection {
@@ -111,6 +117,8 @@ impl Connection {
             pending: Vec::with_capacity(PENDING_BYTES),
             read: [0; READ_BYTES],
             startup_deadline: None,
+            descriptors: VecDeque::with_capacity(8),
+            wait: Duration::from_millis(100),
         })
     }
 
@@ -167,15 +175,18 @@ impl Connection {
     }
 
     fn read_more(&mut self) -> Result<()> {
-        let wait = self.budget(Duration::from_millis(100))?;
+        let wait = self.budget(self.wait)?;
         self.stream.set_read_timeout(Some(wait)).map_err(error)?;
         let start = Instant::now();
         match crate::sys::receive(&self.stream, &mut self.read) {
-            Ok(0) => Err("Wayland compositor disconnected".into()),
-            Ok(count) => {
-                if self.pending.len().saturating_add(count) > PENDING_BYTES {
+            Ok((0, _)) => Err("Wayland compositor disconnected".into()),
+            Ok((count, fds)) => {
+                if self.pending.len().saturating_add(count) > PENDING_BYTES
+                    || self.descriptors.len().saturating_add(fds.len()) > 8
+                {
                     return Err("Wayland receive budget".into());
                 }
+                self.descriptors.extend(fds);
                 self.pending
                     .extend_from_slice(self.read.get(..count).ok_or("Wayland receive length")?);
                 Ok(())
@@ -219,6 +230,10 @@ enum Kind {
     Frame,
     Retired,
     RetiredBuffer,
+    Seat,
+    Keyboard,
+    RetiredKeyboard,
+    RetiredSeat,
 }
 
 struct Buffer {
@@ -247,12 +262,18 @@ struct Window {
     bound: bool,
     closed: bool,
     temporary: PathBuf,
+    seat: Option<u32>,
+    device: Option<u32>,
+    input: Input,
+    clock: u64,
+    notice: Option<String>,
+    quitting: bool,
 }
 
 impl Window {
     fn new(stream: UnixStream, temporary: PathBuf) -> Result<Self> {
         let mut ui = Controller::default();
-        let first = match ui.dispatch(Event::Load(b"td-editor Wayland preview\n\nThis window tests bitmap presentation and resizing.\n\nRead-only fixture: keyboard and pointer input are not connected.\nOpen, Save, menus, clipboard and spelling are still being built.\n\nUnicode scalars: caf\xc3\xa9, na\xc3\xafve, \xce\xbb.\n\tTabs advance to eight-column stops.\n\nClose using your window manager, or Ctrl+C in the launching terminal.\nDo not set $EDITOR to this preview.\n")).map_err(error)? {
+        let first = match ui.dispatch(Event::Load(b"td-editor scratch preview -- NO SAVE\n\nYou can type, select, undo and switch tabs with the keyboard.\nCtrl+Tab switches tabs. Emacs: M-q fills a paragraph.\n\nOpen, Save, mouse input, menus, clipboard and spelling are not connected.\nUse --keys=emacs or --keys=windows at startup.\n\nUnicode scalars: caf\xc3\xa9, na\xc3\xafve, \xce\xbb.\n\tTabs advance to eight-column stops.\n\nClosing dirty text asks for explicit discard. Do not use as $EDITOR.\nProcess termination still loses scratch text; keep nothing important here.\n")).map_err(error)? {
             Outcome::Created(tab) => tab, _ => return Err("preview fixture creation".into()),
         };
         let second = match ui
@@ -276,7 +297,7 @@ impl Window {
             objects,
             ui,
             font: crate::font::pinned()?,
-            labels: vec![(first, "Read-only preview"), (second, "Second tab")],
+            labels: vec![(first, "Scratch (no save)"), (second, "Second tab")],
             buffers: Vec::with_capacity(3),
             pixels: Vec::new(),
             configured: false,
@@ -288,6 +309,12 @@ impl Window {
             bound: false,
             closed: false,
             temporary,
+            seat: None,
+            device: None,
+            input: Input::default(),
+            clock: 0,
+            notice: None,
+            quitting: false,
         })
     }
 
@@ -338,10 +365,25 @@ impl Window {
         self.bind("wl_compositor", 4, COMPOSITOR)?;
         self.bind("wl_shm", 1, SHM)?;
         self.bind("xdg_wm_base", 1, WM)?;
+        if let Some(version) = self
+            .globals
+            .values()
+            .find(|(name, version)| name == "wl_seat" && *version >= 5)
+            .map(|(_, version)| (*version).min(7))
+        {
+            let seat = self.allocate(Kind::Seat)?;
+            self.bind("wl_seat", version, seat)?;
+            self.seat = Some(seat);
+        } else {
+            self.notify("No wl_seat v5+; scratch input unavailable");
+        }
         self.connection.words(COMPOSITOR, 0, &[SURFACE])?;
         self.connection.words(WM, 2, &[XDG_SURFACE, SURFACE])?;
         self.connection.words(XDG_SURFACE, 1, &[TOPLEVEL])?;
-        for (opcode, value) in [(2, "td-editor — read-only preview"), (3, "td-editor")] {
+        for (opcode, value) in [
+            (2, "td-editor — scratch preview (NO SAVE)"),
+            (3, "td-editor"),
+        ] {
             let mut body = Builder::new();
             body.string(value)?;
             self.connection.send(TOPLEVEL, opcode, body, None)?;
@@ -364,7 +406,10 @@ impl Window {
             }
             (DISPLAY, 1) => {
                 let id = cursor.u32()?;
-                if !matches!(self.kind(id)?, Kind::Retired | Kind::RetiredBuffer) {
+                if !matches!(
+                    self.kind(id)?,
+                    Kind::Retired | Kind::RetiredBuffer | Kind::RetiredKeyboard | Kind::RetiredSeat
+                ) {
                     return Err("unexpected delete_id".into());
                 }
                 self.set_kind(id, Kind::Free)?;
@@ -386,10 +431,28 @@ impl Window {
             }
             (REGISTRY, 1) => {
                 let id = cursor.u32()?;
+                cursor.finish()?;
+                if self
+                    .globals
+                    .get(&id)
+                    .is_some_and(|(name, _)| name == "wl_seat")
+                    && self.required.contains(&id)
+                {
+                    self.release_keyboard()?;
+                    if let Some(seat) = self.seat.take() {
+                        self.connection.words(seat, 3, &[])?;
+                        self.set_kind(seat, Kind::RetiredSeat)?;
+                    }
+                    self.required.retain(|global| *global != id);
+                    self.globals.remove(&id);
+                    self.notify("Seat removed; scratch text retained");
+                    return Ok(());
+                }
                 if self.required.contains(&id) {
                     return Err("required Wayland global was removed".into());
                 }
                 self.globals.remove(&id);
+                return Ok(());
             }
             (SYNC, 0) if !self.bound => {
                 cursor.u32()?;
@@ -416,7 +479,11 @@ impl Window {
                 }
                 self.pending_size = Some((width, height));
             }
-            (TOPLEVEL, 1) if self.bound => self.closed = true,
+            (TOPLEVEL, 1) if self.bound => {
+                cursor.finish()?;
+                self.close();
+                return Ok(());
+            }
             (XDG_SURFACE, 0) if self.bound => {
                 let serial = cursor.u32()?;
                 if let Some((width, height)) = self.pending_size.take() {
@@ -444,6 +511,35 @@ impl Window {
             (SURFACE, 0 | 1) if self.bound => {
                 cursor.u32()?;
             }
+            (id, opcode) if self.seat == Some(id) || self.kind(id)? == Kind::RetiredSeat => {
+                match opcode {
+                    0 => {
+                        let capabilities = cursor.u32()?;
+                        cursor.finish()?;
+                        if self.seat != Some(id) {
+                            return Ok(());
+                        }
+                        if capabilities & 2 == 0 {
+                            self.release_keyboard()?;
+                            self.notify("Seat has no keyboard; scratch text retained");
+                        } else if self.device.is_none() {
+                            let device = self.allocate(Kind::Keyboard)?;
+                            self.connection.words(id, 1, &[device])?;
+                            self.device = Some(device);
+                        }
+                        return Ok(());
+                    }
+                    1 => {
+                        if cursor.string()?.len() > 256 {
+                            return Err("seat name budget".into());
+                        }
+                    }
+                    _ => return Err("unknown seat event".into()),
+                }
+            }
+            (id, _) if matches!(self.kind(id)?, Kind::Keyboard | Kind::RetiredKeyboard) => {
+                return self.keyboard_event(message);
+            }
             (id, 0) if self.kind(id)? == Kind::Frame && self.callback == Some(id) => {
                 cursor.u32()?;
                 self.callback = None;
@@ -470,6 +566,206 @@ impl Window {
             }
         }
         cursor.finish()
+    }
+
+    fn notify(&mut self, detail: impl AsRef<str>) {
+        self.notice = Some(
+            detail
+                .as_ref()
+                .chars()
+                .take(512)
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        );
+        self.dirty = true;
+    }
+
+    fn close(&mut self) {
+        self.input.cancel_repeat();
+        if self.ui.editor().tabs().any(|(_, doc)| doc.dirty()) {
+            self.quitting = true;
+            self.dirty = true;
+        } else {
+            self.closed = true;
+        }
+    }
+
+    fn release_keyboard(&mut self) -> Result<()> {
+        if let Some(device) = self.device.take() {
+            self.connection.words(device, 0, &[])?;
+            self.set_kind(device, Kind::RetiredKeyboard)?;
+        }
+        self.input = Input::default();
+        self.ui.dispatch(Event::Focus(false)).map_err(error)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn keyboard_event(&mut self, message: Message) -> Result<()> {
+        let event = keyboard_event(&message)?;
+        let active = self.device == Some(message.object);
+        // Retired objects can have events in flight, including rights. Drain
+        // their exact schema until delete_id without activating a new map.
+        if let KeyboardEvent::Map(format, size) = event {
+            let fd = self
+                .connection
+                .descriptors
+                .pop_front()
+                .ok_or("missing keymap descriptor")?;
+            if !active {
+                return Ok(());
+            }
+            self.input.map = None;
+            self.input.cancel_repeat();
+            self.input.synchronized = false;
+            self.ui.dispatch(Event::Focus(false)).map_err(error)?;
+            match read_keymap(fd, format, size) {
+                Ok(map) => {
+                    self.input.map = Some(map);
+                    self.ui
+                        .dispatch(Event::Focus(self.input.focused))
+                        .map_err(error)?;
+                    self.notify(
+                        "Keymap compiled; waiting for focus/modifier snapshot. Tap and release Shift if needed.",
+                    );
+                }
+                Err(detail) => self.notify(format!("Keyboard disabled: {detail}")),
+            }
+            self.dirty = true;
+            return Ok(());
+        }
+        if !active {
+            return Ok(());
+        }
+        match event {
+            KeyboardEvent::Map(_, _) => {}
+            KeyboardEvent::Enter(surface, keys) => {
+                if surface != SURFACE {
+                    return Err("keyboard enter for unknown surface".into());
+                }
+                self.input.focus(&keys, true)?;
+                self.ui
+                    .dispatch(Event::Focus(self.input.map.is_some()))
+                    .map_err(error)?;
+                self.dirty = true;
+            }
+            KeyboardEvent::Leave(surface) => {
+                if surface != SURFACE {
+                    return Err("keyboard leave for unknown surface".into());
+                }
+                self.input.focus(&[], false)?;
+                self.ui.dispatch(Event::Focus(false)).map_err(error)?;
+                self.dirty = true;
+            }
+            KeyboardEvent::Modifiers(modifiers) => {
+                let ready =
+                    !self.input.synchronized && self.input.focused && self.input.map.is_some();
+                self.input.modifiers(modifiers);
+                if ready {
+                    self.notify(
+                        "Keymap ready; Escape dismisses this notice. Scratch only: no Save.",
+                    );
+                }
+            }
+            KeyboardEvent::Timing(rate, delay) => self.input.timing(rate, delay, self.clock)?,
+            KeyboardEvent::Key(key, pressed) => match self.input.key(key, pressed) {
+                Ok(Some(stroke)) => {
+                    if self.chord(&stroke.chord, false)? && stroke.repeat {
+                        self.input.arm(key, self.clock);
+                    }
+                }
+                Ok(None) => {}
+                Err(detail) => self.notify(detail),
+            },
+        }
+        Ok(())
+    }
+
+    fn chord(&mut self, chord: &str, repeated: bool) -> Result<bool> {
+        if self.quitting {
+            if !repeated {
+                match chord {
+                    "C-d" => self.closed = true,
+                    "Escape" | "C-g" => {
+                        self.quitting = false;
+                        self.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(false);
+        }
+        if matches!(chord, "Escape" | "C-g") && self.notice.take().is_some() {
+            self.dirty = true;
+        }
+        let Some(tab) = self.ui.editor().active() else {
+            return Ok(false);
+        };
+        let revision = self.ui.editor().document(tab).map_err(error)?.revision();
+        let before = self.ui.generation();
+        let result = self.ui.dispatch(Event::Key {
+            tab,
+            revision,
+            chord,
+        });
+        self.dirty |= self.ui.generation() != before;
+        match result {
+            Ok(Outcome::Changed) => Ok(true),
+            Ok(Outcome::Request { name: "quit", .. }) => {
+                self.close();
+                Ok(false)
+            }
+            Ok(Outcome::Request {
+                name: "close-tab",
+                tab,
+                revision,
+            }) => {
+                match self.ui.dispatch(Event::Close { tab, revision }) {
+                    Ok(_) => {
+                        self.labels.retain(|(id, _)| *id != tab);
+                        if self.ui.editor().active().is_none() { self.closed = true; }
+                        self.dirty = true;
+                    }
+                    Err(crate::Error::Dirty) => self.notify("Tab has unsaved scratch text. Undo to clean, or close the window to discard all."),
+                    Err(detail) => self.notify(detail.to_string()),
+                }
+                Ok(false)
+            }
+            Ok(Outcome::Request { name, .. }) => {
+                self.notify(format!(
+                    "{name} is not connected in this scratch preview. Escape dismisses."
+                ));
+                Ok(false)
+            }
+            Ok(_) => Ok(false),
+            Err(detail) => {
+                self.notify(format!("Key refused: {detail}"));
+                Ok(false)
+            }
+        }
+    }
+
+    fn tick(&mut self, now: u64, repeat: bool) -> Result<()> {
+        let before = self.ui.generation();
+        self.ui.dispatch(Event::Tick(now)).map_err(error)?;
+        self.clock = now;
+        self.dirty |= self.ui.generation() != before;
+        if repeat {
+            match self.input.repeat(now) {
+                Ok(Some(stroke)) => {
+                    if !self.chord(&stroke.chord, true)? {
+                        self.input.cancel_repeat();
+                    }
+                }
+                Ok(None) => {}
+                Err(detail) => {
+                    self.input.cancel_repeat();
+                    self.notify(detail);
+                }
+            }
+        }
+        self.connection.wait = Duration::from_millis(self.input.wait_ms(now));
+        Ok(())
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -505,10 +801,20 @@ impl Window {
             .iter()
             .map(|(tab, title)| Label { tab: *tab, title })
             .collect();
-        Raster::new(&mut self.pixels, &self.font, geometry, width * 4)
-            .map_err(error)?
+        let close_notice = self.close_notice();
+        let mut raster =
+            Raster::new(&mut self.pixels, &self.font, geometry, width * 4).map_err(error)?;
+        raster
             .paint(&self.ui.scene(&labels).map_err(error)?, geometry.bounds())
             .map_err(error)?;
+        let notice = if self.quitting {
+            Some(close_notice)
+        } else {
+            self.notice.as_deref()
+        };
+        if let Some(notice) = notice {
+            paint_notice(&mut raster, geometry, notice);
+        }
         let buffer = self.buffers.get(index).ok_or("buffer slot")?;
         buffer.file.write_all_at(&self.pixels, 0).map_err(error)?;
         let id = buffer.id;
@@ -564,6 +870,9 @@ impl Window {
     }
 
     fn run(&mut self) -> Result<()> {
+        let started = Instant::now();
+        let now = || u64::try_from(started.elapsed().as_millis()).map_err(error);
+        let mut waiting: Option<(Message, Instant)> = None;
         self.connection.startup_deadline = Some(Instant::now() + INITIAL_DEADLINE);
         self.connection.words(DISPLAY, 1, &[REGISTRY])?;
         self.connection.words(DISPLAY, 0, &[SYNC])?;
@@ -571,21 +880,190 @@ impl Window {
             self.connection.budget(WRITE_DEADLINE)?;
             let mut processed = 0;
             while processed < 256 {
-                let Some(message) = wire::take(&mut self.connection.pending)? else {
+                let next = match waiting.take() {
+                    Some((message, deadline)) => {
+                        if Instant::now() >= deadline {
+                            return Err("keymap descriptor deadline".into());
+                        }
+                        Some((message, deadline))
+                    }
+                    None => wire::take(&mut self.connection.pending)?
+                        .map(|m| (m, Instant::now() + WRITE_DEADLINE)),
+                };
+                let Some((message, deadline)) = next else {
                     break;
                 };
+                if message.opcode == 0
+                    && matches!(
+                        self.kind(message.object)?,
+                        Kind::Keyboard | Kind::RetiredKeyboard
+                    )
+                    && self.connection.descriptors.is_empty()
+                {
+                    if Instant::now() >= deadline {
+                        return Err("keymap descriptor deadline".into());
+                    }
+                    self.input.cancel_repeat();
+                    waiting = Some((message, deadline));
+                    break;
+                }
+                self.tick(now()?, false)?;
                 self.event(message)?;
                 processed += 1;
                 if self.closed {
                     break;
                 }
             }
+            // Process queued releases/focus changes before a repeat can fire.
+            self.tick(now()?, processed < 256 && waiting.is_none())?;
             self.draw()?;
             if !self.closed && processed < 256 {
+                if let Some((_, deadline)) = &waiting {
+                    self.connection.wait = self.connection.wait.min(
+                        deadline
+                            .checked_duration_since(Instant::now())
+                            .filter(|d| !d.is_zero())
+                            .ok_or("keymap descriptor deadline")?,
+                    );
+                }
                 self.connection.read_more()?;
             }
         }
         Ok(())
+    }
+}
+
+impl Window {
+    fn close_notice(&self) -> &'static str {
+        if self.device.is_none() || self.input.map.is_none() {
+            "Cannot confirm discard: keyboard unavailable.\nScratch text is retained in memory.\nRestore keyboard/map to cancel or discard.\nTerminating this process loses ALL scratch text."
+        } else if !self.input.focused || !self.input.synchronized {
+            "Discard pending; input not ready.\nFocus the editor; tap and release Shift.\nThen Ctrl+D: Discard ALL; Escape/Ctrl+G: Cancel.\nSave is unavailable in this scratch preview."
+        } else {
+            "Discard ALL unsaved scratch text?\nSave is unavailable in this preview.\nCtrl+D: Discard and quit\nEscape / Ctrl+G: Cancel"
+        }
+    }
+}
+
+enum KeyboardEvent {
+    Map(u32, u32),
+    Enter(u32, Vec<u32>),
+    Leave(u32),
+    Key(u32, bool),
+    Modifiers(Modifiers),
+    Timing(i32, i32),
+}
+
+fn keyboard_event(message: &Message) -> Result<KeyboardEvent> {
+    let mut cursor = Cursor::new(&message.payload);
+    let event = match message.opcode {
+        0 => KeyboardEvent::Map(cursor.u32()?, cursor.u32()?),
+        1 => {
+            cursor.u32()?;
+            let surface = cursor.u32()?;
+            let bytes = cursor.u32()?;
+            if bytes % 4 != 0 || bytes > 768 * 4 {
+                return Err("keyboard enter array budget".into());
+            }
+            let mut keys = Vec::with_capacity(bytes as usize / 4);
+            for _ in 0..bytes / 4 {
+                keys.push(cursor.u32()?);
+            }
+            KeyboardEvent::Enter(surface, keys)
+        }
+        2 => {
+            cursor.u32()?;
+            KeyboardEvent::Leave(cursor.u32()?)
+        }
+        3 => {
+            cursor.u32()?;
+            cursor.u32()?; // Server timestamps have an unrelated, wrapping epoch.
+            let key = cursor.u32()?;
+            let state = cursor.u32()?;
+            if state > 1 {
+                return Err("invalid keyboard state for v5-v7".into());
+            }
+            KeyboardEvent::Key(key, state == 1)
+        }
+        4 => {
+            cursor.u32()?;
+            KeyboardEvent::Modifiers(Modifiers {
+                depressed: cursor.u32()?,
+                latched: cursor.u32()?,
+                locked: cursor.u32()?,
+                group: cursor.u32()?,
+            })
+        }
+        5 => KeyboardEvent::Timing(cursor.i32()?, cursor.i32()?),
+        _ => return Err("unknown keyboard event".into()),
+    };
+    cursor.finish()?;
+    Ok(event)
+}
+
+fn read_keymap(fd: OwnedFd, format: u32, size: u32) -> Result<Keymap> {
+    if format != 1 {
+        return Err(format!("unsupported keymap format {format}"));
+    }
+    if size == 0 || size > 1024 * 1024 {
+        return Err("keymap byte budget".into());
+    }
+    let file = File::from(fd);
+    let metadata = file.metadata().map_err(error)?;
+    if !metadata.is_file() || metadata.len() < u64::from(size) {
+        return Err("keymap must be a regular file covering its advertised size".into());
+    }
+    let mut bytes = vec![0; size as usize];
+    // Positioned reads do not move the compositor's shared file offset, and
+    // truncation is an I/O error rather than a mapped-file SIGBUS.
+    file.read_exact_at(&mut bytes, 0).map_err(error)?;
+    if bytes.last() != Some(&0) {
+        return Err("keymap requires a trailing NUL".into());
+    }
+    let source = std::str::from_utf8(&bytes).map_err(error)?;
+    Keymap::parse(source).map_err(error)
+}
+
+fn paint_notice(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
+    let (width, height) = geometry.dimensions();
+    let y = if height >= 160 { 48 } else { 0 };
+    let clip = Rect {
+        x: 0,
+        y,
+        width: width as u32,
+        height: (height as u32).saturating_sub(y as u32).min(96),
+    };
+    raster.draw(Draw {
+        clip,
+        primitive: Primitive::Fill {
+            rect: clip,
+            color: CHROME,
+        },
+    });
+    let columns = width.saturating_sub(16).checked_div(8).unwrap_or(0).max(1);
+    let mut column = 0;
+    let mut row = 0;
+    for scalar in text.chars().take(512) {
+        if scalar == '\n' || column == columns {
+            row += 1;
+            column = 0;
+        }
+        if row >= 6 {
+            break;
+        }
+        if scalar == '\n' {
+            continue;
+        }
+        raster.draw(Draw {
+            clip,
+            primitive: Primitive::Glyph {
+                x: 8 + column as i64 * 8,
+                y: y + row * 16,
+                scalar,
+                style: GlyphStyle::medium(INK, CHROME),
+            },
+        });
+        column += 1;
     }
 }
 
@@ -620,8 +1098,12 @@ fn backing_file(directory: &Path, size: usize) -> Result<File> {
     Err("Wayland pool filename collision budget".into())
 }
 
-/// Run the explicitly read-only fixture using the normal Wayland environment.
+/// Run the scratch fixture using the normal Wayland environment.
 pub fn preview() -> io::Result<()> {
+    preview_with_profile(Profile::Windows)
+}
+
+pub fn preview_with_profile(profile: Profile) -> io::Result<()> {
     let work = || -> Result<()> {
         let endpoint = endpoint(
             std::env::var_os("WAYLAND_SOCKET"),
@@ -629,7 +1111,9 @@ pub fn preview() -> io::Result<()> {
             std::env::var_os("XDG_RUNTIME_DIR"),
         )?;
         let stream = connect(endpoint)?;
-        Window::new(stream, std::env::temp_dir())?.run()
+        let mut window = Window::new(stream, std::env::temp_dir())?;
+        window.ui.dispatch(Event::Profile(profile)).map_err(error)?;
+        window.run()
     };
     work().map_err(io::Error::other)
 }
@@ -718,6 +1202,506 @@ mod tests {
         let id = w.callback.unwrap();
         w.event(message(id, 0, &[0])).unwrap();
         w.event(message(DISPLAY, 1, &[id])).unwrap();
+    }
+
+    fn seat_fixture() -> (Window, UnixStream, u32) {
+        let (a, b) = UnixStream::pair().unwrap();
+        b.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        let mut w = Window::new(a, std::env::temp_dir()).unwrap();
+        for event in [
+            global(1, "wl_compositor", 4),
+            global(2, "wl_shm", 1),
+            global(3, "xdg_wm_base", 1),
+            global(4, "wl_seat", 10),
+        ] {
+            w.event(event).unwrap();
+        }
+        w.event(message(SYNC, 0, &[0])).unwrap();
+        let seat = w.seat.unwrap();
+        let (binds, _) = drain(&b);
+        let binding = binds
+            .iter()
+            .find(|m| {
+                m.object == REGISTRY && {
+                    let mut c = Cursor::new(&m.payload);
+                    c.u32().unwrap() == 4
+                }
+            })
+            .unwrap();
+        let mut c = Cursor::new(&binding.payload);
+        assert_eq!(c.u32().unwrap(), 4);
+        assert_eq!(c.string().unwrap(), "wl_seat");
+        assert_eq!(c.u32().unwrap(), 7);
+        assert_eq!(c.u32().unwrap(), seat);
+        assert!(w.device.is_none());
+        w.event(message(seat, 0, &[3])).unwrap();
+        let device = w.device.unwrap();
+        assert_eq!(drain(&b).0, [message(seat, 1, &[device])]);
+        (w, b, device)
+    }
+
+    fn map_file() -> File {
+        let source = include_str!("../tests/fixtures/us.xkb");
+        let file = backing_file(&std::env::temp_dir(), source.len() + 1).unwrap();
+        file.write_all_at(source.as_bytes(), 0).unwrap();
+        file
+    }
+
+    fn send_map(w: &mut Window, peer: &UnixStream, device: u32, file: &File) {
+        let mut sender = Connection::new(peer.try_clone().unwrap()).unwrap();
+        let mut body = Builder::new();
+        body.u32(1);
+        body.u32(file.metadata().unwrap().len() as u32);
+        sender.send(device, 0, body, Some(file)).unwrap();
+        w.connection.read_more().unwrap();
+        while let Some(event) = wire::take(&mut w.connection.pending).unwrap() {
+            w.event(event).unwrap();
+        }
+    }
+
+    fn focus(w: &mut Window, device: u32) {
+        w.event(message(device, 1, &[1, SURFACE, 0])).unwrap();
+        w.event(message(device, 4, &[2, 0, 0, 0, 0])).unwrap();
+        w.event(message(device, 5, &[25, 600])).unwrap();
+    }
+
+    fn key(w: &mut Window, device: u32, code: u32) {
+        w.event(message(device, 3, &[1, u32::MAX, code, 1]))
+            .unwrap();
+        w.event(message(device, 3, &[2, 0, code, 0])).unwrap();
+    }
+
+    #[test]
+    fn actual_descriptor_and_keyboard_events_edit_both_profiles_and_pixels() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, peer, device) = seat_fixture();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            let file = map_file();
+            send_map(&mut w, &peer, device, &file);
+            focus(&mut w, device);
+            key(&mut w, device, 1); // dismiss notice
+            w.event(message(SHM, 0, &[1])).unwrap();
+            configure(&mut w, 800, 600);
+            w.draw().unwrap();
+            let before = w.pixels.clone();
+            drain(&peer);
+            let tab = w.ui.editor().active().unwrap();
+            let original = w.ui.editor().document(tab).unwrap().text().to_owned();
+            key(&mut w, device, 30);
+            let text = w.ui.editor().document(tab).unwrap().text();
+            assert_eq!(text, format!("a{original}"));
+            assert!(w.ui.editor().document(tab).unwrap().dirty());
+            done(&mut w);
+            w.draw().unwrap();
+            assert_ne!(w.pixels, before);
+            drain(&peer);
+            w.event(message(device, 4, &[0, 4, 0, 0, 0])).unwrap(); // Control
+            key(
+                &mut w,
+                device,
+                if profile == Profile::Windows { 44 } else { 53 },
+            );
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), original);
+            assert!(!w.ui.editor().document(tab).unwrap().dirty());
+            key(&mut w, device, 15); // Ctrl+Tab
+            assert_ne!(w.ui.editor().active().unwrap(), tab);
+        }
+    }
+
+    #[test]
+    fn keymap_reads_do_not_move_shared_offsets_and_refuse_bad_sources() {
+        use std::io::{Seek, SeekFrom};
+        let mut file = map_file();
+        file.seek(SeekFrom::Start(9)).unwrap();
+        let size = file.metadata().unwrap().len() as u32;
+        for _ in 0..2 {
+            assert!(read_keymap(file.try_clone().unwrap().into(), 1, size).is_ok());
+            assert_eq!(file.stream_position().unwrap(), 9);
+        }
+        for (format, size) in [
+            (0, size),
+            (1, 0),
+            (1, 1024 * 1024 + 1),
+            (1, size + 1),
+            (1, size - 1),
+        ] {
+            assert!(read_keymap(file.try_clone().unwrap().into(), format, size).is_err());
+        }
+        let (mut a, b) = UnixStream::pair().unwrap();
+        assert!(read_keymap(b.into(), 1, 1)
+            .unwrap_err()
+            .contains("regular file"));
+        assert_eq!(a.read(&mut [0]).unwrap(), 0);
+        file.write_all_at(b"\0", 100).unwrap();
+        assert!(read_keymap(file.into(), 1, size).is_err());
+    }
+
+    #[test]
+    fn replacement_map_and_capability_loss_cancel_input_without_losing_text() {
+        let (mut w, peer, device) = seat_fixture();
+        send_map(&mut w, &peer, device, &map_file());
+        focus(&mut w, device);
+        w.event(message(device, 3, &[0, 0, 30, 1])).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let text = w.ui.editor().document(tab).unwrap().text().to_owned();
+        let invalid = backing_file(&std::env::temp_dir(), 4).unwrap();
+        send_map(&mut w, &peer, device, &invalid);
+        assert!(w.input.map.is_none());
+        assert!(!w.ui.focused());
+        w.tick(1000, true).unwrap();
+        key(&mut w, device, 48);
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), text);
+        send_map(&mut w, &peer, device, &map_file());
+        w.event(message(device, 4, &[0, 0, 0, 0, 0])).unwrap();
+        key(&mut w, device, 48);
+        assert_ne!(w.ui.editor().document(tab).unwrap().text(), text);
+        let seat = w.seat.unwrap();
+        w.event(message(seat, 0, &[1])).unwrap();
+        assert_eq!(drain(&peer).0, [message(device, 0, &[])]);
+        assert!(!w.ui.focused());
+        assert!(w.device.is_none());
+        send_map(&mut w, &peer, device, &map_file()); // in-flight retired event
+        assert!(w.input.map.is_none());
+        assert!(w.connection.descriptors.is_empty());
+        w.event(message(seat, 0, &[3])).unwrap();
+        assert_ne!(
+            w.device,
+            Some(device),
+            "ID cannot be reused before delete_id"
+        );
+        w.event(message(DISPLAY, 1, &[device])).unwrap();
+        assert_eq!(w.kind(device).unwrap(), Kind::Free);
+    }
+
+    #[test]
+    fn dirty_close_requires_fresh_explicit_discard_and_cancel_restores_session() {
+        let (mut w, peer, device) = seat_fixture();
+        send_map(&mut w, &peer, device, &map_file());
+        focus(&mut w, device);
+        key(&mut w, device, 30);
+        let tab = w.ui.editor().active().unwrap();
+        let revision = w.ui.editor().document(tab).unwrap().revision();
+        let before = w.ui.editor().document(tab).unwrap().text().to_owned();
+        w.chord("C-s", false).unwrap();
+        assert!(w.notice.as_ref().unwrap().contains("save is not connected"));
+        w.chord("C-w", false).unwrap();
+        assert!(w.ui.editor().document(tab).unwrap().dirty());
+        w.event(message(TOPLEVEL, 1, &[])).unwrap();
+        assert!(!w.closed && w.quitting);
+        w.chord("C-d", true).unwrap();
+        assert!(!w.closed);
+        key(&mut w, device, 48); // modal blocks editing
+        w.chord("Escape", false).unwrap();
+        assert!(!w.quitting && !w.closed);
+        let doc = w.ui.editor().document(tab).unwrap();
+        assert_eq!(doc.text(), before);
+        assert_eq!(doc.revision(), revision);
+        w.event(message(TOPLEVEL, 1, &[])).unwrap();
+        w.event(message(WM, 0, &[77])).unwrap();
+        assert_eq!(drain(&peer).0, [message(WM, 3, &[77])]);
+        w.event(message(device, 4, &[0, 4, 0, 0, 0])).unwrap();
+        key(&mut w, device, 32); // Ctrl+D
+        assert!(w.closed);
+    }
+
+    #[test]
+    fn malformed_keyboard_events_do_not_mutate_state() {
+        let (mut w, _peer, device) = seat_fixture();
+        for event in [
+            message(device, 1, &[0, SURFACE, 3076]),
+            message(device, 1, &[0, SURFACE, 3]),
+            message(device, 3, &[0, 0, 30, 2]),
+            message(device, 3, &[0, 0, 30, 1, 999]),
+            message(device, 4, &[0, 1]),
+            message(device, 99, &[]),
+        ] {
+            let generation = w.ui.generation();
+            assert!(w.event(event).is_err());
+            assert_eq!(w.ui.generation(), generation);
+        }
+    }
+
+    #[test]
+    fn modal_cancel_preserves_selection_prefix_and_next_input() {
+        use crate::model::{Command, Selection};
+        for profile in [Profile::Windows, Profile::Emacs] {
+            for cancel in ["Escape", "C-g"] {
+                let (mut w, peer, device) = seat_fixture();
+                send_map(&mut w, &peer, device, &map_file());
+                focus(&mut w, device);
+                w.ui.dispatch(Event::Profile(profile)).unwrap();
+                key(&mut w, device, 30);
+                let tab = w.ui.editor().active().unwrap();
+                let revision = w.ui.editor().document(tab).unwrap().revision();
+                w.ui.dispatch(Event::Edit {
+                    tab,
+                    revision,
+                    command: Command::Select(Selection {
+                        anchor: 0,
+                        caret: 2,
+                    }),
+                })
+                .unwrap();
+                let original = w.ui.editor().document(tab).unwrap().text().to_owned();
+                let view = w.ui.tab_view(tab).unwrap();
+                let generation = w.ui.generation();
+                let notice = w.notice.clone();
+                w.close();
+                w.chord(cancel, false).unwrap();
+                assert!(!w.quitting && !w.closed);
+                assert_eq!(w.ui.generation(), generation, "{profile:?}/{cancel}");
+                assert_eq!(w.ui.tab_view(tab).unwrap(), view);
+                assert_eq!(w.notice, notice);
+                let doc = w.ui.editor().document(tab).unwrap();
+                assert_eq!(
+                    doc.selection(),
+                    Selection {
+                        anchor: 0,
+                        caret: 2
+                    }
+                );
+                assert_eq!(doc.text(), original);
+                key(&mut w, device, 48);
+                assert_eq!(
+                    w.ui.editor().document(tab).unwrap().text(),
+                    format!("b{}", &original[2..])
+                );
+
+                if profile == Profile::Emacs {
+                    w.chord("C-x", false).unwrap();
+                    assert!(w.ui.keys().pending());
+                    w.close();
+                    w.chord(cancel, false).unwrap();
+                    assert!(
+                        w.ui.keys().pending(),
+                        "cancel consumed the preexisting prefix"
+                    );
+                    w.chord("C-s", false).unwrap();
+                    assert!(!w.ui.keys().pending());
+                    assert!(w
+                        .notice
+                        .as_ref()
+                        .unwrap()
+                        .starts_with("save is not connected"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seat_removal_drains_retired_events_and_keeps_scratch_text() {
+        let (mut w, peer, device) = seat_fixture();
+        send_map(&mut w, &peer, device, &map_file());
+        focus(&mut w, device);
+        key(&mut w, device, 30);
+        let tab = w.ui.editor().active().unwrap();
+        let text = w.ui.editor().document(tab).unwrap().text().to_owned();
+        let seat = w.seat.unwrap();
+        w.event(message(REGISTRY, 1, &[4])).unwrap();
+        assert!(w.seat.is_none() && w.device.is_none() && !w.closed);
+        assert_eq!(
+            drain(&peer).0,
+            [message(device, 0, &[]), message(seat, 3, &[])]
+        );
+        w.event(message(seat, 0, &[2])).unwrap();
+        send_map(&mut w, &peer, device, &map_file());
+        assert!(w.device.is_none() && w.input.map.is_none());
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), text);
+        w.event(message(DISPLAY, 1, &[device])).unwrap();
+        w.event(message(DISPLAY, 1, &[seat])).unwrap();
+    }
+
+    #[test]
+    fn seat_binding_skips_old_versions_and_selects_lowest_compatible_global() {
+        let (client, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut w = Window::new(client, std::env::temp_dir()).unwrap();
+        for event in [
+            global(1, "wl_compositor", 4),
+            global(2, "wl_shm", 1),
+            global(3, "xdg_wm_base", 1),
+            global(4, "wl_seat", 4),
+            global(5, "wl_seat", 6),
+            global(6, "wl_seat", 7),
+        ] {
+            w.event(event).unwrap();
+        }
+        w.event(message(SYNC, 0, &[0])).unwrap();
+        assert_eq!(w.required, [1, 2, 3, 5]);
+        let (messages, _) = drain(&peer);
+        let binding = messages
+            .iter()
+            .rfind(|m| m.object == REGISTRY)
+            .unwrap();
+        let mut cursor = Cursor::new(&binding.payload);
+        assert_eq!(cursor.u32().unwrap(), 5);
+        assert_eq!(cursor.string().unwrap(), "wl_seat");
+        assert_eq!(cursor.u32().unwrap(), 6);
+        assert_eq!(cursor.u32().unwrap(), w.seat.unwrap());
+        cursor.finish().unwrap();
+    }
+
+    #[test]
+    fn close_question_reports_unavailable_and_pending_input_until_restored() {
+        let (mut w, peer, device) = seat_fixture();
+        send_map(&mut w, &peer, device, &map_file());
+        assert!(w
+            .notice
+            .as_ref()
+            .unwrap()
+            .contains("waiting for focus/modifier"));
+        focus(&mut w, device);
+        assert!(w.notice.as_ref().unwrap().starts_with("Keymap ready"));
+        key(&mut w, device, 30);
+        let tab = w.ui.editor().active().unwrap();
+        let text = w.ui.editor().document(tab).unwrap().text().to_owned();
+        w.close();
+        assert!(w.close_notice().contains("Ctrl+D: Discard and quit"));
+        let invalid = backing_file(&std::env::temp_dir(), 4).unwrap();
+        send_map(&mut w, &peer, device, &invalid);
+        assert!(w.close_notice().contains("keyboard unavailable"));
+        assert!(w.close_notice().contains("loses ALL scratch text"));
+        assert!(!w.close_notice().contains("Ctrl+D"));
+        w.close();
+        assert!(!w.closed);
+        send_map(&mut w, &peer, device, &map_file());
+        assert!(w.close_notice().contains("input not ready"));
+        assert!(w
+            .notice
+            .as_ref()
+            .unwrap()
+            .contains("waiting for focus/modifier"));
+        key(&mut w, device, 48);
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), text);
+        w.event(message(device, 4, &[0, 0, 0, 0, 0])).unwrap();
+        assert!(w.notice.as_ref().unwrap().starts_with("Keymap ready"));
+        assert!(w.close_notice().contains("Ctrl+D: Discard and quit"));
+        key(&mut w, device, 1);
+        assert!(!w.quitting && !w.closed);
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), text);
+    }
+
+    #[test]
+    fn descriptor_queue_overflow_and_disconnect_drop_every_owner() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut sender = Connection::new(a).unwrap();
+        let mut receiver = Connection::new(b).unwrap();
+        let mut endpoints = Vec::new();
+        for n in 0..9 {
+            let (peer, endpoint) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let file = File::from(OwnedFd::from(endpoint));
+            sender.send(99, 0, Builder::new(), Some(&file)).unwrap();
+            drop(file);
+            if n < 8 {
+                receiver.read_more().unwrap();
+            } else {
+                assert!(receiver.read_more().unwrap_err().contains("budget"));
+            }
+            endpoints.push(peer);
+        }
+        assert_eq!(receiver.descriptors.len(), 8);
+        drop(receiver);
+        for mut peer in endpoints {
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn full_loop_waits_for_rights_sent_after_the_complete_keymap_event() {
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut w = Window::new(client, std::env::temp_dir()).unwrap();
+            let result = w.run();
+            (result, w)
+        });
+        let mut handshake = [0; 24];
+        peer.read_exact(&mut handshake).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let mut sender = Connection::new(peer.try_clone().unwrap()).unwrap();
+        for event in [
+            global(1, "wl_compositor", 4),
+            global(2, "wl_shm", 1),
+            global(3, "xdg_wm_base", 1),
+            global(4, "wl_seat", 7),
+            message(SYNC, 0, &[0]),
+        ] {
+            let mut body = Builder::new();
+            for word in event.payload.as_chunks::<4>().0 {
+                body.u32(u32::from_ne_bytes(*word));
+            }
+            sender.send(event.object, event.opcode, body, None).unwrap();
+        }
+        let start = Instant::now();
+        let seat = loop {
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let (messages, _) = drain(&peer);
+            if let Some(id) = messages.iter().find_map(|m| {
+                if m.object != REGISTRY {
+                    return None;
+                }
+                let mut c = Cursor::new(&m.payload);
+                if c.u32().unwrap() != 4 {
+                    return None;
+                }
+                c.string().unwrap();
+                c.u32().unwrap();
+                Some(c.u32().unwrap())
+            }) {
+                break id;
+            }
+        };
+        sender.words(seat, 0, &[2]).unwrap();
+        let device = loop {
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let (messages, _) = drain(&peer);
+            if let Some(m) = messages.iter().find(|m| m.object == seat && m.opcode == 1) {
+                break Cursor::new(&m.payload).u32().unwrap();
+            }
+        };
+        let file = map_file();
+        let mut map = Builder::new();
+        map.u32(1);
+        map.u32(file.metadata().unwrap().len() as u32);
+        let bytes = map.message(device, 0).unwrap();
+        for byte in bytes {
+            peer.write_all(&[byte]).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        let mut ping = Builder::new();
+        ping.u32(987);
+        sender.send(WM, 0, ping, Some(&file)).unwrap();
+        for event in [
+            message(device, 1, &[0, SURFACE, 0]),
+            message(device, 4, &[0, 0, 0, 0, 0]),
+            message(device, 5, &[0, 0]),
+            message(device, 3, &[0, 0, 30, 1]),
+            message(device, 3, &[0, 0, 30, 0]),
+            message(TOPLEVEL, 1, &[]),
+            message(device, 4, &[0, 4, 0, 0, 0]),
+            message(device, 3, &[0, 0, 32, 1]),
+        ] {
+            let mut body = Builder::new();
+            for word in event.payload.as_chunks::<4>().0 {
+                body.u32(u32::from_ne_bytes(*word));
+            }
+            sender.send(event.object, event.opcode, body, None).unwrap();
+        }
+        let (result, w) = worker.join().unwrap();
+        result.unwrap();
+        assert!(w.closed && w.quitting);
+        assert!(w
+            .ui
+            .editor()
+            .document(w.ui.editor().active().unwrap())
+            .unwrap()
+            .text()
+            .starts_with("atd-editor"));
+        assert!(w.connection.descriptors.is_empty());
+        assert!(drain(&peer).0.contains(&message(WM, 3, &[987])));
     }
 
     #[test]
