@@ -3257,9 +3257,10 @@ exit 0
         .map_err(|e| format!("FAIL: cannot spawn the host-sandbox reaping probe: {e}"))?;
     let top = i64::from(child.id());
 
-    // The tree is UP when both leaf sleeps exist. Three processes above them
+    // The tree is UP when both leaf sleeps exist. Four processes above them
     // carry the marker in their own argv — the top td-builder, the PID-ns
-    // parent that waits on PID 1, and `sh` — so a count of marker-BEARING
+    // parent that waits on PID 1, PID 1 itself (a fork of that parent that
+    // stays behind as init), and `sh` — so a count of marker-BEARING
     // processes reaches 2 before `sh` has forked either leaf, and killing
     // there tests the sandbox mid-construction rather than once it is up.
     const LEAVES: usize = 2;

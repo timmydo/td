@@ -656,6 +656,8 @@ pub fn flock_exclusive(fd: i32) -> io::Result<()> {
 /// PID 1 of the fresh PID namespace (the namespace's first process), which then
 /// mounts a private /proc reflecting that namespace — matching `guix shell -C`'s
 /// child-is-pid1 model so nested containers can create their own PID ns + /proc.
+/// That PID 1 then forks once more and stays behind as init for the program
+/// (sandbox.rs `pid1_serve_as_init`), which is what `wait_any` below serves.
 pub fn fork() -> io::Result<i64> {
     let ret = unsafe { syscall5(SYS_FORK, 0, 0, 0, 0, 0) };
     if ret < 0 {
@@ -677,6 +679,28 @@ pub fn waitpid(pid: i64) -> io::Result<i32> {
         Err(io::Error::from_raw_os_error(-ret as i32))
     } else {
         Ok(status)
+    }
+}
+
+/// wait4(2) on ANY child (pid -1), the same no-options no-rusage call, retried
+/// through EINTR. This is init's wait: the check namespace's PID 1 collects
+/// every child the kernel hands it, so the reaped pid comes back beside the
+/// status — the caller has to tell the program whose status it mirrors from a
+/// stray it merely releases. Post-fork safe: one raw syscall, no allocation.
+pub fn wait_any() -> io::Result<(i64, i32)> {
+    const ANY_CHILD: i64 = -1;
+    let mut status: i32 = 0;
+    loop {
+        let ret = unsafe {
+            syscall5(SYS_WAIT4, ANY_CHILD as usize, &mut status as *mut i32 as usize, 0, 0, 0)
+        };
+        if ret >= 0 {
+            return Ok((ret as i64, status));
+        }
+        let errno = -ret as i32;
+        if errno != EINTR {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
     }
 }
 

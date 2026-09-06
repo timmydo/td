@@ -3,9 +3,10 @@
 //! nix/libstore/build.cc):
 //!   - namespaces: NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS. NEWNET makes the
 //!     build offline by construction; NEWPID (in the same unshare as NEWUSER, so
-//!     the PID ns is owned by the new user ns) forks the builder to PID 1 of its
-//!     own pid namespace with a FRESH procfs — the build sees only its own process
-//!     tree, not the host's (the daemon, other concurrent builds, their
+//!     the PID ns is owned by the new user ns) forks PID 1 of a fresh pid
+//!     namespace, which mounts a FRESH procfs and then serves as init for the
+//!     builder it forks beneath it — the build sees only its own process tree,
+//!     not the host's (the daemon, other concurrent builds, their
 //!     /proc/<pid>/environ), full parity with host_shell / `guix shell -C`;
 //!   - uid/gid: guest 30001/30000 mapped over the invoking user, setgroups
 //!     denied (build.cc defaultGuestUID/GID, initializeUserNamespace);
@@ -997,15 +998,18 @@ pub fn die_with_parent(cmd: &mut Command) {
     }
 }
 
-/// Make `cmd` PID 1 of a fresh rootless PID namespace while preserving the
-/// caller-visible child and exit status.
+/// Run `cmd` inside a fresh rootless PID namespace, behind an init, while
+/// preserving the caller-visible child and exit status.
 ///
-/// The `Command` child first creates the namespaces, then forks once. Its
-/// child becomes PID 1 and execs the requested program; the outer half only
-/// waits and mirrors the status. Linux tears down every other namespace member
-/// when PID 1 exits, including double-forked descendants that changed process
-/// group or session. This turns a check-host or gate permit into a real process
-/// lifetime boundary without a privileged cgroup.
+/// The `Command` child first creates the namespaces, then forks twice. Its
+/// child becomes PID 1 and plays init: it forks the requested program as PID
+/// 2 and reaps every child the namespace hands it until the program's own
+/// status arrives, which it mirrors; the outer half only waits and mirrors in
+/// turn. Linux tears down every other namespace member when PID 1 exits,
+/// including double-forked descendants that changed process group or session.
+/// This turns a check-host or gate permit into a real process lifetime
+/// boundary without a privileged cgroup, and keeps a long check from stacking
+/// its orphans up as zombies for the whole run.
 pub fn contain_pid_namespace(cmd: &mut Command) -> io::Result<()> {
     let host_uid = sys::getuid();
     let host_gid = sys::getgid();
@@ -1032,15 +1036,13 @@ pub fn contain_pid_namespace(cmd: &mut Command) -> io::Result<()> {
             if pid != 0 {
                 let _ = sys::close(live_r);
                 let status = sys::waitpid(pid)?;
-                let code = if status & 0x7f == 0 {
-                    (status >> 8) & 0xff
-                } else {
-                    128 + (status & 0x7f)
-                };
-                sys::exit_group(code);
+                sys::exit_group(exit_code_of(status));
             }
             sys::set_pdeathsig(sys::SIGKILL)?;
             pid1_confirm_parent(live_r, live_w)?;
+            // The answer is in, and init below would otherwise hold this end
+            // open for the program's whole life.
+            let _ = sys::close(live_r);
             sys::mount(
                 Some(&proc_type),
                 &proc_path,
@@ -1051,10 +1053,22 @@ pub fn contain_pid_namespace(cmd: &mut Command) -> io::Result<()> {
             .map_err(|e| {
                 sys::warn(b"td-builder check: FAILED mounting the PID namespace procfs\n");
                 e
-            })
+            })?;
+            pid1_serve_as_init(b"td-builder check: FAILED waiting as the PID namespace init\n")
         });
     }
     Ok(())
+}
+
+/// The shell's reading of a raw wait status: the exit code of an exited
+/// child, 128 plus the signal number of a killed one. What each namespace
+/// half mirrors outward, so a status crosses both without changing meaning.
+fn exit_code_of(status: i32) -> i32 {
+    if status & 0x7f == 0 {
+        (status >> 8) & 0xff
+    } else {
+        128 + (status & 0x7f)
+    }
 }
 
 /// Executed only by the hidden `check-pidns-run` wrapper (or its unit-test
@@ -1122,6 +1136,43 @@ fn pid1_confirm_parent(live_r: i32, live_w: i32) -> io::Result<()> {
     }
     sys::warn(b"td-builder sandbox: parent died before pid 1 armed PR_SET_PDEATHSIG\n");
     Err(io::Error::from_raw_os_error(ESRCH))
+}
+
+/// PID 1's last act before the program: stay behind as its init. Forks once
+/// more and returns `Ok(())` only in the grandchild, which goes on into std's
+/// exec; this process reaps every child the kernel hands it until the
+/// program's own status arrives, then leaves with that status mirrored.
+///
+/// Every orphan in a PID namespace reparents to PID 1, and a program that
+/// never expected to be init leaves each one a zombie until it exits: `ready`
+/// as PID 1 kept a thousand exited git children per run, and three concurrent
+/// runs pushed the host's /proc past the 4096 entries td-jail's descendant
+/// walk tolerates. Teardown is unchanged — the kernel still ends every other
+/// member when this process exits, and PR_SET_PDEATHSIG, armed on this
+/// process, still ends it when the supervisor dies — so the lifetime boundary
+/// each caller relies on is the same one. The program is PID 2 now, and a
+/// signal to its group reaches it with its default disposition instead of
+/// being discarded by the kernel's PID-1 rule.
+///
+/// The reaper must never return: a second sync-pipe write after the program's
+/// exec would turn a spawn that succeeded into a spawn error, so a wait
+/// failure ends the namespace with `failure` on stderr and exit 1 instead.
+/// Post-fork safe: raw syscalls only.
+fn pid1_serve_as_init(failure: &'static [u8]) -> io::Result<()> {
+    let program = sys::fork()?;
+    if program == 0 {
+        return Ok(());
+    }
+    loop {
+        match sys::wait_any() {
+            Ok((reaped, status)) if reaped == program => sys::exit_group(exit_code_of(status)),
+            Ok(_) => {}
+            Err(_) => {
+                sys::warn(failure);
+                sys::exit_group(1);
+            }
+        }
+    }
 }
 
 /// WHO issued the authority for a staged input's hash — its provenance CLASS
@@ -1596,10 +1647,11 @@ pub fn build(
             // creation below happens as 30001/30000, not the overflow id.
             map_userns_id(host_uid, host_gid, GUEST_UID, GUEST_GID)?;
             // Fork: the child is PID 1 of the new PID namespace and does the mount
-            // setup + (via std) exec of the builder; THIS process (the PID-ns
-            // parent, still in the outer PID ns) only waits for it and propagates
-            // its exit. It must NOT fall through to std's exec path — the builder is
-            // exec'd exactly once, as PID 1. Stdio is inherited, so output streams.
+            // setup, then forks the builder beneath it and serves as its init;
+            // THIS process (the PID-ns parent, still in the outer PID ns) only
+            // waits for it and propagates its exit. It must NOT fall through to
+            // std's exec path — the builder is exec'd exactly once, by the child
+            // init forks. Stdio is inherited, so output streams.
             // Created BEFORE the fork so both ends are inherited; this process
             // then holds the write end for the rest of its life, and its death
             // — however abrupt — closes it. See `pid1_confirm_parent`.
@@ -1610,22 +1662,19 @@ pub fn build(
                 // PID 1 watches, and must stay open for this process's life.
                 let _ = sys::close(live_r);
                 let status = sys::waitpid(pid)?;
-                let code = if status & 0x7f == 0 {
-                    (status >> 8) & 0xff
-                } else {
-                    128 + (status & 0x7f)
-                };
-                sys::exit_group(code);
+                sys::exit_group(exit_code_of(status));
             }
             // --- PID 1 of the new PID namespace from here on ---
             // Re-arm parent-death reaping (fork cleared it): if the PID-ns parent
             // waiting above dies, PID 1 is SIGKILLed and the kernel tears down the
-            // whole namespace, reaping the build. PDEATHSIG survives the execve.
+            // whole namespace, reaping the build. PID 1 stays behind as init (see
+            // `pid1_serve_as_init`), so the arming covers the build's whole life.
             sys::set_pdeathsig(sys::SIGKILL)?;
             // Then check the parent outlived the fork: arming after one leaves a
             // window where nothing would reap this process, and an orphan here is
             // a whole build tree.
             pid1_confirm_parent(live_r, live_w)?;
+            let _ = sys::close(live_r);
             // Keep every mount below private to this namespace.
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)?;
             // Stage each closure item into newstore (host scratch, OUTSIDE the new
@@ -1687,7 +1736,7 @@ pub fn build(
             fs::DirBuilder::new().mode(0o700).create(&build_dir_owned)?;
             write_mesboot_steps_file(&mesboot_steps_file, mesboot_steps.as_deref())?;
             std::env::set_current_dir(&build_dir_owned)?;
-            Ok(())
+            pid1_serve_as_init(b"td-builder sandbox: FAILED waiting as the build's PID namespace init\n")
         });
     }
 
@@ -1998,11 +2047,12 @@ pub fn host_shell(
             sys::bring_loopback_up()
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED bringing loopback up\n"); e })?;
             // Fork: the child is PID 1 of the new PID namespace and goes on to set
-            // up the mounts + exec the command; THIS process (the PID-ns parent,
-            // still in the outer PID ns) only waits for it and propagates its exit
-            // via exit_group. It must NOT fall through to std's exec path — the
-            // command is exec'd exactly once, as PID 1. Stdio is inherited
-            // directly, so output still streams; only the exit status flows here.
+            // up the mounts, then forks the command beneath it and serves as its
+            // init; THIS process (the PID-ns parent, still in the outer PID ns)
+            // only waits for it and propagates its exit via exit_group. It must
+            // NOT fall through to std's exec path — the command is exec'd exactly
+            // once, by the child init forks. Stdio is inherited directly, so
+            // output still streams; only the exit status flows here.
             // Created BEFORE the fork so both ends are inherited; this process
             // then holds the write end for the rest of its life, and its death
             // — however abrupt — closes it. See `pid1_confirm_parent`.
@@ -2015,19 +2065,15 @@ pub fn host_shell(
                 // PID 1 is watching and must stay open for this process's life.
                 let _ = sys::close(live_r);
                 let status = sys::waitpid(pid)?;
-                let code = if status & 0x7f == 0 {
-                    (status >> 8) & 0xff
-                } else {
-                    128 + (status & 0x7f)
-                };
-                sys::exit_group(code);
+                sys::exit_group(exit_code_of(status));
             }
             // --- PID 1 of the new PID namespace, from here on ---
             // Re-arm parent-death reaping FIRST (fork cleared it): if the
             // PID-namespace parent — the process waitpid-ing us just above — dies,
             // we (PID 1) are SIGKILLed, and the kernel then tears down the whole
-            // PID namespace, reaping every descendant build/mount. PDEATHSIG
-            // survives the upcoming execve, so the exec'd command stays covered.
+            // PID namespace, reaping every descendant build/mount. PID 1 stays
+            // behind as init (see `pid1_serve_as_init`), so the arming covers
+            // the command for its whole life.
             sys::set_pdeathsig(sys::SIGKILL)
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED re-arming PR_SET_PDEATHSIG in pid 1\n"); e })?;
             // Then check that the parent survived long enough for that arming
@@ -2036,6 +2082,7 @@ pub fn host_shell(
             // namespace, so nothing would reap it — it would finish setup, exec
             // and leave the whole tree running.
             pid1_confirm_parent(live_r, live_w)?;
+            let _ = sys::close(live_r);
             // Everything below private to this namespace.
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED at mount(/, MS_REC|MS_PRIVATE)\n"); e })?;
@@ -2169,7 +2216,7 @@ pub fn host_shell(
             let _ = fs::remove_dir("/oldroot");
             // Enter the requested working directory (e.g. the exposed worktree).
             std::env::set_current_dir(&workdir_owned)?;
-            Ok(())
+            pid1_serve_as_init(b"td-builder host-sandbox: FAILED waiting as the PID namespace init\n")
         });
     }
 

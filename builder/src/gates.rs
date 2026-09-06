@@ -2196,6 +2196,97 @@ mod tests {
         std::process::exit(code);
     }
 
+    /// The program half of `pid_namespace_init_reaps_an_orphan_while_the_program_runs`,
+    /// selected by `--exact` and armed only by its environment field like the
+    /// exec helper above. It orphans a shell onto namespace PID 1, waits until
+    /// the namespace's own /proc names PID 1 as that shell's parent, and only
+    /// then releases the shell to exit: a child that exits while its launching
+    /// shell still lives can be reaped by THAT shell, which would prove nothing.
+    /// Exit 0 once the released orphan is gone, 3 if it is still there five
+    /// seconds later. A Rust process never reaps children it did not spawn, so
+    /// were THIS process PID 1 the orphan would stay a zombie.
+    #[test]
+    fn pid_namespace_orphan_probe() {
+        let Ok(dir) = std::env::var("TD_TEST_PIDNS_ORPHAN_DIR") else {
+            return;
+        };
+        fn fail(code: i32, why: &str) -> ! {
+            eprintln!("orphan probe: {why}");
+            std::process::exit(code)
+        }
+        // `pid (comm) state ppid ...`: the fields after the LAST ") ", so a comm
+        // with spaces or parens cannot shift them.
+        fn stat_fields(stat: &str) -> Vec<&str> {
+            stat.rsplit(") ").next().unwrap_or("").split(' ').collect()
+        }
+        fn stat_of(pid: u32) -> std::io::Result<String> {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        }
+        let dir = PathBuf::from(dir);
+        let pidfile = dir.join("orphan.pid");
+        let release = dir.join("release");
+        // `sh -c 'X &'` exits the instant X is forked, so X is parentless and
+        // the kernel hands it to PID 1; X reports itself, then blocks opening
+        // the FIFO to read until the probe opens it to write the release. A
+        // FIFO rather than a polled file: no sleep, and nothing beyond POSIX sh.
+        let script = format!(
+            "mkfifo {r} || exit 1; sh -c 'echo $$ > {p}; read go < {r}' &",
+            p = pidfile.display(),
+            r = release.display()
+        );
+        let orphaned = std::process::Command::new("sh").arg("-c").arg(script).status();
+        if !orphaned.map(|s| s.success()).unwrap_or(false) {
+            fail(125, "could not fork the orphan");
+        }
+        let patience = Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + patience;
+        let pid = loop {
+            let reported = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            if let Some(pid) = reported {
+                if let Ok(stat) = stat_of(pid) {
+                    if stat_fields(&stat).get(1) == Some(&"1") {
+                        break pid;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                fail(125, "the orphan never reported itself, or was never adopted by PID 1");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Opening the FIFO to write blocks until the orphan is at its read, so
+        // the line lands only once both sides are there.
+        let released = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&release)
+            .and_then(|mut fifo| std::io::Write::write_all(&mut fifo, b"go\n"));
+        if released.is_err() {
+            fail(125, "could not release the orphan");
+        }
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            match stat_of(pid) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("orphan probe: pid {pid} was adopted by PID 1 and reaped");
+                    std::process::exit(0);
+                }
+                Err(e) => fail(125, &format!("cannot read /proc/{pid}/stat: {e}")),
+                Ok(stat) if std::time::Instant::now() >= deadline => {
+                    let state = stat_fields(&stat).first().copied().unwrap_or("?");
+                    fail(
+                        3,
+                        &format!(
+                            "pid {pid} is still present in state {state} five seconds after its release"
+                        ),
+                    );
+                }
+                Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
     /// Every compiled gate_def that resolves the evaluator must propagate that
     /// step's exit status. It exits 69 with the unprovisioned sentinel when no
     /// toolchain is reachable in the jail, and run_gate reads exactly that as a
@@ -2814,6 +2905,44 @@ mod tests {
         assert!(
             !escaped.exists(),
             "a setsid descendant survived after its gate released the permit"
+        );
+    }
+
+    /// Namespace PID 1 is an init, not the program: an orphan the program
+    /// leaves is reaped while the program still runs. With the program itself
+    /// as PID 1 every orphan stayed a zombie until the check ended, and one
+    /// `ready` left a thousand exited git children behind for its whole run.
+    /// The probe's success line is required, not just its exit status, so a
+    /// probe that never armed cannot pass this vacuously.
+    #[test]
+    fn pid_namespace_init_reaps_an_orphan_while_the_program_runs() {
+        let d = tmpdir("pidns-orphan");
+        let self_exe = std::env::current_exe().unwrap();
+        let probe = [
+            "--exact",
+            "gates::tests::pid_namespace_orphan_probe",
+            "--quiet",
+            "--test-threads=1",
+            "--nocapture",
+        ];
+        let mut cmd = std::process::Command::new(&self_exe);
+        cmd.args([
+            "--exact",
+            "gates::tests::pid_namespace_exec_helper",
+            "--quiet",
+            "--test-threads=1",
+        ])
+        .env("TD_TEST_PIDNS_PROGRAM", &self_exe)
+        .env("TD_TEST_PIDNS_ARG_COUNT", probe.len().to_string())
+        .env("TD_TEST_PIDNS_ORPHAN_DIR", &d);
+        for (index, arg) in probe.iter().enumerate() {
+            cmd.env(format!("TD_TEST_PIDNS_ARG_{index}"), arg);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stderr.contains("was adopted by PID 1 and reaped"),
+            "namespace PID 1 left the program's orphan unreaped: {stderr}"
         );
     }
 
