@@ -369,6 +369,7 @@ const POINTER_BUTTON_LEFT: u32 = 272;
 
 pub struct Runtime {
     scene: Scene,
+    attention_enabled: bool,
     framebuffer: Framebuffer,
     /// What the next paint will tell the backend about what changed. The
     /// backend discovers ordinary damage itself, so this carries only the
@@ -526,6 +527,7 @@ impl Runtime {
     pub fn new(framebuffer: Framebuffer) -> Runtime {
         Runtime {
             scene: Scene::new(),
+            attention_enabled: false,
             framebuffer,
             owed_damage: Damage::Unknown,
             last_submission: None,
@@ -1681,6 +1683,75 @@ impl Runtime {
         self.settle(layout_changed)
     }
 
+    pub(crate) fn enable_attention(&mut self, enabled: bool) {
+        self.attention_enabled = enabled;
+    }
+
+    pub(crate) fn attention_enabled(&self) -> bool {
+        self.attention_enabled
+    }
+
+    pub(crate) fn drain_attention(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+    ) -> Result<(), String> {
+        if !self.attention_enabled || !self.scene.attention_visible() {
+            return Err("secure attention is not active".to_string());
+        }
+        self.scene.drain_attention();
+        self.owed_damage = Damage::Whole;
+        self.repaint()
+    }
+
+    pub(crate) fn attention(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+        visible: bool,
+    ) -> Result<u128, String> {
+        if !self.attention_enabled {
+            return Err("secure attention requires the paired compositor profile".to_string());
+        }
+        let was_draining = self.scene.attention_draining();
+        self.scene.set_attention(visible);
+        self.owed_damage = Damage::Whole;
+        self.cancel_drag_under_overlay();
+        let result = (|| {
+            let events = self.keyboard.suspend()?;
+            self.publish_keyboard(events)?;
+            if visible {
+                self.refresh_focus()?;
+                self.repaint()?;
+                Ok(0)
+            } else {
+                self.repaint()?;
+                self.refresh_focus()?;
+                self.application_stored_surfaces(None)?;
+                crate::sys::monotonic_time()
+            }
+        })();
+        match result {
+            Ok(cutoff) => Ok(cutoff),
+            Err(mut error) => {
+                self.scene.set_attention(true);
+                if was_draining {
+                    self.scene.drain_attention();
+                }
+                self.owed_damage = Damage::Whole;
+                let keyboard = self
+                    .keyboard
+                    .suspend()
+                    .and_then(|events| self.publish_keyboard(events));
+                for recovery in [keyboard, self.refresh_focus(), self.repaint()] {
+                    if let Err(failure) = recovery {
+                        error.push_str("; trusted-screen recovery: ");
+                        error.push_str(&failure);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn command(&mut self, command: Command) -> Result<(), String> {
         self.scene.command(command);
         // A tiling command is what a user reaches for when the screen looks
@@ -1846,6 +1917,9 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
+        if self.scene.attention_visible() {
+            return Ok(());
+        }
         // Whether the pointer MOVED, which a nonzero delta does not prove: an
         // outward one at the edge of the output is clamped away, and a report
         // that changed no coordinate owes no paint, re-answers no focus and
@@ -1873,6 +1947,9 @@ impl Runtime {
         scroll: PointerScroll,
     ) -> Result<(), String> {
         let size = self.framebuffer.dimensions();
+        if self.scene.attention_visible() {
+            return Ok(());
+        }
         let moved = self.scene.place_pointer(x, y, size.width, size.height);
         self.pointer_report(time, moved, buttons, scroll)
     }
@@ -2479,6 +2556,9 @@ impl Runtime {
     }
 
     pub fn key(&mut self, input: KeyInput) -> Result<(), String> {
+        if self.scene.attention_visible() {
+            return Ok(());
+        }
         if let Some(event) = self.keyboard.key(input)? {
             self.publish_keyboard_event(event);
         }
@@ -2486,6 +2566,9 @@ impl Runtime {
     }
 
     pub fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
+        if self.scene.attention_visible() {
+            return Ok(());
+        }
         if let Some(event) = self.keyboard.modifiers(modifiers)? {
             self.publish_keyboard_event(event);
         }
@@ -3758,6 +3841,9 @@ impl Runtime {
     /// than moving this target. The portal dialog differs because it is a
     /// client surface owed keyboard enter/leave while it enforces modality.
     fn keyboard_target(&self) -> Option<SurfaceKey> {
+        if self.scene.attention_visible() {
+            return None;
+        }
         let size = self.framebuffer.dimensions();
         if let Some(dialog) = self.scene.portal_modal() {
             return self
@@ -3787,6 +3873,9 @@ impl Runtime {
     }
 
     fn routed_pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
+        if self.scene.attention_visible() {
+            return (None, None);
+        }
         if !self.scene.modal() {
             return self.pointer_targets();
         }
@@ -12622,5 +12711,122 @@ mod tests {
         assert!(stop.is_stopped());
         assert!(events.recv().is_err());
         runtime.unsubscribe_keyboard(6);
+    }
+    #[test]
+    fn attention_retries_readiness_when_the_app_finished_behind_the_trusted_screen() {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-attention-readiness-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let mut runtime = Runtime::new(Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap());
+        let (wake, ready) = mpsc::sync_channel(1);
+        runtime
+            .watch_application(
+                "org.mozilla.firefox".to_string(),
+                APPLICATION_CONTENT_RGBS,
+                wake,
+            )
+            .unwrap();
+        runtime.enable_attention(true);
+        let origin = crate::input::test_origin();
+        runtime.attention(&origin, true).unwrap();
+        let key = SurfaceKey {
+            client: 7,
+            object: 11,
+        };
+        lend_application_resources(&mut runtime, key.client);
+        runtime
+            .set_application_id(key, "org.mozilla.firefox")
+            .unwrap();
+        runtime.apply_commit(key, Some(application_content_surface()), None, None).unwrap();
+        assert_eq!(ready.try_recv(), Err(TryRecvError::Empty));
+        // Query colors actually present on the private screen, so removing
+        // the explicit guard would expose its pixels to this observer.
+        let background = [0x18, 0x20, 0x28];
+        assert_eq!(
+            runtime
+                .framebuffer
+                .surface_rgb_pixel_counts(&runtime.scene, key, [background; 2])
+                .unwrap(),
+            [0; 2]
+        );
+        runtime.attention(&origin, false).unwrap();
+        let evidence = ready.try_recv().unwrap();
+        assert_eq!(evidence.content_pixels, [5_000; 2]);
+        assert_eq!(evidence.app_id, "org.mozilla.firefox");
+    }
+
+    #[test]
+    fn attention_repaints_private_pixels_after_focus_or_output_failure() {
+        for closing in [false, true] {
+            for fail_write in [false, true] {
+                let cleanup = Cleanup(std::env::temp_dir().join(format!(
+                    "td-attention-recovery-{}-{}",
+                    std::process::id(),
+                    SEQ.fetch_add(1, Ordering::Relaxed)
+                )));
+                let mut runtime =
+                    Runtime::new(Framebuffer::test_file(&cleanup.0, 240, 120, 960).unwrap());
+                let key = SurfaceKey {
+                    client: 1,
+                    object: 1,
+                };
+                runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+                let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+                runtime.pointer_frame(1, i32::try_from(rect.x + 4).unwrap(),
+                    i32::try_from(rect.y + 4).unwrap(), &[], PointerScroll::default()).unwrap();
+                assert!(runtime.pointer_snapshot().focus.is_some());
+                runtime.enable_attention(true);
+                let origin = crate::input::test_origin();
+                runtime.attention(&origin, true).unwrap();
+                if closing {
+                    runtime.drain_attention(&origin).unwrap();
+                }
+                let private = std::fs::read(&cleanup.0).unwrap();
+                if !closing {
+                    runtime.attention(&origin, false).unwrap();
+                }
+                if fail_write {
+                    runtime.framebuffer.fail_next_write();
+                } else {
+                    runtime.exhaust_pointer_revision();
+                }
+                let error = runtime.attention(&origin, !closing).unwrap_err();
+                assert!(runtime.scene.attention_visible());
+                assert!(
+                    std::fs::read(&cleanup.0).unwrap() == private,
+                    "closing={closing} fail_write={fail_write}: {error}"
+                );
+                assert_eq!(runtime.scene.attention_draining(), closing);
+                assert!(runtime.keyboard_snapshot().focus.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn attention_cutoff_is_sampled_after_the_ordinary_frame_is_written() {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-attention-clock-order-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let mut runtime = Runtime::new(Framebuffer::test_file(&cleanup.0, 240, 120, 960).unwrap());
+        runtime.enable_attention(true);
+        let origin = crate::input::test_origin();
+        runtime.attention(&origin, true).unwrap();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let saved = std::sync::Arc::clone(&observed);
+        runtime.framebuffer.after_next_write(move || {
+            // Separate the observations even on a coarse host clock.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            *saved.lock().unwrap() = Some(crate::sys::monotonic_time().unwrap());
+        });
+        let cutoff = runtime.attention(&origin, false).unwrap();
+        let after_write = observed.lock().unwrap().unwrap();
+        assert!(
+            cutoff >= after_write,
+            "cutoff preceded ordinary frame publication"
+        );
     }
 }

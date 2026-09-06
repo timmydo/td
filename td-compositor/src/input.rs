@@ -107,14 +107,36 @@ const KEY_REPEAT: i32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Event {
+    timestamp: u128,
     time: u32,
     kind: u16,
     code: u16,
     value: i32,
 }
 
+/// Only the evdev adapter can construct this origin witness.
+pub(crate) struct EvdevOrigin {
+    _private: (),
+}
+
+#[cfg(test)]
+pub(crate) fn test_origin() -> EvdevOrigin {
+    EvdevOrigin { _private: () }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum AttentionState {
+    #[default]
+    Closed,
+    Open,
+    Draining,
+}
+
 #[derive(Default)]
 struct KeyBindings {
+    attention_enabled: bool,
+    attention: AttentionState,
+    cutoff: Option<u128>,
     pressed: BTreeSet<(usize, u16)>,
     forwarded: BTreeSet<(usize, u16)>,
     caps_lock: bool,
@@ -122,12 +144,15 @@ struct KeyBindings {
     launcher_open: bool,
     help_open: bool,
     consumed: BTreeSet<(usize, u16)>,
+    pointer_pending: BTreeSet<usize>,
     pointer_pressed: BTreeSet<(usize, u16)>,
     pointer_forwarded: BTreeSet<u16>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct KeyDecision {
+    attention: Option<bool>,
+    draining: bool,
     command: Option<Command>,
     launcher: Option<LauncherAction>,
     help: Option<HelpAction>,
@@ -144,6 +169,8 @@ impl KeyBindings {
 
     fn feed_device(&mut self, device: usize, event: Event) -> KeyDecision {
         let mut decision = KeyDecision {
+            attention: None,
+            draining: false,
             command: None,
             launcher: None,
             help: None,
@@ -167,6 +194,34 @@ impl KeyBindings {
             self.pressed.remove(&physical)
         };
         if !changed {
+            return decision;
+        }
+        if self.attention != AttentionState::Closed {
+            if self.attention == AttentionState::Open
+                && event.code == KEY_ESC
+                && event.value == KEY_PRESS
+            {
+                self.attention = AttentionState::Draining;
+                decision.draining = true;
+            }
+            if self.attention_can_close() {
+                decision.attention = Some(false);
+            }
+            return decision;
+        }
+        if self.attention_enabled
+            && event.code == KEY_ESC
+            && event.value == KEY_PRESS
+            && (self.pressed(KEY_LEFTCTRL) || self.pressed(KEY_RIGHTCTRL))
+            && (self.pressed(KEY_LEFTALT) || self.pressed(KEY_RIGHTALT))
+        {
+            self.attention = AttentionState::Open;
+            self.forwarded.clear();
+            self.pointer_forwarded.clear();
+            self.consumed.clear();
+            self.launcher_open = false;
+            self.help_open = false;
+            decision.attention = Some(true);
             return decision;
         }
         if event.value == KEY_PRESS && logical_pressed {
@@ -478,6 +533,13 @@ impl KeyBindings {
         self.commit_pointer(buttons);
     }
 
+    fn attention_can_close(&self) -> bool {
+        self.attention == AttentionState::Draining
+            && self.pressed.is_empty()
+            && self.pointer_pressed.is_empty()
+            && self.pointer_pending.is_empty()
+    }
+
     fn remove_pointer_device(&mut self, device: usize) {
         self.pointer_pressed.retain(|(owner, _)| *owner != device);
     }
@@ -539,8 +601,35 @@ impl AbsoluteAxes {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct EventTimeline {
+    cutoff: Option<u128>,
+    discard: bool,
+}
+
+impl PointerMotion {
+    /// Kernel queues and returned batches can outlive cancellation on another
+    /// device. Reject those records before they mutate any seat state.
+    fn accept_event(&mut self, event: Event, cutoff: Option<u128>) -> bool {
+        if self.timeline.cutoff != cutoff {
+            self.reset();
+            self.timeline.cutoff = cutoff;
+            self.timeline.discard = true;
+        }
+        let stale = cutoff.is_some_and(|cutoff| event.timestamp <= cutoff);
+        let boundary = event.kind == EV_SYN && event.code == SYN_REPORT;
+        let rejected = stale || self.timeline.discard;
+        if rejected {
+            self.reset();
+            self.timeline.discard = !boundary;
+        }
+        !rejected
+    }
+}
+
 #[derive(Default)]
 struct PointerMotion {
+    timeline: EventTimeline,
     dx: i32,
     dy: i32,
     /// The absolute value each axis reported in the frame being built. A
@@ -595,6 +684,8 @@ struct PointerFrame {
 }
 
 trait InputTarget {
+    fn attention(&mut self, visible: bool) -> Result<u128, String>;
+    fn drain_attention(&mut self) -> Result<(), String>;
     fn command(&mut self, command: Command) -> Result<(), String>;
     fn launcher(&mut self, action: LauncherAction) -> Result<bool, String>;
     /// Answers whether the sheet is up afterwards, as `launcher` does: the
@@ -666,6 +757,20 @@ impl LiveInputTarget {
 }
 
 impl InputTarget for LiveInputTarget {
+    fn drain_attention(&mut self) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .drain_attention(&EvdevOrigin { _private: () })
+    }
+
+    fn attention(&mut self, visible: bool) -> Result<u128, String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .attention(&EvdevOrigin { _private: () }, visible)
+    }
+
     fn command(&mut self, command: Command) -> Result<(), String> {
         self.runtime
             .lock()
@@ -813,7 +918,9 @@ impl PointerMotion {
     /// every ordinary report between two frames already relies on.
     fn reset(&mut self) {
         let (held_x, held_y) = (self.held_x, self.held_y);
+        let timeline = self.timeline;
         *self = PointerMotion::default();
+        self.timeline = timeline;
         self.held_x = held_x;
         self.held_y = held_y;
     }
@@ -979,18 +1086,17 @@ fn read_i64(bytes: &[u8]) -> Result<i64, String> {
     Ok(i64::from_ne_bytes(raw))
 }
 
-fn event_time(bytes: &[u8]) -> Result<u32, String> {
+fn event_timestamp(bytes: &[u8]) -> Result<u128, String> {
     let seconds = read_i64(bytes)?;
     let micros = read_i64(
         bytes
             .get(8..16)
             .ok_or_else(|| "input_event lacks microseconds".to_string())?,
     )?;
-    let seconds = seconds.max(0);
-    let micros = micros.clamp(0, 999_999);
-    let millis = i128::from(seconds) * 1_000 + i128::from(micros / 1_000);
-    let modulo = i128::from(u32::MAX) + 1;
-    u32::try_from(millis % modulo).map_err(|_| "input timestamp conversion failed".to_string())
+    if seconds < 0 || !(0..1_000_000).contains(&micros) {
+        return Err("invalid input timestamp".to_string());
+    }
+    Ok((seconds as u128) * 1_000_000_000 + (micros as u128) * 1_000)
 }
 
 fn parse(bytes: &[u8]) -> Result<Event, String> {
@@ -1000,8 +1106,10 @@ fn parse(bytes: &[u8]) -> Result<Event, String> {
             bytes.len()
         ));
     }
+    let timestamp = event_timestamp(bytes)?;
     Ok(Event {
-        time: event_time(bytes)?,
+        timestamp,
+        time: ((timestamp / 1_000_000) % (u128::from(u32::MAX) + 1)) as u32,
         kind: read_u16(
             bytes
                 .get(16..18)
@@ -1043,6 +1151,7 @@ fn event_paths(input_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+#[cfg(test)]
 fn apply<T: InputTarget>(
     runtime: &Mutex<T>,
     event: Event,
@@ -1051,15 +1160,40 @@ fn apply<T: InputTarget>(
     pointer: &mut PointerMotion,
     axes: Option<AbsoluteAxes>,
 ) -> Result<(), String> {
-    let frame = pointer.feed(event, axes);
-    if event.kind != EV_KEY && frame.is_none() {
-        return Ok(());
-    }
     let mut bindings = bindings
         .lock()
         .map_err(|_| "input bindings lock poisoned".to_string())?;
-    let decision = bindings.feed_device(device, event);
-    if decision.command.is_none()
+    if !pointer.accept_event(event, bindings.cutoff) {
+        return Ok(());
+    }
+    apply_locked(runtime, event, device, &mut bindings, pointer, axes)
+}
+
+fn apply_locked<T: InputTarget>(
+    runtime: &Mutex<T>,
+    event: Event,
+    device: usize,
+    bindings: &mut KeyBindings,
+    pointer: &mut PointerMotion,
+    axes: Option<AbsoluteAxes>,
+) -> Result<(), String> {
+    let frame = pointer.feed(event, axes);
+    if event.kind == EV_REL
+        || event.kind == EV_ABS
+        || (event.kind == EV_KEY && (BTN_MOUSE..=BTN_TASK).contains(&event.code))
+    {
+        bindings.pointer_pending.insert(device);
+    }
+    if event.kind == EV_SYN && event.code == SYN_REPORT {
+        bindings.pointer_pending.remove(&device);
+    }
+    let mut decision = bindings.feed_device(device, event);
+    if frame.is_none() && bindings.attention_can_close() {
+        decision.attention = Some(false);
+    }
+    if !decision.draining
+        && decision.attention.is_none()
+        && decision.command.is_none()
         && decision.launcher.is_none()
         && decision.help.is_none()
         && decision.launch.is_none()
@@ -1073,15 +1207,9 @@ fn apply<T: InputTarget>(
     let mut runtime = runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?;
-    deliver_key_decision(&mut *runtime, &mut bindings, decision)?;
+    deliver_key_decision(&mut *runtime, bindings, decision)?;
     if let Some(frame) = frame {
-        deliver_pointer_frame(
-            &mut *runtime,
-            &mut bindings,
-            device,
-            &frame,
-            &pointer.pressed,
-        )?;
+        deliver_pointer_frame(&mut *runtime, bindings, device, &frame, &pointer.pressed)?;
     }
     Ok(())
 }
@@ -1096,6 +1224,10 @@ fn deliver_pointer_frame<T: InputTarget>(
     frame: &PointerFrame,
     pressed: &BTreeSet<u16>,
 ) -> Result<(), String> {
+    if bindings.attention != AttentionState::Closed {
+        bindings.commit_pointer_device(device, pressed, &[]);
+        return finish_attention(runtime, bindings);
+    }
     let mut buttons = bindings.pointer_device_changes(device, &frame.buttons, frame.time);
     if bindings.launcher_open || bindings.help_open {
         buttons.retain(|button| button.state == PointerButtonState::Released);
@@ -1126,6 +1258,16 @@ fn deliver_key_decision<T: InputTarget>(
     bindings: &mut KeyBindings,
     decision: KeyDecision,
 ) -> Result<(), String> {
+    if decision.draining {
+        runtime.drain_attention()?;
+    }
+    if let Some(visible) = decision.attention {
+        if visible {
+            runtime.attention(true)?;
+        } else {
+            finish_attention(runtime, bindings)?;
+        }
+    }
     if let Some(command) = decision.command {
         runtime.command(command)?;
     }
@@ -1145,6 +1287,30 @@ fn deliver_key_decision<T: InputTarget>(
     }
     if let Some(modifiers) = decision.modifiers {
         runtime.modifiers(modifiers)?;
+    }
+    Ok(())
+}
+
+fn finish_attention<T: InputTarget>(
+    runtime: &mut T,
+    bindings: &mut KeyBindings,
+) -> Result<(), String> {
+    if bindings.attention_can_close() {
+        let cutoff = runtime.attention(false)?;
+        if let Err(mut error) = runtime.modifiers(bindings.modifiers()) {
+            for recovery in [
+                runtime.attention(true).map(|_| ()),
+                runtime.drain_attention(),
+            ] {
+                if let Err(recovery) = recovery {
+                    error.push_str("; trusted-screen recovery: ");
+                    error.push_str(&recovery);
+                }
+            }
+            return Err(error);
+        }
+        bindings.cutoff = Some(cutoff);
+        bindings.attention = AttentionState::Closed;
     }
     Ok(())
 }
@@ -1185,6 +1351,15 @@ fn release_device<T: InputTarget>(
     let mut bindings = bindings
         .lock()
         .map_err(|_| "input bindings lock poisoned".to_string())?;
+    release_device_locked(runtime, device, &mut bindings, time)
+}
+
+fn release_device_locked<T: InputTarget>(
+    runtime: &Mutex<T>,
+    device: usize,
+    bindings: &mut KeyBindings,
+    time: u32,
+) -> Result<(), String> {
     let codes: Vec<u16> = bindings
         .pressed
         .iter()
@@ -1194,7 +1369,11 @@ fn release_device<T: InputTarget>(
         .pointer_pressed
         .iter()
         .any(|(owner, _)| *owner == device);
-    if codes.is_empty() && !had_pointer_state && bindings.pointer_forwarded.is_empty() {
+    if codes.is_empty()
+        && !had_pointer_state
+        && bindings.pointer_forwarded.is_empty()
+        && !bindings.pointer_pending.contains(&device)
+    {
         return Ok(());
     }
     let mut failure = None;
@@ -1209,6 +1388,7 @@ fn release_device<T: InputTarget>(
         let decision = bindings.feed_device(
             device,
             Event {
+                timestamp: u128::from(time) * 1_000_000,
                 time,
                 kind: EV_KEY,
                 code,
@@ -1219,7 +1399,17 @@ fn release_device<T: InputTarget>(
             deliver_key_cleanup(target, decision, &mut failure);
         }
     }
+    // Settle attention after both keyboard and pointer cleanup; a key
+    // decision alone cannot account for this device's pending mouse report.
     bindings.remove_pointer_device(device);
+    bindings.pointer_pending.remove(&device);
+    if bindings.attention != AttentionState::Closed {
+        if let Some(target) = runtime.as_deref_mut() {
+            if let Err(error) = finish_attention(target, bindings) {
+                retain_failure(&mut failure, error);
+            }
+        }
+    }
     let mut buttons = bindings.pointer_changes(time);
     buttons.retain(|button| button.state == PointerButtonState::Released);
     if !buttons.is_empty() {
@@ -1241,6 +1431,7 @@ fn release_device<T: InputTarget>(
 /// accumulated, whether a dropped batch is still being discarded, what the
 /// device said about its absolute axes, and how to ask it again.
 struct DeviceState<'a> {
+    attention_enabled: bool,
     pointer: PointerMotion,
     dropped: bool,
     axes: Option<AbsoluteAxes>,
@@ -1251,8 +1442,10 @@ impl DeviceState<'_> {
     fn new(
         axes: Option<AbsoluteAxes>,
         resync: &mut dyn FnMut() -> Option<AbsoluteAxes>,
+        attention_enabled: bool,
     ) -> DeviceState<'_> {
         DeviceState {
+            attention_enabled,
             pointer: PointerMotion::default(),
             dropped: false,
             axes,
@@ -1260,8 +1453,8 @@ impl DeviceState<'_> {
         }
     }
 
-    /// The recovery boundary, and the one moment the device can be asked.
-    /// `SYN_DROPPED` means reports were lost, and the kernel does not re-send
+    /// A complete discarded report is the boundary for querying the device.
+    /// Quarantine and `SYN_DROPPED` lose changes the kernel does not re-send
     /// an axis it believes unchanged — it compares against the value IT last
     /// emitted, not the one that arrived — so an axis that moved inside the
     /// gap would stay stale until it moved again. Only the device still knows.
@@ -1301,14 +1494,20 @@ fn apply_device_event<T: InputTarget>(
     bindings: &Mutex<KeyBindings>,
     state: &mut DeviceState<'_>,
 ) -> Result<(), String> {
-    if state.dropped {
+    if !state.attention_enabled && !state.dropped && event.kind != EV_KEY && event.kind != EV_SYN {
+        state.pointer.feed(event, state.axes);
+        return Ok(());
+    }
+    let mut bindings = bindings
+        .lock()
+        .map_err(|_| "input bindings lock poisoned".to_string())?;
+    let accepted = state.pointer.accept_event(event, bindings.cutoff);
+    // Both quarantine and SYN_DROPPED lose changes that evdev need not send
+    // again. Recover position only at the report boundary, without buttons.
+    if !accepted || state.dropped {
         if event.kind == EV_SYN && event.code == SYN_REPORT {
             state.dropped = false;
             if let Some(frame) = state.recover(event.time) {
-                // Same lock order as `apply`: bindings, then the runtime.
-                let mut bindings = bindings
-                    .lock()
-                    .map_err(|_| "input bindings lock poisoned".to_string())?;
                 let mut runtime = runtime
                     .lock()
                     .map_err(|_| "runtime lock poisoned".to_string())?;
@@ -1325,21 +1524,21 @@ fn apply_device_event<T: InputTarget>(
     }
     if event.kind == EV_SYN && event.code == SYN_DROPPED {
         state.pointer.reset();
-        release_device(runtime, device, bindings, event.time)?;
+        release_device_locked(runtime, device, &mut bindings, event.time)?;
         state.dropped = true;
         return Ok(());
     }
-    apply(
+    apply_locked(
         runtime,
         event,
         device,
-        bindings,
+        &mut bindings,
         &mut state.pointer,
         state.axes,
     )?;
     if state.pointer.overflowed {
         state.pointer.reset();
-        release_device(runtime, device, bindings, event.time)?;
+        release_device_locked(runtime, device, &mut bindings, event.time)?;
         state.dropped = true;
     }
     Ok(())
@@ -1391,7 +1590,11 @@ fn read_device<T: InputTarget>(
             axes.y.maximum
         );
     }
-    let mut state = DeviceState::new(axes, resync);
+    let attention_enabled = bindings
+        .lock()
+        .map_err(|_| "input bindings lock poisoned".to_string())?
+        .attention_enabled;
+    let mut state = DeviceState::new(axes, resync, attention_enabled);
     let mut last_time = 0;
     let result = loop {
         // An empty tail, not just an out-of-range one: `get_mut(len..)` yields
@@ -1492,11 +1695,21 @@ pub fn start(
     launches: LaunchBackend,
 ) -> Result<usize, String> {
     let paths = event_paths(input_dir)?;
-    let bindings = Arc::new(Mutex::new(KeyBindings::default()));
+    let attention_enabled = runtime
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?
+        .attention_enabled();
+    let bindings = Arc::new(Mutex::new(KeyBindings {
+        attention_enabled,
+        ..KeyBindings::default()
+    }));
     let target = Arc::new(Mutex::new(LiveInputTarget { runtime, launches }));
     for (device, path) in paths.iter().enumerate() {
         let mut file =
             File::open(path).map_err(|e| format!("open input {}: {e}", path.display()))?;
+        if attention_enabled {
+            sys::input_monotonic_clock(&file)?;
+        }
         let axes = absolute_axes(&file);
         // A second handle purely so a dropped batch can ask the device where
         // it is now. The reader takes an `impl Read` so its tests can drive it
@@ -1568,6 +1781,7 @@ mod tests {
 
     fn key(code: u16, value: i32) -> Event {
         Event {
+            timestamp: 0,
             time: 0,
             kind: EV_KEY,
             code,
@@ -1604,6 +1818,7 @@ mod tests {
 
     fn abs(time: u32, code: u16, value: i32) -> Event {
         Event {
+            timestamp: u128::from(time) * 1_000_000,
             time,
             kind: EV_ABS,
             code,
@@ -1613,6 +1828,7 @@ mod tests {
 
     fn syn(time: u32) -> Event {
         Event {
+            timestamp: u128::from(time) * 1_000_000,
             time,
             kind: EV_SYN,
             code: SYN_REPORT,
@@ -1771,6 +1987,7 @@ mod tests {
         let mut pointer = PointerMotion::default();
         pointer.feed(
             Event {
+                timestamp: 4_000_000,
                 time: 4,
                 kind: EV_REL,
                 code: REL_X,
@@ -1886,6 +2103,7 @@ mod tests {
         // asked exactly once per recovery rather than per report, and the
         // frame that publishes the answer carries the recovery's own time.
         let drop = |time| Event {
+            timestamp: u128::from(time) * 1_000_000,
             time,
             kind: EV_SYN,
             code: SYN_DROPPED,
@@ -1901,6 +2119,7 @@ mod tests {
             // still be the FIRST place anything is published.
             drop(3),
             Event {
+                timestamp: 4_000_000,
                 time: 4,
                 kind: EV_SYN,
                 code: 1,
@@ -2006,6 +2225,12 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingTarget {
+        attention_events: Vec<bool>,
+        attention_cutoff: u128,
+        attention_error: Option<String>,
+        draining_events: usize,
+        draining_error: Option<String>,
+        modifiers_error: Option<String>,
         commands: Vec<Command>,
         launcher_actions: Vec<LauncherAction>,
         launcher_visible: bool,
@@ -2040,6 +2265,25 @@ mod tests {
     }
 
     impl InputTarget for RecordingTarget {
+        fn drain_attention(&mut self) -> Result<(), String> {
+            self.draining_events += 1;
+            match self.draining_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn attention(&mut self, visible: bool) -> Result<u128, String> {
+            self.attention_events.push(visible);
+            match self.attention_error.take() {
+                Some(error) if visible => Err(error),
+                error => {
+                    self.attention_error = error;
+                    Ok(self.attention_cutoff)
+                }
+            }
+        }
+
         fn command(&mut self, command: Command) -> Result<(), String> {
             self.commands.push(command);
             Ok(())
@@ -2084,7 +2328,10 @@ mod tests {
         fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
             self.modifiers.push(modifiers);
             self.keyboard_calls.push(KeyboardCall::Modifiers(modifiers));
-            Ok(())
+            match self.modifiers_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
 
         fn pointer_frame(
@@ -2146,6 +2393,14 @@ mod tests {
     }
 
     impl InputTarget for LauncherModelTarget {
+        fn drain_attention(&mut self) -> Result<(), String> {
+            self.recording.drain_attention()
+        }
+
+        fn attention(&mut self, visible: bool) -> Result<u128, String> {
+            self.recording.attention(visible)
+        }
+
         fn command(&mut self, command: Command) -> Result<(), String> {
             self.recording.command(command)
         }
@@ -2201,8 +2456,16 @@ mod tests {
 
     fn encode(event: Event) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(EVENT_SIZE);
-        bytes.extend_from_slice(&i64::from(event.time / 1_000).to_ne_bytes());
-        bytes.extend_from_slice(&(i64::from(event.time % 1_000) * 1_000).to_ne_bytes());
+        bytes.extend_from_slice(
+            &i64::try_from(event.timestamp / 1_000_000_000)
+                .unwrap()
+                .to_ne_bytes(),
+        );
+        bytes.extend_from_slice(
+            &i64::try_from((event.timestamp % 1_000_000_000) / 1_000)
+                .unwrap()
+                .to_ne_bytes(),
+        );
         bytes.extend_from_slice(&event.kind.to_ne_bytes());
         bytes.extend_from_slice(&event.code.to_ne_bytes());
         bytes.extend_from_slice(&event.value.to_ne_bytes());
@@ -2248,6 +2511,7 @@ mod tests {
             abs(1, ABS_Y, 100),
             syn(1),
             Event {
+                timestamp: 2_000_000,
                 time: 2,
                 kind: EV_SYN,
                 code: SYN_DROPPED,
@@ -2278,6 +2542,7 @@ mod tests {
             abs(1, ABS_Y, 100),
             syn(1),
             Event {
+                timestamp: 2_000_000,
                 time: 2,
                 kind: EV_SYN,
                 code: SYN_DROPPED,
@@ -2331,12 +2596,14 @@ mod tests {
         let mut data = Vec::new();
         for event in [
             Event {
+                timestamp: 2_000_000,
                 time: 2,
                 kind: EV_REL,
                 code: REL_X,
                 value: 7,
             },
             Event {
+                timestamp: 2_000_000,
                 time: 2,
                 kind: EV_REL,
                 code: REL_Y,
@@ -2364,6 +2631,7 @@ mod tests {
         let mut data = Vec::new();
         for event in [
             Event {
+                timestamp: 3_000_000,
                 time: 3,
                 kind: EV_REL,
                 code: REL_WHEEL,
@@ -2394,12 +2662,14 @@ mod tests {
 
     fn motion(time: u32, dx: i32) -> Vec<u8> {
         let mut bytes = encode(Event {
+            timestamp: u128::from(time) * 1_000_000,
             time,
             kind: EV_REL,
             code: REL_X,
             value: dx,
         });
         bytes.extend_from_slice(&encode(Event {
+            timestamp: u128::from(time) * 1_000_000,
             time,
             kind: EV_SYN,
             code: SYN_REPORT,
@@ -2569,6 +2839,7 @@ mod tests {
         target.lock().unwrap().flush_error = Some("paint refused".to_string());
         let bindings = Mutex::new(KeyBindings::default());
         let mut data = encode(Event {
+            timestamp: 1_000_000,
             time: 1,
             kind: EV_KEY,
             code: BTN_MOUSE,
@@ -2628,6 +2899,7 @@ mod tests {
         assert_eq!(
             parse(&bytes).unwrap(),
             Event {
+                timestamp: 12_345_000_000,
                 time: 12_345,
                 kind: EV_KEY,
                 code: KEY_RIGHT,
@@ -2639,7 +2911,7 @@ mod tests {
             .get_mut(8..16)
             .unwrap()
             .copy_from_slice(&1_000_000i64.to_ne_bytes());
-        assert_eq!(parse(&bytes).unwrap().time, 12_999);
+        assert!(parse(&bytes).is_err());
         bytes
             .get_mut(..8)
             .unwrap()
@@ -2648,7 +2920,7 @@ mod tests {
             .get_mut(8..16)
             .unwrap()
             .copy_from_slice(&(-1i64).to_ne_bytes());
-        assert_eq!(parse(&bytes).unwrap().time, 0);
+        assert!(parse(&bytes).is_err());
     }
 
     #[test]
@@ -3364,6 +3636,7 @@ mod tests {
         // which is what an ordinary scroll IS.
         let mut pointer = PointerMotion::default();
         let rel = |code, value| Event {
+            timestamp: 0,
             time: 0,
             kind: EV_REL,
             code,
@@ -3372,6 +3645,7 @@ mod tests {
         assert_eq!(pointer.feed_relative(rel(REL_WHEEL, -1)), None);
         let frame = pointer
             .feed_relative(Event {
+                timestamp: 4_000_000,
                 time: 4,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3396,6 +3670,7 @@ mod tests {
         pointer.feed_relative(rel(REL_HWHEEL, -4));
         let frame = pointer
             .feed_relative(Event {
+                timestamp: 5_000_000,
                 time: 5,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3414,6 +3689,7 @@ mod tests {
         // next report would scroll again by a wheel nobody turned.
         assert_eq!(
             pointer.feed_relative(Event {
+                timestamp: 6_000_000,
                 time: 6,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3428,6 +3704,7 @@ mod tests {
         let mut pointer = PointerMotion::default();
         assert_eq!(
             pointer.feed_relative(Event {
+                timestamp: 0,
                 time: 0,
                 kind: EV_REL,
                 code: REL_X,
@@ -3436,12 +3713,14 @@ mod tests {
             None
         );
         pointer.feed_relative(Event {
+            timestamp: 0,
             time: 0,
             kind: EV_REL,
             code: REL_X,
             value: 2,
         });
         pointer.feed_relative(Event {
+            timestamp: 0,
             time: 0,
             kind: EV_REL,
             code: REL_Y,
@@ -3449,6 +3728,7 @@ mod tests {
         });
         assert_eq!(
             pointer.feed_relative(Event {
+                timestamp: 9_000_000,
                 time: 9,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3466,6 +3746,7 @@ mod tests {
         );
         assert_eq!(
             pointer.feed_relative(Event {
+                timestamp: 0,
                 time: 0,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3493,7 +3774,7 @@ mod tests {
             asked.set(asked.get().saturating_add(1));
             Some(moved)
         };
-        let mut state = DeviceState::new(Some(tablet()), &mut resync);
+        let mut state = DeviceState::new(Some(tablet()), &mut resync, false);
         // A place first, so the recovery has a stale position to replace
         // rather than an absent one.
         for event in [abs(1, ABS_X, 100), abs(1, ABS_Y, 100), syn(1)] {
@@ -3534,7 +3815,7 @@ mod tests {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
         let mut resync = || None;
-        let mut state = DeviceState::new(None, &mut resync);
+        let mut state = DeviceState::new(None, &mut resync, false);
         for index in 0..=MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
             apply_device_event(
                 &target,
@@ -3558,24 +3839,28 @@ mod tests {
 
         for event in [
             Event {
+                timestamp: 7_000_000,
                 time: 7,
                 kind: EV_REL,
                 code: REL_X,
                 value: 99,
             },
             Event {
+                timestamp: 8_000_000,
                 time: 8,
                 kind: EV_SYN,
                 code: SYN_REPORT,
                 value: 0,
             },
             Event {
+                timestamp: 9_000_000,
                 time: 9,
                 kind: EV_REL,
                 code: REL_X,
                 value: 3,
             },
             Event {
+                timestamp: 10_000_000,
                 time: 10,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3602,6 +3887,7 @@ mod tests {
             (
                 0,
                 Event {
+                    timestamp: 5_000_000,
                     time: 5,
                     kind: EV_SYN,
                     code: SYN_REPORT,
@@ -3611,6 +3897,7 @@ mod tests {
             (
                 1,
                 Event {
+                    timestamp: 5_000_000,
                     time: 5,
                     kind: EV_SYN,
                     code: SYN_REPORT,
@@ -3621,6 +3908,7 @@ mod tests {
             (
                 0,
                 Event {
+                    timestamp: 6_000_000,
                     time: 6,
                     kind: EV_SYN,
                     code: SYN_REPORT,
@@ -3631,6 +3919,7 @@ mod tests {
             (
                 1,
                 Event {
+                    timestamp: 7_000_000,
                     time: 7,
                     kind: EV_SYN,
                     code: SYN_REPORT,
@@ -3684,6 +3973,7 @@ mod tests {
         apply_event(key(BTN_MOUSE, KEY_PRESS), &mut pointer);
         apply_event(
             Event {
+                timestamp: 1_000_000,
                 time: 1,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3695,6 +3985,7 @@ mod tests {
 
         apply_event(
             Event {
+                timestamp: 2_000_000,
                 time: 2,
                 kind: EV_REL,
                 code: REL_X,
@@ -3704,6 +3995,7 @@ mod tests {
         );
         apply_event(
             Event {
+                timestamp: 2_000_000,
                 time: 2,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3719,6 +4011,7 @@ mod tests {
         apply_event(key(BTN_MOUSE, KEY_RELEASE), &mut pointer);
         apply_event(
             Event {
+                timestamp: 3_000_000,
                 time: 3,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -3736,6 +4029,7 @@ mod tests {
         let mut first = PointerMotion::default();
         let mut second = PointerMotion::default();
         let syn = |time| Event {
+            timestamp: u128::from(time) * 1_000_000,
             time,
             kind: EV_SYN,
             code: SYN_REPORT,
@@ -3818,6 +4112,7 @@ mod tests {
         let mut first = PointerMotion::default();
         let mut second = PointerMotion::default();
         let syn = |time| Event {
+            timestamp: u128::from(time) * 1_000_000,
             time,
             kind: EV_SYN,
             code: SYN_REPORT,
@@ -3861,18 +4156,21 @@ mod tests {
             key(KEY_LEFTMETA, KEY_PRESS),
             key(KEY_LEFT, KEY_PRESS),
             Event {
+                timestamp: 0,
                 time: 0,
                 kind: EV_REL,
                 code: REL_X,
                 value: 3,
             },
             Event {
+                timestamp: 0,
                 time: 0,
                 kind: EV_REL,
                 code: REL_Y,
                 value: -2,
             },
             Event {
+                timestamp: 17_000_000,
                 time: 17,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -4076,6 +4374,7 @@ mod tests {
         apply(
             &target,
             Event {
+                timestamp: 3_000_000,
                 time: 3,
                 kind: EV_REL,
                 code: REL_X,
@@ -4093,6 +4392,7 @@ mod tests {
         apply(
             &target,
             Event {
+                timestamp: 4_000_000,
                 time: 4,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -4122,6 +4422,7 @@ mod tests {
     fn ordinary_keys_and_modifiers_forward_but_shortcut_pairs_do_not() {
         let mut bindings = KeyBindings::default();
         let ordinary = bindings.feed(Event {
+            timestamp: 44_000_000,
             time: 44,
             kind: EV_KEY,
             code: 30,
@@ -4170,6 +4471,7 @@ mod tests {
         assert_eq!(pointer.feed_relative(key(BTN_MOUSE, KEY_RELEASE)), None);
         assert_eq!(
             pointer.feed_relative(Event {
+                timestamp: 9_000_000,
                 time: 9,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -4514,17 +4816,19 @@ mod tests {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
         let mut resync = || None;
-        let mut state = DeviceState::new(None, &mut resync);
+        let mut state = DeviceState::new(None, &mut resync, false);
         for event in [
             key(KEY_LEFTMETA, KEY_PRESS),
             key(KEY_V, KEY_PRESS),
             Event {
+                timestamp: 3_000_000,
                 time: 3,
                 kind: EV_REL,
                 code: REL_X,
                 value: 9,
             },
             Event {
+                timestamp: 4_000_000,
                 time: 4,
                 kind: EV_SYN,
                 code: SYN_DROPPED,
@@ -4532,6 +4836,7 @@ mod tests {
             },
             key(30, KEY_PRESS),
             Event {
+                timestamp: 6_000_000,
                 time: 6,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -4539,6 +4844,7 @@ mod tests {
             },
             key(KEY_2, KEY_PRESS),
             Event {
+                timestamp: 8_000_000,
                 time: 8,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -4591,10 +4897,11 @@ mod tests {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
         let mut resync = || None;
-        let mut state = DeviceState::new(None, &mut resync);
+        let mut state = DeviceState::new(None, &mut resync, false);
         for event in [
             key(BTN_MOUSE, KEY_PRESS),
             Event {
+                timestamp: 1_000_000,
                 time: 1,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -4602,18 +4909,21 @@ mod tests {
             },
             key(BTN_MOUSE, KEY_RELEASE),
             Event {
+                timestamp: 2_000_000,
                 time: 2,
                 kind: EV_REL,
                 code: REL_X,
                 value: 20,
             },
             Event {
+                timestamp: 3_000_000,
                 time: 3,
                 kind: EV_SYN,
                 code: SYN_DROPPED,
                 value: 0,
             },
             Event {
+                timestamp: 4_000_000,
                 time: 4,
                 kind: EV_SYN,
                 code: SYN_REPORT,
@@ -4709,5 +5019,646 @@ mod tests {
             bindings.feed_device(1, key(code, KEY_PRESS));
             assert_eq!(bindings.modifiers().locked, 0);
         }
+    }
+    #[test]
+    fn secure_attention_reserves_the_chord_and_drains_all_devices() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        });
+        let mut keyboard = PointerMotion::default();
+        let mut mouse = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+        ] {
+            apply(&target, event, 0, &bindings, &mut keyboard, None).unwrap();
+        }
+        let before = target.lock().unwrap().keyboard_calls.len();
+        for event in [
+            key(KEY_ESC, KEY_REPEAT),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTMETA, KEY_PRESS),
+            key(KEY_T, KEY_PRESS),
+            key(KEY_T, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut keyboard, None).unwrap();
+        }
+        apply(
+            &target,
+            key(BTN_MOUSE, KEY_PRESS),
+            1,
+            &bindings,
+            &mut mouse,
+            None,
+        )
+        .unwrap();
+        // Cancel before this other device has delivered SYN_REPORT.
+        for event in [
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+            key(KEY_LEFTMETA, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut keyboard, None).unwrap();
+        }
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        apply(&target, syn(1), 1, &bindings, &mut mouse, None).unwrap();
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        apply(
+            &target,
+            key(BTN_MOUSE, KEY_RELEASE),
+            1,
+            &bindings,
+            &mut mouse,
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        apply(&target, syn(2), 1, &bindings, &mut mouse, None).unwrap();
+        let target = target.lock().unwrap();
+        assert_eq!(target.attention_events, [true, false]);
+        assert!(target.launched.is_empty());
+        assert!(target.pointer_frames.is_empty());
+        assert_eq!(target.keyboard_calls.len(), before + 1); // restored lock modifiers
+        assert!(target
+            .keys
+            .iter()
+            .all(|input| input.key != u32::from(KEY_ESC)));
+    }
+
+    #[test]
+    fn losing_an_input_device_does_not_cancel_attention() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        });
+        let mut pointer = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+        ] {
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
+        }
+        release_device(&target, 0, &bindings, 1).unwrap();
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        for event in [key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE)] {
+            apply(&target, event, 1, &bindings, &mut pointer, None).unwrap();
+        }
+        assert_eq!(target.lock().unwrap().attention_events, [true, false]);
+    }
+
+    #[test]
+    fn direct_profile_does_not_claim_a_trusted_chord() {
+        let mut bindings = KeyBindings::default();
+        for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS)] {
+            assert!(bindings.feed(event).attention.is_none());
+        }
+        let decision = bindings.feed(key(KEY_ESC, KEY_PRESS));
+        assert!(decision.attention.is_none());
+        assert_eq!(decision.forward.unwrap().key, u32::from(KEY_ESC));
+    }
+
+    #[test]
+    fn attention_withdraws_focus_suppresses_runtime_input_and_survives_paint_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "td-attention-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&cleanup.0, 320, 200, 320 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let origin = EvdevOrigin { _private: () };
+        assert!(runtime.attention(&origin, true).is_err());
+        runtime.enable_attention(true);
+        let surface = crate::scene::SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        runtime
+            .commit(
+                surface,
+                crate::buffer::Surface::from_shm_pixels(
+                    100,
+                    100,
+                    [1, 2, 3, 0].repeat(10_000),
+                    crate::scene::SHM_XRGB8888,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        runtime
+            .key(key(KEY_LEFTCTRL, KEY_PRESS).key_input())
+            .unwrap();
+        let before = runtime.keyboard_snapshot();
+        assert_eq!(before.focus, Some(surface));
+        runtime.attention(&origin, true).unwrap();
+        let trusted_pixels = std::fs::read(&cleanup.0).unwrap();
+        let captured = runtime.keyboard_snapshot();
+        assert_eq!(captured.focus, None);
+        assert!(captured.keys.is_empty());
+        assert!(captured.revision > before.revision);
+        runtime.key(key(KEY_T, KEY_PRESS).key_input()).unwrap();
+        runtime
+            .modifiers(ModifierState {
+                depressed: MOD_CONTROL,
+                ..ModifierState::default()
+            })
+            .unwrap();
+        runtime
+            .pointer_frame(1, 70, 70, &[], PointerScroll::default())
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot(), captured);
+        assert!(runtime.pointer_snapshot().focus.is_none());
+        // An application commit cannot cover the display-only sheet or take focus.
+        runtime
+            .commit(
+                surface,
+                crate::buffer::Surface::from_shm_pixels(
+                    100,
+                    100,
+                    [6, 7, 8, 0].repeat(10_000),
+                    crate::scene::SHM_XRGB8888,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(&cleanup.0).unwrap(), trusted_pixels);
+        assert_eq!(runtime.keyboard_snapshot().focus, None);
+        runtime.fail_next_repaint();
+        assert!(runtime.attention(&origin, false).is_err());
+        runtime.key(key(KEY_T, KEY_PRESS).key_input()).unwrap();
+        assert!(runtime.keyboard_snapshot().keys.is_empty());
+        assert_eq!(runtime.keyboard_snapshot().focus, None);
+        runtime.clear_repaint_failure();
+        runtime.attention(&origin, false).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(surface));
+        assert!(runtime.keyboard_snapshot().keys.is_empty());
+        assert_ne!(std::fs::read(&cleanup.0).unwrap(), trusted_pixels);
+    }
+    #[test]
+    fn cancelling_attention_drains_even_a_silent_pointer_report() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        });
+        let mut keyboard = PointerMotion::default();
+        let mut mouse = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut keyboard, None).unwrap();
+        }
+        // Net-zero motion yields no PointerFrame, but its SYN still drains it.
+        for value in [1, -1] {
+            apply(
+                &target,
+                Event {
+                    timestamp: 1_000_000,
+                    time: 1,
+                    kind: EV_REL,
+                    code: REL_X,
+                    value,
+                },
+                1,
+                &bindings,
+                &mut mouse,
+                None,
+            )
+            .unwrap();
+        }
+        for event in [
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut keyboard, None).unwrap();
+        }
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        apply(&target, syn(2), 1, &bindings, &mut mouse, None).unwrap();
+        assert_eq!(target.lock().unwrap().attention_events, [true, false]);
+        assert!(target.lock().unwrap().pointer_frames.is_empty());
+    }
+    fn at_millis(mut event: Event, time: u32) -> Event {
+        event.time = time;
+        event.timestamp = u128::from(time) * 1_000_000;
+        event
+    }
+
+    #[test]
+    fn a_returned_batch_cannot_deliver_trusted_input_after_another_reader_cancels() {
+        struct PausedRead {
+            bytes: std::io::Cursor<Vec<u8>>,
+            read: Arc<std::sync::Barrier>,
+            resume: Arc<std::sync::Barrier>,
+            paused: bool,
+        }
+        impl Read for PausedRead {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.bytes.read(output)?;
+                if !self.paused {
+                    self.paused = true;
+                    self.read.wait();
+                    self.resume.wait();
+                }
+                Ok(count)
+            }
+        }
+        let target = Arc::new(Mutex::new(RecordingTarget {
+            attention_cutoff: 100_000_000,
+            ..RecordingTarget::default()
+        }));
+        let bindings = Arc::new(Mutex::new(KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        }));
+        let mut keyboard = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+        ] {
+            apply(
+                target.as_ref(),
+                event,
+                0,
+                bindings.as_ref(),
+                &mut keyboard,
+                None,
+            )
+            .unwrap();
+        }
+        target.lock().unwrap().keys.clear();
+        let read = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let queued = [
+            at_millis(key(KEY_T, KEY_PRESS), 50),
+            at_millis(key(KEY_T, KEY_RELEASE), 51),
+            syn(51),
+            at_millis(key(BTN_MOUSE, KEY_PRESS), 52),
+            syn(52),
+            at_millis(key(BTN_MOUSE, KEY_RELEASE), 53),
+            syn(53),
+            at_millis(key(KEY_A, KEY_PRESS), 200),
+            syn(200),
+            at_millis(key(KEY_A, KEY_RELEASE), 201),
+            syn(201),
+        ]
+        .into_iter()
+        .flat_map(encode)
+        .collect();
+        let mut file = PausedRead {
+            bytes: std::io::Cursor::new(queued),
+            read: Arc::clone(&read),
+            resume: Arc::clone(&resume),
+            paused: false,
+        };
+        let reader_target = Arc::clone(&target);
+        let reader_bindings = Arc::clone(&bindings);
+        let reader = thread::spawn(move || {
+            read_device(
+                Path::new("delayed-reader"),
+                &mut file,
+                1,
+                reader_target.as_ref(),
+                reader_bindings.as_ref(),
+                None,
+                &mut || None,
+            )
+        });
+        read.wait();
+        for event in [
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+        ] {
+            apply(
+                target.as_ref(),
+                event,
+                0,
+                bindings.as_ref(),
+                &mut keyboard,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(target.lock().unwrap().attention_events, [true, false]);
+        resume.wait();
+        reader.join().unwrap().unwrap();
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.keys,
+            [
+                at_millis(key(KEY_A, KEY_PRESS), 200).key_input(),
+                at_millis(key(KEY_A, KEY_RELEASE), 201).key_input()
+            ]
+        );
+        assert!(target.pointer_frames.is_empty());
+        assert_eq!(target.draining_events, 1);
+    }
+
+    #[test]
+    fn cutoff_quarantines_straddling_reports_and_does_not_wrap_with_wayland_time() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        });
+        let mut resync = || None;
+        let mut state = DeviceState::new(None, &mut resync, true);
+        let partial = Event {
+            kind: 4,
+            code: 0,
+            value: 0,
+            ..syn(1)
+        };
+        apply_device_event(&target, partial, 0, &bindings, &mut state).unwrap();
+        let cutoff = (u128::from(u32::MAX) + 1) * 1_000_000;
+        bindings.lock().unwrap().cutoff = Some(cutoff);
+        for mut event in [at_millis(key(KEY_T, KEY_PRESS), 1), syn(1)] {
+            event.timestamp += cutoff;
+            apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+        }
+        assert!(
+            target.lock().unwrap().keys.is_empty(),
+            "partial report escaped"
+        );
+        for event in [at_millis(key(KEY_T, KEY_PRESS), 2), syn(2)] {
+            apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+        }
+        assert!(
+            target.lock().unwrap().keys.is_empty(),
+            "wrapped stale event escaped"
+        );
+        let mut fresh = at_millis(key(KEY_A, KEY_PRESS), 3);
+        fresh.timestamp += cutoff;
+        let decoded = parse(&encode(fresh)).unwrap();
+        assert_eq!(decoded.time, 3);
+        assert_eq!(decoded.timestamp, fresh.timestamp);
+        apply_device_event(&target, decoded, 0, &bindings, &mut state).unwrap();
+        assert_eq!(target.lock().unwrap().keys, [fresh.key_input()]);
+    }
+
+    #[test]
+    fn a_fresh_escape_on_another_keyboard_can_enter_and_cancel_attention() {
+        let mut bindings = KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        };
+        bindings.feed_device(0, key(KEY_ESC, KEY_PRESS));
+        bindings.feed_device(1, key(KEY_LEFTCTRL, KEY_PRESS));
+        bindings.feed_device(1, key(KEY_LEFTALT, KEY_PRESS));
+        assert_eq!(
+            bindings.feed_device(1, key(KEY_ESC, KEY_PRESS)).attention,
+            Some(true)
+        );
+        bindings.feed_device(1, key(KEY_ESC, KEY_RELEASE));
+        assert!(bindings.feed_device(1, key(KEY_ESC, KEY_PRESS)).draining);
+        assert!(bindings.attention == AttentionState::Draining);
+    }
+
+    #[test]
+    fn device_cleanup_completes_cancellation_after_keyboard_and_pointer_drain() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        });
+        let mut pointer = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(BTN_MOUSE, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+        ] {
+            apply(&target, event, 0, &bindings, &mut pointer, None).unwrap();
+        }
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        release_device(&target, 0, &bindings, 1).unwrap();
+        assert_eq!(target.lock().unwrap().attention_events, [true, false]);
+        assert!(bindings.lock().unwrap().pointer_pending.is_empty());
+    }
+    #[test]
+    fn a_report_timestamped_after_close_must_cross_the_first_report_fence() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            cutoff: Some(100_000_000),
+            ..KeyBindings::default()
+        });
+        let mut resync = || None;
+        let mut state = DeviceState::new(None, &mut resync, true);
+        // Linux can collect a value before close and timestamp the whole
+        // report at a later input_sync. Userspace has seen no partial record.
+        for event in [
+            at_millis(key(KEY_T, KEY_PRESS), 101),
+            syn(101),
+            at_millis(key(KEY_T, KEY_RELEASE), 102),
+            syn(102),
+        ] {
+            apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+        }
+        assert!(target.lock().unwrap().keys.is_empty());
+        for event in [
+            at_millis(key(KEY_A, KEY_PRESS), 103),
+            syn(103),
+            at_millis(key(KEY_A, KEY_RELEASE), 104),
+            syn(104),
+        ] {
+            apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+        }
+        assert_eq!(
+            target.lock().unwrap().keys,
+            [
+                at_millis(key(KEY_A, KEY_PRESS), 103).key_input(),
+                at_millis(key(KEY_A, KEY_RELEASE), 104).key_input()
+            ]
+        );
+    }
+
+    #[test]
+    fn cutoff_reports_resync_absolute_state_without_replaying_discarded_buttons() {
+        for dropped in [false, true] {
+            for reopened in [false, true] {
+                let target = Mutex::new(RecordingTarget::default());
+                let bindings = Mutex::new(KeyBindings {
+                    attention_enabled: true,
+                    cutoff: Some(100_000_000),
+                    attention: if reopened {
+                        AttentionState::Open
+                    } else {
+                        AttentionState::Closed
+                    },
+                    ..KeyBindings::default()
+                });
+                let calls = std::cell::Cell::new(0);
+                let moved = AbsoluteAxes {
+                    x: axis(20000, 0, 32767),
+                    y: axis(30000, 0, 40000),
+                };
+                let mut resync = || {
+                    calls.set(calls.get() + 1);
+                    Some(moved)
+                };
+                let mut state = DeviceState::new(Some(tablet()), &mut resync, true);
+                state.pointer.hold(100, 100);
+                if dropped {
+                    apply_device_event(
+                        &target,
+                        Event {
+                            code: SYN_DROPPED,
+                            ..syn(101)
+                        },
+                        0,
+                        &bindings,
+                        &mut state,
+                    )
+                    .unwrap();
+                }
+                for event in [
+                    abs(101, ABS_X, 20000),
+                    abs(101, ABS_Y, 30000),
+                    at_millis(key(BTN_MOUSE, KEY_PRESS), 101),
+                ] {
+                    apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+                }
+                assert_eq!(
+                    calls.get(),
+                    0,
+                    "a partial rejected report queried the device"
+                );
+                apply_device_event(&target, syn(101), 0, &bindings, &mut state).unwrap();
+                assert_eq!(
+                    calls.get(),
+                    1,
+                    "cutoff lost absolute state: dropped={dropped}, reopened={reopened}"
+                );
+                assert!(!state.dropped);
+                assert!(state.pointer.pressed.is_empty());
+                assert!(bindings.lock().unwrap().pointer_pressed.is_empty());
+                assert!(target.lock().unwrap().keys.is_empty());
+                let places = target.lock().unwrap().pointer_places.clone();
+                if reopened {
+                    assert!(
+                        places.is_empty(),
+                        "recovery published through active attention"
+                    );
+                } else {
+                    assert_eq!(
+                        places.as_slice(),
+                        &[(101, over(20000, 32767), over(30000, 40000), Vec::new())]
+                    );
+                }
+                // A later button-only report must use the current position,
+                // even when the kernel never reports another changed axis.
+                bindings.lock().unwrap().attention = AttentionState::Closed;
+                for event in [at_millis(key(BTN_MOUSE, KEY_PRESS), 102), syn(102)] {
+                    apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+                }
+                let target = target.lock().unwrap();
+                let (_, x, y, buttons) = target.pointer_places.last().unwrap();
+                assert_eq!((*x, *y), (over(20000, 32767), over(30000, 40000)));
+                assert_eq!(
+                    buttons.as_slice(),
+                    &[PointerButtonInput {
+                        button: u32::from(BTN_MOUSE),
+                        state: PointerButtonState::Pressed,
+                        time: 102
+                    }]
+                );
+                assert_eq!(calls.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn modifier_failure_restores_attention_and_reports_every_recovery_failure() {
+        for screen_failure in [false, true] {
+            for banner_failure in [false, true] {
+                let mut target = RecordingTarget::default();
+                target.attention(true).unwrap();
+                target.modifiers_error = Some("modifier publication failed".to_string());
+                target.attention_error =
+                    screen_failure.then(|| "screen recovery failed".to_string());
+                target.draining_error =
+                    banner_failure.then(|| "banner recovery failed".to_string());
+                let mut bindings = KeyBindings {
+                    attention: AttentionState::Draining,
+                    ..KeyBindings::default()
+                };
+                let error = finish_attention(&mut target, &mut bindings).unwrap_err();
+                assert_eq!(target.attention_events, [true, false, true]);
+                assert_eq!(target.draining_events, 1);
+                assert!(bindings.attention == AttentionState::Draining);
+                assert_eq!(bindings.cutoff, None);
+                assert!(error.contains("modifier publication failed"));
+                assert_eq!(error.contains("screen recovery failed"), screen_failure);
+                assert_eq!(error.contains("banner recovery failed"), banner_failure);
+            }
+        }
+    }
+
+    #[test]
+    fn unplugging_a_pending_pointer_report_alone_completes_attention_drain() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            ..KeyBindings::default()
+        });
+        let mut keyboard = PointerMotion::default();
+        let mut mouse = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut keyboard, None).unwrap();
+        }
+        apply(
+            &target,
+            Event {
+                kind: EV_REL,
+                code: REL_X,
+                value: 5,
+                ..syn(1)
+            },
+            7,
+            &bindings,
+            &mut mouse,
+            None,
+        )
+        .unwrap();
+        for event in [key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE)] {
+            apply(&target, event, 0, &bindings, &mut keyboard, None).unwrap();
+        }
+        assert!(bindings.lock().unwrap().pressed.is_empty());
+        assert!(bindings.lock().unwrap().pointer_pressed.is_empty());
+        assert_eq!(
+            bindings.lock().unwrap().pointer_pending,
+            BTreeSet::from([7])
+        );
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        release_device(&target, 7, &bindings, 1).unwrap();
+        assert!(bindings.lock().unwrap().pointer_pending.is_empty());
+        assert_eq!(target.lock().unwrap().attention_events, [true, false]);
     }
 }

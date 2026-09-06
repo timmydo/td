@@ -264,6 +264,20 @@ impl KeyboardState {
         }
     }
 
+    pub(crate) fn suspend(&mut self) -> Result<Vec<RoutedKeyboardEvent>, String> {
+        let revision = self.advance()?;
+        let previous = self.focus.take();
+        self.pressed.clear();
+        self.modifiers = ModifierState::default();
+        Ok(previous
+            .into_iter()
+            .map(|surface| RoutedKeyboardEvent {
+                revision,
+                event: KeyboardEvent::Leave { surface },
+            })
+            .collect())
+    }
+
     pub fn set_focus(
         &mut self,
         focus: Option<SurfaceKey>,

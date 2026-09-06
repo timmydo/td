@@ -8151,10 +8151,9 @@ This enables ordinary terminal launches, with no consent path.
    `TD-COMPOSITOR-DEVICES-PRIVATE`. Deployment reboot discards pre-cutover
    open descriptors. This requires no `EVIOCGRAB`; processes at the
    compositor's own UID are inside the same trust boundary.
-2. **`.Screenshot` captures full output** and `td_portal_manager_v1`
-   exposes `capture_output`, with nothing excluding a prompt from a
-   capture. The prompt must be excluded from every capture path by
-   construction.
+2. **`.Screenshot` and `capture_output` remain planned.** Every future
+   capture path must exclude trusted prompt pixels by construction. Ordinary
+   scene rendering excludes the private painter; display rendering uses it.
 3. **`TIOCSTI`/`TIOCLINUX` are not the input-injection defence.** They
    are terminal injection, denied inside the *application* filter, and
    say nothing about `/dev/uinput`, virtual-keyboard or input-method
@@ -8182,8 +8181,8 @@ requester ──request──▶ td-authd (root)
                     td-compositor ── prompt on the secure path
                           │          exclusive input for its lifetime
                           ▼
-                    human approves ─── reserved key combination, then a
-                          │            randomized approval key
+                    human approves ─── physical secure-attention chord,
+                          │            operation-specific confirmation
                           ▼
                  td-authd PERFORMS the named operation itself
 ```
@@ -8231,8 +8230,8 @@ requester ──request──▶ td-authd (root)
    unambiguously a new request.
 4. **Authorization is separate from consent.** The table says what may be
    elevated; it does not say who may approve it. `SO_PEERCRED`
-   authenticates the requester and a keystroke authenticates presence —
-   neither says the approving human is entitled to publish a deployment.
+   identifies the requesting process and protected input supplies consent;
+   neither grants the approving principal permission to publish a deployment.
    So `td-authd` carries an **operation-to-principal policy**, consulted
    *before* any prompt is shown, living with system configuration rather
    than in any user's home. **td is not single-user**: a family machine's
@@ -8249,6 +8248,27 @@ requester ──request──▶ td-authd (root)
    mechanism.
 
 #### What proves a human is present
+
+The paired stock compositor reserves **Ctrl+Alt+Esc** for an opaque,
+compositor-owned screen. The evdev adapter enters it before client, launcher
+or help bindings; it withdraws keyboard/pointer focus and grabs. It currently
+says `NO AUTHORIZATION REQUEST` and accepts no approval. Direct development
+mode leaves the chord alone.
+
+Escape requests cancellation and displays `RELEASE KEYS AND BUTTONS` while
+known held input drains. Device loss clears its contribution without itself
+cancelling an open screen. The adapter rejects stale kernel events and
+quarantines each device's first completed report after cancellation; this
+can discard a first fresh report too. Its exact clock/report boundary and
+hardware buffering limits are specified in `td-compositor/DESIGN.md`.
+Failed transitions retain capture and attempt a full private repaint.
+Ordinary rendering excludes private pixels; a future capture must use that
+path. Only display rendering includes the trusted screen.
+
+The following ordinary-consent mechanism remains planned. Secret-store
+release and writes additionally require the enrolled FIDO2 assertion in
+§W.4; keyboard consent cannot replace that assertion. Disk/session unlock
+and protector changes follow `td-install/ENCRYPTION.md`.
 
 **The primary mechanism is a compositor-reserved key combination**, not a
 security key — the classic secure attention key, chosen over hardware for
@@ -8289,9 +8309,10 @@ timed with the prompt and consume the operator's touch. Today no jail
 binds hidraw, which closes it by accident and reopens the moment anything
 wants WebAuthn.
 
-**Neither mechanism runs on today's kernel**, and the key is further away
-than it looks: the pin list contains **no `CONFIG_USB*` at all** — not
-merely no `HIDRAW` but no host controller — so a token cannot be
+**Neither consent mechanism is implemented.** The inert screen above
+provides no approval, and the token is further away than it looks: the pin
+list contains **no `CONFIG_USB*` at all** — not merely no `HIDRAW` but no
+host controller — so a token cannot be
 enumerated. The key combination needs only what the compositor already
 has, which is the other reason it is primary.
 
@@ -8312,16 +8333,15 @@ has, which is the other reason it is primary.
 **Deliberately NOT in this design**: a `sudo`-equivalent running an
 arbitrary command; remembered or timed authority; per-application
 allow-lists that pre-approve anything; auto-elevation by signature or
-path; any recovery path accepting a memorised secret (recovery is a
-second enrolled token); and a policy language — the operation table is
-code, reviewed as code.
+path; account-password recovery; and a policy language — the operation
+table is code, reviewed as code. Hardware PIN and recovery policy belong to
+`td-install/ENCRYPTION.md`; the application-secret policy remains in §W.4.
 
 **Cost, honestly.** A new root component and a new trust surface, needing
-USB HID and CTAP2 in a kernel config that has neither, a compositor mode
-that does not exist, and it is on no ladder here. What this section buys
-today is that the question is decided and written down, so the workstream
-that reaches it amends a plan instead of inventing one — and so no other
-part of this design quietly assumes a password prompt is available.
+USB HID and CTAP2 in a kernel config that has neither. The physical
+attention screen is inert; immutable request presentation, consent and
+one-operation execution remain unimplemented. This plan grants no current
+authority and supplies no account-password prompt.
 
 ## M. Hardware rendering — not painting into the corner
 
@@ -8894,7 +8914,7 @@ and source-building changes nothing about it.
 2. **A td automation protocol on the private compositor socket**, beside
    `td_portal_manager_v1` and privileged the same way — by path
    visibility. Enumerate toplevels (app id, title, geometry), capture
-   (the Screenshot path already exists), inject synthetic keyboard and
+   (when the planned Screenshot path lands), inject synthetic keyboard and
    pointer events (the compositor owns input), and read td-native text
    directly. This is the 80% an agent needs *today*, since current
    agents work from screenshots plus input injection, and it is a few
@@ -9230,6 +9250,18 @@ UID/GID 993 and broker assignment at UID/GID 992, reserving the portal
 and application assignments. Their remaining activation must migrate
 state and socket authorization together. `td-authd/DESIGN.md` specifies
 the canonical table, account classes, and durable ledger.
+
+The paired compositor's physical attention screen is implemented but
+accepts no request or approval. Secret operations require a complete,
+immutable prompt confirmed presented before token acquisition; a queued
+frame is not a presentation receipt. Bind the FIDO2 challenge to a fresh
+nonce and a domain-separated, versioned, length-prefixed encoding of the
+requester, operation and descriptor-pinned arguments. Exclusive CTAP
+mediation prevents another process from consuming that touch for its own
+challenge. Possession plus user presence is the requested secret-store
+policy: a token left available to a walk-up attacker remains usable by
+that attacker. This is distinct from the hardware PIN disk/session policy
+in `td-install/ENCRYPTION.md`.
 
 **Remaining increments, in order on the rolling workstream.** (c) Gate release
 on FIDO2 user presence at session start, after the compositor provides secure

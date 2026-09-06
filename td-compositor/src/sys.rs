@@ -15,6 +15,8 @@ const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
 const SYS_GETSOCKOPT: usize = 55;
 const SYS_FCNTL: usize = 72;
+const SYS_CLOCK_GETTIME: usize = 228;
+const CLOCK_MONOTONIC: i32 = 1;
 
 /// The only `fcntl(2)` commands this crate may issue. They temporarily make
 /// one clipboard destination nonblocking so a receiver cannot park td-term's
@@ -35,6 +37,7 @@ const TIOCGWINSZ: usize = 0x5413;
 /// the 24-byte buffer below as much as `ABSINFO_WORDS` does.
 const EVIOCGABS_X: usize = 0x8018_4540;
 const EVIOCGABS_Y: usize = 0x8018_4541;
+const EVIOCSCLOCKID: usize = 0x4004_45a0;
 
 /// The DRM/KMS requests this crate may issue, from Linux 7.1.4's
 /// `include/uapi/drm/drm.h`. `_IOC` packs the argument's SIZE into bits 16..30,
@@ -376,11 +379,9 @@ pub fn restore_status_flags(file: &impl AsRawFd, flags: usize) -> Result<(), Str
 /// roster, so a mistyped or newly invented number cannot reach the kernel
 /// without amending both this list and the confinement tests that pin it.
 ///
-/// Unlike the two message wrappers this does not retry `EINTR`: none of the
-/// six terminal and evdev requests sleeps interruptibly, so a retry loop here
-/// would be dead code that reads like a live one. The DRM requests DO sleep
-/// interruptibly and are issued through `drm_ioctl` below, which is that loop —
-/// the distinction is per-request and not a property of this function.
+/// Terminal/evdev failures propagate to their caller, including interrupted
+/// clock selection. DRM operations use the bounded `drm_ioctl` retry loop
+/// below; retry behavior belongs to the operation.
 fn ioctl_checked(
     fd: RawFd,
     request: usize,
@@ -395,6 +396,7 @@ fn ioctl_checked(
             | TIOCGWINSZ
             | EVIOCGABS_X
             | EVIOCGABS_Y
+            | EVIOCSCLOCKID
             | DRM_IOCTL_VERSION
             | DRM_IOCTL_MODE_GETRESOURCES
             | DRM_IOCTL_MODE_GETENCODER
@@ -571,8 +573,8 @@ pub fn window_size(terminal: &impl AsRawFd) -> Result<WindowSize, String> {
 
 /// Which axis of an absolute device to ask about. An ENUM rather than a
 /// request number at the call site, for `Disposition`'s reason in td-sh: the
-/// two requests differ in one nibble, they are the only evdev requests on this
-/// surface, and a caller that could name a number could name a third.
+/// two range requests differ in one nibble, and a caller that could supply
+/// a number could issue a different kernel operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AbsAxis {
     X,
@@ -611,6 +613,39 @@ pub struct AbsInfo {
 /// is 24 bytes written into less — an out-of-bounds kernel write from code the
 /// compiler reads as safe. Both numbers above encode that same 24.
 const ABSINFO_WORDS: usize = 6;
+
+/// Select a common clock before a trusted evdev reader starts.
+pub fn input_monotonic_clock(device: &impl AsRawFd) -> Result<(), String> {
+    let clock: i32 = CLOCK_MONOTONIC;
+    ioctl(
+        device.as_raw_fd(),
+        EVIOCSCLOCKID,
+        (&clock as *const i32) as usize,
+        "EVIOCSCLOCKID",
+    )?;
+    Ok(())
+}
+
+/// The same clock selected on each trusted evdev client, without wrapping.
+pub fn monotonic_time() -> Result<u128, String> {
+    let mut words = [0_i64; 2];
+    errno_result(
+        syscall5(
+            SYS_CLOCK_GETTIME,
+            CLOCK_MONOTONIC as usize,
+            (&mut words as *mut [i64; 2]) as usize,
+            0,
+            0,
+            0,
+        ),
+        "clock_gettime(CLOCK_MONOTONIC)",
+    )?;
+    let [seconds, nanos] = words;
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return Err("invalid monotonic timespec".to_string());
+    }
+    Ok((seconds as u128) * 1_000_000_000 + nanos as u128)
+}
 
 /// Ask an absolute device where one of its axes is and what range it reports
 /// over.

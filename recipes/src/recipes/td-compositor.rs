@@ -11,6 +11,10 @@ use crate::types::{Recipe, Step};
 const MAIN_RS: &str = include_str!("../../../td-compositor/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     (
+        "attention",
+        include_str!("../../../td-compositor/src/attention.rs"),
+    ),
+    (
         "authority",
         include_str!("../../../td-compositor/src/authority.rs"),
     ),

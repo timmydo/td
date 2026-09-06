@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod attention;
 mod authority;
 mod bar;
 mod buffer;
@@ -450,6 +451,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         })
         .collect();
     let mut runtime = Runtime::new(framebuffer);
+    runtime.enable_attention(options.terminal_authority);
     runtime.set_launcher_application(options.launcher_application.as_deref());
     if let Some((((path, app_id), content_rgb_a), content_rgb_b)) = options
         .application_ready_socket
@@ -1198,6 +1200,7 @@ mod confinement {
     const AUTH_SYS: &str = include_str!("../../td-authd/src/sys.rs");
 
     const OTHER: &[(&str, &str)] = &[
+        ("attention.rs", include_str!("attention.rs")),
         ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
         ("buffer.rs", include_str!("buffer.rs")),
@@ -1493,10 +1496,11 @@ fn syscall6(
             "const SYS_RECVMSG: usize = 47;",
             "const SYS_GETSOCKOPT: usize = 55;",
             "const SYS_FCNTL: usize = 72;",
+            "const SYS_CLOCK_GETTIME: usize = 228;",
         ] {
             assert!(SYS.contains(syscall), "{syscall}");
         }
-        assert_eq!(occurrences(SYS, "const SYS_"), 8);
+        assert_eq!(occurrences(SYS, "const SYS_"), 9);
         for (name, source) in OTHER.iter().chain(TEST_ONLY) {
             assert_eq!(
                 source.matches("unsafe").count(),
@@ -1630,8 +1634,8 @@ fn syscall6(
     }
 
     /// `ioctl(2)`'s request number chooses the operation, so the roster is the
-    /// confinement: these nineteen values, one allow-list, and eighteen
-    /// callers.
+    /// confinement: these twenty-one values, one allow-list, and twenty
+    /// wrapper functions.
     ///
     /// Four DRM numbers READ a card. `DROP_MASTER` releases authority that
     /// opening a primary node granted without being asked, and `SET_MASTER` --
@@ -1652,7 +1656,7 @@ fn syscall6(
     /// whole display state at once, which is what replaces this legacy
     /// modeset-and-flip pair when more than one plane is in play.
     #[test]
-    fn the_ioctl_surface_is_twenty_pinned_requests_and_nineteen_wrappers() {
+    fn the_ioctl_surface_is_twenty_one_pinned_requests_and_twenty_wrappers() {
         for request in [
             "const TIOCSPTLCK: usize = 0x4004_5431;",
             "const TIOCGPTPEER: usize = 0x5441;",
@@ -1660,6 +1664,7 @@ fn syscall6(
             "const TIOCGWINSZ: usize = 0x5413;",
             "const EVIOCGABS_X: usize = 0x8018_4540;",
             "const EVIOCGABS_Y: usize = 0x8018_4541;",
+            "const EVIOCSCLOCKID: usize = 0x4004_45a0;",
             "const DRM_IOCTL_VERSION: usize = 0xc040_6400;",
             "const DRM_IOCTL_MODE_GETRESOURCES: usize = 0xc040_64a0;",
             "const DRM_IOCTL_MODE_GETENCODER: usize = 0xc014_64a6;",
@@ -1723,6 +1728,7 @@ fn syscall6(
             | TIOCGWINSZ
             | EVIOCGABS_X
             | EVIOCGABS_Y
+            | EVIOCSCLOCKID
             | DRM_IOCTL_VERSION
             | DRM_IOCTL_MODE_GETRESOURCES
             | DRM_IOCTL_MODE_GETENCODER
@@ -1748,10 +1754,10 @@ fn syscall6(
         let prose = occurrences(production_sys, "ioctl(2)");
         let every = occurrences(production_sys, "ioctl(") - prose;
         let drm = occurrences(production_sys, "drm_ioctl(");
-        // One definition plus exactly five call sites for the terminal and
-        // evdev entry point: a SIXTH wrapper reusing a pinned request would
+        // One definition plus exactly six call sites for the terminal and
+        // evdev entry point: a seventh wrapper reusing a pinned request would
         // satisfy every other assertion here.
-        assert_eq!(every - drm, 6);
+        assert_eq!(every - drm, 7);
         // One definition plus the seventeen requests the fourteen DRM wrappers
         // issue: two each for the three that ask a count before they ask for
         // data, one for the encoder, whose answer is a fixed-size struct, one
@@ -2056,7 +2062,7 @@ fn syscall6(
             MAP_SHARED,
             fd as usize,
             offset,"#;
-        assert_eq!(occurrences(SYS, "syscall5("), 8);
+        assert_eq!(occurrences(SYS, "syscall5("), 9);
         // The definition and the ONE call. `mmap` is the only six-argument
         // syscall this crate makes, and a second caller of `syscall6` would be
         // a second mapping with no region type owning its unmap.
@@ -2119,12 +2125,51 @@ pub struct MappedRegion {
         }
     }
 
-    /// Four disjoint reviewed surfaces live behind one syscall body, so each
-    /// is pinned to its own module: descriptor transport to the protocol
-    /// endpoints, private-peer authentication to the server, terminal control
-    /// to the PTY adapter, and an absolute device's axis range to the evdev
-    /// reader. Nothing else names `sys` at all — an alias elsewhere would give
-    /// an audited call a name none of these scans looks for.
+    #[test]
+    fn attention_clocks_pin_the_same_clock_and_native_operand_widths() {
+        let source = production(SYS);
+        for fragment in [
+            "const CLOCK_MONOTONIC: i32 = 1;",
+            "let clock: i32 = CLOCK_MONOTONIC;",
+            "(&clock as *const i32) as usize",
+            "let mut words = [0_i64; 2];",
+            "(&mut words as *mut [i64; 2]) as usize",
+            "let [seconds, nanos] = words;",
+        ] {
+            assert!(source.contains(fragment), "{fragment}");
+        }
+        assert_eq!(occurrences(source, "SYS_CLOCK_GETTIME"), 2);
+        assert_eq!(occurrences(source, "EVIOCSCLOCKID"), 4);
+        let call = "SYS_CLOCK_GETTIME,\n            CLOCK_MONOTONIC as usize,\n            (&mut words as *mut [i64; 2]) as usize,\n            0,\n            0,\n            0,";
+        assert!(source.contains(call));
+        for (name, module) in OTHER {
+            // The transition test also samples the clock after its write.
+            let module = if *name == "runtime.rs" {
+                production(module)
+            } else {
+                module
+            };
+            assert_eq!(
+                occurrences(module, "sys::monotonic_time"),
+                usize::from(*name == "runtime.rs"),
+                "{name}"
+            );
+            assert_eq!(
+                occurrences(module, "sys::input_monotonic_clock"),
+                usize::from(*name == "input.rs"),
+                "{name}"
+            );
+        }
+        let first = crate::sys::monotonic_time().unwrap();
+        assert!(crate::sys::monotonic_time().unwrap() >= first);
+        assert!(
+            crate::sys::input_monotonic_clock(&std::fs::File::open("/dev/null").unwrap()).is_err()
+        );
+    }
+
+    /// Pin each syscall family to its reviewed callers: transport endpoints,
+    /// terminal control, evdev, peer admission, DRM, and the shared clock.
+    /// Aliases must not hide an additional caller from these scans.
     #[test]
     fn each_confined_operation_is_reachable_only_from_its_own_module() {
         const TRANSPORT: &[&str] = &[
@@ -2134,9 +2179,29 @@ pub struct MappedRegion {
             "sys::discard_received(",
             "sys::ReceivedFd::adopt(",
             "sys::ReceivedFd::into_file(",
-            "sys::make_nonblocking(",
-            "sys::restore_status_flags(",
         ];
+        assert!(production(MAIN).contains("runtime.enable_attention(options.terminal_authority)"));
+        assert_eq!(
+            occurrences(
+                production(include_str!("runtime.rs")),
+                "crate::sys::monotonic_time()"
+            ),
+            1
+        );
+        assert_eq!(
+            occurrences(
+                production(include_str!("input.rs")),
+                "sys::input_monotonic_clock(&file)?"
+            ),
+            1
+        );
+        assert!(production(include_str!("input.rs")).contains(
+            "if attention_enabled {\n            sys::input_monotonic_clock(&file)?;\n        }"
+        ));
+        assert_eq!(
+            occurrences(production(include_str!("runtime.rs")), "sys::"),
+            1
+        );
         const PEER_AUTH: &[&str] = &["sys::peer_uid("];
         assert!(production(MAIN)
             .contains("session::SocketPolicy::for_authority(options.terminal_authority)"));
@@ -2149,8 +2214,7 @@ pub struct MappedRegion {
             "sys::set_window_size(",
             "sys::window_size(",
         ];
-        // The fourth surface, and the reason the module list below grew: an
-        // absolute pointer's range is asked for where the device file is
+        // An absolute pointer's range is asked for where the device file is
         // opened, and again only at a recovery.
         const ABSOLUTE: &[&str] = &["sys::absolute_info("];
         // Each axis asked once and asked FOR ITS OWN COORDINATE, neither of
@@ -2241,6 +2305,7 @@ pub struct MappedRegion {
                     | "input.rs"
                     | "drm.rs"
                     | "session.rs"
+                    | "runtime.rs"
             ) {
                 continue;
             }
@@ -2254,7 +2319,7 @@ pub struct MappedRegion {
         // nothing it looks for, and terminal control would be reachable from a
         // module that never resizes anything it verified. Every reach must be
         // spelled `sys::<wrapper>` where the caller scan can see it — including
-        // inside the three permitted modules, so the module list stays the
+        // inside every permitted module, so the module list stays the
         // whole answer to "who can call this".
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())
@@ -2299,7 +2364,6 @@ pub struct MappedRegion {
         let conn = include_str!("conn.rs");
         let server = include_str!("server.rs");
         let pty = include_str!("pty.rs");
-        let input = include_str!("input.rs");
         // The control listener is STARTED, and by the compositor's own run
         // path. Nothing else can see this: `td-ctl help` needs no session, the
         // recipe compares an `exec=` string, and the crate's socket tests
@@ -2367,54 +2431,38 @@ pub struct MappedRegion {
             assert_eq!(occurrences(source, "sys::make_nonblocking("), 0);
             assert_eq!(occurrences(source, "sys::restore_status_flags("), 0);
         }
-        for operation in TRANSPORT {
-            assert!(
-                client.contains(operation) || conn.contains(operation) || server.contains(operation),
-                "{operation}"
-            );
-            assert!(!pty.contains(operation), "pty.rs reached {operation}");
-        }
-        for operation in PEER_AUTH {
-            assert_eq!(occurrences(production(server), operation), 1);
-            for (name, source) in [
-                ("client.rs", production(client)),
-                ("conn.rs", production(conn)),
-                ("pty.rs", production(pty)),
-                ("input.rs", production(input)),
-            ] {
-                assert_eq!(
-                    occurrences(source, operation),
-                    0,
-                    "{name} reached private-peer authentication"
-                );
+        // Scan every family against every module, including other admitted
+        // syscall users. The union of the module roster is not confinement.
+        const FAMILIES: &[(&[&str], &[&str])] = &[
+            (TRANSPORT, &["client.rs", "conn.rs", "server.rs"]),
+            (PEER_AUTH, &["server.rs", "session.rs"]),
+            (TERMINAL, &["pty.rs"]),
+            (ABSOLUTE, &["input.rs"]),
+            (&["sys::drm_", "sys::parse_drm_event"], &["drm.rs"]),
+            (
+                &["sys::make_nonblocking", "sys::restore_status_flags"],
+                &["conn.rs", "drm.rs"],
+            ),
+            (&["sys::input_monotonic_clock"], &["input.rs"]),
+            (&["sys::monotonic_time"], &["runtime.rs"]),
+        ];
+        for (name, source) in std::iter::once(("main.rs", production_main))
+            .chain(OTHER.iter().copied())
+            .chain(TEST_ONLY.iter().copied())
+        {
+            let source = squeezed(source);
+            for (operations, permitted) in FAMILIES {
+                if permitted.contains(&name) {
+                    continue;
+                }
+                for operation in *operations {
+                    let identifier = operation.trim_end_matches('(');
+                    assert!(
+                        !source.contains(identifier),
+                        "{name} reached {identifier} outside its reviewed family"
+                    );
+                }
             }
-        }
-        for operation in TERMINAL {
-            assert!(pty.contains(operation), "{operation}");
-            assert!(
-                !client.contains(operation)
-                    && !conn.contains(operation)
-                    && !server.contains(operation)
-                    && !input.contains(operation),
-                "a module outside the terminal reached {operation}"
-            );
-        }
-        // The four surfaces are DISJOINT, which is what makes the roster a
-        // statement about each rather than about their union: the input reader
-        // may ask a device for its range and nothing else, and no module that
-        // speaks the protocol or drives a terminal may ask at all.
-        for operation in ABSOLUTE {
-            assert!(input.contains(operation), "{operation}");
-            assert!(
-                !client.contains(operation)
-                    && !conn.contains(operation)
-                    && !server.contains(operation)
-                    && !pty.contains(operation),
-                "a module outside the input reader reached {operation}"
-            );
-        }
-        for operation in TRANSPORT.iter().chain(PEER_AUTH).chain(TERMINAL) {
-            assert!(!input.contains(operation), "input.rs reached {operation}");
         }
         // Both wrappers are generic over `AsRawFd`, so inside pty.rs they
         // would type-check against ANY terminal — including an operator's.

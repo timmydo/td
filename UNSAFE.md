@@ -69,7 +69,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty-one value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -464,7 +464,7 @@ safe to run beside a running compositor; this is not, and two claims that
 different must not share one name.
 
 `MODE_PAGE_FLIP` (0xc018_64b0) joined for the landing after that, and it is
-the twentieth and last of the roster. It carries the 24-byte
+the twentieth request in the roster. It carries the 24-byte
 `drm_mode_crtc_page_flip`, which is four `u32` and a `u64`; the kernel's own
 handler takes the wider `drm_mode_crtc_page_flip_target`, but the request
 number is sized for the narrower struct and the repurposed field is read only
@@ -532,7 +532,7 @@ rather than believed, since the kernel copies a connector's mode and encoder
 arrays all-or-nothing.
 
 The request roster is enforced in code, not only in a test — one
-allow-list refuses anything outside the twenty before either entry point
+allow-list refuses anything outside the twenty-one before either entry point
 issues the syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.
@@ -583,11 +583,13 @@ that outlived a crash would leave a keyboard nothing can type on.
 specification. Its confinement tests pin the allow count, assembly body,
 syscall numbers, callers, and absence of unsafe from every other module;
 adding another syscall or scoped allow is an amendment there AND here. The
-four surfaces behind the one body are pinned to their modules —
-transport to `client.rs`/`conn.rs`/`server.rs`, terminal control to
-`pty.rs`, the absolute-axis range to `input.rs`, and private peer
-authentication to `server.rs` and the session socket policy in `session.rs`;
-no other module names `sys` at all.
+syscall families are pinned to their modules: transport to
+`client.rs`/`conn.rs`/`server.rs`, terminal control to `pty.rs`, absolute
+axis queries and evdev clock selection to `input.rs`, peer authentication
+to `server.rs` and `session.rs`, DRM to `drm.rs`, and the monotonic cutoff
+to `runtime.rs`. The runtime and session policy each have one total
+`sys::` reference, whose exact wrapper is pinned. No other module may
+reach a syscall wrapper.
 `conn.rs` is the client
 transport itself, extracted from `client.rs` so the terminal is a second
 USER of one connection rather than a second copy of it; the descriptor
@@ -732,6 +734,19 @@ build on it as a constraint.
 What this subsection settles is only that the answer was not "refuse `mmap`
 forever", which is the one way td could paint itself out of hardware
 rendering.
+
+The trusted evdev profile selects `CLOCK_MONOTONIC` with the additional
+`EVIOCSCLOCKID` request `0x400445a0`. Its operand is one live four-byte
+`i32`, fixed to clock ID 1; no caller supplies a clock or a request. Refusal
+is fatal before that reader starts. The compositor's `clock_gettime(2)`
+(syscall 228 on x86-64) uses the same fixed clock and a live 16-byte
+`[i64; 2]` timespec. It validates the seconds/nanoseconds ranges and returns
+nonwrapping nanoseconds. Both operations reuse the existing syscall body
+and add no scoped allow. Source confinement pins the clock, operand widths,
+request, syscall, and caller modules. Input selects the clock; runtime
+orders its cutoff sample after ordinary-screen restoration, exercised by
+its transition tests.
+
 
 ## 7. `td-util` — the diagnostics multicall
 

@@ -860,6 +860,8 @@ pub struct Scene {
     cursor_charge: BufferCharge,
     launcher: Launcher,
     help: Help,
+    attention: bool,
+    attention_draining: bool,
     status: String,
 }
 
@@ -894,6 +896,8 @@ impl Scene {
             cursor_charge: BufferCharge::none(),
             launcher: Launcher::new(),
             help: Help::default(),
+            attention: false,
+            attention_draining: false,
             status: String::new(),
         }
     }
@@ -2225,7 +2229,7 @@ impl Scene {
     /// Either overlay is modal: it owns the keyboard, withdraws pointer
     /// hover, and must not be clicked through to the tiles it covers.
     pub fn modal(&self) -> bool {
-        self.launcher.visible() || self.help.visible()
+        self.attention || self.launcher.visible() || self.help.visible()
     }
 
     pub fn launcher_checkpoint(&self) -> Launcher {
@@ -3140,6 +3144,41 @@ impl Scene {
             TITLE_TEXT,
             text_clip,
         );
+    }
+
+    pub(crate) fn attention_visible(&self) -> bool {
+        self.attention
+    }
+
+    pub(crate) fn attention_draining(&self) -> bool {
+        self.attention_draining
+    }
+
+    pub(crate) fn set_attention(&mut self, visible: bool) {
+        self.attention = visible;
+        self.attention_draining = false;
+        if visible {
+            self.launcher.apply(LauncherAction::Close);
+            self.help.set(false);
+        }
+    }
+
+    pub(crate) fn drain_attention(&mut self) {
+        self.attention_draining = true;
+    }
+
+    pub(crate) fn render_display(
+        &self,
+        frame: &mut [u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) {
+        if self.attention {
+            crate::attention::paint(frame, width, height, stride, self.attention_draining);
+        } else {
+            self.render(frame, width, height, stride);
+        }
     }
 
     pub fn render(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
@@ -9622,5 +9661,29 @@ mod tests {
         let mut frame = vec![100, 100, 100, 0];
         blend_pixel(&mut frame, 1, 1, 4, 0, 0, [50, 25, 0, 128]);
         assert_eq!(frame, [99, 74, 49, 0]);
+    }
+    #[test]
+    fn trusted_pixels_are_display_only_and_cover_the_whole_scene() {
+        let mut scene = Scene::new();
+        scene
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([8, 9, 10, 0], 100, 100),
+            )
+            .unwrap();
+        let mut ordinary = vec![0; 320 * 200 * 4];
+        scene.render(&mut ordinary, 320, 200, 320 * 4);
+        scene.set_attention(true);
+        let mut capture = vec![0; ordinary.len()];
+        scene.render(&mut capture, 320, 200, 320 * 4);
+        assert_eq!(capture, ordinary);
+        let mut display = vec![0xff; ordinary.len()];
+        scene.render_display(&mut display, 320, 200, 320 * 4);
+        assert_ne!(display, ordinary);
+        assert_eq!(&display[..4], &[0x28, 0x20, 0x18, 0]);
+        assert_eq!(&display[display.len() - 4..], &[0x28, 0x20, 0x18, 0]);
     }
 }

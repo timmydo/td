@@ -41,6 +41,8 @@ pub struct Framebuffer {
     fail_next_paint: bool,
     #[cfg(test)]
     fail_next_write: bool,
+    #[cfg(test)]
+    after_next_write: Option<Box<dyn FnOnce() + Send>>,
 }
 
 fn parse_number(path: &Path) -> Result<usize, String> {
@@ -206,6 +208,8 @@ impl Framebuffer {
             fail_next_paint: false,
             #[cfg(test)]
             fail_next_write: false,
+            #[cfg(test)]
+            after_next_write: None,
         })
     }
 
@@ -239,6 +243,8 @@ impl Framebuffer {
             writes: Vec::new(),
             fail_next_paint: false,
             fail_next_write: false,
+            #[cfg(test)]
+            after_next_write: None,
         })
     }
 
@@ -258,6 +264,11 @@ impl Framebuffer {
     #[cfg(test)]
     pub fn fail_next_write(&mut self) {
         self.fail_next_write = true;
+    }
+
+    #[cfg(test)]
+    pub fn after_next_write(&mut self, observe: impl FnOnce() + Send + 'static) {
+        self.after_next_write = Some(Box::new(observe));
     }
 
     /// Offset and length of every write this framebuffer has issued.
@@ -283,6 +294,9 @@ impl Framebuffer {
         surface: SurfaceKey,
         rgbs: [[u8; 3]; 2],
     ) -> Result<[usize; 2], String> {
+        if scene.attention_visible() {
+            return Ok([0; 2]);
+        }
         if self.comparison.len() != self.frame.len() {
             let additional = self.frame.len().saturating_sub(self.comparison.len());
             self.comparison
@@ -404,6 +418,10 @@ impl OutputBackend for Framebuffer {
         self.file
             .flush()
             .map_err(|e| format!("flush framebuffer: {e}"))?;
+        #[cfg(test)]
+        if let Some(observe) = self.after_next_write.take() {
+            observe();
+        }
         self.written
             .get_mut(start..end)
             .ok_or_else(|| format!("framebuffer shadow {start}..{end} is outside the image"))?

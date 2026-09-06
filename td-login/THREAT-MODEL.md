@@ -333,9 +333,12 @@ standard descriptor before spawning this helper. Its unprivileged
 terminal-exec wrapper refuses a failed session-cgroup placement before
 terminal code runs, and a new process group keeps the user terminal
 independent of the authority generation. This adds no credential-switch
-mechanism or human authentication policy here. FIDO2 release must wait
-for secure attention and trusted input; no login or `su` behavior is a
-substitute for that future authorization.
+mechanism or human authentication policy here. The paired compositor now
+reserves physical Ctrl+Alt+Esc for an inert trusted screen with exclusive
+input; it accepts no authorization. FIDO2 release still requires token
+enrollment/recovery, protected ownership and a presented prompt bound to
+its assertion. No login, `su` or keyboard-consent behavior substitutes for
+that authorization.
 
 ## 4. Privilege can only be dropped, never gained
 

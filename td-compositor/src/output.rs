@@ -420,7 +420,7 @@ pub trait OutputBackend {
     /// promise.
     fn paint(&mut self, scene: &Scene, damage: Damage) -> Result<Submission, String> {
         let target = self.begin_frame(damage)?;
-        scene.render(target.pixels, target.width, target.height, target.stride);
+        scene.render_display(target.pixels, target.width, target.height, target.stride);
         self.present()
     }
 }

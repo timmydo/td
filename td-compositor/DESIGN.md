@@ -880,8 +880,10 @@ why none of this may lean on it: an error out of a device's `apply` ends that
 reader thread, so the flush that would have paid the debt is gone with it and
 another device or the next client frame pays it instead.
 The shared logical-seat boundary spans a key decision through its runtime
-adapter delivery, so evdev inputs remain ordered behind that lock; partial
-pointer records return before acquiring either lock. Each adapter operation
+adapter delivery, so evdev inputs remain ordered behind that lock. Partial
+pointer records in the direct profile return before acquiring either lock;
+the trusted profile includes accumulation and cutoff filtering in the lock.
+Each adapter operation
 reacquires the scene runtime lock, so a Wayland commit may interleave between
 command, launcher, key, modifier, and pointer operations from one report. This
 keeps process launch outside the scene lock without changing evdev ordering.
@@ -3320,8 +3322,9 @@ The keyboard side of the per-client seat queue is active only while that
 client owns at least one keyboard resource, so keyboard-agnostic clients
 receive no keyboard deliveries.
 Evdev timestamps cross the adapter as explicit milliseconds modulo 2^32.
-They retain evdev's default realtime clock and can step when wall time changes;
-selecting a monotonic clock would require a separately reviewed ioctl surface.
+The direct profile retains evdev's default realtime clock. The trusted
+profile selects CLOCK_MONOTONIC and separately retains the full nanosecond
+timestamp for attention filtering; Wayland's millisecond field still wraps.
 All event nodes contribute to one logical seat state. Duplicate presses and
 unmatched releases are suppressed, a key held on two devices remains down
 until both release it, and an event node that closes releases its contribution.
@@ -3762,8 +3765,9 @@ trusted boundary and return immediately: once a record boundary is invalid,
 the parser cannot identify later installed descriptors itself and relies on
 the kernel's conforming ancillary framing.
 
-`td-compositor/src/sys.rs` contains the two scoped `unsafe` blocks. One raw
-`syscall5` body carries exactly:
+`td-compositor/src/sys.rs` has four scoped unsafe blocks: the five- and
+six-argument syscall bodies, descriptor adoption, and mapped-region access.
+The `syscall5` body carries:
 
 - sendmsg(2), to send the demo client's wl_shm descriptor, the server's XKB
   keymap descriptor, or a test request;
@@ -3774,10 +3778,14 @@ the kernel's conforming ancillary framing.
   result, and one server caller, to admit only uid 1000 on the private portal
   listener;
 - fcntl(2), with only `F_GETFL` and `F_SETFL`, to add `O_NONBLOCK` while one
-  clipboard source writes and restore the destination's prior status; and
+  clipboard source writes and restore the destination's prior status;
 - ioctl(2), for the four pinned terminal-control requests in section 12, the
   two pinned `EVIOCGABS` requests that read an absolute pointer's declared
-  axis range, and the four pinned DRM requests below that read a card.
+  axis range, EVIOCSCLOCKID fixed to CLOCK_MONOTONIC, and the fourteen DRM
+  requests below;
+- clock_gettime(2), fixed to CLOCK_MONOTONIC for the attention cutoff; and
+- munmap(2), for an owned dumb-buffer mapping. The six-argument body carries
+  only mmap(2), pinned to that buffer's shared read/write mapping.
 
 The DRM fourteen are reached only from `drm.rs`. Four READ —
 `DRM_IOCTL_VERSION`, `MODE_GETRESOURCES`, `MODE_GETCONNECTOR` and
@@ -3895,7 +3903,7 @@ temporarily adds `O_NONBLOCK`, retries against a five-second absolute deadline,
 and restores the complete prior status word before closing the endpoint. A
 receiver can therefore lose its own transfer but cannot park every later one.
 
-The crate denies unsafe globally; confinement tests pin the allow count, both
+The crate denies unsafe globally; confinement tests pin the allow count, all four
 unsafe bodies, syscall numbers, callers, and the absence of unsafe from every
 other target source file. Each developer tool is a separate crate root that
 also denies unsafe. Adding a syscall or another scoped allow amends this
@@ -3918,42 +3926,37 @@ its drop reaches the rostered close wrapper. The client clipboard source has
 its separately pinned adoption/conversion path. PTY slave acquisition retains
 its existing reopen-and-close helper and does not receive cross-UID files.
 
-The four surfaces behind that one body are pinned to their modules: descriptor
-transport is reachable only from `client.rs`, `conn.rs`, and `server.rs`,
-terminal control only from `pty.rs`, the absolute-axis range only from
-`input.rs`, and private peer authentication only from `server.rs`; no other
-module names `sys` at all. The extracted connection is crate-visible, so a
-module holding one reaches the transport without spelling `sys`: who may NAME
-`conn` is therefore pinned by the same confinement test as who may call the
-wrappers. That roster is `client.rs`, `conn.rs`, and `term_client.rs` — the two
-clients and the transport itself. A transport user is not thereby a syscall
-caller: `term_client.rs` names no `sys` and does not appear above.
+Confinement tests pin each wrapper family to its callers across every module:
+descriptor transport to `client.rs`, `conn.rs`, and `server.rs`; terminal
+control to `pty.rs`; absolute-axis recovery and evdev clock selection to
+`input.rs`; peer authentication to `server.rs` and `session.rs`; DRM to
+`drm.rs`; descriptor status changes to `conn.rs` and `drm.rs`; and the
+monotonic attention cutoff to `runtime.rs`. The complete family/module
+matrix also rejects a wrong-family call from an otherwise admitted module,
+and aliases cannot bypass it. The extracted connection is crate-visible,
+so its naming roster is separately pinned to `client.rs`, `conn.rs`, and
+`term_client.rs`. A transport user is not thereby a syscall caller:
+`term_client.rs` names no `sys`.
 
-`ioctl(2)` is the request-carrying one, so its roster is the
-confinement: a request outside the six is refused before the syscall, and a
-test pins each value, the single guard, the single entry point, and each
-wrapper's operand shape. Two of those values also pin a LENGTH. The size
-field of an evdev request number encodes `sizeof(struct input_absinfo)`, so
-`EVIOCGABS`'s 0x8018 prefix and the crate's own 24-byte buffer are two
-statements of one fact, and a test holds them to each other — the kernel copies
-the smaller of that size field and the struct's own size, so an oversized
-number is harmless while a buffer shortened without the number is an
-out-of-bounds write.
+`ioctl(2)` carries twenty-one value-pinned requests. One allow-list refuses
+any other value before either the ordinary or bounded-retry DRM entry point
+issues the syscall. Tests pin each value, the shared guard, both entry
+points, and each wrapper's operand shape. Two values also pin a length: the
+size field of an evdev request encodes `sizeof(struct input_absinfo)`, so
+`EVIOCGABS`'s 0x8018 prefix and the crate's 24-byte buffer express the same
+size. A test holds them together because shortening the buffer without
+changing the request number permits an out-of-bounds kernel write.
 
-This crate maps no memory: wl_shm pixels are copied out of client pools with
-`FileExt::read_exact_at` and the device is written with `seek`+`write_all`.
-The DRM/KMS output backend `APPLICATIONS.md` §M plans cannot keep that
-property, because a dumb buffer has no `write(2)` path. `UNSAFE.md` §6's
-mapping-class subsection therefore records what that landing must look like
-before it is written — `mmap`/`munmap` pinned to one owned card descriptor, a
-region type holding the length the mapping was created with, a `Drop` that
-unmaps, a lent slice rather than an escaping pointer, and confinement tests
-in the same guard style as the descriptor types above. It is an anticipation
-rather than an allowance: no source in the crate names `mmap`, the
-confinement tests still pin the absence of `unsafe` outside `sys.rs`, and the
-landing that adds a mapping amends both documents together. Naming
-the class now is the point, since it is the one shape the roster's
-syscall-instruction phrasing does not describe.
+Client wl_shm pixels are copied with `FileExt::read_exact_at`, and the file
+framebuffer is written with `seek` and `write_all`. The DRM dumb-buffer path
+owns a shared read/write mapping of one card descriptor at the offset the
+kernel returned for a buffer this crate created. `MappedRegion` retains the
+construction length, lends a mutable slice whose lifetime is tied to its
+borrow, and unmaps on drop; no pointer escapes. The four scoped unsafe
+bodies cover the two syscall instructions, received-descriptor adoption,
+and the borrowed mapped slice. Confinement tests pin these bodies, the
+mapping construction and length, and its unmap-before-handle-release order.
+`UNSAFE.md` §6 records the complete mapping contract.
 
 ## 5. Boot and recovery
 
@@ -5064,10 +5067,10 @@ is likewise the tty convention rather than a relaxation: owner read/write and
 tty group WRITE, which is how anything reaches a terminal it does not own,
 where the devpts default would be 0600 owned by group root.
 
-Stable Rust does not expose the required PTY operations. The widening adds
-x86-64 `SYS_IOCTL=16` to the existing raw body. Four of the entry point's
-six permitted request values are this section's; the other two are §2's
-`EVIOCGABS` pair, which no module here may name:
+Stable Rust does not expose the required PTY operations. The existing
+x86-64 `SYS_IOCTL=16` entry point permits twenty-one request values. Four
+are this section's; the others are the `EVIOCGABS` pair, fixed evdev clock
+selection, and fourteen DRM requests, which no module here may name:
 
 - `TIOCSPTLCK=0x40045431`, to unlock the slave;
 - `TIOCGPTPEER=0x5441`, to obtain the slave as a new owned descriptor;
@@ -6164,7 +6167,7 @@ kernel peer UID 1000 before any protocol access. Socket mode 0666 permits
 cross-UID connection, while the peer check supplies session admission.
 The existing private portal listener additionally retains its UID-1000
 check; separating that backend from applications remains a later identity
-increment. This does not yet provide secure attention or token consent.
+increment. The physical attention screen below supplies no token consent.
 Host-development direct mode retains its private socket permissions.
 
 The session policy is the only additional caller of the existing peer-UID
@@ -6203,3 +6206,77 @@ The terminal creates its shared-memory buffers in the parent of its own
 readiness socket. That writable client directory is independent of the
 compositor-owned display socket directory; startup and resize use the same
 client directory. A bare readiness filename without a directory is refused.
+
+## Physical secure attention
+
+Only the root-paired stock compositor profile reserves Ctrl+Alt+Esc. The
+Escape press opens an opaque, built-in screen with no pending authorization
+request. The evdev adapter alone can construct the private origin witness
+required by Runtime's transition method. Control, Wayland and portal clients
+have no transition request, and ordinary key/pointer APIs suppress input
+while the screen is active. Direct development mode leaves the chord alone.
+
+Opening withdraws keyboard focus, clears held-key and modifier snapshots
+with a new monotonic revision, cancels compositor drags, and withdraws
+pointer focus and grabs. Subsequent application commits cannot reacquire
+focus. Entry drops a client's implicit pointer grab with Leave, without
+synthesizing button releases. Real releases during attention stay private;
+a client that ignores Leave may retain its own drag state on return. The
+compositor clears its held-button state at this boundary.
+The input adapter captures all devices and suppresses other chords,
+modifiers, repeats and pointer reports. A fresh physical Escape press requests
+cancellation; capture persists until all held keys/buttons and pending
+pointer reports drain, including reports from another device between their
+button events and SYN_REPORT. Device loss clears that device's held state
+but cannot itself cancel the screen. Focus or repaint failure retains
+capture; it never restores ordinary routing after an uncertain transition.
+
+Scene::render_display alone includes the private screen. The output backend
+uses it instead of ordinary scene rendering, covering the entire output and
+all client cursors. Scene::render and render_omitting exclude those private
+pixels; a future screenshot/recording path must use that public rendering.
+The application pixel-evidence oracle returns zero while attention is up,
+so it cannot attribute private screen pixels to an application. No pixel
+capture or synthetic-input portal is implemented by this increment.
+
+This screen accepts no credential or approval and invokes no root operation.
+FIDO2 release and typed one-operation elevation remain unimplemented. Their
+future token acquisition must begin only after the complete immutable prompt
+is confirmed presented: Submission::Queued is not a presentation receipt.
+APPLICATIONS.md §W.4 requires a token assertion bound to each secret
+request, with exclusive CTAP mediation; keyboard consent cannot approve
+those requests. Ordinary elevation and hardware PIN policy retain their
+separate contracts in §L.1 and td-install/ENCRYPTION.md.
+
+Trusted evdev clients explicitly select `CLOCK_MONOTONIC` before reading.
+After cancellation has drained known held input, the runtime repaints the
+ordinary screen, restores focus, retries pending application readiness, and
+samples the same clock. Seat bookkeeping keeps that nonwrapping cutoff.
+Every device rejects events at or before it before any recovery or input
+state mutation, including records delayed in a returned batch or still in a
+kernel queue. Each device discards through its first `SYN_REPORT` under a
+new cutoff, even if the whole report has a newer timestamp: the input core
+can buffer a value before close and timestamp its report only when it
+flushes afterward. This conservatively drops the first wholly fresh report
+from an idle device as well. Later stale records are discarded through
+their report boundary; they cannot restore modifiers or pointer buttons.
+At each discarded report boundary, an absolute device re-reads EVIOCGABS
+and refreshes its held position, including when quarantine swallowed a
+SYN_DROPPED marker. A buttonless position update reaches ordinary routing
+only while attention is closed; a reopened screen suppresses it. Later
+button-only reports therefore use the current device position. No rejected
+key, button, wheel or relative-motion change is replayed by recovery.
+Evdev timestamps classify kernel reports, not electrical actuation time;
+deeper driver and hardware buffering remains a trusted-device limitation.
+The bindings lock covers this filter, pointer accumulation, and delivery.
+A failed transition restores input capture and attempts a full private
+repaint; every recovery failure is included in its returned diagnostic.
+
+Cancellation displays `RELEASE KEYS AND BUTTONS` until every admitted held
+key, button and partial pointer report drains. Device removal performs both
+keyboard and pointer cleanup before checking that condition. A stuck device
+can keep input captured; there is no timeout that silently returns input to
+applications. Unplugging the device drains its bookkeeping. The current
+fixed device roster requires compositor restart to add a replacement.
+Direct-profile readers retain their per-device partial-report fast path;
+they never claim secure attention or use the trusted timestamp cutoff.
