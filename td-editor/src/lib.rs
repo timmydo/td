@@ -22,6 +22,7 @@ mod menu;
 mod number;
 mod pointer;
 pub mod render;
+mod replace;
 pub mod replay;
 mod seat;
 mod search;

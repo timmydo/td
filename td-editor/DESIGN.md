@@ -1373,9 +1373,8 @@ history depth. Scratch mode disables Open/Save/Save As/Dictionary rather
 than pretending to persist its text. Only existing bindings are shown:
 Windows uses Ctrl+ labels, Emacs uses its C-/M- chord notation, and unbound
 items have no shortcut.
-Find/Find Next/Find Previous and Go To Line use the native contracts below.
-Replace remains a later prompt increment, not a hidden implementation
-behind these menus. Help > Command shares the named command prompt below.
+Find/Find Next/Find Previous, Replace and Go To Line use the native contracts
+below. Help > Command shares the named command prompt below.
 
 Menu actions dispatch the existing controller events, file-path requests and
 close coordinators. Keyboard, tab-close marks and menus share one native
@@ -1408,7 +1407,7 @@ popup and displays an enlargement notice; invisible/clipped rows can never
 be activated. A clipped-menu refusal does not reset pending prefix/mark/drag.
 A new physical key press still cancels native repeat before menu admission,
 as it does for every key. Escape/C-g with a menu open dismisses both the
-menu and any underlying notice; F10 only toggles the menu. At most twelve
+menu and any underlying notice; F10 only toggles the menu. At most thirteen
 rows exist, with static bounded labels, and painting and hit tests use the
 same panel geometry. Header geometry derives
 from the reference renderer's single menu-bar string. Colors remain warm
@@ -1656,11 +1655,68 @@ selection-away-and-back from reviving it; focus/keymap loss also clears it.
 Successful matches reveal the selected range through the ordinary view
 controller and never create an undo entry or change text revision.
 
-The three Find entries are followed by Go To Line. Complete panel fitting
-and scale bounds remain unchanged. Tests cover native chords
+The three Find entries are followed by Replace and Go To Line. Complete panel
+fitting uses the menu's current item count. Tests cover native chords
 in both profiles, query entry/cancel, both directions, explicit wrap,
 missing/stale/foreign targets, scalar byte limits and overlay-only pixels.
 The headless model/replay Find interface is unchanged.
+
+### Implemented native Replace
+
+Windows Ctrl+H and Edit > Replace open the same modal in both window modes;
+the menu supplies Emacs-profile access. Find and With are separate single-line
+UTF-8 fields, each capped at 4096 bytes. Find starts from a nonempty printable
+selection within that limit, otherwise the last submitted search query. With
+starts empty. Tab or Shift+Tab switches fields; printable translated scalars,
+Space, scalar Backspace and Ctrl+U edit only the active field. There is no
+clipboard entry, multiline/escape syntax, regex or case folding. Empty Find
+is refused without editing. Empty With is a deliberate deletion replacement.
+Typing never searches or edits document text. Repeated keys never act.
+
+Return finds the next match through the existing search history/controller,
+selecting and revealing it without editing. Reaching the end reports it;
+another explicit Return may wrap under Find's same target/query rules. Query
+edits invalidate pending wrap even if the old query is later restored. Alt+R
+replaces only a selection exactly equal to Find; otherwise it asks the user
+to select a match with Return. It neither searches nor advances implicitly.
+Alt+A replaces all nonoverlapping matches in the active document, independent
+of selection. Both replacements use the existing Insert/ReplaceAll controller
+commands, not typing/Auto Fill. Each successful text change is one ordinary
+undo transaction. A size/history limit refuses the whole edit and retains
+both fields for correction; no prefix of the replacement is applied.
+
+Replace All with no matches reports absence without dispatching or moving
+the viewport. With matches it collapses selection at document end; single
+replacement collapses at its replacement end. Identical Find/With reports
+unchanged text and creates no undo entry or revision, while keeping these
+normal selection-collapse semantics. Undo restores each edit's original
+directed selection. Replace All counts for status/no-match admission, then
+the model counts for admission and constructs the replacement: three bounded
+synchronous scans. This increment does not claim an event-loop latency ceiling.
+
+The modal remains open after searches and replacements. It captures editor
+identity, active tab, text revision and directed selection, refreshing that
+binding only after its own successful action. Other target changes refuse
+submission instead of silently operating on the changed target. Opening
+cancels input prefix/mark, drag, repeat, pending Paste and pending wrap while
+preserving selection. Document pointer actions are blocked. File/discard
+dialogs keep priority; focus/keymap loss pauses entry visibly without losing
+fields. Escape/C-g closes and cancels pending wrap; completed replacements
+stay edited and can be undone after closing. Window close dismisses entry
+before normal dirty-document questions. Neither cancellation path rolls back
+already confirmed edits.
+
+The overlay shows result, Find/With tails (24 scalars each with ellipses),
+active-field marker and action guidance. While paused, readiness replaces the
+result line without discarding it, keeping close/clear guidance in six rows
+at 320 pixels wide. Narrower windows retain the ordinary clipping rule. Field
+switches retain the result; a changed field or a new action supersedes it.
+Both fields plus retained search
+history hold at most 12 KiB of text, with no document-sized modal snapshot.
+Replace precedes Go To Line, making Edit thirteen rows: its complete popup
+requires 320 by 360 pixels at scale 1 (previously 336 high), multiplied by
+the integer scale. Windows Ctrl+H remains available below that height;
+the Emacs profile requires enlarging the window for menu access.
 
 ### Implemented named command prompt
 
@@ -1721,8 +1777,8 @@ input remains visible with an error for correction, including `2400` rather
 than silently truncating it to `240`. Backspace, Ctrl+U, Escape/C-g, repeat
 suppression, focus pause and pointer blocking match Go To Line. There is no
 new direct key binding. Fill Column follows Fill Paragraph, before the
-spelling commands. The largest complete menu keeps its existing twelve-row
-minimum unchanged.
+spelling commands. The larger Edit menu follows its current item-count
+minimum under the native menu contract.
 Format itself now requires 320 by 240 pixels at scale 1, up from 320 by 216;
 multiply both axes by the integer scale. At smaller heights its entire popup
 is refused with the existing enlargement notice. F6 and F7 remain available
@@ -1770,7 +1826,7 @@ document. Opening cancels prefix/mark, drag, repeat, pending search wrap and
 native Paste while preserving selection. Document pointer actions are blocked
 and file/discard dialogs retain priority. Focus/keymap loss pauses entry
 visibly without losing digits. Window close cancels it before normal close
-handling. The largest fixed menu now has twelve rows (a 320 by 336 pixel
+handling. The largest fixed menu has thirteen rows (a 320 by 360 pixel
 minimum at scale 1) and is shown only when
 its complete panel fits, using the existing scale bounds. Native tests cover
 both profiles, real digit/Return events, invalid input, focus pause, stale

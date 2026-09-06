@@ -353,6 +353,7 @@ struct Window {
     search: Option<crate::search::Prompt>,
     number: Option<crate::number::Prompt>,
     command: Option<crate::command::Prompt>,
+    replace: Option<crate::replace::Prompt>,
     searches: crate::search::History,
     spelling: crate::spelling::WindowState,
 }
@@ -449,6 +450,7 @@ impl Window {
             search: None,
             number: None,
             command: None,
+            replace: None,
             searches: crate::search::History::default(),
             spelling: crate::spelling::WindowState::default(),
         })
@@ -822,6 +824,7 @@ impl Window {
         self.search = None;
         self.number = None;
         self.command = None;
+        self.replace = None;
         self.searches.cancel_wrap();
         self.clipboard.incoming = None;
         self.menu = None;
@@ -869,6 +872,7 @@ impl Window {
             || self.search.is_some()
             || self.number.is_some()
             || self.command.is_some()
+            || self.replace.is_some()
             || self.prompt.is_some()
             || self.closing.is_some()
             || self.conflict.is_some()
@@ -1237,6 +1241,10 @@ impl Window {
             self.search_chord(chord, repeated)?;
             return Ok(false);
         }
+        if self.replace.is_some() {
+            self.replace_chord(chord, repeated)?;
+            return Ok(false);
+        }
         if self.menu.is_some() {
             self.menu_chord(chord, repeated)?;
             return Ok(false);
@@ -1294,6 +1302,16 @@ impl Window {
             }) => {
                 if !repeated {
                     self.command_request(tab, revision)?;
+                }
+                Ok(false)
+            }
+            Ok(Outcome::Request {
+                name: "replace",
+                tab,
+                revision,
+            }) => {
+                if !repeated {
+                    self.replace_request(tab, revision)?;
                 }
                 Ok(false)
             }
@@ -1477,6 +1495,7 @@ impl Window {
         let search_notice = self.search_notice();
         let number_notice = self.number_notice();
         let command_notice = self.command_notice();
+        let replace_notice = self.replace_notice();
         let closing_notice = self.closing_notice();
         let conflict_notice = self.conflict_notice();
         let mut raster =
@@ -1505,6 +1524,8 @@ impl Window {
             command_notice.as_deref()
         } else if search_notice.is_some() {
             search_notice.as_deref()
+        } else if replace_notice.is_some() {
+            replace_notice.as_deref()
         } else {
             self.notice.as_deref()
         };
@@ -1893,6 +1914,10 @@ impl Window {
             }
             Item::GoToLine => {
                 self.number_request(tab, revision, crate::number::Kind::Line)?;
+                return Ok(());
+            }
+            Item::Replace => {
+                self.replace_request(tab, revision)?;
                 return Ok(());
             }
             Item::FillColumn => {
@@ -2406,6 +2431,78 @@ impl Window {
         })
     }
 
+    fn replace_notice(&self) -> Option<String> {
+        self.replace.as_ref().map(|prompt| {
+            let paused = if self.device.is_none() || self.input.map.is_none() {
+                Some("Replace paused: restore seat/keymap.")
+            } else if !self.input.focused || !self.input.synchronized {
+                Some("Replace paused: focus; tap Shift.")
+            } else {
+                None
+            };
+            prompt.notice(paused)
+        })
+    }
+
+    fn replace_request(&mut self, tab: crate::model::TabId, revision: u64) -> Result<()> {
+        let prompt =
+            match crate::replace::Prompt::new(self.ui.editor(), tab, revision, &self.searches) {
+                Ok(prompt) => prompt,
+                Err(detail) => {
+                    self.notify(format!("Replace refused: {detail}"));
+                    return Ok(());
+                }
+            };
+        self.ui.dispatch(Event::CancelInput).map_err(error)?;
+        self.stop_pointer();
+        self.input.cancel_repeat();
+        self.clipboard.incoming = None;
+        self.searches.cancel_wrap();
+        self.menu = None;
+        self.search = None;
+        self.number = None;
+        self.command = None;
+        self.replace = Some(prompt);
+        self.notice = None;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn replace_chord(&mut self, chord: &str, repeated: bool) -> Result<()> {
+        if repeated {
+            return Ok(());
+        }
+        let Some(mut prompt) = self.replace.take() else {
+            return Ok(());
+        };
+        self.dirty = true;
+        if matches!(chord, "Escape" | "C-g") {
+            self.searches.cancel_wrap();
+            self.notice = None;
+            self.ui.dispatch(Event::CancelInput).map_err(error)?;
+            return Ok(());
+        }
+        let action = match chord {
+            "Return" => Some(crate::replace::Action::Find),
+            "M-r" => Some(crate::replace::Action::One),
+            "M-a" => Some(crate::replace::Action::All),
+            _ => None,
+        };
+        if let Some(action) = action {
+            if let Err(detail) = prompt.apply(&mut self.ui, &mut self.searches, action) {
+                self.searches.cancel_wrap();
+                self.notify(format!(
+                    "Replace cancelled: target changed or action refused ({detail})."
+                ));
+                return Ok(());
+            }
+        } else {
+            prompt.type_chord(chord, &mut self.searches);
+        }
+        self.replace = Some(prompt);
+        Ok(())
+    }
+
     fn command_request(&mut self, tab: crate::model::TabId, revision: u64) -> Result<()> {
         let prompt = match crate::command::Prompt::new(self.ui.editor(), tab, revision) {
             Ok(prompt) => prompt,
@@ -2423,6 +2520,7 @@ impl Window {
         self.search = None;
         self.number = None;
         self.command = Some(prompt);
+        self.replace = None;
         self.notice = None;
         self.dirty = true;
         Ok(())
@@ -2506,6 +2604,7 @@ impl Window {
         self.number = Some(prompt);
         self.search = None;
         self.command = None;
+        self.replace = None;
         self.clipboard.incoming = None;
         self.notice = None;
         self.dirty = true;
@@ -2617,6 +2716,7 @@ impl Window {
         self.search = Some(prompt);
         self.clipboard.incoming = None;
         self.command = None;
+        self.replace = None;
         self.notice = None;
         self.dirty = true;
         Ok(())
@@ -5191,6 +5291,100 @@ mod tests {
         assert!(w.notice.as_deref().unwrap().contains("no dictionary"));
         assert_eq!(w.ui.editor().document(tab).unwrap().text(), "");
         assert!(!w.ui.editor().document(tab).unwrap().dirty());
+        drain(&peer);
+    }
+
+    #[test]
+    fn native_replace_chord_menu_and_explicit_actions_share_undo_and_modal_guards() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Load(b"red red")).unwrap();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            let tab = w.ui.editor().active().unwrap();
+            let device = w.device.unwrap();
+            w.open_menu(crate::menu::Group::Edit).unwrap();
+            let index = crate::menu::Group::Edit
+                .items()
+                .iter()
+                .position(|item| *item == crate::menu::Item::Replace)
+                .unwrap();
+            w.activate_menu(index).unwrap();
+            assert!(w.replace.is_some());
+            w.chord("Escape", false).unwrap();
+            assert!(w.replace.is_none());
+            if profile == Profile::Windows {
+                configure(&mut w, 320, 336);
+                w.event(message(device, 4, &[0, 4, 0, 0, 0])).unwrap();
+                key(&mut w, device, 35); // physical Ctrl+H
+                w.event(message(device, 4, &[0, 0, 0, 0, 0])).unwrap();
+            } else {
+                w.chord("C-h", false).unwrap();
+                assert!(w.replace.is_none());
+                w.open_menu(crate::menu::Group::Edit).unwrap();
+                let index = crate::menu::Group::Edit
+                    .items()
+                    .iter()
+                    .position(|item| *item == crate::menu::Item::Replace)
+                    .unwrap();
+                w.activate_menu(index).unwrap();
+            }
+            assert!(w.replace.is_some() && w.pointer_modal());
+            for chord in ["r", "e", "d", "Tab", "b", "l", "u", "e"] {
+                w.chord(chord, false).unwrap();
+            }
+            for chord in ["Return", "M-r", "M-a", "Escape"] {
+                w.chord(chord, true).unwrap();
+            }
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "red red");
+            assert_eq!(w.ui.editor().document(tab).unwrap().selection().caret, 0);
+            key(&mut w, device, 28); // physical Return selects only.
+            assert_eq!(
+                w.ui.editor().document(tab).unwrap().selection().range(),
+                0..3
+            );
+            w.event(message(device, 4, &[0, 8, 0, 0, 0])).unwrap();
+            key(&mut w, device, 19); // physical Alt+R
+            w.event(message(device, 4, &[0, 0, 0, 0, 0])).unwrap();
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "blue red");
+            w.chord("M-a", false).unwrap();
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "blue blue");
+            assert_eq!(w.ui.editor().document(tab).unwrap().history_depth(), (2, 0));
+            w.chord("C-g", false).unwrap();
+            assert!(w.replace.is_none());
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "blue blue");
+            w.chord(
+                if profile == Profile::Windows {
+                    "C-z"
+                } else {
+                    "C-/"
+                },
+                false,
+            )
+            .unwrap();
+            assert_eq!(w.ui.editor().document(tab).unwrap().text(), "blue red");
+            drain(&peer);
+        }
+    }
+
+    #[test]
+    fn replace_pauses_retains_entry_rejects_stale_targets_and_closes_without_editing() {
+        let (mut w, peer) = file_dialog_fixture();
+        w.replace_request(1, 0).unwrap();
+        w.chord("x", false).unwrap();
+        let device = w.device.unwrap();
+        w.event(message(device, 2, &[2, SURFACE])).unwrap();
+        assert!(w.replace_notice().unwrap().contains("Replace paused"));
+        assert!(w.replace_notice().unwrap().contains("Find > x"));
+        focus(&mut w, device);
+        w.ui.dispatch(Event::New).unwrap();
+        w.chord("M-a", false).unwrap();
+        assert!(w.replace.is_none());
+        assert!(w.notice.as_deref().unwrap().contains("Replace cancelled"));
+        assert!(!w.ui.editor().document(1).unwrap().dirty());
+        assert!(!w.ui.editor().document(2).unwrap().dirty());
+        w.replace_request(2, 0).unwrap();
+        w.close();
+        assert!(w.replace.is_none());
         drain(&peer);
     }
 

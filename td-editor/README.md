@@ -36,6 +36,14 @@ F3 searches next and Shift+F3 previous; Emacs C-s/C-r open directional
 search. Type a literal case-sensitive query, Return to search, Ctrl+U to
 clear or Escape/Ctrl+G to cancel. Search reports the end before the next
 explicit search wraps. Entry is submitted, not incremental while typing.
+Windows Ctrl+H or Edit > Replace opens Find/With fields. Tab switches fields;
+Return finds the next match, Alt+R replaces only the selected exact match,
+and Alt+A replaces all matches in one undo step. Empty With deletes matches.
+Escape/Ctrl+G closes the dialog without rolling back completed edits; Undo
+is available after closing. Each field is limited to 4096 UTF-8 bytes and
+does not support clipboard entry yet. The Edit menu now needs 360 scaled
+pixels of height; Windows Ctrl+H works below that minimum, while Emacs
+requires enlarging the window for menu access.
 Edit > Go To Line or F6 accepts a one-based logical line in either profile;
 soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt

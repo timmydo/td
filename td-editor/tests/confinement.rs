@@ -34,6 +34,7 @@ fn source_inventory_and_allowances_are_closed() {
         "number.rs",
         "pointer.rs",
         "render.rs",
+        "replace.rs",
         "replay.rs",
         "seat.rs",
         "search.rs",

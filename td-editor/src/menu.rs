@@ -38,6 +38,7 @@ impl Group {
                 Find,
                 FindNext,
                 FindPrevious,
+                Replace,
                 GoToLine,
             ],
             Self::Format => &[
@@ -81,6 +82,7 @@ pub(crate) enum Item {
     Find,
     FindNext,
     FindPrevious,
+    Replace,
     GoToLine,
     Dictionary,
     NextMisspelling,
@@ -117,6 +119,7 @@ impl Item {
             Self::Find => "Find...",
             Self::FindNext => "Find Next",
             Self::FindPrevious => "Find Previous",
+            Self::Replace => "Replace...",
             Self::GoToLine => "Go To Line...",
         }
     }
@@ -147,6 +150,7 @@ impl Item {
             (Self::SelectAll, Profile::Windows) => "Ctrl+A",
             (Self::Fill, Profile::Emacs) => "M-q",
             (Self::Find, Profile::Windows) => "Ctrl+F",
+            (Self::Replace, Profile::Windows) => "Ctrl+H",
             (Self::Find, Profile::Emacs) => "C-s / C-r",
             (Self::FindNext, Profile::Windows) => "F3",
             (Self::FindPrevious, Profile::Windows) => "Shift+F3",
@@ -338,6 +342,21 @@ mod tests {
                 .is_none());
             assert!(menu
                 .panel(Geometry::new(320 * s, 240 * s, Scale::new(scale).unwrap()).unwrap())
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn edit_with_replace_requires_thirteen_complete_scaled_rows() {
+        for scale in 1..=4 {
+            let s = scale as usize;
+            let menu = menu(Group::Edit);
+            assert_eq!(Group::Edit.items().len(), 13);
+            assert!(menu
+                .panel(Geometry::new(320 * s, 359 * s, Scale::new(scale).unwrap()).unwrap())
+                .is_none());
+            assert!(menu
+                .panel(Geometry::new(320 * s, 360 * s, Scale::new(scale).unwrap()).unwrap())
                 .is_some());
         }
     }
