@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -220,6 +220,68 @@ impl std::fmt::Display for AdmissionKey {
 pub struct IdentifiedPeer {
     credential: PeerCredential,
     identity: Identity,
+    authentication: PeerIdentity,
+}
+
+enum PeerUidMap {
+    SameNamespace,
+    Extent(Vec<u8>),
+}
+
+/// A same-namespace UID map reports its parent column. In a remapped broker,
+/// prove namespace equality before interpreting that column as broker UIDs.
+fn read_peer_uid_map(pid: i32) -> io::Result<PeerUidMap> {
+    use std::io::Read;
+    fn bounded(path: &str) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(crate::auth::MAX_UID_MAP_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    if !crate::auth::broker_uid_map_is_identity(&bounded("/proc/self/uid_map")?) {
+        let own = fs::File::open("/proc/self/ns/user")?;
+        let path = format!("/proc/{pid}/ns/user");
+        let peer = fs::File::open(&path)?;
+        return read_namespace_map(
+            &own,
+            &peer,
+            || bounded(&format!("/proc/{pid}/uid_map")),
+            || fs::metadata(&path),
+        );
+    }
+    bounded(&format!("/proc/{pid}/uid_map")).map(PeerUidMap::Extent)
+}
+
+/// Keep namespace objects alive while sampling. A peer may enter a child
+/// namespace without changing its process pin; that is a different mapping.
+fn read_namespace_map(
+    own: &fs::File,
+    peer: &fs::File,
+    read_map: impl FnOnce() -> io::Result<Vec<u8>>,
+    current: impl FnOnce() -> io::Result<fs::Metadata>,
+) -> io::Result<PeerUidMap> {
+    let own = own.metadata()?;
+    let before = peer.metadata()?;
+    let identity = |metadata: &fs::Metadata| (metadata.dev(), metadata.ino());
+    let map = if identity(&own) == identity(&before) {
+        PeerUidMap::SameNamespace
+    } else {
+        let bytes = read_map()?;
+        if crate::auth::broker_uid_map_is_identity(&bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a remapped broker requires a count-one peer UID map",
+            ));
+        }
+        PeerUidMap::Extent(bytes)
+    };
+    if identity(&before) != identity(&current()?) {
+        return Err(io::Error::other(
+            "peer user namespace changed during admission",
+        ));
+    }
+    Ok(map)
 }
 
 impl IdentifiedPeer {
@@ -628,6 +690,14 @@ impl Drop for Connection<'_> {
 impl<'a> Connection<'a> {
     /// Resolve the peer once, before admission as well as authentication.
     pub fn identify(stream: &UnixStream, instances: &Instances) -> io::Result<IdentifiedPeer> {
+        Self::identify_with_map(stream, instances, read_peer_uid_map)
+    }
+
+    fn identify_with_map(
+        stream: &UnixStream,
+        instances: &Instances,
+        read_map: impl FnOnce(i32) -> io::Result<PeerUidMap>,
+    ) -> io::Result<IdentifiedPeer> {
         let credential = sys::peer_credential(stream)?;
         // Before the handshake, because this is the kernel's account of the
         // peer and the handshake is the peer's account of itself. It is taken
@@ -648,18 +718,64 @@ impl<'a> Connection<'a> {
         // connection lands here and this bus routes nothing between peers.
         // That is fail-closed working as intended rather than a fallback, and
         // it is why the image pins 7.x.
+        let mut authentication = PeerIdentity::unmapped(credential.uid);
         let identity = match sys::peer_pidfd(stream) {
             // Dropped at the end of this expression, and deliberately: the
             // answer is taken once, here, and never recomputed, so holding one
             // descriptor per connection would spend an fd on a question
             // nothing asks again.
-            Ok(pidfd) => instances.resolve(&RealProcfs, pidfd.as_raw_fd()),
+            Ok(pidfd) => match Self::peer_authentication(
+                &RealProcfs,
+                pidfd.as_raw_fd(),
+                credential,
+                read_map,
+            ) {
+                Ok(resolved) => {
+                    authentication = resolved;
+                    instances.resolve(&RealProcfs, pidfd.as_raw_fd())
+                }
+                Err(error) => {
+                    Identity::Unknown(format!("peer authentication identity failed: {error}"))
+                }
+            },
             Err(why) => Self::unidentifiable(&why),
         };
         Ok(IdentifiedPeer {
             credential,
             identity,
+            authentication,
         })
+    }
+
+    /// Bracket the UID-map read with the same process pin used for lineage.
+    /// The map selects only the EXTERNAL claim; it grants no application role.
+    fn peer_authentication(
+        procfs: &dyn Procfs,
+        pidfd: RawFd,
+        credential: PeerCredential,
+        read_map: impl FnOnce(i32) -> io::Result<PeerUidMap>,
+    ) -> io::Result<PeerIdentity> {
+        let invalid = || io::Error::other("the peer process pin could not be established");
+        let Named::Pid(pid) = procfs.named_by(pidfd) else {
+            return Err(invalid());
+        };
+        if pid <= 0 || pid != credential.pid {
+            return Err(invalid());
+        }
+        let identity = match read_map(pid)? {
+            PeerUidMap::SameNamespace => PeerIdentity::unmapped(credential.uid),
+            PeerUidMap::Extent(map) => PeerIdentity::from_uid_map(credential.uid, &map)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the peer UID map is malformed, unsupported or lacks UID coverage",
+                    )
+                })?,
+        };
+        if procfs.named_by(pidfd) != Named::Pid(pid) {
+            return Err(invalid());
+        }
+        Ok(identity)
     }
 
     /// Take a peer the listener accepted. Test callers that do not have an
@@ -692,7 +808,7 @@ impl<'a> Connection<'a> {
         let outbox = bus.outbox_for(stream.try_clone()?);
         Ok(Connection {
             stream,
-            shake: Handshake::new(PeerIdentity::unmapped(identified.credential.uid), guid),
+            shake: Handshake::new(identified.authentication, guid),
             guid: guid_text,
             credential: identified.credential,
             quota,
@@ -10508,6 +10624,185 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remapped_broker_refuses_namespace_changes_on_both_read_paths() {
+        let peer = fs::File::open("/proc/self/ns/user").unwrap();
+        let other = fs::File::open("/proc/self/ns/mnt").unwrap();
+        assert_ne!(
+            peer.metadata().unwrap().ino(),
+            other.metadata().unwrap().ino()
+        );
+        for own in [&peer, &other] {
+            assert!(read_namespace_map(
+                own,
+                &peer,
+                || Ok(b"1000 65537 1\n".to_vec()),
+                || other.metadata(),
+            )
+            .is_err());
+            assert!(read_namespace_map(
+                own,
+                &peer,
+                || Ok(b"1000 65537 1\n".to_vec()),
+                || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            )
+            .is_err());
+        }
+        assert!(matches!(
+            read_namespace_map(
+                &peer,
+                &peer,
+                || panic!("same namespace reads no map"),
+                || peer.metadata()
+            )
+            .unwrap(),
+            PeerUidMap::SameNamespace
+        ));
+        assert!(read_namespace_map(
+            &other,
+            &peer,
+            || Ok(b"0 0 4294967295\n".to_vec()),
+            || peer.metadata(),
+        )
+        .is_err());
+        assert!(matches!(
+            read_namespace_map(
+                &other,
+                &peer,
+                || Ok(b"1000 65537 1\n".to_vec()),
+                || peer.metadata(),
+            ).unwrap(),
+            PeerUidMap::Extent(bytes) if bytes == b"1000 65537 1\n"
+        ));
+    }
+
+    #[test]
+    fn authentication_maps_a_pinned_peer_but_keeps_its_external_uid() {
+        let process = Staged::new(Named::Pid(71), a_stat(1));
+        let credential = PeerCredential {
+            pid: 71,
+            uid: 65537,
+            gid: 65537,
+        };
+        let identity = Connection::peer_authentication(&process, 4, credential, |pid| {
+            assert_eq!(pid, 71);
+            Ok(PeerUidMap::Extent(b"1000 65537 1\n".to_vec()))
+        })
+        .unwrap();
+        assert!(identity.resolves(1000));
+        assert!(!identity.resolves(65537));
+        assert_eq!(identity.credential(), 65537);
+        let same = Connection::peer_authentication(&process, 4, credential, |_| {
+            Ok(PeerUidMap::SameNamespace)
+        })
+        .unwrap();
+        assert!(same.resolves(65537));
+        assert_eq!(same.credential(), 65537);
+    }
+
+    #[test]
+    fn authentication_refuses_reaping_across_the_uid_map_read() {
+        let credential = PeerCredential {
+            pid: 71,
+            uid: 65537,
+            gid: 65537,
+        };
+        for first in [
+            Named::Reaped,
+            Named::Unreadable,
+            Named::Pid(72),
+            Named::Pid(0),
+        ] {
+            let process = Staged::new(first, a_stat(1));
+            assert!(
+                Connection::peer_authentication(&process, 4, credential, |_| {
+                    panic!("an unpinned peer reached the UID map read")
+                })
+                .is_err()
+            );
+        }
+        for last in [Named::Reaped, Named::Unreadable, Named::Pid(72)] {
+            let process = Staged::new(Named::Pid(71), a_stat(1)).then(last);
+            assert!(
+                Connection::peer_authentication(&process, 4, credential, |_| {
+                    process.read.set(true);
+                    Ok(PeerUidMap::Extent(b"1000 65537 1\n".to_vec()))
+                })
+                .is_err()
+            );
+        }
+        let changed = Staged::new(Named::Pid(71), a_stat(1)).then(Named::Reaped);
+        assert!(
+            Connection::peer_authentication(&changed, 4, credential, |_| {
+                changed.read.set(true);
+                Ok(PeerUidMap::SameNamespace)
+            })
+            .is_err()
+        );
+        let process = Staged::new(Named::Pid(71), a_stat(1));
+        assert!(
+            Connection::peer_authentication(&process, 4, credential, |_| {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .is_err()
+        );
+        assert!(
+            Connection::peer_authentication(&process, 4, credential, |_| {
+                Ok(PeerUidMap::Extent(b"1000 65538 1\n".to_vec()))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn uid_map_failure_withholds_identity_in_the_actual_accept_path() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let instances = Instances::new();
+        let refused = Connection::identify_with_map(&server, &instances, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap();
+        assert!(matches!(refused.identity, Identity::Unknown(_)));
+        assert_eq!(refused.admission_key(), AdmissionKey::Unknown);
+        let malformed = Connection::identify_with_map(&server, &instances, |_| {
+            Ok(PeerUidMap::Extent(b"not a UID map\n".to_vec()))
+        })
+        .unwrap();
+        assert!(matches!(malformed.identity, Identity::Unknown(_)));
+        let credential = sys::peer_credential(&server).unwrap();
+        let mapped = Connection::identify_with_map(&server, &instances, |_| {
+            Ok(PeerUidMap::Extent(
+                format!("1000 {} 1\n", credential.uid).into_bytes(),
+            ))
+        })
+        .unwrap();
+        assert!(!mapped.identity.is_unknown());
+        assert!(mapped.authentication.resolves(1000));
+        assert_eq!(mapped.authentication.credential(), credential.uid);
+        assert_eq!(mapped.credential.uid, credential.uid);
+    }
+
+    #[test]
+    fn role_and_registration_modules_do_not_use_external_claim_resolution() {
+        for source in [
+            include_str!("policy.rs"),
+            include_str!("registry.rs"),
+            include_str!("lineage.rs"),
+        ] {
+            assert!(!source.contains(".resolves("));
+        }
+    }
+
+    #[test]
+    fn live_peer_admission_carries_the_kernel_uid_map_to_authentication() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let credential = sys::peer_credential(&server).unwrap();
+        let identified = Connection::identify(&server, &Instances::new()).unwrap();
+        assert!(!identified.identity.is_unknown());
+        assert_eq!(identified.authentication.credential(), credential.uid);
+        assert!(identified.authentication.resolves(credential.uid));
+    }
+
     struct PortalProcfs {
         supervisor: Caller,
         child: Caller,
@@ -11722,6 +12017,7 @@ mod tests {
     #[test]
     fn distinct_processes_of_one_jail_share_one_admission_key() {
         let peer = |pid| IdentifiedPeer {
+            authentication: PeerIdentity::unmapped(1000),
             credential: PeerCredential {
                 pid,
                 uid: this_uid(),
@@ -11743,6 +12039,7 @@ mod tests {
     #[test]
     fn unknown_processes_share_one_fail_closed_admission_key() {
         let peer = |pid| IdentifiedPeer {
+            authentication: PeerIdentity::unmapped(1000),
             credential: PeerCredential {
                 pid,
                 uid: this_uid(),

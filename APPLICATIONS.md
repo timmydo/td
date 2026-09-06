@@ -3514,16 +3514,46 @@ S: AGREE_UNIX_FD
 C: BEGIN
 ```
 
-Only `EXTERNAL`. The hex identity must **resolve to** `SO_PEERCRED.uid` —
-equality today, since every peer shares the session uid, but *stated as
-resolution rather than equality because equality breaks under per-app
-uids* (§L). A sandboxed app in a user namespace believes it is uid 1000
-and sends that; `SO_PEERCRED`, read outside the namespace, reports the
-mapped uid. Comparing the two for equality would drop every sandboxed
-connection the day per-app uids land, and the failure would present as
-"D-Bus stopped working" rather than as anything about identity. So the
-comparison goes through the instance's registered mapping from the
-outset, which costs nothing while the mapping is the identity.
+Only `EXTERNAL`. A stated UID must resolve to `SO_PEERCRED.uid` through the
+connecting process's kernel UID map. The transport holds its peer pidfd and
+requires it to name the same positive PID before and after reading
+`/proc/<pid>/uid_map`. This is the namespace at the map's open, not a promise
+that a peer cannot subsequently change namespaces. The result selects only
+which UID an EXTERNAL claim may spell: application identity still comes from
+the independent lineage check, and accounting and connection credentials keep
+the external kernel UID. The map grants no application or service role.
+
+The supported map is one nonempty extent, either the full identity map or the
+single-entry map td-jail creates. Reads are bounded to 128 bytes plus one
+oversize sentinel; malformed records, multiple extents, overflow, missing UID
+coverage and unreadable or reaped peers all withhold identity. Linux renders a
+same-namespace map relative to that namespace's parent. With a full identity
+map of its own, the broker can interpret that column directly; this is the
+stock image path and needs no cross-UID namespace-link access. A remapped
+broker instead compares the device/inode identities of its own and the peer's
+`/proc/<pid>/ns/user` targets, inside the same pidfd bracket. It holds both
+namespace files open to prevent inode reuse, and rechecks the peer's current
+namespace after either decision. A changed or unreadable namespace withholds
+identity. Equal namespaces use the unchanged kernel UID. Different namespaces
+use the peer's map as expressed in the broker's namespace. This is a sampled
+admission state, with no permission bypass or promise that the peer cannot
+change namespaces after the final observation. This supports the target
+recipe sandbox and host test brokers without requiring a privileged service.
+The remapped-broker path requires ptrace-read access to the peer's user
+namespace link. A remapped host broker without that access refuses the
+peer's identity; this path is not a general cross-UID container fallback.
+The initial-namespace stock broker uses the map-file path above instead.
+
+A remapped broker supports its own namespace and count-one peer maps; a peer
+in an ancestor namespace whose map cannot express its UID remains unsupported.
+An unsupported map yields `Unknown` and the existing denied-identity policy.
+Such a peer may still complete the ordinary unmapped EXTERNAL handshake and
+receive an explicit method refusal; empty EXTERNAL remains allowed and never
+establishes a role.
+
+A jailed app seeing UID 1000 can therefore authenticate while the broker
+records its different external UID. This does not activate reserved per-app
+UIDs, relax registration policy, or provide a host upstream-bus proxy.
 
 Two related notes on what `EXTERNAL` does *not* require. It does not
 require the broker's own uid to match the client's — the mechanism
@@ -3544,6 +3574,11 @@ specification reserves `ERROR` for a peer that "did not understand the
 arguments to the command" and requires the sender to "continue as if the
 command causing the `ERROR` had never been received". `REJECTED` there
 would end an attempt no one made.
+
+The jail's first registration connection claims its outside UID before
+unsharing. Its completion connection is made after installing the user
+namespace map and claims its inside UID. Both authenticate to the same
+external kernel UID; phase-two ownership checks retain that external UID.
 
 ### Messages
 
@@ -7864,7 +7899,8 @@ v2**, because both are silent breakages rather than missing features:
   peer credential disagree by construction, so a broker that compares
   them for equality drops every sandboxed connection the moment per-app
   uids land. The rule must be that the claimed uid is checked against
-  what the peer's credential *maps to*, and §D says so.
+  what the peer's credential *maps to*. The live transport now implements
+  that prerequisite through the kernel UID-map read specified in §D.
 - **`~/.td/app/<name>` is owned by the wrong uid.** State directories are
   created before the identity exists in v1, so the v2 landing needs a
   chown pass or idmapped mounts, and `td-authd` (§L.1) is where that
@@ -9448,13 +9484,12 @@ in every case is flatpak's: **bind the host's authority into the jail.**
 | `td-seatd` | absent and unneeded; the host owns its own devices |
 | `td-authd` | absent, and nothing replaces it. There is no elevated operation here, so host mode has no privileged path at all — and it must not grow one by reaching for the host's `sudo`, which would be a password prompt from td's own code (principle 7) and a shell (directive 3) |
 
-Rung 12a supplies the local td-busd endpoint needed by the existing
-registration handshake, but it does not yet make that endpoint a usable
-application bus for a caller mapped to uid 1000: the live broker transport
-still treats the outside `SO_PEERCRED` uid as an unmapped EXTERNAL claim.
-Mapped downstream authentication and the upstream host-bus proxy described
-below both remain §D work. Applications that need the bus therefore remain
-blocked there rather than bypassing td-busd or binding the host bus directly.
+Rung 12a supplies the local td-busd endpoint used by registration and jailed
+applications. The live broker resolves a mapped downstream EXTERNAL claim
+through the kernel UID map as specified in §D, while retaining the outside
+credential for policy. The upstream host-bus proxy described below remains
+unimplemented; applications can use the local broker's implemented services,
+not arbitrary services on the host bus.
 
 **Forwarding is the largest piece of work in this section, not the
 smallest.** §D makes `td-busd` a *bus daemon* — it owns the socket,

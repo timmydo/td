@@ -5947,9 +5947,11 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
         // which is full portal access for the one process that is certainly
         // confined. This is §D's "stage 1 refuses to proceed without the token",
         // placed where it is actually enforceable.
+        // Phase two runs after installing the user namespace map. EXTERNAL
+        // must claim our inside UID; the broker retains its outside credential.
         if let Err(error) = crate::bus::complete(
             &application.bus_socket,
-            outside_identity.uid,
+            inside_identity.uid,
             &registration,
             child.id(),
         ) {

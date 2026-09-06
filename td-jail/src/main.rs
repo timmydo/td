@@ -341,7 +341,7 @@ mod confinement {
         // grant. A literal that is the ARGUMENT has nowhere to be edited
         // between construction and the call.
         assert!(
-            launch.contains("identity.uid,\n        crate::bus::Registration {"),
+            launch.contains("outside_identity.uid,\n        crate::bus::Registration {"),
             "the registration is no longer built as the argument of the call \
              that sends it, so there is a window in which its own-set can be \
              emptied after this test has seen it"
@@ -378,10 +378,14 @@ mod confinement {
         // be green.
         assert!(at("sys::unshare_namespaces(") < at("command.spawn()"));
         assert!(at("command.spawn()") < at("bus::complete("));
+        assert!(at("install_launch_identity_maps(") < at("bus::complete("));
         assert!(at("ManagedCgroup::create(") < at("sys::unshare_namespaces("));
         assert!(at("application_cgroup.attach(child.id())") < at("bus::complete("));
         assert!(at("application_cgroup.attach(child.id())") < at("proof_writer.write_all(&token)"));
 
+        assert!(launch.contains(
+            "crate::bus::complete(\n            &application.bus_socket,\n            inside_identity.uid,"
+        ));
         let refused = launch
             .split_once("bus::complete(")
             .unwrap()

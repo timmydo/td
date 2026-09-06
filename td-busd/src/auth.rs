@@ -16,9 +16,9 @@
 //!
 //! * **A claim is VERIFIED against what the peer believes it is; the
 //!   connection is CHARGED to what the kernel says it is.** The two are the
-//!   same number today, since every peer shares the session uid, and they part
-//!   the day per-app uids land: a sandboxed app in a user namespace believes it
-//!   is uid 1000 and sends that, while `SO_PEERCRED` read outside the namespace
+//!   same number in the current stock session and differ for mapped peers. A
+//!   sandboxed app in a user namespace believes it is uid 1000 and sends that,
+//!   while `SO_PEERCRED` read outside the namespace
 //!   reports the mapped uid. Verifying by equality would refuse every jailed
 //!   client, and the failure would present as "D-Bus stopped working" rather
 //!   than as anything about identity. Recording the CLAIM would be the opposite
@@ -76,11 +76,67 @@ impl<'a> Guid<'a> {
     }
 }
 
+/// At most 128 bytes of kernel UID-map text; readers take one extra byte
+/// as an oversize sentinel before parsing.
+pub const MAX_UID_MAP_BYTES: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UidMap {
+    inside: u32,
+    outside: u32,
+    count: u32,
+}
+
+impl UidMap {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > MAX_UID_MAP_BYTES || !bytes.ends_with(b"\n") {
+            return None;
+        }
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines();
+        let mut fields = lines.next()?.split_ascii_whitespace();
+        let mut number = || {
+            let field = fields.next()?;
+            if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            field.parse::<u32>().ok()
+        };
+        let map = Self {
+            inside: number()?,
+            outside: number()?,
+            count: number()?,
+        };
+        if fields.next().is_some() || lines.next().is_some() || map.count == 0 {
+            return None;
+        }
+        if map.count != 1 && !(map.inside == 0 && map.outside == 0 && map.count == u32::MAX) {
+            return None;
+        }
+        // u32::MAX is the unmapped sentinel, never a member of an extent.
+        map.inside.checked_add(map.count)?;
+        map.outside.checked_add(map.count)?;
+        Some(map)
+    }
+}
+
+/// Reading another process's uid_map expresses its second column in the
+/// reader's namespace, except when both share a noninitial namespace. A full
+/// identity map makes that exception harmless; otherwise compare namespaces.
+pub fn broker_uid_map_is_identity(bytes: &[u8]) -> bool {
+    UidMap::parse(bytes)
+        == Some(UidMap {
+            inside: 0,
+            outside: 0,
+            count: u32::MAX,
+        })
+}
+
 /// Who the peer is, and what identity it may claim.
 ///
 /// `credential` is what `SO_PEERCRED` reported OUTSIDE any namespace the peer
-/// is in; `claimable` is the uid that peer sees itself as. They are equal for
-/// an unmapped peer, which is every peer today.
+/// is in; `claimable` is the UID resolved through that peer's kernel UID map.
+/// The transport pins the connecting process across the map read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerIdentity {
     credential: u32,
@@ -96,13 +152,25 @@ impl PeerIdentity {
         }
     }
 
-    /// A peer inside a user namespace, from its registered jail instance: it
-    /// believes it is `claimable`, and the kernel reports `credential`.
+    /// Pair an external credential with a separately resolved inside claim.
+    /// Neither this constructor nor the claim grants an application role.
     pub fn mapped(credential: u32, claimable: u32) -> Self {
         Self {
             credential,
             claimable,
         }
+    }
+
+    /// Resolve a supported kernel map without changing the external UID.
+    /// The peer can choose its inside UID. This claim must never authorize
+    /// an operation; only the external credential and lineage carry roles.
+    pub fn from_uid_map(credential: u32, bytes: &[u8]) -> Option<Self> {
+        let map = UidMap::parse(bytes)?;
+        let offset = credential.checked_sub(map.outside)?;
+        if offset >= map.count {
+            return None;
+        }
+        Some(Self::mapped(credential, map.inside.checked_add(offset)?))
     }
 
     /// The uid the broker charges this connection to: what the kernel
@@ -570,6 +638,69 @@ mod tests {
     fn feed(shake: &mut Handshake<'_>, bytes: &[u8]) -> String {
         let fed = shake.feed(bytes).expect("the handshake accepted the bytes");
         String::from_utf8(fed.reply).expect("replies are ASCII")
+    }
+
+    #[test]
+    fn a_uid_map_changes_only_the_claim() {
+        let mapped =
+            PeerIdentity::from_uid_map(65537, b"      1000      65537          1\n").unwrap();
+        assert!(mapped.resolves(1000));
+        assert!(!mapped.resolves(65537));
+        assert_eq!(mapped.credential(), 65537);
+        assert!(PeerIdentity::from_uid_map(65536, b"1000 65537 1\n").is_none());
+        assert!(PeerIdentity::from_uid_map(65538, b"1000 65537 1\n").is_none());
+        assert!(PeerIdentity::from_uid_map(1005, b"2000 1000 10\n").is_none());
+    }
+
+    #[test]
+    fn a_complete_broker_identity_map_needs_no_namespace_comparison() {
+        let initial = b"         0          0 4294967295\n";
+        assert!(broker_uid_map_is_identity(initial));
+        for uid in [0, 1000, 65537, u32::MAX - 1] {
+            let identity = PeerIdentity::from_uid_map(uid, initial).unwrap();
+            assert!(identity.resolves(uid));
+            assert_eq!(identity.credential(), uid);
+        }
+        assert!(PeerIdentity::from_uid_map(u32::MAX, initial).is_none());
+        for other in [
+            b"0 1000 1\n".as_slice(),
+            b"1000 1000 1\n",
+            b"0 0 4294967294\n",
+        ] {
+            assert!(!broker_uid_map_is_identity(other));
+        }
+    }
+
+    #[test]
+    fn malformed_or_unsupported_uid_maps_are_refused() {
+        for invalid in [
+            "",
+            "1000 65537 1",
+            "1000 65537 1\n\n",
+            "1000 65537 1 extra\n",
+            "1000 65537\n",
+            "1000 65537 0\n",
+            "1000 65537 2\n",
+            "0 0 4294967294\n",
+            "-1 65537 1\n",
+            "+1000 65537 1\n",
+            "1000 65537 +1\n",
+            "1000 65537 1\n2000 65538 1\n",
+            "4294967295 65537 1\n",
+            "1000 4294967295 1\n",
+            "1000 65537 4294967295\n",
+            "1000 65537 4294967296\n",
+            "1000 65537 1\0\n",
+            "1000 65537 １\n",
+        ] {
+            assert!(
+                PeerIdentity::from_uid_map(65537, invalid.as_bytes()).is_none(),
+                "{invalid:?}"
+            );
+        }
+        let oversized = format!("{}1000 65537 1\n", " ".repeat(MAX_UID_MAP_BYTES));
+        assert!(PeerIdentity::from_uid_map(65537, oversized.as_bytes()).is_none());
+        assert!(PeerIdentity::from_uid_map(65537, &[0xff, b'\n']).is_none());
     }
 
     /// §D's transcript, byte for byte.
