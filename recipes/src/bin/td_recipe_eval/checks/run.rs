@@ -276,8 +276,9 @@ impl Drop for TempImages {
 
 /// `lock` is the ladder lock, acquired by the caller and held across `setup()` + the
 /// build below; we RELEASE it (drop) once the images are copied/built out and before the
-/// unbounded interactive boot, so other ladder builds/checks are not blocked for the
-/// whole session.
+/// unbounded interactive boot, so a `clear-store` or fsck, each of which waits for every
+/// holder, is not held out for the whole session. Builds and checks share the ladder and
+/// wait on this hold only when an eviction cap is armed, here or in theirs.
 pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> {
     // Locate host qemu FIRST, before the (potentially multi-minute) build: if qemu
     // is absent the tool can only fail, so fail fast rather than after a full build.
@@ -340,7 +341,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     // Release the ladder lock now, BEFORE the unbounded interactive boot: this process
     // stays alive so the reaper never touches our scratch, and the boot reads only the
     // private copies. Holding the lock across an unbounded interactive session would
-    // block every other ladder build/check the whole time.
+    // hold a `clear-store` or fsck out the whole time; builds and checks share it
+    // unless an eviction cap is armed, here or in theirs.
     drop(lock);
 
     println!(

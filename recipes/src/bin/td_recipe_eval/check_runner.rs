@@ -182,7 +182,7 @@ pub fn verify_store_cli(args: &[String]) -> Result<(), String> {
     let runner = RecipeCheckRunner::new(root, &scratch_name("verify-store", &[]))?;
     // Hold the ladder lock across the fsck so it sees a stable cache: a concurrent build
     // commit or a `clear-store` would otherwise race the re-hash (spurious "corruption") or
-    // swap the whole cache out from under it. Same lock `run`/`clear-store` take.
+    // swap the whole cache out from under it. Same lock file `run`/`clear-store` take.
     let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
     runner.verify_store()
 }
@@ -377,8 +377,7 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
-    runner.setup()?;
+    let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::run(&runner)
 }
 
@@ -410,8 +409,7 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
-    runner.setup()?;
+    let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::run_erofs(&runner)
 }
 
@@ -447,8 +445,7 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
-    runner.setup()?;
+    let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::run_system(&runner)
 }
 
@@ -483,8 +480,7 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
-    runner.setup()?;
+    let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::run_net(&runner)
 }
 
@@ -517,8 +513,7 @@ pub fn qemu_boot_kexec_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let _lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
-    runner.setup()?;
+    let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::run_kexec(&runner)
 }
 
@@ -562,12 +557,12 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let scratch_name = scratch_name("run", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
-    let lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
-    runner.setup()?;
+    let lock = lock_ladder_for_run(&runner)?;
     // The interactive boot runs unbounded (until the operator quits qemu), so hand the
-    // ladder lock to the runner: it releases it after the build, before the boot, so the
-    // whole ladder is not blocked for the entire session (re #541, Codex review). setup()
-    // above and the build inside run() still hold it.
+    // ladder lock to the runner: it releases it after the build, before the boot, so a
+    // `clear-store` or fsck is not held out for the entire session (re #541, Codex
+    // review). The setup inside the acquisition above and the build inside run()
+    // still hold it.
     crate::checks::run::run(&runner, lock)
 }
 
@@ -620,10 +615,10 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
     // below can recover from: reporting it here costs seconds, and reporting it
     // there costs the climb.
     crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Explicit)?;
-    let lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
-    runner.setup()?;
+    let lock = lock_ladder_for_run(&runner)?;
     // The lock goes to the callee: it releases it once the volume is built and
-    // before the qcow2 conversion, which reads only the bundle directory.
+    // before the qcow2 conversion, which reads only the private TMPDIR scratch
+    // the bundle staged out, guarded against the ladder as `run`'s is.
     crate::checks::bundle::run(&runner, lock, &options)
 }
 
@@ -1621,8 +1616,12 @@ fn selected_check_runner(stem: &str, index: usize) -> Result<CheckRunner, String
 }
 
 /// How a caller holds the ladder: EXCLUSIVE for whole-ladder operations
-/// (`clear-store`, the fsck, the boot harnesses), SHARED for a build or check,
-/// which reads the warm cache and writes only its own pid-tagged scratch.
+/// (`clear-store`, the fsck, the seed-digest generator), SHARED for a build,
+/// a check, or a boot harness, each of which reads the warm cache and writes
+/// only its own claimed scratch, unless an eviction cap arms it exclusive. A
+/// harness boots from a store it staged into that scratch, so its boots —
+/// hours of them for the system oracle — are nothing a peer build needs to
+/// wait behind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LadderLock {
     Shared,
@@ -1642,9 +1641,9 @@ fn ladder_lock_mode(cache_cap: Option<u64>) -> LadderLock {
     }
 }
 
-/// Take the ladder for a build or check, holding it for the WHOLE run — setup
-/// included. One acquisition, so no window where the run holds nothing and a
-/// `clear-store` could wipe the tree out from under it.
+/// Take the ladder for a build, a check, or a boot harness, holding it for the
+/// WHOLE run — setup included. One acquisition, so no window where the run
+/// holds nothing and a `clear-store` could wipe the tree out from under it.
 fn lock_ladder_for_run(runner: &RecipeCheckRunner) -> Result<File, String> {
     lock_ladder_for_run_with_cache_cap(runner, explicit_ladder_cache_cap())
 }
@@ -7780,6 +7779,101 @@ chmod 755 '{}'
         assert_eq!(ladder_lock_mode(Some(1)), LadderLock::Exclusive);
         assert_eq!(ladder_lock_mode(parse_cache_cap(Some("0"))), LadderLock::Shared);
         assert_eq!(ladder_lock_mode(parse_cache_cap(Some("4096"))), LadderLock::Exclusive);
+    }
+
+    /// Which entries may hold the ladder EXCLUSIVELY, pinned in source because the
+    /// compiler cannot see what a mode costs: a boot harness holding it that way for
+    /// its whole run starves every worktree's gates on the machine. Every entry that
+    /// boots or bundles acquires through `lock_ladder_for_run` and nothing else; the
+    /// exclusive literal survives only where the whole ladder is rewritten or read as
+    /// a whole, plus the policy that arms it for an eviction cap and the acquisition
+    /// that honours it. One file suffices: `lock_ladder`, `lock_file` and
+    /// `LadderLock` are private to this module.
+    #[test]
+    fn only_whole_ladder_operations_take_the_ladder_exclusively() {
+        let src = include_str!("check_runner.rs");
+        let shipped = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(at) => src.get(..at).unwrap_or(src),
+            None => src,
+        };
+        // A call of `name`, not a longer identifier that ends in it
+        // (`open_lock_file(`, an `unlock_*` helper).
+        fn calls(line: &str, name: &str) -> bool {
+            line.match_indices(name).any(|(at, _)| {
+                !line
+                    .get(..at)
+                    .and_then(|head| head.chars().next_back())
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+        }
+        let mut current = "";
+        let mut exclusive = std::collections::BTreeSet::new();
+        let mut through_run = std::collections::BTreeSet::new();
+        let mut direct = std::collections::BTreeSet::new();
+        for line in shipped.lines().map(str::trim) {
+            if line.starts_with("//") {
+                continue;
+            }
+            // A signature line starts a new attribution, whatever qualifies its
+            // `fn`; a body folded onto that line is still scanned below.
+            let mut words = line.split_whitespace();
+            let name = words
+                .by_ref()
+                .find(|w| {
+                    !matches!(
+                        *w,
+                        "pub" | "pub(crate)" | "pub(super)" | "const" | "async" | "unsafe"
+                    )
+                })
+                .filter(|w| *w == "fn")
+                .and_then(|_| words.next());
+            if let Some(name) = name {
+                current = name.split(['(', '<']).next().unwrap_or(name);
+            }
+            if line.contains("LadderLock::Exclusive") {
+                exclusive.insert(current);
+            }
+            if calls(line, "lock_ladder_for_run(") {
+                through_run.insert(current);
+            }
+            // A second acquisition beside the shared one would hold the ladder
+            // exclusively without spelling the literal: `lock_file` has no mode.
+            if calls(line, "lock_ladder(") || calls(line, "lock_file(") {
+                direct.insert(current);
+            }
+        }
+        let whole_ladder: std::collections::BTreeSet<&str> = [
+            "clear_ladder",
+            "verify_store_cli",
+            "seed_digests_cli",
+            "ladder_lock_mode",
+            "lock_ladder",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            exclusive, whole_ladder,
+            "only a whole-ladder operation may spell LadderLock::Exclusive"
+        );
+        for harness in [
+            "qemu_boot_cli",
+            "qemu_boot_erofs_cli",
+            "qemu_boot_system_cli",
+            "qemu_boot_net_cli",
+            "qemu_boot_kexec_cli",
+            "run_cli",
+            "bundle_cli",
+        ] {
+            assert!(
+                through_run.contains(harness),
+                "{harness} must take the ladder through lock_ladder_for_run: shared unless \
+                 eviction is armed, and one acquisition across setup and the run"
+            );
+            assert!(
+                !direct.contains(harness),
+                "{harness} must not take the ladder or a lock file directly"
+            );
+        }
     }
 
     // `clear-store` must take the SEED store's commit lock as well as the cache's, and it
