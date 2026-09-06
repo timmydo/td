@@ -21,7 +21,7 @@ The safe, dependency-free library implements UTF-8/BOM/LF/CRLF conversion,
 scalar edits and selection, tabs, bounded undo/redo with saved-state tracking,
 literal search/replace, paragraph filling and Auto Fill. Logical Windows and
 Emacs keys share those commands. The controller also handles visual navigation
-and pointer selection. Dialogs, clipboard, spelling and actual file I/O produce
+and pointer selection. Dialogs, clipboard, spelling and window file I/O produce
 an explicit adapter request. The Wayland scratch preview accepts keyboard
 editing with both profiles; no pointer input, GPU renderer, filesystem
 Open/Save, remote socket or tmc integration is claimed yet. Do not set
@@ -45,6 +45,30 @@ controller with framed commands.
 save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector
 reference. It also launches the real replay executable without a display.
+
+`src/files.rs` now supplies the synchronous file-transaction adapter: bounded
+regular-file Open and baselines, external-change detection, metadata-checked
+atomic Save, and no-clobber Save As. It preserves BOM/line endings through
+the model's encoded snapshots. Errors distinguish publication attempts from
+confirmed publication and report temporary cleanup failures. Inline tests
+exercise real files, failures at each save stage, concurrent changes and
+exact saved-state acknowledgements. The worker queue, tab associations and
+window prompts are not connected yet: the window still cannot Open or Save.
+See DESIGN's file-safety section for metadata restrictions and race limits.
+
+An optional kernel attribute test needs a dedicated UTF-8 fixture with an
+extended attribute (for example one created with `setfattr -n user.test -v x`).
+No attribute tool is a build or runtime dependency:
+
+```text
+TD_EDITOR_TEST_XATTR_FILE=/absolute/path/to/dedicated-fixture cargo test --frozen --manifest-path td-editor/Cargo.toml attribute_fixture_is_refused_without_touching_it -- --ignored
+```
+
+Likewise, `TD_EDITOR_TEST_FIFO` can name a dedicated FIFO for the ignored
+`fifo_fixture_is_refused_without_waiting_for_a_writer` test. It must return
+without a writer both for an initial FIFO and a regular file replaced by
+one between inspection and open. The ordinary suite also checks devices,
+directories, symlinks and sockets. Neither fixture is needed by default.
 
 `src/layout.rs` adds an allocation-free visual-row and scalar-cell map:
 soft wrapping, tab widths, caret affinity, pixel hit testing, vertical/page

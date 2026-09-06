@@ -68,7 +68,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
-| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`; plus one scoped descriptor adoption |
+| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport for bounded credential replies |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -2036,14 +2036,28 @@ amendment here and in `APPLICATIONS.md` §K in the same landing.
 
 ## 14. `td-editor` — the Wayland scratch editor
 
-The editor's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
-function-scoped instruction: `recvmsg` (47), `sendmsg` (46), and `fcntl` (72).
+The editor's `sys.rs` carries exactly FOUR x86-64 Linux syscalls through one
+function-scoped instruction: `recvmsg` (47), `sendmsg` (46), `fcntl` (72),
+and `flistxattr` (196).
 A second function-scoped allowance adopts newly installed nonnegative
 descriptors into `OwnedFd`. Safe `std` owns connection setup, byte-only sends,
 timeouts, file creation/unlinking, positional pixel writes, and every close.
 No raw pointer or unowned received descriptor escapes this private module.
 Other architectures are refused at compile time rather than inheriting its
 ABI. The core, layout, renderer and controller still have no raw boundary.
+
+`flistxattr` is the file adapter's only raw operation. `files.rs` alone calls
+`has_attributes` with a borrowed, opened regular file: the destination before
+replacement and the prepared/published temporary inode. The wrapper fixes
+both list pointer and size to zero, returns whether the kernel reports any
+listable names, and propagates every query error. No name, value, allocation,
+attribute mutation, descriptor adoption or caller-selected pointer crosses
+this boundary. Stable `std` has no extended-attribute query. File ownership
+and mode use safe `fchown`/`File::set_permissions`, with readback; ordinary
+open/read/write, hard-link publication, rename, unlink and sync use `std` too.
+An unsupported query refuses saving, not just replacement. Attributes hidden
+from the calling credentials are not proven absent by Linux's listing API;
+the exact supported-file boundary is recorded in `td-editor/DESIGN.md`.
 
 `fcntl` is pinned to `F_DUPFD_CLOEXEC` (1030), minimum descriptor 3. Its only
 production caller duplicates the borrowed descriptor from `WAYLAND_SOCKET`;
@@ -2102,7 +2116,7 @@ control test checks cleanup beyond unrecognized records and invalid entries.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child exec,
 raw environment-fd adoption or other received-fd consumer is authorized here. A
-fourth syscall, another fcntl command, another caller, incoming descriptor
+fifth syscall, another fcntl command, another caller, incoming descriptor
 consumer, or additional allowance amends this section and
 `td-editor/DESIGN.md` in the same landing.
 

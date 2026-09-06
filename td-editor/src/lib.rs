@@ -1,8 +1,9 @@
 #![deny(unsafe_code)]
 
-//! Safe editor state and explicit adapters. Only the window adapter accesses
-//! the environment, clock, filesystem and Wayland connection.
+//! Safe editor state and explicit adapters. File and window adapters own I/O;
+//! the document core has no environment, clock or filesystem access.
 
+pub mod files;
 pub mod fill;
 #[path = "../../td-compositor/src/font.rs"]
 pub mod font;

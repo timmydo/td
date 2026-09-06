@@ -11,6 +11,7 @@ compile_error!("the editor window transport requires Linux x86-64");
 const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
 const SYS_FCNTL: usize = 72;
+const SYS_FLISTXATTR: usize = 196;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
@@ -75,6 +76,11 @@ fn result(value: isize) -> io::Result<usize> {
         return Err(io::Error::from_raw_os_error((-value) as i32));
     }
     Ok(value as usize)
+}
+
+/// Query list size only: no caller pointer, name, value or mutation.
+pub(super) fn has_attributes(file: &File) -> io::Result<bool> {
+    result(syscall3(SYS_FLISTXATTR, file.as_raw_fd() as usize, 0, 0)).map(|size| size != 0)
 }
 
 /// Duplicate, never adopt or close, the environment's borrowed descriptor.

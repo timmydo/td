@@ -18,6 +18,7 @@ fn source_inventory_and_allowances_are_closed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(!root.join("build.rs").exists());
     let expected: BTreeSet<_> = [
+        "files.rs",
         "fill.rs",
         "keys.rs",
         "keyboard.rs",
@@ -153,6 +154,7 @@ fn source_inventory_and_allowances_are_closed() {
             raw_module_tokens(&text),
             match name.as_str() {
                 "lib.rs" => 1,
+                "files.rs" => 1,
                 "wayland.rs" => 4,
                 _ => 0,
             },
@@ -169,13 +171,15 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x9c3db6af4d495727,
+        hash, 0x2afd9e3fab65d666,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
         "const SYS_SENDMSG: usize = 46;",
         "const SYS_RECVMSG: usize = 47;",
         "const SYS_FCNTL: usize = 72;",
+        "const SYS_FLISTXATTR: usize = 196;",
+        "syscall3(SYS_FLISTXATTR, file.as_raw_fd() as usize, 0, 0)",
         "const F_DUPFD_CLOEXEC: usize = 1030;",
         "#[allow(unsafe_code)]\nfn syscall3(",
         "#[allow(unsafe_code)]\nfn adopt(",
@@ -185,6 +189,21 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert!(!raw.contains("#![allow("));
     assert_eq!(raw.matches("core::arch::asm!").count(), 1);
     assert_eq!(raw.matches("OwnedFd::from_raw_fd").count(), 1);
+    let files = include_str!("../src/files.rs");
+    assert_eq!(files.matches("crate::sys::has_attributes(file)").count(), 1);
+    assert_eq!(files.matches("crate::sys::").count(), 1);
+    for pin in [
+        "const O_NOFOLLOW: i32 = 0o400000;",
+        "const O_NONBLOCK: i32 = 0o4000;",
+        "const O_DIRECTORY: i32 = 0o200000;",
+        ".custom_flags(O_NOFOLLOW | O_NONBLOCK)",
+        "temporary.file.sync_all()?;",
+        "location.parent.sync_all()?;",
+        "fs::rename(&temporary.path, &location.path)?;",
+        "fs::hard_link(&temporary.path, &location.path)",
+    ] {
+        assert!(files.contains(pin), "file transaction pin: {pin}");
+    }
     let adapter = include_str!("../src/wayland.rs");
     assert_eq!(adapter.matches("Keymap::parse(source)").count(), 1);
     assert_eq!(adapter.matches("File::from(fd)").count(), 1);

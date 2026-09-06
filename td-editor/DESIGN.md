@@ -13,8 +13,10 @@ The safe document core and `td-editor --replay` are implemented. They cover
 UTF-8/file-format conversion, scalar edits and selection, bounded tabs and
 undo/redo, save-snapshot state tracking, literal search/replace, paragraph
 filling, Auto Fill, and logical Windows/Emacs key dispatch. The core opens no
-files and reads no environment or clocks. File baselines/metadata, actual
-save I/O, pointer input, GPU rendering, spelling and the
+files and reads no environment or clocks. The synchronous `files::Session`
+adapter now implements bounded file baselines and atomic save I/O, separately
+from the model. Its worker scheduling, window connection and prompts,
+pointer input, GPU rendering, spelling and the
 control socket are not implemented yet. Key bindings for those adapters
 produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -281,14 +283,30 @@ creation, writes the complete snapshot, syncs it, atomically renames it over
 the intended destination, and syncs the parent directory. An unsuccessful
 write must not truncate the original. New files start mode 0600. Existing
 destinations must be regular files with one hard link, no setuid/setgid bits,
-and no extended attributes (including extended ACLs). Preserve their owner,
+and no listable extended attributes (including extended ACLs). Preserve their owner,
 group and permission bits; refuse replacement if the temporary inode cannot
 match them. Refuse symlink destinations and offer Save As; reject symlinks
 when opening too, so association and later saving use the same rule.
-Extended-attribute inspection belongs in the future audited file adapter;
-safe `std` alone does not expose it, and Save must not silently skip this
-check. An unsupported attribute query refuses replacement. Save As to a new
-path remains available for files whose metadata is outside this profile.
+Extended-attribute inspection uses the audited file adapter's size-only
+`flistxattr` query; safe `std` alone does not expose it. An unsupported query
+refuses saving. Save As to a new path remains available for files whose
+metadata is outside this profile, provided the new temporary inode passes
+inspection too. Inherited extended ACLs or automatically supplied labels on
+that inode are refused, not silently removed.
+
+Linux may hide attribute names from the caller's credentials, so an empty
+list is not proof that privileged/hidden attributes are absent. The supported
+profile is ordinary user text with no such hidden metadata; files depending
+on it are outside the replacement guarantee. There is no elevated helper or
+attempt to read privileged namespaces. This bounds the original blanket
+"no extended attributes" requirement to what this interface can establish.
+See the [Linux listing contract](https://man7.org/linux/man-pages/man2/listxattr.2.html).
+The filesystem/LSM configuration must permit attribute-free temporary
+inodes. A destination directory with inherited extended ACLs, or a host
+that automatically labels every new file (for example with SELinux/Smack),
+can therefore make all Save/Save As operations unavailable. A supported
+destination is required; this is not a claim that every ordinary text file
+on every Linux desktop fits the metadata profile.
 
 Before replacing an existing destination, reread and compare its device/inode,
 owner/group, mode, link count, length, mtime/ctime and complete bytes against
@@ -299,6 +317,9 @@ version 1. Save As refuses an existing destination. Publishing a previously
 absent path uses a same-filesystem hard link from the complete temporary
 inode and then removes the temporary name, so a concurrently created file
 is never overwritten. Both paths sync the parent after publication.
+Hard-link support is therefore required for missing-file Save and Save As;
+filesystems without it are refused. File/directory synchronization and the
+attribute query must also succeed. There is no weaker filesystem fallback.
 
 The existing-file check followed by rename is not compare-and-swap and
 cannot exclude a writer racing between those operations. The file adapter
@@ -356,6 +377,87 @@ after the captured bytes have been written. The replay wire cannot synthesize
 save acknowledgements or discard dirty tabs. Replay EOF ends the in-memory
 test session, with no persistence claim. `load` is a replay-only byte-fixture
 operation, not filesystem Open. See README for the implemented wire subset.
+
+### Implemented file-transaction adapter
+
+`files::Session` is a synchronous, exclusive worker-owned adapter, with no
+model mutation, UI dispatch, environment setting, process spawn or control
+endpoint. Its public operations are Open, Save, Save As, baseline/path/missing
+queries, and Forget. File IDs are local to that session, separate from tab
+IDs. At most 64 associations and 64 MiB of encoded baselines are retained.
+The 16 MiB file ceiling is checked before reading, snapshot validation and
+publication; complete-file comparison streams through an 8 KiB buffer.
+The baseline budget counts retained encoded bytes, not all process memory.
+Save also owns the caller's at-most-16-MiB snapshot; validation temporarily
+decodes up to another 16 MiB through the shared codec before writing. That
+copy deliberately avoids a second codec or trusting caller-supplied bytes.
+It is freed before publication. Session debug output exposes only counts,
+never paths or document text, and a compile-time test pins `Session: Send`.
+Open validates the file codec before association admission. Open/save errors
+leave all associations and baselines unchanged. Forget removes only an
+association, never a filesystem object.
+
+Paths retain arbitrary Unix filename bytes and must fit 4096 bytes both
+before and after resolving the parent. Empty paths, NUL, and a final slash,
+`.` or `..` are refused. Parent components are canonicalized once (ordinary
+parent symlinks are allowed); the final component is never canonicalized or
+followed. Open uses `O_NOFOLLOW | O_NONBLOCK`, checks regular-file identity
+before/after open and metadata before/after reading. This refuses a FIFO
+without waiting for a writer. A parent directory handle is retained for
+sync, and its pathname's device/inode is checked again before publication.
+It does not eliminate the already documented same-authority directory race.
+
+Opening an already associated path or device/inode returns its existing ID
+without refreshing the baseline or silently reloading text. A missing path
+gets an empty baseline and explicit missing state, not a created file. The
+future UI must make that tab dirty and pair each association with exactly
+one model tab; untitled Save As can first reserve a missing association.
+Save As refuses both existing names and names reserved by another open
+association, and changes the association only on fully confirmed success.
+Existing baselines retain their opened file handle, preventing inode-number
+reuse while the association lives (at most 64 such handles plus 64 parents).
+
+Save takes ownership of one encoded, immutable model snapshot. It admits
+the replacement baseline budget and validates the bytes before any write.
+Unique same-directory names use create-new, mode 0600, a checked process-local
+serial and at most 64 collision attempts. The temporary inode receives the
+complete bytes, then supported owner/group/mode with readback, then attribute
+inspection and file sync. Existing destinations get a second full baseline
+comparison immediately before rename. New destinations publish by hard link,
+so another creator cannot be overwritten even after the absence check.
+Temporary-name removal and parent sync precede metadata/content/name
+readback and installation of the new baseline. The published inode has one
+link. No truncation fallback or force overwrite exists.
+
+Every failure carries a kind, diagnostic, `publication_attempted`, `published`
+and optional residual temporary path. The first flag is set immediately
+before invoking rename/link; the second only after the kernel reports
+success. A publication syscall error is not claimed to prove no change on a
+remote filesystem. Failures after publication retain the old baseline and
+must not acknowledge the model snapshot as saved. A subsequent ordinary
+Save then conflicts with changed disk state; Reload or Save As is needed.
+After a post-publication Save As failure, the old association remains and
+the new path may exist; retrying Save As to that name is refused. Open the
+published path as a separate association to inspect it, or choose another
+Save As name. An error never silently adopts the new path or authorizes
+deletion/overwrite of it.
+Cleanup checks the temporary name's inode before unlinking, refuses to
+remove a replacement object, and reports the exact cleanup path on failure.
+An already absent name needs no cleanup and is not reported as a residual.
+Other cleanup failures report an unconfirmed residual: existence and
+ownership must be checked before manual removal, not inferred from the path.
+Abrupt process death can leave a private temporary file; no startup sweep
+deletes prefix-matching files.
+
+This increment does not yet create the one-worker/eight-job queue, bind file
+IDs to tabs, mark missing tabs dirty, acknowledge model save tokens, implement
+Reload/Save/Discard dialogs, or enable filename CLI arguments. Those are the
+next window increment. Callers must run these synchronous operations on the
+future file worker, never in the Wayland dispatch loop. Resource bounds are
+byte/work bounds, not deadlines for a stalled filesystem. Tests use actual
+temporary files and explicit stage-failure injection; a model integration
+test edits while a snapshot is pending and acknowledges only the written
+content state. The scratch-window warning remains unchanged.
 
 ## Paragraph filling
 
@@ -690,8 +792,9 @@ memory-only and may be lost. Users must not keep important text here.
 
 The adapter shares `td-compositor/src/wire.rs` without copying it. That sixth
 shared input must be staged beside the five font/license inputs when the
-future source recipe is added. Only this adapter reads the environment or
-uses files and clocks; the core's explicit-input contract is unchanged.
+future source recipe is added. This adapter owns display environment and
+clock access; `files::Session` separately owns document file I/O. The core's
+explicit-input contract is unchanged.
 
 It binds compositor v4, SHM v1 and xdg shell v1, requiring those minimum
 versions and capping higher advertisements. At startup it also binds the
@@ -737,8 +840,10 @@ name creation. They are unlinked immediately, then sized and written only
 through the owned `File`. An unlink failure reports the exact residual name.
 No mmap, host library or persistent font/file lookup is involved.
 
-The raw boundary is `UNSAFE.md` §14: only sendmsg, recvmsg and
+The transport subset of `UNSAFE.md` §14 uses sendmsg, recvmsg and
 F_DUPFD_CLOEXEC, with one syscall site and one owned-descriptor adoption site.
+The file adapter adds a size-only flistxattr query through the same syscall
+site; it neither adopts descriptors nor changes transport authorization.
 `WAYLAND_SOCKET` takes precedence and is duplicated close-on-exec, not adopted
 directly; its borrowed original is never closed by the adapter and stays open
 until its owner or process exit closes it. The caller must give the adapter
