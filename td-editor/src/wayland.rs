@@ -1488,6 +1488,12 @@ impl Window {
     }
 
     fn control_response(&mut self, request: &crate::control::Request) -> String {
+        if matches!(
+            request.operation,
+            crate::control::Operation::SpellingResults { .. }
+        ) {
+            return request.spelling_response(&self.ui, &self.spelling);
+        }
         if request.is_edit() {
             let result = if self.closed || self.pointer_modal() || self.menu.is_some() {
                 Err(crate::Error::Unavailable)
@@ -5407,6 +5413,92 @@ mod tests {
         assert!(!w.spelling.running());
         assert_eq!(std::fs::read(path).unwrap(), b"wrong");
         assert!(w.ui.editor().document(tab).unwrap().dirty());
+    }
+
+    #[test]
+    fn native_control_socket_spelling_pages_match_marks_and_survive_modals() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        w.ui.dispatch(Event::Load("naïve bad wrong".as_bytes()))
+            .unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let mut client = control_client(
+            &path,
+            format!("1\t0\tspelling-results\t{tab}\t0\t0\t0\t1").as_bytes(),
+        );
+        assert_eq!(
+            control_answer(&mut w, &mut client, &peer),
+            format!("1\t0\tok\t{tab}\t0\t0\tno-dictionary\t0\t0\t-\t-\t-\t-\t-")
+        );
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        w.chord("F7", false).unwrap();
+        let pending = crate::control::Request::parse(
+            format!("1\t1\tspelling-results\t{tab}\t0\t0\t0\t1").as_bytes(),
+        )
+        .unwrap();
+        assert!(w
+            .control_response(&pending)
+            .contains("\t1\tchecking\t0\t0\t-\t-\t-\t-\t-"));
+        while w.spelling.running() {
+            w.end_turn(w.clock, false).unwrap();
+        }
+        assert_eq!(w.spelling.view(w.ui.editor()).1, &[7..10, 11..16]);
+        w.chord("C-f", false).unwrap();
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let before = w.control_response(&state);
+        let notice = w.notice.clone();
+        let mut client = control_client(
+            &path,
+            format!("1\t1\tspelling-results\t{tab}\t0\t0\t0\t1").as_bytes(),
+        );
+        assert_eq!(
+            control_answer(&mut w, &mut client, &peer),
+            format!("1\t1\tok\t{tab}\t0\t1\tcomplete\t1\t2\t2\t2\t1\t0\t7,10")
+        );
+        let mut client = control_client(
+            &path,
+            format!("1\t2\tspelling-results\t{tab}\t0\t1\t1\t1").as_bytes(),
+        );
+        assert_eq!(
+            control_answer(&mut w, &mut client, &peer),
+            format!("1\t2\tok\t{tab}\t0\t1\tcomplete\t2\t2\t2\t2\t1\t0\t11,16")
+        );
+        assert_eq!(w.control_response(&state), before);
+        assert_eq!(w.notice, notice);
+        assert!(w.search.is_some());
+        w.chord("Escape", false).unwrap();
+        let mut client = control_client(
+            &path,
+            format!("1\t3\tinsert\t{tab}\t0\t0\t0\t78").as_bytes(),
+        );
+        assert_eq!(control_answer(&mut w, &mut client, &peer), "1\t3\tok\t");
+        let mut client = control_client(
+            &path,
+            format!("1\t4\tspelling-results\t{tab}\t0\t1\t1\t1").as_bytes(),
+        );
+        assert!(control_answer(&mut w, &mut client, &peer).contains("\terror\tstale-revision\t"));
+        let mut client = control_client(
+            &path,
+            format!("1\t5\tspelling-results\t{tab}\t1\t0\t0\t1").as_bytes(),
+        );
+        assert_eq!(
+            control_answer(&mut w, &mut client, &peer),
+            format!("1\t5\tok\t{tab}\t1\t0\tnot-checked\t0\t0\t-\t-\t-\t-\t-")
+        );
+        assert!(!w.spelling.running());
+        assert!(w.spelling.view(w.ui.editor()).1.is_empty());
+        w.stop_control();
+        assert!(!path.exists());
     }
 
     #[test]

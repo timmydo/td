@@ -3,7 +3,7 @@
 The experimental `--window --control-socket PATH` endpoint implements the
 query and revision-checked editing subset below. It is off by default;
 scratch preview and replay do not accept the option. Remote file operations,
-dialog answers, spelling result pages and frame acknowledgement remain
+dialog answers, Check Spelling admission and frame acknowledgement remain
 unimplemented. This is not the complete
 version-1 endpoint specified in [DESIGN.md](DESIGN.md#test-and-control-architecture).
 
@@ -59,13 +59,15 @@ In the examples below, field spaces denote literal Tab separators.
 | --- | --- |
 | `1 ID state` | Snapshot the current controller. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
+| `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 
 The editing subset is specified below. `new`, `load`, file I/O,
 physical-input simulation and dialog answers remain refused; this parser is
 not a route into replay's broader command set.
 `Request::response` borrows `&Controller`, so it cannot dispatch an edit or
 change selection, views, history or generation. It returns `unavailable`
-for an editing request; only `Request::execute` admits those operations.
+for editing and spelling requests; only `Request::execute` admits edits,
+and the native adapter supplies its separately owned spelling state.
 
 An error response is `1 ID error CODE HEX_DIAGNOSTIC`. A recoverable request
 ID is echoed even if the command name is missing or later arguments are
@@ -169,6 +171,52 @@ The largest text response uses at most 524,288 hex digits plus a bounded
 header/next offset, within the frame ceiling. Serialization never copies
 the whole document to produce a page.
 
+## Spelling results
+
+This native-only read query names any open tab (including inactive tabs),
+its expected text revision and a scan ID. `SCAN=0` discovers the current
+status/ID and requires `OFFSET=0`. Later pages must pin the returned nonzero
+scan ID as well as the revision. `OFFSET` is a zero-based range index, not a
+document byte offset. `LIMIT` is 1..=256 ranges. Queries never start a scan,
+load a dictionary, advance scanning or publish partial marks. Use the ordinary
+F7 action to check; remote `check-spelling` is not yet implemented.
+
+Success is `1 ID ok TAB REVISION SCAN STATUS NEXT TOTAL CHECKED UNKNOWN
+SKIPPED CAPPED` followed by one or more range fields. All separators,
+including the line break shown here, are single Tabs on the wire.
+
+- `STATUS` is `no-dictionary`, `not-checked`, `checking` or `complete`.
+- `SCAN` is zero for the first two statuses. Each admitted native scan gets
+  a window-lifetime, checked, strictly increasing nonzero `u64` ID, retained
+  on completion. Cancel, edit, recheck, tab close or dictionary replacement
+  invalidates the affected scan/report; IDs are never reused, even when a
+  replacement dictionary has identical bytes. Counter exhaustion returns
+  `exhausted` from the ordinary Check Spelling action, retaining prior valid
+  work. IDs are not durable across editor processes/socket lifetimes.
+- `NEXT` is `OFFSET` plus the number of returned ranges. `TOTAL` is the
+  number of stored marks, not the number of unknown words. At `OFFSET=TOTAL`
+  the page is empty. No status before completion exposes partial results:
+  `NEXT` and `TOTAL` are zero and its four count/cap fields are `-`.
+- Completed counts are unsigned decimals; `CAPPED` is `0|1`. Counts cover
+  the whole scan, including words omitted from the shared 10,000-mark budget.
+  A completed scan with no unknown words has numeric count fields with
+  `UNKNOWN=0` and is distinct from an unchecked document.
+- Each range is one `START,END` field, in ascending document order, with
+  scalar-aligned, half-open UTF-8 byte offsets into the normalized text.
+  An empty page has one `-` field instead. No word text is copied.
+
+Validation order is missing tab/revision (`missing-tab`/`stale-revision`),
+limit or zero-scan/nonzero-offset misuse (`invalid-argument`), nonzero scan
+mismatch (`stale-revision`), then offset beyond stored marks
+(`invalid-position`). This includes cancelled/replaced reports and edits
+followed by Undo; old pages never become valid again. A fresh zero-ID query
+can discover a newer scan, but cannot continue an older page sequence.
+Pending scans accept only offset zero. Status and pages are borrowed on the
+UI thread without changing selection, generation, notices, modals or history;
+queries remain available during modals. Existing whole-request transport
+bounds apply. Each page is below 16 KiB under the document/range ceilings,
+and serialization neither copies the whole document nor clones its marks.
+
 ## Controller state response
 
 Success begins `1 ID ok` followed by these tab-separated fields, in order:
@@ -270,6 +318,8 @@ edits in both profiles and rendered pixels; they cover expected-selection
 races, expired jobs, pending-Paste/repeat cancellation, unchanged disk bytes,
 and spelling invalidation without rescanning. These are fake-compositor and
 local kernel tests, not a live independent-compositor or td-jail/td-mail oracle.
+Spelling queries additionally cover native no-dictionary status, complete
+range pages matching the window's marks and modal-preserving reads.
 
 ## Conformance
 
@@ -281,7 +331,10 @@ EOF, zero/oversized/trailing frames, poisoned decoder behavior and arbitrary
 byte input both as raw headers and as correctly framed payloads. Invalid
 envelopes/read-only command refusals are compared with replay, separately
 from the intentionally different mutation allowlists/selection guards.
-These library tests need no display, socket, dictionary or external process.
+Spelling-page tests cover cross-tab pending/report isolation, closed targets,
+hidden partial results, range/mark limits, scan-ID reuse refusal after recheck
+or dictionary replacement, and exhaustion that preserves prior valid work.
+These library tests need no display, socket, dictionary file or external process.
 
 ## Private socket publication prerequisite
 

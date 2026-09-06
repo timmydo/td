@@ -295,11 +295,61 @@ impl Scan {
 #[derive(Default)]
 pub(crate) struct WindowState {
     dictionary: Option<Dictionary>,
-    reports: std::collections::BTreeMap<TabId, Report>,
-    scan: Option<Scan>,
+    reports: std::collections::BTreeMap<TabId, Tagged<Report>>,
+    scan: Option<Tagged<Scan>>,
+    last_scan: u64,
+}
+
+// Standalone scans have no window ID; native ownership always requires one.
+struct Tagged<T> {
+    id: std::num::NonZeroU64,
+    value: T,
+}
+
+pub(crate) struct Snapshot<'a> {
+    pub scan: u64,
+    pub status: &'static str,
+    pub counts: Option<Counts>,
+    pub marks: &'a [Range<usize>],
 }
 
 impl WindowState {
+    /// Borrow only validated completed marks; never expose partial scan work.
+    pub(crate) fn snapshot(
+        &self,
+        editor: &Editor,
+        tab: TabId,
+        revision: u64,
+    ) -> Result<Snapshot<'_>> {
+        editor.revision_point(tab, revision)?;
+        let mut snapshot = Snapshot {
+            scan: 0,
+            status: "no-dictionary",
+            counts: None,
+            marks: &[],
+        };
+        let Some(dictionary) = &self.dictionary else {
+            return Ok(snapshot);
+        };
+        snapshot.status = "not-checked";
+        if let Some(scan) = self.scan.as_ref().filter(|scan| {
+            scan.value.report.tab() == tab && scan.value.report.validate(editor, dictionary).is_ok()
+        }) {
+            snapshot.scan = scan.id.get();
+            snapshot.status = "checking";
+        } else if let Some(report) = self
+            .reports
+            .get(&tab)
+            .filter(|report| report.value.validate(editor, dictionary).is_ok())
+        {
+            snapshot.scan = report.id.get();
+            snapshot.status = "complete";
+            snapshot.counts = Some(report.value.counts);
+            snapshot.marks = &report.value.marks;
+        }
+        Ok(snapshot)
+    }
+
     pub(crate) fn install(&mut self, dictionary: Dictionary) {
         self.scan = None;
         self.reports.clear();
@@ -320,11 +370,10 @@ impl WindowState {
 
     pub(crate) fn checking_active(&self, editor: &Editor) -> bool {
         self.scan.as_ref().is_some_and(|scan| {
-            editor.active() == Some(scan.report.tab())
-                && self
-                    .dictionary
-                    .as_ref()
-                    .is_some_and(|dictionary| scan.report.validate(editor, dictionary).is_ok())
+            editor.active() == Some(scan.value.report.tab())
+                && self.dictionary.as_ref().is_some_and(|dictionary| {
+                    scan.value.report.validate(editor, dictionary).is_ok()
+                })
         })
     }
 
@@ -334,6 +383,7 @@ impl WindowState {
         }
         self.reports
             .get(&editor.active()?)?
+            .value
             .results(editor, self.dictionary.as_ref()?)
             .ok()
     }
@@ -344,11 +394,11 @@ impl WindowState {
         };
         let before = self.reports.len();
         self.reports
-            .retain(|_, report| report.validate(editor, dictionary).is_ok());
+            .retain(|_, report| report.value.validate(editor, dictionary).is_ok());
         let stale = self
             .scan
             .as_ref()
-            .is_some_and(|scan| scan.report.validate(editor, dictionary).is_err());
+            .is_some_and(|scan| scan.value.report.validate(editor, dictionary).is_err());
         if stale {
             self.scan = None;
         }
@@ -361,16 +411,20 @@ impl WindowState {
         let Some(dictionary) = &self.dictionary else {
             return Ok(false);
         };
+        // Never reuse an ID, even after cancellation or dictionary replacement.
+        let next_scan = self.last_scan.checked_add(1).ok_or(Error::Exhausted)?;
+        let id = std::num::NonZeroU64::new(next_scan).ok_or(Error::Exhausted)?;
         let used: usize = self
             .reports
             .iter()
             .filter(|(id, _)| **id != tab)
-            .map(|(_, report)| report.marks.len())
+            .map(|(_, report)| report.value.marks.len())
             .sum();
         let remaining = MARKS.checked_sub(used).ok_or(Error::Limit)?;
         let scan = Scan::limited(editor, tab, revision, dictionary, remaining)?;
         self.reports.remove(&tab);
-        self.scan = Some(scan);
+        self.scan = Some(Tagged { id, value: scan });
+        self.last_scan = next_scan;
         Ok(true)
     }
 
@@ -381,7 +435,7 @@ impl WindowState {
             return Ok(changed);
         };
         let dictionary = self.dictionary.as_ref().ok_or(Error::InvalidArgument)?;
-        let complete = match scan.step(editor, dictionary) {
+        let complete = match scan.value.step(editor, dictionary) {
             Ok(complete) => complete,
             Err(error) => {
                 self.scan = None;
@@ -392,9 +446,15 @@ impl WindowState {
             return Ok(changed);
         }
         let scan = self.scan.take().ok_or(Error::InvalidArgument)?;
-        let mut report = scan.finish(editor, dictionary)?;
+        let mut report = scan.value.finish(editor, dictionary)?;
         report.marks.shrink_to_fit();
-        self.reports.insert(report.tab(), report);
+        self.reports.insert(
+            report.tab(),
+            Tagged {
+                id: scan.id,
+                value: report,
+            },
+        );
         Ok(true)
     }
 
@@ -563,7 +623,11 @@ mod tests {
         assert!(status.contains("2 unknown / 2 checked"));
         assert!(status.contains("marks capped"));
         assert_eq!(
-            state.reports.values().map(|r| r.marks.len()).sum::<usize>(),
+            state
+                .reports
+                .values()
+                .map(|r| r.value.marks.len())
+                .sum::<usize>(),
             MARKS
         );
         ui.dispatch(Event::Close {
@@ -760,6 +824,29 @@ mod tests {
             }
         );
         assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn window_scan_identity_survives_completion_and_never_reuses_cancelled_ids() {
+        let ui = document("bad");
+        let mut state = WindowState::default();
+        state.install(Dictionary::parse(b"known").unwrap());
+        state.start(ui.editor(), 1, 0).unwrap();
+        assert_eq!(state.snapshot(ui.editor(), 1, 0).unwrap().scan, 1);
+        state.cancel();
+        assert_eq!(state.snapshot(ui.editor(), 1, 0).unwrap().scan, 0);
+        state.start(ui.editor(), 1, 0).unwrap();
+        state.step(ui.editor()).unwrap();
+        assert_eq!(state.snapshot(ui.editor(), 1, 0).unwrap().scan, 2);
+        state.last_scan = u64::MAX; // Checked-counter exhaustion is terminal.
+        assert_eq!(state.start(ui.editor(), 1, 0), Err(Error::Exhausted));
+        let snapshot = state.snapshot(ui.editor(), 1, 0).unwrap();
+        assert_eq!((snapshot.scan, snapshot.status), (2, "complete"));
+        assert_eq!(snapshot.marks.len(), 1);
+        assert_eq!(snapshot.marks.first(), Some(&(0..3)));
+        state.install(Dictionary::parse(b"known").unwrap());
+        assert_eq!(state.start(ui.editor(), 1, 0), Err(Error::Exhausted));
+        assert!(!state.running());
     }
 
     #[test]

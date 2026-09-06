@@ -74,7 +74,11 @@ queries and revision-checked edits through the shared controller. See
 coarse native modal/job/spelling flags. It also supports Select Tab/Range,
 Insert, Delete, Undo, Redo and Fill Paragraph. Insert/Delete/Fill check the
 expected directed selection as well as the tab revision; native modals refuse
-remote edits. File operations and dialog answers remain later work.
+remote edits. `spelling-results` exposes status, whole-scan counts and bounded
+range pages pinned to both text revision and scan ID. Checking still starts
+with ordinary F7; pending scans expose no partial marks. File operations,
+dialog answers, Check Spelling admission and frame acknowledgement remain
+later work.
 The separate `control_socket` library publishes a private Linux Unix
 listener only when explicitly requested. It checks directory
 ownership/permissions, refuses symlinks and existing endpoints, and pins

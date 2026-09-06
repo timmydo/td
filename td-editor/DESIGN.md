@@ -22,8 +22,9 @@ explicit local dictionary through the file worker, scans on F7 in bounded
 chunks, and publishes underlines and counts together. Format supplies
 dictionary selection and next/previous marked-word navigation. GPU rendering
 is not implemented yet. The optional native control socket now exposes
-state/text queries and revision/selection-checked edits; remote file operations,
-dialog answers and frame acknowledgement remain unimplemented.
+state/text and scan-pinned spelling queries, plus revision/selection-checked
+edits. Remote file operations, dialog answers, Check Spelling admission and
+frame acknowledgement remain unimplemented.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -2090,8 +2091,11 @@ pin the directed selection. Native modals refuse edits without dismissal.
 All edits use the ordinary controller, including history, view refresh and
 native search/spelling/Paste/repeat invalidation. Its exact
 implemented subset, startup/cleanup behavior and two-job-per-turn budget
-are specified in CONTROL.md. Remote file operations, dialog answers, spelling
-range queries and frame acknowledgement remain unimplemented.
+are specified in CONTROL.md. Native spelling-result pages borrow validated
+reports, pin text revision and a never-reused window scan ID, and expose no
+partial marks. This also distinguishes a recheck or dictionary replacement
+without text changes. Remote file operations, dialog answers, Check Spelling
+admission and frame acknowledgement remain unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 
@@ -2146,7 +2150,9 @@ without side effects. `state` reports the active tab, all tab IDs/revisions,
 dirty flags, cursors/selections, modes, current dialog, spelling job/status,
 and submitted/callback-completed frame generations. `text` takes tab ID,
 revision, byte offset and byte limit; it returns a scalar-aligned page and
-the next byte offset. Spelling result pages likewise pin the scan revision.
+the next byte offset. Spelling result pages pin both text revision and the
+native scan ID; zero discovers an ID only at range offset zero. CONTROL.md
+defines their implemented status/count/range fields and 256-range ceiling.
 
 Save and spelling return a job ID with `pending` when work is queued;
 `state` supplies completion/error. A queued save pins its expected revision;

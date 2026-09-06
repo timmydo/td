@@ -3,10 +3,12 @@
 use crate::model::{Command, Selection, TabId};
 use crate::ui::{Controller, Event};
 use crate::{Error, Result};
+use std::fmt::Write;
 
 pub const MAX_FRAME: usize = 1024 * 1024;
 pub const PAGE_BYTES: usize = 256 * 1024;
 pub const INSERT_BYTES: usize = 256 * 1024;
+pub const SPELLING_RANGES: usize = 256;
 
 /// One length-prefixed frame. Any refusal poisons it and drops partial text.
 #[derive(Default)]
@@ -93,6 +95,13 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
     State,
+    SpellingResults {
+        tab: TabId,
+        revision: u64,
+        scan: u64,
+        offset: usize,
+        limit: usize,
+    },
     Text {
         tab: TabId,
         revision: u64,
@@ -169,6 +178,13 @@ impl Request {
         let result = (|| {
             let operation = match name {
                 "state" => Operation::State,
+                "spelling-results" => Operation::SpellingResults {
+                    tab: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    revision: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    scan: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    offset: size(args.next().ok_or(Error::Protocol)?)?,
+                    limit: size(args.next().ok_or(Error::Protocol)?)?,
+                },
                 "text" => Operation::Text {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
                     revision: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -237,7 +253,7 @@ impl Request {
                 offset,
                 limit,
             } => page(ui, *tab, *revision, *offset, *limit),
-            Operation::Edit { .. } => Err(Error::Unavailable),
+            Operation::Edit { .. } | Operation::SpellingResults { .. } => Err(Error::Unavailable),
         };
         match result {
             Ok(body) => format!("1\t{}\tok\t{body}", self.id),
@@ -247,6 +263,68 @@ impl Request {
 
     pub fn is_edit(&self) -> bool {
         matches!(self.operation, Operation::Edit { .. })
+    }
+
+    pub(crate) fn spelling_response(
+        &self,
+        ui: &Controller,
+        spelling: &crate::spelling::WindowState,
+    ) -> String {
+        let result = (|| {
+            let Operation::SpellingResults {
+                tab,
+                revision,
+                scan,
+                offset,
+                limit,
+            } = self.operation
+            else {
+                return Err(Error::InvalidArgument);
+            };
+            let snapshot = spelling.snapshot(ui.editor(), tab, revision)?;
+            if !(1..=SPELLING_RANGES).contains(&limit) || (scan == 0 && offset != 0) {
+                return Err(Error::InvalidArgument);
+            }
+            if scan != 0 && scan != snapshot.scan {
+                return Err(Error::StaleRevision);
+            }
+            let remaining = snapshot.marks.get(offset..).ok_or(Error::InvalidPosition)?;
+            let page = remaining
+                .get(..remaining.len().min(limit))
+                .ok_or(Error::InvalidPosition)?;
+            let counts = snapshot.counts.map_or_else(
+                || "-\t-\t-\t-".into(),
+                |counts| {
+                    format!(
+                        "{}\t{}\t{}\t{}",
+                        counts.checked,
+                        counts.unknown,
+                        counts.skipped,
+                        u8::from(counts.truncated)
+                    )
+                },
+            );
+            let mut body = format!(
+                "{tab}\t{revision}\t{}\t{}\t{}\t{}\t{counts}",
+                snapshot.scan,
+                snapshot.status,
+                offset + page.len(),
+                snapshot.marks.len()
+            );
+            if page.is_empty() {
+                body.push_str("\t-");
+            } else {
+                body.reserve(page.len() * 42); // Tab plus two maximum-width u64 offsets.
+                for range in page {
+                    write!(body, "\t{},{}", range.start, range.end).map_err(|_| Error::Protocol)?;
+                }
+            }
+            Ok(body)
+        })();
+        match result {
+            Ok(body) => format!("1\t{}\tok\t{body}", self.id),
+            Err(error) => Refusal { id: self.id, error }.response(),
+        }
     }
 
     /// Native modal/liveness admission belongs to the adapter. No file or
@@ -476,6 +554,208 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    fn spelling_page(
+        ui: &Controller,
+        spelling: &crate::spelling::WindowState,
+        args: &str,
+    ) -> String {
+        Request::parse(format!("1\t7\tspelling-results\t{args}").as_bytes())
+            .unwrap()
+            .spelling_response(ui, spelling)
+    }
+
+    #[test]
+    fn spelling_pages_pin_scan_and_revision_and_hide_partial_results() {
+        use crate::spelling::{Dictionary, WindowState, STEP_SCALARS};
+        let mut ui = Controller::default();
+        let text = format!("naïve bad {}wrong", " ".repeat(STEP_SCALARS));
+        ui.dispatch(Event::Load(text.as_bytes())).unwrap();
+        let mut spelling = WindowState::default();
+        assert_eq!(
+            spelling_page(&ui, &spelling, "1\t0\t0\t0\t1"),
+            "1\t7\tok\t1\t0\t0\tno-dictionary\t0\t0\t-\t-\t-\t-\t-"
+        );
+        spelling.install(Dictionary::parse(b"known").unwrap());
+        assert!(spelling_page(&ui, &spelling, "1\t0\t0\t0\t1")
+            .contains("\t0\tnot-checked\t0\t0\t-\t-\t-\t-\t-"));
+        spelling.start(ui.editor(), 1, 0).unwrap();
+        spelling.step(ui.editor()).unwrap();
+        assert_eq!(
+            spelling_page(&ui, &spelling, "1\t0\t0\t0\t1"),
+            "1\t7\tok\t1\t0\t1\tchecking\t0\t0\t-\t-\t-\t-\t-"
+        );
+        spelling.step(ui.editor()).unwrap();
+        let generation = ui.generation();
+        assert_eq!(
+            spelling_page(&ui, &spelling, "1\t0\t1\t0\t1"),
+            "1\t7\tok\t1\t0\t1\tcomplete\t1\t2\t2\t2\t1\t0\t7,10"
+        );
+        assert_eq!(
+            spelling_page(&ui, &spelling, "1\t0\t1\t1\t256"),
+            format!(
+                "1\t7\tok\t1\t0\t1\tcomplete\t2\t2\t2\t2\t1\t0\t{},{}",
+                text.len() - 5,
+                text.len()
+            )
+        );
+        assert_eq!(
+            spelling_page(&ui, &spelling, "1\t0\t1\t2\t1"),
+            "1\t7\tok\t1\t0\t1\tcomplete\t2\t2\t2\t2\t1\t0\t-"
+        );
+        assert_eq!(ui.generation(), generation);
+        // An inactive tab is readable, with no selection or generation change.
+        ui.dispatch(Event::New).unwrap();
+        assert!(spelling_page(&ui, &spelling, "1\t0\t1\t0\t1").contains("\tcomplete\t"));
+        assert_eq!(ui.editor().active(), Some(2));
+        spelling.start(ui.editor(), 1, 0).unwrap();
+        assert!(
+            spelling_page(&ui, &spelling, "1\t0\t1\t1\t1").contains("\terror\tstale-revision\t")
+        );
+        assert!(spelling_page(&ui, &spelling, "1\t0\t0\t0\t1").contains("\t2\tchecking\t"));
+        spelling.install(Dictionary::parse(b"known").unwrap());
+        assert!(
+            spelling_page(&ui, &spelling, "1\t0\t2\t0\t1").contains("\terror\tstale-revision\t")
+        );
+        spelling.start(ui.editor(), 1, 0).unwrap();
+        assert!(spelling_page(&ui, &spelling, "1\t0\t3\t0\t1").contains("\t3\tchecking\t"));
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: Command::Insert("x".into()),
+        })
+        .unwrap();
+        // Query validates independently, even before the window observer runs.
+        assert!(
+            spelling_page(&ui, &spelling, "1\t0\t3\t0\t1").contains("\terror\tstale-revision\t")
+        );
+        assert!(spelling_page(&ui, &spelling, "1\t1\t0\t0\t1").contains("\tnot-checked\t"));
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 1,
+            command: Command::Undo,
+        })
+        .unwrap();
+        assert!(
+            spelling_page(&ui, &spelling, "1\t2\t3\t0\t1").contains("\terror\tstale-revision\t")
+        );
+    }
+
+    #[test]
+    fn spelling_queries_isolate_pending_tabs_and_reject_closed_targets() {
+        use crate::spelling::{Dictionary, WindowState, STEP_SCALARS};
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load("bad ".repeat(STEP_SCALARS).as_bytes()))
+            .unwrap();
+        ui.dispatch(Event::Load(b"wrong")).unwrap();
+        let mut spelling = WindowState::default();
+        spelling.install(Dictionary::parse(b"known").unwrap());
+        spelling.start(ui.editor(), 1, 0).unwrap();
+        spelling.step(ui.editor()).unwrap();
+        assert_eq!(
+            spelling_page(&ui, &spelling, "2\t0\t0\t0\t1"),
+            "1\t7\tok\t2\t0\t0\tnot-checked\t0\t0\t-\t-\t-\t-\t-"
+        );
+        assert!(
+            spelling_page(&ui, &spelling, "1\t0\t1\t1\t1").contains("\terror\tinvalid-position\t")
+        );
+        spelling.cancel();
+        assert!(
+            spelling_page(&ui, &spelling, "1\t0\t1\t0\t1").contains("\terror\tstale-revision\t")
+        );
+        spelling.start(ui.editor(), 2, 0).unwrap();
+        spelling.step(ui.editor()).unwrap();
+        spelling.start(ui.editor(), 1, 0).unwrap();
+        let generation = ui.generation();
+        assert_eq!(
+            spelling_page(&ui, &spelling, "2\t0\t2\t0\t1"),
+            "1\t7\tok\t2\t0\t2\tcomplete\t1\t1\t1\t1\t0\t0\t0,5"
+        );
+        assert!(spelling_page(&ui, &spelling, "1\t0\t3\t0\t1").contains("\t3\tchecking\t"));
+        assert_eq!(ui.generation(), generation);
+        ui.dispatch(Event::Close {
+            tab: 2,
+            revision: 0,
+        })
+        .unwrap();
+        assert!(spelling_page(&ui, &spelling, "2\t0\t2\t0\t1").contains("\terror\tmissing-tab\t"));
+        assert!(spelling_page(&ui, &spelling, "1\t0\t3\t0\t1").contains("\t3\tchecking\t"));
+        ui.dispatch(Event::Close {
+            tab: 1,
+            revision: 0,
+        })
+        .unwrap();
+        assert!(spelling_page(&ui, &spelling, "1\t0\t3\t0\t1").contains("\terror\tmissing-tab\t"));
+        spelling.observe(ui.editor());
+        assert!(!spelling.running());
+    }
+
+    #[test]
+    fn spelling_page_refusals_and_range_bounds_are_explicit() {
+        use crate::spelling::{Dictionary, WindowState, MARKS};
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load("x ".repeat(MARKS + 3).as_bytes()))
+            .unwrap();
+        let mut spelling = WindowState::default();
+        spelling.install(Dictionary::parse(b"known").unwrap());
+        spelling.start(ui.editor(), 1, 0).unwrap();
+        while spelling.running() {
+            spelling.step(ui.editor()).unwrap();
+        }
+        let response = spelling_page(&ui, &spelling, "1\t0\t1\t0\t256");
+        assert!(response.starts_with(&format!(
+            "1\t7\tok\t1\t0\t1\tcomplete\t256\t{MARKS}\t{}\t{}\t0\t1\t0,1",
+            MARKS + 3,
+            MARKS + 3
+        )));
+        assert_eq!(response.split('\t').skip(13).count(), SPELLING_RANGES);
+        assert!(response.len() < 16 * 1024);
+        for (args, code) in [
+            ("99\t0\t0\t0\t1", "missing-tab"),
+            ("1\t9\t0\t0\t1", "stale-revision"),
+            ("1\t0\t0\t1\t1", "invalid-argument"),
+            ("1\t0\t1\t0\t0", "invalid-argument"),
+            ("1\t0\t1\t0\t257", "invalid-argument"),
+            ("1\t0\t1\t10001\t1", "invalid-position"),
+            ("1\t0\t2\t0\t1", "stale-revision"),
+        ] {
+            assert!(
+                spelling_page(&ui, &spelling, args).contains(&format!("\terror\t{code}\t")),
+                "{args}"
+            );
+        }
+        for args in [
+            "",
+            "1\t0\t0\t0",
+            "1\t0\t0\t0\t1\t0",
+            "1\t0\t-1\t0\t1",
+            "1\t0\t18446744073709551616\t0\t1",
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t7\tspelling-results\t{args}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                Error::Protocol
+            );
+        }
+        let request = Request::parse(b"1\t7\tspelling-results\t1\t0\t0\t0\t1").unwrap();
+        assert!(!request.is_edit());
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        spelling.cancel();
+        spelling.install(Dictionary::parse(b"x").unwrap());
+        spelling.start(ui.editor(), 1, 0).unwrap();
+        while spelling.running() {
+            spelling.step(ui.editor()).unwrap();
+        }
+        assert_eq!(
+            spelling_page(&ui, &spelling, "1\t0\t0\t0\t1"),
+            format!(
+                "1\t7\tok\t1\t0\t2\tcomplete\t0\t0\t{}\t0\t0\t0\t-",
+                MARKS + 3
+            )
+        );
+    }
 
     #[test]
     fn every_frame_split_and_single_byte_delivery_wait_for_complete_payload() {
