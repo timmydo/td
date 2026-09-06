@@ -17,8 +17,10 @@ files and reads no environment or clocks. The synchronous `files::Session`
 adapter now implements bounded file baselines and atomic save I/O, separately
 from the model. `--window` now connects it through one file worker to
 file-backed tabs and keyboard Open/Save/Save As path prompts. Native pointer
-selection, tab clicks and scrolling are connected. GPU rendering, spelling
-and the control socket are not implemented yet.
+selection, tab clicks and scrolling are connected. The safe spelling library
+now parses explicit word-list bytes and scans in bounded chunks, but native
+dictionary loading/marking, GPU rendering and the control socket are not
+implemented yet.
 Key bindings for those absent adapters
 produce explicit requests; replay does not pretend to perform their work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -609,9 +611,50 @@ and punctuation delimit tokens. This is an English ASCII spelling profile,
 not a language detector. The result reports checked, unknown and skipped
 counts, its revision, and whether the stored-mark ceiling was reached.
 
+This is scalar tokenization, not Unicode word segmentation. For example,
+decomposed `nai` + U+0308 + `ve` produces two checked ASCII fragments, while
+precomposed `naïve` is one skipped token. U+00AD soft hyphen and U+200D joiner
+also delimit fragments. Those fragments can be marked unknown: version 1
+does not normalize equivalent encodings or infer whole words across these
+delimiters. Tests pin this consequence of the explicit scalar profile.
+
 There is no writable personal dictionary in version 1. Users edit their
 chosen word-list file with the editor and explicitly reload it through the
 Dictionary command. Spelling results never change document bytes or history.
+
+### Implemented spelling core
+
+`spelling::Dictionary::parse` validates caller-supplied bytes against the
+English word-list contract above. It performs no file lookup or I/O. A
+bounded temporary ordered set deduplicates lowercase entries and becomes a
+sorted vector for binary lookup. Invalid replacement data cannot mutate an
+existing dictionary. Each successful parse has a fresh opaque identity,
+including reloading identical bytes; this is the core dictionary-generation
+token and prevents old results from silently becoming current again.
+
+`spelling::Scan` borrows text from the specified editor/tab/revision on each
+explicit `step`, consuming at most 4,096 scalars. The only token lookahead
+is one scalar to decide whether an apostrophe is internal. A token crossing
+a step boundary retains at most 64 normalized ASCII bytes; oversized or
+unsupported tokens remain one skipped token without unbounded accumulation.
+The scan holds no document copy and exposes no partial marks or counts.
+`finish` publishes a report only after EOF and a final target/dictionary
+check. Empty documents complete on the first step with zero counts.
+
+Each report stores at most 10,000 ordered byte ranges. Scanning continues
+past that limit so checked, unknown and skipped counts remain complete;
+truncation is true only if an unknown range was omitted. Reports guard both
+counts and ranges by editor identity, text revision and dictionary identity.
+Edits (including Undo), tab removal and dictionary replacement invalidate
+them; cursor motion, tab switching and save acknowledgment do not. A scan
+that observes invalidation fails permanently even if supplied its old
+dictionary later. Dropping a scan cancels it without changing any document.
+
+This increment is the safe library only. Dictionary file loading, window
+ownership/budgeting, F7/menu actions, status/underlines, result navigation
+and control queries are not connected yet. Native UI still reports spelling
+unavailable and must not claim these library tests are an interactive scan.
+No automatic trigger, word-list source, subprocess or dependency is added.
 
 ## Rendering and reuse
 

@@ -37,6 +37,7 @@ fn source_inventory_and_allowances_are_closed() {
         "seat.rs",
         "search.rs",
         "session.rs",
+        "spelling.rs",
         "sys.rs",
         "text.rs",
         "transfer.rs",

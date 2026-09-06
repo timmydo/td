@@ -25,6 +25,7 @@ pub mod replay;
 mod seat;
 mod search;
 mod session;
+pub mod spelling;
 mod sys;
 pub mod text;
 pub mod transfer;
