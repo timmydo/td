@@ -9313,12 +9313,15 @@ webpki-roots, and no decoder. So:
    recipe through the Cargo runner from the checkout's `net/` and
    `engine/` trees and the committed lock's vendor closure: the first
    target-built control-plane program, and the one target network
-   client. It listens on `/run/user/1000/td-fetch` as the UI user under
-   a `[fetchd]` unit after `seat` and `netup`, `restart=always`; the
-   socket is mode 0600 under a runtime directory of mode 0700, and that
-   is the whole of the authentication: the tier forbids `unsafe`, so
-   peer credentials are not read, and only the UI user's processes, the
-   jails among them, can connect.
+   client. It listens on `/run/user/1000/td-fetch/socket` as the UI
+   user under a `[fetchd]` unit after `seat` and `netup`,
+   `restart=always`, in a directory of its own that it makes, mode
+   0700, so that the jail binds the directory rather than the socket
+   inode and a restart's fresh socket is the one a running jail
+   connects to; the socket is mode 0600, and that is the whole of the
+   authentication: the tier forbids `unsafe`, so peer credentials are
+   not read, and only the UI user's processes, the jails among them,
+   can connect.
 2. The grant is `sockets=fetch`, beside `sockets=wayland`. §C's mount
    plan step 12 binds `td-fetch` into the jail's runtime directory when
    it is granted, read-only like the bus; the stage-2 readback's name
@@ -9331,42 +9334,66 @@ webpki-roots, and no decoder. So:
 3. One request per connection, a text header block and then the body.
    The client writes `td-fetch 1`, `method GET` or `POST`, `url …`, zero
    or more `header name: value` lines with the name in lower case,
-   `limit N` for the most response bytes it will take, `body N`, a blank
-   line, and N bytes. The service replies `td-fetch 1`, `status 200`,
-   `header` lines, `body N`, a blank line and N bytes, or `td-fetch 1`,
-   `error reason`, a blank line. A line is at most 8 KiB, a request at
-   most 64 headers. The service refuses any scheme but `http` and
-   `https`; a host that names, or resolves to, a loopback, link-local or
-   unspecified address, since td's own listeners are inside the shared
-   stack and the grant must not reach them; a request body over 32 MiB;
-   and a response over the client's limit or 64 MiB. It follows at most
-   five redirects and none for `POST`, sends `Accept-Encoding: identity`
-   because the tier's closure has no decoder and principle 2 makes one a
-   sign-off, and keeps `http.rs`'s connect, read and write timeouts. A
-   bounded number of connections are served at once; the rest wait.
+   `limit N` for the most response bytes it will take, `redirects N`
+   for the most redirects it will have followed for it, `body N`, a
+   blank line, and N bytes. The service replies `td-fetch 1`,
+   `status 200`, `header` lines, `body N`, a blank line and N bytes, or
+   `td-fetch 1`, `error reason`, a blank line. A line is at most 8 KiB
+   and a head at most 64 headers, in either direction; an `error` line
+   is cut at the bound, not refused. The service refuses any scheme but
+   `http` and `https`; a host that names, or resolves to, a loopback,
+   unspecified, link-local, broadcast or multicast address, the
+   v4-mapped and v4-compatible v6 forms and all of 0.0.0.0/8 included,
+   since td's own loopback listeners are inside the shared stack and
+   the grant must not reach them; a request body over 32 MiB; a
+   response over the client's limit or 64 MiB; a response header over
+   the line bound; and `redirects` over five, whatever the method. A
+   `POST` asking for one to five is malformed: a redirected body is a
+   different request. The address policy is applied in the resolver
+   ureq calls before every connection, so it judges the host and port
+   ureq itself parsed, for the first hop and for every redirect. It
+   follows at most five redirects for `GET`, as many as asked when
+   fewer, and none for `POST`; beyond a count of one or more is ureq's
+   refusal, handed on as a transport error, and beyond none the `3xx`
+   itself. It drops `authorization` and `cookie` on the way as ureq
+   does, so a client that carries a credential across a redirect asks
+   for none, is handed the `3xx` with its `location`, and follows it
+   itself, a relative one joined against the URL it asked for; sends
+   `Accept-Encoding: identity` because the tier's closure has no
+   decoder and principle 2 makes one a sign-off; and gives the whole
+   exchange with the origin, redirects included, five minutes over
+   `http.rs`'s connect deadline: ureq's one deadline, which supersedes
+   its per-read and per-write timeouts. A bounded number of
+   connections are served at once; the rest wait.
 4. Evidence. The boot VM has no route out, so the evidence is the socket
    and the policy: `[fetch-evidence]` connects as the UI user, asks for
    a loopback URL and expects the exact refusal; inside the jail, the
    stage-2 readback already requires every granted socket to be present
    and mounted read-only, so `TD-MAIL-RUNNING` under the grant proves
    the socket reached the instance; the marker `TD-FETCH-OK` is latched
-   as an exact line and required by the oracle. Host side, a recipe
-   check runs the applet against a std `TcpListener` on loopback under a
-   test-only allow flag and pins the framing, the caps, the header rules
-   and a redirect.
+   as an exact line and required by the oracle. Host side, the crate's
+   own tests, which the `net-test` preflight runs, serve the applet
+   against a std `TcpListener` on loopback under a test-only allow flag
+   and pin the framing, the caps, the header rules and the redirects;
+   no recipe check builds td-net.
 5. What this buys, exactly: the applications hold no socket but a unix
    one, resolve no names, carry no trust store, and their closures are
    std; TLS trust, timeouts and body caps live in one reviewed place,
    and a jail that lost its grant loses the network entirely rather than
    its unmounted sockets. What it does not buy: a destination policy. An
    application with the grant reaches any `http` or `https` host the
-   machine can, as `shared=network` allowed, less td's own listeners;
-   and a name that changes its answer after the policy check is not
-   defended. Both are recorded as gaps. §L's claim list gains the
-   sentence: `sockets=fetch` mediates the transport, not the
-   destinations. §B.6's row "Nothing on the target fetches" and §B.7's
-   "reuse only in the control plane" are amended by the landing that
-   ships the applet, in that landing.
+   machine can, as `shared=network` allowed, less loopback and the link;
+   a listener on the machine's own routable address is among what it
+   reaches, since the tier's crate forbids `unsafe` and cannot enumerate
+   the interfaces; and a name that answers the resolver one way now and
+   another way later is defended only as far as the address it returned
+   is the one connected to; and a name lookup is outside every deadline,
+   since ureq resolves through a blocking call, so a resolver that hangs
+   holds a worker until it answers. All four are recorded as gaps. §L's
+   claim list gains the sentence: `sockets=fetch` mediates the
+   transport, not the destinations. §B.6's row "Nothing on the target
+   fetches" and §B.7's "reuse only in the control plane" are amended by
+   the landing that ships the applet, in that landing.
 
 **Sequencing.** (1) The fetch service, proven in the boot with the
 current pinned `tn` and `tmc` switched to it: the last pin bump. (2) The

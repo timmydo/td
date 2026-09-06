@@ -37,7 +37,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The connect half of ureq's default, restated here so both halves are visible at
 /// one place rather than one being a default and the other a setting.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Writes are small (request heads); a peer not reading them is as stuck as one not
 /// writing.
