@@ -1317,6 +1317,66 @@ F10, mouse menus, disabled/outside/repeated input, profile/format changes,
 Save and dirty-close flows, stale targets, resize and late file completion.
 This is not a clipboard, remote-control socket, GPU or jail milestone.
 
+### Implemented clipboard admission prerequisite
+
+The safe `clipboard` module captures clipboard intent independently of any
+display, descriptor, clock or worker. It does not claim system clipboard
+ownership. Native Cut/Copy/Paste remain unavailable until their transport
+adapter is implemented and the descriptor contract is amended.
+
+`Snapshot::capture` requires the active tab and expected text revision.
+It captures the directed selection, editor-instance identity and at most
+1 MiB of selected UTF-8 bytes as an immutable shared string. Empty selection
+returns None and must leave any existing clipboard ownership untouched.
+Oversized selection is refused before copying bytes. Subsequent edits do
+not change a retained snapshot. Debug output reports identity fields and
+byte counts, never the selected text.
+
+`Paste::begin` captures the same active tab/revision/selection binding.
+Incoming chunks are collected up to 1 MiB of raw transfer bytes, counting
+CRLF before normalization. Chunks may split a UTF-8 scalar or CRLF pair.
+Overflow clears the buffered prefix and permanently poisons the transfer:
+further chunks and attempted admission return `limit`. Dropping a transfer
+cancels it without model effects. The adapter must dispatch Event::Paste
+only after successful EOF, never after timeout, cancellation or I/O error;
+this pure layer cannot infer EOF or a transport failure from supplied bytes.
+
+Controller Cut/Paste admission consumes the snapshot/transfer. It checks
+editor-instance identity, active tab, exact revision and the original
+directed selection before any editing. A changed text revision returns
+`stale-revision`; another editor, inactive target or different selection
+returns `invalid-argument`; a closed target returns `missing-tab`.
+Selection is compared by value: moving away
+and back without editing satisfies that value check; a native adapter must
+separately cancel on focus/target transitions. Text edit followed by Undo
+still has a newer revision and cannot revive an old transfer.
+
+Cut deletes only the captured nonempty range. The adapter retains the shared
+snapshot for serving before dispatching Cut; a refusal leaves the document
+intact and may still leave a useful copy. This token is not a compositor
+ownership acknowledgement. Paste validates complete UTF-8 and uses ordinary
+Insert admission, normalizing CRLF and rejecting unsupported controls or an
+initial BOM in the resulting document. It cannot change file BOM/line-ending
+mode and does not invoke Auto Fill. Empty paste is Ignored rather than
+deleting the selection. Each text-changing paste or Cut is one ordinary
+undo transaction, with the original selection restored on Undo. Pasting
+identical text follows ordinary Insert's no-op rule: collapse the selection
+without changing revision, dirty state or history. That selection-only change
+is not undoable; Undo still refers to the previous text transaction. Existing
+document/history budgets, revision/content counters and controller generation
+admission apply before mutation. Rejected operations preserve view and input
+state as well as text; accepted operations reset input and reveal the caret.
+Like semantic Edit, these controller events do not require keyboard focus.
+The native adapter must enforce focus and cancel pending transfers on loss.
+
+The eventual window owns at most one copy snapshot and one incoming transfer
+at a time, separately charged from document/history memory; the public
+library API does not impose a process-wide allocator limit on callers.
+Tests exercise byte-at-a-time Unicode/CRLF, cancellation, malformed/oversized
+input, stale/foreign/inactive/selection-changed tokens, Undo, encoded-file
+budgets and generation exhaustion through the production controller.
+No new replay command, native clipboard claim or raw consumer is introduced.
+
 ### Version-1 compatibility target
 
 Use core `wl_compositor`, `wl_shm`, `wl_seat`, and `xdg_wm_base`; clipboard

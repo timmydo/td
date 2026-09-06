@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 pub type TabId = u64;
 
-pub(crate) struct ClosePoint {
+pub(crate) struct RevisionPoint {
     owner: Arc<()>,
     pub(crate) tab: TabId,
     pub(crate) revision: u64,
@@ -311,16 +311,16 @@ impl Editor {
         Ok(())
     }
 
-    pub(crate) fn close_point(&self, tab: TabId, revision: u64) -> Result<ClosePoint> {
+    pub(crate) fn revision_point(&self, tab: TabId, revision: u64) -> Result<RevisionPoint> {
         self.checked(tab, revision)?;
-        Ok(ClosePoint {
+        Ok(RevisionPoint {
             owner: self.identity.clone(),
             tab,
             revision,
         })
     }
 
-    pub(crate) fn check_close(&self, point: &ClosePoint) -> Result<()> {
+    pub(crate) fn check_revision(&self, point: &RevisionPoint) -> Result<()> {
         if !Arc::ptr_eq(&self.identity, &point.owner) {
             return Err(Error::InvalidArgument);
         }
@@ -328,19 +328,19 @@ impl Editor {
         Ok(())
     }
 
-    pub(crate) fn discard_tab(&mut self, point: ClosePoint) -> Result<()> {
-        self.check_close(&point)?;
+    pub(crate) fn discard_tab(&mut self, point: RevisionPoint) -> Result<()> {
+        self.check_revision(&point)?;
         self.remove_tab(point.tab);
         Ok(())
     }
 
     pub(crate) fn reload_bytes(
         &mut self,
-        point: ClosePoint,
+        point: RevisionPoint,
         bytes: &[u8],
         missing: bool,
     ) -> Result<()> {
-        self.check_close(&point)?;
+        self.check_revision(&point)?;
         if bytes.len() > self.limits.file_bytes {
             return Err(Error::Limit);
         }
@@ -819,7 +819,7 @@ mod reload_tests {
         editor.dispatch(tab, 1, Command::FillColumn(40)).unwrap();
         let (old_save, _) = editor.save_snapshot(tab).unwrap();
         let other = editor.load_bytes(b"other").unwrap();
-        let point = editor.close_point(tab, 1).unwrap();
+        let point = editor.revision_point(tab, 1).unwrap();
         editor
             .reload_bytes(point, b"\xef\xbb\xbfnew\r\n", false)
             .unwrap();
@@ -834,7 +834,7 @@ mod reload_tests {
         assert_eq!(editor.save_snapshot(tab).unwrap().1, b"\xef\xbb\xbfnew\r\n");
         editor.acknowledge_saved(old_save).unwrap();
         assert!(editor.document(tab).unwrap().dirty());
-        let point = editor.close_point(tab, 2).unwrap();
+        let point = editor.revision_point(tab, 2).unwrap();
         editor.reload_bytes(point, b"", true).unwrap();
         let doc = editor.document(tab).unwrap();
         assert!(doc.text().is_empty() && doc.dirty());
@@ -858,23 +858,23 @@ mod reload_tests {
             (b"x", true, Error::InvalidArgument),
         ] {
             let before = format!("{editor:?}");
-            let point = editor.close_point(tab, 0).unwrap();
+            let point = editor.revision_point(tab, 0).unwrap();
             assert_eq!(editor.reload_bytes(point, bytes, missing), Err(error));
             assert_eq!(format!("{editor:?}"), before);
         }
         let before = format!("{editor:?}");
-        let point = editor.close_point(tab, 0).unwrap();
+        let point = editor.revision_point(tab, 0).unwrap();
         assert!(editor.reload_bytes(point, b"\xff", false).is_err());
         assert_eq!(format!("{editor:?}"), before);
         let mut foreign = Editor::default();
         foreign.new_tab().unwrap();
-        let point = foreign.close_point(tab, 0).unwrap();
+        let point = foreign.revision_point(tab, 0).unwrap();
         assert_eq!(
             editor.reload_bytes(point, b"new", false),
             Err(Error::InvalidArgument)
         );
         assert_eq!(format!("{editor:?}"), before);
-        let stale = editor.close_point(tab, 0).unwrap();
+        let stale = editor.revision_point(tab, 0).unwrap();
         editor.document_mut(tab).unwrap().revision = 1;
         let before = format!("{editor:?}");
         assert_eq!(
@@ -891,7 +891,7 @@ mod reload_tests {
             }
             let before = format!("{editor:?}");
             let point = editor
-                .close_point(tab, editor.document(tab).unwrap().revision())
+                .revision_point(tab, editor.document(tab).unwrap().revision())
                 .unwrap();
             assert_eq!(
                 editor.reload_bytes(point, b"new", false),

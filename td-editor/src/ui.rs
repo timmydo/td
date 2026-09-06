@@ -40,6 +40,10 @@ pub enum Event<'a> {
         revision: u64,
         command: Command,
     },
+    /// Complete a successful EOF transfer; admission rechecks its selection.
+    Paste(crate::clipboard::Paste),
+    /// Delete only the captured selection, after the adapter retains its copy.
+    Cut(crate::clipboard::Snapshot),
     Key {
         tab: TabId,
         revision: u64,
@@ -197,6 +201,13 @@ impl Controller {
         Ok(())
     }
 
+    fn edit(&mut self, tab: TabId, revision: u64, command: Command) -> Result<Outcome> {
+        self.editor.dispatch(tab, revision, command)?;
+        self.reset_input();
+        self.nonvertical(tab)?;
+        Ok(Outcome::Changed)
+    }
+
     fn reset_input(&mut self) {
         self.keys.reset();
         self.mark = None;
@@ -316,11 +327,16 @@ impl Controller {
                 tab,
                 revision,
                 command,
-            } => {
-                self.editor.dispatch(tab, revision, command)?;
-                self.reset_input();
-                self.nonvertical(tab)?;
-                Ok(Outcome::Changed)
+            } => self.edit(tab, revision, command),
+            Event::Paste(paste) => {
+                let Some((tab, revision, command)) = paste.finish(&self.editor)? else {
+                    return Ok(Outcome::Ignored);
+                };
+                self.edit(tab, revision, command)
+            }
+            Event::Cut(snapshot) => {
+                let (tab, revision, command) = snapshot.cut(&self.editor)?;
+                self.edit(tab, revision, command)
             }
             Event::Key {
                 tab,
@@ -687,5 +703,52 @@ impl Controller {
         state.desired_column = None;
         self.wake_caret();
         Ok(Outcome::Changed)
+    }
+}
+
+#[cfg(test)]
+mod clipboard_admission_tests {
+    use super::*;
+    use crate::clipboard::{Paste, Snapshot};
+    use crate::model::Limits;
+
+    #[test]
+    fn clipboard_generation_and_encoded_file_budgets_refuse_without_mutation() {
+        let mut ui = Controller {
+            editor: Editor::with_limits(Limits {
+                file_bytes: 5,
+                ..Limits::default()
+            })
+            .unwrap(),
+            ..Controller::default()
+        };
+        let Outcome::Created(tab) = ui.dispatch(Event::Load(b"a\r\n")).unwrap() else {
+            panic!("fixture");
+        };
+        let mut paste = Paste::begin(ui.editor(), tab, 0).unwrap();
+        paste.push(b"\n\n").unwrap();
+        let before = format!("{:?}", ui.editor());
+        let generation = ui.generation;
+        assert_eq!(ui.dispatch(Event::Paste(paste)), Err(Error::Limit));
+        assert_eq!(format!("{:?}", ui.editor()), before);
+        assert_eq!(ui.generation, generation);
+        ui.dispatch(Event::Edit {
+            tab,
+            revision: 0,
+            command: Command::Select(Selection {
+                anchor: 0,
+                caret: 1,
+            }),
+        })
+        .unwrap();
+        let snapshot = Snapshot::capture(ui.editor(), tab, 0).unwrap().unwrap();
+        let mut paste = Paste::begin(ui.editor(), tab, 0).unwrap();
+        paste.push(b"b").unwrap();
+        ui.generation = u64::MAX;
+        let before = format!("{:?}", ui.editor());
+        assert_eq!(ui.dispatch(Event::Paste(paste)), Err(Error::Exhausted));
+        assert_eq!(ui.dispatch(Event::Cut(snapshot)), Err(Error::Exhausted));
+        assert_eq!(format!("{:?}", ui.editor()), before);
+        assert_eq!(ui.generation, u64::MAX);
     }
 }

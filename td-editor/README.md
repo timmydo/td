@@ -51,6 +51,13 @@ save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector
 reference. It also launches the real replay executable without a display.
 
+`clipboard.rs` supplies tested, display-independent copy snapshots and
+selection-bound Cut/Paste admission through the controller. Paste collects
+at most 1 MiB of raw bytes; oversized, malformed or stale transfers cannot
+partially edit a document. This is a prerequisite, not system clipboard
+support: the native menu entries remain disabled until the Wayland adapter
+and its descriptor audit are connected.
+
 `src/files.rs` now supplies the synchronous file-transaction adapter: bounded
 regular-file Open and baselines, external-change detection, metadata-checked
 atomic Save, and no-clobber Save As. It preserves BOM/line endings through

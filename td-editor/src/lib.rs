@@ -3,6 +3,7 @@
 //! Safe editor state and explicit adapters. File and window adapters own I/O;
 //! the document core has no environment, clock or filesystem access.
 
+pub mod clipboard;
 mod dialog;
 pub use dialog::{Discard, Reload};
 pub mod files;

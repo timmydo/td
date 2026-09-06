@@ -1,14 +1,14 @@
 //! Close decisions are explicit, editor/revision-bound and deferred until the
 //! entire close request is resolved. Dropping a request is cancellation.
 
-use crate::model::{ClosePoint, Editor, TabId};
+use crate::model::{Editor, RevisionPoint, TabId};
 use crate::ui::{Controller, Event};
 use crate::{Error, Result};
 use std::collections::BTreeSet;
 
 /// No public constructor: only a completed close dialog can approve discard.
 pub struct Discard {
-    point: ClosePoint,
+    point: RevisionPoint,
 }
 impl Discard {
     pub(crate) fn apply(self, editor: &mut Editor) -> Result<()> {
@@ -18,11 +18,11 @@ impl Discard {
 
 /// Only an answer to a live conflict dialog can authorize replacement.
 pub struct Reload {
-    point: ClosePoint,
+    point: RevisionPoint,
 }
 impl Reload {
     pub(crate) fn check(&self, editor: &Editor) -> Result<()> {
-        editor.check_close(&self.point)
+        editor.check_revision(&self.point)
     }
     pub(crate) fn tab(&self) -> TabId {
         self.point.tab
@@ -33,19 +33,19 @@ impl Reload {
 }
 
 pub(crate) struct Conflict {
-    point: Option<ClosePoint>,
+    point: Option<RevisionPoint>,
     discard: bool,
 }
 impl Conflict {
     pub(crate) fn new(editor: &Editor, target: Target) -> Result<Self> {
         Ok(Self {
-            point: Some(editor.close_point(target.tab, target.revision)?),
+            point: Some(editor.revision_point(target.tab, target.revision)?),
             discard: false,
         })
     }
     pub(crate) fn target(&self, editor: &Editor) -> Result<Target> {
         let point = self.point.as_ref().ok_or(Error::InvalidArgument)?;
-        editor.check_close(point)?;
+        editor.check_revision(point)?;
         Ok(Target {
             tab: point.tab,
             revision: point.revision,
@@ -87,17 +87,17 @@ pub(crate) enum Closed {
 
 pub(crate) struct Close {
     scope: Scope,
-    points: Vec<ClosePoint>,
+    points: Vec<RevisionPoint>,
     discarded: BTreeSet<TabId>,
 }
 
 impl Close {
     pub(crate) fn new(editor: &Editor, scope: Scope) -> Result<Self> {
         let mut points = match scope {
-            Scope::Tab { tab, revision } => vec![editor.close_point(tab, revision)?],
+            Scope::Tab { tab, revision } => vec![editor.revision_point(tab, revision)?],
             Scope::Window => editor
                 .tabs()
-                .map(|(tab, doc)| editor.close_point(tab, doc.revision()))
+                .map(|(tab, doc)| editor.revision_point(tab, doc.revision()))
                 .collect::<Result<Vec<_>>>()?,
         };
         // Ask about the active document first without changing the selection,
@@ -117,7 +117,7 @@ impl Close {
             return Err(Error::StaleRevision);
         }
         for point in &self.points {
-            editor.check_close(point)?;
+            editor.check_revision(point)?;
         }
         Ok(())
     }
