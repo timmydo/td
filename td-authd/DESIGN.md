@@ -5,8 +5,10 @@ secure attention and subsequent one-operation elevation. It enables no secret
 access, FIDO2 release, consent prompt, or public request listener. The image
 does not yet start it or use its terminal launcher.
 The eventual operation policy follows APPLICATIONS.md §L.1 and principle 7:
-one named operation, typed and descriptor-pinned arguments, one token
-assertion bound to that request, no remembered approval. Separate
+one named operation, typed and descriptor-pinned arguments, one protected
+consent bound to that request, no remembered approval. Protector changes
+add fresh hardware-backed authentication under
+[`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). Separate
 compositor/application identities and exclusive device ownership precede
 enabling that path.
 

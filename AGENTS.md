@@ -16,6 +16,7 @@ needs them:
 - Before changing or adding `unsafe`, read `UNSAFE.md` and the touched crate's
   normative document.
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
+- For disk encryption or session unlock, read `td-install/ENCRYPTION.md`.
 - For compositor/UI, service supervision, or installation, read the matching
   `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`.
 - Before changing target compiler flags, ELF debug handling, profiler code, or
@@ -196,14 +197,16 @@ paragraph is a target contract rather than a whole-image completeness claim.
    distribution. System deployments retain `current` and `previous` and boot
    one; the future application tier retains versions side by side and selects
    one with a pointer. The system runs one thing; applications run many.
-7. **Passwordless, not authorization-less.** Human authentication uses a FIDO2
-   token; secrets at rest are hardware-sealed; TPM possession is device
-   binding, not user identity. Elevation is one named operation with typed,
-   descriptor-pinned arguments and one consent bound to that request, never a
-   shell, password, remembered approval, or grace window. The compositor must
-   provide a secure attention and trusted-input path before this ships.
-   Recovery is a second token enrolled when the secret is created, or the
-   secret is explicitly unrecoverable.
+7. **Passwordless, not authorization-less.** Human authentication defaults to
+   TPM plus PIN, with FIDO2 plus PIN as an alternative. PINs authorize
+   hardware-protected keys; TPM possession alone is device binding, not user
+   identity. `td-install/ENCRYPTION.md` owns disk unlock and recovery policy.
+   Elevation is one named operation with typed, descriptor-pinned arguments
+   and one consent bound to that request, never a shell, account password,
+   remembered approval, or grace window. Sensitive protector changes require
+   fresh hardware-backed authentication. The compositor must provide a secure
+   attention and trusted-input path before this ships. Other secrets require
+   a second recovery token or an explicit unrecoverability decision.
 
 Principle 7 is a target, not a current claim. The stock VM writes empty
 shadow fields for `root` and `tester`, auto-logs in, and retains `su` as an

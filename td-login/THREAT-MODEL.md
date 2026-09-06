@@ -295,6 +295,11 @@ Consequences worth stating plainly:
   interactive behavior is unchanged from the busybox chain this replaces,
   which also accepted the empty shadow field without prompting.
 
+The future hardware-backed disk and session unlock contract lives in
+[`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). It binds primary
+authentication to one enrolled account and distinguishes recovery from login;
+the current auto-login and credential-switching behavior below is unchanged.
+
 TPM credential-store enrollment and boot release are separate root-owned
 operations in td-secret and td-firstboot, specified by
 `td-secret/DESIGN.md`. They do not switch process credentials or

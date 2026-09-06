@@ -783,7 +783,9 @@ stronger claim than it is:
 - **No A/B partition scheme.** Deployments are directories on one volume with
   `current`/`previous` selectors, which is already transactional. A/B
   partitioning solves a problem td does not have.
-- **The disk is not encrypted.**
+- **The disk is not encrypted.** [ENCRYPTION.md](ENCRYPTION.md) specifies the
+  lost-laptop workstream, authentication policy and activation gates. It
+  changes no current boot or installation behavior.
 
 ## 10. Sequence
 

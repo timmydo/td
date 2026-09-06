@@ -7924,9 +7924,10 @@ enumerated operation in the table below, beside `deploy-publish`. Today
 neither exists, which is why the tension went unnoticed: an application
 update IS a deployment, and deployments are already in the table.
 
-The requirement is a pair that looks contradictory and is not: **a user
-must be able to elevate, and must never type a secret to do it**
-(`AGENTS.md` principle 7). What resolves it is that a password and a
+Ordinary elevation requires **protected consent without an account
+password** (`AGENTS.md` principle 7). Changes to unlock credentials and
+recovery policy additionally require fresh hardware-backed PIN verification
+under [td-install/ENCRYPTION.md](td-install/ENCRYPTION.md). A password and a
 consent prompt answer different questions. A password asks *does this
 person know the secret* — which malware holding the person's session can
 also answer, having watched them type it. A consent prompt on a path
@@ -8147,9 +8148,10 @@ which a fake prompt cannot know and a primed reflex cannot supply.
 **A security key remains optional and stronger**: a full assertion over a
 domain-separated, versioned, length-prefixed canonical encoding of the
 complete request. It is not *authentication* by itself unless UV is
-enrolled — CTAP2 user presence proves possession, and the only ways to
-make it two-factor are `clientPin` (a memorised secret principle 7
-forbids) or an on-authenticator biometric. A PIN-less key means *whoever
+enrolled — CTAP2 user presence proves possession; `clientPin` or an
+on-authenticator biometric additionally verifies the user. Hardware-backed
+PINs are permitted by principle 7; disk unlock and protector changes require
+the PIN policy in `td-install/ENCRYPTION.md`. A PIN-less key means *whoever
 holds the key may elevate*, consistent with physical access being out of
 scope. If a token is used, **CTAP access must be exclusively mediated**:
 a key is `/dev/hidraw`, not evdev, so the compositor's input path does
