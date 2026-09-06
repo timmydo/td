@@ -3,9 +3,9 @@
 The experimental `--window --control-socket PATH` endpoint implements the
 query and revision-checked editing subset below. It is off by default;
 scratch preview and replay do not accept the option. Remote file operations,
-dialog answers, Check Spelling admission and frame acknowledgement remain
-unimplemented. This is not the complete
-version-1 endpoint specified in [DESIGN.md](DESIGN.md#test-and-control-architecture).
+dialog answers and Check Spelling admission remain unimplemented. The complete
+version-1 target is specified in
+[DESIGN.md](DESIGN.md#test-and-control-architecture).
 
 `control` has no listener, thread, filesystem access, clock or Wayland access.
 The separate `control_socket` library publishes a private Unix listener
@@ -60,14 +60,15 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID state` | Snapshot the current controller. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
+| `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
 
 The editing subset is specified below. `new`, `load`, file I/O,
 physical-input simulation and dialog answers remain refused; this parser is
 not a route into replay's broader command set.
 `Request::response` borrows `&Controller`, so it cannot dispatch an edit or
 change selection, views, history or generation. It returns `unavailable`
-for editing and spelling requests; only `Request::execute` admits edits,
-and the native adapter supplies its separately owned spelling state.
+for editing, spelling and frame requests; only `Request::execute` admits
+edits, and the native adapter supplies its spelling/frame state.
 
 An error response is `1 ID error CODE HEX_DIAGNOSTIC`. A recoverable request
 ID is echoed even if the command name is missing or later arguments are
@@ -217,6 +218,62 @@ queries remain available during modals. Existing whole-request transport
 bounds apply. Each page is below 16 KiB under the document/range ceilings,
 and serialization neither copies the whole document nor clones its marks.
 
+## Frame acknowledgement
+
+Native `state` supplies `window-generation=N`, a checked redraw-invalidation
+counter starting at one for the initial pending frame. Main-surface redraw
+requests advance it, including native notices, menus, dialogs, spelling and
+caret changes. Conservative invalidations and no-op edits may also advance
+it; multiple invalidations can coalesce into one submitted frame, so values
+may be skipped in the submitted/completed streams. This is separate from
+the controller's `generation` and is not a version of every native job flag.
+It is local to one window lifetime, not durable across endpoint restarts.
+
+`wait-frame GENERATION` requires `1..=window-generation` at UI admission.
+Zero or a future value is `invalid-argument`. The request has no side effects,
+does not request a redraw or dismiss a modal, and does not require focus.
+If a matching callback already completed, respond immediately. Otherwise
+retain the job until a main-surface frame of at least that generation receives
+its `wl_callback.done`, or the existing request deadline/cancellation wins.
+There is no intermediate `pending` response and no new timeout clock.
+Transport expiry closes the connection without a guaranteed error frame;
+an occluded/unconfigured window need not produce a matching callback at all.
+
+Success is `1 ID ok GENERATION,CONTROLLER,TAB,REVISION,WIDTH,HEIGHT,SCALE`.
+The seven numbers form one comma-separated field after the ordinary Tab
+header. They describe the immutable snapshot used to paint and submit the
+acknowledged buffer, not the controller when the callback or reply arrives.
+`TAB=0,REVISION=0` means the rendered snapshot had no active document.
+Other fields retain their existing units: UTF-8 document revision, controller
+generation and buffer pixel geometry/integer scale. A newer completed frame
+may satisfy an older request, and edits can intervene before the reply.
+Check the returned tab/revision when testing a particular edit.
+
+Native state appends `frame-submitted` and `frame-completed`, each either
+`-` (none) or the same seven-number snapshot. A sent commit records submitted
+state; only the matching outstanding main-surface callback records completed
+state. `wl_buffer.release` controls buffer reuse independently and never
+satisfies a wait. No response claims physical scanout, visibility, screenshot
+capture, compositor decorations or the separate pointer-cursor surface.
+
+At most eight jobs may be held, sharing the worker's existing eight live
+connection slots. Each outer turn inspects every held job once, drops dead
+jobs, and shares a two-action budget between ready held replies and newly
+admitted requests. Held replies have priority; unresolved holds consume no
+reply budget, so other admitted requests and Wayland dispatch continue.
+Eight holds can occupy all transport slots until completion/expiry; this
+endpoint promises bounded resource use, not per-client fairness. Shutdown or
+control disable drops all held jobs. If the defensive held-capacity check
+refuses admission, the live request receives `limit`; it is not held beyond
+the cap. Socket I/O remains on the worker.
+
+Native generation exhaustion poisons the window and terminates the event
+loop with `exhausted`, instead of wrapping, continuing redraws or reporting a
+false acknowledgement. The last admitted input may already have changed the
+model; this terminal display failure is not an undo/rollback or persistence
+guarantee. Subsequent control admission and drawing refuse the poisoned
+state, and ordinary endpoint cleanup cancels pending waits.
+
 ## Controller state response
 
 Success begins `1 ID ok` followed by these tab-separated fields, in order:
@@ -234,9 +291,9 @@ Success begins `1 ID ok` followed by these tab-separated fields, in order:
 There are at most 64 tab/view pairs. No text bytes, file path, title, dictionary,
 pending dialog/job or spelling range is serialized by this controller-only
 snapshot. Its generation means local UI state, **not** a submitted buffer,
-frame callback or scanout. The native extension below adds coarse flags; a
-complete native endpoint must add its own state under the
-full design contract before claiming complete remote control.
+frame callback or scanout. The native extension below adds its own redraw
+generations/snapshots and coarse flags. File/dialog job identities remain
+later work before claiming complete remote control.
 
 ## Experimental native adapter
 
@@ -258,10 +315,11 @@ response proves the UI is answering, not that a frame has been presented.
 Startup cleanup is best-effort; an abrupt death can leave a stale socket,
 which the caller must inspect and remove explicitly before retrying.
 
-The adapter polls at most two live jobs at the end of each outer event-loop
-turn, after file/timer processing and the single spelling step. It does not
-multiply that allowance for each decoded Wayland event. Each worker poll may
-discard its existing bounded prefix of expired jobs. While control is enabled,
+The adapter shares at most two live actions between held frame replies and
+new job admission at the end of each outer event-loop turn, after file/timer
+processing and the single spelling step. It does not multiply that allowance
+for each decoded Wayland event. Each worker poll may discard its existing
+bounded prefix of expired jobs. While control is enabled,
 the ordinary receive wait is capped at ten milliseconds, including idle time.
 This opt-in latency tradeoff can wake an otherwise idle window 100 times per
 second; the default window adds no control polling. All socket reads and
@@ -277,12 +335,15 @@ Native `text` responses are exactly the shared response above. Native `state`
 appends these tab-separated fields to successful controller snapshots, in
 this order. Error responses are unchanged:
 
-| Field | Comma-separated values |
+| Field | Value |
 | --- | --- |
-| `adapter=native-edit` | Explicit implemented adapter identity. |
+| `adapter=native-frame` | Explicit implemented adapter identity. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |
+| `window-generation=N` | Current native redraw-invalidation generation. |
+| `frame-submitted=...` | Last submitted snapshot, or `-`. |
+| `frame-completed=...` | Last callback-completed snapshot, or `-`. |
 
 Boolean flags are `0|1`; the dictionary field is an entry count or `-`.
 These are coarse presence flags, not dialog/job IDs,
@@ -290,7 +351,8 @@ allowed answers, operation results or spelling ranges. No path or entry text
 is disclosed by these added fields. Query `text` separately for document
 bytes. Controller generation does not cover native-only modal/job changes,
 and is not a submitted/callback-completed frame generation. Clients must not
-use it as a native snapshot version or presentation fence.
+use it as a native snapshot version or presentation fence. Use the separate
+`window-generation` with `wait-frame` under the frame contract above.
 
 On ordinary window exit, stop and join the worker and explicitly attempt
 checked cleanup; a shutdown error contributes to nonzero exit status. Drop
@@ -311,8 +373,10 @@ preserve modal state, reject stale pages after edit/Undo, answer Wayland
 pings with requests outstanding, and
 check startup-failure cleanup, timed shutdown with partial/nonreading peers,
 and retained cleanup errors without deleting replacement names. A separate
-source confinement assertion pins the two-job per-turn budget; the socket
-progress fixture does not count exact per-turn admissions.
+source confinement assertion pins the two-action per-turn budget. Held-frame
+socket tests count ready replies across turns, exercise old callbacks after
+newer edits, distinguish callback from release, preserve modal reads, service
+pings, expire a wait without a callback, and cancel holds on shutdown.
 Editing tests compare shared state/history with replay, native keyboard
 edits in both profiles and rendered pixels; they cover expected-selection
 races, expired jobs, pending-Paste/repeat cancellation, unchanged disk bytes,

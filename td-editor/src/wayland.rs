@@ -330,9 +330,8 @@ struct Window {
     argb: bool,
     pointer: Pointer,
     cursor_image: Option<CursorImage>,
-    dirty: bool,
+    frames: crate::control_frame::Frames,
     callback: Option<u32>,
-    presented: bool,
     bound: bool,
     closed: bool,
     temporary: PathBuf,
@@ -358,6 +357,7 @@ struct Window {
     searches: crate::search::History,
     spelling: crate::spelling::WindowState,
     control: Option<crate::control_worker::Worker>,
+    frame_waiters: VecDeque<crate::control_worker::Job>,
     control_cleanup_error: Option<String>,
 }
 
@@ -429,9 +429,8 @@ impl Window {
             argb: false,
             pointer: Pointer::default(),
             cursor_image: None,
-            dirty: true,
+            frames: crate::control_frame::Frames::default(),
             callback: None,
-            presented: false,
             bound: false,
             closed: false,
             temporary,
@@ -457,6 +456,7 @@ impl Window {
             searches: crate::search::History::default(),
             spelling: crate::spelling::WindowState::default(),
             control: None,
+            frame_waiters: VecDeque::new(),
             control_cleanup_error: None,
         })
     }
@@ -551,7 +551,8 @@ impl Window {
         let result = self.event_inner(message);
         self.cancel_stale_paste();
         self.searches.observe(self.ui.editor());
-        self.dirty |= self.spelling.observe(self.ui.editor());
+        self.frames
+            .invalidate(self.spelling.observe(self.ui.editor()));
         result
     }
 
@@ -691,7 +692,7 @@ impl Window {
                 }
                 self.connection.words(XDG_SURFACE, 4, &[serial])?;
                 self.configured = true;
-                self.dirty = true;
+                self.frames.invalidate(true);
             }
             (SURFACE, 0 | 1) if self.bound => {
                 cursor.u32()?;
@@ -787,8 +788,8 @@ impl Window {
             }
             (id, 0) if self.kind(id)? == Kind::Frame && self.callback == Some(id) => {
                 cursor.u32()?;
+                self.frames.complete().map_err(error)?;
                 self.callback = None;
-                self.presented = true;
                 self.set_kind(id, Kind::Retired)?;
             }
             (id, 0) if self.kind(id)? == Kind::Buffer => {
@@ -822,7 +823,7 @@ impl Window {
                 .map(|c| if c.is_control() { ' ' } else { c })
                 .collect(),
         );
-        self.dirty = true;
+        self.frames.invalidate(true);
     }
 
     fn close(&mut self) {
@@ -842,7 +843,7 @@ impl Window {
         self.prompt = None;
         if self.ui.editor().tabs().any(|(_, doc)| doc.dirty()) {
             self.quitting = true;
-            self.dirty = true;
+            self.frames.invalidate(true);
         } else {
             self.closed = true;
         }
@@ -858,7 +859,7 @@ impl Window {
         }
         self.input = Input::default();
         self.ui.dispatch(Event::Focus(false)).map_err(error)?;
-        self.dirty = true;
+        self.frames.invalidate(true);
         Ok(())
     }
 
@@ -921,7 +922,7 @@ impl Window {
                 self.show_cursor()?;
             }
             P::Leave(_) => {
-                self.dirty |= self.menu.take().is_some();
+                self.frames.invalidate(self.menu.take().is_some());
                 self.pointer.enter = None;
                 self.stop_pointer();
             }
@@ -940,7 +941,7 @@ impl Window {
                             .get(index)
                             .is_some_and(|item| menu.enabled(*item))
                         {
-                            self.dirty |= menu.selected != index;
+                            self.frames.invalidate(menu.selected != index);
                             menu.selected = index;
                         }
                     }
@@ -1000,7 +1001,7 @@ impl Window {
                             }
                             Err(e) => self.notify(format!("Scroll refused: {e}")),
                         }
-                        self.dirty |= before != self.ui.generation();
+                        self.frames.invalidate(before != self.ui.generation());
                     }
                 }
             }
@@ -1066,7 +1067,7 @@ impl Window {
                 return Ok(());
             }
         };
-        self.dirty |= before != self.ui.generation();
+        self.frames.invalidate(before != self.ui.generation());
         if !matches!(outcome, Outcome::Ignored) {
             self.input.cancel_repeat();
         }
@@ -1150,7 +1151,7 @@ impl Window {
                 }
                 Err(detail) => self.notify(format!("Keyboard disabled: {detail}")),
             }
-            self.dirty = true;
+            self.frames.invalidate(true);
             return Ok(());
         }
         if !active {
@@ -1166,7 +1167,7 @@ impl Window {
                 self.ui
                     .dispatch(Event::Focus(self.input.map.is_some()))
                     .map_err(error)?;
-                self.dirty = true;
+                self.frames.invalidate(true);
             }
             KeyboardEvent::Leave(surface) => {
                 if surface != SURFACE {
@@ -1177,7 +1178,7 @@ impl Window {
                 self.clipboard_focus_lost()?;
                 self.menu = None;
                 self.ui.dispatch(Event::Focus(false)).map_err(error)?;
-                self.dirty = true;
+                self.frames.invalidate(true);
             }
             KeyboardEvent::Modifiers(modifiers) => {
                 let ready =
@@ -1211,7 +1212,7 @@ impl Window {
         if matches!(chord, "Escape" | "C-g") && !repeated {
             self.clipboard.incoming = None;
             self.searches.cancel_wrap();
-            self.dirty |= self.spelling.cancel();
+            self.frames.invalidate(self.spelling.cancel());
         }
         if self.quitting {
             if !repeated {
@@ -1219,7 +1220,7 @@ impl Window {
                     "C-d" => self.closed = true,
                     "Escape" | "C-g" => {
                         self.quitting = false;
-                        self.dirty = true;
+                        self.frames.invalidate(true);
                     }
                     _ => {}
                 }
@@ -1265,7 +1266,7 @@ impl Window {
             return Ok(false);
         }
         if matches!(chord, "Escape" | "C-g") && self.notice.take().is_some() {
-            self.dirty = true;
+            self.frames.invalidate(true);
         }
         let Some(tab) = self.ui.editor().active() else {
             return Ok(false);
@@ -1289,7 +1290,7 @@ impl Window {
             revision,
             chord,
         });
-        self.dirty |= self.ui.generation() != before;
+        self.frames.invalidate(self.ui.generation() != before);
         match result {
             Ok(Outcome::Changed) => Ok(true),
             Ok(Outcome::Request { name: "quit", .. }) => {
@@ -1393,7 +1394,7 @@ impl Window {
                 .and_then(|files| files.take_dictionary())
             {
                 self.spelling.install(dictionary);
-                self.dirty = true;
+                self.frames.invalidate(true);
             }
             self.notify(match result {
                 Ok(notice) => notice,
@@ -1423,7 +1424,7 @@ impl Window {
         self.ui.dispatch(Event::Tick(now)).map_err(error)?;
         self.clock = now;
         self.clipboard_tick(now, repeat)?;
-        self.dirty |= self.ui.generation() != before;
+        self.frames.invalidate(self.ui.generation() != before);
         if repeat {
             match self.input.repeat(now) {
                 Ok(Some(stroke)) => {
@@ -1444,20 +1445,22 @@ impl Window {
         }
         self.cancel_stale_paste();
         self.searches.observe(self.ui.editor());
-        self.dirty |= self.spelling.observe(self.ui.editor());
+        self.frames
+            .invalidate(self.spelling.observe(self.ui.editor()));
         Ok(())
     }
 
     fn end_turn(&mut self, now: u64, repeat: bool) -> Result<()> {
         self.tick(now, repeat)?;
         match self.spelling.step(self.ui.editor()) {
-            Ok(changed) => self.dirty |= changed,
+            Ok(changed) => self.frames.invalidate(changed),
             Err(detail) => self.notify(format!("Spelling cancelled: {detail}")),
         }
         if self.spelling.running() {
             self.connection.wait = self.connection.wait.min(Duration::from_millis(1));
         }
         self.control_tick();
+        self.frames.generation().map_err(error)?;
         Ok(())
     }
 
@@ -1468,8 +1471,36 @@ impl Window {
         if self.control.is_some() {
             self.connection.wait = self.connection.wait.min(Duration::from_millis(10));
         }
+        let mut budget = CONTROL_JOBS_PER_TURN;
+        // Inspect each held job once. Replies share the ordinary admission budget.
+        for _ in 0..self.frame_waiters.len() {
+            let Some(job) = self.frame_waiters.pop_front() else {
+                break;
+            };
+            if !job.is_live() {
+                continue;
+            }
+            let ready = match job.request().operation {
+                crate::control::Operation::WaitFrame(target) => {
+                    self.frames.wait(target) != Ok(None)
+                }
+                // Only waits are queued; unexpected jobs still use ordinary admission.
+                _ => true,
+            };
+            if ready && budget > 0 {
+                budget -= 1;
+                if let Err(detail) = job.respond_with(|request| self.control_response(request)) {
+                    self.notify(format!("Control response refused: {detail}"));
+                }
+            } else {
+                self.frame_waiters.push_back(job);
+            }
+        }
         // One outer turn, not every decoded Wayland event, budgets UI work.
         for _ in 0..CONTROL_JOBS_PER_TURN {
+            if budget == 0 {
+                break;
+            }
             let Some(worker) = self.control.as_ref() else {
                 break;
             };
@@ -1481,6 +1512,26 @@ impl Window {
                     break;
                 }
             };
+            if !job.is_live() {
+                continue;
+            }
+            budget -= 1;
+            if let crate::control::Operation::WaitFrame(target) = job.request().operation {
+                if self.frames.wait(target) == Ok(None) {
+                    if self.frame_waiters.len() < crate::control_worker::CONNECTIONS {
+                        self.frame_waiters.push_back(job);
+                    } else if let Err(detail) = job.respond_with(|request| {
+                        crate::control::Refusal {
+                            id: request.id,
+                            error: crate::Error::Limit,
+                        }
+                        .response()
+                    }) {
+                        self.notify(format!("Control response refused: {detail}"));
+                    }
+                    continue;
+                }
+            }
             if let Err(detail) = job.respond_with(|request| self.control_response(request)) {
                 self.notify(format!("Control response refused: {detail}"));
             }
@@ -1488,6 +1539,29 @@ impl Window {
     }
 
     fn control_response(&mut self, request: &crate::control::Request) -> String {
+        if let Err(error) = self.frames.generation() {
+            return crate::control::Refusal {
+                id: request.id,
+                error,
+            }
+            .response();
+        }
+        if let crate::control::Operation::WaitFrame(target) = request.operation {
+            return match self.frames.wait(target) {
+                Ok(Some(stamp)) => format!("1\t{}\tok\t{}", request.id, stamp.fields()),
+                // The scheduler holds pending waits; direct dispatch still fails safely.
+                Ok(None) => crate::control::Refusal {
+                    id: request.id,
+                    error: crate::Error::Unavailable,
+                }
+                .response(),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if matches!(
             request.operation,
             crate::control::Operation::SpellingResults { .. }
@@ -1511,7 +1585,7 @@ impl Window {
                     self.clipboard.incoming_target = None;
                     self.searches.observe(self.ui.editor());
                     self.spelling.observe(self.ui.editor());
-                    self.dirty = true;
+                    self.frames.invalidate(true);
                     format!("1\t{}\tok\t", request.id)
                 }
                 Err(error) => crate::control::Refusal {
@@ -1523,18 +1597,24 @@ impl Window {
         }
         let response = request.response(&self.ui);
         if request.operation == crate::control::Operation::State {
-            self.native_state(response)
+            self.native_state(response).unwrap_or_else(|error| {
+                crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response()
+            })
         } else {
             response
         }
     }
 
-    fn native_state(&self, mut response: String) -> String {
+    fn native_state(&self, mut response: String) -> crate::Result<String> {
         if response.split('\t').nth(2) == Some("ok") {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-edit\tnative={},{},{},{}",
+                    "\tadapter=native-frame\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.configured),
@@ -1555,11 +1635,14 @@ impl Window {
                     .map_or_else(|| "-".into(), |n| n.to_string()),
                 flag(self.spelling.running()),
             ));
+            response.push('\t');
+            response.push_str(&self.frames.fields()?);
         }
-        response
+        Ok(response)
     }
 
     fn stop_control(&mut self) {
+        self.frame_waiters.clear();
         if let Some(worker) = self.control.take() {
             if let Err(error) = worker.close() {
                 self.control_cleanup_error = Some(error.to_string());
@@ -1588,10 +1671,17 @@ impl Window {
     }
 
     fn draw(&mut self) -> Result<()> {
-        if self.closed || !self.dirty || !self.configured || !self.xrgb || self.callback.is_some() {
+        self.frames.generation().map_err(error)?;
+        if self.closed
+            || !self.frames.is_dirty()
+            || !self.configured
+            || !self.xrgb
+            || self.callback.is_some()
+        {
             return Ok(());
         }
         let geometry = self.ui.geometry();
+        let stamp = self.frames.capture(&self.ui).map_err(error)?;
         let free = self
             .buffers
             .iter()
@@ -1687,7 +1777,7 @@ impl Window {
         // initial handshake/submission has a deadline.
         self.connection.startup_deadline = None;
         self.callback = Some(callback);
-        self.dirty = false;
+        self.frames.submit(stamp).map_err(error)?;
         Ok(())
     }
 
@@ -1843,7 +1933,7 @@ impl Window {
             menu.step(false);
         }
         self.menu = Some(menu);
-        self.dirty = true;
+        self.frames.invalidate(true);
         Ok(())
     }
 
@@ -1864,7 +1954,7 @@ impl Window {
         if let Some(group) = crate::menu::header(self.ui.geometry(), x, y) {
             if self.menu.as_ref().is_some_and(|menu| menu.group == group) {
                 self.menu = None;
-                self.dirty = true;
+                self.frames.invalidate(true);
             } else {
                 self.open_menu(group)?;
             }
@@ -1877,7 +1967,7 @@ impl Window {
             self.activate_menu(index)?;
         } else {
             self.menu = None;
-            self.dirty = true;
+            self.frames.invalidate(true);
         }
         Ok(true)
     }
@@ -1891,7 +1981,7 @@ impl Window {
             if chord != "F10" {
                 self.notice = None;
             }
-            self.dirty = true;
+            self.frames.invalidate(true);
             return Ok(());
         }
         if !self.menu_valid() {
@@ -1905,7 +1995,7 @@ impl Window {
         match chord {
             "Up" | "Down" => {
                 menu.step(chord == "Up");
-                self.dirty = true;
+                self.frames.invalidate(true);
             }
             "Left" | "Right" => {
                 let count = crate::menu::Group::ALL.len();
@@ -1958,7 +2048,7 @@ impl Window {
         self.menu = None;
         self.stop_pointer();
         self.input.cancel_repeat();
-        self.dirty = true;
+        self.frames.invalidate(true);
         let event = match item {
             Item::Command => {
                 self.command_request(tab, revision)?;
@@ -2088,7 +2178,7 @@ impl Window {
             Ok(_) => {
                 self.labels.retain(|(id, _)| *id != tab);
                 self.closed |= self.ui.editor().active().is_none();
-                self.dirty = true;
+                self.frames.invalidate(true);
             }
             Err(crate::Error::Dirty) => self.notify(
                 "Tab has unsaved scratch text. Undo to clean, or close the window to discard all.",
@@ -2127,7 +2217,7 @@ impl Window {
         if self.files.as_ref().is_some_and(|files| files.busy()) {
             return;
         }
-        self.dirty = true;
+        self.frames.invalidate(true);
         let Some(close) = self.closing.as_ref() else {
             return;
         };
@@ -2224,7 +2314,7 @@ impl Window {
                 self.notify("Reload cancelled; pending read will finish without replacing text or baseline.");
             } else {
                 // Keep the original file diagnostic available after dismissal.
-                self.dirty = true;
+                self.frames.invalidate(true);
             }
             return;
         }
@@ -2265,12 +2355,12 @@ impl Window {
                 match result {
                     Ok(()) => {
                         self.reloading = Some(target);
-                        self.dirty = true;
+                        self.frames.invalidate(true);
                     }
                     Err(detail) => self.notify(format!("Reload refused: {detail}; text retained")),
                 }
             }
-            Ok(None) => self.dirty = true,
+            Ok(None) => self.frames.invalidate(true),
             Err(detail) => {
                 self.conflict = None;
                 self.notify(format!("Reload refused: {detail}; text retained"));
@@ -2401,7 +2491,7 @@ impl Window {
             self.notify(format!("Spelling request refused: {detail}"));
             return;
         }
-        self.dirty = true;
+        self.frames.invalidate(true);
         match self.spelling.start(self.ui.editor(), tab, revision) {
             Ok(true) => self.notice = None,
             Ok(false) => self.notify(if self.files.is_some() {
@@ -2438,7 +2528,7 @@ impl Window {
                 }),
             })
             .map_err(error)?;
-        self.dirty = true;
+        self.frames.invalidate(true);
         self.cancel_stale_paste();
         Ok(())
     }
@@ -2473,7 +2563,7 @@ impl Window {
                 },
                 text: String::new(),
             });
-            self.dirty = true;
+            self.frames.invalidate(true);
             true
         }
     }
@@ -2485,7 +2575,7 @@ impl Window {
         let Some(mut prompt) = self.prompt.take() else {
             return;
         };
-        self.dirty = true;
+        self.frames.invalidate(true);
         match chord {
             "Escape" | "C-g" => {
                 if self.closing.take().is_some() {
@@ -2600,7 +2690,7 @@ impl Window {
         self.command = None;
         self.replace = Some(prompt);
         self.notice = None;
-        self.dirty = true;
+        self.frames.invalidate(true);
         Ok(())
     }
 
@@ -2611,7 +2701,7 @@ impl Window {
         let Some(mut prompt) = self.replace.take() else {
             return Ok(());
         };
-        self.dirty = true;
+        self.frames.invalidate(true);
         if matches!(chord, "Escape" | "C-g") {
             self.searches.cancel_wrap();
             self.notice = None;
@@ -2658,7 +2748,7 @@ impl Window {
         self.command = Some(prompt);
         self.replace = None;
         self.notice = None;
-        self.dirty = true;
+        self.frames.invalidate(true);
         Ok(())
     }
 
@@ -2669,7 +2759,7 @@ impl Window {
         let Some(mut prompt) = self.command.take() else {
             return Ok(());
         };
-        self.dirty = true;
+        self.frames.invalidate(true);
         if matches!(chord, "Escape" | "C-g") {
             self.notice = None;
             self.ui.dispatch(Event::CancelInput).map_err(error)?;
@@ -2743,7 +2833,7 @@ impl Window {
         self.replace = None;
         self.clipboard.incoming = None;
         self.notice = None;
-        self.dirty = true;
+        self.frames.invalidate(true);
         Ok(())
     }
 
@@ -2754,7 +2844,7 @@ impl Window {
         let Some(mut prompt) = self.number.take() else {
             return Ok(());
         };
-        self.dirty = true;
+        self.frames.invalidate(true);
         if matches!(chord, "Escape" | "C-g") {
             self.notice = None;
             self.ui.dispatch(Event::CancelInput).map_err(error)?;
@@ -2854,7 +2944,7 @@ impl Window {
         self.command = None;
         self.replace = None;
         self.notice = None;
-        self.dirty = true;
+        self.frames.invalidate(true);
         Ok(())
     }
 
@@ -2882,7 +2972,7 @@ impl Window {
         let Some(mut prompt) = self.search.take() else {
             return Ok(());
         };
-        self.dirty = true;
+        self.frames.invalidate(true);
         if matches!(chord, "Escape" | "C-g") {
             self.searches.cancel_wrap();
             self.notice = None;
@@ -3023,7 +3113,7 @@ impl Window {
             self.set_kind(device, Kind::RetiredClipboardDevice)?;
         }
         self.menu = None;
-        self.dirty = true;
+        self.frames.invalidate(true);
         Ok(())
     }
 
@@ -3109,7 +3199,7 @@ impl Window {
                     self.retire_offer(offer)?;
                 }
                 self.menu = None;
-                self.dirty = true;
+                self.frames.invalidate(true);
             }
             D::Enter { surface, offer } => {
                 if surface != SURFACE {
@@ -4408,7 +4498,7 @@ mod tests {
             let prompt = w.number.as_mut().unwrap();
             prompt.type_chord("Backspace");
             prompt.type_chord("0"); // same digits/focus, only invalid feedback removed
-            w.dirty = true;
+            w.frames.invalidate(true);
             w.draw().unwrap();
             assert!(w.pixels != error_pixels);
             assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..0);
@@ -5085,11 +5175,12 @@ mod tests {
             operation: crate::control::Operation::State,
         };
         let before = query.response(&w.ui);
+        let generation = w.frames.generation().unwrap();
         let response = w.control_response(&query);
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-edit\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0"
+                "{before}\tadapter=native-frame\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -5105,7 +5196,7 @@ mod tests {
         let refused = crate::control::Request::parse(b"1\t77\tnew")
             .unwrap_err()
             .response();
-        assert_eq!(w.native_state(refused.clone()), refused);
+        assert_eq!(w.native_state(refused.clone()), Ok(refused));
     }
 
     #[test]
@@ -5502,6 +5593,230 @@ mod tests {
     }
 
     #[test]
+    fn native_frame_waits_acknowledge_rendered_revisions_not_later_edits_or_releases() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        w.event(message(SHM, 0, &[1])).unwrap();
+        configure(&mut w, 800, 600);
+        w.draw().unwrap();
+        drain(&peer);
+        let old = w.frames.capture(&w.ui).unwrap();
+        let pixels = w.pixels.clone();
+        let state = crate::control::Request::parse(b"1\t90\tstate").unwrap();
+        let before = w.control_response(&state);
+        for (id, target) in [(80, 0), (81, u64::MAX)] {
+            let mut invalid =
+                control_client(&path, format!("1\t{id}\twait-frame\t{target}").as_bytes());
+            assert!(control_answer(&mut w, &mut invalid, &peer)
+                .starts_with(&format!("1\t{id}\terror\tinvalid-argument\t")));
+            assert!(w.frame_waiters.is_empty());
+            assert_eq!(w.control_response(&state), before);
+        }
+        let mut query = control_client(&path, b"1\t90\tstate");
+        let response = control_answer(&mut w, &mut query, &peer);
+        assert!(response.contains(&format!(
+            "\tframe-submitted={}\tframe-completed=-",
+            old.fields()
+        )));
+        let mut first = control_client(
+            &path,
+            format!("1\t1\twait-frame\t{}", old.generation()).as_bytes(),
+        );
+        hold_frame_waits(&mut w, &peer, 1);
+        w.chord("a", false).unwrap();
+        let target = w.frames.generation().unwrap();
+        assert!(target > old.generation());
+        let mut second = control_client(&path, format!("1\t2\twait-frame\t{target}").as_bytes());
+        hold_frame_waits(&mut w, &peer, 2);
+        let mut byte = [0];
+        assert_eq!(
+            first.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let buffer = w.buffers.first().unwrap().id;
+        w.event(message(buffer, 0, &[])).unwrap(); // Release alone cannot satisfy either fence.
+        w.control_tick();
+        assert_eq!(w.frame_waiters.len(), 2);
+        assert_eq!(w.pixels, pixels);
+        done(&mut w);
+        w.control_tick();
+        assert_eq!(w.frame_waiters.len(), 1);
+        assert_eq!(
+            control_answer(&mut w, &mut first, &peer),
+            format!("1\t1\tok\t{}", old.fields())
+        );
+        let mut query = control_client(&path, b"1\t91\tstate");
+        assert!(control_answer(&mut w, &mut query, &peer)
+            .ends_with(&format!("\tframe-completed={}", old.fields())));
+        assert_eq!(
+            second.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        w.draw().unwrap();
+        drain(&peer);
+        let new = w.frames.capture(&w.ui).unwrap();
+        assert!(new.generation() >= target);
+        assert_ne!(w.pixels, pixels);
+        assert_eq!(w.frames.wait(target), Ok(None));
+        done(&mut w);
+        assert_eq!(
+            control_answer(&mut w, &mut second, &peer),
+            format!("1\t2\tok\t{}", new.fields())
+        );
+        let mut query = control_client(&path, b"1\t92\tstate");
+        assert!(control_answer(&mut w, &mut query, &peer).contains(&format!(
+            "\tframe-submitted={}\tframe-completed={}",
+            new.fields(),
+            new.fields()
+        )));
+        assert!(w.buffers.iter().any(|buffer| buffer.busy)); // Callback is not release.
+        w.stop_control();
+        assert!(!path.exists());
+    }
+
+    fn hold_frame_waits(w: &mut Window, peer: &UnixStream, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while w.frame_waiters.len() != count {
+            assert!(Instant::now() < deadline, "frame wait admission");
+            w.control_tick();
+            drain(peer);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn frame_wait_replies_share_the_two_job_budget_and_shutdown_clears_holds() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        w.event(message(SHM, 0, &[1])).unwrap();
+        configure(&mut w, 800, 600);
+        w.chord("C-f", false).unwrap();
+        w.draw().unwrap();
+        drain(&peer);
+        let stamp = w.frames.capture(&w.ui).unwrap();
+        let mut clients: Vec<_> = (1..=3)
+            .map(|id| {
+                control_client(
+                    &path,
+                    format!("1\t{id}\twait-frame\t{}", stamp.generation()).as_bytes(),
+                )
+            })
+            .collect();
+        hold_frame_waits(&mut w, &peer, 3);
+        let state = crate::control::Request::parse(b"1\t4\tstate").unwrap();
+        let before = w.control_response(&state);
+        let mut query = control_client(&path, b"1\t4\tstate");
+        assert_eq!(control_answer(&mut w, &mut query, &peer), before);
+        assert!(w.search.is_some());
+        w.event(message(WM, 0, &[918])).unwrap();
+        assert!(drain(&peer)
+            .0
+            .iter()
+            .any(|m| m.object == WM && m.opcode == 3));
+        done(&mut w);
+        w.control_tick();
+        assert_eq!(w.frame_waiters.len(), 1);
+        w.control_tick();
+        assert!(w.frame_waiters.is_empty());
+        for (id, client) in (1..=3).zip(&mut clients) {
+            assert_eq!(
+                control_answer(&mut w, client, &peer),
+                format!("1\t{id}\tok\t{}", stamp.fields())
+            );
+        }
+        w.chord("Escape", false).unwrap();
+        let target = w.frames.generation().unwrap();
+        let mut pending = control_client(&path, format!("1\t5\twait-frame\t{target}").as_bytes());
+        hold_frame_waits(&mut w, &peer, 1);
+        w.stop_control();
+        assert!(w.frame_waiters.is_empty());
+        assert_eq!(pending.read(&mut [0]).unwrap(), 0);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn native_frame_poison_refuses_edits_drawing_and_turns_then_cleans_holds() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        let target = w.frames.generation().unwrap();
+        let _client = control_client(&path, format!("1\t1\twait-frame\t{target}").as_bytes());
+        hold_frame_waits(&mut w, &peer, 1);
+        let before = crate::control::state(&w.ui).unwrap();
+        w.frames.exhaust_for_test(); // Exercise window wiring at the counter boundary.
+        assert_eq!(w.draw(), Err("exhausted".into())); // Unconfigured: no capture fallback.
+        let edit = crate::control::Request::parse(b"1\t2\tinsert\t1\t0\t0\t0\t61").unwrap();
+        assert!(w.control_response(&edit).contains("\terror\texhausted\t"));
+        assert_eq!(crate::control::state(&w.ui).unwrap(), before);
+        let result = w.end_turn(w.clock, false);
+        assert_eq!(result, Err("exhausted".into()));
+        assert_eq!(w.finish_control(result), Err("exhausted".into()));
+        assert!(w.frame_waiters.is_empty());
+        assert!(w.control.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn frame_wait_deadlines_expire_without_a_callback_or_ui_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        let target = w.frames.generation().unwrap();
+        let before = crate::control::state(&w.ui).unwrap();
+        let mut client = control_client(&path, format!("1\t1\twait-frame\t{target}").as_bytes());
+        hold_frame_waits(&mut w, &peer, 1);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !w.frame_waiters.is_empty() {
+            assert!(Instant::now() < deadline, "expired frame wait retained");
+            w.control_tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        client.set_nonblocking(false).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        assert_eq!(crate::control::state(&w.ui).unwrap(), before);
+        assert_eq!(w.frames.generation().unwrap(), target);
+        assert!(w.callback.is_none());
+        w.stop_control();
+    }
+
+    #[test]
     fn native_control_socket_queries_preserve_modal_state_and_revision_checks() {
         use std::os::unix::fs::PermissionsExt;
         let directory = DialogDirectory::new();
@@ -5623,7 +5938,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-edit\t"));
+            assert!(response.contains("\tadapter=native-frame\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");
@@ -5820,10 +6135,10 @@ mod tests {
         std::fs::write(&path, b"disk").unwrap();
         w.files.as_mut().unwrap().open(path).unwrap();
         w.open_menu(Group::Format).unwrap();
-        w.dirty = false;
+        w.frames.clear_damage_for_test();
         finish_file(&mut w);
         assert!(w.menu.is_none());
-        assert!(w.dirty);
+        assert!(w.frames.is_dirty());
         assert_ne!(w.ui.editor().active(), Some(tab));
         assert_eq!(w.ui.editor().document(tab).unwrap().text(), "xy");
     }
@@ -5856,11 +6171,11 @@ mod tests {
     fn keymap_replacement_dismisses_menus_and_repaints() {
         let (mut w, peer) = file_dialog_fixture();
         w.open_menu(crate::menu::Group::Edit).unwrap();
-        w.dirty = false;
+        w.frames.clear_damage_for_test();
         let device = w.device.unwrap();
         send_map(&mut w, &peer, device, &map_file());
         assert!(w.menu.is_none());
-        assert!(w.dirty);
+        assert!(w.frames.is_dirty());
     }
 
     #[test]
@@ -5906,12 +6221,12 @@ mod tests {
         assert!(w.menu.is_some());
         assert_eq!(w.ui.tab_view(tab).unwrap(), before);
         assert!(w.pointer.wheel_target.is_none());
-        w.dirty = false;
+        w.frames.clear_damage_for_test();
         w.event(message(pointer, 1, &[20, SURFACE])).unwrap();
-        assert!(w.menu.is_none() && w.dirty);
-        w.dirty = false;
+        assert!(w.menu.is_none() && w.frames.is_dirty());
+        w.frames.clear_damage_for_test();
         w.event(message(pointer, 1, &[21, SURFACE])).unwrap();
-        assert!(!w.dirty);
+        assert!(!w.frames.is_dirty());
     }
 
     struct DialogDirectory(PathBuf);
@@ -7494,7 +7809,7 @@ mod tests {
         configure(&mut w, 700, 200);
         configure(&mut w, 0, 240);
         w.draw().unwrap();
-        assert!(w.dirty);
+        assert!(w.frames.is_dirty());
         assert!(w.callback.is_none());
         assert_eq!(w.buffers.len(), 3);
         assert_eq!(w.ui.geometry().dimensions(), (700, 240));
@@ -7503,7 +7818,7 @@ mod tests {
         assert_eq!(still_original, original);
         w.event(message(first, 0, &[])).unwrap();
         w.draw().unwrap();
-        assert!(!w.dirty);
+        assert!(!w.frames.is_dirty());
         assert_eq!(w.buffers.len(), 3);
         assert_eq!(w.buffers.last().unwrap().geometry.dimensions(), (700, 240));
         assert_eq!(w.kind(first).unwrap(), Kind::RetiredBuffer);
@@ -7522,7 +7837,7 @@ mod tests {
         w.event(message(id, 0, &[])).unwrap();
         configure(&mut w, 100, 100);
         w.draw().unwrap();
-        assert!(w.dirty);
+        assert!(w.frames.is_dirty());
         done(&mut w);
         w.draw().unwrap();
         let (_, files) = drain(&peer);
@@ -7585,7 +7900,7 @@ mod tests {
         let (messages, _) = drain(&peer);
         assert_eq!(messages, [message(WM, 3, &[1234])]);
         w.event(message(TOPLEVEL, 1, &[])).unwrap();
-        w.dirty = true;
+        w.frames.invalidate(true);
         w.draw().unwrap();
         assert!(w.closed);
         assert!(drain(&peer).0.is_empty());
@@ -7700,7 +8015,7 @@ mod tests {
         drain(&peer);
         assert!(w.connection.startup_deadline.is_none());
         assert!(w.callback.is_some());
-        assert!(!w.presented);
+        assert_eq!(w.frames.wait(1), Ok(None));
         assert_eq!(w.connection.budget(WRITE_DEADLINE).unwrap(), WRITE_DEADLINE);
         w.event(message(WM, 0, &[9])).unwrap();
         assert_eq!(drain(&peer).0, [message(WM, 3, &[9])]);
@@ -7764,7 +8079,7 @@ mod tests {
         w.connection.words(DISPLAY, 1, &[REGISTRY]).unwrap();
         w.connection.words(DISPLAY, 0, &[SYNC]).unwrap();
         let start = Instant::now();
-        while !w.presented {
+        while w.frames.wait(1).unwrap().is_none() {
             assert!(
                 start.elapsed() < INITIAL_DEADLINE,
                 "Weston presentation timeout"
@@ -7773,7 +8088,7 @@ mod tests {
                 w.event(m).unwrap();
             }
             w.draw().unwrap();
-            if !w.presented {
+            if w.frames.wait(1).unwrap().is_none() {
                 w.connection.read_more().unwrap();
             }
         }

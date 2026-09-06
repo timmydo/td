@@ -23,8 +23,9 @@ chunks, and publishes underlines and counts together. Format supplies
 dictionary selection and next/previous marked-word navigation. GPU rendering
 is not implemented yet. The optional native control socket now exposes
 state/text and scan-pinned spelling queries, plus revision/selection-checked
-edits. Remote file operations, dialog answers, Check Spelling admission and
-frame acknowledgement remain unimplemented.
+edits. Native redraw/submitted/callback generations and bounded `wait-frame`
+acknowledgement are connected. Remote file operations, dialog answers and
+Check Spelling admission remain unimplemented.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -190,10 +191,11 @@ the controller does not infer time between them. Backward ticks are refused.
 The caret is visible for 500 ms, hidden for 500 ms, and hidden when unfocused;
 accepted keys and selection/edit actions restart its visible interval. Repeat
 scheduling belongs to the seat adapter, not this blink clock.
-Every successful command conservatively advances a checked window generation;
+Every successful command conservatively advances a checked controller generation;
 ignored input and ticks that do not change caret visibility do not. Rejected
-events do not advance it. Generations describe local state only: no committed
-or callback-completed frame, socket endpoint or `wait-frame` is claimed yet.
+events do not advance it. This describes controller state only. The native
+adapter separately tracks main-surface redraw/submitted/callback generations
+under CONTROL.md; do not use the controller counter as a frame fence.
 
 ## Document model and file safety
 
@@ -2090,12 +2092,14 @@ job admission and target revision; selection-relative operations additionally
 pin the directed selection. Native modals refuse edits without dismissal.
 All edits use the ordinary controller, including history, view refresh and
 native search/spelling/Paste/repeat invalidation. Its exact
-implemented subset, startup/cleanup behavior and two-job-per-turn budget
+implemented subset, startup/cleanup behavior and two-action-per-turn budget
 are specified in CONTROL.md. Native spelling-result pages borrow validated
 reports, pin text revision and a never-reused window scan ID, and expose no
 partial marks. This also distinguishes a recheck or dictionary replacement
-without text changes. Remote file operations, dialog answers, Check Spelling
-admission and frame acknowledgement remain unimplemented.
+without text changes. Native frame snapshots and held `wait-frame` requests
+now implement callback acknowledgement without blocking Wayland dispatch.
+Remote file operations, dialog answers and Check Spelling admission remain
+unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 
@@ -2167,13 +2171,16 @@ The implementation's protocol reference lists field order for every command
 and response alongside conformance fixtures; it cannot invent additional
 authority or a second mutation path.
 
-Every accepted UI-visible change advances a window generation. `wait-frame N`
-waits for a committed buffer tagged with generation at least N to receive
-its frame callback and reports the actual generation and document revision
-rendered. It times out after the whole-request deadline. This acknowledges
-compositor processing, not physical scanout; screenshots and image tests
+Every main-surface redraw invalidation advances a checked native window
+generation; conservative invalidations may advance it without new pixels.
+Coalesced draws may skip generations. `wait-frame N` requires a nonzero,
+already issued generation and waits for a committed buffer tagged with at
+least N to receive its frame callback. It reports the actual generation and
+document revision rendered. It times out after the whole-request deadline.
+This acknowledges compositor processing, not physical scanout; image tests
 must separately observe the presented pixels. Buffer reuse still waits for
-release, independently of a frame-wait response.
+release, independently of a frame-wait response. CONTROL.md fixes the snapshot
+fields, held-job/turn budgets, timeout behavior and fail-stop overflow policy.
 
 The control endpoint grants read/write access to all this editor's documents
 within its existing authority. It cannot bypass dirty-close confirmation or

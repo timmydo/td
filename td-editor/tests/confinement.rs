@@ -21,6 +21,7 @@ fn source_inventory_and_allowances_are_closed() {
         "clipboard.rs",
         "command.rs",
         "control.rs",
+        "control_frame.rs",
         "control_socket.rs",
         "control_worker.rs",
         "data.rs",
@@ -346,9 +347,27 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     let end_turn = production.split("fn end_turn(").nth(1).unwrap();
     let end_turn = end_turn.split("\n    fn ").next().unwrap();
     assert!(end_turn.contains("self.control_tick();"));
+    assert!(end_turn.contains("self.frames.generation().map_err(error)?"));
     let poll = production.split("fn control_tick(").nth(1).unwrap();
     let poll = poll.split("\n    fn ").next().unwrap();
     assert!(production.contains("const CONTROL_JOBS_PER_TURN: usize = 2;"));
+    assert!(poll.contains("let mut budget = CONTROL_JOBS_PER_TURN;"));
+    assert!(poll.contains("for _ in 0..self.frame_waiters.len()"));
+    assert!(poll.contains("self.frame_waiters.len() < crate::control_worker::CONNECTIONS"));
+    assert!(poll.contains("error: crate::Error::Limit"));
+    assert_eq!(poll.matches("budget -= 1;").count(), 2);
+    assert_eq!(production.matches("self.frames.complete()").count(), 1);
+    let draw = production
+        .split("fn draw(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(draw.contains("self.callback.is_some()"));
+    assert!(draw.contains("self.frames.generation().map_err(error)?"));
+    assert!(draw.find("self.frames.capture").unwrap() < draw.find("Raster::new").unwrap());
+    assert!(draw.find("words(SURFACE, 6").unwrap() < draw.find("self.frames.submit").unwrap());
     for pin in [
         "if self.closed",
         "Duration::from_millis(10)",
@@ -366,6 +385,10 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(production.contains("let response = request.response(&self.ui);"));
     let dispatch = production.split("fn control_response(").nth(1).unwrap();
     let dispatch = dispatch.split("\n    fn ").next().unwrap();
+    assert!(
+        dispatch.find("self.frames.generation()").unwrap()
+            < dispatch.find("request.is_edit()").unwrap()
+    );
     assert!(dispatch.contains("self.closed || self.pointer_modal() || self.menu.is_some()"));
     assert!(dispatch.contains("request.execute(&mut self.ui)"));
     assert!(dispatch.contains("request.spelling_response(&self.ui, &self.spelling)"));

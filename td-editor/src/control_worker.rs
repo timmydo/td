@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-const CONNECTIONS: usize = 8;
+pub(crate) const CONNECTIONS: usize = 8;
 const IO_BYTES: usize = 16 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(10);

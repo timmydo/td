@@ -95,6 +95,7 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
     State,
+    WaitFrame(u64),
     SpellingResults {
         tab: TabId,
         revision: u64,
@@ -178,6 +179,7 @@ impl Request {
         let result = (|| {
             let operation = match name {
                 "state" => Operation::State,
+                "wait-frame" => Operation::WaitFrame(decimal(args.next().ok_or(Error::Protocol)?)?),
                 "spelling-results" => Operation::SpellingResults {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
                     revision: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -242,8 +244,7 @@ impl Request {
             .map_err(|error| Refusal { id, error })
     }
 
-    /// State is a controller snapshot only. A future window endpoint must add
-    /// its dialogs, jobs and submitted/callback-completed frame generations.
+    /// Controller snapshot only. Native state adds its own flags and frames.
     pub fn response(&self, ui: &Controller) -> String {
         let result = match &self.operation {
             Operation::State => state(ui),
@@ -253,7 +254,9 @@ impl Request {
                 offset,
                 limit,
             } => page(ui, *tab, *revision, *offset, *limit),
-            Operation::Edit { .. } | Operation::SpellingResults { .. } => Err(Error::Unavailable),
+            Operation::Edit { .. }
+            | Operation::SpellingResults { .. }
+            | Operation::WaitFrame(_) => Err(Error::Unavailable),
         };
         match result {
             Ok(body) => format!("1\t{}\tok\t{body}", self.id),
@@ -554,6 +557,33 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn wait_frame_parser_keeps_native_fences_out_of_controller_dispatch() {
+        for target in [0, 1, u64::MAX] {
+            let request = Request::parse(format!("1\t9\twait-frame\t{target}").as_bytes()).unwrap();
+            assert_eq!(request.operation, Operation::WaitFrame(target));
+            let mut ui = Controller::default();
+            assert!(!request.is_edit());
+            assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+            assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        }
+        for command in [
+            "wait-frame",
+            "wait-frame\t",
+            "wait-frame\t1\t2",
+            "wait-frame\t-1",
+            "wait-frame\t18446744073709551616",
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t9\t{command}").as_bytes()).unwrap_err(),
+                Refusal {
+                    id: 9,
+                    error: Error::Protocol
+                }
+            );
+        }
+    }
 
     fn spelling_page(
         ui: &Controller,

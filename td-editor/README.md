@@ -77,8 +77,9 @@ expected directed selection as well as the tab revision; native modals refuse
 remote edits. `spelling-results` exposes status, whole-scan counts and bounded
 range pages pinned to both text revision and scan ID. Checking still starts
 with ordinary F7; pending scans expose no partial marks. File operations,
-dialog answers, Check Spelling admission and frame acknowledgement remain
-later work.
+dialog answers and Check Spelling admission remain later work. Native state
+now exposes separate redraw/submitted/callback generations; `wait-frame`
+waits for a matching main-surface callback without blocking editing.
 The separate `control_socket` library publishes a private Linux Unix
 listener only when explicitly requested. It checks directory
 ownership/permissions, refuses symlinks and existing endpoints, and pins
@@ -105,7 +106,9 @@ there is no environment override. No endpoint is enabled without the option.
 Its mode-0600 socket permits reading and editing open tabs, including
 unsaved text.
 Sharing it across a jail boundary is a separate grant. Socket existence is
-not readiness; ask for state, and do not treat its generation as frame proof.
+not readiness; ask for state. Its controller `generation` is not frame proof:
+use the separate `window-generation` with `wait-frame` and check the returned
+rendered tab/revision. A callback is not physical scanout or buffer release.
 Mutation replies confirm controller admission, not persistence or presentation.
 A lost reply means an unknown outcome: inspect state/text before retrying.
 Normal shutdown removes only the owned endpoint, not its parent directory.
@@ -135,7 +138,7 @@ Format > Next/Previous Misspelling selects marked words without wrapping.
 At most 10,000 ranges are stored across the window; omitted unknown words
 still count and status reports capped marks. No word list is bundled or
 downloaded, and no text leaves the machine. A separate results-list panel
-and remote spelling queries remain unimplemented.
+remains unimplemented; scan-pinned remote result pages are available.
 
 Emacs `M-x` or Help > Command opens exact named editor actions. Type a prefix
 and Tab to complete; Return runs an exact name, Ctrl+U clears, and
