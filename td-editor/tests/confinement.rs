@@ -18,6 +18,7 @@ fn source_inventory_and_allowances_are_closed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(!root.join("build.rs").exists());
     let expected: BTreeSet<_> = [
+        "dialog.rs",
         "files.rs",
         "fill.rs",
         "keys.rs",

@@ -8,6 +8,12 @@ use std::sync::Arc;
 
 pub type TabId = u64;
 
+pub(crate) struct ClosePoint {
+    owner: Arc<()>,
+    pub(crate) tab: TabId,
+    pub(crate) revision: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     pub file_bytes: usize,
@@ -294,18 +300,45 @@ impl Editor {
         self.select_tab(id)
     }
 
-    /// Dirty close is refused. A later dialog adapter owns explicit discard;
+    /// Direct dirty close is refused. The dialog adapter owns explicit discard;
     /// there is deliberately no bool that lets a replay caller skip consent.
     pub fn close_tab(&mut self, id: TabId, revision: u64) -> Result<()> {
         let doc = self.checked(id, revision)?;
         if doc.dirty() {
             return Err(Error::Dirty);
         }
+        self.remove_tab(id);
+        Ok(())
+    }
+
+    pub(crate) fn close_point(&self, tab: TabId, revision: u64) -> Result<ClosePoint> {
+        self.checked(tab, revision)?;
+        Ok(ClosePoint {
+            owner: self.identity.clone(),
+            tab,
+            revision,
+        })
+    }
+
+    pub(crate) fn check_close(&self, point: &ClosePoint) -> Result<()> {
+        if !Arc::ptr_eq(&self.identity, &point.owner) {
+            return Err(Error::InvalidArgument);
+        }
+        self.checked(point.tab, point.revision)?;
+        Ok(())
+    }
+
+    pub(crate) fn discard_tab(&mut self, point: ClosePoint) -> Result<()> {
+        self.check_close(&point)?;
+        self.remove_tab(point.tab);
+        Ok(())
+    }
+
+    fn remove_tab(&mut self, id: TabId) {
         self.tabs.remove(&id);
         if self.active == Some(id) {
             self.active = self.tabs.keys().next().copied();
         }
-        Ok(())
     }
 
     pub fn save_snapshot(&self, id: TabId) -> Result<(SavePoint, Vec<u8>)> {

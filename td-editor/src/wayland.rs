@@ -1,5 +1,6 @@
 //! Wayland presentation and input, with an optional asynchronous file session.
 
+use crate::dialog::{Close, Closed, Scope};
 use crate::font::Font;
 use crate::keyboard::{Keymap, Modifiers};
 use crate::keys::Profile;
@@ -270,6 +271,8 @@ struct Window {
     quitting: bool,
     files: Option<crate::session::Session>,
     prompt: Option<PathPrompt>,
+    closing: Option<Close>,
+    closing_save: bool,
 }
 
 enum PathAction {
@@ -349,6 +352,8 @@ impl Window {
             quitting: false,
             files: None,
             prompt: None,
+            closing: None,
+            closing_save: false,
         })
     }
 
@@ -626,8 +631,8 @@ impl Window {
 
     fn close(&mut self) {
         self.input.cancel_repeat();
-        if self.files.as_ref().is_some_and(|files| files.busy()) {
-            self.notify("File operation pending. Wait for completion, then close again; quitting does not cancel a write.");
+        if self.files.is_some() {
+            self.start_close(Scope::Window);
             return;
         }
         self.prompt = None;
@@ -750,6 +755,10 @@ impl Window {
             self.path_chord(chord, repeated);
             return Ok(false);
         }
+        if self.closing.is_some() {
+            self.close_chord(chord, repeated);
+            return Ok(false);
+        }
         if matches!(chord, "Escape" | "C-g") && self.notice.take().is_some() {
             self.dirty = true;
         }
@@ -775,20 +784,17 @@ impl Window {
                 tab,
                 revision,
             }) => {
-                if self.files.as_ref().is_some_and(|files| files.busy()) {
-                    self.notify("File operation pending; wait before closing tabs.");
+                if self.files.is_some() {
+                    self.start_close(Scope::Tab { tab, revision });
                     return Ok(false);
                 }
                 match self.ui.dispatch(Event::Close { tab, revision }) {
                     Ok(_) => {
                         self.labels.retain(|(id, _)| *id != tab);
-                        if let Some(files) = &mut self.files { files.forget(tab); }
                         if self.ui.editor().active().is_none() { self.closed = true; }
                         self.dirty = true;
                     }
-                    Err(crate::Error::Dirty) => self.notify(if self.files.is_some() {
-                        "Tab has unsaved edits. Save first, or close the window to explicitly discard all unsaved edits."
-                    } else { "Tab has unsaved scratch text. Undo to clean, or close the window to discard all." }),
+                    Err(crate::Error::Dirty) => self.notify("Tab has unsaved scratch text. Undo to clean, or close the window to discard all."),
                     Err(detail) => self.notify(detail.to_string()),
                 }
                 Ok(false)
@@ -830,10 +836,19 @@ impl Window {
             if self.ui.editor().active() != active {
                 self.input.cancel_repeat();
             }
+            let succeeded = result.is_ok();
             self.notify(match result {
                 Ok(notice) => notice,
                 Err(detail) => format!("File operation failed: {detail}"),
             });
+            if self.closing_save {
+                self.closing_save = false;
+                if succeeded {
+                    self.advance_close();
+                } else {
+                    self.close_failed();
+                }
+            }
         }
         let before = self.ui.generation();
         self.ui.dispatch(Event::Tick(now)).map_err(error)?;
@@ -898,6 +913,7 @@ impl Window {
             .collect();
         let close_notice = self.close_notice();
         let path_notice = self.path_notice();
+        let closing_notice = self.closing_notice();
         let mut raster =
             Raster::new(&mut self.pixels, &self.font, geometry, width * 4).map_err(error)?;
         raster
@@ -907,6 +923,8 @@ impl Window {
             Some(close_notice)
         } else if path_notice.is_some() {
             path_notice.as_deref()
+        } else if closing_notice.is_some() {
+            closing_notice.as_deref()
         } else {
             self.notice.as_deref()
         };
@@ -1032,6 +1050,158 @@ impl Window {
 }
 
 impl Window {
+    fn start_close(&mut self, scope: Scope) {
+        self.input.cancel_repeat();
+        if self.closing.is_some() {
+            return;
+        }
+        if self.files.as_ref().is_some_and(|files| files.busy()) {
+            self.notify(match scope {
+                Scope::Tab { .. } => "File operation pending; wait before closing tabs.",
+                Scope::Window => "File operation pending. Wait for completion, then close again; quitting does not cancel a write.",
+            });
+            return;
+        }
+        match Close::new(self.ui.editor(), scope) {
+            Ok(close) => {
+                self.prompt = None;
+                self.notice = None;
+                self.closing = Some(close);
+                self.advance_close();
+            }
+            Err(detail) => self.notify(format!("Close refused: {detail}")),
+        }
+    }
+
+    fn advance_close(&mut self) {
+        if self.files.as_ref().is_some_and(|files| files.busy()) {
+            return;
+        }
+        self.dirty = true;
+        let Some(close) = self.closing.as_ref() else {
+            return;
+        };
+        match close.next(self.ui.editor()) {
+            Ok(Some(_)) => return,
+            Err(detail) => {
+                self.closing = None;
+                self.notify(format!(
+                    "Close cancelled: documents changed ({detail}); all remaining tabs retained."
+                ));
+                return;
+            }
+            Ok(None) => {}
+        }
+        let Some(close) = self.closing.take() else {
+            return;
+        };
+        match close.complete(&mut self.ui) {
+            Ok(Closed::Window) => self.closed = true,
+            Ok(Closed::Tab(tab)) => {
+                self.labels.retain(|(id, _)| *id != tab);
+                if let Some(files) = &mut self.files {
+                    files.forget(tab);
+                }
+                self.closed = self.ui.editor().active().is_none();
+            }
+            Err(detail) => self.notify(format!("Close cancelled: {detail}")),
+        }
+    }
+
+    fn close_chord(&mut self, chord: &str, repeated: bool) {
+        if repeated {
+            return;
+        }
+        if matches!(chord, "Escape" | "C-g") {
+            self.closing = None;
+            self.closing_save = false;
+            self.notify(if self.files.as_ref().is_some_and(|f| f.busy()) {
+                "Close cancelled; the pending Save will still finish."
+            } else {
+                "Close cancelled; tabs retained. Completed saves are not reverted."
+            });
+            return;
+        }
+        if self.closing_save || !self.close_answer_visible() {
+            return;
+        }
+        let Some(close) = &mut self.closing else {
+            return;
+        };
+        let target = match close.next(self.ui.editor()) {
+            Ok(Some(target)) => target,
+            _ => {
+                self.advance_close();
+                return;
+            }
+        };
+        match chord {
+            "C-d" => {
+                if let Err(detail) = close.discard(self.ui.editor(), target) {
+                    self.closing = None;
+                    self.notify(format!("Discard refused: {detail}"));
+                } else {
+                    self.advance_close();
+                }
+            }
+            "C-s" => {
+                if !self.file_request("save", target.tab, target.revision) {
+                    self.close_failed();
+                } else {
+                    self.closing_save = self.files.as_ref().is_some_and(|f| f.busy());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn close_failed(&mut self) {
+        self.closing = None;
+        let detail = self.notice.take().unwrap_or_default();
+        self.notify(format!("Close cancelled; tabs retained. {detail}"));
+    }
+
+    fn close_answer_visible(&self) -> bool {
+        let (width, height) = self.ui.geometry().dimensions();
+        width >= 272
+            && height >= 160
+            && self.device.is_some()
+            && self.input.map.is_some()
+            && self.input.focused
+            && self.input.synchronized
+    }
+
+    fn closing_notice(&self) -> Option<String> {
+        let close = self.closing.as_ref()?;
+        let readiness = if self.device.is_none() || self.input.map.is_none() {
+            "Input unavailable: restore the seat/keymap to resolve close.\n"
+        } else if !self.input.focused || !self.input.synchronized {
+            "Input pending: focus the editor; tap and release Shift.\n"
+        } else {
+            ""
+        };
+        if self.closing_save {
+            return Some(format!("{readiness}Saving before close...\nEscape/Ctrl+G: Cancel closing (the Save still finishes)\nOther commands wait; no pending write is discarded."));
+        }
+        match close.next(self.ui.editor()) {
+            Ok(Some(target)) => {
+                let title = self.files.as_ref().and_then(|f| f.labels().find(|(tab, _)| *tab == target.tab).map(|(_, label)| label)).unwrap_or("Untitled");
+                let identity = format!("Tab {}", target.tab);
+                if !readiness.is_empty() {
+                    return Some(format!("{identity}\n{readiness}"));
+                }
+                if !self.close_answer_visible() {
+                    return Some(format!("{identity}\nEnlarge window to answer close.\nEscape/Ctrl+G cancels closing."));
+                }
+                let short: String = title.chars().take(27).collect();
+                let suffix = if short.len() < title.len() { "..." } else { "" };
+                Some(format!("{identity}\n{short}{suffix}\nCtrl+S: Save\nCtrl+D: Discard this tab\nEsc/Ctrl+G: Cancel closing\ncompleted saves stay saved"))
+            }
+            Ok(None) => None,
+            Err(detail) => Some(format!("Close request changed ({detail}); Escape/Ctrl+G cancels.\nNo unapproved edits will be discarded.")),
+        }
+    }
+
     fn path_notice(&self) -> Option<String> {
         let prompt = self.prompt.as_ref()?;
         let readiness = if self.device.is_none() || self.input.map.is_none() {
@@ -1041,22 +1211,30 @@ impl Window {
         } else {
             ""
         };
-        Some(format!("{readiness}{}", prompt.notice()))
+        let closing = if self.closing.is_some() {
+            "Save before close: Escape/Ctrl+G cancels ALL closing.\n"
+        } else {
+            ""
+        };
+        Some(format!("{readiness}{closing}{}", prompt.notice()))
     }
 
-    fn file_request(&mut self, name: &str, tab: crate::model::TabId, revision: u64) {
+    fn file_request(&mut self, name: &str, tab: crate::model::TabId, revision: u64) -> bool {
         let Some(files) = &mut self.files else {
-            return;
+            return false;
         };
         self.input.cancel_repeat();
         if files.busy() {
             self.notify("File operation pending; wait before trying again.");
+            false
         } else if name == "save" && files.associated(tab) {
             let result = files.save(&self.ui, tab, revision, None);
+            let accepted = result.is_ok();
             self.notify(match result {
                 Ok(()) => "Saving snapshot; newer edits will remain unsaved.".into(),
                 Err(detail) => detail,
             });
+            accepted
         } else {
             self.notice = None;
             self.prompt = Some(PathPrompt {
@@ -1068,6 +1246,7 @@ impl Window {
                 text: String::new(),
             });
             self.dirty = true;
+            true
         }
     }
 
@@ -1080,7 +1259,15 @@ impl Window {
         };
         self.dirty = true;
         match chord {
-            "Escape" | "C-g" => return,
+            "Escape" | "C-g" => {
+                if self.closing.take().is_some() {
+                    self.notify(
+                        "Close cancelled; tabs retained. Completed saves are not reverted.",
+                    );
+                }
+                self.closing_save = false;
+                return;
+            }
             "Return" => {
                 if prompt.text.is_empty() {
                     self.prompt = Some(prompt);
@@ -1096,10 +1283,17 @@ impl Window {
                         files.save(&self.ui, tab, revision, Some(path))
                     }
                 };
+                let close_failed = self.closing.is_some() && result.is_err();
+                if self.closing.is_some() {
+                    self.closing_save = result.is_ok();
+                }
                 self.notify(match result {
                     Ok(()) => "File operation pending...".into(),
                     Err(detail) => detail,
                 });
+                if close_failed {
+                    self.close_failed();
+                }
                 return;
             }
             "Backspace" => {
@@ -1120,15 +1314,6 @@ impl Window {
     }
 
     fn close_notice(&self) -> &'static str {
-        if self.files.is_some() {
-            return if self.device.is_none() || self.input.map.is_none() {
-                "Cannot confirm discard: keyboard unavailable.\nUnsaved edits remain in memory. Restore input to cancel or discard.\nTerminating the process loses unsaved edits."
-            } else if !self.input.focused || !self.input.synchronized {
-                "Discard pending; input not ready.\nFocus the editor; tap and release Shift.\nEscape/Ctrl+G: cancel and save first; Ctrl+D: discard ALL unsaved edits."
-            } else {
-                "Discard ALL unsaved edits and quit?\nEscape/Ctrl+G: Cancel (then Save each tab first)\nCtrl+D: Discard and quit\nCompleted saves are not reverted."
-            };
-        }
         if self.device.is_none() || self.input.map.is_none() {
             "Cannot confirm discard: keyboard unavailable.\nScratch text is retained in memory.\nRestore keyboard/map to cancel or discard.\nTerminating this process loses ALL scratch text."
         } else if !self.input.focused || !self.input.synchronized {
@@ -1599,6 +1784,10 @@ mod tests {
                 w.chord("k", false).unwrap();
             }
             assert!(w.ui.editor().document(tab).is_ok());
+            assert_eq!(
+                w.notice.as_deref(),
+                Some("File operation pending; wait before closing tabs.")
+            );
             w.event(message(device, 3, &[0, 0, 48, 1])).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while w.files.as_ref().unwrap().busy() {
@@ -1620,14 +1809,15 @@ mod tests {
             assert_ne!(w.pixels, prompt_pixels);
             drain(&peer);
             w.close();
-            assert!(w.quitting && !w.closed);
+            assert!(w.closing.is_some() && !w.closed);
             assert!(w
-                .close_notice()
-                .contains("Completed saves are not reverted"));
+                .closing_notice()
+                .unwrap()
+                .contains("completed saves stay saved"));
             w.chord("C-d", true).unwrap();
             assert!(!w.closed);
             w.chord("Escape", false).unwrap();
-            assert!(!w.quitting);
+            assert!(w.closing.is_none());
             w.close();
             w.chord("C-d", false).unwrap();
             assert!(w.closed);
@@ -1635,6 +1825,269 @@ mod tests {
             std::fs::remove_file(path).unwrap();
             std::fs::remove_dir(directory).unwrap();
         }
+    }
+
+    fn file_dialog_fixture() -> (Window, UnixStream) {
+        let (mut w, peer, device) = seat_fixture();
+        send_map(&mut w, &peer, device, &map_file());
+        focus(&mut w, device);
+        w.ui = Controller::default();
+        w.ui.dispatch(Event::New).unwrap();
+        w.labels.clear();
+        w.files = Some(crate::session::Session::start().unwrap());
+        (w, peer)
+    }
+
+    struct DialogDirectory(PathBuf);
+    impl DialogDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "td-editor-dialog-{}-{}",
+                std::process::id(),
+                NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self, leaf: &str) -> PathBuf {
+            self.0.join(leaf)
+        }
+    }
+    impl Drop for DialogDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn finish_file(w: &mut Window) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.files.as_ref().unwrap().busy() {
+            assert!(Instant::now() < deadline, "file completion timeout");
+            w.tick(w.clock + 1, false).unwrap();
+            std::thread::yield_now();
+        }
+    }
+
+    fn path_text(w: &mut Window, path: &Path) {
+        for c in path.to_str().unwrap().chars() {
+            w.chord(&c.to_string(), false).unwrap();
+        }
+        w.chord("Return", false).unwrap();
+    }
+
+    #[test]
+    fn close_tab_save_as_can_cancel_or_complete_without_closing_other_tabs() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            let first = w.ui.editor().active().unwrap();
+            w.chord("a", false).unwrap();
+            let before = w.ui.editor().document(first).unwrap().selection();
+            w.ui.dispatch(Event::New).unwrap();
+            let other = w.ui.editor().active().unwrap();
+            w.ui.dispatch(Event::SelectTab(first)).unwrap();
+            let close_tab = |w: &mut Window| {
+                if profile == Profile::Emacs {
+                    w.chord("C-x", false).unwrap();
+                    w.chord("k", false).unwrap();
+                } else {
+                    w.chord("C-w", false).unwrap();
+                }
+            };
+            close_tab(&mut w);
+            assert!(w.closing.is_some());
+            w.chord("C-s", false).unwrap();
+            assert!(w.prompt.is_some());
+            assert!(w.path_notice().unwrap().contains("cancels ALL closing"));
+            w.close(); // repeated WM close does not replace the close-tab flow
+            assert!(w.prompt.is_some());
+            w.chord("Escape", false).unwrap();
+            assert!(w.closing.is_none() && w.prompt.is_none());
+            assert!(w.notice.as_deref().unwrap().starts_with("Close cancelled;"));
+            assert_eq!(w.ui.editor().tabs().count(), 2);
+            assert_eq!(w.ui.editor().document(first).unwrap().selection(), before);
+            close_tab(&mut w);
+            w.chord("C-s", false).unwrap();
+            let directory = DialogDirectory::new();
+            let path = directory.path("saved");
+            path_text(&mut w, &path);
+            assert!(w.closing_save);
+            w.event(message(WM, 0, &[991])).unwrap();
+            assert!(drain(&peer).0.contains(&message(WM, 3, &[991])));
+            configure(&mut w, 640, 480);
+            w.chord("C-d", false).unwrap();
+            w.chord("x", false).unwrap();
+            assert_eq!(w.ui.editor().document(first).unwrap().text(), "a");
+            assert!(!w.closed);
+            finish_file(&mut w);
+            assert_eq!(std::fs::read(path).unwrap(), b"a");
+            assert!(w.ui.editor().document(first).is_err());
+            assert_eq!(w.ui.editor().active(), Some(other));
+            assert!(!w.closed && w.closing.is_none());
+            assert!(!w.files.as_ref().unwrap().associated(first));
+        }
+    }
+
+    #[test]
+    fn window_close_cancel_preserves_discard_approvals_as_dirty_tabs() {
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        let first = w.ui.editor().active().unwrap();
+        w.ui.dispatch(Event::New).unwrap();
+        w.chord("b", false).unwrap();
+        let second = w.ui.editor().active().unwrap();
+        w.close();
+        assert!(w.closing_notice().unwrap().contains("Ctrl+S: Save"));
+        w.input.synchronized = false;
+        assert!(w
+            .closing_notice()
+            .unwrap()
+            .contains("tap and release Shift"));
+        w.input.synchronized = true;
+        w.chord("C-d", false).unwrap();
+        assert!(!w.closed);
+        assert_eq!(
+            w.closing
+                .as_ref()
+                .unwrap()
+                .next(w.ui.editor())
+                .unwrap()
+                .unwrap()
+                .tab,
+            first
+        );
+        assert!(w.ui.editor().document(second).unwrap().dirty());
+        w.chord("C-d", true).unwrap();
+        assert!(!w.closed);
+        w.chord("C-g", false).unwrap();
+        assert!(w.closing.is_none());
+        assert_eq!(w.ui.editor().active(), Some(second));
+        assert_eq!(w.ui.editor().tabs().count(), 2);
+        assert_eq!(w.ui.editor().document(first).unwrap().text(), "a");
+        assert_eq!(w.ui.editor().document(second).unwrap().text(), "b");
+        w.close();
+        w.chord("C-d", false).unwrap();
+        w.chord("C-d", false).unwrap();
+        assert!(w.closed);
+    }
+
+    #[test]
+    fn file_close_never_confirms_a_clipped_question_and_survives_input_loss() {
+        let (mut w, peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        w.close();
+        for (width, height) in [(1, 1), (208, 480), (272, 159)] {
+            w.ui.dispatch(Event::Resize {
+                width,
+                height,
+                scale: 1,
+            })
+            .unwrap();
+            assert!(w
+                .closing_notice()
+                .unwrap()
+                .starts_with(&format!("Tab {tab}\n")));
+            w.chord("C-d", false).unwrap();
+            w.chord("C-s", false).unwrap();
+            assert!(!w.closed && w.closing.is_some() && w.prompt.is_none());
+            assert!(!w.files.as_ref().unwrap().busy());
+        }
+        w.ui.dispatch(Event::Resize {
+            width: 272,
+            height: 160,
+            scale: 1,
+        })
+        .unwrap();
+        let notice = w.closing_notice().unwrap();
+        assert_eq!(notice.lines().count(), 6);
+        assert!(notice.lines().all(|line| line.chars().count() <= 32));
+        let seat = w.seat.unwrap();
+        w.event(message(seat, 0, &[0])).unwrap();
+        assert!(w.closing.is_some() && w.device.is_none());
+        assert!(w.closing_notice().unwrap().contains("Input unavailable"));
+        w.chord("C-d", false).unwrap();
+        assert!(!w.closed);
+        w.event(message(seat, 0, &[3])).unwrap();
+        let device = w.device.unwrap();
+        send_map(&mut w, &peer, device, &map_file());
+        assert!(w.closing_notice().unwrap().contains("Input pending"));
+        focus(&mut w, device);
+        assert!(w.closing_notice().unwrap().contains("Ctrl+D"));
+        w.chord("Escape", false).unwrap();
+        assert!(w.closing.is_none() && !w.closed);
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), "a");
+    }
+
+    #[test]
+    fn later_save_failure_aborts_window_close_but_keeps_prior_saves() {
+        let directory = DialogDirectory::new();
+        let first_path = directory.path("first");
+        let second_path = directory.path("second");
+        std::fs::write(&first_path, b"first").unwrap();
+        std::fs::write(&second_path, b"second").unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        w.files
+            .as_mut()
+            .unwrap()
+            .initial_open(&mut w.ui, first_path.clone())
+            .unwrap();
+        let first = w.ui.editor().active().unwrap();
+        w.chord("a", false).unwrap();
+        w.files
+            .as_mut()
+            .unwrap()
+            .initial_open(&mut w.ui, second_path.clone())
+            .unwrap();
+        let second = w.ui.editor().active().unwrap();
+        w.chord("b", false).unwrap();
+        w.ui.dispatch(Event::SelectTab(first)).unwrap();
+        w.close();
+        w.chord("C-s", false).unwrap();
+        finish_file(&mut w);
+        assert!(!w.closed && w.closing.is_some());
+        assert_eq!(std::fs::read(&first_path).unwrap(), b"afirst");
+        assert_eq!(w.ui.editor().tabs().count(), 3);
+        std::fs::write(&second_path, b"external").unwrap();
+        w.chord("C-s", false).unwrap();
+        finish_file(&mut w);
+        assert!(!w.closed && w.closing.is_none());
+        assert!(!w.ui.editor().document(first).unwrap().dirty());
+        assert!(w.ui.editor().document(second).unwrap().dirty());
+        assert_eq!(w.ui.editor().document(second).unwrap().text(), "bsecond");
+        assert_eq!(std::fs::read(second_path).unwrap(), b"external");
+        assert!(w.notice.as_ref().unwrap().contains("Disk conflict"));
+        assert!(w
+            .notice
+            .as_ref()
+            .unwrap()
+            .starts_with("Close cancelled; tabs retained."));
+        assert_eq!(w.ui.editor().tabs().count(), 3);
+    }
+
+    #[test]
+    fn cancel_closing_during_save_allows_edits_without_later_auto_close() {
+        let directory = DialogDirectory::new();
+        let path = directory.path("new");
+        let (mut w, _peer) = file_dialog_fixture();
+        w.files
+            .as_mut()
+            .unwrap()
+            .initial_open(&mut w.ui, path.clone())
+            .unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        w.close();
+        w.chord("C-s", false).unwrap();
+        assert!(w.closing_save);
+        w.chord("C-g", false).unwrap();
+        assert!(w.closing.is_none() && !w.closing_save);
+        assert!(w.files.as_ref().unwrap().busy());
+        w.chord("x", false).unwrap();
+        finish_file(&mut w);
+        assert!(!w.closed);
+        assert_eq!(std::fs::read(path).unwrap(), b"");
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), "x");
+        assert!(w.ui.editor().document(tab).unwrap().dirty());
     }
 
     #[test]

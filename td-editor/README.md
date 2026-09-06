@@ -131,12 +131,19 @@ Switch tabs with Ctrl+Tab. An existing file opened again selects its current
 tab without reloading it. External disk changes refuse Save; use Save As to
 a new name to preserve your edits. There is no conflict Reload yet.
 
-Close is refused during pending I/O. After completion, save each dirty tab
-before closing, or explicitly discard all unsaved edits at the window-close
-question. Ctrl+D confirms discard; Escape/Ctrl+G cancels. Completed saves are
-not undone by discard. Fatal errors or process termination can lose unsaved
-edits; a pending write may have reached disk. There is no recovery. The full
-Save/Discard/Cancel dialog and `$EDITOR` invocation remain future work.
+Close asks about each dirty tab: Ctrl+S saves, Ctrl+D approves discarding that
+tab's edits, and Escape/Ctrl+G cancels closing. Untitled tabs enter Save As.
+Window close keeps all tabs until every choice is resolved; cancelling after
+some discard choices retains those edits. A failed save stops closing and
+keeps every tab open, including already-saved tabs. Completed saves are not
+undone by cancellation or discard.
+
+Starting close during unrelated pending I/O is refused. A save started by a
+close dialog keeps the dialog modal; Escape/Ctrl+G cancels closing but the
+save still finishes. You can then keep editing without an unexpected later
+exit. Fatal errors or process termination can lose unsaved edits; a pending
+write may have reached disk. There is no recovery. Conflict Reload and
+ordinary `$EDITOR` invocation remain future work.
 
 The original no-file-access scratch fixture is still available:
 

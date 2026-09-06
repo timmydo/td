@@ -36,6 +36,10 @@ still loses scratch text. `--window` is a separate experimental file window;
 it is not yet the usable `$EDITOR` milestone. See the implemented file-window
 contract below for its narrower scheduling and close/conflict behavior.
 
+File-window close now has per-document Save/Discard/Cancel decisions,
+including Save As for untitled tabs and cancellation during a pending save.
+Conflict Reload remains the next file-dialog increment.
+
 The rules below define version 1; milestones identify the
 order of implementation, not choices left to each implementing agent.
 The deliverable is a usable editor, reached through independently tested
@@ -844,20 +848,68 @@ baseline is released before the next job. No-clobber publication is still
 enforced by the transaction, not inferred from the early probe. Reservation
 failures identify the destination, not the user's document, as the problem.
 
-While a file job is pending, tab/window close is refused with a notice. Close
-does not cancel a write or schedule an automatic exit; retry after completion.
-Dirty tab close asks the user to save first. Dirty window close offers only
-explicit whole-window Discard or Cancel; cancel and save individual tabs
-before retrying. Only a fresh Ctrl+D discards unsaved edits and exits;
-completed saves are never reverted. The full Save/Discard/Cancel tab/window
-dialog remains future work. Input-unavailable and unfocused states give
-readiness instructions instead of claiming confirmation works. There is no
+Starting tab/window close while an unrelated file job is pending is refused
+with a notice; retry after completion. The file window otherwise creates a
+revision-bound close dialog, asking about each dirty document, active tab
+first, without switching tabs or changing selections/view state. Ctrl+S
+saves that document, Ctrl+D approves discarding that document's edits, and
+Escape/C-g cancels the whole close request. These modal keys are the same in
+both profiles. Repeated keys never confirm a choice. The first caption line
+identifies the document by stable tab ID, followed by its escaped leaf name
+(or Untitled), shortened to 27 scalars plus an ellipsis when needed. Save and
+Discard require synchronized input and at least 272x160 buffer pixels: all
+six caption/control lines then fit the notice region. Smaller windows show a
+resize instruction and accept only Cancel. Input loss retains the question
+and shows restoration instructions instead of choices. A close-driven path
+prompt explicitly says cancellation cancels the whole close request. Any
+save refusal or failure explicitly reports that closing was cancelled and
+tabs were retained, alongside the file diagnostic.
+
+`dialog::Close` is a display-independent coordinator. Its model points bind
+the originating editor, tab IDs and text revisions; another editor, changed
+revision, removed tab or a new tab in a window-close request invalidates the
+request before any discard. Direct model/replay dirty close still refuses.
+Only this coordinator can construct the opaque `Discard` permit consumed
+by `Event::Discard`, which rechecks its editor/revision binding before
+removing a tab. The controller's generation admission still precedes mutation.
+The window's single-threaded dispatcher supplies explicit choices; there is
+no wire shortcut for minting a permit. A future control adapter must answer
+the live dialog, not call a discard bypass.
+
+Window-close discard approvals are deferred: no tab is removed and no dirty
+state is cleared while further decisions remain. Cancel drops the approvals
+and retains every tab, its text, selection, view and history. When all dirty
+tabs have been saved or explicitly approved for discard, the window exits.
+A tab-close request removes only its own tab after its decision resolves,
+exiting if it was the last tab. Completed saves stay saved if later choices
+are cancelled or another save fails; all tabs remain open on such a failed
+window-close attempt. There is no force-overwrite fallback.
+
+Saving an untitled tab enters the existing Save As path prompt. Cancelling
+that prompt cancels closing. An accepted save keeps the close dialog modal
+until completion, while protocol events, resize and redraw continue. All
+ordinary editing/close actions are consumed in this state. Escape/C-g may
+cancel closing while I/O is pending, but does not cancel or undo the write;
+editing resumes and the eventual exact-snapshot acknowledgement cannot
+auto-close anything or mark newer edits clean. A failed save clears the close
+request and exposes its diagnostic. After successful completion the dialog
+revalidates every pinned revision and advances to the next unresolved tab.
+Repeated window-manager close neither replaces the request nor erases an
+entered Save As path. Input-unavailable and unfocused states give readiness
+instructions instead of claiming confirmation works. There is no
 recovery: abrupt termination or a fatal display error can lose unsaved edits.
 A fatal display error during a file job additionally reports that the write
 may have published. File syscall duration is not bounded; a stalled filesystem
 can keep a job pending and ordinary close refused until the user terminates
 the process. Dropping the session disconnects the worker, but cannot cancel a
 filesystem call already in progress. No normal close exits with a pending job.
+
+Pure dialog tests pin deferred discard, cancellation, ownership/revision
+invalidation and saved-state retention. Fake-compositor file tests exercise
+both profiles, Save As cancellation/completion, unrelated-tab retention,
+held confirmation rejection, later-save conflicts and cancellation during
+I/O followed by new edits. The scratch fixture keeps its explicit no-Save,
+whole-window-discard behavior; it cannot exercise filesystem dialogs.
 
 Deterministic channel-driven tests execute the production file jobs with
 explicit completion timing, checking edit-during-save, stale requests,

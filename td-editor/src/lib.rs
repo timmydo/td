@@ -3,6 +3,8 @@
 //! Safe editor state and explicit adapters. File and window adapters own I/O;
 //! the document core has no environment, clock or filesystem access.
 
+mod dialog;
+pub use dialog::Discard;
 pub mod files;
 pub mod fill;
 #[path = "../../td-compositor/src/font.rs"]

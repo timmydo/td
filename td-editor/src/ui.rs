@@ -23,6 +23,8 @@ pub enum Event<'a> {
     MissingFile,
     /// Opaque token for the exact state successfully published by the adapter.
     Saved(crate::model::SavePoint),
+    /// Single-use, editor/revision-bound approval from the dialog coordinator.
+    Discard(crate::Discard),
     SelectTab(TabId),
     Close {
         tab: TabId,
@@ -277,8 +279,12 @@ impl Controller {
                 self.wake_caret();
                 Ok(Outcome::Changed)
             }
-            Event::Close { tab, revision } => {
-                self.editor.close_tab(tab, revision)?;
+            Event::Close { .. } | Event::Discard(_) => {
+                match event {
+                    Event::Close { tab, revision } => self.editor.close_tab(tab, revision)?,
+                    Event::Discard(permit) => permit.apply(&mut self.editor)?,
+                    _ => return Err(Error::InvalidArgument),
+                }
                 self.reset_input();
                 self.refresh(None)?;
                 self.wake_caret();
