@@ -214,6 +214,17 @@ authorization. The boot oracle requires the exact `TD-PRINCIPALS-ENROLLED`
 line on every successful boot. Retired human accounts may disappear while
 their service and application reservations remain.
 
+The canonical table parser and reservation union live in
+`engine/src/principals.rs`. td-firstboot includes that dependency-free source
+and owns file validation, account checks, locking and persistent writes.
+Registry maps remain private and have no unchecked constructor or mutable
+accessor. Session and application row values are plain data, not authority
+tokens: an admission consumer must obtain its assignments from a Registry
+parsed from an authorized input. This shares source implementation, not Rust
+type identity between separately compiled programs. The engine and host
+provisioner compile the parser/enrollment fixtures; the target provisioner
+recipe stages the same source and executes those fixtures.
+
 The ledger retains the union of every successfully enrolled deployment,
 including removed applications. Reassigning a tuple or reusing a retired uid
 fails boot provisioning. A malformed existing ledger is never reset. A

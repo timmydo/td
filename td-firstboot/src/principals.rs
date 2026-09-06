@@ -7,51 +7,15 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-const MAGIC: &str = "td-principals-v1\n";
-pub(crate) const MAX_BYTES: usize = 64 * 1024;
-const MAX_ROWS: usize = 256;
+#[path = "../../engine/src/principals.rs"]
+mod table;
+use table::decimal;
+pub(crate) use table::{Registry, MAX_BYTES};
+
 const TABLE_NAME: &str = "td-principals.tsv";
 pub(crate) const O_NOFOLLOW: i32 = 0x20000;
 pub(crate) const O_NONBLOCK: i32 = 0x800;
 pub(crate) const O_DIRECTORY: i32 = 0x10000;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Session {
-    pub owner: u32,
-    pub compositor: u32,
-    pub broker: u32,
-    pub portal: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Application {
-    pub owner: u32,
-    pub name: String,
-    pub uid: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Registry {
-    sessions: BTreeMap<u32, Session>,
-    applications: BTreeMap<(u32, String), Application>,
-}
-
-fn decimal(value: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, String> {
-    let number = value.parse::<u32>().map_err(|_| "invalid principal uid")?;
-    if !range.contains(&number) || number.to_string() != value {
-        return Err("noncanonical or out-of-range principal uid".into());
-    }
-    Ok(number)
-}
-
-fn name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
-        })
-}
 
 fn root_directory(path: &Path, owner: Option<(u32, u32)>) -> Result<File, String> {
     let file = OpenOptions::new()
@@ -158,8 +122,7 @@ impl Registry {
         passwd: &str,
     ) -> Result<(), String> {
         if !self
-            .sessions
-            .get(&owner)
+            .session(owner)
             .is_some_and(|session| session.compositor == compositor)
         {
             return Err("launch compositor does not own this session".into());
@@ -212,7 +175,7 @@ impl Registry {
 
     fn account_names(&self) -> BTreeMap<u32, String> {
         let mut names = BTreeMap::new();
-        for session in self.sessions.values() {
+        for session in self.sessions() {
             for (uid, role) in [
                 (session.compositor, "c"),
                 (session.broker, "b"),
@@ -221,7 +184,7 @@ impl Registry {
                 names.insert(uid, format!("td{role}{}", session.owner));
             }
         }
-        for application in self.applications.values() {
+        for application in self.applications() {
             names.insert(application.uid, format!("tda{}", application.uid));
         }
         names
@@ -267,9 +230,8 @@ impl Registry {
             }
         }
         if active
-            .sessions
-            .keys()
-            .any(|owner| !seen_uids.contains(owner))
+            .sessions()
+            .any(|session| !seen_uids.contains(&session.owner))
         {
             return Err("principal session has no human account".into());
         }
@@ -320,153 +282,6 @@ impl Registry {
             return Err("principal account lacks service authorization".into());
         }
         Ok(())
-    }
-
-    pub fn parse(text: &str) -> Result<Self, String> {
-        if text.len() > MAX_BYTES || !text.ends_with('\n') || !text.is_ascii() {
-            return Err("principal table is oversized or not canonical ASCII lines".into());
-        }
-        let rows = text
-            .strip_prefix(MAGIC)
-            .ok_or("unsupported principal table format")?;
-        let mut registry = Self {
-            sessions: BTreeMap::new(),
-            applications: BTreeMap::new(),
-        };
-        let mut assigned = BTreeSet::new();
-        let mut previous_session = None;
-        let mut previous_application = None;
-        for (index, row) in rows.split_terminator('\n').enumerate() {
-            if index >= MAX_ROWS {
-                return Err("principal table exceeds 256 rows".into());
-            }
-            let fields: Vec<&str> = row.split('\t').take(6).collect();
-            match fields.as_slice() {
-                ["session", owner, compositor, broker, portal] => {
-                    let owner = decimal(owner, 1000..=65533)?;
-                    let compositor = decimal(compositor, 1..=999)?;
-                    let broker = decimal(broker, 1..=999)?;
-                    let portal = decimal(portal, 1..=999)?;
-                    if previous_application.is_some()
-                        || previous_session.is_some_and(|previous| previous >= owner)
-                    {
-                        return Err("principal sessions are duplicate or unsorted".into());
-                    }
-                    for uid in [compositor, broker, portal] {
-                        if !assigned.insert(uid) {
-                            return Err("principal uid is assigned more than once".into());
-                        }
-                    }
-                    registry.sessions.insert(
-                        owner,
-                        Session {
-                            owner,
-                            compositor,
-                            broker,
-                            portal,
-                        },
-                    );
-                    previous_session = Some(owner);
-                }
-                ["application", owner, application, uid] => {
-                    let owner = decimal(owner, 1000..=65533)?;
-                    let uid = decimal(uid, 65536..=2147483647)?;
-                    if !registry.sessions.contains_key(&owner) {
-                        return Err("application has no declared human session".into());
-                    }
-                    if !name(application) {
-                        return Err("invalid principal application name".into());
-                    }
-                    let key = (owner, (*application).to_string());
-                    if previous_application
-                        .as_ref()
-                        .is_some_and(|previous| previous >= &key)
-                    {
-                        return Err("principal applications are duplicate or unsorted".into());
-                    }
-                    if !assigned.insert(uid) {
-                        return Err("principal uid is assigned more than once".into());
-                    }
-                    registry.applications.insert(
-                        key.clone(),
-                        Application {
-                            owner,
-                            name: (*application).to_string(),
-                            uid,
-                        },
-                    );
-                    previous_application = Some(key);
-                }
-                _ => return Err("invalid principal row shape".into()),
-            }
-        }
-        if registry.sessions.is_empty() {
-            return Err("principal table needs at least one session".into());
-        }
-        Ok(registry)
-    }
-
-    #[cfg(test)]
-    pub fn session(&self, owner: u32) -> Option<&Session> {
-        self.sessions.get(&owner)
-    }
-
-    #[cfg(test)]
-    pub fn application(&self, owner: u32, name: &str) -> Option<&Application> {
-        self.applications.get(&(owner, name.to_string()))
-    }
-
-    #[cfg(test)]
-    pub fn application_for_uid(&self, uid: u32) -> Option<&Application> {
-        self.applications
-            .values()
-            .find(|application| application.uid == uid)
-    }
-
-    /// Preserve retired assignments so a later deployment cannot recycle them.
-    pub fn enroll(&self, desired: &Self) -> Result<Self, String> {
-        let mut retained = self.clone();
-        for (owner, session) in &desired.sessions {
-            if self
-                .sessions
-                .get(owner)
-                .is_some_and(|prior| prior != session)
-            {
-                return Err("deployment changes an enrolled session identity".into());
-            }
-            retained.sessions.insert(*owner, session.clone());
-        }
-        for (key, application) in &desired.applications {
-            if self
-                .applications
-                .get(key)
-                .is_some_and(|prior| prior != application)
-            {
-                return Err("deployment changes an enrolled application identity".into());
-            }
-            retained
-                .applications
-                .insert(key.clone(), application.clone());
-        }
-        // Validate aggregate bounds and cross-principal collisions in the union.
-        Self::parse(&retained.encode())
-    }
-
-    pub fn encode(&self) -> String {
-        let mut text = MAGIC.to_string();
-        for session in self.sessions.values() {
-            text.push_str(&format!(
-                "session\t{}\t{}\t{}\t{}\n",
-                session.owner, session.compositor, session.broker, session.portal
-            ));
-        }
-        for application in self.applications.values() {
-            text.push_str(&format!(
-                "application\t{}\t{}\t{}\n",
-                application.owner, application.name, application.uid
-            ));
-        }
-        text
     }
 }
 

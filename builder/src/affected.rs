@@ -289,6 +289,10 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
 /// tests; no target/bootstrap gate embeds that external-dependency crate.
 const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     (
+        "engine/src/principals.rs",
+        "host and target-static td-firstboot canonical identity parsing and retained reservations",
+    ),
+    (
         "engine/src/sha256.rs",
         "td-builder, td-recipe-eval, target-static td-boot, and the td-compositor terminal corpus verifier/importer",
     ),
@@ -1965,6 +1969,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // guard that the gate is selected AT ALL, not that the table selected it.
     assert_target!("engine/src/sha256.rs", "check-engine");
     assert_target!("engine/src/sha256.rs", "recipe-checks");
+    assert_contains!("engine/src/principals.rs", "target-static td-firstboot");
     assert_contains!("engine/src/sha256.rs", "target-static td-boot");
     assert_contains!("engine/src/crc32.rs", "target-static td-install");
     assert_contains!("engine/src/gpt.rs", "target-static td-install");
@@ -1982,6 +1987,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // which for a routing table is the direction that decides which gate a
     // target binary's sources get.
     let expected_target_included = [
+        "engine/src/principals.rs",
         "engine/src/sha256.rs",
         "engine/src/crc32.rs",
         "engine/src/gpt.rs",

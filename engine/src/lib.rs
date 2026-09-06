@@ -43,6 +43,7 @@ pub mod ed25519;
 pub mod launcher;
 pub mod ostree;
 pub mod permissions;
+pub mod principals;
 // SIGNING is a separate module because, of the two ed25519 files, td-boot
 // `#[path]`-includes only the VERIFIER: keeping the signer out of that file is
 // what keeps it off the boot path. Its one caller is the recipe-check oracle.

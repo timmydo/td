@@ -118,6 +118,11 @@ pub fn recipe() -> Recipe {
         });
     }
     steps.push(Step::WriteFile {
+        path: "{src}/engine/src/principals.rs".into(),
+        content: include_str!("../../../engine/src/principals.rs").into(),
+        exec: false,
+    });
+    steps.push(Step::WriteFile {
         path: "{src}/engine/src/sha256.rs".into(),
         content: include_str!("../../../engine/src/sha256.rs").into(),
         exec: false,
