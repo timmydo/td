@@ -1,6 +1,7 @@
-//! The `mail` application: tmc, td's JMAP mail client, as a static package on
-//! the empty runtime. It runs in a td-term window at boot (`system-x86-64`'s
-//! `[mail]` unit) and reads `$XDG_CONFIG_HOME/tmc/config.toml`, which
+//! The `mail` application: td-mail, td's JMAP mail client, as a static
+//! package on the empty runtime. It runs in a td-term window at boot
+//! (`system-x86-64`'s `[mail]` unit) and reads
+//! `$XDG_CONFIG_HOME/td-mail/config.toml`, which
 //! td-firstboot provisions once under the login user's jail state. Saved
 //! attachments land in the `xdg-download` grant, the directory Firefox shares.
 use crate::application::ApplicationDeclaration;
@@ -13,8 +14,8 @@ const APPLICATION_ENTRY: &str = crate::ladder::TD_MAIL_ENTRY;
 const APPLICATION_DISPLAY_NAME: &str = crate::ladder::TD_MAIL_DISPLAY_NAME;
 const APPLICATION_SEARCH_TERMS: &[&str] = crate::ladder::TD_MAIL_SEARCH_TERMS;
 /// The source-built static binary this package wraps, and its recipe.
-const PROGRAM: &str = "tmc";
-const PROGRAM_RECIPE: &str = "tmc";
+const PROGRAM: &str = "td-mail";
+const PROGRAM_RECIPE: &str = "td-mail";
 
 pub fn recipe() -> Recipe {
     let Ok(declaration) = ApplicationDeclaration::new("empty-runtime", APPLICATION_ENTRY) else {
@@ -40,10 +41,9 @@ pub fn recipe() -> Recipe {
         })
         .and_then(|permissions| permissions.with_memory_high(192 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(256 * 1024 * 1024))
-        // Tasks, threads included: an async client's runtime keeps a worker
-        // per vCPU and a blocking pool, and a cap hit aborts a program that
-        // td-svc will not restart, so the fixture's 32 rather than a tighter
-        // number.
+        // Tasks, threads included: the client keeps a backend thread beside
+        // the screen's, and a cap hit aborts a program that td-svc will not
+        // restart, so the fixture's 32 rather than a tighter number.
         .and_then(|permissions| permissions.with_pids_max(32))
         .and_then(|permissions| permissions.with_cpu_max(50_000, 100_000))
     else {
@@ -98,7 +98,7 @@ pub fn recipe() -> Recipe {
         .application_permissions(permissions)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check mail: package the source-built static tmc as the mail application without executing it"
+echo ">> recipe-check mail: package the source-built static td-mail as the mail application without executing it"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run mail 1
 "#,

@@ -6144,9 +6144,9 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     /// with the shell alone on the first workspace.
     #[test]
     fn the_terminal_applications_are_td_term_windows_of_their_launchers() {
-        assert_eq!(entry_program(TD_MAIL_ENTRY), "tmc");
-        assert_eq!(entry_program(TD_NEWS_ENTRY), "tn");
-        assert_eq!(entry_program("tn"), "tn");
+        assert_eq!(entry_program(TD_MAIL_ENTRY), "td-mail");
+        assert_eq!(entry_program(TD_NEWS_ENTRY), "td-news");
+        assert_eq!(entry_program("td-news"), "td-news");
         assert!(
             (2..=9).contains(&TERMINAL_APPLICATION_WORKSPACE),
             "the control channel's vocabulary is the keyboard's nine workspaces, and the \

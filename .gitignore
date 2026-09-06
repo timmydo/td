@@ -106,3 +106,9 @@ td-audio/target/
 # Release bundles from `./build-qcow` — host-local build output, several hundred
 # MiB of images, never versioned. Upload them to a release page instead.
 /dist/
+
+# td-mail, td-news: the terminal applications, shipped by direct rustc
+# recipes from their trees but compiled here by the cargo-test preflight and
+# by hand.
+td-mail/target/
+td-news/target/

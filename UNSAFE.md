@@ -14,7 +14,7 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are SIXTEEN
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are EIGHTEEN
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
@@ -36,7 +36,13 @@ module — see §13 for the escape a module-level one permits. The fourteenth,
 one adoption site for freshly installed descriptors, with no mapping. The
 fifteenth, `td-secret`, shares the portal transport. The sixteenth,
 `td-authd`, confines kernel sender credentials and pidfds to one instruction
-and one descriptor-adoption site.
+and one descriptor-adoption site. The seventeenth and eighteenth, `td-mail`
+and `td-news`, are ONE surface recorded twice: each carries a byte-identical
+copy of `term_sys.rs`, the terminal half of td-sh's surface — `ioctl(2)`
+with the same three value-pinned requests, and `poll(2)` — because the
+one-package locks the gate requires of a root crate leave no shared crate to
+put it in. §17 argues it once; §18 records only that the copy is the same
+bytes.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -74,6 +80,8 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport for bounded credential replies |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption |
+| 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
+| 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -2192,8 +2200,8 @@ SCM_RIGHTS descriptor; an owning guard closes it on every refusal and drop.
 An authenticated `td.Secret1.Retrieve` reply transfers that one descriptor
 through the shared reopen-and-close function. The reopened file must be
 regular, unlinked, and at most 4096 bytes. The client reads it once and writes
-the credential to its stdout pipe, which tmc captures directly without a
-shell. Applications import no cryptographic implementation.
+the credential to its stdout pipe, which td-mail captures directly without
+a shell. Applications import no cryptographic implementation.
 
 The receive loop reads exactly the current D-Bus frame, negotiates descriptor
 transfer, checks the declared descriptor count, and never assigns a descriptor
@@ -2266,3 +2274,77 @@ creates no child process. Original stdin remains exclusive in the compositor.
 Both crates pin the shared source, while compositor confinement pins the two
 shared include paths and the startup/worker caller roster. The target recipe
 stages those exact sources and runs their transport and client-policy tests.
+
+## 17. `td-mail` — the terminal surface of a screen application
+
+td-mail is td's JMAP mail client (APPLICATIONS.md §W.8), a std-only root
+crate whose `src/term_sys.rs` carries the crate's whole `unsafe` surface:
+one `syscall4` body, the syscall-instruction layer copied from
+`td-sh/src/sys.rs` (itself from `td-util` and `td-init` before it), under
+one FUNCTION-level `#[allow(unsafe_code)]` — the entry-point pinning §13
+argued for — beneath a crate root that `#![deny(unsafe_code)]`s. The body
+carries EXACTLY TWO syscalls: `ioctl(2)` (16) with three value-pinned
+requests, `TCGETS` (0x5401), `TCSETS` (0x5402) and `TIOCGWINSZ` (0x5413),
+and `poll(2)` (7) asking about one descriptor. That is td-sh's surface (§8)
+minus `umask(2)` and minus its disposition-only `rt_sigaction(2)`, and plus
+nothing.
+
+Both subtractions are deliberate. A screen application creates no file
+whose mode it has to reason about, so there is no `umask`. And it installs
+no signal handler: the obvious way to learn that a terminal was resized is a
+`SIGWINCH` handler, which is exactly the `rt_sigaction(2)` this module
+refuses to own — the size is ASKED for instead, one `TIOCGWINSZ` on each
+input tick, which the loop's tenth-of-a-second read timeout already paces,
+and a resize that lands while the loop is elsewhere is not lost because a
+size is compared rather than a flag consumed. So the terminal half of
+td-sh's surface reaches the applications without the half that would have
+needed an `SA_RESTORER` trampoline and an async-signal-safe store.
+
+`ioctl(2)` is one syscall onto an unbounded space of operations, so the
+request is the surface and not the number in the register. The three
+admitted requests are pinned by VALUE and the wrapper refuses any other
+BEFORE issuing, so the roster is code rather than a test. Deliberately NOT
+admitted, each one digit from something that is: `TCSETSW`/`TCSETSF`, which
+drain or discard pending terminal I/O another process may own (`TCSETS`
+mistyped as 0x5404 IS `TCSETSF`); `TIOCSWINSZ`, the setter; `TIOCSTI`, the
+classic input injection out of a restricted session; and `TIOCSCTTY`, which
+is td-init's alone. The confinement tests issue the refused values and
+require the refusal.
+
+The termios and winsize buffers are opaque to the syscall wrappers, which
+hand the kernel a correctly sized array and give it back; the layout lives
+beside the readback that checks it. A termios is never CONSTRUCTED: the
+kernel's own bytes are read, known offsets patched, and the untouched
+original is what the restore writes back, on drop or explicitly, with a
+restore that does not take reported to the caller rather than swallowed.
+Raw mode is read back and REFUSED unless the kernel returns exactly the
+36 bytes computed, because a `TCSETS` can succeed having applied part of
+what was asked and a terminal still in canonical mode is indistinguishable
+from one whose reader has not typed yet.
+
+x86_64-linux and no other target: the numbers, the instruction and the
+register mapping are properties of one ABI, and the module states the
+restriction as every crate on this roster does. A second architecture would
+arrive carrying a syscall this file does not admit (`asm-generic` has no
+`poll(2)`), which is an amendment here rather than a `#[cfg]`.
+
+Confinement tests pin what the compiler cannot: the lint named exactly
+twice in the crate — denied at the root, allowed once, on `syscall4` — with
+every other module scanned from disk for the forms that introduce `unsafe`;
+the two syscall numbers passed by name at exactly one call site each; the
+three request values and the refused ones; the `pollfd` layout, which no
+observation of a successful poll can check; and the wrapper's behaviour on
+a real pseudo-terminal. A third syscall, a fourth request, a signal handler
+or a second allowance is an amendment to this section — and, since the
+file is copied, to §18 in the same landing.
+
+## 18. `td-news` — the same terminal surface
+
+td-news, td's feed reader, carries `src/term_sys.rs` byte for byte as
+td-mail does, under the same crate-root deny and the same single
+function-level allowance, with the same confinement tests, and nothing
+else. The surface is §17's; this entry exists because the gate holds every
+root crate to a one-package lock, so the shared file is a copy rather than
+a dependency, and a copy that drifted would be a second surface. The
+import's rule is that the two copies stay identical: a change to either is
+a change to both, reviewed once and recorded in §17.

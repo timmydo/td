@@ -1,6 +1,7 @@
-//! The `news` application: tn, td's feed reader, as a static package on the
-//! empty runtime. It runs in a td-term window at boot (`system-x86-64`'s
-//! `[news]` unit) and reads `$XDG_CONFIG_HOME/tn/config.toml`, which
+//! The `news` application: td-news, td's feed reader, as a static package
+//! on the empty runtime. It runs in a td-term window at boot
+//! (`system-x86-64`'s `[news]` unit) and reads
+//! `$XDG_CONFIG_HOME/td-news/config.toml`, which
 //! td-firstboot provisions once under the login user's jail state.
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
@@ -12,8 +13,8 @@ const APPLICATION_ENTRY: &str = crate::ladder::TD_NEWS_ENTRY;
 const APPLICATION_DISPLAY_NAME: &str = crate::ladder::TD_NEWS_DISPLAY_NAME;
 const APPLICATION_SEARCH_TERMS: &[&str] = crate::ladder::TD_NEWS_SEARCH_TERMS;
 /// The source-built static binary this package wraps, and its recipe.
-const PROGRAM: &str = "tn";
-const PROGRAM_RECIPE: &str = "tn";
+const PROGRAM: &str = "td-news";
+const PROGRAM_RECIPE: &str = "td-news";
 
 pub fn recipe() -> Recipe {
     let Ok(declaration) = ApplicationDeclaration::new("empty-runtime", APPLICATION_ENTRY) else {
@@ -36,10 +37,9 @@ pub fn recipe() -> Recipe {
         .and_then(|permissions| permissions.with_terminal())
         .and_then(|permissions| permissions.with_memory_high(128 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(192 * 1024 * 1024))
-        // Tasks, threads included: an async client's runtime keeps a worker
-        // per vCPU and a blocking pool, and a cap hit aborts a program that
-        // td-svc will not restart, so the fixture's 32 rather than a tighter
-        // number.
+        // Tasks, threads included: the client keeps a backend thread beside
+        // the screen's, and a cap hit aborts a program that td-svc will not
+        // restart, so the fixture's 32 rather than a tighter number.
         .and_then(|permissions| permissions.with_pids_max(32))
         .and_then(|permissions| permissions.with_cpu_max(50_000, 100_000))
     else {
@@ -86,7 +86,7 @@ pub fn recipe() -> Recipe {
         .application_permissions(permissions)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check news: package the source-built static tn as the news application without executing it"
+echo ">> recipe-check news: package the source-built static td-news as the news application without executing it"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run news 1
 "#,

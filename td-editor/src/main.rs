@@ -35,7 +35,7 @@ const HELP: &str = concat!(
     "Format: Dictionary, Check Spelling, Next/Previous Misspelling (no wrapping).\n",
     "Spelling underlines appear at completion; edits clear them without rechecking.\n",
     "Word list: UTF-8, one ASCII word per line; 16 MiB / 250,000 unique words.\n",
-    "No bundled word list, GPU renderer, control socket, recovery or tmc integration.\n",
+    "No bundled word list, GPU renderer, control socket, recovery or td-mail link.\n",
     "Fixtures: --replay | --preview\n",
     "Scratch: --window-preview [--keys=windows|emacs]\n",
     "Scratch window has no file I/O.\n",

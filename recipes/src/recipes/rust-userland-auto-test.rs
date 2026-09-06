@@ -59,12 +59,14 @@ fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
     .env("PATH", &post_bootstrap_path())
 }
 
-/// The contract of a `static_link` Cargo output: the same provenance scans and
-/// ELF64/x86-64 shape as the dynamic rungs, then no program interpreter, no
-/// `DT_NEEDED`, no run-path, and a position-independent executable (`ET_DYN`
-/// flagged `PIE`) rather than a fixed-address `ET_EXEC` — the static shape an
-/// application package's validator admits, with the image base the kernel
-/// still randomizes.
+/// The contract of a td-owned static program (`static_local_source_program`,
+/// the shape td-sh and td-init wear): the same provenance scans and
+/// ELF64/x86-64 shape as the dynamic rungs, then a fixed-address `ET_EXEC`
+/// with no program interpreter, no `DT_NEEDED`, and no run-path — a static
+/// `ET_EXEC` has no dynamic section for either to live in, and `readelf -d`
+/// says so by printing none. The application package's validator admits
+/// this shape or a static PIE (APPLICATIONS.md); the recipe's own
+/// `assert_static` step is the producer's check, this one the consumer's.
 fn static_contract(label: &str, binary: &str) -> Step {
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
     let scans = provenance_scans(label, binary);
@@ -79,11 +81,10 @@ fn static_contract(label: &str, binary: &str) -> Step {
                  h=$('{readelf}' -h '{binary}') || {{ echo 'readelf -h failed on {label}' >&2; exit 1; }}; \
                  printf '%s\\n' \"$h\" | grep -i 'class:' | grep -qi ELF64 || {{ echo '{label} is not ELF64' >&2; exit 1; }}; \
                  printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi x86-64 || {{ echo '{label} is not x86-64' >&2; exit 1; }}; \
-                 printf '%s\\n' \"$h\" | grep -i 'type:' | grep -q 'DYN' || {{ echo '{label} is not a position-independent (ET_DYN) static executable' >&2; exit 1; }}; \
+                 printf '%s\\n' \"$h\" | grep -qE 'Type:[[:space:]]+EXEC([[:space:]]|$)' || {{ echo '{label} is not a fixed-address (ET_EXEC) static executable' >&2; exit 1; }}; \
                  p=$('{readelf}' -l '{binary}') || {{ echo 'readelf -l failed on {label}' >&2; exit 1; }}; \
                  printf '%s\\n' \"$p\" | grep -q 'INTERP' && {{ echo '{label} has a program interpreter' >&2; exit 1; }}; \
                  d=$('{readelf}' -d '{binary}' 2>&1) || {{ echo 'readelf -d failed on {label}' >&2; exit 1; }}; \
-                 printf '%s\\n' \"$d\" | grep '(FLAGS_1)' | grep -q 'PIE' || {{ echo '{label} is ET_DYN without the PIE flag: a shared object, not a static PIE' >&2; exit 1; }}; \
                  printf '%s\\n' \"$d\" | grep -q '(NEEDED)' && {{ echo '{label} has a DT_NEEDED entry' >&2; exit 1; }}; \
                  printf '%s\\n' \"$d\" | grep -q '(RUNPATH)\\|(RPATH)' && {{ echo '{label} has a run-path' >&2; exit 1; }}; \
                  exit 0"
@@ -96,18 +97,17 @@ fn static_contract(label: &str, binary: &str) -> Step {
 pub fn recipe() -> Recipe {
     let rg = "{in:ripgrep}/bin/rg";
     let fd = "{in:fd}/bin/fd";
-    let tn = "{in:tn}/bin/tn";
-    let tmc = "{in:tmc}/bin/tmc";
+    let news = "{in:td-news}/bin/td-news";
+    let mail = "{in:td-mail}/bin/td-mail";
     let fixture = "{root}/fixtures/known-needle.txt";
     let mut steps = vec![
         dynamic_contract("ripgrep", rg, "ld-linux-x86-64.so.2\nlibc.so.6"),
         dynamic_contract("fd", fd, "libc.so.6"),
-        // The two terminal applications are GitHub commit archives rather than
-        // crates.io packages, link `ring`'s C and assembly through the Cargo
-        // build-script path, and are the first `static_link` Cargo outputs:
-        // their contract is the static validator's shape, not the glibc one.
-        static_contract("tn", tn),
-        static_contract("tmc", tmc),
+        // The two terminal applications are td's own root crates, built static
+        // by direct rustc from the checkout (APPLICATIONS.md §W.8): their
+        // contract is the td-owned static shape, not the glibc one.
+        static_contract("td-news", news),
+        static_contract("td-mail", mail),
         Step::MkDir {
             path: "{root}/fixtures".into(),
         },
@@ -128,10 +128,10 @@ pub fn recipe() -> Recipe {
                      [ \"$actual\" = 'needle' ] || {{ echo \"ripgrep returned unexpected output: $actual\" >&2; exit 1; }}; \
                      actual=$('{fd}' --color never --absolute-path '^known-needle[.]txt$' '{{root}}/fixtures') || {{ echo 'fd search failed' >&2; exit 1; }}; \
                      [ \"$actual\" = '{fixture}' ] || {{ echo \"fd returned unexpected output: $actual\" >&2; exit 1; }}; \
-                     usage=$('{tn}' --help 2>&1) || {{ echo 'tn --help failed' >&2; exit 1; }}; \
-                     case \"$usage\" in *'Usage: tn'*) :;; *) echo \"tn --help returned unexpected output: $usage\" >&2; exit 1;; esac; \
-                     usage=$('{tmc}' --help 2>&1) || {{ echo 'tmc --help failed' >&2; exit 1; }}; \
-                     case \"$usage\" in *'Usage: tmc'*) :;; *) echo \"tmc --help returned unexpected output: $usage\" >&2; exit 1;; esac"
+                     usage=$('{news}' --help 2>&1) || {{ echo 'td-news --help failed' >&2; exit 1; }}; \
+                     case \"$usage\" in *'Usage: td-news'*) :;; *) echo \"td-news --help returned unexpected output: $usage\" >&2; exit 1;; esac; \
+                     usage=$('{mail}' --help 2>&1) || {{ echo 'td-mail --help failed' >&2; exit 1; }}; \
+                     case \"$usage\" in *'Usage: td-mail'*) :;; *) echo \"td-mail --help returned unexpected output: $usage\" >&2; exit 1;; esac"
                 ),
             ],
         )
@@ -142,7 +142,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: ripgrep and fd are target-built auto graph nodes with the declared td glibc runtime closure, and tn and tmc are fully static Cargo outputs\n".into(),
+        content: "PASS: ripgrep and fd are target-built auto graph nodes with the declared td glibc runtime closure, and td-news and td-mail are fully static direct-rustc outputs\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -154,8 +154,8 @@ pub fn recipe() -> Recipe {
         .native_inputs(&[
             "ripgrep",
             "fd",
-            "tn",
-            "tmc",
+            "td-news",
+            "td-mail",
             "binutils-x86-64-self",
             "glibc-x86-64",
             "busybox-x86-64",
@@ -168,7 +168,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![
             RecipeCheck::new(
                 r#"
-echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, tn and tmc with the source-built Rust/native toolchain, verifies the exact dynamic runtime closure of the first two and the static position-independent shape of the last two, and runs real searches and usage output with /gnu/store absent"
+echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news and td-mail with the source-built Rust/native toolchain, verifies the exact dynamic runtime closure of the first two and the td-owned static ET_EXEC shape of the last two, and runs real searches and usage output with /gnu/store absent"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-userland-auto-test 1
 "#,

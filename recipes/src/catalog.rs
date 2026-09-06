@@ -178,7 +178,9 @@ mod tests {
             "td-jail",
             "td-kexec",
             "td-login",
+            "td-mail",
             "td-netd",
+            "td-news",
             "td-portal",
             "td-profiler",
             "td-seatd",
@@ -361,6 +363,7 @@ mod tests {
     #[test]
     fn local_source_trees_are_staged_by_basename_and_routed_by_the_builder() {
         let mut trees: Vec<String> = Vec::new();
+        let mut lone: Vec<String> = Vec::new();
         for (stem, recipe) in all() {
             let siblings = recipe.local_source_trees.clone().unwrap_or_default();
             let Some(main) = recipe.local_source.clone() else {
@@ -371,6 +374,9 @@ mod tests {
                 continue;
             };
             if siblings.is_empty() {
+                // A tree with no siblings is a crate of its own; the builder
+                // routes it by the literal roster in `local_source_crate`.
+                lone.push(main);
                 continue;
             }
             let basename = std::path::Path::new(&main)
@@ -387,6 +393,13 @@ mod tests {
         trees.sort_unstable();
         trees.dedup();
         assert_eq!(trees, ["engine", "net", "td-boot"]);
+        lone.sort_unstable();
+        lone.dedup();
+        assert_eq!(
+            lone,
+            ["td-mail", "td-news"],
+            "a lone local-source crate joined; add it to builder/src/affected.rs local_source_crate"
+        );
     }
 
     #[test]

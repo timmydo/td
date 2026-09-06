@@ -80,24 +80,24 @@ struct ApplicationConfig {
 const APPLICATION_CONFIGS: &[ApplicationConfig] = &[
     ApplicationConfig {
         application: "mail",
-        program: "tmc",
-        files: &[("config.toml", TMC_CONFIG)],
+        program: "td-mail",
+        files: &[("config.toml", MAIL_CONFIG)],
     },
     ApplicationConfig {
         application: "news",
-        program: "tn",
-        files: &[("config.toml", TN_CONFIG)],
+        program: "td-news",
+        files: &[("config.toml", NEWS_CONFIG)],
     },
 ];
 
-/// tmc starts offline from this and says so; the operator replaces the three
-/// placeholders and stores mail/main through td-secret, and reads them when it next
+/// td-mail starts offline from this and says so; the operator replaces the two
+/// placeholders, stores mail/main through td-secret, and the client reads them when it next
 /// starts. The comments name no way to start it: a user-level relaunch of a
 /// terminal window is deferred (APPLICATIONS.md §W.7), and the
 /// administrative escape hatch is not a flow a shipped file may depend on
 /// (AGENTS.md).
-const TMC_CONFIG: &str = "\
-# td mail (tmc). Provisioned on first boot; edit freely, it is never rewritten.
+const MAIL_CONFIG: &str = "\
+# td-mail. Provisioned on first boot; edit freely, it is never rewritten.
 # Paths are as the application sees them inside its jail. The client reads
 # this file when it starts.
 
@@ -107,12 +107,12 @@ username = \"you@example.com\"
 secret = \"portal\"
 ";
 
-/// tn needs at least one feed to start. These two public feeds are shipped
-/// so the first window shows something rather than an error; tn fetches them
+/// td-news needs at least one feed to start. These two public feeds are
+/// shipped so the first window shows something rather than an error; it fetches them
 /// on its first start, which is the one outbound request the image makes on a
 /// user's behalf without being asked, and the comment says how to stop it.
-const TN_CONFIG: &str = "\
-# td news (tn). Provisioned on first boot; edit freely, it is never rewritten.
+const NEWS_CONFIG: &str = "\
+# td-news. Provisioned on first boot; edit freely, it is never rewritten.
 # The client reads this file when it starts. The feeds below are public
 # starting points: replace or delete them, and nothing is fetched until you
 # name a feed of your own.
@@ -1399,9 +1399,9 @@ mod tests {
             first,
             vec![("mail", Outcome::Created), ("news", Outcome::Created)]
         );
-        let mail = home.join(".td/app/mail/config/tmc/config.toml");
-        let password = home.join(".td/app/mail/config/tmc/password");
-        let news = home.join(".td/app/news/config/tn/config.toml");
+        let mail = home.join(".td/app/mail/config/td-mail/config.toml");
+        let password = home.join(".td/app/mail/config/td-mail/password");
+        let news = home.join(".td/app/news/config/td-news/config.toml");
         for path in [&mail, &news] {
             let metadata = std::fs::metadata(path).unwrap();
             assert_eq!(
@@ -1417,19 +1417,19 @@ mod tests {
             ".td/app",
             ".td/app/mail",
             ".td/app/mail/config",
-            ".td/app/mail/config/tmc",
+            ".td/app/mail/config/td-mail",
             ".td/app/news",
             ".td/app/news/config",
-            ".td/app/news/config/tn",
+            ".td/app/news/config/td-news",
         ] {
             let metadata = std::fs::metadata(home.join(directory)).unwrap();
             assert!(metadata.is_dir());
             assert_eq!(metadata.permissions().mode() & 0o7777, 0o700, "{directory}");
             assert_eq!((metadata.uid(), metadata.gid()), (owner.uid, owner.gid));
         }
-        assert_eq!(std::fs::read_to_string(&mail).unwrap(), TMC_CONFIG);
+        assert_eq!(std::fs::read_to_string(&mail).unwrap(), MAIL_CONFIG);
         assert!(!password.exists());
-        assert_eq!(std::fs::read_to_string(&news).unwrap(), TN_CONFIG);
+        assert_eq!(std::fs::read_to_string(&news).unwrap(), NEWS_CONFIG);
 
         // The operator's edit survives every later boot; a missing sibling
         // is created without touching it.
@@ -1452,7 +1452,7 @@ mod tests {
         std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::remove_file(&news).unwrap();
         assert_eq!(provision_applications(&owner, &root).unwrap(), vec![("news", Outcome::Created)]);
-        assert_eq!(std::fs::read_to_string(&news).unwrap(), TN_CONFIG);
+        assert_eq!(std::fs::read_to_string(&news).unwrap(), NEWS_CONFIG);
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
 
         // Somebody else's home, or none, is skipped and said, not failed.

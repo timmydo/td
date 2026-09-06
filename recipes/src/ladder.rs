@@ -12,7 +12,7 @@
 //! - Unpacking is ENGINE-NATIVE (`Step::Unpack` — td's own std-only
 //!   tar/gzip/bzip2/xz readers), so no rung declares an unpacker package.
 
-use crate::types::{Step, TextEdit};
+use crate::types::{Recipe, Step, TextEdit};
 
 pub const TD_APPLICATION_PACKAGE_ROOT: &str = "/td/store";
 pub const TD_APPLICATION_STATE_ROOT: &str = ".td/app";
@@ -44,17 +44,17 @@ pub const TD_JAIL_FIXTURE_SEARCH_TERMS: &[&str] =
     &["jail", "fixture", "sandbox", "wayland"];
 // The two terminal applications: td-owned static programs on the empty
 // runtime, each a `/bin` launcher that td-term runs as its `--command` in
-// a window of its own at boot. `mail` is tmc, `news` is tn; the launcher
-// keys are the words a person types, the entries are the upstream binary
-// names.
+// a window of its own at boot. `mail` is td-mail, `news` is td-news; the
+// launcher keys are the words a person types, the entries are the
+// programs' names.
 pub const TD_MAIL_NAME: &str = "mail";
-pub const TD_MAIL_ENTRY: &str = "/app/bin/tmc";
+pub const TD_MAIL_ENTRY: &str = "/app/bin/td-mail";
 pub const TD_MAIL_DISPLAY_NAME: &str = "Mail";
-pub const TD_MAIL_SEARCH_TERMS: &[&str] = &["mail", "email", "jmap", "tmc"];
+pub const TD_MAIL_SEARCH_TERMS: &[&str] = &["mail", "email", "jmap", "td-mail"];
 pub const TD_NEWS_NAME: &str = "news";
-pub const TD_NEWS_ENTRY: &str = "/app/bin/tn";
+pub const TD_NEWS_ENTRY: &str = "/app/bin/td-news";
 pub const TD_NEWS_DISPLAY_NAME: &str = "News";
-pub const TD_NEWS_SEARCH_TERMS: &[&str] = &["news", "rss", "feeds", "tn"];
+pub const TD_NEWS_SEARCH_TERMS: &[&str] = &["news", "rss", "feeds", "td-news"];
 /// The program a jailed entry runs as: the final component of its `/app`
 /// path, which `td-jail --probe-process-token` matches and the boot
 /// evidence names.
@@ -217,6 +217,103 @@ pub fn target_rustc_at_roots(
 /// compile and post-link halves of the global policy one reusable path.
 pub fn split_target_debug(root: &str) -> Step {
     Step::split_debug_tree(root, "{in:binutils-x86-64-self}/bin/objcopy")
+}
+
+/// A td-owned program built by direct rustc from a `local_source` tree of the
+/// checkout named `name` (`td-mail/`, `td-news/`: APPLICATIONS.md §W.8) and
+/// linked static exactly as td-sh is. The interned tree is copied under
+/// `{src}` before the compile so its paths remap to `/td-build` as every
+/// other direct recipe's do; rustc reads `src/main.rs` and resolves each
+/// `mod` from the tree beside it, so unlike the `include_str!` recipes this
+/// one carries no module roster to keep in step with the crate.
+pub fn static_local_source_program(name: &str) -> Recipe {
+    // The self-hosted toolchains install under a nested stage/td/store/<pkg>
+    // DESTDIR (re the /td/store prefix); rust-toolchain installs flat.
+    let rustc = "{in:rust-toolchain}/bin/rustc";
+    let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
+    let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
+    let bbin = "{in:binutils-x86-64-self}/bin";
+    let glib = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
+    // gcc-x86-64-self folds the unwinder into libgcc.a and emits no static
+    // libgcc_eh.a, which a `-static` rustc link still asks for; synthesize one
+    // from libgcc.a as td-sh does.
+    let objcopy = "{in:binutils-x86-64-self}/bin/objcopy";
+    let ranlib = "{in:binutils-x86-64-self}/bin/ranlib";
+    let libgcc_a = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc.a";
+
+    let linker = format!("-Clinker={gcc}");
+    let lib_b = format!("-Clink-arg=-B{glib}");
+    let bin_b = format!("-Clink-arg=-B{bbin}");
+    let path = format!("{bbin}:{gccbin}");
+    let source = format!("{{in:{name}-source}}");
+    let binary = format!("{{out}}/bin/{name}");
+
+    let steps = vec![
+        Step::MkDir {
+            path: "{out}/bin".into(),
+        },
+        Step::CopyTree {
+            from: source,
+            dest: "{src}".into(),
+        },
+        Step::MkDir {
+            path: "{root}/eh".into(),
+        },
+        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
+        Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "-C",
+                "opt-level=s",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                // Mirror the crate's [profile.release] (cargo never sees this
+                // direct rustc build): abort — not unwind — on panic. The
+                // shared target policy deliberately preserves symbols.
+                "-C",
+                "panic=abort",
+                &linker,
+                "-L",
+                glib,
+                &lib_b,
+                &bin_b,
+                "-Clink-arg=-L{root}/eh",
+                "-Clink-arg=-static-libgcc",
+                "-o",
+                &binary,
+                "{src}/src/main.rs",
+            ],
+        )
+        .env("PATH", &path)
+        .env("SOURCE_DATE_EPOCH", "1"),
+        Step::Require {
+            paths: vec![binary.clone()],
+            exec: true,
+        },
+        // Fail closed on any interpreter/needed/rpath: the application package
+        // validates a static entry on the empty runtime, where a loader is
+        // nothing the jail shows.
+        split_target_debug("{out}"),
+        Step::assert_static(&[&binary]),
+    ];
+
+    Recipe::mesboot(name, "0.1")
+        .local_source(name)
+        .native_inputs(&[
+            "rust-toolchain",
+            "gcc-x86-64-self",
+            "binutils-x86-64-self",
+            "glibc-x86-64",
+        ])
+        .steps(steps)
 }
 
 const DEBUG_LINE_AWK: &str = r#"
@@ -2544,7 +2641,7 @@ mod tests {
                 .matches(stage0_token)
                 .count(),
             4,
-            "the boundary probe may name rust-stage0 once per tested binary (ripgrep, fd, tn, tmc)"
+            "the boundary probe may name rust-stage0 once per tested binary (ripgrep, fd, td-news, td-mail)"
         );
 
         let commands: Vec<&str> = recipe

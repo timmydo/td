@@ -133,6 +133,19 @@ fn pattern_matches(alts: &str, s: &str) -> bool {
     alts.split('|').any(|a| glob_match(a, s))
 }
 
+/// The crates whose whole tree is a `local_source` seed of their own recipe
+/// (APPLICATIONS.md §W.8): the name, when `p` lies anywhere beneath one. The
+/// separator matters (`td-mailer/x` is not `td-mail/x`), and a `..` names no
+/// path a recipe can stage.
+fn local_source_crate(p: &str) -> Option<&'static str> {
+    if p.contains("..") {
+        return None;
+    }
+    ["td-mail", "td-news"]
+        .into_iter()
+        .find(|name| p.strip_prefix(name).is_some_and(|rest| rest.starts_with('/')))
+}
+
 // ---------------------------------------------------------------------------
 // Selection accumulator — insertion-ordered dedup (the shell `contains_word`).
 // ---------------------------------------------------------------------------
@@ -1068,6 +1081,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
             ));
             return;
         }
+        // The terminal applications' trees are their own seeds, whole
+        // (APPLICATIONS.md §W.8), so a document in one moves that row too.
+        if let Some(seed) = local_source_crate(p) {
+            sel.add_preflight("local-source-digests");
+            sel.add_note(&format!(
+                "{p} is a document inside the {seed} tree, which is staged whole as the {seed}-source seed, so it moves that digest row: the digest preflight is the one check."
+            ));
+            return;
+        }
         return; // docs — no checks
     }
 
@@ -1300,6 +1322,25 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         p,
     ) {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
+    // td-mail and td-news: the two terminal applications, standalone std-only
+    // crates OUTSIDE the engine workspace, built static by direct rustc like
+    // td-util — but from a `local_source` tree rather than `include_str!`
+    // (APPLICATIONS.md §W.8), so the whole tree is the `<crate>-source` seed
+    // and ANY file in it, tests and documents included, moves that crate's
+    // seed-digest row: the digest preflight reds a stale row before an image
+    // build would. Unit and integration tests lint/test on the host cargo-test
+    // preflight; the recipe-checks that build the program (the `mail`/`news`
+    // package checks, td-firstboot-test, rust-userland-auto-test) prove the
+    // static link and the provisioned configuration. Their RECIPE files are
+    // routed by the recipes arm above, not here.
+    if local_source_crate(p).is_some() {
+        sel.add_preflight("cargo-test");
+        sel.add_preflight("local-source-digests");
         sel.add_target("check");
         sel.add_target("recipe-checks");
         return;
@@ -2295,6 +2336,24 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-sh/src/lib.rs", "recipe-checks");
     assert_target!("td-sh/spec/smoke.test.sh", "check");
     assert_target!("td-sh/spec/smoke.test.sh", "recipe-checks");
+
+    // td-mail and td-news: standalone std-only crates staged WHOLE as their
+    // own seeds, so every path in the tree — tests, documents, the manifest —
+    // moves the digest row, and the source paths also take the static-link
+    // proof through recipe-checks.
+    for crate_dir in ["td-mail", "td-news"] {
+        assert_target!(&format!("{crate_dir}/src/main.rs"), "check");
+        assert_target!(&format!("{crate_dir}/src/main.rs"), "recipe-checks");
+        assert_target!(&format!("{crate_dir}/src/tui/mod.rs"), "recipe-checks");
+        assert_target!(&format!("{crate_dir}/tests/cli_integration.rs"), "check");
+        assert_target!(&format!("{crate_dir}/Cargo.toml"), "recipe-checks");
+        assert_preflight!(&format!("{crate_dir}/src/main.rs"), "cargo-test");
+        assert_preflight!(&format!("{crate_dir}/tests/cli_integration.rs"), "cargo-test");
+        assert_preflight!(&format!("{crate_dir}/src/main.rs"), "local-source-digests");
+        assert_preflight!(&format!("{crate_dir}/tests/cli_integration.rs"), "local-source-digests");
+        assert_preflight!(&format!("{crate_dir}/README.md"), "local-source-digests");
+        assert_preflight!(&format!("{crate_dir}/Cargo.lock"), "local-source-digests");
+    }
 
     // td-txt mirrors td-sh: standalone std-only crate, main.rs + modules
     // include_str!'d into the recipe, corpus DATA under spec/ (including the

@@ -365,10 +365,10 @@ pub(crate) fn valid_process_token(token: &str) -> bool {
 /// One that begins with `-` is a flag and names a process by an exact argv
 /// word after argv[0]; any other is a program and names a process by the
 /// final path component of argv[0], which for a td-jail launch is the entry
-/// path (`/app/bin/tmc` runs as `tmc`). Neither reads the other's field, so
-/// a wrapper carrying the program's name as an argument is not the program,
-/// a path component such as `bin` names nothing, and a word matches only
-/// whole.
+/// path (`/app/bin/td-mail` runs as `td-mail`). Neither reads the other's
+/// field, so a wrapper carrying the program's name as an argument is not
+/// the program, a path component such as `bin` names nothing, and a word
+/// matches only whole.
 fn command_has_token(command: &[u8], token: &str) -> bool {
     if token.is_empty() {
         return false;

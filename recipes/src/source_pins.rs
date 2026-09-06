@@ -636,26 +636,6 @@ const PINS: &[PinDef] = &[
         file: "tcc-0.9.27.tar.bz2",
     },
     PinDef {
-        key: "tmc-source",
-        aliases: &[],
-        // Timmy's Mail Console — the `mail` application's JMAP terminal client,
-        // pinned to one upstream commit archive. GitHub's commit archive is the
-        // only upstream-hosted source archive; the dependency closure is pinned
-        // separately by the committed recipes/locks/tmc/Cargo.lock.
-        url: "https://github.com/timmydo/tmc/archive/6d5c85f68b421aebdb4fdcbd1bdb33b88a5c493c.tar.gz",
-        sha256: "96cacb70e6be0f89fdcbc41eddfae326efe42701ff53ee27f07079afd0802fd0",
-        file: "tmc-6d5c85f68b421aebdb4fdcbd1bdb33b88a5c493c.tar.gz",
-    },
-    PinDef {
-        key: "tn-source",
-        aliases: &[],
-        // Timmy's News — the `news` application's terminal feed reader, pinned
-        // the same way; closure in recipes/locks/tn/Cargo.lock.
-        url: "https://github.com/timmydo/news/archive/f2376c77e4774f05f3b9bb0175eaa7d3c5081b7a.tar.gz",
-        sha256: "f600c9bc9e103473bb30a0593c849096cf9e988ff02263f5a5e44021561cdc8b",
-        file: "news-f2376c77e4774f05f3b9bb0175eaa7d3c5081b7a.tar.gz",
-    },
-    PinDef {
         key: "util-linux-libs-x86-64-source",
         aliases: &[],
         // btrfs-progs requires libuuid and libblkid. The recipe builds only
@@ -789,10 +769,10 @@ mod tests {
         // 0.148.0 (including its
         // vendored Bubblewrap and five Cargo Git commit archives), libcap 2.78,
         // Protobuf 31.1 with its exact Abseil 20250127.0 source dependency, and
-        // the second reviewed foreign application seed, the Claude Code 2.1.260
-        // native release, and the two terminal applications' commit archives,
-        // tmc and tn.
-        assert_eq!(all().len(), 74);
+        // the second reviewed foreign application seed, the Claude Code
+        // 2.1.260 native release. The terminal applications are td's own
+        // trees (APPLICATIONS.md §W.8) and pin nothing here.
+        assert_eq!(all().len(), 72);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
