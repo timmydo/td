@@ -4227,6 +4227,7 @@ mod tests {
         // authd names the compositor runtime directory in its fixed argv.
         // The conservative textual edge widens checks even without a read.
         assert_eq!(readers_of("td-compositor"), ["td-authd", "td-editor", "td-portal"]);
+        assert_eq!(readers_of("td-authd"), ["td-compositor"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled.

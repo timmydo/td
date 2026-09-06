@@ -10,6 +10,10 @@ use crate::types::{Recipe, Step};
 // of td-compositor's is on it.
 const MAIN_RS: &str = include_str!("../../../td-compositor/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    (
+        "authority",
+        include_str!("../../../td-compositor/src/authority.rs"),
+    ),
     ("bar", include_str!("../../../td-compositor/src/bar.rs")),
     (
         "buffer",
@@ -136,6 +140,32 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
+    for directory in ["{src}/auth", "{src}/tests"] {
+        steps.push(Step::MkDir {
+            path: directory.into(),
+        });
+    }
+    for (name, source) in [
+        (
+            "auth/channel.rs",
+            include_str!("../../../td-authd/src/channel.rs"),
+        ),
+        ("auth/sys.rs", include_str!("../../../td-authd/src/sys.rs")),
+        (
+            "tests/channel.rs",
+            include_str!("../../../td-authd/tests/channel.rs"),
+        ),
+        (
+            "tests/sys.rs",
+            include_str!("../../../td-authd/tests/sys.rs"),
+        ),
+    ] {
+        steps.push(Step::WriteFile {
+            path: format!("{{src}}/{name}"),
+            content: source.into(),
+            exec: false,
+        });
+    }
     steps.extend([
         Step::MkDir {
             path: "{root}/eh".into(),
@@ -148,6 +178,8 @@ pub fn recipe() -> Recipe {
             &[
                 "--edition",
                 "2021",
+                "--cfg",
+                "feature=\"target-recipe\"",
                 "-C",
                 "opt-level=s",
                 "--target",
@@ -219,6 +251,38 @@ pub fn recipe() -> Recipe {
             paths: vec!["{out}/share/terminfo/t/td-term".into()],
             exec: false,
         },
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--test",
+                "--crate-name",
+                "td_compositor_authority_tests",
+                "--cfg",
+                "feature=\"target-recipe\"",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                &linker,
+                "-L",
+                glib,
+                &lib_b,
+                &bin_b,
+                "-Clink-arg=-L{root}/eh",
+                "-Clink-arg=-static-libgcc",
+                "-o",
+                "{root}/authority-tests",
+                "{src}/authority.rs",
+            ],
+        )
+        .env("PATH", &path)
+        .env("SOURCE_DATE_EPOCH", "1"),
+        Step::run("{root}", &["{root}/authority-tests"]),
         split_target_debug("{out}"),
         Step::assert_static(&[
             "{out}/bin/td-compositor",
@@ -271,6 +335,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    fn authority_producer_stages_shared_sources_and_executes_target_tests() {
+        let authority = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "authority").then_some(*source))
+            .unwrap();
+        for path in ["auth/channel.rs", "auth/sys.rs"] {
+            assert!(authority.contains(&format!("path = {path:?}")));
+        }
+        let recipe = recipe();
+        for (path, expected) in [
+            (
+                "{src}/auth/channel.rs",
+                include_str!("../../../td-authd/src/channel.rs"),
+            ),
+            (
+                "{src}/auth/sys.rs",
+                include_str!("../../../td-authd/src/sys.rs"),
+            ),
+            (
+                "{src}/tests/channel.rs",
+                include_str!("../../../td-authd/tests/channel.rs"),
+            ),
+            (
+                "{src}/tests/sys.rs",
+                include_str!("../../../td-authd/tests/sys.rs"),
+            ),
+        ] {
+            let writes: Vec<_> = recipe
+                .steps
+                .iter()
+                .flatten()
+                .filter_map(|step| match step {
+                    Step::WriteFile {
+                        path: actual,
+                        content,
+                        exec,
+                    } if actual == path => {
+                        assert!(!exec);
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(writes, [expected]);
+        }
+        let runs: Vec<_> = recipe
+            .steps
+            .iter()
+            .flatten()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv),
+                _ => None,
+            })
+            .collect();
+        let compile = runs
+            .iter()
+            .position(|argv| {
+                argv.iter()
+                    .any(|arg| arg == "td_compositor_authority_tests")
+            })
+            .unwrap();
+        let execute = runs
+            .iter()
+            .position(|argv| argv.as_slice() == ["{root}/authority-tests"])
+            .unwrap();
+        assert!(compile < execute);
+        let args = runs[compile];
+        assert!(args.iter().any(|arg| arg == "--test"));
+        assert!(args.iter().any(|arg| arg == "{src}/authority.rs"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--cfg", "feature=\"target-recipe\""]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--target", "x86_64-unknown-linux-gnu"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "{root}/authority-tests"]));
     }
 
     #[test]

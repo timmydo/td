@@ -21,6 +21,9 @@ path = "tools/import-libvterm.rs"
 name = "td-term-import-unifont"
 path = "tools/import-unifont.rs"
 
+[features]
+target-recipe = []
+
 [workspace]
 
 [lints.clippy]

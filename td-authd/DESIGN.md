@@ -399,3 +399,11 @@ The host must have that static target and linker installed. `cargo test`
 executes the ordinary suite; its two ignored exec-only fixtures are invoked
 by their parent tests with sanitized descriptors and environment. Running
 all ignored fixtures directly is not a supported suite invocation.
+
+The optional compositor client is specified by td-compositor/DESIGN.md. It
+shares this transport, greets before workers exist, then keeps the endpoint
+exclusive in one worker. The image UID/device/socket cutover remains pending.
+Linux's `include/net/scm.h::scm_send` supplies `task_tgid(current)`; a worker
+thread retains the process pin while a forked descendant does not. The kernel
+fixture exercises both cases. The shared module imports its sibling sys
+module so each consumer's transport remains private to that consumer.

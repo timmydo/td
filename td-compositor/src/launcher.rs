@@ -129,6 +129,32 @@ where
     sequence: u64,
 }
 
+pub(crate) enum LaunchBackend {
+    Direct(LaunchProcesses),
+    Authority(crate::authority::Launcher),
+}
+
+impl LaunchBackend {
+    pub fn activates_application(&self) -> bool {
+        match self {
+            Self::Direct(processes) => processes.activates_application(),
+            Self::Authority(_) => true,
+        }
+    }
+
+    pub fn launch(&mut self, request: LaunchRequest) -> Result<Vec<String>, String> {
+        match self {
+            Self::Direct(processes) => processes.launch(request),
+            Self::Authority(authority) if request == LaunchRequest::Terminal => {
+                authority.launch()?;
+                Ok(Vec::new())
+            }
+            // LiveInputTarget activates the configured scene before calling us.
+            Self::Authority(_) => Err("configured application is activation-only".into()),
+        }
+    }
+}
+
 struct LaunchedChild<C> {
     process: C,
     ready_socket: PathBuf,

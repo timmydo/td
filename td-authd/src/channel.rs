@@ -1,6 +1,6 @@
 //! A root-created stream with a live kernel-pinned sender on every receive.
 
-use crate::sys;
+use super::sys;
 use std::fs::File;
 use std::io::{self, Write};
 use std::net::Shutdown;

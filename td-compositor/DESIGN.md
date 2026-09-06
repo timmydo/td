@@ -6056,3 +6056,67 @@ client gave itself; there is no label a caller can attach to a window and use
 later. That matters for the one case this channel is worst at — launching
 several identical terminals and telling them apart afterwards — which no field
 in the report answers today.
+
+## Private terminal authority client prerequisite
+
+`--terminal-authority stdin` selects the root-created private channel in place
+of `--terminal-client PATH`. Exactly one is required. Authority mode requires
+the supervised application card; that card activates its existing Wayland
+surface and never invokes a program. The image does not enable this client
+until its atomic identity, device and socket cutover. The existing direct
+launcher remains the current image and host-development path.
+
+Before opening the framebuffer or starting any worker, the client verifies one
+thread, identical service uid/gid columns in 1..=999, and only inherited fd
+0/1/2. It checks their existence before descriptor enumeration can reuse a
+missing standard fd. The root authority verifies the exact configured
+compositor identity against the enrolled session. Both ends complete the
+kernel sender-pinning greeting before this process starts a worker or could
+delegate an endpoint. The application protocol then completes its version and
+session-admission handshake before graphical startup proceeds.
+
+One worker owns the channel and every process handle. Input submits only a
+terminal-launch notification through a capacity-one nonblocking queue; an
+already-pending request is a reported refusal, never an input-thread wait.
+The worker serializes starts and polls one retained handle per loop iteration.
+It waits at most 250 ms for a new request before polling; sustained launches
+can poll sooner, and each wire exchange spends its bounded deadline. It sends
+a heartbeat when no handle remains. Sixteen retained handles bound
+its table. Completed handles retire exactly once, reused/nonmonotonic handles
+and malformed responses fail the generation, and capacity/spawn failures are
+reported without retry. A send failure may follow delivery and is never
+permission to repeat a launch. Losing the worker or either channel peer exits
+the compositor unsuccessfully so paired supervision replaces the generation.
+
+The original stdin remains open and private for the compositor's lifetime.
+Authority-mode launch requests never reach CommandSpawner; all ordinary
+terminal processes are created by the root authority through td-login. The
+compositor neither reads nor removes human-owned readiness paths. It observes
+new terminals as ordinary Wayland surfaces. No secret release, token operation
+or consent is carried by this protocol.
+
+The client compiles the exact td-authd channel/sys sources under its private
+authority module. Their fixed syscall/descriptor contract is UNSAFE.md §16;
+surface 6 explicitly includes those two shared function-scoped allowances.
+Safe client code owns the queue and handle policy; the existing Wayland/PTY
+transport receives no authority descriptors. Host and target-producer tests
+exercise wire refusal, bounded lifecycle and a sender moved to a worker after
+the greeting. Linux attaches `task_tgid(current)` credentials, so moving the
+channel to another thread retains the pinned process; a forked child remains
+a different sender and is refused. This is tested, not inferred from numeric
+PID equality.
+
+The application name is consumed by Runtime::set_launcher_application for the
+scene card. LiveInputTarget handles that card's activation before calling the
+terminal backend; the backend's non-terminal refusal guards accidental use.
+Direct backend construction only validates options and allocates empty state.
+
+The target-recipe feature selects paths generated only in the target build
+sandbox, as in td-jail. Host tests and clippy use default features and all
+host targets; --all-features is not a supported host source layout. A separate
+staged-layout compilation and the target producer test the generated paths.
+
+Worker failure always ends the paired generation, including loss of the input
+owner during startup. That failure can race the main thread's more specific
+startup diagnostic; preserving the paired lifetime takes precedence. It never
+turns an uncertain request into a retry or leaves a live unauthenticated UI.

@@ -2,7 +2,9 @@ use crate::help::HelpAction;
 use crate::keyboard::{
     KeyInput, KeyState, ModifierState, MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_NUM, MOD_SHIFT,
 };
-use crate::launcher::{LaunchOptions, LaunchProcesses, LaunchRequest, LauncherAction};
+use crate::launcher::{LaunchBackend, LaunchRequest, LauncherAction};
+#[cfg(test)]
+use crate::launcher::{LaunchOptions, LaunchProcesses};
 use crate::layout::{Command, Direction, Presentation};
 use crate::pointer::{
     PointerButtonInput, PointerButtonState, PointerScroll, MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME,
@@ -632,7 +634,7 @@ trait InputTarget {
 
 struct LiveInputTarget {
     runtime: Arc<Mutex<Runtime>>,
-    launches: LaunchProcesses,
+    launches: LaunchBackend,
 }
 
 impl LiveInputTarget {
@@ -1487,9 +1489,8 @@ fn absolute_axes(device: &File) -> Option<AbsoluteAxes> {
 pub fn start(
     input_dir: &Path,
     runtime: Arc<Mutex<Runtime>>,
-    launch_options: LaunchOptions,
+    launches: LaunchBackend,
 ) -> Result<usize, String> {
-    let launches = LaunchProcesses::new(launch_options)?;
     let paths = event_paths(input_dir)?;
     let bindings = Arc::new(Mutex::new(KeyBindings::default()));
     let target = Arc::new(Mutex::new(LiveInputTarget { runtime, launches }));
@@ -4011,7 +4012,7 @@ mod tests {
         .unwrap();
         let target = Mutex::new(LiveInputTarget {
             runtime: Arc::clone(&runtime),
-            launches,
+            launches: LaunchBackend::Direct(launches),
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
@@ -4059,7 +4060,7 @@ mod tests {
         .unwrap();
         let target = Mutex::new(LiveInputTarget {
             runtime: Arc::clone(&runtime),
-            launches,
+            launches: LaunchBackend::Direct(launches),
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();

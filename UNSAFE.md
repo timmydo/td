@@ -63,7 +63,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with nineteen value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped client-side clipboard descriptor adoption and one lifetime-carrying mapped region |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with nineteen value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped client-side clipboard descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -2225,3 +2225,16 @@ std creates a new process group for the terminal helper; neither path adds
 a raw syscall or credential switch.
 Confinement pins the complete startup and launch sources as well as the raw
 channel boundary.
+
+The compositor's optional authority client compiles §16's exact channel and
+raw modules under `authority::{channel,sys}`. This adds the shared fixed
+setsockopt and pidfd poll calls and their two function-scoped allowances to
+surface 6; it adds no operation to the shared raw module. The Wayland/PTY raw
+module remains separate and unchanged. Only the authority client calls the
+shared Channel constructor; no private-channel descriptor reaches the
+Wayland, clipboard or PTY interfaces. Its greeting occurs before the first
+worker; one worker then owns framed exchanges, and the authority-mode launcher
+creates no child process. Original stdin remains exclusive in the compositor.
+Both crates pin the shared source, while compositor confinement pins the two
+shared include paths and the startup/worker caller roster. The target recipe
+stages those exact sources and runs their transport and client-policy tests.

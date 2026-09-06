@@ -128,7 +128,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     );
     assert_eq!(
         fingerprint(channel),
-        0x5f0361594df592f1,
+        0xbad9a1ce43bb1449,
         "channel.rs: production startup changed"
     );
 }

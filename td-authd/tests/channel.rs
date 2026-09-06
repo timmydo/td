@@ -24,7 +24,14 @@ impl Drop for Fixture {
 fn spawn(stream: UnixStream, mode: &str) -> Fixture {
     Fixture(
         Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "channel::tests::peer_fixture", "--nocapture"])
+            .args([
+                "--exact",
+                &format!(
+                    "{}::peer_fixture",
+                    module_path!().split_once("::").unwrap().1
+                ),
+                "--nocapture",
+            ])
             .env("TD_AUTH_CHANNEL_FIXTURE", mode)
             .stdin(Stdio::from(OwnedFd::from(stream)))
             .stdout(Stdio::null())
@@ -65,6 +72,17 @@ fn peer_fixture() {
     }
     let mut channel = Channel::connect(stream.try_clone().unwrap(), uid(), uid()).unwrap();
     match mode.as_str() {
+        "worker" => {
+            std::thread::spawn(move || {
+                while let Ok(bytes) = channel.receive() {
+                    if channel.send(&bytes).is_err() {
+                        break;
+                    }
+                }
+            })
+            .join()
+            .unwrap();
+        }
         "echo" => {
             while let Ok(bytes) = channel.receive() {
                 if channel.send(&bytes).is_err() {
@@ -275,4 +293,19 @@ fn transport_constructor_refuses_overflow_uids_without_waiting_for_a_peer() {
         let error = Channel::connect(left, overflow, uid()).err().unwrap();
         assert!(error.to_string().contains("unsupported peer uid"));
     }
+}
+
+#[test]
+fn a_worker_after_greeting_keeps_the_same_process_sender_pin() {
+    let (mut channel, mut child) = connected("worker");
+    let peer = channel.peer.as_ref().unwrap();
+    let identity = (peer.credentials, peer.device, peer.inode);
+    for sequence in 0..4u8 {
+        channel.send(&[sequence]).unwrap();
+        assert_eq!(channel.receive().unwrap(), [sequence]);
+        let peer = channel.peer.as_ref().unwrap();
+        assert_eq!((peer.credentials, peer.device, peer.inode), identity);
+    }
+    drop(channel);
+    assert!(child.0.wait().unwrap().success());
 }

@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod authority;
 mod bar;
 mod buffer;
 mod client;
@@ -60,13 +61,14 @@ fn usage() -> String {
      (--launcher-client PATH | --launcher-application NAME \
      --application-ready-socket PATH --application-app-id ID \
      --application-content-rgb-a RGB --application-content-rgb-b RGB) \
-     --terminal-client PATH | \
+     (--terminal-client PATH | --terminal-authority stdin) | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
      td-compositor probe-drm DEVICE | \
      td-compositor probe-kms DEVICE | \
      td-compositor terminfo PATH | \
-     td-compositor selftest"
+     td-compositor selftest\n\
+     --terminal-authority requires --launcher-application."
         .into()
 }
 
@@ -217,7 +219,8 @@ struct RunOptions {
     portal_socket: PathBuf,
     launcher_client: Option<PathBuf>,
     launcher_application: Option<String>,
-    terminal_client: PathBuf,
+    terminal_client: Option<PathBuf>,
+    terminal_authority: bool,
     /// Absent by DEFAULT, and absent means there is no control socket to
     /// reach: a session that was not asked for one exposes none, so the way
     /// to turn the surface off is not to configure it.
@@ -236,6 +239,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut launcher_client = None;
     let mut launcher_application = None;
     let mut terminal_client = None;
+    let mut terminal_authority = false;
     let mut control_socket = None;
     let mut application_ready_socket = None;
     let mut application_app_id = None;
@@ -265,6 +269,12 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--terminal-client" if terminal_client.is_none() => {
                 terminal_client = Some(PathBuf::from(value))
             }
+            "--terminal-authority" if !terminal_authority => {
+                if value != "stdin" {
+                    return Err("--terminal-authority requires stdin".into());
+                }
+                terminal_authority = true;
+            }
             "--control-socket" if control_socket.is_none() => {
                 control_socket = Some(PathBuf::from(value))
             }
@@ -280,15 +290,30 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--application-content-rgb-b" if application_content_rgb_b.is_none() => {
                 application_content_rgb_b = Some(value.clone())
             }
-            "--framebuffer" | "--input" | "--socket" | "--portal-socket" | "--launcher-client"
-            | "--launcher-application" | "--terminal-client" | "--control-socket"
-            | "--application-ready-socket" | "--application-app-id"
-            | "--application-content-rgb-a" | "--application-content-rgb-b" => {
+            "--framebuffer"
+            | "--input"
+            | "--socket"
+            | "--portal-socket"
+            | "--launcher-client"
+            | "--launcher-application"
+            | "--terminal-client"
+            | "--terminal-authority"
+            | "--control-socket"
+            | "--application-ready-socket"
+            | "--application-app-id"
+            | "--application-content-rgb-a"
+            | "--application-content-rgb-b" => {
                 return Err(format!("duplicate flag '{flag}'"));
             }
             _ => return Err(format!("unrecognised argument '{flag}'")),
         }
         index += 2;
+    }
+    if terminal_client.is_some() == terminal_authority {
+        return Err("exactly one --terminal-client or --terminal-authority is required".into());
+    }
+    if terminal_authority && launcher_application.is_none() {
+        return Err("the authority launcher requires a supervised application card".into());
     }
     if launcher_client.is_some() == launcher_application.is_some() {
         return Err("exactly one --launcher-client or --launcher-application is required".into());
@@ -357,11 +382,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         portal_socket,
         launcher_client,
         launcher_application,
-        // Required rather than defaulted: the compositor cannot know the store
-        // path the terminal landed at, and a launcher entry that spawns nothing
-        // is worse than one that never appeared.
-        terminal_client: terminal_client
-            .ok_or_else(|| "--terminal-client is required".to_string())?,
+        terminal_client,
+        terminal_authority,
         control_socket,
         application_ready_socket,
         application_app_id,
@@ -386,6 +408,23 @@ fn resolve_socket_endpoint(path: &Path, label: &str) -> Result<PathBuf, String> 
 }
 
 fn run_compositor(options: RunOptions) -> Result<(), String> {
+    // Pin the root sender before framebuffer, listener, or input workers exist.
+    let launches = if options.terminal_authority {
+        launcher::LaunchBackend::Authority(authority::Launcher::connect()?)
+    } else {
+        launcher::LaunchBackend::Direct(launcher::LaunchProcesses::new(launcher::LaunchOptions {
+            socket: options.socket.clone(),
+            client: options.launcher_client.clone(),
+            terminal: options
+                .terminal_client
+                .clone()
+                .ok_or("missing direct terminal client")?,
+            application: options
+                .launcher_application
+                .clone()
+                .map(|name| launcher::ApplicationLaunch { name }),
+        })?)
+    };
     let framebuffer = Framebuffer::open(&options.framebuffer)?;
     let size = framebuffer.dimensions();
     let geometry = (size.width, size.height, framebuffer.stride());
@@ -429,18 +468,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
         .repaint()?;
-    let inputs = input::start(
-        &options.input,
-        Arc::clone(&runtime),
-        launcher::LaunchOptions {
-            socket: options.socket.clone(),
-            client: options.launcher_client,
-            terminal: options.terminal_client,
-            application: options
-                .launcher_application
-                .map(|name| launcher::ApplicationLaunch { name }),
-        },
-    )?;
+    let inputs = input::start(&options.input, Arc::clone(&runtime), launches)?;
     // FATAL, like the Wayland listeners and unlike the status bar below. An
     // earlier draft reasoned from the bar — a session you can see beats one
     // that refused to start — and it was the wrong analogy: the bar is a
@@ -1055,7 +1083,15 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
+    const AUTHORITY_FINGERPRINT: u64 = 0xe936a8fbfb61b341;
+    const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
+    const AUTH_CHANNEL_FINGERPRINT: u64 = 0xbad9a1ce43bb1449;
+    const AUTHORITY: &str = include_str!("authority.rs");
+    const AUTH_CHANNEL: &str = include_str!("../../td-authd/src/channel.rs");
+    const AUTH_SYS: &str = include_str!("../../td-authd/src/sys.rs");
+
     const OTHER: &[(&str, &str)] = &[
+        ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
         ("buffer.rs", include_str!("buffer.rs")),
         ("client.rs", include_str!("client.rs")),
@@ -1144,6 +1180,75 @@ mod confinement {
         ] {
             assert!(body.contains(layer), "the terminal selftest skips {layer}");
         }
+    }
+
+    #[test]
+    fn private_authority_startup_and_shared_transport_have_one_owner() {
+        let fingerprint = |source: &str| {
+            source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+            })
+        };
+        assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
+        assert_eq!(
+            fingerprint(AUTH_CHANNEL),
+            AUTH_CHANNEL_FINGERPRINT,
+            "shared channel changed: reconcile td-authd/tests/confinement.rs and this pin"
+        );
+        assert_eq!(
+            fingerprint(AUTH_SYS),
+            AUTH_SYS_FINGERPRINT,
+            "shared sys changed: reconcile td-authd/tests/confinement.rs and this pin"
+        );
+        assert!(AUTHORITY.starts_with("#![deny(unsafe_code)]"));
+        assert_eq!(AUTHORITY.matches("mod channel;").count(), 1);
+        assert_eq!(AUTHORITY.matches("mod sys;").count(), 1);
+        assert_eq!(AUTHORITY.matches("path =").count(), 4);
+        assert_eq!(AUTH_SYS.matches("unsafe").count(), 4);
+        assert_eq!(AUTH_SYS.matches("#[allow(unsafe_code)]").count(), 2);
+        assert_eq!(AUTH_SYS.matches("const SYS_").count(), 4);
+        for (name, source) in OTHER {
+            // Negative scan: modules without tests are scanned in full.
+            let source = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map_or(*source, |(body, _)| body);
+            for forbidden in ["io::stdin(", "fd/0", "from_raw_fd(0"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name}: inherited authority stdin access"
+                );
+            }
+        }
+        let client = production(AUTHORITY);
+        for absent in [
+            "::Command",
+            "pre_exec",
+            ".exec(",
+            "println!",
+            "eprintln!",
+            "sys::",
+        ] {
+            assert!(!client.contains(absent), "{absent}");
+        }
+        assert_eq!(client.matches(".spawn(").count(), 1);
+        assert_eq!(client.matches("Channel::from_stdin(0)").count(), 1);
+        assert_eq!(client.matches("std::process::exit(1)").count(), 1);
+        let greeting = client.find("Channel::from_stdin(0)").unwrap();
+        assert!(greeting < client.find("std::thread::Builder").unwrap());
+        let run = MAIN
+            .split_once("fn run_compositor(")
+            .unwrap()
+            .1
+            .split_once("fn selftest(")
+            .unwrap()
+            .0;
+        assert!(
+            run.find("authority::Launcher::connect()").unwrap()
+                < run.find("Framebuffer::open").unwrap()
+        );
+        assert!(
+            run.find("authority::Launcher::connect()").unwrap() < run.find("input::start").unwrap()
+        );
     }
 
     #[test]
@@ -1285,9 +1390,10 @@ fn syscall6(
         }
         assert_eq!(occurrences(SYS, "const SYS_"), 8);
         for (name, source) in OTHER.iter().chain(TEST_ONLY) {
-            assert!(
-                !source.contains("unsafe"),
-                "{name} introduced a second unsafe surface"
+            assert_eq!(
+                source.matches("unsafe").count(),
+                usize::from(*name == "authority.rs"),
+                "{name} changed its permitted denial-only keyword count"
             );
             assert!(
                 !source.contains("core::arch::asm!"),
@@ -2315,13 +2421,43 @@ pub struct MappedRegion {
             ]
         };
         let options = super::parse_run(&valid(&wayland, &portal, &ready)).unwrap();
+        let mut authority = valid(&wayland, &portal, &ready);
+        let at = authority
+            .iter()
+            .position(|word| word == "--terminal-client")
+            .unwrap();
+        authority[at] = "--terminal-authority".into();
+        authority[at + 1] = "stdin".into();
+        let remote = super::parse_run(&authority).unwrap();
+        assert!(remote.terminal_authority);
+        assert!(remote.terminal_client.is_none());
+        for value in ["0", "/run/authority", "stdout", ""] {
+            let mut invalid = authority.clone();
+            invalid[at + 1] = value.into();
+            assert!(super::parse_run(&invalid).is_err());
+        }
+        let mut both = authority.clone();
+        both.extend(["--terminal-client".into(), "/bin/td-term".into()]);
+        assert!(super::parse_run(&both).is_err());
+        let mut duplicated = authority.clone();
+        duplicated.extend(["--terminal-authority".into(), "stdin".into()]);
+        assert!(super::parse_run(&duplicated).is_err());
+        let mut demo = authority;
+        let app = demo
+            .iter()
+            .position(|word| word == "--launcher-application")
+            .unwrap();
+        demo[app] = "--launcher-client".into();
+        demo[app + 1] = "/bin/td-ui-demo".into();
+        assert!(super::parse_run(&demo).is_err());
+
         let resolved_parent = std::fs::canonicalize(&actual).unwrap();
         assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
         assert_eq!(options.launcher_client, None);
         assert_eq!(options.launcher_application.as_deref(), Some("td-jail-fixture"));
         assert_eq!(
             options.terminal_client,
-            std::path::PathBuf::from("/bin/td-term")
+            Some(std::path::PathBuf::from("/bin/td-term"))
         );
         assert_eq!(options.socket, resolved_parent.join("wayland-0"));
         assert_eq!(
