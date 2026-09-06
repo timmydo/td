@@ -12,12 +12,48 @@ pub const FONT_PROVENANCE: &str = include_str!("../../td-compositor/assets/PROVE
 pub const FONT_COPYING: &str = include_str!("../../td-compositor/assets/unifont-COPYING");
 pub const FONT_LICENSE: &str = include_str!("../../td-compositor/assets/unifont-OFL-1.1.txt");
 
-pub const PAPER: u32 = 0xffffff;
-pub const INK: u32 = 0x202124;
-pub const CHROME: u32 = 0xf0f0f0;
-pub const BORDER: u32 = 0xc5c7cb;
-pub const SELECTED: u32 = 0x2468c5;
-pub const INACTIVE_SELECTION: u32 = 0xd6d9df;
+pub const PAPER: u32 = 0xeee8dc;
+pub const INK: u32 = 0x48453f;
+pub const CHROME: u32 = 0xe1dbcf;
+pub const BORDER: u32 = 0xb5ada0;
+pub const SELECTED: u32 = 0x536b73;
+pub const INACTIVE_SELECTION: u32 = 0xc8c4bb;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Weight {
+    Regular,
+    Medium,
+}
+
+/// Transparent glyph paint; the caller supplies the already-painted background.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlyphStyle {
+    pub ink: u32,
+    pub background: u32,
+    pub weight: Weight,
+}
+
+impl GlyphStyle {
+    pub fn medium(ink: u32, background: u32) -> Self {
+        Self {
+            ink,
+            background,
+            weight: Weight::Medium,
+        }
+    }
+
+    fn fringe(self) -> u32 {
+        // One-third ink, two-thirds background, independently per RGB channel.
+        // Explicit colors make partial/repeated repaints independent of old pixels.
+        let mut color = 0;
+        for shift in [0, 8, 16] {
+            let ink = (self.ink >> shift) & 255;
+            let background = (self.background >> shift) & 255;
+            color |= ((ink + 2 * background) / 3) << shift;
+        }
+        color
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Scale(u8);
@@ -76,7 +112,7 @@ pub enum Primitive {
         x: i64,
         y: i64,
         scalar: char,
-        color: u32,
+        style: GlyphStyle,
     },
 }
 
@@ -238,22 +274,27 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         let Some(clip) = draw.clip.intersection(self.geometry.bounds()) else {
             return;
         };
+        let scale = self.geometry.scale.value();
         let (rect, color, glyph) = match draw.primitive {
             Primitive::Fill { rect, color } => (rect, color, None),
             Primitive::Glyph {
                 x,
                 y,
                 scalar,
-                color,
+                style,
             } => (
                 Rect {
                     x,
                     y,
-                    width: (CELL_WIDTH * self.geometry.scale.value()) as u32,
-                    height: (CELL_HEIGHT * self.geometry.scale.value()) as u32,
+                    width: (CELL_WIDTH * scale) as u32,
+                    height: (CELL_HEIGHT * scale) as u32,
                 },
-                color,
-                Some(self.font.index(scalar)),
+                style.ink,
+                Some((
+                    self.font.index(scalar),
+                    (style.weight == Weight::Medium)
+                        .then(|| (style.fringe() | 0xff000000).to_le_bytes()),
+                )),
             ),
         };
         let Some(area) = rect.intersection(clip) else {
@@ -261,19 +302,34 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         };
         let bytes = (color | 0xff000000).to_le_bytes();
         for y in area.y..area.y + i64::from(area.height) {
+            let row = if glyph.is_some() {
+                y.saturating_sub(rect.y) as usize / scale
+            } else {
+                0
+            };
+            let start = y as usize * self.stride;
             for x in area.x..area.x + i64::from(area.width) {
-                if let Some(index) = glyph {
+                let mut paint = &bytes;
+                if let Some((index, fringe)) = &glyph {
                     // Intersection with an at-most-32x64 glyph makes these
                     // differences small even for hostile signed origins.
-                    let col = x.saturating_sub(rect.x) as usize / self.geometry.scale.value();
-                    let row = y.saturating_sub(rect.y) as usize / self.geometry.scale.value();
-                    if !self.font.pixel(index, col, row) {
-                        continue;
+                    let col = x.saturating_sub(rect.x) as usize / scale;
+                    if !self.font.pixel(*index, col, row) {
+                        let Some(fringe) = fringe else {
+                            continue;
+                        };
+                        if !col
+                            .checked_sub(1)
+                            .is_some_and(|left| self.font.pixel(*index, left, row))
+                        {
+                            continue;
+                        }
+                        paint = fringe;
                     }
                 }
-                let at = y as usize * self.stride + x as usize * 4;
+                let at = start + x as usize * 4;
                 if let Some(pixel) = self.pixels.get_mut(at..at + 4) {
-                    pixel.copy_from_slice(&bytes);
+                    pixel.copy_from_slice(paint);
                 }
             }
         }
@@ -418,7 +474,7 @@ impl<'a> Scene<'a> {
                 width: self.geometry.width as u32,
                 height: (24 * s) as u32,
             },
-            INK,
+            GlyphStyle::medium(INK, CHROME),
             clip,
             sink,
         );
@@ -432,15 +488,13 @@ impl<'a> Scene<'a> {
             let Some(rect) = self.geometry.tab(index, active, count) else {
                 continue;
             };
-            fill(
-                rect,
-                if Some(id) == self.editor.active() {
-                    PAPER
-                } else {
-                    CHROME
-                },
-                sink,
-            );
+            let background = if Some(id) == self.editor.active() {
+                PAPER
+            } else {
+                CHROME
+            };
+            let style = GlyphStyle::medium(INK, background);
+            fill(rect, background, sink);
             fill(
                 Rect {
                     x: rect.x,
@@ -479,7 +533,7 @@ impl<'a> Scene<'a> {
                     .chain(title.chars()),
                 (rect.x + 8 * s, rect.y + 4 * s),
                 title_rect,
-                INK,
+                style,
                 clip,
                 sink,
             );
@@ -487,7 +541,7 @@ impl<'a> Scene<'a> {
                 "x".chars(),
                 (close.x + 8 * s, close.y + 4 * s),
                 close,
-                INK,
+                style,
                 clip,
                 sink,
             );
@@ -507,7 +561,7 @@ impl<'a> Scene<'a> {
             self.status.chars(),
             (8 * s, status_rect.y + 4 * s),
             status_rect,
-            INK,
+            GlyphStyle::medium(INK, CHROME),
             clip,
             sink,
         );
@@ -582,11 +636,22 @@ impl<'a> Scene<'a> {
                             x,
                             y,
                             scalar: cell.scalar,
-                            color: if selected && self.view.focused {
-                                PAPER
-                            } else {
-                                INK
-                            },
+                            style: GlyphStyle::medium(
+                                if selected && self.view.focused {
+                                    PAPER
+                                } else {
+                                    INK
+                                },
+                                if selected {
+                                    if self.view.focused {
+                                        SELECTED
+                                    } else {
+                                        INACTIVE_SELECTION
+                                    }
+                                } else {
+                                    PAPER
+                                },
+                            ),
                         },
                     });
                 }
@@ -660,7 +725,7 @@ impl<'a> Scene<'a> {
         chars: impl Iterator<Item = char>,
         (x, y): (i64, i64),
         bounds: Rect,
-        color: u32,
+        style: GlyphStyle,
         damage: Rect,
         sink: &mut impl FnMut(Draw),
     ) {
@@ -686,7 +751,7 @@ impl<'a> Scene<'a> {
                     x: x + index as i64 * cw,
                     y,
                     scalar,
-                    color,
+                    style,
                 },
             });
         }

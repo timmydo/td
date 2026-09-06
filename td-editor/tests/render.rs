@@ -2,7 +2,9 @@ use td_editor::font::{self, Font};
 use td_editor::keys::Profile;
 use td_editor::layout::{Affinity, Position};
 use td_editor::model::{Command, Editor, Selection};
-use td_editor::render::{self, Draw, Geometry, Label, Primitive, Raster, Rect, Scale, Scene, View};
+use td_editor::render::{
+    self, Draw, Geometry, GlyphStyle, Label, Primitive, Raster, Rect, Scale, Scene, View, Weight,
+};
 use td_editor::Error;
 
 #[allow(clippy::unwrap_used, reason = "bounded test geometry")]
@@ -104,51 +106,69 @@ fn glyph_scaling_clipping_and_fallback_match_font_row_bits() {
         height: 30,
     };
     for scale in 1..=4 {
-        for scalar in ['A', ' ', 'λ', '漢', '\u{10ffff}'] {
-            for x in [i64::MIN, -5, 0, 31, i64::MAX] {
-                for y in [-3, 0, 28] {
-                    let geometry = geometry(49, 35, scale);
-                    let mut actual = vec![0xaa; 49 * 35 * 4];
-                    Raster::new(&mut actual, &font, geometry, 49 * 4)
-                        .unwrap()
-                        .draw(Draw {
-                            clip,
-                            primitive: Primitive::Glyph {
-                                x,
-                                y,
-                                scalar,
-                                color: 0xabcdef,
-                            },
-                        });
-                    let mut expected = vec![0xaa; actual.len()];
-                    for row in 0..35 {
-                        for col in 0..49 {
-                            let dx = col as i128 - i128::from(x);
-                            let dy = row as i128 - i128::from(y);
-                            if !inside(clip, col, row)
-                                || dx < 0
-                                || dy < 0
-                                || dx >= 8 * i128::from(scale)
-                                || dy >= 16 * i128::from(scale)
-                            {
-                                continue;
-                            }
-                            let bits = font
-                                .row(font.index(scalar), dy as usize / usize::from(scale))
-                                .unwrap();
-                            let set = bits.first().unwrap()
-                                & (0x80 >> (dx as usize / usize::from(scale)))
-                                != 0;
-                            if set {
-                                let at = (row * 49 + col) * 4;
-                                expected
-                                    .get_mut(at..at + 4)
-                                    .unwrap()
-                                    .copy_from_slice(&[0xef, 0xcd, 0xab, 0xff]);
+        for weight in [Weight::Regular, Weight::Medium] {
+            for scalar in ['A', ' ', 'λ', '漢', '█', '\u{10ffff}'] {
+                for x in [i64::MIN, -5, 0, 31, i64::MAX] {
+                    for y in [-3, 0, 28] {
+                        let geometry = geometry(49, 35, scale);
+                        let mut actual = vec![0xaa; 49 * 35 * 4];
+                        Raster::new(&mut actual, &font, geometry, 49 * 4)
+                            .unwrap()
+                            .draw(Draw {
+                                clip,
+                                primitive: Primitive::Glyph {
+                                    x,
+                                    y,
+                                    scalar,
+                                    style: GlyphStyle {
+                                        ink: 0xabcdef,
+                                        // Blue is 413/3: the oracle distinguishes floor from rounding.
+                                        background: 0x123457,
+                                        weight,
+                                    },
+                                },
+                            });
+                        let mut expected = vec![0xaa; actual.len()];
+                        for row in 0..35 {
+                            for col in 0..49 {
+                                let dx = col as i128 - i128::from(x);
+                                let dy = row as i128 - i128::from(y);
+                                if !inside(clip, col, row)
+                                    || dx < 0
+                                    || dy < 0
+                                    || dx >= 8 * i128::from(scale)
+                                    || dy >= 16 * i128::from(scale)
+                                {
+                                    continue;
+                                }
+                                let bits = font
+                                    .row(font.index(scalar), dy as usize / usize::from(scale))
+                                    .unwrap();
+                                let set = bits.first().unwrap()
+                                    & (0x80 >> (dx as usize / usize::from(scale)))
+                                    != 0;
+                                let column = dx as usize / usize::from(scale);
+                                let fringe = weight == Weight::Medium
+                                    && column > 0
+                                    && bits.first().unwrap() & (0x80 >> (column - 1)) != 0;
+                                if set || fringe {
+                                    let at = (row * 49 + col) * 4;
+                                    expected
+                                        .get_mut(at..at + 4)
+                                        .unwrap()
+                                        .copy_from_slice(if set {
+                                            &[0xef, 0xcd, 0xab, 0xff]
+                                        } else {
+                                            &[0x89, 0x67, 0x45, 0xff]
+                                        });
+                                }
                             }
                         }
+                        assert_eq!(
+                            actual, expected,
+                            "{scalar}, scale {scale}, {weight:?}, ({x},{y})"
+                        );
                     }
-                    assert_eq!(actual, expected, "{scalar}, scale {scale}, ({x},{y})");
                 }
             }
         }
@@ -638,7 +658,7 @@ fn the_real_binary_exposes_a_deterministic_preview_and_its_font_notices() {
         .fold(0xcbf29ce484222325u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         });
-    assert_eq!(hash, 0xd6c480eb75800984, "preview checksum: {hash:016x}");
+    assert_eq!(hash, 0xd83cb0c8983b1d96, "preview checksum: {hash:016x}");
     let output = std::process::Command::new(exe)
         .arg("--font-license")
         .output()
@@ -648,4 +668,120 @@ fn the_real_binary_exposes_a_deterministic_preview_and_its_font_notices() {
     let notices = String::from_utf8(output.stdout).unwrap();
     assert!(notices.contains("SIL OPEN FONT LICENSE Version 1.1"));
     assert!(notices.contains("64019ab811067e03a8de5990d2e6f23dcec5418e5a90caa5e5666b0524156732"));
+}
+
+#[test]
+fn scene_weight_uses_each_surfaces_own_background_and_keeps_original_ink() {
+    let font = font::pinned().unwrap();
+    let editor = editor(
+        "AAA",
+        Selection {
+            anchor: 1,
+            caret: 2,
+        },
+    );
+    let geometry = geometry(400, 120, 1);
+    for focused in [false, true] {
+        let scene = Scene::new(
+            &editor,
+            geometry,
+            View {
+                focused,
+                caret_visible: false,
+                ..View::default()
+            },
+            &[],
+            Profile::Windows,
+        )
+        .unwrap();
+        let mut medium = vec![0xaa; 400 * 120 * 4];
+        let mut regular = medium.clone();
+        let mut weighted = Raster::new(&mut medium, &font, geometry, 400 * 4).unwrap();
+        let mut original = Raster::new(&mut regular, &font, geometry, 400 * 4).unwrap();
+        let mut selected = 0;
+        scene.emit(geometry.bounds(), &mut |draw| {
+            weighted.draw(draw);
+            let mut plain = draw;
+            if let Primitive::Glyph { x, y, style, .. } = &mut plain.primitive {
+                assert_eq!(style.weight, Weight::Medium);
+                if *y == 48 && *x == 16 {
+                    assert_eq!(style.ink, if focused { render::PAPER } else { render::INK });
+                    assert_eq!(
+                        style.background,
+                        if focused {
+                            render::SELECTED
+                        } else {
+                            render::INACTIVE_SELECTION
+                        }
+                    );
+                    selected += 1;
+                }
+                style.weight = Weight::Regular;
+            }
+            original.draw(plain);
+        });
+        assert_eq!(selected, 1);
+        let mut added = 0;
+        for (position, (new, old)) in medium
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(regular.as_chunks::<4>().0)
+            .enumerate()
+        {
+            let old = u32::from_le_bytes(*old) & 0xffffff;
+            let new = u32::from_le_bytes(*new) & 0xffffff;
+            let selected_ink = focused
+                && old == render::PAPER
+                && (16..24).contains(&(position % 400))
+                && (48..64).contains(&(position / 400));
+            if old == render::INK || selected_ink {
+                assert_eq!(new, old);
+            }
+            if new != old {
+                assert!(matches!(new, 0xb6b1a7 | 0xaea99f | 0x869496 | 0x9d9991));
+                added += 1;
+            }
+        }
+        assert!(added > 100, "medium weight must change visible pixels");
+    }
+}
+
+#[test]
+fn medium_weight_partial_repaints_are_idempotent_at_all_scales_and_focus_states() {
+    let font = font::pinned().unwrap();
+    let editor = editor(
+        "ab\tcd\nλ",
+        Selection {
+            anchor: 1,
+            caret: 6,
+        },
+    );
+    for scale in 1..=4 {
+        for focused in [false, true] {
+            let w = 81 * usize::from(scale) + 1;
+            let h = 105 * usize::from(scale) + 1;
+            let geometry = geometry(w, h, scale);
+            let view = View {
+                focused,
+                ..View::default()
+            };
+            let full = pixels(&editor, geometry, view);
+            let scene = Scene::new(&editor, geometry, view, &[], Profile::Windows).unwrap();
+            let mut actual = vec![0xaa; full.len()];
+            let mut raster = Raster::new(&mut actual, &font, geometry, w * 4).unwrap();
+            // Boundaries deliberately cut through source pixels and glyph fringes.
+            for x in (0..w).step_by(13) {
+                let damage = Rect {
+                    x: x as i64,
+                    y: 0,
+                    width: 13,
+                    height: h as u32,
+                };
+                raster.paint(&scene, damage).unwrap();
+                raster.paint(&scene, damage).unwrap();
+            }
+            assert_eq!(actual, full, "scale {scale}, focus {focused}");
+        }
+    }
 }

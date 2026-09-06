@@ -766,9 +766,12 @@ mod tests {
         file.read_to_end(&mut pixels).unwrap();
         assert_eq!(pixels.len(), 800 * 600 * 4);
         assert_eq!(pixels, w.pixels);
-        assert_eq!(&pixels[..4], &[0xf0, 0xf0, 0xf0, 0xff]);
+        assert_eq!(&pixels[..4], &[0xcf, 0xdb, 0xe1, 0xff]);
         assert!(
-            pixels.windows(4).any(|p| p == [0x24, 0x21, 0x20, 0xff]),
+            pixels
+                .as_chunks::<4>()
+                .0
+                .contains(&[0x3f, 0x45, 0x48, 0xff]),
             "glyph ink"
         );
         let binds: Vec<_> = messages.iter().filter(|m| m.object == REGISTRY).collect();

@@ -67,6 +67,12 @@ damage, padding, fallback glyphs, scrolling and extreme geometry. Menus remain
 drawing only. Tab presses select tabs; close marks emit typed requests for the
 clicked tab without discarding it.
 
+The default appearance uses warm off-white paper and charcoal text, with
+muted chrome and blue-grey selection. A synthetic medium bitmap weight adds
+a faint right edge while preserving the original glyph pixels and 8x16
+cell spacing. Both previews use it; no system fonts or theme services are
+needed. There is no theme or weight settings UI yet.
+
 Inspect a deterministic 800x600 rendering without a display:
 
 ```text

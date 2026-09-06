@@ -465,8 +465,10 @@ without usable GPU access; it does not satisfy the GPU-acceleration objective
 by itself. Layout emits clipped solid rectangles and bitmap-glyph draws with
 integer coordinates, foreground/background colors and scale 1, 2, 3 or 4.
 Font scale defaults to 1 and is user-selectable. Each backend consumes those
-same operations. No font discovery, antialiasing or fractional scaling is
-part of version 1. A frame uses one scale throughout.
+same operations. No font discovery, outline rasterization, subpixel
+antialiasing or fractional scaling is part of version 1. The fixed medium
+bitmap weight below adds one explicitly shaded edge; it does not smooth or
+resample the original glyph. A frame uses one scale throughout.
 
 Draw only the visible viewport and damaged chrome; clip every operation to
 the current surface. Coalesce redraws behind one outstanding frame callback.
@@ -524,10 +526,33 @@ pixels of right margin, and uses only full 8x16 cells. Tabs are 160 pixels
 wide with 24 pixels reserved for the close mark. A contiguous slice of tabs
 is shown, keeping the active tab visible; a surface narrower than one tab
 clips that tab. Tiny surfaces may have no document cells; status paints last
-and wins any chrome overlap. The palette is white paper, #202124 ink,
-#f0f0f0 chrome, #c5c7cb borders, #2468c5 focused selection with white ink, and
-#d6d9df unfocused selection with ordinary ink. The caret is one logical pixel
+and wins any chrome overlap. The default palette is warm #eee8dc paper,
+#48453f charcoal ink, #e1dbcf chrome, #b5ada0 borders, #536b73 focused
+selection with paper-colored ink, and #c8c4bb unfocused selection with
+ordinary ink. It avoids white backgrounds and near-black text, including
+in the menu, tabs and status bar. These are fixed defaults, not an OS theme
+lookup or a user-configurable theme system. The caret is one logical pixel
 wide; an upstream soft-wrap caret remains inside the row's right edge.
+
+Every glyph draw carries a `GlyphStyle`: ink, the already-painted background
+and `Regular` or `Medium` weight. Scene text uses Medium. Regular paints
+exactly the pinned bitmap. Medium also paints an unset pixel whose immediate
+left neighbour is set in the original glyph, with RGB channels
+`floor((ink + 2 * background) / 3)`. Original set pixels keep their full ink;
+the fringe is derived only from original bits, never extended recursively.
+It stays inside the same 8x16 cell and scales by the same integer factor,
+so spacing, wrapping, hit testing and selection boundaries do not change.
+Space remains blank; missing scalars receive the same treatment on the
+existing fallback glyph. All writes retain XRGB's 0xff high byte.
+
+This is a synthetic medium presentation, not a new font face or altered
+font asset. It adds modest weight without the solid one-pixel expansion
+closing Unifont's small counters. Fringe colors use the explicit background,
+not sampled buffer bytes: repeated/damaged redraws cannot accumulate weight.
+Selected text uses the selection background; active tabs use paper and
+inactive tabs, menus and status use chrome. Other transparent-glyph callers
+must likewise supply the background they have painted. The compositor's
+font decoder, font data and terminal appearance are unchanged.
 
 Selection covers whole scalar cells, including the complete visible tab
 span. A selected logical newline paints one trailing cell only where a full
@@ -550,7 +575,8 @@ The headless `--preview` command uses these production APIs with a fixed
 800x600, scale-1 two-tab fixture and writes binary P6 PPM to stdout. It does
 not inspect files, environment, clocks or displays. Tests pin its complete
 byte checksum, compare rasterization to independent pixel-membership and
-font-row oracles, and prove partitioned damage matches a full repaint.
+font-row oracles for both weights, and prove repeated partitioned damage
+matches a full repaint at every supported scale and in both focus states.
 
 ### GPU access and the Firefox prerequisite
 
