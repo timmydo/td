@@ -8,6 +8,7 @@ use std::fmt::Write;
 pub const MAX_FRAME: usize = 1024 * 1024;
 pub const PAGE_BYTES: usize = 256 * 1024;
 pub const INSERT_BYTES: usize = 256 * 1024;
+pub const SEARCH_BYTES: usize = crate::search::QUERY_BYTES;
 pub const SPELLING_RANGES: usize = 256;
 
 /// One length-prefixed frame. Any refusal poisons it and drops partial text.
@@ -120,15 +121,32 @@ pub enum Operation {
 pub enum Edit {
     SelectTab,
     SelectRange(Selection),
-    Insert { expected: Selection, text: String },
-    Delete { expected: Selection },
+    Insert {
+        expected: Selection,
+        text: String,
+    },
+    Delete {
+        expected: Selection,
+    },
     Undo,
     Redo,
-    FillParagraph { expected: Selection },
+    FillParagraph {
+        expected: Selection,
+    },
     AutoFill(bool),
     FillColumn(usize),
     GoToLine(usize),
     Profile(crate::keys::Profile),
+    Find {
+        expected: Selection,
+        needle: String,
+        backward: bool,
+        wrap: bool,
+    },
+    ReplaceAll {
+        needle: String,
+        replacement: String,
+    },
 }
 
 impl std::fmt::Debug for Edit {
@@ -152,6 +170,26 @@ impl std::fmt::Debug for Edit {
             Self::FillColumn(value) => f.debug_tuple("FillColumn").field(value).finish(),
             Self::GoToLine(value) => f.debug_tuple("GoToLine").field(value).finish(),
             Self::Profile(value) => f.debug_tuple("Profile").field(value).finish(),
+            Self::Find {
+                expected,
+                needle,
+                backward,
+                wrap,
+            } => f
+                .debug_struct("Find")
+                .field("expected", expected)
+                .field("needle_bytes", &needle.len())
+                .field("backward", backward)
+                .field("wrap", wrap)
+                .finish(),
+            Self::ReplaceAll {
+                needle,
+                replacement,
+            } => f
+                .debug_struct("ReplaceAll")
+                .field("needle_bytes", &needle.len())
+                .field("replacement_bytes", &replacement.len())
+                .finish(),
         }
     }
 }
@@ -203,7 +241,7 @@ impl Request {
                 },
                 "select-tab" | "select-range" | "insert" | "delete" | "undo" | "redo"
                 | "fill-paragraph" | "set-auto-fill" | "set-fill-column" | "go-to-line"
-                | "set-key-profile" => {
+                | "set-key-profile" | "find" | "replace" => {
                     let tab = decimal(args.next().ok_or(Error::Protocol)?)?;
                     let revision = decimal(args.next().ok_or(Error::Protocol)?)?;
                     let mut selection = || -> Result<Selection> {
@@ -217,12 +255,8 @@ impl Request {
                         "select-range" => Edit::SelectRange(selection()?),
                         "insert" => {
                             let expected = selection()?;
-                            let encoded = args.next().ok_or(Error::Protocol)?;
-                            if encoded.len() > INSERT_BYTES * 2 {
-                                return Err(Error::Limit);
-                            }
-                            let text = String::from_utf8(unhex(encoded)?)
-                                .map_err(|_| Error::InvalidText)?;
+                            let text =
+                                bounded_text(args.next().ok_or(Error::Protocol)?, INSERT_BYTES)?;
                             Edit::Insert { expected, text }
                         }
                         "delete" => Edit::Delete {
@@ -247,6 +281,29 @@ impl Request {
                                 _ => return Err(Error::InvalidArgument),
                             })
                         }
+                        "find" => {
+                            let expected = selection()?;
+                            let needle =
+                                bounded_text(args.next().ok_or(Error::Protocol)?, SEARCH_BYTES)?;
+                            let backward = boolean(args.next().ok_or(Error::Protocol)?)?;
+                            let wrap = boolean(args.next().ok_or(Error::Protocol)?)?;
+                            Edit::Find {
+                                expected,
+                                needle,
+                                backward,
+                                wrap,
+                            }
+                        }
+                        "replace" => Edit::ReplaceAll {
+                            needle: bounded_text(
+                                args.next().ok_or(Error::Protocol)?,
+                                SEARCH_BYTES,
+                            )?,
+                            replacement: bounded_text(
+                                args.next().ok_or(Error::Protocol)?,
+                                INSERT_BYTES,
+                            )?,
+                        },
                         _ => return Err(Error::Protocol),
                     };
                     Operation::Edit {
@@ -289,6 +346,23 @@ impl Request {
 
     pub fn is_edit(&self) -> bool {
         matches!(self.operation, Operation::Edit { .. })
+    }
+
+    /// Only after native admission: do not classify modal refusal as no match.
+    pub(crate) fn admitted_edit_refusal(&self, error: Error) -> String {
+        if error == Error::Unavailable
+            && matches!(
+                self.operation,
+                Operation::Edit {
+                    edit: Edit::Find { .. },
+                    ..
+                }
+            )
+        {
+            format!("1\t{}\terror\tno-match\t{}", self.id, hex(b"no-match"))
+        } else {
+            Refusal { id: self.id, error }.response()
+        }
     }
 
     pub(crate) fn spelling_response(
@@ -381,7 +455,8 @@ impl Request {
         }
         if let Edit::Insert { expected, .. }
         | Edit::Delete { expected }
-        | Edit::FillParagraph { expected } = edit
+        | Edit::FillParagraph { expected }
+        | Edit::Find { expected, .. } = edit
         {
             if doc.selection() != *expected {
                 return Err(Error::InvalidArgument);
@@ -405,6 +480,33 @@ impl Request {
             Edit::AutoFill(enabled) => Command::AutoFill(*enabled),
             Edit::FillColumn(column) => Command::FillColumn(*column),
             Edit::GoToLine(line) => Command::GoToLine(*line),
+            Edit::Find {
+                needle,
+                backward,
+                wrap,
+                ..
+            } => {
+                if needle.len() > SEARCH_BYTES {
+                    return Err(Error::Limit);
+                }
+                Command::Find {
+                    needle: needle.clone(),
+                    backward: *backward,
+                    wrap: *wrap,
+                }
+            }
+            Edit::ReplaceAll {
+                needle,
+                replacement,
+            } => {
+                if needle.len() > SEARCH_BYTES || replacement.len() > INSERT_BYTES {
+                    return Err(Error::Limit);
+                }
+                Command::ReplaceAll {
+                    needle: needle.clone(),
+                    replacement: replacement.clone(),
+                }
+            }
         };
         ui.dispatch(Event::Edit {
             tab: *tab,
@@ -413,6 +515,13 @@ impl Request {
         })?;
         Ok(())
     }
+}
+
+fn bounded_text(encoded: &str, limit: usize) -> Result<String> {
+    if encoded.len() > limit.checked_mul(2).ok_or(Error::Limit)? {
+        return Err(Error::Limit);
+    }
+    String::from_utf8(unhex(encoded)?).map_err(|_| Error::InvalidText)
 }
 
 pub(crate) struct Envelope<'a> {
@@ -1225,6 +1334,252 @@ mod tests {
             assert_eq!(refusal.response(), replay.request(input));
             assert_eq!(replay.ui.generation(), 0);
             assert_eq!(replay.ui.editor().tabs().count(), 0);
+        }
+    }
+
+    #[test]
+    fn remote_search_and_replace_match_replay_unicode_selection_and_history() {
+        let mut ui = Controller::default();
+        let mut replay = crate::replay::Session::default();
+        for controller in [&mut ui, &mut replay.ui] {
+            controller
+                .dispatch(Event::Load("λ one λ\none".as_bytes()))
+                .unwrap();
+        }
+        for (remote, local) in [
+            ("find\t1\t0\t0\t0\tcebb\t0\t0", "find\t1\t0\tcebb\t0\t0"),
+            ("find\t1\t0\t0\t2\tcebb\t0\t0", "find\t1\t0\tcebb\t0\t0"),
+            ("find\t1\t0\t7\t9\tcebb\t0\t1", "find\t1\t0\tcebb\t0\t1"),
+            ("find\t1\t0\t0\t2\tcebb\t1\t1", "find\t1\t0\tcebb\t1\t1"),
+            ("find\t1\t0\t7\t9\tcebb0a\t0\t1", "find\t1\t0\tcebb0a\t0\t1"),
+            (
+                "replace\t1\t0\t6f6e65\t6f6e65",
+                "replace\t1\t0\t6f6e65\t6f6e65",
+            ),
+            (
+                "replace\t1\t0\t6f6e65\t74776f0d0a",
+                "replace\t1\t0\t6f6e65\t74776f0d0a",
+            ),
+            ("undo\t1\t1", "undo\t1\t1"),
+            ("redo\t1\t2", "redo\t1\t2"),
+            ("replace\t1\t3\t74776f0a\t-", "replace\t1\t3\t74776f0a\t-"),
+            (
+                "replace\t1\t4\t6d697373696e67\t78",
+                "replace\t1\t4\t6d697373696e67\t78",
+            ),
+        ] {
+            Request::parse(format!("1\t1\t{remote}").as_bytes())
+                .unwrap()
+                .execute(&mut ui)
+                .unwrap();
+            assert!(
+                replay
+                    .request(format!("1\t1\t{local}").as_bytes())
+                    .starts_with("1\t1\tok\t"),
+                "{local}"
+            );
+            assert_eq!(state(&ui), state(&replay.ui), "{remote}");
+            if remote == "replace\t1\t0\t6f6e65\t6f6e65" {
+                let doc = ui.editor().document(1).unwrap();
+                assert_eq!(
+                    doc.selection(),
+                    Selection {
+                        anchor: 13,
+                        caret: 13
+                    }
+                );
+                assert_eq!(doc.revision(), 0);
+                assert_eq!(doc.history_depth(), (0, 0));
+                assert!(!doc.dirty());
+            }
+            assert_eq!(
+                format!("{:?}", ui.editor()),
+                format!("{:?}", replay.ui.editor())
+            );
+        }
+        let doc = ui.editor().document(1).unwrap();
+        assert_eq!(doc.text(), "λ  λ\n");
+        assert_eq!(doc.revision(), 4); // No-match replace is an admitted no-op.
+        assert_eq!(doc.history_depth(), (2, 0));
+    }
+
+    #[test]
+    fn remote_search_refusals_preserve_selection_prefix_and_model_state() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load("λ λ".as_bytes())).unwrap();
+        ui.dispatch(Event::New).unwrap();
+        ui.dispatch(Event::SelectTab(1)).unwrap();
+        ui.dispatch(Event::Profile(crate::keys::Profile::Emacs))
+            .unwrap();
+        ui.dispatch(Event::Key {
+            tab: 1,
+            revision: 0,
+            chord: "C-x",
+        })
+        .unwrap();
+        let before = state(&ui);
+        let model = format!("{:?}", ui.editor());
+        for (command, error) in [
+            ("find\t1\t0\t2\t0\tcebb\t0\t0", Error::InvalidArgument),
+            ("find\t1\t1\t0\t0\tcebb\t0\t0", Error::StaleRevision),
+            ("replace\t1\t1\tcebb\t78", Error::StaleRevision),
+            ("find\t2\t0\t0\t0\tcebb\t0\t0", Error::InvalidArgument),
+            ("replace\t2\t0\tcebb\t78", Error::InvalidArgument),
+            ("find\t9\t0\t0\t0\tcebb\t0\t0", Error::MissingTab),
+            ("replace\t9\t0\tcebb\t78", Error::MissingTab),
+            ("find\t1\t0\t0\t0\t-\t0\t0", Error::InvalidArgument),
+            ("replace\t1\t0\t-\t78", Error::InvalidArgument),
+            ("replace\t1\t0\tcebb\t00", Error::InvalidText),
+            ("find\t1\t0\t0\t0\t78\t0\t1", Error::Unavailable),
+            ("find\t1\t0\t0\t0\tcebb\t1\t0", Error::Unavailable),
+            ("find\t1\t0\t0\t0\tcebb0d0a\t0\t1", Error::Unavailable),
+            ("find\t9\t0\t0\t0\t-\t0\t0", Error::MissingTab),
+            ("replace\t1\t1\t-\t78", Error::StaleRevision),
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t1\t{command}").as_bytes())
+                    .unwrap()
+                    .execute(&mut ui),
+                Err(error),
+                "{command}"
+            );
+            assert_eq!(state(&ui), before);
+            assert_eq!(format!("{:?}", ui.editor()), model);
+        }
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: Command::Select(Selection {
+                anchor: 2,
+                caret: 0,
+            }),
+        })
+        .unwrap();
+        let before = state(&ui);
+        let swapped = Request::parse(b"1\t1\tfind\t1\t0\t0\t2\tcebb\t0\t1").unwrap();
+        assert_eq!(swapped.execute(&mut ui), Err(Error::InvalidArgument));
+        assert_eq!(state(&ui), before); // Same sorted range, opposite direction.
+    }
+
+    #[test]
+    fn remote_replace_refuses_expansion_before_mutating_document_or_history() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load(&vec![b'a'; SEARCH_BYTES])).unwrap();
+        let needle = "a".repeat(SEARCH_BYTES);
+        let find = Request::parse(
+            format!("1\t1\tfind\t1\t0\t0\t0\t{}\t0\t0", hex(needle.as_bytes())).as_bytes(),
+        )
+        .unwrap();
+        find.execute(&mut ui).unwrap();
+        assert_eq!(
+            ui.editor().document(1).unwrap().selection().range(),
+            0..SEARCH_BYTES
+        );
+        let before = state(&ui);
+        let model = format!("{:?}", ui.editor());
+        let request = Request::parse(
+            format!("1\t2\treplace\t1\t0\t61\t{}", "62".repeat(INSERT_BYTES)).as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(request.execute(&mut ui), Err(Error::Limit));
+        assert_eq!(state(&ui), before);
+        assert_eq!(format!("{:?}", ui.editor()), model);
+    }
+
+    #[test]
+    fn remote_search_grammar_bounds_text_and_redacts_debug_values() {
+        for command in [
+            "find\t1\t0\t0\t0\t61\t0",
+            "find\t1\t0\t0\t0\t61\t2\t0",
+            "find\t1\t0\t0\t0\t61\t0\ttrue",
+            "find\t1\t0\t0\t0\t61\t0\t0\textra",
+            "replace\t1\t0\t61",
+            "replace\t1\t0\t61\t-\textra",
+            "replace\t1\t0\t6A\t-",
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t7\t{command}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                Error::Protocol
+            );
+        }
+        for command in ["find\t1\t0\t0\t0\tff\t0\t0", "replace\t1\t0\t61\tff"] {
+            assert_eq!(
+                Request::parse(format!("1\t7\t{command}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                Error::InvalidText
+            );
+        }
+        for (prefix, suffix, limit) in [
+            ("find\t1\t0\t0\t0\t", "\t0\t0", SEARCH_BYTES),
+            ("replace\t1\t0\t", "\t-", SEARCH_BYTES),
+            ("replace\t1\t0\t61\t", "", INSERT_BYTES),
+        ] {
+            assert!(Request::parse(
+                format!("1\t7\t{prefix}{}{suffix}", "61".repeat(limit)).as_bytes()
+            )
+            .is_ok());
+            assert_eq!(
+                Request::parse(
+                    format!("1\t7\t{prefix}{}{suffix}", "61".repeat(limit + 1)).as_bytes()
+                )
+                .unwrap_err()
+                .error,
+                Error::Limit
+            );
+        }
+        let mut ui = Controller::default();
+        ui.dispatch(Event::New).unwrap();
+        let before = state(&ui);
+        for edit in [
+            Edit::Insert {
+                expected: Selection {
+                    anchor: 0,
+                    caret: 0,
+                },
+                text: "a".repeat(INSERT_BYTES + 1),
+            },
+            Edit::Find {
+                expected: Selection {
+                    anchor: 0,
+                    caret: 0,
+                },
+                needle: "a".repeat(SEARCH_BYTES + 1),
+                backward: false,
+                wrap: false,
+            },
+            Edit::ReplaceAll {
+                needle: "a".repeat(SEARCH_BYTES + 1),
+                replacement: String::new(),
+            },
+            Edit::ReplaceAll {
+                needle: "a".into(),
+                replacement: "a".repeat(INSERT_BYTES + 1),
+            },
+        ] {
+            assert_eq!(
+                Request {
+                    id: 1,
+                    operation: Operation::Edit {
+                        tab: 1,
+                        revision: 0,
+                        edit
+                    }
+                }
+                .execute(&mut ui),
+                Err(Error::Limit)
+            );
+            assert_eq!(state(&ui), before);
+        }
+        for command in [
+            "find\t1\t0\t0\t0\t736563726574\t0\t0",
+            "replace\t1\t0\t736563726574\t70726976617465",
+        ] {
+            let request = Request::parse(format!("1\t7\t{command}").as_bytes()).unwrap();
+            let debug = format!("{request:?}");
+            assert!(!debug.contains("secret") && !debug.contains("private"));
         }
     }
 

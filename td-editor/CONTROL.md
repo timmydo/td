@@ -100,6 +100,8 @@ byte offsets, not scalar indices or a sorted range.
 | `1 ID set-fill-column TAB REVISION COLUMN` | Set this tab's fill column, 20..=240. |
 | `1 ID go-to-line TAB REVISION LINE` | Collapse selection at the start of the one-based logical line. |
 | `1 ID set-key-profile TAB REVISION PROFILE` | Set the whole window's key profile to `windows` or `emacs`. |
+| `1 ID find TAB REVISION EXPECTED_ANCHOR EXPECTED_CARET HEX_NEEDLE BACKWARD WRAP` | Find a literal match from the expected selection; flags are exactly `0` or `1`. |
+| `1 ID replace TAB REVISION HEX_NEEDLE HEX_REPLACEMENT` | Replace all nonoverlapping literal matches in the whole active document. |
 
 Success is `1 ID ok` followed by one trailing Tab (an empty body).
 It means controller admission completed, not saved bytes, client receipt,
@@ -115,12 +117,56 @@ Replace modal is present. It neither dismisses nor answers the modal, and a
 refusal does not replace the visible notice. Queries remain available.
 Outside modals, a missing tab is `missing-tab`, a differing text revision is
 `stale-revision`, and all operations other than `select-tab` require that tab
-to be active (`invalid-argument` otherwise). Insert/Delete/Fill additionally
+to be active (`invalid-argument` otherwise). Insert/Delete/Fill/Find additionally
 require the exact expected directed selection (`invalid-argument` on mismatch).
 These checks run on the UI thread immediately before dispatch. A selection
 that moved away and back without text edits passes the value check; Undo
 cannot resurrect an old text revision. Select Range deliberately specifies
 its destination, rather than capturing an earlier selection.
+
+Find is case-sensitive and literal, not a regular expression. Forward search
+starts at the selection's sorted end; backward search ends at its sorted
+start. With `WRAP=1`, a failed directional search retries the whole document
+from the appropriate end; it can select the same occurrence again. With
+`WRAP=0`, it never wraps. A match selects its half-open UTF-8 byte range in
+forward direction. Native Find reports `no-match` only after admission and
+preserves all state. This is distinct from a native modal/closed-window
+`unavailable` refusal, so a client need not infer absence from a racy state
+query. The controller retains its existing `Unavailable` result; the native
+adapter classifies that result only after its own admission guard.
+The needle accepts 1..=4096 decoded UTF-8 bytes, including literal newlines;
+it is not normalized. Empty needles are `invalid-argument`, oversize is
+`limit`, invalid UTF-8 is `invalid-text`, and malformed hex/flags are
+`protocol`. The decoded-size bounds also apply to directly constructed
+requests, not just wire parsing. Wire size, hex, UTF-8 and flags are parsed
+before UI admission; empty needles and unsupported replacement text are
+model validation after tab/revision/selection guards. For example, an empty
+needle on a missing tab is `missing-tab`, not `invalid-argument`.
+
+Replace uses the same literal needle bound and accepts 0..=262,144 raw
+decoded replacement bytes before ordinary insertion normalization (CRLF to
+LF). It replaces every nonoverlapping match, regardless of selection, with
+one ordinary undo transaction and the model's document/history budgets.
+It does not invoke typing's Auto Fill. A text-changing replacement places
+the caret at EOF; Undo restores the previous directed selection. Empty `-`
+deletes matches. No matches, or an identical resulting document, follow the
+model's admitted no-op rules: no matches leave selection intact, while an
+identical replacement still moves the caret to EOF without a text revision
+or history entry. Neither command changes the native Find/Replace
+entry history or creates a prompt. Remote Find's explicit wrap flag is
+independent of the interactive end-then-repeat-to-wrap gesture; it does not
+seed or advance F3 history. Both paths dispatch the same model commands.
+Native prompts additionally manage their own wrap gesture: a remote no-match
+Replace All leaves an existing F3 boundary intact because its revision and
+selection are unchanged, unlike submission through the native Replace prompt.
+Selection/revision-changing remote commands clear that boundary immediately;
+moving away and back cannot revive it.
+
+The input bound is not an output/change-size bound. Replacement may expand
+to the model's 16-MiB document ceiling, with additional aggregate text/history
+limits checked before mutation. Like native Replace All, admitted Find and
+replacement run synchronously on the UI thread; the transport deadline
+cannot preempt an already executing model operation or roll it back.
 
 Insert accepts at most 262,144 raw decoded UTF-8 bytes before normalization.
 Oversize is `limit`, malformed hex is `protocol`, and invalid UTF-8 or

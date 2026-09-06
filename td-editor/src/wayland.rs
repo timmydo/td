@@ -1569,11 +1569,14 @@ impl Window {
             return request.spelling_response(&self.ui, &self.spelling);
         }
         if request.is_edit() {
-            let result = if self.closed || self.pointer_modal() || self.menu.is_some() {
-                Err(crate::Error::Unavailable)
-            } else {
-                request.execute(&mut self.ui)
-            };
+            if self.closed || self.pointer_modal() || self.menu.is_some() {
+                return crate::control::Refusal {
+                    id: request.id,
+                    error: crate::Error::Unavailable,
+                }
+                .response();
+            }
+            let result = request.execute(&mut self.ui);
             return match result {
                 Ok(()) => {
                     self.input.cancel_repeat();
@@ -1588,11 +1591,7 @@ impl Window {
                     self.frames.invalidate(true);
                     format!("1\t{}\tok\t", request.id)
                 }
-                Err(error) => crate::control::Refusal {
-                    id: request.id,
-                    error,
-                }
-                .response(),
+                Err(error) => request.admitted_edit_refusal(error),
             };
         }
         let response = request.response(&self.ui);
@@ -5448,6 +5447,8 @@ mod tests {
                 "set-fill-column\t1\t1\t40",
                 "go-to-line\t1\t1\t1",
                 "set-key-profile\t1\t1\temacs",
+                "find\t1\t1\t1\t1\t61\t0\t1",
+                "replace\t1\t1\t61\t62",
             ] {
                 let request =
                     crate::control::Request::parse(format!("1\t1\t{command}").as_bytes()).unwrap();
@@ -5636,6 +5637,117 @@ mod tests {
         assert!(w.frames.generation().unwrap() > generation);
         assert!(!w.ui.editor().document(1).unwrap().auto_fill());
         assert_eq!(w.ui.editor().document(1).unwrap().revision(), 0);
+    }
+
+    #[test]
+    fn native_remote_search_replacement_and_undo_preserve_the_shared_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.ui.dispatch(Event::Load("λ bad λ bad".as_bytes()))
+            .unwrap();
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        w.chord("F7", false).unwrap();
+        w.end_turn(w.clock, false).unwrap();
+        let marks = w.spelling.view(w.ui.editor()).1.to_vec();
+        assert!(!marks.is_empty());
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        w.find(2, 0, "λ", true);
+        assert_eq!(
+            w.notice.as_deref(),
+            Some("Reached start; repeat this search to wrap.")
+        );
+        let mut noop = control_client(&path, b"1\t90\treplace\t2\t0\t6d697373696e67\t78");
+        assert_eq!(control_answer(&mut w, &mut noop, &peer), "1\t90\tok\t");
+        assert_eq!(w.searches.query(), "λ");
+        w.find(2, 0, "λ", true);
+        assert_eq!(w.notice.as_deref(), Some("Search wrapped; match found."));
+        let mut reset = control_client(&path, b"1\t91\tselect-range\t2\t0\t0\t0");
+        assert_eq!(control_answer(&mut w, &mut reset, &peer), "1\t91\tok\t");
+        w.event(message(SHM, 0, &[1])).unwrap();
+        configure(&mut w, 800, 600);
+        w.draw().unwrap();
+        drain(&peer);
+        let pixels = w.pixels.clone();
+        for (id, command) in [
+            (1, "find\t2\t0\t0\t0\t626164\t0\t0"),
+            (2, "find\t2\t0\t3\t6\t626164\t0\t0"),
+        ] {
+            let mut client = control_client(&path, format!("1\t{id}\t{command}").as_bytes());
+            assert_eq!(
+                control_answer(&mut w, &mut client, &peer),
+                format!("1\t{id}\tok\t")
+            );
+        }
+        assert_eq!(
+            w.ui.editor().document(2).unwrap().selection().range(),
+            10..13
+        );
+        assert_eq!(w.spelling.view(w.ui.editor()).1, marks);
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let before = w.control_response(&state);
+        let mut missing = control_client(&path, b"1\t3\tfind\t2\t0\t10\t13\t626164\t0\t0");
+        assert_eq!(
+            control_answer(&mut w, &mut missing, &peer),
+            "1\t3\terror\tno-match\t6e6f2d6d61746368"
+        );
+        assert_eq!(w.control_response(&state), before);
+        let mut wrapped = control_client(&path, b"1\t4\tfind\t2\t0\t10\t13\t626164\t0\t1");
+        assert_eq!(control_answer(&mut w, &mut wrapped, &peer), "1\t4\tok\t");
+        assert_eq!(w.ui.editor().document(2).unwrap().selection().range(), 3..6);
+        assert_eq!(w.searches.query(), "λ"); // Semantic search neither seeds nor clears F3 history.
+        done(&mut w);
+        w.draw().unwrap();
+        drain(&peer);
+        assert_ne!(w.pixels, pixels); // Selection-only redraw retains marks.
+        let mut replace = control_client(&path, b"1\t5\treplace\t2\t0\t626164\t676f6f64");
+        assert_eq!(control_answer(&mut w, &mut replace, &peer), "1\t5\tok\t");
+        let doc = w.ui.editor().document(2).unwrap();
+        assert_eq!(doc.text(), "λ good λ good");
+        assert_eq!(
+            doc.selection(),
+            crate::model::Selection {
+                anchor: 15,
+                caret: 15
+            }
+        );
+        assert_eq!(doc.revision(), 1);
+        assert_eq!(doc.history_depth(), (1, 0));
+        assert!(w.spelling.view(w.ui.editor()).1.is_empty());
+        assert!(!w.spelling.running());
+        let mut undo = control_client(&path, b"1\t6\tundo\t2\t1");
+        assert_eq!(control_answer(&mut w, &mut undo, &peer), "1\t6\tok\t");
+        let doc = w.ui.editor().document(2).unwrap();
+        assert_eq!(doc.text(), "λ bad λ bad");
+        assert_eq!(doc.selection().range(), 3..6);
+        assert!(!doc.dirty());
+        assert_eq!(doc.revision(), 2);
+        let mut stale = control_client(&path, b"1\t7\treplace\t2\t0\t626164\t78");
+        assert!(control_answer(&mut w, &mut stale, &peer).contains("\terror\tstale-revision\t"));
+        w.find(2, 2, "bad", true);
+        assert_eq!(
+            w.notice.as_deref(),
+            Some("Reached start; repeat this search to wrap.")
+        );
+        // Two admissions in one outer turn: no tick may repair invalidation.
+        let moved = crate::control::Request::parse(b"1\t92\tfind\t2\t2\t3\t6\tcebb\t0\t0").unwrap();
+        assert_eq!(w.control_response(&moved), "1\t92\tok\t");
+        let reset = crate::control::Request::parse(b"1\t93\tselect-range\t2\t2\t3\t6").unwrap();
+        assert_eq!(w.control_response(&reset), "1\t93\tok\t");
+        w.find(2, 2, "bad", true);
+        assert_eq!(
+            w.notice.as_deref(),
+            Some("Reached start; repeat this search to wrap.")
+        );
+        w.stop_control();
     }
 
     #[test]

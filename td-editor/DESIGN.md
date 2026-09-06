@@ -2088,9 +2088,14 @@ deadlines under CONTROL.md's exact scheduling contract. The experimental
 `--window --control-socket PATH` adapter now connects read-only state/text
 requests, including coarse native modal/job/spelling flags, plus Select
 Tab/Range, Insert, Delete, Undo, Redo, Fill Paragraph, Auto Fill/fill-column
-setters, Go To Line and whole-window key-profile selection. Dispatch requires
-live job admission and target revision; selection-relative operations additionally
-pin the directed selection. Native modals refuse edits without dismissal.
+setters, Go To Line and whole-window key-profile selection. Literal Find
+and whole-document Replace All use the same controller/replay commands with
+bounded private text arguments. Find pins the starting selection and
+explicitly selects direction/wrapping; neither operation changes native
+prompt entry history. Its native `no-match` reply differs from a modal
+`unavailable` refusal. Dispatch requires live job admission and target
+revision; selection-relative operations pin the directed selection. Native
+modals refuse edits without dismissal.
 All edits use the ordinary controller, including history, view refresh and
 native search/spelling/Paste/repeat invalidation. Its exact
 implemented subset, startup/cleanup behavior and two-action-per-turn budget

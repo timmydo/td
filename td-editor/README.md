@@ -72,14 +72,15 @@ queries and revision-checked edits through the shared controller. See
 [CONTROL.md](CONTROL.md) for exact fields and bounds. The experimental
 `--window --control-socket PATH` option connects state/text inspection and
 coarse native modal/job/spelling flags. It also supports Select Tab/Range,
-Insert, Delete, Undo, Redo and Fill Paragraph. Insert/Delete/Fill check the
-expected directed selection as well as the tab revision; native modals refuse
-remote edits. Auto Fill, fill-column and key-profile setters and Go To Line
-also use revision-checked native control dispatch without changing text or
-history. `spelling-results` exposes status, whole-scan counts and bounded
-range pages pinned to both text revision and scan ID. Checking still starts
-with ordinary F7; pending scans expose no partial marks. File operations,
-dialog answers and Check Spelling admission remain later work. Native state
+Insert, Delete, Undo, Redo, Fill Paragraph, literal Find and Replace All.
+Insert/Delete/Fill/Find check the expected directed selection as well as the
+tab revision; native modals refuse remote edits. Auto Fill, fill-column and
+key-profile setters and Go To Line also use revision-checked native control
+dispatch without changing text or history. `spelling-results` exposes status,
+whole-scan counts and bounded range pages pinned to both text revision and
+scan ID. Checking still starts with ordinary F7; pending scans expose no
+partial marks. File operations, dialog answers and Check Spelling admission
+remain later work. Native state
 now exposes separate redraw/submitted/callback generations; `wait-frame`
 waits for a matching main-surface callback without blocking editing.
 The separate `control_socket` library publishes a private Linux Unix
