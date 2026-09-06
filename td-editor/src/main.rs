@@ -6,6 +6,8 @@ use std::process::ExitCode;
 const HELP: &str = concat!(
     "td-editor --window [--keys=windows|emacs] [--] [FILE...]\n",
     "Window option: --dictionary PATH loads an explicit local English word list.\n",
+    "Window option: --control-socket PATH enables private read-only state/text.\n",
+    "Control can read every tab, including unsaved text; it cannot edit.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -35,7 +37,7 @@ const HELP: &str = concat!(
     "Format: Dictionary, Check Spelling, Next/Previous Misspelling (no wrapping).\n",
     "Spelling underlines appear at completion; edits clear them without rechecking.\n",
     "Word list: UTF-8, one ASCII word per line; 16 MiB / 250,000 unique words.\n",
-    "No bundled word list, GPU renderer, control socket, recovery or td-mail link.\n",
+    "No bundled word list, GPU renderer, remote editing, recovery or td-mail link.\n",
     "Fixtures: --replay | --preview\n",
     "Scratch: --window-preview [--keys=windows|emacs]\n",
     "Scratch window has no file I/O.\n",
@@ -69,11 +71,7 @@ fn main() -> ExitCode {
     }
 }
 
-struct WindowArgs {
-    profile: td_editor::keys::Profile,
-    paths: Vec<std::path::PathBuf>,
-    dictionary: Option<std::path::PathBuf>,
-}
+type WindowArgs = td_editor::wayland::FileWindowOptions;
 
 fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
     use std::os::unix::ffi::OsStrExt;
@@ -81,6 +79,7 @@ fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
     let mut literal = false;
     let mut paths = Vec::new();
     let mut dictionary = None;
+    let mut control = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if !literal && arg == "--" {
@@ -89,6 +88,24 @@ fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
             profile = td_editor::keys::Profile::Emacs;
         } else if !literal && arg == "--keys=windows" {
             profile = td_editor::keys::Profile::Windows;
+        } else if !literal && arg == "--control-socket" {
+            if control.is_some() {
+                return Err(io::Error::other(
+                    "--control-socket may be specified only once",
+                ));
+            }
+            let path = args.next().ok_or_else(|| {
+                io::Error::other("--control-socket needs an absolute literal path")
+            })?;
+            if !std::path::Path::new(path).is_absolute()
+                || path.as_bytes().len() > 107
+                || path.as_bytes().contains(&0)
+            {
+                return Err(io::Error::other(
+                    "control socket path must be absolute, non-NUL and at most 107 bytes",
+                ));
+            }
+            control = Some(path.into());
         } else if !literal && arg == "--dictionary" {
             if dictionary.is_some() {
                 return Err(io::Error::other("--dictionary may be specified only once"));
@@ -125,12 +142,12 @@ fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
         profile,
         paths,
         dictionary,
+        control,
     })
 }
 
 fn file_window(args: &[std::ffi::OsString]) -> io::Result<()> {
-    let args = window_args(args)?;
-    td_editor::wayland::file_window(args.profile, args.paths, args.dictionary)
+    td_editor::wayland::file_window(window_args(args)?)
 }
 
 #[cfg(test)]
@@ -156,6 +173,7 @@ mod tests {
             "Do not use as $EDITOR yet",
             "F7 checks the whole document on demand",
             "No bundled word list, GPU renderer",
+            "private read-only state/text",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }
@@ -209,12 +227,60 @@ mod tests {
             profile,
             paths,
             dictionary,
+            control,
         } = window_args(&args).unwrap();
         assert!(dictionary.is_none());
+        assert!(control.is_none());
         assert_eq!(profile, td_editor::keys::Profile::Emacs);
         assert_eq!(paths, vec![std::path::PathBuf::from("-file"), raw.into()]);
         assert!(window_args(&["--keys=other".into()]).is_err());
         assert!(window_args(&vec!["file".into(); 65]).is_err());
         assert!(window_args(&["a".repeat(4097).into()]).is_err());
+    }
+
+    #[test]
+    fn control_socket_is_opt_in_literal_bounded_and_separate_from_documents() {
+        let raw = OsString::from_vec(b"/tmp/private/control-\xff".to_vec());
+        let args = window_args(&[
+            "--control-socket".into(),
+            raw.clone(),
+            "--dictionary".into(),
+            "words".into(),
+            "--keys=emacs".into(),
+            "--".into(),
+            "--control-socket".into(),
+            "document".into(),
+        ])
+        .unwrap();
+        assert_eq!(args.control, Some(raw.into()));
+        assert_eq!(args.dictionary, Some("words".into()));
+        assert_eq!(args.profile, td_editor::keys::Profile::Emacs);
+        assert_eq!(
+            args.paths,
+            vec![
+                std::path::PathBuf::from("--control-socket"),
+                "document".into()
+            ]
+        );
+        for input in [
+            vec!["--control-socket=/tmp/control".into()],
+            vec!["--control-socket".into()],
+            vec!["--control-socket".into(), "relative".into()],
+            vec!["--control-socket".into(), "/tmp/a\0b".into()],
+            vec![
+                "--control-socket".into(),
+                format!("/{}", "x".repeat(107)).into(),
+            ],
+            vec![
+                "--control-socket".into(),
+                "/tmp/a".into(),
+                "--control-socket".into(),
+                "/tmp/b".into(),
+            ],
+        ] {
+            assert!(window_args(&input).is_err(), "{input:?}");
+        }
+        let boundary = format!("/{}", "x".repeat(106));
+        assert!(window_args(&["--control-socket".into(), boundary.into()]).is_ok());
     }
 }

@@ -32,6 +32,7 @@ const TOPLEVEL: u32 = 9;
 const OBJECTS: usize = 128;
 const READ_BYTES: usize = 16 * 1024;
 const PENDING_BYTES: usize = 128 * 1024;
+const CONTROL_JOBS_PER_TURN: usize = 2;
 const INITIAL_DEADLINE: Duration = Duration::from_secs(20);
 const WRITE_DEADLINE: Duration = Duration::from_secs(5);
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
@@ -356,6 +357,8 @@ struct Window {
     replace: Option<crate::replace::Prompt>,
     searches: crate::search::History,
     spelling: crate::spelling::WindowState,
+    control: Option<crate::control_worker::Worker>,
+    control_cleanup_error: Option<String>,
 }
 
 enum PathAction {
@@ -453,6 +456,8 @@ impl Window {
             replace: None,
             searches: crate::search::History::default(),
             spelling: crate::spelling::WindowState::default(),
+            control: None,
+            control_cleanup_error: None,
         })
     }
 
@@ -1448,7 +1453,102 @@ impl Window {
         if self.spelling.running() {
             self.connection.wait = self.connection.wait.min(Duration::from_millis(1));
         }
+        self.control_tick();
         Ok(())
+    }
+
+    fn control_tick(&mut self) {
+        if self.closed {
+            return;
+        }
+        if self.control.is_some() {
+            self.connection.wait = self.connection.wait.min(Duration::from_millis(10));
+        }
+        // One outer turn, not every decoded Wayland event, budgets page copies.
+        for _ in 0..CONTROL_JOBS_PER_TURN {
+            let Some(worker) = self.control.as_ref() else {
+                break;
+            };
+            let job = match worker.try_request() {
+                Ok(Some(job)) => job,
+                Ok(None) => break,
+                Err(detail) => {
+                    self.disable_control(&detail.to_string());
+                    break;
+                }
+            };
+            let response = self.control_response(job.request());
+            if let Err(detail) = job.respond(response.as_bytes()) {
+                self.notify(format!("Control response refused: {detail}"));
+            }
+        }
+    }
+
+    fn control_response(&self, request: crate::control::Request) -> String {
+        let response = request.response(&self.ui);
+        if request.query == crate::control::Query::State {
+            self.native_state(response)
+        } else {
+            response
+        }
+    }
+
+    fn native_state(&self, mut response: String) -> String {
+        if response.split('\t').nth(2) == Some("ok") {
+            let flag = u8::from;
+            response.push_str(&format!(
+                concat!(
+                    "\tadapter=native-read-only\tnative={},{},{},{}",
+                    "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
+                ),
+                flag(self.configured),
+                flag(self.files.is_some()),
+                flag(self.files.as_ref().is_some_and(|files| files.busy())),
+                flag(self.quitting),
+                flag(self.prompt.is_some()),
+                flag(self.closing.is_some()),
+                flag(self.conflict.is_some()),
+                flag(self.reloading.is_some()),
+                flag(self.menu.is_some()),
+                flag(self.search.is_some()),
+                flag(self.number.is_some()),
+                flag(self.command.is_some()),
+                flag(self.replace.is_some()),
+                self.spelling
+                    .dictionary_entries()
+                    .map_or_else(|| "-".into(), |n| n.to_string()),
+                flag(self.spelling.running()),
+            ));
+        }
+        response
+    }
+
+    fn stop_control(&mut self) {
+        if let Some(worker) = self.control.take() {
+            if let Err(error) = worker.close() {
+                self.control_cleanup_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn disable_control(&mut self, detail: &str) {
+        self.stop_control();
+        let suffix = self
+            .control_cleanup_error
+            .as_ref()
+            .map_or_else(String::new, |error| format!("; shutdown: {error}"));
+        self.notify(format!("Control disabled: {detail}{suffix}"));
+    }
+
+    fn finish_control(&mut self, result: Result<()>) -> Result<()> {
+        self.stop_control();
+        match self.control_cleanup_error.take() {
+            Some(detail) => Err(match result {
+                Ok(()) => format!("Control shutdown failed: {detail}"),
+                Err(previous) => format!("{previous}; control shutdown failed: {detail}"),
+            }),
+            None => result,
+        }
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -3407,13 +3507,27 @@ fn prepare_files(
     Ok((ui, files, spelling))
 }
 
+/// Literal startup inputs; control grants read access to every open document.
+pub struct FileWindowOptions {
+    pub profile: Profile,
+    pub paths: Vec<PathBuf>,
+    pub dictionary: Option<PathBuf>,
+    pub control: Option<PathBuf>,
+}
+
 /// Experimental file window; ordinary $EDITOR invocation remains unavailable.
-pub fn file_window(
-    profile: Profile,
-    paths: Vec<PathBuf>,
-    dictionary: Option<PathBuf>,
-) -> io::Result<()> {
+pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
+    let FileWindowOptions {
+        profile,
+        paths,
+        dictionary,
+        control,
+    } = options;
     let work = || -> Result<()> {
+        let socket = control
+            .map(|path| crate::control_socket::Socket::bind(&path))
+            .transpose()
+            .map_err(error)?;
         let (ui, files, spelling) = prepare_files(profile, paths, dictionary)?;
         let endpoint = endpoint(
             std::env::var_os("WAYLAND_SOCKET"),
@@ -3429,12 +3543,18 @@ pub fn file_window(
         );
         window.spelling = spelling;
         window.files = Some(files);
+        window.control = socket
+            .map(crate::control_worker::Worker::start)
+            .transpose()
+            .map_err(error)?;
         window.notify(format!("{dictionary_notice}Experimental file window. UTF-8 clipboard needs data-device v3. F7 checks spelling; Format > Dictionary selects a local word list. No recovery. Not ready for $EDITOR."));
         let result = window.run();
-        if result.is_err() && window.files.as_ref().is_some_and(|files| files.busy()) {
-            return Err(format!("{}; file operation was pending and may have published. Verify the destination; unsaved edits are not recovered.", result.err().unwrap_or_default()));
+        match window.finish_control(result) {
+            Err(detail) if window.files.as_ref().is_some_and(|files| files.busy()) => Err(format!(
+                "{detail}; file operation was pending and may have published. Verify the destination; unsaved edits are not recovered."
+            )),
+            result => result,
         }
-        result
     };
     work().map_err(io::Error::other)
 }
@@ -4921,6 +5041,249 @@ mod tests {
         (w, peer)
     }
 
+    #[test]
+    fn native_read_only_state_names_modal_state_without_mutating_it() {
+        let (mut w, _peer) = file_dialog_fixture();
+        let query = crate::control::Request {
+            id: 77,
+            query: crate::control::Query::State,
+        };
+        let before = query.response(&w.ui);
+        let response = w.control_response(query);
+        assert_eq!(
+            response,
+            format!(
+                "{before}\tadapter=native-read-only\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0"
+            )
+        );
+        assert_eq!(query.response(&w.ui), before);
+        w.chord("C-f", false).unwrap();
+        assert!(w.search.is_some());
+        let before = query.response(&w.ui);
+        let response = w.control_response(query);
+        assert!(response.contains("\tmodal=0,0,0,0,0,1,0,0,0\t"));
+        assert!(w.search.is_some());
+        assert_eq!(query.response(&w.ui), before);
+        w.chord("Escape", false).unwrap();
+        assert!(w.search.is_none());
+        let refused = crate::control::Request::parse(b"1\t77\tnew")
+            .unwrap_err()
+            .response();
+        assert_eq!(w.native_state(refused.clone()), refused);
+    }
+
+    #[test]
+    fn native_read_only_text_preserves_revision_checks_across_edit_and_undo() {
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let revision = w.ui.editor().document(tab).unwrap().revision();
+        let query = crate::control::Request {
+            id: 78,
+            query: crate::control::Query::Text {
+                tab,
+                revision,
+                offset: 0,
+                limit: 4,
+            },
+        };
+        assert_eq!(w.control_response(query), query.response(&w.ui));
+        assert!(w.control_response(query).ends_with("\t61"));
+        w.chord("b", false).unwrap();
+        assert!(w
+            .control_response(query)
+            .contains("\terror\tstale-revision\t"));
+        w.chord("C-z", false).unwrap();
+        assert!(w
+            .control_response(query)
+            .contains("\terror\tstale-revision\t"));
+    }
+
+    fn control_client(path: &Path, payload: &[u8]) -> UnixStream {
+        let mut client = UnixStream::connect(path).unwrap();
+        client
+            .write_all(&crate::control::frame(payload).unwrap())
+            .unwrap();
+        client.set_nonblocking(true).unwrap();
+        client
+    }
+
+    fn control_answer(w: &mut Window, client: &mut UnixStream, peer: &UnixStream) -> String {
+        drain(peer);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut decoder = crate::control::Decoder::default();
+        let mut bytes = [0; 4096];
+        loop {
+            assert!(Instant::now() < deadline, "native control response timeout");
+            w.end_turn(w.clock, false).unwrap();
+            match client.read(&mut bytes) {
+                Ok(0) => return String::from_utf8(decoder.finish().unwrap()).unwrap(),
+                Ok(count) => decoder.push(&bytes[..count]).unwrap(),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("native control read: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn native_control_socket_queries_preserve_modal_state_and_revision_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        let socket = crate::control_socket::Socket::bind(&path).unwrap();
+        w.control = Some(crate::control_worker::Worker::start(socket).unwrap());
+        w.chord("a", false).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let revision = w.ui.editor().document(tab).unwrap().revision();
+        w.chord("C-f", false).unwrap();
+        let state = crate::control::Request::parse(b"1\t10\tstate").unwrap();
+        let before = w.control_response(state);
+        let mut client = control_client(&path, b"1\t10\tstate");
+        assert_eq!(control_answer(&mut w, &mut client, &peer), before);
+        assert!(w.search.is_some());
+        assert_eq!(w.control_response(state), before);
+        assert_eq!(w.connection.wait, Duration::from_millis(10));
+
+        let text = format!("1\t11\ttext\t{tab}\t{revision}\t0\t4");
+        let mut client = control_client(&path, text.as_bytes());
+        assert_eq!(
+            control_answer(&mut w, &mut client, &peer),
+            "1\t11\tok\t1\t61"
+        );
+        let mut client = control_client(&path, b"1\t12\tnew");
+        assert!(control_answer(&mut w, &mut client, &peer).starts_with("1\t12\terror\tprotocol\t"));
+        assert_eq!(w.control_response(state), before);
+        w.chord("Escape", false).unwrap();
+        w.chord("b", false).unwrap();
+        w.chord("C-z", false).unwrap();
+        let mut client = control_client(&path, text.as_bytes());
+        assert!(control_answer(&mut w, &mut client, &peer)
+            .starts_with("1\t11\terror\tstale-revision\t"));
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), "a");
+
+        drop(w);
+        assert!(!path.exists());
+        assert!(UnixStream::connect(&path).is_err());
+    }
+
+    #[test]
+    fn native_control_shutdown_cancels_partial_and_nonreading_peers() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        let tab = w.ui.editor().active().unwrap();
+        w.ui.dispatch(Event::Edit {
+            tab,
+            revision: 0,
+            command: crate::model::Command::Insert("a".repeat(256 * 1024)),
+        })
+        .unwrap();
+        let revision = w.ui.editor().document(tab).unwrap().revision();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut partial = UnixStream::connect(&path).unwrap();
+        partial.write_all(&[0, 0]).unwrap();
+        let text = format!("1\t20\ttext\t{tab}\t{revision}\t0\t262144");
+        let _nonreading = control_client(&path, text.as_bytes());
+        // A later queued connection's reply witnesses an accept/dispatch pass.
+        let mut sentinel = control_client(&path, b"1\t21\tstate");
+        assert!(control_answer(&mut w, &mut sentinel, &peer).starts_with("1\t21\tok\t"));
+        let start = Instant::now();
+        drop(w);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!path.exists());
+        assert!(UnixStream::connect(&path).is_err());
+    }
+
+    #[test]
+    fn native_control_disable_retains_cleanup_failure_until_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, _peer) = file_dialog_fixture();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        w.disable_control("test transport failure");
+        assert!(w.control.is_none());
+        assert!(w.control_cleanup_error.is_some());
+        w.chord("a", false).unwrap();
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "a");
+        assert!(w
+            .finish_control(Err("display failed".into()))
+            .unwrap_err()
+            .starts_with("display failed; control shutdown failed:"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn native_control_queries_allow_wayland_dispatch_between_bounded_turns() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        let socket = crate::control_socket::Socket::bind(&path).unwrap();
+        w.control = Some(crate::control_worker::Worker::start(socket).unwrap());
+        let mut clients: Vec<_> = (0..8)
+            .map(|id| control_client(&path, format!("1\t{id}\tstate").as_bytes()))
+            .collect();
+        for (id, client) in clients.iter_mut().enumerate() {
+            w.event(message(WM, 0, &[100 + id as u32])).unwrap();
+            assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
+            let response = control_answer(&mut w, client, &peer);
+            assert!(response.starts_with(&format!("1\t{id}\tok\t")));
+            assert!(response.contains("\tadapter=native-read-only\t"));
+        }
+        assert_eq!(w.ui.editor().tabs().count(), 1);
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "");
+        w.control.take().unwrap().close().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn native_control_startup_failure_cleans_only_its_endpoint() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let dictionary = directory.path("missing-dictionary");
+        let failed = file_window(FileWindowOptions {
+            profile: Profile::Windows,
+            paths: Vec::new(),
+            dictionary: Some(dictionary.clone()),
+            control: Some(path.clone()),
+        });
+        assert!(failed.is_err());
+        assert!(!path.exists());
+        assert!(!dictionary.exists());
+        std::fs::write(&path, b"do not replace").unwrap();
+        assert!(file_window(FileWindowOptions {
+            profile: Profile::Windows,
+            paths: Vec::new(),
+            dictionary: Some(dictionary),
+            control: Some(path.clone()),
+        })
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"do not replace");
+    }
+
     fn menu_click(w: &mut Window, group: crate::menu::Group, index: usize) {
         let header = w.ui.geometry().menu(group.index()).unwrap();
         pointer_move(w, header.x, header.y);
@@ -5244,7 +5607,13 @@ mod tests {
                 .contains("dictionary selection unchanged")
         );
         let missing = directory.path("missing");
-        assert!(file_window(Profile::Windows, Vec::new(), Some(missing.clone())).is_err());
+        assert!(file_window(FileWindowOptions {
+            profile: Profile::Windows,
+            paths: Vec::new(),
+            dictionary: Some(missing.clone()),
+            control: None,
+        })
+        .is_err());
         assert!(!missing.exists());
     }
 

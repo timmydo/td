@@ -21,9 +21,11 @@ selection, tab clicks and scrolling are connected. Native spelling loads an
 explicit local dictionary through the file worker, scans on F7 in bounded
 chunks, and publishes underlines and counts together. Format supplies
 dictionary selection and next/previous marked-word navigation. GPU rendering
-and the control socket are not implemented yet.
-Key bindings for those absent adapters
-produce explicit requests; replay does not pretend to perform their work.
+is not implemented yet. The optional native control socket now exposes
+read-only state/text queries; remote edits and frame acknowledgement remain
+unimplemented.
+Replay emits explicit external-operation requests and does not pretend to
+perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
 caret affinity, pixel hit testing, vertical/page-motion calculation and
 viewport scrolling. The safe UI controller connects those APIs to logical
@@ -360,7 +362,8 @@ Version 1 resource ceilings are part of the API:
 | Spelling results | 10,000 stored ranges across the window, including a running scan; finish scanning and count additional unknown words, reporting when marks are capped. |
 | Frames | 8,192 pixels per axis, 32 MiB per XRGB buffer, three live buffers; defer redraw/resize until a buffer can be retired. |
 | Wayland input | 1 MiB keymap, 128 KiB buffered wire bytes, eight pending descriptors; byte/descriptor overflow closes the display connection, an over-limit map disables input. |
-| Control | One active connection, 16 queued commands, 1 MiB request/response frame, 256 KiB raw text per response page, five-second whole-request deadline. |
+| Control | Eight admitted connections, eight queued read-only jobs, 1 MiB request/response frame, 256 KiB raw text per response page, five-second whole-request deadline. |
+| Control commands (version 1 target) | Sixteen queued typed command descriptors; refuse additional commands. Remote mutation is not implemented by the current read-only worker. |
 
 Undo stores edit deltas and cursor/selection before and after the transaction.
 The core uses one contiguous replacement span per transaction, trimming
@@ -2074,11 +2077,15 @@ field order, errors, limits and conformance fixtures are recorded in
 [CONTROL.md](CONTROL.md). The separate `control_socket` library implements
 explicit private Unix listener publication with descriptor-pinned paths,
 owner/mode admission and identity-checked cleanup; its complete path/trust
-contract and same-UID race boundary are in that reference. These are transport
-prerequisites only. The `control_worker` library now adds eight-connection
+contract and same-UID race boundary are in that reference. The
+`control_worker` library adds eight-connection
 nonblocking transport, typed bounded UI jobs and five-second acceptance-based
-deadlines under CONTROL.md's exact scheduling contract. There is no
-`--control-socket` option, native job/dialog state or frame acknowledgement yet.
+deadlines under CONTROL.md's exact scheduling contract. The experimental
+`--window --control-socket PATH` adapter now connects read-only state/text
+requests, including coarse native modal/job/spelling flags. Its exact
+implemented subset, startup/cleanup behavior and two-job-per-turn budget
+are specified in CONTROL.md. Remote mutations, dialog answers, spelling
+range queries and frame acknowledgement remain unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 

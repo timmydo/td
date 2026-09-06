@@ -1,14 +1,16 @@
 # Control protocol reference
 
-This is the implemented **library prerequisite**, not an available endpoint.
+The experimental `--window --control-socket PATH` endpoint implements the
+read-only subset below. It is off by default; scratch preview and replay do
+not accept the option. Remote edits, dialog answers, spelling result pages
+and frame acknowledgement remain unimplemented. This is not the complete
+version-1 endpoint specified in [DESIGN.md](DESIGN.md#test-and-control-architecture).
+
 `control` has no listener, thread, filesystem access, clock or Wayland access.
-The separate `control_socket` library can explicitly publish a private Unix
-listener under the contract below; it is not connected to the executable.
+The separate `control_socket` library publishes a private Unix listener
+under the contract below.
 `control_worker` owns that listener on a bounded transport thread and hands
-read-only requests to its caller. It too is a library prerequisite only.
-`--control-socket` is not accepted yet. Native dialogs/jobs/spelling results,
-remote mutations and frame acknowledgements still require the window adapter
-specified in [DESIGN.md](DESIGN.md#test-and-control-architecture).
+read-only requests to the native window's UI thread.
 
 ## Framing
 
@@ -111,18 +113,93 @@ Success begins `1 ID ok` followed by these tab-separated fields, in order:
 There are at most 64 tab/view pairs. No text bytes, file path, title, dictionary,
 pending dialog/job or spelling range is serialized by this controller-only
 snapshot. Its generation means local UI state, **not** a submitted buffer,
-frame callback or scanout. A native endpoint must add its own state under the
+frame callback or scanout. The native extension below adds coarse flags; a
+complete native endpoint must add its own state under the
 full design contract before claiming complete remote control.
+
+## Experimental native read-only adapter
+
+`--control-socket PATH` may appear once after `--window`, before the literal
+`--` delimiter. Its next argument is one literal OS-byte pathname, not shell
+text. It must satisfy the complete private-socket contract below. The caller
+creates the private parent; no directory or endpoint is discovered, adopted
+or repaired automatically. Giving access to the endpoint grants read access
+to every tab's current in-memory text, including unsaved text and inactive
+tabs. It does not grant remote writes in this increment.
+
+Startup binds before opening document/dictionary files or connecting to
+Wayland, so an invalid endpoint fails startup without those operations.
+The worker starts only after file preparation and window construction.
+An earlier startup failure drops the socket and attempts checked cleanup;
+no response is available during that interval. Pathname existence or a
+successful connect is therefore not a readiness signal. A successful state
+response proves the UI is answering, not that a frame has been presented.
+Startup cleanup is best-effort; an abrupt death can leave a stale socket,
+which the caller must inspect and remove explicitly before retrying.
+
+The adapter polls at most two live jobs at the end of each outer event-loop
+turn, after file/timer processing and the single spelling step. It does not
+multiply that allowance for each decoded Wayland event. Each worker poll may
+discard its existing bounded prefix of expired jobs. While control is enabled,
+the ordinary receive wait is capped at ten milliseconds, including idle time.
+This opt-in latency tradeoff can wake an otherwise idle window 100 times per
+second; the default window adds no control polling. All socket reads and
+writes stay on the worker. Two maximum pages can allocate about one MiB of
+hex response text per turn; this is a byte/work bound, not a real-time latency
+guarantee. State/text serialization only borrows the controller immutably.
+Queries neither answer nor dismiss a modal, move selection, start I/O, mark
+a document saved nor invoke an edit.
+
+Native `text` responses are exactly the shared response above. Native `state`
+appends these tab-separated fields to successful controller snapshots, in
+this order. Error responses are unchanged:
+
+| Field | Comma-separated values |
+| --- | --- |
+| `adapter=native-read-only` | Explicit implemented adapter identity. |
+| `native=...` | Configured, file session present, file job busy, quitting. |
+| `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
+| `spelling=...` | Selected dictionary entry count or `-`, scan running. |
+
+Boolean flags are `0|1`; the dictionary field is an entry count or `-`.
+These are coarse presence flags, not dialog/job IDs,
+allowed answers, operation results or spelling ranges. No path or entry text
+is disclosed by these added fields. Query `text` separately for document
+bytes. Controller generation does not cover native-only modal/job changes,
+and is not a submitted/callback-completed frame generation. Clients must not
+use it as a native snapshot version or presentation fence.
+
+On ordinary window exit, stop and join the worker and explicitly attempt
+checked cleanup; a shutdown error contributes to nonzero exit status. Drop
+also cancels the worker on other unwind/owner-drop paths. Incomplete or
+nonreading peers cannot keep shutdown waiting for their request deadline.
+If the transport thread fails while the editor is live, disable control and
+show a retained diagnostic without discarding documents or stopping editing.
+Any cleanup failure remains recorded for eventual nonzero exit status.
+Invalid response frames report a notice; ordinary expired/disconnected reply
+admission is silent and cannot change text or overwrite a user-facing notice.
+No automatic rebinding or restart occurs. A reply that was queued but not
+delivered is not a claim of client receipt.
+
+Tests use actual private pathname sockets with the native window fixture,
+exercise state/text and mutation refusals, preserve modal state, reject stale
+pages after edit/Undo, answer Wayland pings with requests outstanding, and
+check startup-failure cleanup, timed shutdown with partial/nonreading peers,
+and retained cleanup errors without deleting replacement names. A separate
+source confinement assertion pins the two-job per-turn budget; the socket
+progress fixture does not count exact per-turn admissions.
+These are fake-compositor and local
+kernel tests, not a live independent-compositor or td-jail/tmc oracle.
 
 ## Conformance
 
-Tests pin exact request/error/text payloads, matching state/text responses
+Shared control-library tests pin exact request/error/text payloads, matching state/text responses
 through replay, immutable controller state, maximum pages and 64-tab output,
 stale-after-Undo rejection, every frame split, single-byte delivery, premature
 EOF, zero/oversized/trailing frames, poisoned decoder behavior and arbitrary
 byte input both as raw headers and as correctly framed payloads. Invalid
 envelopes/read-only command refusals are compared with replay, separately
-from the intentionally different mutation allowlists. Tests need no display,
+from the intentionally different mutation allowlists. These library tests need no display,
 socket, dictionary or external process.
 
 ## Private socket publication prerequisite
@@ -243,7 +320,7 @@ native editor-control endpoint or an adversarial same-UID race proof.
 `control_worker::Worker::start` takes an already admitted `Socket`. One named
 thread owns the listener and every accepted connection; no socket I/O occurs
 in `try_request` or `Job::respond`. The thread has no editor reference or
-model lock. This is not yet wired to the native window or command line.
+model lock. The native adapter above owns UI dispatch and command-line opt-in.
 
 Admit at most eight connections. When all slots are occupied, leave further
 clients in the kernel listener backlog; do not create descriptors, threads or

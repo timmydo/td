@@ -49,8 +49,8 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-No GPU renderer, remote socket or td-mail integration is
-claimed yet. Do not set
+Read-only native control is available explicitly; remote edits, GPU rendering
+and td-mail integration remain unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
@@ -69,19 +69,38 @@ logical chords; `ui.rs` owns input/view state; and `replay.rs` feeds that same
 controller with framed commands.
 The safe `control` library supplies one-frame decoding and read-only
 controller state/text queries using the same serializers as replay. See
-[CONTROL.md](CONTROL.md) for exact fields and bounds. No native control
-listener or `--control-socket` option is available yet; native state and remote
-mutation remain later work.
-The separate `control_socket` prerequisite publishes a private Linux Unix
-listener only when explicitly called by a library user. It checks directory
+[CONTROL.md](CONTROL.md) for exact fields and bounds. The experimental
+`--window --control-socket PATH` option connects state/text inspection and
+coarse native modal/job/spelling flags; remote mutation remains later work.
+The separate `control_socket` library publishes a private Linux Unix
+listener only when explicitly requested. It checks directory
 ownership/permissions, refuses symlinks and existing endpoints, and pins
 parent/socket inodes for checked cleanup. It has no request worker or editor
-access and is not connected to the executable yet; CONTROL.md specifies the
+access itself; CONTROL.md specifies the
 absolute-path limits and trust boundary.
 The `control_worker` library adds a bounded read-only request thread with
 eight connection slots, typed nonblocking UI queues, whole-request deadlines
-and joined shutdown. It remains unwired to the native window; there is no
-remote-control command-line option yet.
+and joined shutdown. The native adapter polls at most two jobs per outer
+event-loop turn without performing socket I/O on the UI thread. Opting in
+caps the receive wait at 10 ms even while idle; the default window does not
+incur this polling cost.
+
+For an explicitly controllable local window:
+
+```sh
+editor_control_dir=$(mktemp -d /tmp/td-editor-control.XXXXXX)
+td-editor/target/release/td-editor --window --control-socket "$editor_control_dir/socket" -- notes.txt
+```
+
+The parent must already be caller-owned mode 0700, with caller/root-owned
+trusted ancestors. Unknown owners in a rootless container remain refused;
+there is no environment override. No endpoint is enabled without the option.
+Its mode-0600 socket permits reading all open tabs, including unsaved text.
+Sharing it across a jail boundary is a separate grant. Socket existence is
+not readiness; ask for state, and do not treat its generation as frame proof.
+Normal shutdown removes only the owned endpoint, not its parent directory.
+After abnormal termination, inspect any stale endpoint before removing it.
+
 `tests/core.rs` covers byte round trips, stale/invalid commands, limits,
 save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector

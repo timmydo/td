@@ -337,3 +337,41 @@ fn control_worker_keeps_bounded_nonblocking_transport_separate_from_editor_state
         assert!(!production.contains(forbidden), "{forbidden}");
     }
 }
+
+#[test]
+fn native_control_is_opt_in_read_only_and_bounded_per_outer_turn() {
+    let source = include_str!("../src/wayland.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    assert_eq!(production.matches("self.control_tick();").count(), 1);
+    let end_turn = production.split("fn end_turn(").nth(1).unwrap();
+    let end_turn = end_turn.split("\n    fn ").next().unwrap();
+    assert!(end_turn.contains("self.control_tick();"));
+    let poll = production.split("fn control_tick(").nth(1).unwrap();
+    let poll = poll.split("\n    fn ").next().unwrap();
+    assert!(production.contains("const CONTROL_JOBS_PER_TURN: usize = 2;"));
+    for pin in [
+        "if self.closed",
+        "Duration::from_millis(10)",
+        "for _ in 0..CONTROL_JOBS_PER_TURN",
+        "worker.try_request()",
+        "self.control_response(job.request())",
+        "job.respond(response.as_bytes())",
+    ] {
+        assert!(poll.contains(pin), "{pin}");
+    }
+    for forbidden in [".read(", ".write(", ".recv(", "ui.dispatch("] {
+        assert!(!poll.contains(forbidden), "{forbidden}");
+    }
+    assert!(production.contains("control: None"));
+    assert!(production.contains("fn control_response(&self,"));
+    assert!(production.contains("let response = request.response(&self.ui);"));
+    let startup = production.split("pub fn file_window(").nth(1).unwrap();
+    assert!(startup.find("Socket::bind").unwrap() < startup.find("prepare_files(").unwrap());
+    assert!(startup.contains("window.finish_control(result)"));
+    let cli = include_str!("../src/main.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert!(cli.contains("let mut control = None;"));
+    assert!(cli.contains("!literal && arg == \"--control-socket\""));
+}
