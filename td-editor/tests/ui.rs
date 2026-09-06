@@ -77,6 +77,43 @@ fn pixels(ui: &Controller) -> Vec<u8> {
 }
 
 #[test]
+fn cancel_input_preserves_document_focus_and_selection_but_ends_prefix_mark_drag() {
+    let mut ui = loaded("abcdef");
+    ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+    select(&mut ui, 1, 4);
+    key(&mut ui, "C-x");
+    let before = format!("{:?}", ui.editor());
+    assert_eq!(ui.dispatch(Event::CancelInput).unwrap(), Outcome::Changed);
+    assert_eq!(format!("{:?}", ui.editor()), before);
+    assert!(!ui.keys().pending());
+    assert!(ui.focused());
+    assert_eq!(ui.dispatch(Event::CancelInput).unwrap(), Outcome::Ignored);
+    key(&mut ui, "C-Space");
+    ui.dispatch(Event::CancelInput).unwrap();
+    key(&mut ui, "Right");
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 5,
+            caret: 5
+        }
+    );
+    pointer(&mut ui, PointerPhase::Press, 8, 48, false);
+    ui.dispatch(Event::CancelInput).unwrap();
+    assert_eq!(
+        pointer(&mut ui, PointerPhase::Move, 48, 48, false),
+        Outcome::Ignored
+    );
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 0,
+            caret: 0
+        }
+    );
+}
+
+#[test]
 fn vertical_motion_retains_desired_column_and_shift_selection() {
     let mut ui = loaded("abcdef\nx\nabcdef");
     select(&mut ui, 5, 5);

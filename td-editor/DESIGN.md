@@ -28,8 +28,9 @@ keys, pointer selection, resize, scrolling and headless replay.
 The safe reference renderer streams bitmap scene operations into a
 caller-owned XRGB8888 buffer. `--preview` emits a fixed headless PPM fixture;
 it is not an interactive window. Menus and status are drawn; tab clicks select
-tabs and close marks emit typed requests, but visible menus/dialogs and the
-remaining adapters remain future work. `--window-preview` now presents
+tabs and close marks emit typed requests. Native menus and file dialogs are
+connected by the window adapter; remaining adapters are future work.
+`--window-preview` now presents
 editable scratch tabs through the real Wayland transport and SHM lifecycle.
 It accepts keyboard input in both profiles, but cannot save or open user
 documents. Dirty window close requires explicit discard; process termination
@@ -160,7 +161,8 @@ clamps out-of-surface motion to the viewport edges, and ends on release.
 There is no drag autoscroll yet. Blank rows below EOF select document end.
 Typing, semantic edits, tab/profile changes, effective resize/scroll and focus loss
 cancel dragging. Presses outside document cells or tab hit areas are ignored;
-menus are not interactive yet. Drawing and hit testing share `Geometry::tab`,
+menu popups are owned by the native adapter, not this controller. Drawing
+and hit testing share `Geometry::tab`,
 `tab_close` and `status` rectangles for the hidden-tab slice, close area and
 status-overlap precedence on tiny windows. A clamped scroll is ignored without
 cancelling a drag.
@@ -858,8 +860,8 @@ Prompts and notices share the existing clipped top-six-document-row overlay.
 When input is unavailable or not synchronized, the prompt instead prefixes
 readiness instructions without erasing the entered path.
 Path and confirmation dialogs remain keyboard-only. Native pointer selection,
-tab clicks and scrolling follow the pointer contract below; clickable menus
-and clipboard remain unimplemented.
+tab clicks and scrolling follow the pointer contract below. Menus use the
+native menu contract; clipboard remains unimplemented.
 
 `session::Session` keeps FileId-to-TabId associations and an opaque model save
 token per pending save. One `std::thread::Builder` worker exclusively owns
@@ -1038,8 +1040,8 @@ milestone below. It opens one 800x600 scale-1 xdg toplevel and two initially
 clean fixture tabs through `ui::Controller` and the reference renderer.
 `--window-preview --keys=windows|emacs` selects the profile (Windows default).
 The title and fixture say NO SAVE. Typing, selection, visual motion, undo,
-tab switching, native pointer input and core commands are connected. Menus
-are not connected; unavailable commands produce a visible, bounded notice,
+tab switching, native pointer input, menus and core commands are connected.
+Unavailable commands produce a visible, bounded notice,
 retained until Escape/C-g or another explicit notice-producing action.
 Notices wrap over the document's top six rows and clip on small surfaces;
 they do not mutate document text. The binary refuses filenames and ordinary
@@ -1245,6 +1247,75 @@ readiness, capability removal/reacquisition, retired events, modal safety,
 tab close, frame target binding and cursor requests/descriptor bytes. The
 cursor follows the core [Wayland pointer protocol](https://wayland.freedesktop.org/docs/html/apa.html#protocol-spec-wl_pointer).
 These are not yet a live hardware pointer or jail integration oracle.
+
+### Implemented native menu contract
+
+File, Edit, Format and Help open with a left-button press on their header.
+F10 opens File in both key profiles; F10, Escape or C-g closes an open menu
+without changing document selection. Left/Right switches groups and Up/Down
+moves among enabled items, wrapping within that group. Return or Space
+activates the selected item. Repeated keys never activate or navigate menus.
+Other keys are consumed while open, not interpreted as text or Emacs prefixes.
+Opening cancels pending key prefix, Emacs mark, controller drag and native
+held/repeat/wheel state, preserving the document and selection. The new
+controller CancelInput event performs this reset without a fake focus loss.
+
+File exposes New, Open, Save, Save As, Close Tab and Quit. Edit exposes Undo,
+Redo, Select All and the two key profiles, with clipboard commands visibly
+disabled as unavailable. Format exposes Soft Wrap, Auto Fill and Fill
+Paragraph; Spelling is visibly disabled until its adapter exists. Help
+shows an experimental-build About notice. A plus marks the active key profile
+or enabled format toggle. Undo/Redo availability reflects the captured
+history depth. Scratch mode disables Open/Save/Save As rather than pretending
+to persist its text. Only existing bindings are shown: Windows uses Ctrl+
+labels, Emacs uses its C-/M- chord notation, and unbound items have no shortcut.
+Find/Replace, Go To Line, fill-column entry and command completion remain
+later prompt increments, not hidden implementations behind these menus.
+
+Menu actions dispatch the existing controller events, file-path requests and
+close coordinators. Keyboard, tab-close marks and menus share one native
+close-tab handler. No menu creates a discard or Reload permit, writes files,
+marks a snapshot saved or bypasses the pending-I/O guard. Save on Untitled
+still enters Save As; Quit/Close still asks about dirty text. Path and
+confirmation dialogs take precedence, so F10 and clicks cannot open a menu
+through a modal question.
+
+Menu state pins the active tab/revision and key profile at opening. Admission
+rechecks them and the popup geometry before executing an item; a stale menu
+dismisses visibly without issuing the command. File completion dismisses an
+open menu before showing its result or switching tabs. Configure, keyboard
+map replacement and keyboard-focus loss dismiss menus; pointer leave also
+dismisses without altering keyboard focus. The first press outside a popup
+only dismisses it; it cannot click through to text or tabs. Disabled entries
+do nothing and stay open. Pointer motion highlights only enabled rows; wheel
+events are consumed. Selecting another header switches menus, and selecting
+the current header closes it.
+
+Activation uses a separate press on an item after opening the header;
+press-drag-release menu selection is not implemented. Release cannot
+activate a row or resume a document drag behind the dismissed popup.
+
+Each popup is 320 font pixels wide with 24-pixel rows, scaled by Geometry's
+integer scale. The complete menu must fit above the status row: the minimum
+size is 320 by (48 + 24 times item count), multiplied by scale. Horizontal
+placement clamps to the right edge. A too-small surface refuses to open the
+popup and displays an enlargement notice; invisible/clipped rows can never
+be activated. A clipped-menu refusal does not reset pending prefix/mark/drag.
+A new physical key press still cancels native repeat before menu admission,
+as it does for every key. Escape/C-g with a menu open dismisses both the
+menu and any underlying notice; F10 only toggles the menu. At most eight
+rows exist, with static bounded labels, and painting and hit tests use the
+same panel geometry. Header geometry derives
+from the reference renderer's single menu-bar string. Colors remain warm
+and muted, with dim disabled text and a highlighted selected row. The core
+headless preview's closed menu bar has unchanged pixels.
+
+Pure tests pin panel bounds and row hits at scales 1-4, disabled navigation,
+shortcut widths and header mapping. Controller tests pin prefix/mark/drag
+cancellation with selection retained. Fake-compositor tests drive physical
+F10, mouse menus, disabled/outside/repeated input, profile/format changes,
+Save and dirty-close flows, stale targets, resize and late file completion.
+This is not a clipboard, remote-control socket, GPU or jail milestone.
 
 ### Version-1 compatibility target
 

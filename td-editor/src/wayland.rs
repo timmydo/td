@@ -341,6 +341,7 @@ struct Window {
     closing_save: bool,
     conflict: Option<Conflict>,
     reloading: Option<Target>,
+    menu: Option<crate::menu::Menu>,
 }
 
 enum PathAction {
@@ -376,7 +377,7 @@ impl PathPrompt {
 impl Window {
     fn new(stream: UnixStream, temporary: PathBuf) -> Result<Self> {
         let mut ui = Controller::default();
-        let first = match ui.dispatch(Event::Load(b"td-editor scratch preview -- NO SAVE\n\nYou can type, select, undo and switch tabs with the keyboard.\nCtrl+Tab switches tabs. Emacs: M-q fills a paragraph.\n\nMouse selection, tab clicks and scrolling work. Open, Save, menus, clipboard and spelling are not connected.\nUse --keys=emacs or --keys=windows at startup.\n\nUnicode scalars: caf\xc3\xa9, na\xc3\xafve, \xce\xbb.\n\tTabs advance to eight-column stops.\n\nClosing dirty text asks for explicit discard. Do not use as $EDITOR.\nProcess termination still loses scratch text; keep nothing important here.\n")).map_err(error)? {
+        let first = match ui.dispatch(Event::Load(b"td-editor scratch preview -- NO SAVE\n\nYou can type, select, undo and switch tabs with the keyboard.\nCtrl+Tab switches tabs. Emacs: M-q fills a paragraph.\n\nMouse selection, tab clicks, scrolling and menus work. F10 opens menus. Open, Save, clipboard and spelling are not connected.\nUse --keys=emacs or --keys=windows at startup.\n\nUnicode scalars: caf\xc3\xa9, na\xc3\xafve, \xce\xbb.\n\tTabs advance to eight-column stops.\n\nClosing dirty text asks for explicit discard. Do not use as $EDITOR.\nProcess termination still loses scratch text; keep nothing important here.\n")).map_err(error)? {
             Outcome::Created(tab) => tab, _ => return Err("preview fixture creation".into()),
         };
         let second = match ui
@@ -427,6 +428,7 @@ impl Window {
             closing_save: false,
             conflict: None,
             reloading: None,
+            menu: None,
         })
     }
 
@@ -619,6 +621,7 @@ impl Window {
                 return Ok(());
             }
             (XDG_SURFACE, 0) if self.bound => {
+                self.menu = None;
                 let serial = cursor.u32()?;
                 if let Some((width, height)) = self.pending_size.take() {
                     let current = self.ui.geometry();
@@ -738,6 +741,7 @@ impl Window {
     }
 
     fn close(&mut self) {
+        self.menu = None;
         self.stop_pointer();
         self.input.cancel_repeat();
         if self.files.is_some() {
@@ -754,6 +758,7 @@ impl Window {
     }
 
     fn release_keyboard(&mut self) -> Result<()> {
+        self.menu = None;
         if let Some(device) = self.device.take() {
             self.connection.words(device, 0, &[])?;
             self.set_kind(device, Kind::RetiredKeyboard)?;
@@ -815,13 +820,30 @@ impl Window {
                 self.show_cursor()?;
             }
             P::Leave(_) => {
+                self.dirty |= self.menu.take().is_some();
                 self.pointer.enter = None;
                 self.stop_pointer();
             }
             P::Motion(x, y) => {
                 self.pointer.x = x;
                 self.pointer.y = y;
-                if self.pointer.held {
+                if let Some(menu) = &mut self.menu {
+                    if let Some(index) = menu.hit(
+                        self.ui.geometry(),
+                        i64::from(x).div_euclid(256),
+                        i64::from(y).div_euclid(256),
+                    ) {
+                        if menu
+                            .group
+                            .items()
+                            .get(index)
+                            .is_some_and(|item| menu.enabled(*item))
+                        {
+                            self.dirty |= menu.selected != index;
+                            menu.selected = index;
+                        }
+                    }
+                } else if self.pointer.held {
                     self.pointer_action(crate::ui::PointerPhase::Move)?;
                 }
             }
@@ -839,7 +861,7 @@ impl Window {
                 }
             }
             P::Axis(..) | P::Source(_) | P::Stop(_) | P::Discrete(..)
-                if self.pointer.enter.is_some() && !self.pointer_modal() =>
+                if self.pointer.enter.is_some() && !self.pointer_modal() && self.menu.is_none() =>
             {
                 if self.pointer.wheel_target.is_none() {
                     let target = self.ui.editor().active().and_then(|tab| {
@@ -884,6 +906,15 @@ impl Window {
     }
 
     fn pointer_action(&mut self, phase: crate::ui::PointerPhase) -> Result<()> {
+        let raw_x = i64::from(self.pointer.x).div_euclid(256);
+        let raw_y = i64::from(self.pointer.y).div_euclid(256);
+        if phase == crate::ui::PointerPhase::Press && self.menu_pointer(raw_x, raw_y)? {
+            self.pointer.held = false;
+            return Ok(());
+        }
+        if self.menu.is_some() {
+            return Ok(());
+        }
         let Some(tab) = self.ui.editor().active() else {
             return Ok(());
         };
@@ -996,6 +1027,7 @@ impl Window {
             if !active {
                 return Ok(());
             }
+            self.menu = None;
             self.input.map = None;
             self.input.cancel_repeat();
             self.input.synchronized = false;
@@ -1035,6 +1067,7 @@ impl Window {
                     return Err("keyboard leave for unknown surface".into());
                 }
                 self.input.focus(&[], false)?;
+                self.menu = None;
                 self.ui.dispatch(Event::Focus(false)).map_err(error)?;
                 self.dirty = true;
             }
@@ -1088,6 +1121,16 @@ impl Window {
         }
         if self.conflict.is_some() || self.reloading.is_some() {
             self.conflict_chord(chord, repeated);
+            return Ok(false);
+        }
+        if self.menu.is_some() {
+            self.menu_chord(chord, repeated)?;
+            return Ok(false);
+        }
+        if chord == "F10" {
+            if !repeated {
+                self.open_menu(crate::menu::Group::File)?;
+            }
             return Ok(false);
         }
         if matches!(chord, "Escape" | "C-g") && self.notice.take().is_some() {
@@ -1152,6 +1195,7 @@ impl Window {
             .as_mut()
             .and_then(|files| files.poll(&mut self.ui))
         {
+            self.menu = None;
             if self.ui.editor().active() != active {
                 self.input.cancel_repeat();
             }
@@ -1263,6 +1307,9 @@ impl Window {
         };
         if let Some(notice) = notice {
             paint_notice(&mut raster, geometry, notice);
+        }
+        if let Some(menu) = &self.menu {
+            menu.paint(&mut raster, geometry);
         }
         let buffer = self.buffers.get(index).ok_or("buffer slot")?;
         buffer.file.write_all_at(&self.pixels, 0).map_err(error)?;
@@ -1383,6 +1430,226 @@ impl Window {
 }
 
 impl Window {
+    fn open_menu(&mut self, group: crate::menu::Group) -> Result<()> {
+        if self.pointer_modal() {
+            return Ok(());
+        }
+        let Some(tab) = self.ui.editor().active() else {
+            return Ok(());
+        };
+        let doc = self.ui.editor().document(tab).map_err(error)?;
+        let (undo, redo) = doc.history_depth();
+        let mut menu = crate::menu::Menu {
+            group,
+            selected: 0,
+            target: Target {
+                tab,
+                revision: doc.revision(),
+            },
+            profile: self.ui.keys().profile(),
+            file_window: self.files.is_some(),
+            undo: undo != 0,
+            redo: redo != 0,
+            auto_fill: doc.auto_fill(),
+            wrap: self.ui.tab_view(tab).map_err(error)?.soft_wrap,
+        };
+        if menu.panel(self.ui.geometry()).is_none() {
+            self.menu = None;
+            self.notify(
+                "Enlarge the window to show the complete menu. Keyboard commands remain available.",
+            );
+            return Ok(());
+        }
+        if let Err(e) = self.ui.dispatch(Event::CancelInput) {
+            self.notify(format!("Menu refused: {e}"));
+            return Ok(());
+        }
+        self.stop_pointer();
+        self.input.cancel_repeat();
+        if menu
+            .group
+            .items()
+            .first()
+            .is_some_and(|item| !menu.enabled(*item))
+        {
+            menu.step(false);
+        }
+        self.menu = Some(menu);
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn menu_valid(&self) -> bool {
+        self.menu.as_ref().is_some_and(|menu| {
+            self.ui.editor().active() == Some(menu.target.tab)
+                && self.ui.keys().profile() == menu.profile
+                && self
+                    .ui
+                    .editor()
+                    .document(menu.target.tab)
+                    .is_ok_and(|doc| doc.revision() == menu.target.revision)
+                && menu.panel(self.ui.geometry()).is_some()
+        })
+    }
+
+    fn menu_pointer(&mut self, x: i64, y: i64) -> Result<bool> {
+        if let Some(group) = crate::menu::header(self.ui.geometry(), x, y) {
+            if self.menu.as_ref().is_some_and(|menu| menu.group == group) {
+                self.menu = None;
+                self.dirty = true;
+            } else {
+                self.open_menu(group)?;
+            }
+            return Ok(true);
+        }
+        let Some(menu) = &self.menu else {
+            return Ok(false);
+        };
+        if let Some(index) = menu.hit(self.ui.geometry(), x, y) {
+            self.activate_menu(index)?;
+        } else {
+            self.menu = None;
+            self.dirty = true;
+        }
+        Ok(true)
+    }
+
+    fn menu_chord(&mut self, chord: &str, repeated: bool) -> Result<()> {
+        if repeated {
+            return Ok(());
+        }
+        if matches!(chord, "Escape" | "C-g" | "F10") {
+            self.menu = None;
+            if chord != "F10" {
+                self.notice = None;
+            }
+            self.dirty = true;
+            return Ok(());
+        }
+        if !self.menu_valid() {
+            self.menu = None;
+            self.notify("Menu cancelled: document changed. Open the menu again.");
+            return Ok(());
+        }
+        let Some(menu) = &mut self.menu else {
+            return Ok(());
+        };
+        match chord {
+            "Up" | "Down" => {
+                menu.step(chord == "Up");
+                self.dirty = true;
+            }
+            "Left" | "Right" => {
+                let count = crate::menu::Group::ALL.len();
+                let index =
+                    (menu.group.index() + if chord == "Left" { count - 1 } else { 1 }) % count;
+                let group = crate::menu::Group::ALL
+                    .get(index)
+                    .copied()
+                    .ok_or("menu group")?;
+                self.open_menu(group)?;
+            }
+            "Return" | "Space" => {
+                let index = menu.selected;
+                self.activate_menu(index)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn activate_menu(&mut self, index: usize) -> Result<()> {
+        use crate::menu::Item;
+        if !self.menu_valid() {
+            self.menu = None;
+            self.notify("Menu cancelled: document changed. Open the menu again.");
+            return Ok(());
+        }
+        let Some(menu) = &self.menu else {
+            return Ok(());
+        };
+        let Some(item) = menu.group.items().get(index).copied() else {
+            return Ok(());
+        };
+        if !menu.enabled(item) {
+            return Ok(());
+        }
+        let Target { tab, revision } = menu.target;
+        let wrap = menu.wrap;
+        let auto_fill = menu.auto_fill;
+        self.menu = None;
+        self.stop_pointer();
+        self.input.cancel_repeat();
+        self.dirty = true;
+        let event = match item {
+            Item::New => Event::New,
+            Item::Open | Item::Save | Item::SaveAs => {
+                self.file_request(
+                    match item {
+                        Item::Open => "open",
+                        Item::Save => "save",
+                        _ => "save-as",
+                    },
+                    tab,
+                    revision,
+                );
+                return Ok(());
+            }
+            Item::Close => {
+                self.close_tab(tab, revision);
+                return Ok(());
+            }
+            Item::Quit => {
+                self.close();
+                return Ok(());
+            }
+            Item::Undo => Event::Edit {
+                tab,
+                revision,
+                command: crate::model::Command::Undo,
+            },
+            Item::Redo => Event::Edit {
+                tab,
+                revision,
+                command: crate::model::Command::Redo,
+            },
+            Item::SelectAll => Event::Edit {
+                tab,
+                revision,
+                command: crate::model::Command::Select(crate::model::Selection {
+                    anchor: 0,
+                    caret: self.ui.editor().document(tab).map_err(error)?.text().len(),
+                }),
+            },
+            Item::Windows => Event::Profile(Profile::Windows),
+            Item::Emacs => Event::Profile(Profile::Emacs),
+            Item::Wrap => Event::Wrap {
+                tab,
+                revision,
+                enabled: !wrap,
+            },
+            Item::AutoFill => Event::Edit {
+                tab,
+                revision,
+                command: crate::model::Command::AutoFill(!auto_fill),
+            },
+            Item::Fill => Event::Edit {
+                tab,
+                revision,
+                command: crate::model::Command::FillParagraph,
+            },
+            Item::About => {
+                self.notify("td-editor: experimental Wayland text editor. Pure std Rust; bitmap Unifont, warm palette. No clipboard, spelling or recovery yet. Do not use as $EDITOR. F10 opens menus.");
+                return Ok(());
+            }
+            Item::Cut | Item::Copy | Item::Paste | Item::Spell => return Ok(()),
+        };
+        if let Err(detail) = self.ui.dispatch(event) {
+            self.notify(format!("Menu command refused: {detail}"));
+        }
+        Ok(())
+    }
+
     fn close_tab(&mut self, tab: crate::model::TabId, revision: u64) {
         if self.files.is_some() {
             self.start_close(Scope::Tab { tab, revision });
@@ -1402,6 +1669,7 @@ impl Window {
     }
 
     fn start_close(&mut self, scope: Scope) {
+        self.menu = None;
         self.stop_pointer();
         self.input.cancel_repeat();
         if self.closing.is_some() {
@@ -1695,6 +1963,7 @@ impl Window {
     }
 
     fn file_request(&mut self, name: &str, tab: crate::model::TabId, revision: u64) -> bool {
+        self.menu = None;
         self.stop_pointer();
         let Some(files) = &mut self.files else {
             return false;
@@ -1998,7 +2267,7 @@ pub fn file_window(profile: Profile, paths: Vec<PathBuf>) -> io::Result<()> {
         window.ui = ui;
         window.labels.clear();
         window.files = Some(files);
-        window.notify("Experimental file window. Open/Save/Save As work; no mouse, clipboard, spelling or recovery. Not ready for $EDITOR.");
+        window.notify("Experimental file window. Open/Save/Save As, mouse and menus work; no clipboard, spelling or recovery. Not ready for $EDITOR.");
         let result = window.run();
         if result.is_err() && window.files.as_ref().is_some_and(|files| files.busy()) {
             return Err(format!("{}; file operation was pending and may have published. Verify the destination; unsaved edits are not recovered.", result.err().unwrap_or_default()));
@@ -2617,6 +2886,262 @@ mod tests {
         w.labels.clear();
         w.files = Some(crate::session::Session::start().unwrap());
         (w, peer)
+    }
+
+    fn menu_click(w: &mut Window, group: crate::menu::Group, index: usize) {
+        let header = w.ui.geometry().menu(group.index()).unwrap();
+        pointer_move(w, header.x, header.y);
+        pointer_button(w, true);
+        pointer_button(w, false);
+        let panel = w.menu.as_ref().unwrap().panel(w.ui.geometry()).unwrap();
+        pointer_move(w, panel.x + 4, panel.y + index as i64 * 24 + 4);
+        pointer_button(w, true);
+        pointer_button(w, false);
+    }
+
+    #[test]
+    fn menus_use_mouse_and_f10_without_editing_on_cancel_or_disabled_items() {
+        use crate::menu::{Group, Item};
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, _peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            let tab = w.ui.editor().active().unwrap();
+            w.chord("x", false).unwrap();
+            pointer_enter(&mut w);
+            let before = format!("{:?}", w.ui.editor());
+            if profile == Profile::Emacs {
+                w.chord("C-x", false).unwrap();
+            }
+            let device = w.device.unwrap();
+            key(&mut w, device, 68); // F10 through the real keymap.
+            assert_eq!(w.menu.as_ref().unwrap().group, Group::File);
+            assert!(!w.ui.keys().pending());
+            w.chord("Return", true).unwrap();
+            assert_eq!(w.ui.editor().tabs().count(), 1);
+            w.chord("Escape", false).unwrap();
+            assert_eq!(format!("{:?}", w.ui.editor()), before);
+            menu_click(&mut w, Group::Edit, 2); // Disabled Cut.
+            assert!(w.menu.is_some());
+            assert_ne!(w.menu.as_ref().unwrap().selected, 2);
+            assert_eq!(format!("{:?}", w.ui.editor()), before);
+            // First click outside a popup only dismisses; it does not move
+            // the document caret or start a drag under the old menu.
+            pointer_move(&mut w, 700, 500);
+            pointer_button(&mut w, true);
+            pointer_button(&mut w, false);
+            assert!(w.menu.is_none());
+            assert_eq!(format!("{:?}", w.ui.editor()), before);
+            w.open_menu(Group::Edit).unwrap();
+            w.chord("Down", false).unwrap(); // Redo/Cut/Copy/Paste disabled.
+            let menu = w.menu.as_ref().unwrap();
+            assert_eq!(
+                menu.group.items().get(menu.selected),
+                Some(&Item::SelectAll)
+            );
+            w.chord("Return", false).unwrap();
+            assert_eq!(
+                w.ui.editor().document(tab).unwrap().selection(),
+                crate::model::Selection {
+                    anchor: 0,
+                    caret: 1
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn menus_change_profiles_and_format_modes_through_controller_commands() {
+        use crate::menu::Group;
+        let (mut w, _peer) = file_dialog_fixture();
+        pointer_enter(&mut w);
+        let tab = w.ui.editor().active().unwrap();
+        w.ui.dispatch(Event::Edit {
+            tab,
+            revision: 0,
+            command: crate::model::Command::Insert("one two three four five six".into()),
+        })
+        .unwrap();
+        w.ui.dispatch(Event::Edit {
+            tab,
+            revision: 1,
+            command: crate::model::Command::FillColumn(20),
+        })
+        .unwrap();
+        menu_click(&mut w, Group::Edit, 7);
+        assert_eq!(w.ui.keys().profile(), Profile::Emacs);
+        menu_click(&mut w, Group::Format, 0);
+        assert!(!w.ui.tab_view(tab).unwrap().soft_wrap);
+        menu_click(&mut w, Group::Format, 1);
+        assert!(w.ui.editor().document(tab).unwrap().auto_fill());
+        menu_click(&mut w, Group::Format, 2);
+        assert!(w.ui.editor().document(tab).unwrap().text().contains('\n'));
+        menu_click(&mut w, Group::Edit, 0);
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().text(),
+            "one two three four five six"
+        );
+        menu_click(&mut w, Group::Edit, 1);
+        assert!(w.ui.editor().document(tab).unwrap().text().contains('\n'));
+        menu_click(&mut w, Group::Edit, 6);
+        assert_eq!(w.ui.keys().profile(), Profile::Windows);
+        menu_click(&mut w, Group::Help, 0);
+        assert!(w.notice.as_deref().unwrap().contains("experimental"));
+    }
+
+    #[test]
+    fn menus_reuse_file_prompts_and_close_confirmation_without_bypassing_them() {
+        use crate::menu::Group;
+        let directory = DialogDirectory::new();
+        let path = directory.path("menu-file");
+        let (mut w, _peer) = file_dialog_fixture();
+        pointer_enter(&mut w);
+        w.chord("x", false).unwrap();
+        menu_click(&mut w, Group::File, 2); // Untitled Save -> Save As.
+        assert!(w.prompt.is_some() && w.menu.is_none());
+        path_text(&mut w, &path);
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        menu_click(&mut w, Group::File, 0);
+        assert_eq!(w.ui.editor().tabs().count(), 2);
+        w.chord("y", false).unwrap();
+        let before = format!("{:?}", w.ui.editor());
+        menu_click(&mut w, Group::File, 4);
+        assert!(w.closing.is_some());
+        w.chord("F10", false).unwrap();
+        assert!(w.menu.is_none());
+        w.chord("Escape", false).unwrap();
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+        menu_click(&mut w, Group::File, 5);
+        assert!(w.closing.is_some());
+        w.chord("C-d", false).unwrap();
+        assert!(w.closed);
+        assert_eq!(std::fs::read(path).unwrap(), b"x");
+    }
+
+    #[test]
+    fn menus_refuse_clipping_stale_targets_and_late_file_completions_dismiss_them() {
+        use crate::menu::Group;
+        let (mut w, _peer) = file_dialog_fixture();
+        let tab = w.ui.editor().active().unwrap();
+        w.chord("x", false).unwrap();
+        w.open_menu(Group::Edit).unwrap();
+        w.ui.dispatch(Event::Edit {
+            tab,
+            revision: 1,
+            command: crate::model::Command::Insert("y".into()),
+        })
+        .unwrap();
+        let before = format!("{:?}", w.ui.editor());
+        w.activate_menu(7).unwrap();
+        assert!(w.menu.is_none());
+        assert_eq!(w.ui.keys().profile(), Profile::Windows);
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+        configure(&mut w, 319, 600);
+        w.open_menu(Group::File).unwrap();
+        assert!(w.menu.is_none());
+        assert!(w.notice.as_deref().unwrap().contains("Enlarge"));
+        configure(&mut w, 800, 600);
+        w.open_menu(Group::File).unwrap();
+        configure(&mut w, 800, 160);
+        assert!(w.menu.is_none());
+        configure(&mut w, 800, 600);
+        let directory = DialogDirectory::new();
+        let path = directory.path("opened");
+        std::fs::write(&path, b"disk").unwrap();
+        w.files.as_mut().unwrap().open(path).unwrap();
+        w.open_menu(Group::Format).unwrap();
+        w.dirty = false;
+        finish_file(&mut w);
+        assert!(w.menu.is_none());
+        assert!(w.dirty);
+        assert_ne!(w.ui.editor().active(), Some(tab));
+        assert_eq!(w.ui.editor().document(tab).unwrap().text(), "xy");
+    }
+
+    #[test]
+    fn opening_and_cancelling_menus_changes_only_overlay_pixels() {
+        let (mut w, peer) = file_dialog_fixture();
+        w.notice = None;
+        configure(&mut w, 800, 600);
+        w.event(message(SHM, 0, &[1])).unwrap();
+        w.draw().unwrap();
+        drain(&peer);
+        let pixels = w.pixels.clone();
+        let before = format!("{:?}", w.ui.editor());
+        done(&mut w);
+        w.open_menu(crate::menu::Group::Edit).unwrap();
+        w.draw().unwrap();
+        drain(&peer);
+        assert!(w.pixels != pixels);
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+        done(&mut w);
+        w.chord("Escape", false).unwrap();
+        w.draw().unwrap();
+        drain(&peer);
+        assert!(w.pixels == pixels);
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+    }
+
+    #[test]
+    fn keymap_replacement_dismisses_menus_and_repaints() {
+        let (mut w, peer) = file_dialog_fixture();
+        w.open_menu(crate::menu::Group::Edit).unwrap();
+        w.dirty = false;
+        let device = w.device.unwrap();
+        send_map(&mut w, &peer, device, &map_file());
+        assert!(w.menu.is_none());
+        assert!(w.dirty);
+    }
+
+    #[test]
+    fn clipped_menu_preserves_emacs_prefix_and_escape_clears_an_underlying_notice() {
+        let (mut w, _peer) = file_dialog_fixture();
+        w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        configure(&mut w, 320, 160);
+        w.chord("C-x", false).unwrap();
+        w.chord("F10", false).unwrap();
+        assert!(w.menu.is_none());
+        assert!(w.ui.keys().pending());
+        w.chord("C-s", false).unwrap();
+        assert!(w.prompt.is_some());
+        w.chord("Escape", false).unwrap();
+        configure(&mut w, 800, 600);
+        w.notify("Retained notice");
+        w.chord("F10", false).unwrap();
+        w.chord("F10", false).unwrap();
+        assert!(w.menu.is_none() && w.notice.is_some());
+        w.chord("F10", false).unwrap();
+        w.chord("Escape", false).unwrap();
+        assert!(w.menu.is_none() && w.notice.is_none());
+    }
+
+    #[test]
+    fn menus_switch_groups_consume_wheel_and_dismiss_on_pointer_leave() {
+        use crate::menu::Group;
+        let (mut w, _peer) = file_dialog_fixture();
+        pointer_enter(&mut w);
+        let pointer = w.pointer.device.unwrap();
+        w.chord("F10", false).unwrap();
+        w.chord("Left", false).unwrap();
+        assert_eq!(w.menu.as_ref().unwrap().group, Group::Help);
+        w.chord("Right", false).unwrap();
+        assert_eq!(w.menu.as_ref().unwrap().group, Group::File);
+        w.chord("Right", false).unwrap();
+        assert_eq!(w.menu.as_ref().unwrap().group, Group::Edit);
+        let tab = w.ui.editor().active().unwrap();
+        let before = w.ui.tab_view(tab).unwrap();
+        w.event(message(pointer, 8, &[0, 100])).unwrap();
+        w.event(message(pointer, 4, &[0, 0, 10000])).unwrap();
+        w.event(message(pointer, 5, &[])).unwrap();
+        assert!(w.menu.is_some());
+        assert_eq!(w.ui.tab_view(tab).unwrap(), before);
+        assert!(w.pointer.wheel_target.is_none());
+        w.dirty = false;
+        w.event(message(pointer, 1, &[20, SURFACE])).unwrap();
+        assert!(w.menu.is_none() && w.dirty);
+        w.dirty = false;
+        w.event(message(pointer, 1, &[21, SURFACE])).unwrap();
+        assert!(!w.dirty);
     }
 
     struct DialogDirectory(PathBuf);

@@ -79,6 +79,13 @@ pub struct Rect {
 }
 
 impl Rect {
+    pub fn contains(self, x: i64, y: i64) -> bool {
+        x >= self.x
+            && y >= self.y
+            && x < self.x.saturating_add(i64::from(self.width))
+            && y < self.y.saturating_add(i64::from(self.height))
+    }
+
     pub fn intersection(self, other: Self) -> Option<Self> {
         let left = self.x.max(other.x);
         let top = self.y.max(other.y);
@@ -129,6 +136,8 @@ pub struct Geometry {
     scale: Scale,
 }
 
+const MENU_BAR: &str = "File   Edit   Format   Help";
+
 impl Default for Geometry {
     fn default() -> Self {
         Self {
@@ -162,6 +171,23 @@ impl Geometry {
     }
     pub fn scale(self) -> Scale {
         self.scale
+    }
+    pub fn menu(self, index: usize) -> Option<Rect> {
+        let scale = self.scale.value();
+        let mut column = 1;
+        for (i, label) in MENU_BAR.split_inclusive("   ").enumerate() {
+            let columns = label.len();
+            if i == index {
+                return Some(Rect {
+                    x: (column * 8 * scale) as i64,
+                    y: 0,
+                    width: (columns * 8 * scale) as u32,
+                    height: (24 * scale) as u32,
+                });
+            }
+            column += columns;
+        }
+        None
     }
     pub fn bounds(self) -> Rect {
         Rect {
@@ -466,7 +492,7 @@ impl<'a> Scene<'a> {
             sink,
         );
         self.label(
-            "File   Edit   Format   Help".chars(),
+            MENU_BAR.chars(),
             (8 * s, 4 * s),
             Rect {
                 x: 0,

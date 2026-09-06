@@ -15,6 +15,7 @@ pub mod keyboard;
 pub mod keys;
 pub mod layout;
 pub mod model;
+mod menu;
 mod pointer;
 pub mod render;
 pub mod replay;

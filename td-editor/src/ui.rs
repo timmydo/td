@@ -4,7 +4,7 @@
 use crate::keys::{Action, Keymap, Profile};
 use crate::layout::{Affinity, Caret, Metrics, Viewport, CELL_HEIGHT, CELL_WIDTH};
 use crate::model::{Command, Editor, Selection, TabId};
-use crate::render::{Geometry, Label, Rect, Scale, Scene, View};
+use crate::render::{Geometry, Label, Scale, Scene, View};
 use crate::{Error, Result};
 use std::collections::BTreeMap;
 
@@ -72,6 +72,8 @@ pub enum Event<'a> {
     },
     /// End a native drag without changing focus, selection or key prefixes.
     CancelPointer,
+    /// Cancel pending prefix/mark/drag without editing the current selection.
+    CancelInput,
     Focus(bool),
     /// Milliseconds since controller creation. Supply a tick immediately before
     /// each timed input event as well as on timer wakes; there is no ambient clock.
@@ -393,6 +395,15 @@ impl Controller {
             } else {
                 Outcome::Ignored
             }),
+            Event::CancelInput => {
+                let changed = self.keys.pending() || self.mark.is_some() || self.drag.is_some();
+                self.reset_input();
+                Ok(if changed {
+                    Outcome::Changed
+                } else {
+                    Outcome::Ignored
+                })
+            }
             Event::Focus(focused) => {
                 if focused == self.focused {
                     return Ok(Outcome::Ignored);
@@ -575,7 +586,7 @@ impl Controller {
     ) -> Result<Outcome> {
         self.checked(tab, revision, true)?;
         if phase == PointerPhase::Press {
-            if !contains(self.geometry.bounds(), x, y) {
+            if !self.geometry.bounds().contains(x, y) {
                 return Ok(Outcome::Ignored);
             }
             let count = self.editor.tabs().count();
@@ -591,15 +602,15 @@ impl Controller {
                 .find_map(|(index, (id, doc))| {
                     let rect = self.geometry.tab(index, active, count)?;
                     let close = self.geometry.tab_close(index, active, count)?;
-                    contains(rect, x, y).then_some((id, doc.revision(), close))
+                    rect.contains(x, y).then_some((id, doc.revision(), close))
                 });
             // Status is painted last and wins overlaps on tiny surfaces.
-            if contains(self.geometry.status(), x, y) {
+            if self.geometry.status().contains(x, y) {
                 return Ok(Outcome::Ignored);
             }
             if let Some((id, revision, close)) = hit {
                 self.reset_input();
-                if contains(close, x, y) {
+                if close.contains(x, y) {
                     return Ok(Outcome::Request {
                         name: "close-tab",
                         tab: id,
@@ -621,7 +632,7 @@ impl Controller {
         let mut area = self.geometry.document();
         area.width = (columns * CELL_WIDTH * s) as u32;
         area.height = (rows * CELL_HEIGHT * s) as u32;
-        if phase == PointerPhase::Press && !contains(area, x, y) {
+        if phase == PointerPhase::Press && !area.contains(x, y) {
             return Ok(Outcome::Ignored);
         }
         // All cell midpoints are integral font pixels. Ceiling preserves the
@@ -677,11 +688,4 @@ impl Controller {
         self.wake_caret();
         Ok(Outcome::Changed)
     }
-}
-
-fn contains(rect: Rect, x: i64, y: i64) -> bool {
-    x >= rect.x
-        && y >= rect.y
-        && x < rect.x.saturating_add(i64::from(rect.width))
-        && y < rect.y.saturating_add(i64::from(rect.height))
 }

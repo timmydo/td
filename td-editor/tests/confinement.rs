@@ -26,6 +26,7 @@ fn source_inventory_and_allowances_are_closed() {
         "layout.rs",
         "lib.rs",
         "main.rs",
+        "menu.rs",
         "model.rs",
         "pointer.rs",
         "render.rs",
