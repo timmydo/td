@@ -296,18 +296,26 @@ Consequences worth stating plainly:
   which also accepted the empty shadow field without prompting.
 
 TPM credential-store enrollment and boot release are separate root-owned
-operations in td-secret and td-firstboot, specified by `td-secret/DESIGN.md`.
-They do not switch process credentials or authenticate a human. Firstboot
-unseals an explicitly enrolled store into volatile storage before the existing
-auto-login path runs; the TPM policy authenticates selected platform state,
-not that login's user. td-login's session authorization table is unchanged.
-Firstboot also reserves the future compositor, broker, portal, and per-app
-identities in a persistent ledger, without creating accounts or switching
-credentials. It refuses current account records that alias a reservation;
-future activation requires the same service-only class defined here.
-`td-authd/DESIGN.md` specifies that reservation contract.
-FIDO2 release must wait for secure attention and trusted input; no login or
-`su` behavior is a substitute for that future authorization.
+operations in td-secret and td-firstboot, specified by
+`td-secret/DESIGN.md`. They do not switch process credentials or
+authenticate a human. Firstboot unseals an explicitly enrolled store into
+volatile storage before the existing auto-login path runs; the TPM policy
+authenticates selected platform state, not that login's user. td-login's
+session authorization table is unchanged. Firstboot also reserves the future
+compositor, broker, portal, and per-app identities in a persistent ledger,
+without creating accounts or switching credentials. It refuses current
+account records that alias a reservation; future activation requires the
+same service-only class defined here. `td-authd/DESIGN.md` specifies that
+reservation contract. The currently unenabled td-authd terminal launcher
+uses ordinary `exec-as` after a read-only reservation check and
+private-channel authentication. It fixes the human account in root-owned
+service configuration and replaces every standard descriptor before spawning
+this helper. Its unprivileged terminal-exec wrapper refuses a failed
+session-cgroup placement before terminal code runs, and a new process group
+keeps the user terminal independent of the authority generation. This adds
+no credential-switch mechanism or human authentication policy here. FIDO2
+release must wait for secure attention and trusted input; no login or `su`
+behavior is a substitute for that future authorization.
 
 ## 4. Privilege can only be dropped, never gained
 

@@ -2,6 +2,15 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const SOURCES: &[(&str, &str)] = &[
+    ("Cargo.toml", include_str!("../../../td-authd/Cargo.toml")),
+    (
+        "src/launch.rs",
+        include_str!("../../../td-authd/src/launch.rs"),
+    ),
+    (
+        "tests/launch.rs",
+        include_str!("../../../td-authd/tests/launch.rs"),
+    ),
     ("src/main.rs", include_str!("../../../td-authd/src/main.rs")),
     (
         "src/channel.rs",
@@ -165,15 +174,16 @@ mod tests {
     #[test]
     fn staged_sources_match_the_complete_crate_and_have_no_live_templates() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../td-authd");
-        let mut actual = Vec::new();
+        let mut actual = vec!["Cargo.toml".to_string()];
         for directory in ["src", "tests"] {
             for entry in std::fs::read_dir(root.join(directory)).unwrap() {
                 let entry = entry.unwrap();
                 assert!(entry.file_type().unwrap().is_file());
-                actual.push(format!(
-                    "{directory}/{}",
-                    entry.file_name().to_str().unwrap()
-                ));
+                let name = format!("{directory}/{}", entry.file_name().to_str().unwrap());
+                // This standalone QEMU driver is host-only diagnostic code.
+                if name != "tests/launch_vm.rs" {
+                    actual.push(name);
+                }
             }
         }
         let mut embedded: Vec<String> = SOURCES

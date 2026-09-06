@@ -7975,8 +7975,13 @@ service account. The uid-1000 login path is ineligible: it moves into the
 application session cgroup, outside the paired service's leaf. This does not
 provide arbitrary fd-number assignment or named socket activation.
 
-The compositor consumer remains unbuilt. `td-authd` now provides the private
-transport and a `channel-check` proof path, with no operation or consent API.
+The compositor consumer remains unbuilt. `td-authd` provides the private
+transport, a `channel-check` proof path, and a fixed terminal-launch API. The
+root launcher validates the enrolled session and starts only its human
+terminal through td-login; applications receive no authority descriptor. No
+stock unit enables it. This ordinary session operation is not consent, secret
+release, or elevation; the compositor UID/device/socket cutover remains
+required before enabling its client.
 `SO_PEERCRED` on the delivered socketpair identifies its creator, not the
 eventual holder of the opposite endpoint. The transport instead pins a live
 kernel-supplied `SCM_PIDFD` and checks `SCM_CREDENTIALS` on every receive;

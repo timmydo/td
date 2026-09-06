@@ -46,6 +46,34 @@ fn app(name: &str, uid: u32) -> Registry {
 }
 
 #[test]
+fn a_launcher_cannot_enroll_missing_or_new_identities_by_checking_them() {
+    let fixture = Fixture::new();
+    let desired = app("mail", 65537);
+    assert!(fixture.directory.verify_enrolled(&desired).is_err());
+    assert!(!fixture.directory.path(LEDGER).exists());
+    fixture.directory.enroll(&desired).unwrap();
+    let before = fs::read(fixture.directory.path(LEDGER)).unwrap();
+    assert_eq!(
+        fixture.directory.verify_enrolled(&desired).unwrap(),
+        desired
+    );
+    assert!(fixture
+        .directory
+        .verify_enrolled(&app("news", 65538))
+        .is_err());
+    assert!(fixture
+        .directory
+        .verify_enrolled(&app("mail", 65539))
+        .is_err());
+    let removed = Registry::parse(SESSION).unwrap();
+    assert_eq!(
+        fixture.directory.verify_enrolled(&removed).unwrap(),
+        desired
+    );
+    assert_eq!(fs::read(fixture.directory.path(LEDGER)).unwrap(), before);
+}
+
+#[test]
 fn provisioning_is_private_idempotent_and_never_recycles_a_uid() {
     let fixture = Fixture::new();
     let first = app("mail", 65536);

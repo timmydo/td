@@ -4,6 +4,14 @@ use std::path::Path;
 #[test]
 fn the_production_source_and_raw_boundary_are_closed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("autotests = false"));
+    assert_eq!(manifest.matches("[[example]]").count(), 1);
+    assert!(manifest
+        .contains("name = \"terminal-launch-vm\"\npath = \"tests/launch_vm.rs\"\ntest = true"));
+    for target in ["[[bin]]", "[[test]]", "[[bench]]", "[lib]"] {
+        assert!(!manifest.contains(target));
+    }
     let mut files: Vec<String> = std::fs::read_dir(root.join("src"))
         .unwrap()
         .map(|entry| {
@@ -16,8 +24,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
         })
         .collect();
     files.sort();
-    assert_eq!(files, ["channel.rs", "main.rs", "sys.rs"]);
-    for (name, count) in [("main.rs", 1), ("channel.rs", 0), ("sys.rs", 4)] {
+    assert_eq!(files, ["channel.rs", "launch.rs", "main.rs", "sys.rs"]);
+    for (name, count) in [
+        ("main.rs", 1),
+        ("channel.rs", 0),
+        ("sys.rs", 4),
+        ("launch.rs", 0),
+    ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         assert_eq!(source.matches("unsafe").count(), count, "{name}");
         // The first sender is authoritative only when trusted startup has
@@ -33,10 +46,37 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "include!",
             "include_str!",
             "include_bytes!",
+            "println!",
+            "eprintln!",
         ] {
-            assert!(!source.contains(forbidden), "{name}: {forbidden}");
+            if name != "launch.rs"
+                || !["::Command", "::thread", ".spawn(", ".exec("].contains(&forbidden)
+            {
+                assert!(!source.contains(forbidden), "{name}: {forbidden}");
+            }
         }
     }
+    let launch = include_str!("../src/launch.rs");
+    for forbidden in [
+        "thread::spawn",
+        "thread::Builder",
+        "thread::scope",
+        "pre_exec",
+        ".uid(",
+        ".gid(",
+        ".groups(",
+    ] {
+        assert!(!launch.contains(forbidden), "launch.rs: {forbidden}");
+    }
+    assert_eq!(launch.matches("thread::sleep(").count(), 1);
+    assert_eq!(launch.matches(".spawn(").count(), 1);
+    assert_eq!(launch.matches(".exec()").count(), 1);
+    assert_eq!(launch.matches(".process_group(0)").count(), 1);
+    assert_eq!(launch.matches("Command::new(").count(), 3);
+    assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
+    assert_eq!(launch.matches(".stdout(Stdio::null())").count(), 1);
+    assert_eq!(launch.matches(".stderr(Stdio::null())").count(), 1);
+    assert_eq!(fingerprint(launch), LAUNCH_FINGERPRINT);
     let main = include_str!("../src/main.rs");
     assert!(main.starts_with("#![deny(unsafe_code)]"));
     assert_eq!(main.matches("mod channel;").count(), 1);
@@ -83,12 +123,12 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x4502604364ba3cb7,
+        0x9ac6b0aedb4b0204,
         "main.rs: production startup changed"
     );
     assert_eq!(
         fingerprint(channel),
-        0x231d315ff835e41a,
+        0x5f0361594df592f1,
         "channel.rs: production startup changed"
     );
 }
@@ -100,3 +140,5 @@ fn fingerprint(source: &str) -> u64 {
         (hash ^ byte as u64).wrapping_mul(0x100000001b3)
     })
 }
+
+const LAUNCH_FINGERPRINT: u64 = 0xa4a667cc8a5df0dd;

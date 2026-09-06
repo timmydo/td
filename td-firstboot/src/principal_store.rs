@@ -145,6 +145,14 @@ impl Directory {
         Ok(file)
     }
 
+    fn verify_enrolled(&self, desired: &Registry) -> Result<Registry, String> {
+        let prior = Registry::parse(&self.read(LEDGER)?.ok_or("principal ledger is absent")?)?;
+        if prior.enroll(desired)? != prior {
+            return Err("deployment identities have not been enrolled".into());
+        }
+        Ok(prior)
+    }
+
     #[cfg(test)]
     fn enroll(&self, desired: &Registry) -> Result<Registry, String> {
         self.enroll_checked(desired, |_| Ok(()))
@@ -207,7 +215,7 @@ impl Directory {
     }
 }
 
-pub(crate) fn provision(desired: &Registry) -> Result<(), String> {
+fn state_directory() -> Result<Directory, String> {
     let mut status = String::new();
     File::open("/proc/self/status")
         .map_err(|error| error.to_string())?
@@ -243,10 +251,21 @@ pub(crate) fn provision(desired: &Registry) -> Result<(), String> {
             _ => return Err("principal state path is not canonical".into()),
         }
     }
-    root.enroll_checked(desired, |retained| {
+    Ok(root)
+}
+
+pub(crate) fn provision(desired: &Registry) -> Result<(), String> {
+    state_directory()?.enroll_checked(desired, |retained| {
         retained.verify_installed_accounts(desired)
     })?;
     Ok(())
+}
+
+pub(crate) fn check_launch_session(user: &str, owner: u32, compositor: u32) -> Result<(), String> {
+    let desired = Registry::load()?;
+    let prior = state_directory()?.verify_enrolled(&desired)?;
+    prior.verify_installed_accounts(&desired)?;
+    desired.verify_launch_session(user, owner, compositor)
 }
 
 #[cfg(test)]

@@ -135,6 +135,63 @@ fn account_rows(text: &str) -> Result<Vec<Vec<&str>>, String> {
 }
 
 impl Registry {
+    pub fn verify_launch_session(
+        &self,
+        user: &str,
+        owner: u32,
+        compositor: u32,
+    ) -> Result<(), String> {
+        let etc = etc_directory(Path::new("/"), Some((0, 0)))?;
+        self.launch_session(
+            user,
+            owner,
+            compositor,
+            &read_root_file(&etc, "passwd", None)?,
+        )
+    }
+
+    fn launch_session(
+        &self,
+        user: &str,
+        owner: u32,
+        compositor: u32,
+        passwd: &str,
+    ) -> Result<(), String> {
+        if !self
+            .sessions
+            .get(&owner)
+            .is_some_and(|session| session.compositor == compositor)
+        {
+            return Err("launch compositor does not own this session".into());
+        }
+        let mut found = false;
+        for row in account_rows(passwd)? {
+            let [name, "x", uid, gid, _, _, _] = row.as_slice() else {
+                let name: String = row
+                    .first()
+                    .copied()
+                    .unwrap_or("<missing name>")
+                    .chars()
+                    .take(32)
+                    .collect();
+                return Err(format!("invalid launch account record for {name:?}"));
+            };
+            if *name == user {
+                if found
+                    || decimal(uid, 1000..=65533)? != owner
+                    || decimal(gid, 1000..=65533)? != owner
+                {
+                    return Err("launch account has the wrong identity".into());
+                }
+                found = true;
+            }
+        }
+        if !found {
+            return Err("launch account is absent".into());
+        }
+        Ok(())
+    }
+
     pub fn load() -> Result<Self, String> {
         Self::parse(&read_root_file(
             &etc_directory(Path::new("/"), Some((0, 0)))?,

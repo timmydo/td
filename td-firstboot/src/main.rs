@@ -203,7 +203,8 @@ fn usage() -> String {
          provisions this machine's identity under {DEFAULT_STATE_DIR}: {MACHINE_ID}, \
          {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with the application pair, a first \
          configuration for each terminal application under DIR/{APPLICATION_STATE_ROOT}\n  \
-         td-firstboot check-principals ROOT validates staged deployment identities without writing\n"
+         td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
+         td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n"
     )
 }
 
@@ -213,6 +214,11 @@ fn run(args: &[String]) -> Result<(), Failure> {
         Invocation::CheckPrincipals(root) => {
             principals::check_deployment(&root).map_err(Failure::Failed)?;
             return emit("TD-PRINCIPALS-CHECK-OK\n").map_err(Failure::Failed);
+        }
+        Invocation::CheckLaunchSession(user, owner, compositor) => {
+            principal_store::check_launch_session(&user, owner, compositor)
+                .map_err(Failure::Failed)?;
+            return emit("TD-LAUNCH-SESSION-CHECK-OK\n").map_err(Failure::Failed);
         }
         Invocation::Provision(config) => config,
     };
@@ -308,10 +314,45 @@ fn run(args: &[String]) -> Result<(), Failure> {
 enum Invocation {
     Help,
     CheckPrincipals(PathBuf),
+    CheckLaunchSession(String, u32, u32),
     Provision(Config),
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
+    if args
+        .first()
+        .is_some_and(|verb| verb == "check-launch-session")
+    {
+        let [_, user, owner, compositor] = args else {
+            return Err(Failure::Usage(
+                "check-launch-session requires USER UID COMPOSITOR_UID".into(),
+            ));
+        };
+        let number = |text: &str, range: std::ops::RangeInclusive<u32>| {
+            let value = text
+                .parse::<u32>()
+                .map_err(|_| Failure::Usage("invalid launch uid".into()))?;
+            if !range.contains(&value) || value.to_string() != text {
+                return Err(Failure::Usage("noncanonical launch uid".into()));
+            }
+            Ok(value)
+        };
+        // Same name grammar as td-authd terminal-serve; td-login refuses leading hyphens.
+        if user.is_empty()
+            || user.starts_with('-')
+            || user.len() > 32
+            || !user
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+        {
+            return Err(Failure::Usage("invalid launch user".into()));
+        }
+        return Ok(Invocation::CheckLaunchSession(
+            user.clone(),
+            number(owner, 1000..=65533)?,
+            number(compositor, 1..=999)?,
+        ));
+    }
     if args.first().is_some_and(|verb| verb == "check-principals") {
         let [_, root] = args else {
             return Err(Failure::Usage(
@@ -1136,9 +1177,44 @@ mod tests {
     fn config(args: &[&str]) -> Result<Config, Failure> {
         match parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>())? {
             Invocation::Provision(config) => Ok(config),
-            Invocation::Help | Invocation::CheckPrincipals(_) => Err(Failure::Usage(
+            Invocation::Help
+            | Invocation::CheckPrincipals(_)
+            | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
                 "asked for a non-provisioning operation".to_string(),
             )),
+        }
+    }
+
+    #[test]
+    fn launch_session_checks_take_only_the_complete_typed_tuple() {
+        let args = ["check-launch-session", "tester", "1000", "993"].map(String::from);
+        assert!(
+            matches!(parse(&args), Ok(Invocation::CheckLaunchSession(user, 1000, 993)) if user == "tester")
+        );
+        for name in ["123".to_string(), "a".repeat(32)] {
+            let mut valid = args.clone();
+            valid[1] = name;
+            assert!(parse(&valid).is_ok());
+        }
+        let mut too_long = args.clone();
+        too_long[1] = "a".repeat(33);
+        assert!(parse(&too_long).is_err());
+        for count in 1..4 {
+            assert!(parse(&args[..count]).is_err());
+        }
+        let mut extra = args.to_vec();
+        extra.push("--enroll-principals".into());
+        assert!(parse(&extra).is_err());
+        for (field, values) in [
+            (1, ["../root", "x:y", "-tester"]),
+            (2, ["0", "01000", "65534"]),
+            (3, ["0", "0993", "1000"]),
+        ] {
+            for value in values {
+                let mut invalid = args.clone();
+                invalid[field] = value.into();
+                assert!(parse(&invalid).is_err());
+            }
         }
     }
 

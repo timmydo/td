@@ -1,14 +1,29 @@
 #![deny(unsafe_code)]
 
 mod channel;
+mod launch;
 mod sys;
 
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: td-authd channel-check --peer-uid UID";
+const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
+    td-authd terminal-serve --user USER --uid UID --peer-uid UID | \
+    td-authd terminal-exec UID GENERATION HANDLE";
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if let Some((verb, rest)) = arguments.split_first() {
+        if verb == "terminal-exec" {
+            return launch::terminal_exec(rest);
+        }
+        if verb == "terminal-serve" {
+            let config = launch::Config::parse(rest)?;
+            launch::require_launch_startup()?;
+            let channel =
+                channel::Channel::from_stdin(config.peer_uid()).map_err(|e| e.to_string())?;
+            return launch::serve(channel, config);
+        }
+    }
     let [verb, option, value] = arguments else {
         return Err(USAGE.into());
     };

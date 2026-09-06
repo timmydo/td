@@ -2192,7 +2192,7 @@ function-scoped instruction: recvmsg(47), setsockopt(54), getsockopt(55), and
 poll(7). Another function-scoped allowance adopts freshly installed nonnegative
 descriptors into OwnedFd. Safe std owns byte sends, stdin duplication, socket
 timeouts/shutdown, descriptor metadata and every close. Other architectures
-are refused. This prerequisite enables no consent or privileged operation.
+are refused. This prerequisite enables no consent or secret-store operation.
 
 The socket options are fixed to SOL_SOCKET(1), SO_PASSCRED(16)=1,
 SO_PASSPIDFD(76)=1, and SO_PEERCRED(17) with an exact twelve-byte ucred result.
@@ -2215,4 +2215,13 @@ Confinement tests inventory the complete production source, pin keyword counts
 without prose slack, function-only allowances, both bodies, ABI layouts, all
 syscall and option values and production callers. A fifth syscall, new option,
 caller, descriptor consumer or allowance amends this section and
-td-authd/DESIGN.md in the same landing.
+td-authd/DESIGN.md in the same landing. The terminal-launch consumer adds no
+raw syscall or descriptor-adoption surface. Its startup admits only the three
+standard descriptors before the channel greeting. Safe std replaces all three
+with `/dev/null` for every child; the Channel sender-pinning greeting
+precedes the first spawn. The unprivileged terminal-exec path checks its
+already-dropped identity and exact session cgroup before a fixed exec. Safe
+std creates a new process group for the terminal helper; neither path adds
+a raw syscall or credential switch.
+Confinement pins the complete startup and launch sources as well as the raw
+channel boundary.

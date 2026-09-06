@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 const GREETING: &[u8; 8] = b"TDAT001\n";
-const TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_MESSAGE: usize = 4096;
 
 struct Peer {

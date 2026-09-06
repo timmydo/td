@@ -9,6 +9,12 @@ autotests = false
 [package.metadata.td-gate]
 clippy-all-targets = true
 
+# Host-only disposable VM fixture, compiled and tested by cargo test.
+[[example]]
+name = "terminal-launch-vm"
+path = "tests/launch_vm.rs"
+test = true
+
 [workspace]
 
 [lints.clippy]

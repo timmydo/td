@@ -306,3 +306,58 @@ fn staged_configuration_check_is_read_only_and_refuses_substituted_files() {
     fs::set_permissions(etc.join("shadow"), Permissions::from_mode(0o644)).unwrap();
     assert!(check_deployment(&root).is_err());
 }
+
+#[test]
+fn launch_session_binds_the_human_name_uid_gid_and_compositor() {
+    let registry =
+        super::Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
+    let passwd = "root:x:0:0:root:/root:/bin/sh\ntester:x:1000:1000:Test:/home/tester:/bin/sh\n";
+    assert!(registry.launch_session("tester", 1000, 993, passwd).is_ok());
+    for (user, owner, compositor) in [
+        ("root", 1000, 993),
+        ("missing", 1000, 993),
+        ("tester", 1001, 993),
+        ("tester", 1000, 992),
+    ] {
+        assert!(registry
+            .launch_session(user, owner, compositor, passwd)
+            .is_err());
+    }
+    for table in [
+        passwd.replace("1000:1000", "1000:1001"),
+        passwd.replace("1000:1000", "1001:1001"),
+        format!("{passwd}tester:x:1000:1000:Test:/home/tester:/bin/sh\n"),
+    ] {
+        assert!(registry
+            .launch_session("tester", 1000, 993, &table)
+            .is_err());
+    }
+}
+
+#[test]
+fn the_full_account_check_rejects_a_second_name_for_the_human_uid() {
+    let registry = Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
+    let passwd = "root:x:0:0:root:/root:/bin/sh\ntester:x:1000:1000:Test:/home/tester:/bin/sh\n";
+    let group = "root:x:0:\ntester:x:1000:\n";
+    let shadow = "root::1:0:99999:7:::\ntester::1:0:99999:7:::\n";
+    assert!(registry.verify_accounts(passwd, group, shadow).is_ok());
+    assert!(registry
+        .verify_accounts(
+            &format!("{passwd}alias:x:1000:1000:Alias:/home/alias:/bin/sh\n"),
+            group,
+            &format!("{shadow}alias::1:0:99999:7:::\n")
+        )
+        .is_err());
+}
+
+#[test]
+fn malformed_launch_names_have_bounded_escaped_diagnostics() {
+    let registry = Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
+    let table = format!("{}:bad\n", "\u{1b}".repeat(1000));
+    let error = registry
+        .launch_session("tester", 1000, 993, &table)
+        .unwrap_err();
+    assert!(!error.contains('\u{1b}'));
+    assert!(error.len() < 300);
+    assert!(error.contains("invalid launch account record"));
+}

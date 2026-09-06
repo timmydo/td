@@ -1,8 +1,9 @@
 # td-authd
 
-This is the private-channel prerequisite for secure attention and subsequent
-one-operation elevation. It enables no privileged operation, FIDO2 release,
-consent prompt, or public request listener. The image does not yet start it.
+This supplies the private channel and fixed terminal-launch prerequisite for
+secure attention and subsequent one-operation elevation. It enables no secret
+access, FIDO2 release, consent prompt, or public request listener. The image
+does not yet start it or use its terminal launcher.
 The eventual operation policy follows APPLICATIONS.md §L.1 and principle 7:
 one named operation, typed and descriptor-pinned arguments, one token
 assertion bound to that request, no remembered approval. Separate
@@ -21,13 +22,14 @@ The trusted exec chain must complete this greeting before forking, starting
 workers, launching subprocesses, or passing the endpoint elsewhere. The
 first greeting pins its actual sender; the transport cannot identify the
 intended direct child if trusted startup has already delegated the
-descriptor. The current diagnostic has no process-launch or thread path,
-pinned by its confinement tests. Every future consumer must enforce the same
-ordering. The inherited fd 0 remains open and must never reach an untrusted
-child. Authentication pins a process, not its executable: exec retains the
-pin, and same-uid ptrace would retain its authority. Dedicated identities
-and a trusted exec chain are therefore mandatory before any consumer enables
-consent.
+descriptor. The channel diagnostic has no process-launch or thread path.
+Terminal serving checks startup descriptors before the greeting and launches
+children only after it; confinement tests pin that ordering. Every consumer
+must enforce the same ordering. The inherited fd 0 remains open and must
+never reach an untrusted child. Authentication pins a process, not its
+executable: exec retains the pin, and same-uid ptrace would retain its
+authority. Dedicated identities and a trusted exec chain are therefore
+mandatory before any consumer enables consent.
 
 Sender authentication supplies no protection against an inherited endpoint
 reading bytes. A consumer must keep its endpoint exclusive throughout its
@@ -239,3 +241,161 @@ union exceeds its bounds, raise the format's reviewed bounds in a deployment
 update; overflow never silently drops reservations. Without a complete
 ledger, keep the future UID launcher disabled. Console recovery does not
 make an unverified deployment pass the boot oracle.
+
+## Fixed terminal launch prerequisite
+
+`terminal-serve --user USER --uid UID --peer-uid UID` is a root-configured
+consumer of the private channel. It is not enabled in the image yet. The
+compositor must eventually run at its reserved identity and use this channel
+instead of directly creating user processes. The configured application card
+already activates a supervised window; only terminal creation needs this
+request. The existing compositor launch path remains active until that
+atomic UID, device, socket and launch cutover is implemented.
+
+Startup requires all four root uid/gid columns, one thread, and only fd
+0/1/2 inherited from the trusted supervisor. It proves each standard
+descriptor is open before creating the descriptor-directory iterator, which
+must then occupy fd 3. Otherwise a missing standard fd could disguise an
+inherited fd 3 as the iterator. Standard log descriptors must not alias the
+private endpoint, so a diagnostic cannot inject unframed bytes into it.
+Startup also verifies the absence of a controlling terminal in
+/proc/self/stat. These are consumer admission requirements, checked even
+when launched through td-svc's pair-exec path. The daemon then
+completes the Channel sender-pinning greeting before any child is created.
+Its first child runs the immutable `/bin/td-firstboot check-launch-session
+USER UID COMPOSITOR_UID`. This read-only root check runs once per
+generation, requires the persistent ledger to exist, verifies that unioning
+the current deployment would change nothing, and checks current account
+databases against all retained reservations. The named human must have the
+configured uid and primary gid, and that session's compositor must be the
+configured peer uid. Neither startup ordering nor a missing ledger can
+enroll or authorize a launch. The complete account check rejects human UID
+aliases before the tuple check. Account files are immutable deployment
+inputs: a trusted root changing them during a generation is outside this
+contract. In particular, td-login resolves the named account again on each
+launch; startup validation does not pin later account edits.
+
+The validator has a two-second observed completion deadline, measured before
+spawn and shorter than the channel frame deadline. Failure kills and reaps
+the trusted validator and closes the channel. There is no caller-provided
+executable, environment, directory, account, uid or argument vector. All
+children replace stdin, stdout and stderr with `/dev/null`, clear the
+environment, and start from `/`. This also replaces the original private
+endpoint on fd 0: relying only on Channel's CLOEXEC clone would leak
+authority. All subsequently created channel descriptors are CLOEXEC. The
+daemon never passes an inherited root log descriptor to a user program.
+
+Before validation both ends exchange the framed `TDLA001` protocol greeting
+with a final newline. After successful validation the authority sends `80`;
+only then may the peer submit requests. The earlier transport greeting in
+Channel pins the sender before the protocol greeting or any spawn.
+Subsequent payloads are exact byte records:
+
+| Request | Response |
+| --- | --- |
+| `01` | `81` plus a nonzero big-endian u64 process handle |
+| `02` plus that u64 handle | `82 00` running, `82 01` successful exit, or `82 02` failed exit |
+| `03` | `83` heartbeat |
+
+A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
+request, trailing byte, unknown handle, wait error, timeout or transport
+failure ends this channel generation, including ordinary peer EOF. td-svc
+already counts either peer's exit, even zero, as pair failure and applies
+its failure backoff. A malformed request therefore ends the graphical
+session when this pair is enabled. There is no retry authorization after
+a transport error. Successful terminal creation means the fixed credential
+helper was spawned; polling distinguishes a later credential or exec
+failure. A fresh 128-bit kernel-random generation nonce avoids PID reuse
+collisions between terminals that outlive their authority. It is a
+readiness-name identifier, not a secret or authorization token. These
+dynamically launched terminals own their readiness sockets for human-session
+diagnostics; the compositor observes Wayland surfaces and does not probe
+those sockets. The nonce therefore stays private to the launcher and
+terminal, and no reverse traversal grant into the human runtime is required.
+Each generation holds at most sixteen records, including completions the
+peer has not polled. A completion response retires its handle. Handles
+increase without reuse; exhaustion fails before spawn. The peer must send a
+request or heartbeat within each five-second receive deadline.
+
+The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
+terminal-exec UID GENERATION HANDLE` in a new process group. td-login checks
+the human account policy and drops and verifies credentials. Its exact
+environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
+`PATH=/bin`, with no inherited `LANG`, `XDG_RUNTIME_DIR` or
+`WAYLAND_DISPLAY`. The unprivileged terminal-exec entry requires all uid/gid
+columns to equal the selected owner and `/proc/self/cgroup` to be exactly
+`0::/td-user-1000/session`. Ordinary td-login makes placement failure
+nonfatal for console recovery; this wrapper makes it fatal before terminal
+code runs. The current launcher supports only uid 1000, the sole delegation
+configured by td-login.
+
+After that check it execs `/bin/td-term run --socket
+/run/td-compositor/UID/wayland-0 --ready-socket
+/run/user/UID/td-auth-terminal-GENERATION-HANDLE.ready`. No shell command or
+consent operation is involved. Directly invoking terminal-exec cannot change
+credentials or enter a different session. Its membership check verifies
+placement after the trusted credential helper; it is not human
+authorization. Opening one's ordinary terminal is session behavior and opens
+an ordinary shell with the human account's existing authority; it grants
+neither store access nor an elevated shell.
+
+The future cutover must create the compositor-owned runtime directory with
+human traversal and socket access, enable this channel, and atomically
+remove the direct compositor spawner. It must also update the shell's
+Wayland/control socket defaults in td-compositor/src/pty.rs and the jail's
+socket-owner checks. That PTY module constructs a separate fixed shell
+environment, including TERM, TERMINFO, WAYLAND_DISPLAY and XDG_RUNTIME_DIR;
+it does not inherit the five-variable helper environment. The CLI contract
+belongs to `td-compositor/DESIGN.md` and `td-login/THREAT-MODEL.md`. These
+paths are not claimed to work on the current image before that cutover.
+
+Started terminals belong to the human session cgroup and their own process
+group. A paired-authority restart therefore does not terminate them through
+either group. A placement failure creates no terminal. Their completion
+handles expire with the authority generation. The daemon never removes
+readiness paths in the human-owned runtime directory; the terminal owns its
+publication and cleanup. Separate per-application UIDs, resource migration
+and secure attention still precede secret release and elevation.
+
+EOF, malformed requests and unknown handles all fail the paired lifecycle,
+including a double poll of a retired handle. There is no clean-success exit
+that can leave only one authority peer alive, and no soft recovery from a
+caller protocol error. The compositor must serialize requests and discard
+handles when that generation ends. Root diagnostics include validator exit
+status and spawn errors; subprocess stderr remains null. An operator can run
+the fixed read-only firstboot check directly to diagnose its refusal.
+
+Host tests execute a real child through the same descriptor/environment
+sanitizer and verify its inherited kernel descriptors, bounded records,
+terminal argument selection, strict wire records, and completion retirement.
+The target producer runs these tests with source-built Rust. No test or
+terminal-launch success is evidence of FIDO2 authentication or consent.
+
+`td-authd/tests/launch_vm.rs` is a standalone disposable-VM fixture. Compile
+it with host rustc for an installed static target, then run its binary with
+`--run-vm KERNEL AUTHD FIRSTBOOT LOGIN BUSYBOX NEW-LOG`, using absolute
+paths. The supplied production binaries may be source-built target outputs;
+the fixture itself is a host diagnostic, never an input to a target recipe
+or part of an image. It requires td's pidfs-capable kernel and QEMU on the
+host. It proves the real channel-to-validator-to-credential-helper chain,
+verifies the terminal's uid/gid, empty capabilities, independent process
+group, exact session cgroup, five-variable environment and absence of
+inherited authority fds. A wrong sender, missing ledger and failed cgroup
+placement all withhold terminal execution. A missing persistent state
+directory is also refused without recreating it. The fixture's terminal
+stand-in tests the launch boundary; it does not claim a rendered graphical
+terminal or a FIDO2 flow.
+
+Cargo type-checks this fixture as the host-only `terminal-launch-vm`
+example; the recipe compiles production and inline tests directly with rustc
+and does not build Cargo examples. An exact host compilation form is:
+
+```text
+rustc --edition 2021 --target x86_64-unknown-linux-musl -C linker=gcc \
+  td-authd/tests/launch_vm.rs -o /tmp/td-terminal-vm-runner
+```
+
+The host must have that static target and linker installed. `cargo test`
+executes the ordinary suite; its two ignored exec-only fixtures are invoked
+by their parent tests with sanitized descriptors and environment. Running
+all ignored fixtures directly is not a supported suite invocation.
