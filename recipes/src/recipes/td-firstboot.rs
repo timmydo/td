@@ -43,6 +43,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-firstboot/src/credentials.rs"),
     ),
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
+    ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     (
         "secret_store",
         include_str!("../../../td-secret/src/store.rs"),
@@ -99,6 +100,7 @@ pub fn recipe() -> Recipe {
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
             path: match *name {
+                "tpm" => "{src}/td-secret/src/tpm.rs".into(),
                 "crypto" => "{src}/td-secret/src/crypto.rs".into(),
                 "secret_store" => "{src}/td-secret/src/store.rs".into(),
                 _ => format!("{{src}}/td-firstboot/src/{name}.rs"),

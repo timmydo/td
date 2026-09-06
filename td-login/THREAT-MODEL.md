@@ -295,6 +295,15 @@ Consequences worth stating plainly:
   interactive behavior is unchanged from the busybox chain this replaces,
   which also accepted the empty shadow field without prompting.
 
+TPM credential-store enrollment and boot release are separate root-owned
+operations in td-secret and td-firstboot, specified by `td-secret/DESIGN.md`.
+They do not switch process credentials or authenticate a human. Firstboot
+unseals an explicitly enrolled store into volatile storage before the existing
+auto-login path runs; the TPM policy authenticates selected platform state,
+not that login's user. td-login's session authorization table is unchanged.
+FIDO2 release must wait for secure attention and trusted input; no login or
+`su` behavior is a substitute for that future authorization.
+
 ## 4. Privilege can only be dropped, never gained
 
 td-login is **never installed setuid-root**. `system-x86-64` packs it as

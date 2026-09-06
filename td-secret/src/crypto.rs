@@ -7,6 +7,12 @@
 )]
 mod sha256;
 
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = sha256::Sha256::new();
+    hash.update(bytes);
+    hash.finalize()
+}
+
 fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut normalized = [0u8; 64];
     if key.len() > 64 {

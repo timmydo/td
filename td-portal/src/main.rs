@@ -45,6 +45,9 @@ mod secret;
 #[path = "../../td-secret/src/store.rs"]
 #[allow(dead_code, reason = "firstboot and the console share the store writer")]
 mod secret_store;
+#[path = "../../td-secret/src/tpm.rs"]
+#[allow(dead_code, reason = "shared sealed-store format and root enrollment entry points")]
+mod tpm;
 mod settings;
 #[path = "../../td-secret/src/sys.rs"]
 mod sys;

@@ -5611,7 +5611,7 @@ not for a persistent Session lifecycle.
 | — | `.Background` | — | `RequestBackground` returns denied; persistent background execution needs a td-svc user-service design. |
 | — | `.Documents` | FUSE | **absent** (§0: no `CONFIG_FUSE_FS`). See below. |
 | — | `.Print`, `.Camera`, `.ScreenCast`, `.RemoteDesktop` | spooler / PipeWire | **not exported.** A fake PipeWire descriptor would make successful setup indistinguishable from a broken stream. |
-| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); the file-backed master still leaves the same-uid and offline-disk gap. |
+| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); unenrolled stores retain the file-master offline gap, and both backends retain unconfined same-uid access after release. |
 
 **The Documents consequence, stated honestly rather than buried.**
 Without it, a file chooser can only grant what the sandbox can already
@@ -8981,14 +8981,15 @@ package lives rather than of how many copies of it exist.
 
 ### W.4 The credential manager
 
-Increment (a) uses one per-user store at `/var/lib/td/secrets/<uid>` beside
-the machine identity. `td-firstboot` creates the master and the initial
-`mail/main` placeholder. The mode-0700 directory and mode-0600 files are owned
-by that user; credentials use ChaCha20-Poly1305 and per-application HKDF keys.
-The file-backed master is deliberately an interim backend: a same-uid
-unconfined process or an offline disk reader can read it. This increment
-provides no TPM protection, authenticated session lock, token recovery, or
-protection from other unconfined programs running as the user.
+Unenrolled stores use the increment-(a) backend: one per-user store at
+`/var/lib/td/secrets/<uid>` beside the machine identity. `td-firstboot`
+creates the master and the initial `mail/main` placeholder. The mode-0700
+directory and mode-0600 files are owned by that user; credentials use
+ChaCha20-Poly1305 and per-application HKDF keys. The file-backed master is
+deliberately an interim backend: a same-uid unconfined process or an offline
+disk reader can read it. This unenrolled backend provides no TPM protection,
+authenticated session lock, token recovery, or protection from other
+unconfined programs running as the user.
 
 **Applications receive credentials, not encryption keys.** td owns the
 `td.Secret1` interface on the activated `org.freedesktop.portal.Desktop`
@@ -9028,12 +9029,35 @@ increment authorizes the store's uid through ordinary file ownership, at the
 same trust level as the provisioner. It offers no token consent and no
 remembered authorization. The command runs as the user and does not invoke
 `su`, a shell, or a privileged helper. This is the explicit interim exception
-to principle 7 for increment (a), not an elevation claim.
+to principle 7 through increment (b), not an elevation claim.
 
-**Remaining increments, in order on the rolling workstream.** (b) Replace the
-file master with TPM sealing bound to an explicit platform-state policy.
-(c) Gate release on FIDO2 user presence at session start, after the compositor
-provides secure attention and trusted input. Enroll a second recovery token
+**TPM enrollment, increment (b).** The root console can atomically migrate an
+existing store with `td-secret seal --uid UID --pcrs LIST --unrecoverable`.
+It rotates the master, verifies a real TPM seal/unseal roundtrip, publishes
+one sealed bundle, and retires the old master and records. An enrolled store
+never falls back to a file key. Explicit nonzero SHA-256 static PCR selections
+bind release to the recorded platform state; they do not establish which boot
+components the platform measures. The stock direct-kernel QEMU path has no
+measured-deployment policy and remains unenrolled. The kernel carries ACPI
+TPM discovery and the TIS/FIFO and CRB drivers.
+
+Firstboot automatically releases the configured mail user's enrolled store
+into a checked `/run` tmpfs while provisioning that user's valid application
+home. Other enrolled UIDs require the root console release command at each
+boot; release is not yet a general session service. This has no token consent:
+the interim console writer remains uid-authorized, and unconfined same-uid
+code can read the
+volatile release. There is no recovery or policy migration yet; the enrollment
+command explicitly requires acceptance of unrecoverability. Old snapshots
+may retain the former file master and credentials. `td-secret/DESIGN.md`
+specifies the PCR, memory, physical-bus, rollback and update boundaries, plus
+the pinned host-emulator oracle. That oracle covers TPM restart, changed
+measurements, a different TPM and actual store migration; it is separate from
+the desktop boot check.
+
+**Remaining increments, in order on the rolling workstream.** (c) Gate release
+on FIDO2 user presence at session start, after the compositor provides secure
+attention and trusted input. Enroll a second recovery token
 at creation or explicitly mark the store unrecoverable. (d) Move the console
 writer behind `td-authd` as one named operation, with typed application/name
 and descriptor-pinned credential bytes, and one token touch bound to that

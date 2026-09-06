@@ -2,7 +2,7 @@ use crate::ladder::{
     initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into,
     unpack_keep_top, EROFS_MARKER, EROFS_PROBE_CONTENT, EROFS_PROBE_SENTINEL, SH, USERLAND_MARKER,
 };
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // linux-x86-64 (Linux 7.1.4): the capstone of the x86_64 ladder (#529).
 // Source-builds the latest STABLE mainline kernel (not a longterm/LTS line) with
@@ -128,6 +128,17 @@ pub fn recipe() -> Recipe {
     // pin key stays on `.source_input(...)` below, which is what gates/fetches the bytes.
     let mut steps = unpack_into("linux-x86-64-source", "{src}");
 
+    // The embedded cpio must share the external archive's fixed epoch. Upstream
+    // swallows a missing date command and otherwise falls back to wall time.
+    steps.push(Step::substitute_text(
+        "{src}/usr/gen_initramfs.sh",
+        vec![TextEdit::new(
+            "timestamp=\"$(date -d\"$1\" +%s || :)\"",
+            "timestamp=1",
+            1,
+        )],
+    ));
+
     // Host sysroot for HOSTCC only (the Kbuild host programs are ordinary
     // userspace): the x86_64 glibc 2.41 headers + kernel UAPI headers overlaid
     // into include, glibc libs into lib, with the GNU ld linker scripts relocated
@@ -136,7 +147,10 @@ pub fn recipe() -> Recipe {
         from: format!("{xglibc}/include"),
         dest: "{root}/sysroot/include".into(),
     });
-    steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/sysroot/include"));
+    steps.extend(unpack_keep_top(
+        "linux-headers-x86-64",
+        "{root}/sysroot/include",
+    ));
     steps.push(Step::CopyTree {
         from: format!("{xglibc}/lib"),
         dest: "{root}/sysroot/lib".into(),
@@ -537,6 +551,14 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_DRM_FBDEV_EMULATION[ =]/d; \
                   /^#? *CONFIG_DRM_CLIENT_DEFAULT_FBDEV[ =]/d; \
                   /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d; \
+                  /^#? *CONFIG_ACPI[ =]/d; \
+                  /^#? *CONFIG_PNP[ =]/d; \
+                  /^#? *CONFIG_PNPACPI[ =]/d; \
+                  /^#? *CONFIG_TCG_TPM[ =]/d; \
+                  /^#? *CONFIG_TCG_TIS[ =]/d; \
+                  /^#? *CONFIG_TCG_CRB[ =]/d; \
+                  /^#? *CONFIG_TCG_TPM2_HMAC[ =]/d; \
+                  /^#? *CONFIG_HW_RANDOM_TPM[ =]/d; \
                   /^#? *CONFIG_PERF_EVENTS[ =]/d; \
                   /^#? *CONFIG_HOTPLUG_CPU[ =]/d; \
                   /^#? *CONFIG_USER_NS[ =]/d; \
@@ -632,6 +654,14 @@ pub fn recipe() -> Recipe {
                    'CONFIG_DRM_FBDEV_EMULATION=y' \
                    'CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' \
                    '# CONFIG_SECURITY_DMESG_RESTRICT is not set' \
+                   'CONFIG_ACPI=y' \
+                   'CONFIG_PNP=y' \
+                   'CONFIG_PNPACPI=y' \
+                   'CONFIG_TCG_TPM=y' \
+                   'CONFIG_TCG_TIS=y' \
+                   'CONFIG_TCG_CRB=y' \
+                   '# CONFIG_TCG_TPM2_HMAC is not set' \
+                   '# CONFIG_HW_RANDOM_TPM is not set' \
                    'CONFIG_PERF_EVENTS=y' \
                    '# CONFIG_HOTPLUG_CPU is not set' \
                    'CONFIG_USER_NS=y' \
@@ -723,6 +753,12 @@ pub fn recipe() -> Recipe {
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' .config; then echo 'SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users' >&2; exit 1; fi; \
+                 grep -q '^CONFIG_ACPI=y' .config || { echo 'ACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PNP=y' .config || { echo 'PNP off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PNPACPI=y' .config || { echo 'PNPACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TCG_TPM=y' .config || { echo 'TCG_TPM off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TCG_TIS=y' .config || { echo 'TCG_TIS off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TCG_CRB=y' .config || { echo 'TCG_CRB off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_PERF_EVENTS=y' .config || { echo 'PERF_EVENTS off — td-profiler cannot open its per-CPU software sampling events' >&2; exit 1; }; \
                  if grep -q '^CONFIG_HOTPLUG_CPU=y' .config; then echo 'HOTPLUG_CPU on — td-profiler requires one fixed online-CPU roster for complete system-wide coverage' >&2; exit 1; fi; \
                  grep -q '^CONFIG_USER_NS=y' .config || { echo 'USER_NS off — unshare(CLONE_NEWUSER) returns EINVAL, so td-jail cannot build a sandbox at all' >&2; exit 1; }; \
@@ -962,9 +998,7 @@ pub fn recipe() -> Recipe {
     // (it boots this cpio); this is the fast producer-rung shape check.
     let initramfs_check =
         initramfs_cpio_shape_check("{out}/initramfs.cpio", "{in:busybox-x86-64}/bin/busybox");
-    steps.push(
-        Step::run("{out}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()),
-    );
+    steps.push(Step::run("{out}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()));
 
     Recipe::mesboot("linux-x86-64", "7.1.4")
         .source_input("linux-kernel-source")
@@ -997,6 +1031,30 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tpm_discovery_and_drivers_are_pinned_and_checked_after_resolution() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for symbol in ["ACPI", "PNP", "PNPACPI", "TCG_TPM", "TCG_TIS", "TCG_CRB"] {
+            assert!(
+                text.contains(&format!("'CONFIG_{symbol}=y'")),
+                "{symbol} missing pin"
+            );
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
+                "{symbol} missing resolved guard"
+            );
+        }
+    }
 
     #[test]
     fn profiler_perf_events_are_builtin_and_cpu_hotplug_is_off() {

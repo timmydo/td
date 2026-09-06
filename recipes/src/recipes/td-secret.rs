@@ -4,6 +4,7 @@ const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     ("client", include_str!("../../../td-secret/src/client.rs")),
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
+    ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),
     ("sys", include_str!("../../../td-secret/src/sys.rs")),
     ("name", include_str!("../../../td-busd/src/name.rs")),

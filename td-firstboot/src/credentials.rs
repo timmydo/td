@@ -169,6 +169,7 @@ pub(super) fn provision(
         .map_err(|e| Failure::Failed(e.to_string()))?;
     let store = secret_store::Store::open(&parent.join(owner.uid.to_string()), owner.uid, true)
         .map_err(Failure::Failed)?;
+    store.release().map_err(Failure::Failed)?;
     let pinned = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     let config = optional(&pinned, "config.toml", owner.uid, 64 * 1024)?;
     let config = config

@@ -141,6 +141,7 @@ pub fn recipe() -> Recipe {
     }
 
     for (path, source) in [
+        ("{src}/td-secret/src/tpm.rs", include_str!("../../../td-secret/src/tpm.rs")),
         (
             "{src}/td-portal/src/secret.rs",
             include_str!("../../../td-portal/src/secret.rs"),
@@ -286,6 +287,7 @@ mod tests {
             if matches!(
                 module,
                 "sys"
+                    | "tpm"
                     | "secret_store"
                     | "wayland_wire"
                     | "font"
@@ -295,6 +297,7 @@ mod tests {
             ) {
                 let path = match module {
                     "sys" => "../../td-secret/src/sys.rs",
+                    "tpm" => "../../td-secret/src/tpm.rs",
                     "secret_store" => "../../td-secret/src/store.rs",
                     "wayland_wire" => "../../td-compositor/src/wire.rs",
                     "font" => "../../td-compositor/src/font.rs",

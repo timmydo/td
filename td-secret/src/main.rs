@@ -24,6 +24,8 @@ mod store;
     reason = "shared descriptor transport also sends Wayland files"
 )]
 mod sys;
+#[allow(dead_code, reason = "TPM entry points are shared with the provisioner")]
+mod tpm;
 #[path = "../../td-busd/src/wire.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod wire;
@@ -33,6 +35,27 @@ use std::io::{self, Read};
 fn run(args: &[String]) -> Result<(), String> {
     match args {
         [command] if command == "selftest" => crypto::selftest(),
+        [command, uid_flag, uid, pcr_flag, pcrs, recovery]
+            if command == "seal"
+                && uid_flag == "--uid"
+                && pcr_flag == "--pcrs"
+                && recovery == "--unrecoverable" =>
+        {
+            store::require_root()?;
+            let uid = parse_uid(uid)?;
+            let pcrs = tpm::Pcrs::parse(pcrs)?;
+            let store = store::Store::open(&store::user_path(uid), uid, false)?;
+            store.seal(pcrs)?;
+            eprintln!(
+                "td-secret: store TPM sealed; no recovery; boot release without token consent"
+            );
+            Ok(())
+        }
+        [command, uid_flag, uid] if command == "release" && uid_flag == "--uid" => {
+            store::require_root()?;
+            let uid = parse_uid(uid)?;
+            store::Store::open(&store::user_path(uid), uid, false)?.release()
+        }
         [command, name] if command == "get" => {
             let mut secret = client::retrieve(name)?;
             use std::io::Write;
@@ -54,13 +77,26 @@ fn run(args: &[String]) -> Result<(), String> {
                 .take((store::MAX_SECRET + 1) as u64)
                 .read_to_end(&mut secret)
                 .map_err(|e| format!("read credential from stdin: {e}"))?;
-            store.set(app, name, &secret)?;
+            let result = store.set(app, name, &secret);
             secret.fill(0);
-            eprintln!("td-secret: credential stored (file-backed key; console authorization)");
+            result?;
+            eprintln!("td-secret: credential stored (interim console authorization)");
             Ok(())
         }
-        _ => Err("usage: td-secret set APPLICATION/NAME < credential-file".into()),
+        _ => Err(concat!(
+            "usage: td-secret set APPLICATION/NAME < credential-file; ",
+            "td-secret seal --uid UID --pcrs LIST --unrecoverable; ",
+            "td-secret release --uid UID"
+        )
+        .into()),
     }
+}
+
+fn parse_uid(value: &str) -> Result<u32, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("UID must be a decimal user id".into());
+    }
+    value.parse().map_err(|_| "UID is out of range".into())
 }
 
 fn main() -> std::process::ExitCode {
@@ -83,6 +119,7 @@ mod confinement {
             ("crypto.rs", include_str!("crypto.rs")),
             ("store.rs", include_str!("store.rs")),
             ("sys.rs", include_str!("sys.rs")),
+            ("tpm.rs", include_str!("tpm.rs")),
         ];
         for (name, source) in sources {
             let production = source.split("#[cfg(test)]").next().unwrap();
@@ -115,7 +152,14 @@ mod confinement {
         actual.sort();
         assert_eq!(
             actual,
-            ["client.rs", "crypto.rs", "main.rs", "store.rs", "sys.rs"]
+            [
+                "client.rs",
+                "crypto.rs",
+                "main.rs",
+                "store.rs",
+                "sys.rs",
+                "tpm.rs"
+            ]
         );
     }
 }

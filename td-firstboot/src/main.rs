@@ -23,6 +23,9 @@ mod mounts;
 #[path = "../../td-secret/src/store.rs"]
 #[allow(dead_code, reason = "the console and portal share store entry points")]
 mod secret_store;
+#[path = "../../td-secret/src/tpm.rs"]
+#[allow(dead_code, reason = "shared sealed-store format and root enrollment entry points")]
+mod tpm;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};

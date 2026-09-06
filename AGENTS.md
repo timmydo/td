@@ -205,11 +205,12 @@ paragraph is a target contract rather than a whole-image completeness claim.
    Recovery is a second token enrolled when the secret is created, or the
    secret is explicitly unrecoverable.
 
-Principle 7 is a target, not a current claim. The stock VM writes empty shadow
-fields for `root` and `tester`, auto-logs in, and retains `su` as an
-administrative escape hatch. FIDO2, TPM sealing, secure attention, and
-`td-authd` are not built. Do not make a user-facing flow depend on the current
-escape hatch; see `APPLICATIONS.md` §L.1 and `td-login/THREAT-MODEL.md`.
+Principle 7 is a target, not a current claim. The stock VM writes empty
+shadow fields for `root` and `tester`, auto-logs in, and retains `su` as an
+administrative escape hatch. Explicit TPM enrollment and boot release are
+built; FIDO2, secure attention, and `td-authd` are not. The stock VM remains
+unenrolled. Do not make a user-facing flow depend on the current escape
+hatch; see `APPLICATIONS.md` §L.1 and `td-login/THREAT-MODEL.md`.
 
 # Tests
 
