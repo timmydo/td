@@ -2,7 +2,7 @@
 
 td-editor is a small, Wayland-native text editor with a Notepad-like window
 and tabs. It is intended for ordinary text and prose, including use as the
-foreground `$EDITOR` child of tmc inside td-jail. It must also run on Linux
+foreground `$EDITOR` child of td-mail inside td-jail. It must also run on Linux
 Wayland desktops outside td. This document is the component contract and
 the starting point for successive agents; the root `AGENTS.md` and
 `DEVELOPMENT.md` still govern changes and submission.
@@ -935,7 +935,7 @@ files. Duplicate paths/inodes select the existing tab without refreshing its
 baseline or replacing edits. With no paths, New creates one clean Untitled
 tab. Missing paths create empty dirty tabs without creating a disk file.
 Ordinary no-option/filename invocation remains refused: this explicit mode
-is experimental, not the `$EDITOR`/tmc integration milestone.
+is experimental, not the `$EDITOR`/td-mail integration milestone.
 
 The file window reuses the preview's transport, input dispatcher and bitmap
 renderer, with the warm palette and medium weight. It requires a v5+ seat
@@ -1132,7 +1132,8 @@ missing/duplicate opens, conflict refusal, no-clobber Save As and rejected
 admission cleanup. A real worker test covers startup handoff. Fake-compositor
 tests route both profiles through modal paths, pending-close refusal and save
 completion, checking actual file bytes and changed SHM pixels. These tests do
-not claim the still-required interactive Weston US or td-jail/tmc oracle.
+not claim the still-required interactive Weston US or the td-jail/td-mail
+oracle.
 The replay protocol remains filesystem-free and cannot forge save completion.
 
 ### Implemented scratch-window adapter
@@ -1995,7 +1996,7 @@ across all 32 supported real-mask states. The td map is also
 read from its existing source for tests; no production compositor keyboard
 module is imported. These fixtures do not replace the live Weston test.
 
-## `$EDITOR`, tmc, and td-jail
+## `$EDITOR`, td-mail, and td-jail
 
 The command contract is `td-editor [options] -- [file ...]`. It opens the
 requested paths in tabs and stays in the foreground until the invocation's
@@ -2017,34 +2018,35 @@ interprets MML, starts a mail transport, or manages attachment lifetimes.
 Those are outside this editor increment. Save As is the explicit way to
 retain draft text before the caller removes its temporary file.
 
-The caller inspected for this design is `~/src/tmc`. Its `src/tui/mod.rs`
+The caller inspected for this design is td-mail (then the standalone
+`tmc` repository, now `td-mail/` in this tree). Its `src/tui/mod.rs`
 selects `[ui].editor`, then `$EDITOR`, then `vi`; `spawn_editor` starts
 `sh -c` with the editor command and displayed draft path concatenated into
 one string. The TUI continues immediately. A background
 thread waits for the shell child, ignores its exit status, and removes both
-the draft and any attachment directory. tmc neither rereads the saved file
+the draft and any attachment directory. td-mail neither rereads the saved file
 nor submits mail. Consequently a normal Save followed by Quit loses the
 temporary draft to caller cleanup; retaining it requires Save As to a
 persistent granted path. This editor must not be described as a complete
-tmc mail-composition workflow until draft retention/submission is resolved.
+td-mail mail-composition workflow until draft retention/submission is resolved.
 
 `src/compose.rs` creates mode-0600 `.eml` files inside a mode-0700 directory,
-preferring `$XDG_RUNTIME_DIR/tmc/drafts`, then the XDG state directory. The
+preferring `$XDG_RUNTIME_DIR/td-mail/drafts`, then the XDG state directory. The
 draft format includes mail headers, `--text follows this line--`, and
 potential MML attachment tags pointing to temporary sidecar files. Preserve
 these bytes as ordinary text. Saving the draft elsewhere does not preserve
-the referenced attachment files when tmc later removes them. Recognizing,
+the referenced attachment files when td-mail later removes them. Recognizing,
 retaining, or submitting mail is a separate requested product capability.
 
-tmc's unquoted shell concatenation also means paths containing shell syntax
+td-mail's unquoted shell concatenation also means paths containing shell syntax
 or spaces are not passed as literal argv today. td-editor can accept such
 paths correctly but cannot repair a command already misparsed by its parent.
-A tmc integration change must resolve argument construction at the caller;
+A td-mail integration change must resolve argument construction at the caller;
 do not work around it by evaluating shell text inside the editor. The editor
 must avoid consuming the TUI's inherited terminal input.
 
 An integration increment must make the executable and exact runtime closure
-available inside the jail in which tmc runs, set its explicit `EDITOR`
+available inside the jail in which td-mail runs, set its explicit `EDITOR`
 environment, and provide the intended file/directory grants.
 `APPLICATIONS.md` section X.4 currently says source-built td store closures
 are absent from the jail, so
@@ -2052,16 +2054,16 @@ this requires an actual packaging/layout decision; a host `/bin/td-editor`
 path is insufficient. Keep source-built editor artifacts distinct from
 marked foreign application payloads.
 
-The caller's real launch path is the acceptance test: launch tmc, request a
+The caller's real launch path is the acceptance test: launch td-mail, request a
 draft, observe an editor frame, edit and save while its child remains live,
 and verify exact saved bytes before caller cleanup. For retention, exercise
 Save As to a persistent granted directory, close the window, and prove that
-tmc remains responsive, its temporary draft is cleaned up, and the retained
+td-mail remains responsive, its temporary draft is cleaned up, and the retained
 copy survives. Attachment retention and submission need their own agreed
 oracle. Include filenames with spaces and leading dashes after correcting
 the caller, unwritable paths, cancellation, missing display, and an attempted
 path outside the grant. An isolated Wayland smoke test alone is not evidence
-that tmc's jail can launch the editor.
+that td-mail's jail can launch the editor.
 
 ## Test and control architecture
 
@@ -2172,7 +2174,7 @@ td-builder's automatic cargo test/clippy gate and commits its one-package
 3. On-demand whole-document spelling and complete local control: explicit
    scans, result marking/invalidation, paged semantic queries and frame
    synchronization. Exercise the production dispatcher through both inputs.
-4. Source-built recipe and tmc jail integration: staged shared sources and
+4. Source-built recipe and td-mail jail integration: staged shared sources and
    data licenses, runtime closure, file grants, `$EDITOR`, debug companions,
    and a test of the actual caller's child lifetime and draft cleanup.
 5. GPU editor rendering after the separately specified graphics producer and

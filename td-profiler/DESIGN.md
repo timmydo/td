@@ -136,7 +136,8 @@ from its symbols. Debug files are not separate downloads and require no
 td-operated server.
 
 A package that copies a source-built runtime out of the output that built it,
-as the terminal application packages copy `tmc` and `tn` into `files/bin`,
+as the terminal application packages copy `td-mail` and `td-news` into
+`files/bin`,
 carries the companion at the copied runtime's own path below its `lib/debug`
 and the producing output's `.td-assembly-exception` marker at that tree's root:
 the producing output is not in the image's closure, so nothing else would put

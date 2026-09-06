@@ -84,7 +84,7 @@ td-recipe-eval seed-digests > seed/seed-digests.txt
 
 Regenerate after the last edit to the trees and commit the table with the
 change. Today `td-net` is built this way, from `net/`, `engine/` and
-`td-boot/`.
+`td-boot/`, and `td-mail` and `td-news` from their own trees.
 
 When every changed path lies under `td-*` crates, `ready` also scopes the
 recipe-checks gate: the crates and their readers travel to the gate in

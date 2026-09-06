@@ -7,7 +7,7 @@ td and other Linux Wayland desktops and to support deterministic tests and
 explicit local remote control.
 
 Start with [DESIGN.md](DESIGN.md). It records the architecture, reuse map,
-file-safety requirements, compatibility boundaries, tmc integration findings,
+file-safety requirements, compatibility boundaries, td-mail integration findings,
 acceptance tests, and independently landable increments. Version 1 uses
 Unicode-scalar editing and single-cell Unifont rendering, preserves UTF-8
 BOM and uniform LF/CRLF files, defaults to Windows-like bindings, and uses
@@ -49,7 +49,7 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-No GPU renderer, remote socket or tmc integration is
+No GPU renderer, remote socket or td-mail integration is
 claimed yet. Do not set
 `$EDITOR` to this binary yet.
 
@@ -386,6 +386,6 @@ lists its driver, runtime-policy and DMA-BUF prerequisites. Direct GPU
 rendering for the dependency-free editor also needs a source-built graphics
 implementation; the software reference backend does not complete that goal.
 
-tmc currently deletes its temporary draft and attachment files when its
-editor child exits. Saving a draft in place does not retain it, and tmc has
+td-mail currently deletes its temporary draft and attachment files when its
+editor child exits. Saving a draft in place does not retain it, and td-mail has
 no mail submission path. The design describes this integration gap explicitly.

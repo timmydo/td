@@ -3241,7 +3241,7 @@ two ioctls the truncation *is* the point.
    word after argv[0]; any other token is a program and names a process by
    the final path component of argv[0], which for a td-jail launch is the
    entry path, so that a terminal application's boot evidence can name the
-   program its entry runs as, `tmc` or `tn`, without either taking a marker
+   program its entry runs as, `td-mail` or `td-news`, without either taking a marker
    argument. Neither form reads the other's field, so a wrapper carrying the
    program's name as an argument is not the program.
    Every token additionally requires a namespace PID greater than 1, so the
@@ -7118,7 +7118,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 28 | **Firefox proof closure — LANDED**; §H's every-boot kill-reaps leg now creates a dedicated application cgroup through the production detached watcher, proves stage 2 and its descendant occupy it before killing only stage 1, and accepts only after PID-namespace teardown empties the leaf and the watcher removes it. The previously deferred real target-kernel `mount(2)` refusal is supplied by the landed 17-call outer-filter audit. `AGENTS.md` names the source graph, host control plane, and marked foreign payload as three distinct trust zones. The complete shipped source and confinement regressions were reconciled against application-path `UNSAFE.md` surfaces #9 (`td-jail`), #10 (`td-busd`), #12 (`td-portal`), and #13 (`td-audio`); their syscall, operation, flag, ancillary-data, pointer-provenance, and scoped-allow rosters remain exact and require no roster amendment | **Firefox portals, isolation, soak and sound are all proved without manual testing** |
 | 29 | td's OWN clock in local time: a TZif reader in Rust, so the bar can render the zone rung 12k names. Separate from 12j because nothing outside a jail can read the runtime's zoneinfo, and `td-compositor/DESIGN.md` records the UTC bar until it lands | the bar shows the operator's time, and still says which zone |
 | 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
-| 31 | **terminal applications — LANDED**: `mail` (tmc) and `news` (tn) are source-built static packages on the empty runtime, `/bin/mail` and `/bin/news` launchers, and two td-svc units that run each as td-term's `--command` in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
+| 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the empty runtime, `/bin/mail` and `/bin/news` launchers, and two td-svc units that run each as td-term's `--command` in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
@@ -9079,11 +9079,11 @@ a master key, or a derived key. The upstream
 `org.freedesktop.portal.Secret` keyring-key protocol remains unexported:
 returning a credential through it would violate its contract.
 
-`tmc` uses `secret = "portal"` with the account name as the credential name
-(`main` for the provisioned account). Its packaged `/app/bin/td-secret get`
-helper receives and reads the descriptor, acknowledges its receipt, and
-writes the credential into tmc's captured stdout pipe. Neither tmc nor tn
-needs a cryptography dependency. The portal logs the mail receipt only after
+`td-mail` uses `secret = "portal"` with the account name as the credential
+name (`main` for the provisioned account). Its packaged `/app/bin/td-secret
+get` helper receives and reads the descriptor, acknowledges its receipt, and
+writes the credential into td-mail's captured stdout pipe. Neither td-mail
+nor td-news needs a cryptography dependency. The portal logs the mail receipt only after
 the same broker-authenticated connection acknowledges its one-use token;
 QEMU requires the exact supervised `portal: TD-SECRET-READY app=mail name=main`
 line. The token is liveness evidence, not authorization or cryptographic
@@ -9098,7 +9098,7 @@ placeholder. Missing legacy credentials, renamed accounts, custom or ambiguous c
 sources, conflicting existing credentials and malformed files cause an explicit
 refusal; source data is retained for operator resolution. Migration is
 restartable after any completed publication. There is no dual plaintext
-fallback in the shipped tmc client.
+fallback in the shipped td-mail client.
 
 **Interim console writer.** `td-secret set <application>/<name>` reads at most
 4096 credential bytes from stdin and atomically replaces that entry. This
@@ -9153,7 +9153,7 @@ fallback. `td-secret/DESIGN.md` specifies the current format and boundaries.
 
 ### W.5 td-editor: a td-owned editor for mail and text
 
-**Why.** `tmc` composes in `$EDITOR`; the image ships no editor, and the
+**Why.** `td-mail` composes in `$EDITOR`; the image ships no editor, and the
 jail's `/app` cannot see one that is not packaged with the application.
 An editor is also the first td program that must render text in a
 Wayland window from a source other than a terminal.
@@ -9163,7 +9163,7 @@ other td crates (direct rustc, static) and packaged into the `mail`
 application's store closure as `/app/bin/td-editor` with
 `EDITOR=/app/bin/td-editor` in the manifest environment. It is a native
 Wayland client: the mail jail already carries `sockets=wayland`, so the
-editor opens its own toplevel beside the terminal, and tmc waits for it
+editor opens its own toplevel beside the terminal, and td-mail waits for it
 to exit as it does for any editor.
 
 **Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont
@@ -9195,9 +9195,9 @@ mail composition path is the one the editor exists for.
 
 ### W.6 Opening links and attachments from a jailed terminal application
 
-**Diagnosis.** `tn` opens a link by trying, in order, a configured
+**Diagnosis.** `td-news` opens a link by trying, in order, a configured
 browser command through `sh -c`, `$BROWSER` as a program, then
-`xdg-open` and `open`. `tmc` opens links through `sh -c` with its
+`xdg-open` and `open`. `td-mail` opens links through `sh -c` with its
 configured browser and saved attachments through `$OPENER` or
 `xdg-open`; it also runs its editor through `sh -c`. Inside the jail
 none of those exist: the `mail` and `news` packages are static binaries
@@ -9209,7 +9209,7 @@ was already "no browser opener available". The portal is the designed
 answer (§E, row 4): `.OpenURI` starts the configured browser for `http`
 and `https` and refuses `file`; it is listed as absent in rung 22.
 Composing mail has the same shape: until td-editor (W.5) ships inside
-the `mail` closure at `/app/bin/td-editor`, tmc has no editor to run.
+the `mail` closure at `/app/bin/td-editor`, td-mail has no editor to run.
 
 **Plan.** (1) td-portal serves `org.freedesktop.portal.OpenURI.OpenURI`
 for `http` and `https` exactly as §E's row specifies: the handler is the
@@ -9221,7 +9221,7 @@ admit that one call between two instances of the same application. (2) A
 td-owned helper, `td-open URL`, dependency-free Rust reusing td-portal's
 client-side D-Bus codec, packaged into each terminal application's store
 closure as `/app/bin/td-open`. The applications then need no D-Bus code:
-`tn`'s configured browser command and `tmc`'s opener become
+`td-news`'s configured browser command and `td-mail`'s opener become
 `/app/bin/td-open`, and the manifests set `BROWSER=/app/bin/td-open`.
 (3) Attachments: saving goes to the `xdg-download` grant the mail
 manifest carries, which is the directory Firefox already shares. Opening
@@ -9229,7 +9229,7 @@ an attachment needs `OpenURI.OpenFile`, the descriptor-taking member §E
 marks NotSupported in v1 because the handler runs in another sandbox; it
 lands after (1) with the descriptor forwarded to the handler's jail as a
 read-only grant, which is the Documents-portal shape without FUSE.
-(4) The application-side change in the `news` and `tmc` repositories:
+(4) The application-side change in the two crates:
 prefer `$BROWSER` when set before probing `xdg-open`, so the manifest
 environment is enough and no `sh -c` is involved.
 
@@ -9409,8 +9409,10 @@ webpki-roots, and no decoder. So:
 current pinned `tn` and `tmc` switched to it: the last pin bump. (2) The
 rest of the conversion on the two repositories' `td` branches, checked
 offline against the shipped configurations as the refresh fix was
-(§W.4's `password_file` stays until the secret manager's first
-increment). (3) One import landing, principle 4: `git subtree add` for
+(§W.4's `password_file` stayed until the secret manager's first
+increment, which landed while the conversion was in flight; the
+import carries the portal as td-mail's own source, below). (3) One
+import landing, principle 4: `git subtree add` for
 both so history and blame survive; the rename to `td-news` and `td-mail`
 in crates, binaries, td-jail's process-token program names and the
 configuration directories, `~/.config/td-news` and `~/.config/td-mail`,
@@ -9428,6 +9430,34 @@ verifies identity rather than reads; it carries a waiver naming the
 approving human; and every change td's rules require, the `unwrap` pass,
 the UNSAFE.md entries, the renames, is an ordinary reviewed commit above
 it.
+
+**Landed.** The two trees are `td-mail/` and `td-news/` at the root,
+subtree-added from the `td` branches of the two repositories, which are
+frozen at the commits the import names. Each is a std-only root crate
+under td's deny lints, its shared modules (`json`, `toml`, `html`,
+`civil`, `kv`, `term_sys`, `td_fetch`, and `xml`, `regex`, `b64` where
+used) copied byte for byte between the two and held so by a recipe
+test, and each is built by
+`ladder::static_local_source_program`: a direct static rustc over the
+tree interned as its `<crate>-source` seed, so a change anywhere in a
+tree moves that crate's `seed/seed-digests.txt` row and the
+`local-source-digests` preflight reds a stale one. The pins, seed rows,
+feed-index rows and `recipes/locks` closures of `tmc` and `tn` are gone;
+the packages, `/bin` entries, units, boot markers and provisioning are
+unchanged in shape, with the programs, the process tokens and the
+configuration directories renamed. UNSAFE.md §17 and §18 record the
+terminal surface, once and once more for the copy. The credential
+portal (§W.4), which reached `tmc` as a source patch the recipe
+applied, is td-mail's own source from the import: `secret = "portal"`,
+the account name as the credential name, the packaged
+`/app/bin/td-secret get`; `password_file` is gone from the client and
+from what td-firstboot provisions. Per-user state the
+old names kept (`~/.config/tmc`, `~/.cache/tn`, drafts, the spam model)
+is abandoned rather than migrated: there was no release, only
+development VMs, and td-firstboot provisions the new directories on the
+next boot. The import commit is the frozen trees byte for byte; what its
+review found in them is fixed in the commit that follows the rename, and
+the trees' home is td from there on.
 
 ## X. Host mode — development only
 

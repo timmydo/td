@@ -52,7 +52,8 @@ The activated desktop portal serves `td.Secret1` version 1:
   method arguments, process arguments, or persistent temporary plaintext.
 - `Received(s receipt)` consumes the token only on the original connection.
   It grants no authority. The td-owned client calls it after reading the
-  bounded file and requires the exact reply before handing bytes to tmc.
+  bounded file and requires the exact reply before handing bytes to
+  td-mail.
 - Pending lookups plus unacknowledged deliveries are capped at 16; each owner
   may have four pending lookups and deliveries combined. Lookups and receipts expire after 20 seconds,
   with the service's ten-second audit retiring expired entries. Disconnect
@@ -216,7 +217,8 @@ tampering, identity substitution, file metadata, reopen and migration
 idempotence, broker identity refusals, descriptor ownership and live
 transfer. The image requires both the unconfined probe's exact credential
 refusal and the supervised mail receipt marker. This composes the
-provisioner, persistent store, tmc configuration, jailed helper, broker-fixed
-identity, authenticated decryption, descriptor transport and acknowledgement.
+provisioner, persistent store, td-mail configuration, jailed helper,
+broker-fixed identity, authenticated decryption, descriptor transport and
+acknowledgement.
 It is not evidence for FIDO2 release or elevation; TPM evidence is separate
 from this existing desktop boot check.
