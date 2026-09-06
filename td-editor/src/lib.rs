@@ -7,6 +7,7 @@ pub mod clipboard;
 mod command;
 pub mod control;
 pub mod control_socket;
+pub mod control_worker;
 mod data;
 mod dialog;
 pub use dialog::{Discard, Reload};

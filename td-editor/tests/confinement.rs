@@ -22,6 +22,7 @@ fn source_inventory_and_allowances_are_closed() {
         "command.rs",
         "control.rs",
         "control_socket.rs",
+        "control_worker.rs",
         "data.rs",
         "dialog.rs",
         "files.rs",
@@ -298,4 +299,41 @@ fn control_socket_publication_keeps_kernel_path_and_identity_checks_explicit() {
     assert!(!production.contains("canonicalize"));
     assert!(!production.contains("65534"));
     assert!(!production.contains("TD_TEST_TRUSTED_ROOT"));
+}
+
+#[test]
+fn control_worker_keeps_bounded_nonblocking_transport_separate_from_editor_state() {
+    let source = include_str!("../src/control_worker.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    for pin in [
+        "const CONNECTIONS: usize = 8;",
+        "const IO_BYTES: usize = 16 * 1024;",
+        "Duration::from_secs(5)",
+        "Duration::from_millis(10)",
+        "mpsc::sync_channel(CONNECTIONS)",
+        "mpsc::sync_channel(1)",
+        "for _ in connections.len()..CONNECTIONS",
+        "requests.try_send(job)",
+        "self.requests.try_recv()",
+        "reply.try_send(response)",
+        "Request::parse(payload)",
+        "thread::park_timeout(poll_interval(connections.is_empty()))",
+        "Duration::from_millis(100)",
+        ".join()",
+    ] {
+        assert!(production.contains(pin), "{pin}");
+    }
+    let socket = include_str!("../src/control_socket.rs");
+    assert!(socket.contains("socket.listener.set_nonblocking(true)?"));
+    assert!(socket.contains("stream.set_nonblocking(true)?"));
+    for forbidden in [
+        "Controller",
+        "mpsc::channel(",
+        ".read_exact(",
+        ".write_all(",
+        ".recv()",
+        ".send(",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
 }

@@ -2075,8 +2075,10 @@ field order, errors, limits and conformance fixtures are recorded in
 explicit private Unix listener publication with descriptor-pinned paths,
 owner/mode admission and identity-checked cleanup; its complete path/trust
 contract and same-UID race boundary are in that reference. These are transport
-prerequisites only: there is no `--control-socket` option, worker/deadline
-handling, native job/dialog state or frame acknowledgement yet.
+prerequisites only. The `control_worker` library now adds eight-connection
+nonblocking transport, typed bounded UI jobs and five-second acceptance-based
+deadlines under CONTROL.md's exact scheduling contract. There is no
+`--control-socket` option, native job/dialog state or frame acknowledgement yet.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 

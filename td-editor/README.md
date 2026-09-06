@@ -78,6 +78,10 @@ ownership/permissions, refuses symlinks and existing endpoints, and pins
 parent/socket inodes for checked cleanup. It has no request worker or editor
 access and is not connected to the executable yet; CONTROL.md specifies the
 absolute-path limits and trust boundary.
+The `control_worker` library adds a bounded read-only request thread with
+eight connection slots, typed nonblocking UI queues, whole-request deadlines
+and joined shutdown. It remains unwired to the native window; there is no
+remote-control command-line option yet.
 `tests/core.rs` covers byte round trips, stale/invalid commands, limits,
 save completion after intervening edits, global history eviction, reflow
 mapping, key-profile conflicts and generated edits against a scalar-vector
