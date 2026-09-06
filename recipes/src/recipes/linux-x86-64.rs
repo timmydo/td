@@ -397,7 +397,8 @@ pub fn recipe() -> Recipe {
     //    KEXEC leaves KEXEC_FILE intact, and reboot(LINUX_REBOOT_CMD_KEXEC) runs off
     //    KEXEC_CORE). In 7.1.4 KEXEC_FILE `select`s CRYPTO_LIB_SHA256 + KEXEC_CORE on
     //    its own (verified against kernel/Kconfig.kexec), so NO CRYPTO menuconfig is
-    //    pulled in — do not add CONFIG_CRYPTO/CRYPTO_SHA256. CONFIG_RELOCATABLE=y is REQUIRED: the x86
+    //    needed for kexec itself; dm-crypt below selects CRYPTO separately.
+    //    CONFIG_RELOCATABLE=y is REQUIRED: the x86
     //    kexec-bzimage64 loader rejects a non-relocatable image, so a kernel that
     //    boots fine via `-kernel` still fails via kexec — the classic
     //    works-direct/fails-kexec divergence. allnoconfig drops RELOCATABLE despite
@@ -430,6 +431,12 @@ pub fn recipe() -> Recipe {
     //    FIDO USB: explicit prompted parents survive allnoconfig. xHCI PCI
     //    support has no prompt and is checked only after resolution. hidraw
     //    stays root-owned; the token worker validates the FIDO report profile.
+    //
+    //    DISK ENCRYPTION (td-install/ENCRYPTION.md): MD is the prompted parent
+    //    of BLK_DEV_DM; DM_CRYPT selects CRYPTO but not AES-XTS. Keep generic
+    //    AES/XTS for CPUs without AES-NI and the accelerated implementation
+    //    for ordinary laptops. Unlock must work before the volume is mounted.
+    //    This enables no mapping, enrollment or encrypted installation.
     //
     //    SOFTWARE UI: the first graphical profile writes XRGB8888 through the
     //    virtio-gpu driver's fbdev client and reads QEMU's PS/2 devices through
@@ -583,6 +590,12 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_NVME_MULTIPATH[ =]/d; \
                   /^#? *CONFIG_USB_STORAGE[ =]/d; \
                   /^#? *CONFIG_ISO9660_FS[ =]/d; \
+                  /^#? *CONFIG_MD[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_DM[ =]/d; \
+                  /^#? *CONFIG_DM_CRYPT[ =]/d; \
+                  /^#? *CONFIG_CRYPTO_AES[ =]/d; \
+                  /^#? *CONFIG_CRYPTO_XTS[ =]/d; \
+                  /^#? *CONFIG_CRYPTO_AES_NI_INTEL[ =]/d; \
                   /^#? *CONFIG_NET[ =]/d; \
                   /^#? *CONFIG_PACKET[ =]/d; \
                   /^#? *CONFIG_UNIX[ =]/d; \
@@ -722,6 +735,12 @@ pub fn recipe() -> Recipe {
                    '# CONFIG_NVME_MULTIPATH is not set' \
                    'CONFIG_USB_STORAGE=y' \
                    'CONFIG_ISO9660_FS=y' \
+                   'CONFIG_MD=y' \
+                   'CONFIG_BLK_DEV_DM=y' \
+                   'CONFIG_DM_CRYPT=y' \
+                   'CONFIG_CRYPTO_AES=y' \
+                   'CONFIG_CRYPTO_XTS=y' \
+                   'CONFIG_CRYPTO_AES_NI_INTEL=y' \
                    'CONFIG_NET=y' \
                    'CONFIG_PACKET=y' \
                    'CONFIG_UNIX=y' \
@@ -853,6 +872,12 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_KEXEC_FILE=y' .config || { echo 'KEXEC_FILE off — the shim boots the selected deployment via kexec_file_load(2)' >&2; exit 1; }; \
                  grep -q '^CONFIG_RELOCATABLE=y' .config || { echo 'RELOCATABLE off — a non-relocatable bzImage is rejected by the x86 kexec_file_load loader (boots via -kernel, fails via kexec)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BTRFS_FS=y' .config || { echo 'BTRFS_FS off — the persistent volume is one btrfs filesystem (@var plus the loop-mounted EROFS root blobs)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MD=y' .config || { echo 'MD off — device mapper needs its prompted parent enabled' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_DM=y' .config || { echo 'BLK_DEV_DM off — encrypted volumes need built-in device mapper' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DM_CRYPT=y' .config || { echo 'DM_CRYPT off — encrypted volumes need the built-in crypt target' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CRYPTO_AES=y' .config || { echo 'CRYPTO_AES off — disk encryption needs a generic AES fallback' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CRYPTO_XTS=y' .config || { echo 'CRYPTO_XTS off — disk encryption needs the generic XTS mode' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CRYPTO_AES_NI_INTEL=y' .config || { echo 'CRYPTO_AES_NI_INTEL off — disk encryption needs the x86 accelerated AES-XTS implementation' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_LOOP=y' .config || { echo 'BLK_DEV_LOOP off — the immutable EROFS root is a file inside btrfs, loop-mounted read-only' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_RAM=y' .config || { echo 'BLK_DEV_RAM off - a live boot keeps its volatile volume on /dev/ram0' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_RAM_COUNT=1$' .config || { echo 'BLK_DEV_RAM_COUNT is not 1 - the live profile uses exactly /dev/ram0' >&2; exit 1; }; \

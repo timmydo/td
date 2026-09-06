@@ -33,11 +33,16 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      present plus the `TD-USERLAND-OK` /init marker. The behavioural proof that it
 //      actually boots is the host-side `td-recipe-eval qemu-boot linux-x86-64` tool
 //      (host qemu), which cannot run in this host-free BuildOnly rung.
+//   7. The linked vmlinux contains dm-crypt and generic/accelerated AES-XTS entry
+//      points. Checking the ELF rejects a kernel built without them even if
+//      a recipe or stale .config claims they were selected. This is structural
+//      evidence; encrypted I/O and unlock belong to the later VM oracle.
 pub fn recipe() -> Recipe {
     let vmlinux = "{in:linux-x86-64}/vmlinux";
     let bzimage = "{in:linux-x86-64}/bzImage";
     let initramfs = "{in:linux-x86-64}/initramfs.cpio";
     let readelf = "{in:binutils-x86-64-native}/bin/readelf";
+    let nm = "{in:binutils-x86-64-native}/bin/nm";
     let mut steps = Vec::new();
 
     steps.push(
@@ -107,12 +112,29 @@ pub fn recipe() -> Recipe {
     let initramfs_check = initramfs_cpio_shape_check(initramfs, "{in:busybox-x86-64}/bin/busybox");
     steps.push(Step::run("{root}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()));
 
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                &format!(
+                    "'{nm}' '{vmlinux}' > encryption-symbols || exit 1; \
+                     for symbol in crypt_ctr crypto_aes_mod_init xts_module_init aesni_init; do \
+                       grep -q \"[[:space:]][tT][[:space:]]$symbol$\" encryption-symbols || {{ echo \"vmlinux is missing the built-in encryption function $symbol\" >&2; exit 1; }}; \
+                     done"
+                ),
+            ],
+        )
+        .env("PATH", &mesboot0_path()),
+    );
+
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Linux 7.1.4, source-built by the native /td/store x86_64 toolchain — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static busybox userland\n".into(),
+        content: "PASS: Linux 7.1.4, source-built by the native /td/store x86_64 toolchain — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static busybox userland\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -126,7 +148,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage + busybox initramfs, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static busybox userland"
+echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage + busybox initramfs, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static busybox userland"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test 1
 "#,
