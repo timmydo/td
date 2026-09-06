@@ -181,6 +181,7 @@ mod tests {
             "td-portal",
             "td-profiler",
             "td-seatd",
+            "td-secret",
             "td-sh",
             "td-svc",
             "td-txt",

@@ -1396,6 +1396,9 @@ pub(crate) fn valid_cargo_package_name(package: &str) -> bool {
 }
 
 fn valid_cargo_source_patch_path(path: &str) -> bool {
+    if path.ends_with(".rs") && valid_cargo_subdir(path) {
+        return true;
+    }
     for suffix in ["Cargo.toml", "build.rs"] {
         let nested = format!("/{suffix}");
         if path == suffix
@@ -1657,7 +1660,7 @@ pub(crate) fn parse_cargo_source_patches(
             .ok_or("Cargo source patch `file' must be a string")?;
         if !valid_cargo_source_patch_path(file) {
             return Err(format!(
-                "Cargo source patch path must be a plain relative Cargo.toml or build.rs path: {file}"
+                "Cargo source patch path must be a plain relative Cargo.toml or Rust source path: {file}"
             ));
         }
         if !seen_files.insert(file.to_string()) {
@@ -5795,6 +5798,8 @@ mod tests {
             parse_cargo_source_patches(&build_script).unwrap()[0].file,
             "nested/build.rs"
         );
+
+        assert!(valid_cargo_source_patch_path("src/config.rs"));
 
         for invalid in [
             r#"[{"file":"../Cargo.toml","edits":[{"from":"a","to":"b","expect":"1"}]}]"#,

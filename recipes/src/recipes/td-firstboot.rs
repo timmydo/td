@@ -10,8 +10,8 @@ use crate::types::{Recipe, Step};
 // on a machine's first boot. Per-file symlinks rather than an /etc overlay: the
 // overlay would retire SYSTEM_ETC_RO_MARKER for the whole directory.
 //
-// SCOPE: the /var side only. It carries no crypto — OpenSSH `ssh-keygen` mints the
-// Ed25519 key — so the crate is pure safe std needing no syscall surface (its entropy is
+// SCOPE: the /var side only. OpenSSH `ssh-keygen` mints the Ed25519 key;
+// td-secret supplies the shared credential store. The crate is safe std (its entropy is
 // /dev/random read as an ordinary file), which keeps it `#![forbid(unsafe_code)]`
 // and adds NO target-side unsafe exception to UNSAFE.md.
 //
@@ -38,6 +38,15 @@ pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    (
+        "credentials",
+        include_str!("../../../td-firstboot/src/credentials.rs"),
+    ),
+    ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
+    (
+        "secret_store",
+        include_str!("../../../td-secret/src/store.rs"),
+    ),
     (
         "machineid",
         include_str!("../../../td-firstboot/src/machineid.rs"),
@@ -68,11 +77,20 @@ pub fn recipe() -> Recipe {
     let path = format!("{bbin}:{gccbin}");
 
     let mut steps = Vec::new();
+    for directory in [
+        "{src}/td-firstboot/src",
+        "{src}/td-secret/src",
+        "{src}/engine/src",
+    ] {
+        steps.push(Step::MkDir {
+            path: directory.into(),
+        });
+    }
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
     steps.push(Step::WriteFile {
-        path: "{src}/main.rs".into(),
+        path: "{src}/td-firstboot/src/main.rs".into(),
         content: MAIN_RS.into(),
         exec: false,
     });
@@ -80,11 +98,20 @@ pub fn recipe() -> Recipe {
     // can resolve `mod NAME;` from the filesystem.
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: format!("{{src}}/{name}.rs"),
+            path: match *name {
+                "crypto" => "{src}/td-secret/src/crypto.rs".into(),
+                "secret_store" => "{src}/td-secret/src/store.rs".into(),
+                _ => format!("{{src}}/td-firstboot/src/{name}.rs"),
+            },
             content: (*source).into(),
             exec: false,
         });
     }
+    steps.push(Step::WriteFile {
+        path: "{src}/engine/src/sha256.rs".into(),
+        content: include_str!("../../../engine/src/sha256.rs").into(),
+        exec: false,
+    });
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
     });
@@ -120,7 +147,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-firstboot",
-                "{src}/main.rs",
+                "{src}/td-firstboot/src/main.rs",
             ],
         )
         .env("PATH", &path)
@@ -250,7 +277,7 @@ mod tests {
                     if arg.ends_with("/bin/td-util") || arg.ends_with("/bin/td-firstboot") {
                         "{out}/bin/<crate>".to_string()
                     } else if arg.ends_with("/main.rs") {
-                        "{src}/main.rs".to_string()
+                        "{src}/td-firstboot/src/main.rs".to_string()
                     } else {
                         arg
                     }

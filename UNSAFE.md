@@ -66,9 +66,10 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
-| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the private Wayland client's bounded descriptor transfer |
+| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`; plus one scoped descriptor adoption |
+| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport for bounded credential replies |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -1819,10 +1820,10 @@ here and in `td-profiler/DESIGN.md`.
 ## 12. `td-portal` — the private Wayland dialog client
 
 The FileChooser client carries exactly THREE syscalls through one x86-64
-`syscall5` instruction in `td-portal/src/sys.rs`: `recvmsg(2)`, `sendmsg(2)`,
+`syscall5` instruction in `td-secret/src/sys.rs`: `recvmsg(2)`, `sendmsg(2)`,
 and `close(2)`. Safe `UnixStream` carries descriptor-free Wayland messages.
-The raw layer exists only because `wl_keyboard.keymap` and
-`wl_shm.create_pool` carry one SCM_RIGHTS descriptor in opposite directions.
+The raw layer carries the Wayland descriptors and the credential-transfer
+uses recorded in §15.
 It borrows the stream and the descriptor it sends; no socket creation,
 connection, path lookup, or caller-selected ancillary type enters the surface.
 
@@ -1842,8 +1843,8 @@ raw-descriptor adoption that the general D-Bus broker needs. The exact keymap
 size and contents are checked before input is accepted.
 
 The send path emits exactly one descriptor with a 24-byte control buffer and
-fixed `SOL_SOCKET`/`SCM_RIGHTS`; its only production caller sends the
-FileChooser's unlinked 0600 regular backing file in `wl_shm.create_pool`.
+fixed `SOL_SOCKET`/`SCM_RIGHTS`; the FileChooser caller sends its unlinked
+0600 regular backing file in `wl_shm.create_pool`; §15 adds credential replies.
 `sendmsg` pins `MSG_NOSIGNAL` so a compositor departure is an error rather than
 a process-wide signal, and carries the first bytes and descriptor atomically.
 A short body write continues through safe `UnixStream`; the descriptor is not
@@ -2089,3 +2090,33 @@ raw environment-fd adoption or received-fd consumer is authorized here. A
 fourth syscall, another fcntl command, another caller, incoming descriptor
 consumer, or additional allowance amends this section and
 `td-editor/DESIGN.md` in the same landing.
+
+## 15. `td-secret` — the credential portal client
+
+The client compiles surface 12's `td-secret/src/sys.rs` directly: the same
+three-syscall instruction and scoped allowance, with no new raw operation.
+Only `client.rs` receives descriptors. Each D-Bus frame retains at most one
+SCM_RIGHTS descriptor; an owning guard closes it on every refusal and drop.
+An authenticated `td.Secret1.Retrieve` reply transfers that one descriptor
+through the shared reopen-and-close function. The reopened file must be
+regular, unlinked, and at most 4096 bytes. The client reads it once and writes
+the credential to its stdout pipe, which tmc captures directly without a
+shell. Applications import no cryptographic implementation.
+
+The receive loop reads exactly the current D-Bus frame, negotiates descriptor
+transfer, checks the declared descriptor count, and never assigns a descriptor
+from another frame to a reply. One deadline bounds the whole exchange and a
+32-frame limit bounds unrelated traffic. Confinement tests pin the shared
+module, sole receive/reopen sites and disposal guard.
+
+Surface 12 also has one additional send caller in `td-portal/src/secret.rs`.
+It sends only a read-only descriptor for an already-unlinked regular file,
+after obtaining the requester application identity from the broker and
+reading that application's named credential. Secret bytes are written only
+after unlinking. The credential method accepts no incoming descriptor.
+
+After fd negotiation, the portal's bus reader also uses the shared receive
+wrapper. It discards every received fd immediately, counts them only for
+bounded D-Bus decoding, and answers calls with InvalidArgs rather than
+terminating the service. Oversized frames retain the existing bounded drain.
+This receive-and-discard pair is confined to secret.rs and pinned in tests.

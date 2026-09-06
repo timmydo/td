@@ -1,0 +1,121 @@
+#![deny(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )
+)]
+
+mod client;
+#[allow(dead_code, reason = "the portal shares the authenticated store reader")]
+mod crypto;
+#[path = "../../td-busd/src/message.rs"]
+#[allow(dead_code, reason = "shared bounded D-Bus codec")]
+mod message;
+#[path = "../../td-busd/src/name.rs"]
+mod name;
+#[allow(dead_code, reason = "the portal shares the authenticated store reader")]
+mod store;
+#[allow(
+    dead_code,
+    reason = "shared descriptor transport also sends Wayland files"
+)]
+mod sys;
+#[path = "../../td-busd/src/wire.rs"]
+#[allow(dead_code, reason = "shared bounded D-Bus codec")]
+mod wire;
+
+use std::io::{self, Read};
+
+fn run(args: &[String]) -> Result<(), String> {
+    match args {
+        [command] if command == "selftest" => crypto::selftest(),
+        [command, name] if command == "get" => {
+            let mut secret = client::retrieve(name)?;
+            use std::io::Write;
+            let mut stdout = io::stdout().lock();
+            let result = stdout
+                .write_all(&secret)
+                .and_then(|()| stdout.flush())
+                .map_err(|e| e.to_string());
+            secret.fill(0);
+            result
+        }
+        [command, target] if command == "set" => {
+            let (app, name) = store::target(target)?;
+            let uid = std::fs::metadata("/proc/self").map_err(|e| e.to_string())?;
+            use std::os::unix::fs::MetadataExt;
+            let store = store::Store::open(&store::user_path(uid.uid()), uid.uid(), false)?;
+            let mut secret = Vec::new();
+            io::stdin()
+                .take((store::MAX_SECRET + 1) as u64)
+                .read_to_end(&mut secret)
+                .map_err(|e| format!("read credential from stdin: {e}"))?;
+            store.set(app, name, &secret)?;
+            secret.fill(0);
+            eprintln!("td-secret: credential stored (file-backed key; console authorization)");
+            Ok(())
+        }
+        _ => Err("usage: td-secret set APPLICATION/NAME < credential-file".into()),
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    match run(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("td-secret: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod confinement {
+    #[test]
+    fn descriptor_transport_is_the_only_raw_surface() {
+        let sources = [
+            ("main.rs", include_str!("main.rs")),
+            ("client.rs", include_str!("client.rs")),
+            ("crypto.rs", include_str!("crypto.rs")),
+            ("store.rs", include_str!("store.rs")),
+            ("sys.rs", include_str!("sys.rs")),
+        ];
+        for (name, source) in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            let keyword = format!("un{}", "safe");
+            let lint = format!("{keyword}_code");
+            let raw = production.matches(&keyword).count() - production.matches(&lint).count();
+            assert_eq!(raw, usize::from(name == "sys.rs"), "{name}");
+            assert_eq!(
+                production.matches(&format!("#[allow({lint})]")).count(),
+                usize::from(name == "sys.rs")
+            );
+        }
+        let sys = include_str!("sys.rs");
+        assert_eq!(sys.matches("core::arch::asm!").count(), 1);
+        assert_eq!(sys.matches("const SYS_").count(), 3);
+        for pin in [
+            "const SYS_CLOSE: usize = 3;",
+            "const SYS_SENDMSG: usize = 46;",
+            "const SYS_RECVMSG: usize = 47;",
+            "const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;",
+            "const MSG_NOSIGNAL: i32 = 0x4000;",
+        ] {
+            assert!(sys.contains(pin));
+        }
+        let mut actual = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".rs"))
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(
+            actual,
+            ["client.rs", "crypto.rs", "main.rs", "store.rs", "sys.rs"]
+        );
+    }
+}

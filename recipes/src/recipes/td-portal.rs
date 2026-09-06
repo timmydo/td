@@ -10,7 +10,7 @@ const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
 const FILE_CHOOSER_RS: &str = include_str!("../../../td-portal/src/file_chooser.rs");
 const HANDLES_RS: &str = include_str!("../../../td-portal/src/handles.rs");
 const SETTINGS_RS: &str = include_str!("../../../td-portal/src/settings.rs");
-const SYS_RS: &str = include_str!("../../../td-portal/src/sys.rs");
+const SYS_RS: &str = include_str!("../../../td-secret/src/sys.rs");
 const WAYLAND_CHANNEL_RS: &str = include_str!("../../../td-portal/src/wayland_channel.rs");
 const WAYLAND_DIALOG_RS: &str = include_str!("../../../td-portal/src/wayland_dialog.rs");
 const COMPOSITOR_WIRE_RS: &str = include_str!("../../../td-compositor/src/wire.rs");
@@ -82,7 +82,7 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
-            path: "{src}/td-portal/src/sys.rs".into(),
+            path: "{src}/td-secret/src/sys.rs".into(),
             content: SYS_RS.into(),
             exec: false,
         },
@@ -131,6 +131,36 @@ pub fn recipe() -> Recipe {
         steps.push(Step::WriteFile {
             path: (*staged_path).into(),
             content: (*source).into(),
+            exec: false,
+        });
+    }
+    for directory in ["{src}/td-secret/src", "{src}/engine/src"] {
+        steps.push(Step::MkDir {
+            path: directory.into(),
+        });
+    }
+
+    for (path, source) in [
+        (
+            "{src}/td-portal/src/secret.rs",
+            include_str!("../../../td-portal/src/secret.rs"),
+        ),
+        (
+            "{src}/td-secret/src/crypto.rs",
+            include_str!("../../../td-secret/src/crypto.rs"),
+        ),
+        (
+            "{src}/td-secret/src/store.rs",
+            include_str!("../../../td-secret/src/store.rs"),
+        ),
+        (
+            "{src}/engine/src/sha256.rs",
+            include_str!("../../../engine/src/sha256.rs"),
+        ),
+    ] {
+        steps.push(Step::WriteFile {
+            path: path.into(),
+            content: source.into(),
             exec: false,
         });
     }
@@ -205,7 +235,7 @@ mod tests {
             ("{src}/td-portal/src/file_chooser.rs", FILE_CHOOSER_RS),
             ("{src}/td-portal/src/handles.rs", HANDLES_RS),
             ("{src}/td-portal/src/settings.rs", SETTINGS_RS),
-            ("{src}/td-portal/src/sys.rs", SYS_RS),
+            ("{src}/td-secret/src/sys.rs", SYS_RS),
             ("{src}/td-portal/src/wayland_channel.rs", WAYLAND_CHANNEL_RS),
             ("{src}/td-portal/src/wayland_dialog.rs", WAYLAND_DIALOG_RS),
             ("{src}/td-compositor/src/wire.rs", COMPOSITOR_WIRE_RS),
@@ -255,9 +285,17 @@ mod tests {
         for module in declared {
             if matches!(
                 module,
-                "wayland_wire" | "font" | "font_data" | "keyboard" | "list_filter"
+                "sys"
+                    | "secret_store"
+                    | "wayland_wire"
+                    | "font"
+                    | "font_data"
+                    | "keyboard"
+                    | "list_filter"
             ) {
                 let path = match module {
+                    "sys" => "../../td-secret/src/sys.rs",
+                    "secret_store" => "../../td-secret/src/store.rs",
                     "wayland_wire" => "../../td-compositor/src/wire.rs",
                     "font" => "../../td-compositor/src/font.rs",
                     "font_data" => "../../td-compositor/src/font_data.rs",

@@ -349,6 +349,7 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-login/src", "recipes/src/recipes/td-login.rs"),
     ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
     ("td-portal/src", "recipes/src/recipes/td-portal.rs"),
+    ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
     ("td-profiler/src", "recipes/src/recipes/td-profiler.rs"),
     ("td-seatd/src", "recipes/src/recipes/td-seatd.rs"),
     ("td-sh/src", "recipes/src/recipes/td-sh.rs"),
@@ -4219,7 +4220,7 @@ mod tests {
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled.
-        assert_eq!(readers_of("td-busd"), ["td-jail", "td-login", "td-portal"]);
+        assert_eq!(readers_of("td-busd"), ["td-jail", "td-login", "td-portal", "td-secret"]);
         assert_eq!(readers_of("td-boot"), ["td-install"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
         assert!(readers_of("td-sh").is_empty(), "{readers:?}");
@@ -6302,9 +6303,19 @@ mod tests {
         assert_eq!(comp.len(), 8, "{comp:?}");
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
-            ["td-busd", "td-jail", "td-login", "td-portal"]
+            [
+                "td-busd",
+                "td-firstboot",
+                "td-jail",
+                "td-login",
+                "td-portal",
+                "td-secret"
+            ]
         );
-        assert_eq!(names(&one("td-boot/src/protocol.rs")), ["td-boot", "td-install"]);
+        assert_eq!(
+            names(&one("td-boot/src/protocol.rs")),
+            ["td-boot", "td-install"]
+        );
         // The order holds within a narrowed list: every test before any clippy,
         // the workspace first.
         assert!(comp.first().is_some_and(|c| c.starts_with("cargo test --frozen --workspace")));

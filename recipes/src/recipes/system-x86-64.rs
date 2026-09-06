@@ -1473,11 +1473,13 @@ fn build_td_svc_conf() -> String {
          requires=wayland\n\
          timeout={application_place}\n\
          \n\
+         # Mail causes the portal credential receipt. Wait for TLS setup\n\
+         # so its unframed progress dots cannot split that console marker.\n\
          [mail]\n\
          type=daemon\n\
          cgroup=session\n\
          exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-mail-ready --command /bin/{mail_name}'\n\
-         after=terminal,busd,netup,applications-workspace\n\
+         after=terminal,busd,portal,netup,applications-workspace,firefox-tls-setup\n\
          requires=wayland,busd\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-mail-ready'\n\
          ready-timeout=30\n\
@@ -3994,6 +3996,14 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-boot}/bin/td-boot".into(),
         link: "{root}/real-root/bin/td-boot".into(),
     });
+    steps.push(Step::CopyTree {
+        from: "{in:td-secret}".into(),
+        dest: "{root}/real-root{in:td-secret}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-secret}/bin/td-secret".into(),
+        link: "{root}/real-root/bin/td-secret".into(),
+    });
     // /bin/td-firstboot — a single static binary, not a multicall, so it is its own
     // /bin entry. The inittab runs it at sysinit; nothing else invokes it.
     steps.push(Step::Symlink {
@@ -4752,6 +4762,7 @@ pub fn recipe() -> Recipe {
             "td-compositor",
             "td-busd",
             "td-portal",
+            "td-secret",
         ])
         .steps(steps);
     let application_inputs = application_payload_inputs(&SYSTEM);
@@ -6089,7 +6100,11 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             // failed loses the placement, not the applications.
             assert_eq!(
                 unit_after(unit),
-                vec!["terminal", "busd", "netup", "applications-workspace"],
+                if unit == "mail" {
+                    vec!["terminal", "busd", "portal", "netup", "applications-workspace", "firefox-tls-setup"]
+                } else {
+                    vec!["terminal", "busd", "netup", "applications-workspace"]
+                },
                 "{unit}"
             );
             let evidence = format!("{unit}-evidence");
@@ -6527,7 +6542,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("applications-workspace", vec!["terminal"]),
             (
                 "mail",
-                vec!["terminal", "busd", "netup", "applications-workspace"],
+                vec!["terminal", "busd", "portal", "netup", "applications-workspace", "firefox-tls-setup"],
             ),
             ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
             (

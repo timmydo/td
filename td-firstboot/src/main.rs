@@ -13,10 +13,16 @@
 //! malformed is a hard error, because minting a new one over a bad read cannot be
 //! noticed from outside. The Ed25519 key comes from OpenSSH `ssh-keygen`, the one
 //! program in the image that already has the required key implementation, so this crate
-//! stays dependency-free `std` with no crypto of its own.
+//! stays dependency-free `std`; credential encryption shares td-secret's implementation.
 
+mod credentials;
+#[path = "../../td-secret/src/crypto.rs"]
+mod crypto;
 mod machineid;
 mod mounts;
+#[path = "../../td-secret/src/store.rs"]
+#[allow(dead_code, reason = "the console and portal share store entry points")]
+mod secret_store;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -69,7 +75,7 @@ const APPLICATION_CONFIGS: &[ApplicationConfig] = &[
     ApplicationConfig {
         application: "mail",
         program: "tmc",
-        files: &[("config.toml", TMC_CONFIG), ("password", TMC_PASSWORD)],
+        files: &[("config.toml", TMC_CONFIG)],
     },
     ApplicationConfig {
         application: "news",
@@ -79,7 +85,7 @@ const APPLICATION_CONFIGS: &[ApplicationConfig] = &[
 ];
 
 /// tmc starts offline from this and says so; the operator replaces the three
-/// placeholders and the password file, and the client reads them when it next
+/// placeholders and stores mail/main through td-secret, and reads them when it next
 /// starts. The comments name no way to start it: a user-level relaunch of a
 /// terminal window is deferred (APPLICATIONS.md §W.7), and the
 /// administrative escape hatch is not a flow a shipped file may depend on
@@ -92,10 +98,8 @@ const TMC_CONFIG: &str = "\
 [account.main]
 well_known_url = \"https://mail.example.com/.well-known/jmap\"
 username = \"you@example.com\"
-password_file = \"/home/td/.config/tmc/password\"
+secret = \"portal\"
 ";
-
-const TMC_PASSWORD: &str = "replace-me\n";
 
 /// tn needs at least one feed to start. These two public feeds are shipped
 /// so the first window shows something rather than an error; tn fetches them
@@ -265,7 +269,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
     // fail this unit. The home is the user's to break; what breaks there is
     // said on the console and shows up as the application's own failure.
     if let Some(applications) = &config.applications {
-        match provision_applications(applications) {
+        match provision_applications(applications, &config.state) {
             Ok(outcomes) => {
                 for (application, outcome) in outcomes {
                     emit_err(&format!(
@@ -407,6 +411,7 @@ fn parse_owner(value: &str) -> Result<(u32, u32), Failure> {
 /// mail client, and the home is the user's to break.
 fn provision_applications(
     owner: &ApplicationHome,
+    state_dir: &Path,
 ) -> Result<Vec<(&'static str, Outcome)>, Failure> {
     let home = match open_directory(&owner.home) {
         Ok(home) => home,
@@ -462,7 +467,15 @@ fn provision_applications(
         directory.push("config");
         let configuration = owned_dir(&directory, owner, &application)?;
         directory.push(config.program);
-        owned_dir(&directory, owner, &configuration)?;
+        let program_dir = owned_dir(&directory, owner, &configuration)?;
+        if config.application == "mail" {
+            if let Err(Failure::Failed(reason) | Failure::Usage(reason)) =
+                credentials::provision(state_dir, owner, &program_dir)
+            {
+                emit_err(&format!("td-firstboot: mail credential/configuration not provisioned: {reason}\n"));
+                continue;
+            }
+        }
         let mut outcome = Outcome::Present;
         for (name, contents) in config.files {
             let path = directory.join(name);
@@ -1261,7 +1274,7 @@ mod tests {
             gid: metadata.gid(),
         };
 
-        let first = provision_applications(&owner).unwrap();
+        let first = provision_applications(&owner, &root).unwrap();
         assert_eq!(
             first,
             vec![("mail", Outcome::Created), ("news", Outcome::Created)]
@@ -1269,7 +1282,7 @@ mod tests {
         let mail = home.join(".td/app/mail/config/tmc/config.toml");
         let password = home.join(".td/app/mail/config/tmc/password");
         let news = home.join(".td/app/news/config/tn/config.toml");
-        for path in [&mail, &password, &news] {
+        for path in [&mail, &news] {
             let metadata = std::fs::metadata(path).unwrap();
             assert_eq!(
                 metadata.permissions().mode() & 0o7777,
@@ -1295,37 +1308,44 @@ mod tests {
             assert_eq!((metadata.uid(), metadata.gid()), (owner.uid, owner.gid));
         }
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), TMC_CONFIG);
-        assert_eq!(std::fs::read_to_string(&password).unwrap(), TMC_PASSWORD);
+        assert!(!password.exists());
         assert_eq!(std::fs::read_to_string(&news).unwrap(), TN_CONFIG);
 
         // The operator's edit survives every later boot; a missing sibling
         // is created without touching it.
         std::fs::write(&mail, "edited\n").unwrap();
-        std::fs::remove_file(&password).unwrap();
-        let second = provision_applications(&owner).unwrap();
+
+        let second = provision_applications(&owner, &root).unwrap();
         assert_eq!(
             second,
-            vec![("mail", Outcome::Created), ("news", Outcome::Present)]
+            vec![("mail", Outcome::Present), ("news", Outcome::Present)]
         );
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
-        assert_eq!(std::fs::read_to_string(&password).unwrap(), TMC_PASSWORD);
-        let third = provision_applications(&owner).unwrap();
+        assert!(!password.exists());
+        let third = provision_applications(&owner, &root).unwrap();
         assert_eq!(
             third,
             vec![("mail", Outcome::Present), ("news", Outcome::Present)]
         );
+
+        // A mail credential failure does not withhold another application's configuration.
+        std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_file(&news).unwrap();
+        assert_eq!(provision_applications(&owner, &root).unwrap(), vec![("news", Outcome::Created)]);
+        assert_eq!(std::fs::read_to_string(&news).unwrap(), TN_CONFIG);
+        assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
 
         // Somebody else's home, or none, is skipped and said, not failed.
         let foreign = ApplicationHome {
             uid: owner.uid.wrapping_add(1),
             ..owner.clone()
         };
-        assert_eq!(provision_applications(&foreign).unwrap(), Vec::new());
+        assert_eq!(provision_applications(&foreign, &root).unwrap(), Vec::new());
         let absent = ApplicationHome {
             home: root.join("nobody"),
             ..owner.clone()
         };
-        assert_eq!(provision_applications(&absent).unwrap(), Vec::new());
+        assert_eq!(provision_applications(&absent, &root).unwrap(), Vec::new());
         // A symlink where a state directory should be is refused outright.
         let linked_home = root.join("linked");
         std::fs::create_dir_all(&linked_home).unwrap();
@@ -1334,7 +1354,7 @@ mod tests {
             home: linked_home,
             ..owner.clone()
         };
-        assert!(provision_applications(&linked).is_err());
+        assert!(provision_applications(&linked, &root).is_err());
         // So is a file, or anything else that is not a directory.
         let filed_home = root.join("filed");
         std::fs::create_dir_all(filed_home.join(".td")).unwrap();
@@ -1343,7 +1363,7 @@ mod tests {
             home: filed_home,
             ..owner.clone()
         };
-        assert!(provision_applications(&filed).is_err());
+        assert!(provision_applications(&filed, &root).is_err());
         // A home that is itself a link, or a file, is skipped like an absent
         // one: the jail resolves a home through its own rules, not this one.
         std::os::unix::fs::symlink(&home, root.join("home-link")).unwrap();
@@ -1353,7 +1373,7 @@ mod tests {
                 home: root.join(odd),
                 ..owner.clone()
             };
-            assert_eq!(provision_applications(&odd).unwrap(), Vec::new());
+            assert_eq!(provision_applications(&odd, &root).unwrap(), Vec::new());
         }
         let _ = std::fs::remove_dir_all(&root);
     }

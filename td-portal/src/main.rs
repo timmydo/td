@@ -17,6 +17,8 @@
 //! exec-as`, and stays alive while that child owns
 //! `org.freedesktop.portal.Desktop`.
 
+#[path = "../../td-secret/src/crypto.rs"]
+mod crypto;
 mod file_chooser;
 #[path = "../../td-compositor/src/font.rs"]
 mod font;
@@ -39,7 +41,12 @@ mod list_filter;
 mod message;
 #[path = "../../td-busd/src/name.rs"]
 mod name;
+mod secret;
+#[path = "../../td-secret/src/store.rs"]
+#[allow(dead_code, reason = "firstboot and the console share the store writer")]
+mod secret_store;
 mod settings;
+#[path = "../../td-secret/src/sys.rs"]
 mod sys;
 mod wayland_channel;
 mod wayland_dialog;
@@ -91,6 +98,7 @@ const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const SETTINGS_INTERFACE: &str = "org.freedesktop.portal.Settings";
 const BACKGROUND_INTERFACE: &str = "org.freedesktop.portal.Background";
+const SECRET_INTERFACE: &str = "td.Secret1";
 const FILE_CHOOSER_INTERFACE: &str = "org.freedesktop.portal.FileChooser";
 const UNAVAILABLE_INTERFACES: [(&str, &str); 5] = [
     ("org.freedesktop.portal.ScreenCast", "CreateSession"),
@@ -147,6 +155,11 @@ const BACKGROUND_DENIAL_BODY: &[u8] = &[
 ];
 
 const INTROSPECTION_XML: &str = r#"<node>
+  <interface name="td.Secret1">
+    <method name="Retrieve"><arg type="s" name="name" direction="in"/><arg type="h" name="credential" direction="out"/><arg type="s" name="receipt" direction="out"/></method>
+    <method name="Received"><arg type="s" name="receipt" direction="in"/></method>
+    <property name="version" type="u" access="read"/>
+  </interface>
   <interface name="org.freedesktop.portal.Settings">
     <method name="ReadAll">
       <arg type="as" name="namespaces" direction="in"/>
@@ -388,6 +401,10 @@ struct CallGuard<'a> {
 }
 
 enum IncomingFrame {
+    Descriptors {
+        bytes: Vec<u8>,
+        count: u32,
+    },
     Message(Vec<u8>),
     Oversized {
         total: usize,
@@ -555,6 +572,10 @@ impl Connection {
                 line.trim()
             )));
         }
+        self.timed()?.write_all(b"NEGOTIATE_UNIX_FD\r\n")?;
+        if self.read_line()? != "AGREE_UNIX_FD\r" {
+            return Err(io::Error::other("the bus refused descriptor transfer"));
+        }
         self.timed()?.write_all(b"BEGIN\r\n")
     }
 
@@ -671,6 +692,9 @@ impl Connection {
         self.timed()?.write_all(&frame)?;
         for _ in 0..=MAX_UNRELATED_MESSAGES {
             let bytes = match read_frame(&mut self.timed()?)? {
+                IncomingFrame::Descriptors { .. } => {
+                    return Err(io::Error::other("unexpected descriptors during setup"));
+                }
                 IncomingFrame::Message(bytes) => bytes,
                 IncomingFrame::Oversized { total, .. } => {
                     return Err(io::Error::other(format!(
@@ -731,6 +755,9 @@ impl Connection {
     fn wait_request_response(&mut self, path: &str, portal_sender: &str) -> io::Result<Reply> {
         for _ in 0..=MAX_UNRELATED_MESSAGES {
             let bytes = match read_frame(&mut self.timed()?)? {
+                IncomingFrame::Descriptors { .. } => {
+                    return Err(io::Error::other("unexpected descriptors during setup"))
+                }
                 IncomingFrame::Message(bytes) => bytes,
                 IncomingFrame::Oversized { total, .. } => {
                     return Err(io::Error::other(format!(
@@ -894,10 +921,13 @@ fn read_frame(reader: &mut impl Read) -> io::Result<IncomingFrame> {
     Ok(IncomingFrame::Message(frame))
 }
 
+#[cfg(test)]
 fn read_service_frame(reader: &mut impl Read) -> io::Result<IncomingFrame> {
     loop {
         match read_frame(reader)? {
-            frame @ IncomingFrame::Message(_) => return Ok(frame),
+            frame @ (IncomingFrame::Message(_) | IncomingFrame::Descriptors { .. }) => {
+                return Ok(frame)
+            }
             frame @ IncomingFrame::Oversized { call: Some(_), .. } => return Ok(frame),
             IncomingFrame::Oversized { call: None, .. } => {}
         }
@@ -919,7 +949,7 @@ fn oversized_call(prefix: &[u8], endian: Endian) -> io::Result<Option<OversizedC
     }
     let mut fields_reader = wire::Reader::at(prefix, 12, endian);
     let fields = fields_reader
-        .value("a(yv)", Limits::NO_FDS)
+        .value("a(yv)", Limits { fds: message::MAX_FDS_PER_MESSAGE })
         .map_err(wire_error)?
         .as_seq()
         .ok_or_else(|| io::Error::other("an oversized D-Bus call has malformed fields"))?;
@@ -1106,16 +1136,19 @@ fn run(paths: &Paths) -> Result<(), String> {
 }
 
 fn serve(connection: &mut Connection, settings: &Settings) -> io::Result<()> {
-    let mut reader = connection.service_reader()?;
+    let reader = connection.service_reader()?;
     let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_SERVICE_EVENTS);
     let bus_sender = sender.clone();
     thread::Builder::new()
         .name("td-portal-bus-reader".into())
-        .spawn(move || loop {
-            let event = read_service_frame(&mut reader);
-            let terminal = event.is_err();
-            if bus_sender.send(ServiceEvent::Bus(event)).is_err() || terminal {
-                break;
+        .spawn(move || {
+            let mut reader = secret::DescriptorReader::new(reader);
+            loop {
+                let event = read_frame(&mut reader).and_then(|frame| reader.finish(frame));
+                let terminal = event.is_err();
+                if bus_sender.send(ServiceEvent::Bus(event)).is_err() || terminal {
+                    break;
+                }
             }
         })
         .map_err(|error| io::Error::other(format!("start portal bus reader: {error}")))?;
@@ -1136,6 +1169,7 @@ fn serve(connection: &mut Connection, settings: &Settings) -> io::Result<()> {
             .map_err(|_| io::Error::other("all portal service workers stopped"))?;
         match event {
             ServiceEvent::Audit => {
+                secret::expire(connection, &mut state)?;
                 begin_active_audit(connection, &mut state)?;
                 continue;
             }
@@ -1186,6 +1220,8 @@ struct ActiveDialog {
 
 #[derive(Default)]
 struct ServiceState {
+    secrets: BTreeMap<u32, secret::Pending>,
+    secret_receipts: BTreeMap<String, secret::Receipt>,
     handles: Handles,
     pending: BTreeMap<u32, PendingOpen>,
     pending_audits: BTreeMap<u32, String>,
@@ -1201,6 +1237,25 @@ fn consume_bus_frame(
     frame: IncomingFrame,
 ) -> io::Result<()> {
     let frame = match frame {
+        IncomingFrame::Descriptors { bytes, count } => {
+            let (call, _) = message::decode(&bytes, count).map_err(message_error)?;
+            if call.kind == MessageType::MethodCall
+                && call.flags & message::FLAG_NO_REPLY_EXPECTED == 0
+            {
+                let owner = call
+                    .fields
+                    .sender
+                    .ok_or_else(|| io::Error::other("descriptor call has no sender"))?;
+                let serial = connection.next_serial()?;
+                connection.write_frame(&invalid_args(
+                    &call,
+                    serial,
+                    owner,
+                    "this portal method accepts no descriptors",
+                )?)?;
+            }
+            return Ok(());
+        }
         IncomingFrame::Message(frame) => frame,
         IncomingFrame::Oversized {
             call: Some(call), ..
@@ -1223,9 +1278,17 @@ fn consume_bus_frame(
     if consumed != frame.len() {
         return Err(io::Error::other("a portal call carried trailing bytes"));
     }
-    if consume_active_audit_reply(connection, state, &incoming)?
+    if secret::identity_reply(connection, state, &incoming)?
+        || consume_active_audit_reply(connection, state, &incoming)?
         || consume_identity_reply(connection, state, events, &incoming)?
     {
+        return Ok(());
+    }
+    if secret::acknowledge(connection, state, &incoming)? {
+        return Ok(());
+    }
+    if secret::is_call(&incoming) {
+        secret::begin(connection, state, &incoming)?;
         return Ok(());
     }
     if is_open_file_call(&incoming) {
@@ -1252,6 +1315,10 @@ fn consume_bus_frame(
     }
     if let Some(owner) = departed {
         state.pending.retain(|_, pending| pending.owner != owner);
+        state.secrets.retain(|_, pending| pending.owner != owner);
+        state
+            .secret_receipts
+            .retain(|_, receipt| receipt.owner != owner);
         let paths = state
             .active
             .iter()
@@ -2975,6 +3042,7 @@ fn known_property_interface(interface: &str) -> bool {
     matches!(
         interface,
         SETTINGS_INTERFACE
+            | SECRET_INTERFACE
             | BACKGROUND_INTERFACE
             | FILE_CHOOSER_INTERFACE
             | PROPERTIES_INTERFACE
@@ -2985,6 +3053,7 @@ fn known_property_interface(interface: &str) -> bool {
 
 fn interface_version(interface: &str) -> Option<u32> {
     match interface {
+        SECRET_INTERFACE => Some(1),
         SETTINGS_INTERFACE => Some(SETTINGS_VERSION),
         BACKGROUND_INTERFACE => Some(BACKGROUND_VERSION),
         FILE_CHOOSER_INTERFACE => Some(FILE_CHOOSER_VERSION),
@@ -3254,6 +3323,20 @@ fn probe(paths: &Paths) -> Result<(), String> {
         }
         require_unavailable_interface(&mut connection, &portal_sender, interface, member)?;
     }
+    let secret_denial = connection
+        .call_outcome(
+            PORTAL_NAME, PORTAL_PATH, SECRET_INTERFACE, "Retrieve", "s",
+            |writer| writer.string("main"),
+        )
+        .map_err(|error| format!("the unconfined credential probe failed: {error}"))?;
+    require_exact_remote_error(
+        secret_denial,
+        &portal_sender,
+        SECRET_INTERFACE,
+        "Retrieve",
+        "org.freedesktop.portal.Error.NotAllowed",
+        "credential caller is not an authenticated application",
+    )?;
     let unique = connection
         .unique
         .as_deref()
@@ -3489,11 +3572,12 @@ mod confinement {
         ("handles.rs", include_str!("handles.rs")),
         ("main.rs", include_str!("main.rs")),
         ("settings.rs", include_str!("settings.rs")),
-        ("sys.rs", include_str!("sys.rs")),
+        ("secret.rs", include_str!("secret.rs")),
+        ("sys.rs", include_str!("../../td-secret/src/sys.rs")),
         ("wayland_channel.rs", include_str!("wayland_channel.rs")),
         ("wayland_dialog.rs", include_str!("wayland_dialog.rs")),
     ];
-    const SYS: &str = include_str!("sys.rs");
+    const SYS: &str = include_str!("../../td-secret/src/sys.rs");
     const DIALOG: &str = include_str!("wayland_dialog.rs");
 
     fn production(source: &str) -> &str {
@@ -3567,6 +3651,7 @@ mod confinement {
         actual.sort();
         let mut expected = SOURCES
             .iter()
+            .filter(|(name, _)| *name != "sys.rs")
             .map(|(name, _)| (*name).to_string())
             .collect::<Vec<_>>();
         expected.sort();

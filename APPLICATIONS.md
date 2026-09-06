@@ -5611,7 +5611,7 @@ not for a persistent Session lifecycle.
 | — | `.Background` | — | `RequestBackground` returns denied; persistent background execution needs a td-svc user-service design. |
 | — | `.Documents` | FUSE | **absent** (§0: no `CONFIG_FUSE_FS`). See below. |
 | — | `.Print`, `.Camera`, `.ScreenCast`, `.RemoteDesktop` | spooler / PipeWire | **not exported.** A fake PipeWire descriptor would make successful setup indistinguishable from a broken stream. |
-| — | `.Secret` | a keyring | deferred; apps fall back to plaintext inside the app dir. **That is a security DEGRADATION and the earlier claim that it is "the same trust boundary a keyring would be" is wrong** — a keyring adds encryption at rest, a lock state that survives the app, release mediated per secret, and the ability to share one secret between apps under control. Plaintext in the app directory has none of those: it is protected only by the directory's mode, so anything that reads the app's files reads its passwords. It is an acceptable v1 position for a single-user machine whose disk is not encrypted anyway, and it should be recorded as a gap rather than as parity. |
+| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); the file-backed master still leaves the same-uid and offline-disk gap. |
 
 **The Documents consequence, stated honestly rather than buried.**
 Without it, a file chooser can only grant what the sandbox can already
@@ -8979,54 +8979,67 @@ Two things it does not merge. Deduplicating *storage* does nothing for
 it does nothing for the **reboot**, which is a property of where the
 package lives rather than of how many copies of it exist.
 
-### W.4 A secret manager that keeps principle 7
+### W.4 The credential manager
 
-**Today.** The terminal applications keep their credentials in the
-application's private configuration directory as a mode-0600 file. tmc's
-`password_command` runs through `sh -c`, and the jail has no shell: the
-`mail` package is a static binary on the empty runtime, so `/app/bin` and
-`/usr/bin` hold nothing but `tmc`. The POC therefore reads the file
-directly: tmc gains `password_file`, a path it opens itself, and the
-provisioner writes that file. That is APPLICATIONS.md §E's admitted
-degradation for `.Secret`: the file is protected by directory mode alone,
-so anything that reads the application's files reads its passwords, and
-a launcher on the same uid outside the jail can read every application's.
+Increment (a) uses one per-user store at `/var/lib/td/secrets/<uid>` beside
+the machine identity. `td-firstboot` creates the master and the initial
+`mail/main` placeholder. The mode-0700 directory and mode-0600 files are owned
+by that user; credentials use ChaCha20-Poly1305 and per-application HKDF keys.
+The file-backed master is deliberately an interim backend: a same-uid
+unconfined process or an offline disk reader can read it. This increment
+provides no TPM protection, authenticated session lock, token recovery, or
+protection from other unconfined programs running as the user.
 
-**Target.** Principle 7 (AGENTS.md) fixes the shape: human authentication
-is a FIDO2 token, secrets at rest are hardware-sealed, TPM possession is
-device binding rather than identity, and elevation is one named
-operation with typed arguments and one consent bound to that request.
-A secret manager under those rules is:
+**Applications receive credentials, not encryption keys.** td owns the
+`td.Secret1` interface on the activated `org.freedesktop.portal.Desktop`
+service at `/org/freedesktop/portal/desktop`. `Retrieve(s name)` returns a
+read-only descriptor containing that credential and a one-use receipt token.
+The portal obtains `td.AppId` and `UnixUserID` from the broker for the unique
+sender; the call has no application-identity argument. Unconfined, unknown,
+wrong-uid and expired identities are refused. No application sees the store,
+a master key, or a derived key. The upstream
+`org.freedesktop.portal.Secret` keyring-key protocol remains unexported:
+returning a credential through it would violate its contract.
 
-1. **One store, sealed to the device.** `td-authd` (not built; see
-   `td-login/THREAT-MODEL.md`) owns a per-user secret store whose master
-   key is sealed to the TPM's platform state and released only after a
-   FIDO2 user-presence assertion at session start. Nothing at rest is
-   readable without both the device and the token. A second enrolled
-   token is the recovery path, or the store is explicitly unrecoverable.
-2. **Applications never see the store.** They see `.Secret` (§E's portal
-   row): the portal hands each application ONE application-scoped secret
-   over a descriptor, derived from the master key and the application's
-   authenticated identity (`FLATPAK_ID` as the broker fixed it), never
-   the master key. The application encrypts its own credential file with
-   it. Revoking an application re-derives nothing else.
-3. **Writing a credential is an elevation.** `td-secret set
-   <application>/<name>` is the named operation; its typed arguments are
-   the application identity and the secret name; the one consent is the
-   token touch on the secure-attention path the compositor must provide
-   first (§L.1). There is no remembered approval and no grace window.
-4. **No server.** Nothing is synchronized anywhere; the store lives in
-   the persistent `/var` subvolume beside the machine identity
-   `td-firstboot` mints, and moves with the device.
+`tmc` uses `secret = "portal"` with the account name as the credential name
+(`main` for the provisioned account). Its packaged `/app/bin/td-secret get`
+helper receives and reads the descriptor, acknowledges its receipt, and
+writes the credential into tmc's captured stdout pipe. Neither tmc nor tn
+needs a cryptography dependency. The portal logs the mail receipt only after
+the same broker-authenticated connection acknowledges its one-use token;
+QEMU requires the exact supervised `portal: TD-SECRET-READY app=mail name=main`
+line. The token is liveness evidence, not authorization or cryptographic
+proof of a client's read. The shipped helper's ordering and live transfer
+tests establish the read-before-acknowledgement behavior.
 
-**Increments.** (a) The portal row: `.Secret` served by td-portal with a
-per-application secret derived from a file-backed master key, so the
-application side (tmc's `password_command` replaced by a
-`secret = "portal"` mode) can land and be tested before any hardware.
-(b) TPM sealing of that master key. (c) FIDO2 release at session start,
-which needs the secure-attention path. (d) `td-secret set` as the first
-consumer of `td-authd`'s one-operation elevation. Until (a) lands,
-`password_file` stays, and the provisioner writes its file at mode 0600.
+Firstboot writes the placeholder into the store before creating portal-mode
+configuration. It imports an existing credential at the formerly provisioned
+mail password path, durably switches that configuration, and removes the
+plaintext file. It never replaces an existing stored credential with a
+placeholder. Missing legacy credentials, renamed accounts, custom or ambiguous credential
+sources, conflicting existing credentials and malformed files cause an explicit
+refusal; source data is retained for operator resolution. Migration is
+restartable after any completed publication. There is no dual plaintext
+fallback in the shipped tmc client.
+
+**Interim console writer.** `td-secret set <application>/<name>` reads at most
+4096 credential bytes from stdin and atomically replaces that entry. This
+increment authorizes the store's uid through ordinary file ownership, at the
+same trust level as the provisioner. It offers no token consent and no
+remembered authorization. The command runs as the user and does not invoke
+`su`, a shell, or a privileged helper. This is the explicit interim exception
+to principle 7 for increment (a), not an elevation claim.
+
+**Remaining increments, in order on the rolling workstream.** (b) Replace the
+file master with TPM sealing bound to an explicit platform-state policy.
+(c) Gate release on FIDO2 user presence at session start, after the compositor
+provides secure attention and trusted input. Enroll a second recovery token
+at creation or explicitly mark the store unrecoverable. (d) Move the console
+writer behind `td-authd` as one named operation, with typed application/name
+and descriptor-pinned credential bytes, and one token touch bound to that
+operation. Remove each interim mechanism atomically when its replacement
+lands. No increment adds a server, synchronization service, or password
+fallback. `td-secret/DESIGN.md` specifies the current format and boundaries.
 
 ### W.5 td-editor: a td-owned editor for mail and text
 

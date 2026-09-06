@@ -996,7 +996,7 @@ impl CargoGitSource {
     }
 }
 
-/// A literal, count-checked patch to one Cargo.toml or build.rs below the
+/// A literal, count-checked patch to one Cargo.toml or Rust source file below the
 /// selected Rust workspace. This is narrower than a generic build phase, and
 /// the Rust runner applies the edits before enforcing the exact reviewed
 /// Cargo.lock and invoking frozen Cargo.

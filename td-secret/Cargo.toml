@@ -1,0 +1,25 @@
+[package]
+name = "td-secret"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "td's local credential store and console writer"
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[workspace]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true

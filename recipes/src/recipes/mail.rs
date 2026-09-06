@@ -28,8 +28,8 @@ pub fn recipe() -> Recipe {
     // Network for the protocol the program speaks, the Wayland socket the jail
     // requires of every application, and the terminal grant: td-term hands the
     // launcher a fresh pty and td-jail makes it the program's controlling
-    // terminal. No bus name: the program has no D-Bus client, and the image's
-    // one bus-holding application stays Firefox (system-x86-64's tripwire).
+    // terminal. The credential client needs only the default portal grant;
+    // mail still owns no bus name.
     let Ok(permissions) = PermissionPolicy::new()
         .with_network()
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Wayland))
@@ -50,7 +50,7 @@ pub fn recipe() -> Recipe {
     };
 
     Recipe::mesboot(APPLICATION_NAME, "0.1")
-        .inputs(&[PROGRAM_RECIPE])
+        .inputs(&[PROGRAM_RECIPE, "td-secret"])
         .payload_inputs(&["empty-runtime"])
         .steps(vec![
             Step::MkDir {
@@ -81,6 +81,14 @@ pub fn recipe() -> Recipe {
                     "{{in:{PROGRAM_RECIPE}}}/lib/debug/.td-assembly-exception"
                 )],
                 dest: "{out}/lib/debug".into(),
+            },
+            Step::CopyFiles {
+                files: vec!["{in:td-secret}/bin/td-secret".into()],
+                dest: "{out}/files/bin".into(),
+            },
+            Step::CopyFiles {
+                files: vec!["{in:td-secret}/lib/debug/bin/td-secret.debug".into()],
+                dest: "{out}/lib/debug/files/bin".into(),
             },
             Step::validate_static_application(&declaration),
         ])
@@ -115,7 +123,7 @@ mod tests {
         assert_eq!(declaration.runtime(), "empty-runtime");
         assert_eq!(declaration.entry(), APPLICATION_ENTRY);
         assert_eq!(declaration.alias(), None);
-        assert_eq!(recipe.inputs, Some(vec![PROGRAM_RECIPE.into()]));
+        assert_eq!(recipe.inputs, Some(vec![PROGRAM_RECIPE.into(), "td-secret".into()]));
         assert_eq!(recipe.payload_inputs, Some(vec!["empty-runtime".into()]));
         let launcher = recipe.application_launcher.as_ref().expect("launcher");
         assert_eq!(launcher.display_name(), APPLICATION_DISPLAY_NAME);

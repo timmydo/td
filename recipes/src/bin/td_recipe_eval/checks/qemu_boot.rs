@@ -118,6 +118,7 @@ const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
 /// Printed by the unprivileged live portal probe after a routed Properties.Get
 /// and Settings.ReadAll return the exact immutable session policy.
 const TD_PORTAL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_RUNTIME_MARKER;
+const TD_SECRET_CONSOLE_MARKER: &str = "portal: TD-SECRET-READY app=mail name=main";
 const TD_PORTAL_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-READY namespaces=2 settings=11 version=1";
 const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_REQUEST_RUNTIME_MARKER;
@@ -454,6 +455,7 @@ struct ConsoleEvidence {
     td_login_runtime: bool,
     td_busd_runtime: bool,
     td_portal_runtime: bool,
+    td_secret_runtime: bool,
     td_portal_request_runtime: bool,
     td_portal_unavailable_runtime: bool,
     td_portal_channel_runtime: bool,
@@ -1943,6 +1945,9 @@ fn validate_system_boot(
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
+    }
+    if !result.evidence.td_secret_runtime {
+        return Err(format!("the jailed mail client did not acknowledge a credential descriptor from td.Secret1 ({TD_SECRET_CONSOLE_MARKER}). Last serial output:\n{}", tail(&result.console, 80)));
     }
     if !result.evidence.td_portal_request_runtime {
         return Err(format!(
@@ -5047,6 +5052,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         // marker was absent", which reads as a broken card rather than as a
         // retention bug.
         TD_COMPOSITOR_KMS_PROBE_MARKER.len() + 1 + DRM_REPORT_MAX,
+        exact_line_window(TD_SECRET_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_REQUEST_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_CHANNEL_CONSOLE_MARKER),
@@ -5320,6 +5326,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_portal_runtime,
         buf,
         TD_PORTAL_CONSOLE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_secret_runtime,
+        buf,
+        TD_SECRET_CONSOLE_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -8840,7 +8852,7 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 80] {
+    fn all_console_markers() -> [&'static str; 81] {
         [
             MARKER,
             EROFS_MARKER,
@@ -8879,6 +8891,7 @@ mod tests {
             TD_INIT_RUNTIME_MARKER,
             TD_LOGIN_RUNTIME_MARKER,
             TD_BUSD_RUNTIME_MARKER,
+            TD_SECRET_CONSOLE_MARKER,
             TD_PORTAL_CONSOLE_MARKER,
             TD_PORTAL_REQUEST_CONSOLE_MARKER,
             TD_PORTAL_UNAVAILABLE_CONSOLE_MARKER,
@@ -9262,6 +9275,7 @@ mod tests {
     evidence.td_login_runtime = true;
     evidence.td_pointer_absolute = true;
     evidence.td_portal_channel_runtime = true;
+    evidence.td_secret_runtime = true;
     evidence.td_portal_request_runtime = true;
     evidence.td_portal_runtime = true;
     evidence.td_portal_unavailable_runtime = true;
@@ -10408,6 +10422,28 @@ mod tests {
     }
 
     #[test]
+    fn credential_evidence_requires_the_exact_supervised_receipt() {
+        for line in [
+            "TD-SECRET-READY app=mail name=main",
+            "mail: TD-SECRET-READY app=mail name=main",
+            "portal: TD-SECRET-READY app=news name=main",
+            "portal: TD-SECRET-READY app=mail name=other",
+            "portal: TD-SECRET-READY app=mail name=main extra",
+        ] {
+            let mut evidence = ConsoleEvidence::default();
+            latch_console_evidence(&mut evidence, format!("\n{line}\n").as_bytes(), b"target");
+            assert!(!evidence.td_secret_runtime, "accepted {line}");
+        }
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{TD_SECRET_CONSOLE_MARKER}\r\n").as_bytes(),
+            b"target",
+        );
+        assert!(evidence.td_secret_runtime);
+    }
+
+    #[test]
     fn exact_firefox_boot_marker_line_survives_a_read_boundary() {
         const CHUNK: usize = 8192;
         let seq = AtomicU64::new(2600);
@@ -10540,6 +10576,7 @@ mod tests {
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
             TD_BUSD_RUNTIME_MARKER,
+            TD_SECRET_CONSOLE_MARKER,
             TD_PORTAL_CONSOLE_MARKER,
             TD_PORTAL_REQUEST_CONSOLE_MARKER,
             TD_PORTAL_UNAVAILABLE_CONSOLE_MARKER,
