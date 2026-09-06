@@ -244,14 +244,16 @@ Consequences worth stating plainly:
   account passwordless to satisfy ordinary `exec-as` would therefore red both
   the image contract and the credential policy.
 
-  The shipped image has three locked service identities. OpenSSH's `sshd`
+  The shipped image has four locked service identities. OpenSSH's `sshd`
   privilege-separation account and `td-profiler`'s `profiler` account are not
   td-svc `exec-as` targets; each daemon performs its own fixed-purpose drop.
   The `sshd` account has a `/bin/false` shell and an empty root-owned
   `/run/sshd-empty` chroot recreated before the daemon starts. The `audio`
   account has a `/bin/false` shell and a volatile `/run/td-audio` home and is
-  the sole current `exec-service-as` target. None of the three can be entered
-  through td-login's human forced modes or an interactive login.
+  an `exec-service-as` target. The compositor account `tdc1000` has UID/GID
+  993, a `/bin/false` shell and `/run/td-compositor/1000` home; its paired
+  service uses the same checked service path. None can be entered through
+  td-login's human forced modes or an interactive login.
 - **A class is a property of a name; the uid is what the kernel
   enforces.** `classify` reads one account's shadow field, so
   `!td-service` says that the NAME `audio` is refused by every human
@@ -306,12 +308,13 @@ operations in td-secret and td-firstboot, specified by
 authenticate a human. Firstboot unseals an explicitly enrolled store into
 volatile storage before the existing auto-login path runs; the TPM policy
 authenticates selected platform state, not that login's user. td-login's
-session authorization table is unchanged. Firstboot also reserves the future
-compositor, broker, portal, and per-app identities in a persistent ledger,
-without creating accounts or switching credentials. It refuses current
-account records that alias a reservation; future activation requires the
-same service-only class defined here. `td-authd/DESIGN.md` specifies that
-reservation contract. The currently unenabled td-authd terminal launcher
+session authorization table is unchanged. Firstboot reserves compositor,
+broker, portal, and per-app identities in a persistent ledger, and refuses
+account records that alias a reservation. The image activates the compositor
+assignment as service account `tdc1000` at UID/GID 993; broker, portal and app
+assignments remain reserved. Activation consumes the same service-only class
+defined here. `td-authd/DESIGN.md` specifies that reservation contract. The
+image's paired td-authd terminal launcher
 uses ordinary `exec-as` after a read-only reservation check and
 private-channel authentication. It fixes the human account in root-owned
 service configuration and replaces every standard descriptor before spawning

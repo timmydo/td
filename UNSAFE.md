@@ -19,14 +19,14 @@ target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
 The first nine confine that boundary to their syscall-instruction layer except
-for `td-compositor`, whose client-side clipboard source consumes one exact
-received descriptor through a second scoped allow. The tenth, `td-busd`,
+for `td-compositor`, whose received descriptors enter exact File ownership through a second
+scoped allow. The tenth, `td-busd`,
 carries the same different shape for general descriptor forwarding. Sections
 6 and 10 argue the two separately. The eleventh, `td-profiler`, also owns the
 pointer accesses into the perf ring mapping whose lifetime and bounds that
 same module controls. The twelfth, `td-portal`, confines descriptor-carrying
-Wayland I/O to one raw-syscall module and immediately reopens received regular
-files through `/proc/self/fd` so no raw descriptor ownership escapes it. The
+Wayland I/O to one raw-syscall module with one additional scoped adoption
+of freshly received descriptors into File ownership. The
 thirteenth, `td-audio`, is back to the plain shape: one syscall-instruction
 layer, no descriptor adoption and no mapping, because the ALSA transfer mode
 it uses is `SNDRV_PCM_ACCESS_RW_INTERLEAVED` and that mode has none. It is
@@ -69,16 +69,16 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped client-side clipboard descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty value-pinned requests, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
-| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies |
+| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies; one scoped received-descriptor adoption |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
-| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport for bounded credential replies |
+| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
 | 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
@@ -331,9 +331,8 @@ delayed).
 
 The `td-compositor` software Wayland server, whose one `syscall5` body in
 `td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm, clipboard and
-demo-client keymap SCM_RIGHTS reception, `close(2)` for a received descriptor
-after safe duplication through `/proc/self/fd/N` or after its lifetime as an
-exact clipboard endpoint, and `sendmsg(2)` for the
+demo-client keymap SCM_RIGHTS reception, `close(2)` for discarded raw
+descriptors and owned clipboard endpoints, and `sendmsg(2)` for the
 td-native demo client's wl_shm pool descriptor, the server's wl_keyboard
 keymap descriptor, and the transport selftest. Stable Rust exposes no
 stable ancillary-data API. The bounded parser records the first content or
@@ -348,7 +347,14 @@ accepted private-portal connection, with level fixed to `SOL_SOCKET=1`, option
 fixed to x86-64 `SO_PEERCRED=17`, and an exact 12-byte `[u32; 3]` result. The
 wrapper refuses a different returned length and exposes only the uid word;
 `server.rs` has one pinned caller and accepts only uid 1000 before allocating a
-private client slot. Stable `std` exposes neither Unix peer credentials nor a
+private client slot. The dedicated compositor additionally admits the compiled
+human UID 1000 on its public Wayland, private portal, control and readiness
+sockets through one pinned `session.rs` caller of the same peer-uid wrapper.
+The private portal also retains its separate UID check before slot admission.
+These sockets use mode 0666 under compositor-owned directories; the
+credential check precedes protocol reads, writes and slot admission. Host development retains private
+mode-0600 sockets. No new syscall, request, or scoped allowance is added.
+Stable `std` exposes neither Unix peer credentials nor a
 safe wrapper for this option. It also carries `fcntl(2)` with only `F_GETFL=3`
 and `F_SETFL=4`: `conn.rs` temporarily adds x86-64 `O_NONBLOCK=0o4000` while
 the bounded clipboard writer drains one destination, then restores the exact
@@ -530,21 +536,23 @@ allow-list refuses anything outside the twenty before either entry point
 issues the syscall — and the winsize argument is an `[u16; 4]` rather than a
 `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
 rows/columns pair is a well-formed resize to a different size.
-`TIOCGPTPEER`'s returned number is adopted through the SAME
-`/proc/self/fd/N` reopen the file-backed received-descriptor path uses. That
-route remains safe because the crate can reopen this file-backed descriptor by
-identity. A clipboard transfer endpoint is the narrower exception to the
-REOPEN: it may be a pipe or socket and SCM_RIGHTS requires its original
-open-file description. `sys.rs` stores that raw number in `ReceivedFd`, whose
-`Drop` calls the existing close wrapper. One source-pinned server adoption site
-wraps it in an opaque `TransferEndpoint` before the runtime can route it and
-does not use unsafe conversion. The separately pinned client adoption site
-consumes a data-source endpoint through `ReceivedFd::into_file`; its second
-scoped allow calls `File::from_raw_fd`, while `ManuallyDrop` prevents the raw
-owner from closing after `File` assumes sole ownership. This conversion is
-necessary because `/proc/self/fd/N` cannot reopen a socket and would create a
-different open-file description where reopening succeeds. The one conversion
-site is in `conn.rs`; no registry lock spans its eventual write. Deliberately
+`TIOCGPTPEER`'s returned number is still reopened through `/proc/self/fd/N`
+and closed by the PTY wrapper. Received Wayland descriptors instead preserve
+the exact open-file description installed by SCM_RIGHTS. Reopening a regular
+file checks inode permissions again and can fail across the compositor/human
+UID boundary even though the receiver owns a valid descriptor.
+`sys::take_received` consumes that number through the existing `ReceivedFd`
+owner and its one `into_file` conversion. The conversion's scoped allow calls
+`File::from_raw_fd`; `ManuallyDrop` suppresses the raw owner's close after
+File assumes sole ownership. This adds no syscall or scoped allowance to the
+compositor. The source-pinned consumers are `conn.rs` for keymaps,
+`server.rs` for SHM pools, and `client.rs` for the shipped descriptor selftest.
+Each removes the number from its raw disposal queue before adoption and uses
+positional reads, preserving shared offsets.
+Server-routed clipboard endpoints remain in their opaque `TransferEndpoint`
+owner, while the separately pinned client source consumes its endpoint through
+the same `into_file` conversion. No registry lock spans its eventual write.
+Deliberately
 NOT in that surface:
 framebuffer and evdev
 READING (ordinary files — every input REPORT td acts on arrives as bytes off
@@ -578,7 +586,8 @@ adding another syscall or scoped allow is an amendment there AND here. The
 four surfaces behind the one body are pinned to their modules —
 transport to `client.rs`/`conn.rs`/`server.rs`, terminal control to
 `pty.rs`, the absolute-axis range to `input.rs`, and private peer
-authentication only to `server.rs`; no other module names `sys` at all.
+authentication to `server.rs` and the session socket policy in `session.rs`;
+no other module names `sys` at all.
 `conn.rs` is the client
 transport itself, extracted from `client.rs` so the terminal is a second
 USER of one connection rather than a second copy of it; the descriptor
@@ -1712,17 +1721,14 @@ rather than of process-wide state, which is worth the zero it costs.
 
 This surface has two `#[allow(unsafe_code)]` of different shapes: the `syscall`
 instruction, and `OwnedFd::from_raw_fd` for adopting a descriptor the kernel
-has already installed. Section 6 now uses the same adoption shape only when a
-native clipboard source must consume one exact endpoint; it still re-derives
-file-backed descriptors through `/proc/self/fd/N` and keeps server-routed
-clipboard endpoints in a small safe owner whose `Drop` reaches its rostered
-close syscall. Taking the allow here still needs the reason that narrower
-client conversion does not cover a general broker.
+has already installed. Section 6 preserves that same open-file description for
+received SHM pools, keymaps, its descriptor selftest and native clipboard
+sources. It keeps server-routed clipboard endpoints in a small safe owner
+whose `Drop` reaches its rostered close syscall; consumers needing file I/O
+convert that owner into a `File`. The broker instead adopts directly into
+`OwnedFd` and has no close syscall: its forwarding needs no file conversion.
 
-It is this: the reopen trick works on the compositor's wl_shm pool files and
-keymap memfds, but not on its clipboard pipes and sockets; those stay in the
-bespoke owner until the compositor forwards or drops them. A broker forwards
-whatever an application chooses to send, and
+A broker forwards whatever an application chooses to send, and
 for a socket `open("/proc/self/fd/N")` fails with ENXIO — a socket inode
 has no open method — while an `eventfd` or other `anon_inode` fails with
 EACCES. Both are ordinary D-Bus payloads. A broker built on the reopen
@@ -1789,9 +1795,9 @@ time rather than plateauing.
 `close(2)` is NOT on this roster, and its absence is the point of taking the
 adoption: `OwnedFd` means `std` performs every close, so the crate has no close
 of its own. Section 6 needs one because its server retains exact endpoints in a
-safe raw owner and it must also dispose the raw number behind every reopened
-file-backed descriptor. Its client conversion narrows that owner only after a
-source `send`. This broker instead adopts every admitted descriptor immediately
+safe raw owner and disposes refused ancillary descriptors before adoption.
+Its PTY wrapper also closes its reopened slave descriptor. This broker instead
+adopts every admitted descriptor immediately
 and pays for its second allow by giving back a syscall.
 
 There is no `poll(2)` or `epoll_*`. Stable `std` exposes neither, and
@@ -1875,12 +1881,16 @@ everything collected through the last trusted boundary and returns because
 later records cannot be identified; Linux closes descriptors that do not fit
 the supplied control buffer. The dialog connection admits at most
 eight queued descriptors. Its only consumer removes one exact descriptor for
-`wl_keyboard.keymap`, reopens `/proc/self/fd/N` as a safe `File`, and then calls
-the rostered close on the received number on both success and reopen failure.
-The pinned private compositor sends a regular keymap backing file, so this
-narrow reopen preserves the required readable bytes without the second scoped
-raw-descriptor adoption that the general D-Bus broker needs. The exact keymap
-size and contents are checked before input is accepted.
+`wl_keyboard.keymap`, then consumes that exact number through `take_received`.
+The portal includes this same physical source with
+`#[path = "../../td-secret/src/sys.rs"]`; it has no independent transport copy.
+One additional function-scoped allowance calls `File::from_raw_fd` after
+refusing a negative number. Callers remove the descriptor from its sole raw
+disposal queue before adoption; File owns every subsequent close. This is a
+source-pinned provenance contract, not authority conveyed by a raw integer.
+It avoids a procfs reopen and its second inode permission check across UIDs.
+The exact regular-file keymap size and contents are checked with positional
+reads before input is accepted; no shared offset is moved.
 
 The send path emits exactly one descriptor with a 24-byte control buffer and
 fixed `SOL_SOCKET`/`SCM_RIGHTS`; the FileChooser caller sends its unlinked
@@ -1890,22 +1900,21 @@ a process-wide signal, and carries the first bytes and descriptor atomically.
 A short body write continues through safe `UnixStream`; the descriptor is not
 sent a second time.
 `close_raw` is private to the raw module. Its crate-visible disposal helper
-still takes descriptor numbers because safe Rust cannot own a descriptor
-installed by `recvmsg` without another scoped adoption allowance. The four
+still takes descriptor numbers for refused or unused ancillary data. The four
 production call sites pass only numbers returned in that connection's
 `Received` value or moved into its bounded pending queue; confinement tests pin
 those call sites. That provenance is a source-level contract, not something
 the helper's raw-fd type can express.
 
 Confinement tests inventory every portal source file, pin the three syscall
-numbers, the single instruction and scoped allowance, both ancillary constants,
-`MSG_CMSG_CLOEXEC`/`MSG_NOSIGNAL`, the one send, receive, and reopen call site,
-and all four refusal/drop routes.
+numbers, the instruction and exact adoption body with two scoped allowances,
+both ancillary constants, `MSG_CMSG_CLOEXEC`/`MSG_NOSIGNAL`, the one send,
+receive, and adoption call site, and all four refusal/drop routes.
 There is no general descriptor-forwarding API, raw descriptor owner, mmap,
 fcntl, ioctl, credential call, or network socket. A fourth syscall, a second
-ancillary kind, a second scoped allowance, another production caller, or raw
-descriptor adoption is an amendment here and in `APPLICATIONS.md` in the same
-landing.
+ancillary kind, a third scoped allowance, another production caller, or
+another raw descriptor adoption is an amendment here and in `APPLICATIONS.md`
+in the same landing.
 
 ## 13. `td-audio` — the ALSA playback back end
 
@@ -2194,20 +2203,21 @@ consumer, or additional allowance amends this section and
 ## 15. `td-secret` — the credential portal client
 
 The client compiles surface 12's `td-secret/src/sys.rs` directly: the same
-three-syscall instruction and scoped allowance, with no new raw operation.
+three-syscall instruction and exact descriptor-adoption allowance.
 Only `client.rs` receives descriptors. Each D-Bus frame retains at most one
 SCM_RIGHTS descriptor; an owning guard closes it on every refusal and drop.
 An authenticated `td.Secret1.Retrieve` reply transfers that one descriptor
-through the shared reopen-and-close function. The reopened file must be
-regular, unlinked, and at most 4096 bytes. The client reads it once and writes
-the credential to its stdout pipe, which td-mail captures directly without
-a shell. Applications import no cryptographic implementation.
+through the shared exact adoption function. The file must be regular,
+unlinked, and at most 4096 bytes. The client reads it positionally from zero,
+checks for growth beyond its advertised extent, and writes
+the credential to its stdout pipe, which td-mail captures directly without a
+shell. Applications import no cryptographic implementation.
 
 The receive loop reads exactly the current D-Bus frame, negotiates descriptor
 transfer, checks the declared descriptor count, and never assigns a descriptor
 from another frame to a reply. One deadline bounds the whole exchange and a
 32-frame limit bounds unrelated traffic. Confinement tests pin the shared
-module, sole receive/reopen sites and disposal guard.
+module, sole receive/adoption sites and disposal guard.
 
 Surface 12 also has one additional send caller in `td-portal/src/secret.rs`.
 It sends only a read-only descriptor for an already-unlinked regular file,

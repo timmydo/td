@@ -28,6 +28,7 @@ mod render;
 mod runtime;
 mod scene;
 mod server;
+mod session;
 mod socket;
 mod sys;
 mod term;
@@ -62,6 +63,7 @@ fn usage() -> String {
      --application-ready-socket PATH --application-app-id ID \
      --application-content-rgb-a RGB --application-content-rgb-b RGB) \
      (--terminal-client PATH | --terminal-authority stdin) | \
+     td-compositor probe-terminal-authority | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
      td-compositor probe-drm DEVICE | \
@@ -409,6 +411,7 @@ fn resolve_socket_endpoint(path: &Path, label: &str) -> Result<PathBuf, String> 
 }
 
 fn run_compositor(options: RunOptions) -> Result<(), String> {
+    let socket_policy = session::SocketPolicy::for_authority(options.terminal_authority);
     // Pin the root sender before framebuffer, listener, or input workers exist.
     let launches = if options.terminal_authority {
         launcher::LaunchBackend::Authority(authority::Launcher::connect()?)
@@ -455,7 +458,8 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         .zip(options.application_content_rgb_a.as_deref())
         .zip(options.application_content_rgb_b.as_deref())
     {
-        let observer = server::watch_application(path, app_id, content_rgb_a, content_rgb_b)?;
+        let observer =
+            server::watch_application(path, app_id, content_rgb_a, content_rgb_b, socket_policy)?;
         runtime.watch_application_with_cursor(
             app_id.to_string(),
             observer.content_rgbs,
@@ -480,7 +484,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     // answered on it. A caller was then told, with authority, whatever the
     // incumbent said.
     if let Some(path) = options.control_socket.as_deref() {
-        control::serve(path, Arc::clone(&runtime))?;
+        control::serve(path, Arc::clone(&runtime), socket_policy)?;
     }
     // Reported, never fatal: a compositor without a clock is worth more
     // than no compositor.
@@ -498,7 +502,12 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         geometry.2,
         scanout.join(",")
     );
-    server::serve(&options.socket, &options.portal_socket, runtime)
+    server::serve(
+        &options.socket,
+        &options.portal_socket,
+        runtime,
+        socket_policy,
+    )
 }
 
 fn selftest() -> Result<(), String> {
@@ -688,6 +697,12 @@ fn probe_flip(device: &Path) -> Result<(), String> {
 fn run(args: &[String]) -> Result<(), String> {
     let command = args.first().ok_or_else(usage)?;
     match command.as_str() {
+        "probe-terminal-authority" => {
+            if args.len() != 1 {
+                return Err(usage());
+            }
+            session::probe_terminal_authority()
+        }
         "run" => run_compositor(parse_run(args.get(1..).ok_or_else(usage)?)?),
         // §M row 1's discovery half, as a subcommand rather than as something
         // the compositor does on the way up: it reads a card and takes no
@@ -966,6 +981,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_authority_probe_belongs_to_the_compositor_personality() {
+        let result = run(&["probe-terminal-authority".into()]);
+        assert_ne!(
+            result,
+            Err(usage()),
+            "the image command must reach the probe"
+        );
+        assert_eq!(
+            run(&["probe-terminal-authority".into(), "extra".into()]),
+            Err(usage())
+        );
+        assert_eq!(
+            run_term(&[OsString::from("probe-terminal-authority")]),
+            Err(term_usage())
+        );
+    }
+
+    #[test]
     fn a_non_utf8_control_argument_is_a_refusal_not_an_unavailable_session() {
         use std::os::unix::ffi::OsStringExt;
         let raw = OsString::from_vec(vec![b'w', b'i', b'n', 0xff]);
@@ -1193,6 +1226,7 @@ mod confinement {
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
         ("server.rs", include_str!("server.rs")),
+        ("session.rs", include_str!("session.rs")),
         ("socket.rs", include_str!("socket.rs")),
         ("term.rs", include_str!("term.rs")),
         ("term_client.rs", include_str!("term_client.rs")),
@@ -1474,6 +1508,33 @@ fn syscall6(
                 "{name} introduced another raw syscall body"
             );
         }
+    }
+
+    #[test]
+    fn received_files_share_the_existing_exact_adoption_surface() {
+        assert!(production(SYS).contains(
+            r#"pub fn take_received(fd: RawFd) -> Result<File, String> {
+    ReceivedFd::adopt(fd).map(ReceivedFd::into_file)
+}"#
+        ));
+        assert_eq!(production(SYS).matches("ReceivedFd::adopt(fd)").count(), 1);
+        assert_eq!(production(SYS).matches("ReceivedFd::into_file").count(), 1);
+        for (name, source) in OTHER {
+            let expected = usize::from(matches!(*name, "client.rs" | "conn.rs" | "server.rs"));
+            assert_eq!(
+                source
+                    .split_once("\n#[cfg(test)]\nmod tests {")
+                    .map_or(*source, |(body, _)| body)
+                    .matches("sys::take_received(")
+                    .count(),
+                expected,
+                "{name} changed the received-file adoption roster"
+            );
+        }
+        let client = production(include_str!("client.rs"));
+        assert!(client.contains(
+            "let fd = received\n        .fds\n        .pop()\n        .ok_or_else(|| \"demo descriptor transport returned no fd\".to_string())?;\n    let file = sys::take_received(fd)?;"
+        ));
     }
 
     #[test]
@@ -2069,7 +2130,7 @@ pub struct MappedRegion {
         const TRANSPORT: &[&str] = &[
             "sys::send_with_fd(",
             "sys::recv_with_fds(",
-            "sys::duplicate_received(",
+            "sys::take_received(",
             "sys::discard_received(",
             "sys::ReceivedFd::adopt(",
             "sys::ReceivedFd::into_file(",
@@ -2077,6 +2138,11 @@ pub struct MappedRegion {
             "sys::restore_status_flags(",
         ];
         const PEER_AUTH: &[&str] = &["sys::peer_uid("];
+        assert!(production(MAIN)
+            .contains("session::SocketPolicy::for_authority(options.terminal_authority)"));
+        let session = production(include_str!("session.rs"));
+        assert_eq!(occurrences(session, "sys::"), 1);
+        assert_eq!(occurrences(session, "sys::peer_uid(stream)?"), 1);
         const TERMINAL: &[&str] = &[
             "sys::unlock_pty(",
             "sys::pty_peer(",
@@ -2168,7 +2234,13 @@ pub struct MappedRegion {
         {
             if matches!(
                 name,
-                "client.rs" | "conn.rs" | "server.rs" | "pty.rs" | "input.rs" | "drm.rs"
+                "client.rs"
+                    | "conn.rs"
+                    | "server.rs"
+                    | "pty.rs"
+                    | "input.rs"
+                    | "drm.rs"
+                    | "session.rs"
             ) {
                 continue;
             }
@@ -2235,7 +2307,7 @@ pub struct MappedRegion {
         // feature dead in the image with every test green. Pinned in the
         // source, as this crate pins the terminal's selftest layers.
         assert!(
-            production(MAIN).contains("control::serve(path, Arc::clone(&runtime))?"),
+            production(MAIN).contains("control::serve(path, Arc::clone(&runtime), socket_policy)?"),
             "run_compositor no longer starts the control listener"
         );
         assert_eq!(

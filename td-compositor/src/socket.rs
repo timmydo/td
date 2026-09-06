@@ -1,3 +1,4 @@
+use crate::session::SocketPolicy;
 use std::fs::{self, Permissions};
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -33,10 +34,6 @@ pub fn remove_stale(path: &Path, kind: &str) -> Result<(), String> {
         Err(error) => Err(format!("stat {kind} socket {}: {error}", path.display())),
     }
 }
-
-/// Private to the user the service runs as. Both readiness sockets are the
-/// same secret: that this machine has a graphical session up.
-const READY_MODE: u32 = 0o600;
 
 /// Consecutive failed accepts before the listener gives up. Generous, because
 /// every retry is cheap and the alternative to retrying is a service that
@@ -80,7 +77,7 @@ pub fn publish(
     thread_name: &'static str,
     answer: Vec<u8>,
 ) -> Result<Published, String> {
-    publish_inner(path, thread_name, answer, None)
+    publish_inner(path, thread_name, answer, None, SocketPolicy::Private)
 }
 
 /// Publish an answer that becomes stale when the observed resource departs.
@@ -91,8 +88,9 @@ pub fn publish_while(
     thread_name: &'static str,
     answer: Vec<u8>,
     live: Arc<AtomicBool>,
+    policy: SocketPolicy,
 ) -> Result<Published, String> {
-    publish_inner(path, thread_name, answer, Some(live))
+    publish_inner(path, thread_name, answer, Some(live), policy)
 }
 
 fn publish_inner(
@@ -100,6 +98,7 @@ fn publish_inner(
     thread_name: &'static str,
     answer: Vec<u8>,
     live: Option<Arc<AtomicBool>>,
+    policy: SocketPolicy,
 ) -> Result<Published, String> {
     remove_stale(path, "readiness")?;
     let listener = UnixListener::bind(path)
@@ -112,11 +111,11 @@ fn publish_inner(
     let published = Published {
         path: path.to_path_buf(),
     };
-    fs::set_permissions(path, Permissions::from_mode(READY_MODE))
+    fs::set_permissions(path, Permissions::from_mode(policy.mode()))
         .map_err(|e| format!("chmod readiness socket {}: {e}", path.display()))?;
     thread::Builder::new()
         .name(thread_name.into())
-        .spawn(move || serve(listener.incoming(), &answer, live.as_deref()))
+        .spawn(move || serve(listener.incoming(), &answer, live.as_deref(), policy))
         .map_err(|e| format!("start readiness listener {}: {e}", path.display()))?;
     Ok(published)
 }
@@ -132,6 +131,7 @@ fn serve(
     connections: impl Iterator<Item = std::io::Result<UnixStream>>,
     answer: &[u8],
     live: Option<&AtomicBool>,
+    policy: SocketPolicy,
 ) -> AcceptOutcome {
     let mut consecutive = 0;
     for connection in connections {
@@ -143,6 +143,9 @@ fn serve(
             continue;
         };
         consecutive = 0;
+        if policy.admit(&connection).is_err() {
+            continue;
+        }
         if live.is_some_and(|live| !live.load(Ordering::Acquire)) {
             continue;
         }
@@ -262,6 +265,7 @@ mod tests {
             refused.chain(std::iter::once(Ok(caller))),
             b"answered\n",
             None,
+            SocketPolicy::Private,
         );
         assert_eq!(outcome, AcceptOutcome::Exhausted);
         let mut said = String::new();
@@ -276,6 +280,7 @@ mod tests {
             refused.chain(std::iter::once(Ok(caller))),
             b"answered\n",
             None,
+            SocketPolicy::Private,
         );
         assert_eq!(outcome, AcceptOutcome::GaveUp);
         let mut said = String::new();
@@ -297,7 +302,12 @@ mod tests {
             connections.push(Ok(caller));
             peers.push(peer);
         }
-        let outcome = serve(connections.into_iter(), b"answered\n", None);
+        let outcome = serve(
+            connections.into_iter(),
+            b"answered\n",
+            None,
+            SocketPolicy::Private,
+        );
         assert_eq!(outcome, AcceptOutcome::Exhausted);
         for mut peer in peers {
             let mut said = String::new();
@@ -316,6 +326,7 @@ mod tests {
             "latched-ready",
             b"same-client\n".to_vec(),
             Arc::clone(&live),
+            SocketPolicy::Private,
         )
         .unwrap();
 
@@ -332,6 +343,23 @@ mod tests {
 
         drop(published);
         fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn session_readiness_withholds_evidence_from_other_identities() {
+        let (caller, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let outcome = serve(
+            std::iter::once(Ok(caller)),
+            b"ready\n",
+            None,
+            SocketPolicy::HumanSession,
+        );
+        assert_eq!(outcome, AcceptOutcome::Exhausted);
+        let mut answer = String::new();
+        peer.read_to_string(&mut answer).unwrap();
+        let uid = crate::session::process_uid().unwrap();
+        assert_eq!(answer, if uid == 1000 { "ready\n" } else { "" });
     }
 
     /// The name is what an operator reading `ps -T` sees, so it has to reach

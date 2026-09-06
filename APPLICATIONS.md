@@ -3957,18 +3957,14 @@ turned out to be wrong: the handshake needs no syscall of its own, because
 the transport reads the bytes and hands them to a `settle()` that is pure.
 A confinement test pins the narrower list.
 
-**How a forwarded descriptor is owned.** td-compositor reopens received
-file-backed descriptors through `/proc/self/fd/N`; one native clipboard
-source's client-side conversion of an exact pipe or socket is the documented
-scoped-adoption exception. Server-routed clipboard endpoints remain in its safe
-raw owner. The reopen trick is *unavailable* to a broker — opening a
-`/proc/self/fd` entry
-naming a **socket** fails with `ENXIO`, and one naming an `anon_inode` such as
-an `eventfd` with `EACCES` (both measured, not assumed), while the compositor's
-wl_shm and keymap descriptors are memfds and files, which reopen faithfully.
-Reopening also yields a NEW open file description, so even where it
-succeeds the receiver does not get the shared description `SCM_RIGHTS`
-defines. A forwarded descriptor here is freight: it is recounted
+**How a forwarded descriptor is owned.** The compositor preserves exact
+SCM_RIGHTS ownership for SHM pools, keymaps and clipboard endpoints. Procfs
+reopening checks inode permissions again, so even regular files can fail
+across UIDs. A broker also carries sockets, whose procfs reopen fails with
+`ENXIO`, and `anon_inode` descriptors such as eventfd, which fail with
+`EACCES`. Reopening creates a new open-file description where it succeeds,
+so it does not preserve the shared description SCM_RIGHTS defines.
+A forwarded descriptor here is freight: it is recounted
 against the message's `UNIX_FDS` field (mismatch disconnects the sender),
 forwarded by number, and closed.
 
@@ -5874,8 +5870,9 @@ each pressed key. `Escape`, all four arrows, Backspace, letters, Space, Enter,
 keypad Enter, and Control+either Enter form the closed interaction vocabulary.
 Each frame is
 an unlinked mode-0600 file sent as one SCM_RIGHTS descriptor; received keymap
-descriptors are bounded, reopened through `/proc/self/fd`, and closed through
-the confined surface recorded in `UNSAFE.md` §12.
+descriptors are bounded and adopted into exact File ownership through the
+confined surface recorded in `UNSAFE.md` §12. Positional keymap reads preserve
+the shared open-file offset and work across the compositor/human UID boundary.
 
 Host tests retain the pure model coverage and add an actual Unix-socket peer
 that advertises the exact shared registry, sends the real keymap and keyboard
@@ -5940,23 +5937,22 @@ on, and that is false: a Wayland server accepts each client on its own
 per-connection globals are ordinary Wayland practice, not a stretch.
 After per-app uids (§L) the peers would differ by uid as well.
 
-So the reason is a **policy choice, and a better one**, rather than a
-protocol necessity. Keying on `SO_PEERCRED` would mean the privileged
-global exists on the same socket every sandboxed app is already
-connected to, one predicate away from being served to the wrong peer; a
-bug in that predicate is a screen-capture global handed to Firefox.
-Keying on **path visibility** means the compositor listens on a second
-socket, `/run/user/1000/td-portal-wayland-0`, that no jail ever mounts —
-so the privileged interface is not reachable to be mis-served. That is
-td-seatd's argument in the same words: the boundary is what a process can
-*name*, and an absent socket fails safe in a way a conditional does not.
-Both mechanisms are now used together — the private socket also checks exact
-uid-1000 `SO_PEERCRED` — but the socket is the boundary and the credential is
-the belt.
+So the reason is a **policy choice, and a better one**, rather than a protocol
+necessity. Keying on `SO_PEERCRED` would mean the privileged global exists on
+the same socket every sandboxed app is already connected to, one predicate
+away from being served to the wrong peer; a bug in that predicate is a
+screen-capture global handed to Firefox. Keying on **path visibility** means
+the compositor listens on a second socket,
+`/run/td-compositor/1000/td-portal-wayland-0`, that no jail ever mounts — so
+the privileged interface is not reachable to be mis-served. That is td-seatd's
+argument in the same words: the boundary is what a process can *name*, and an
+absent socket fails safe in a way a conditional does not. Both mechanisms are
+now used together — the private socket also checks exact uid-1000
+`SO_PEERCRED` — but the socket is the boundary and the credential is the belt.
 
 **The private transport and first privileged manager slice have LANDED.**
 `td-compositor` resolves the public, private, and application-evidence
-endpoints once, refuses aliases, binds both mode-0600 Wayland listeners before
+endpoints once, refuses aliases, binds both Wayland listeners before
 its ordinary readiness marker, and admits at most 30 public clients plus two
 independently reserved private clients. That preserves the former 32-client
 total without letting public load starve the portal. The private endpoint is
@@ -5972,7 +5968,7 @@ protocol, which is part of the already stated v1 same-uid exposure rather than
 a substitute isolation boundary.
 
 The private listener advertises the same exact ten globals as
-`/run/user/1000/wayland-0`, followed by private-only
+`/run/td-compositor/1000/wayland-0`, followed by private-only
 `td_portal_manager_v1` v1. Its current request surface is deliberately small:
 `get_dialog(wl_surface, parent_handle, flags)` accepts only an existing
 xdg-toplevel, a handle of at most 128 bytes, and zero flags; it returns a
@@ -6028,11 +6024,11 @@ states on the system image. The normal portal's separate dialog client retains
 one private connection per active FileChooser and uses only the confined
 descriptor transport in `UNSAFE.md` §12 for keymap and shared-memory messages.
 
-**What that boundary does not survive is an escape, and it is worth
-naming the consequence rather than leaving it implied by §L.** Path
-visibility is a mount-namespace property. An
-application that breaks out of the filesystem jail will still be uid 1000 in
-v1, so it can open `/run/user/1000/td-portal-wayland-0` directly and drive
+**What that boundary does not survive is an escape, and it is worth naming the
+consequence rather than leaving it implied by §L.** Path visibility is a
+mount-namespace property. An application that breaks out of the filesystem
+jail will still be uid 1000 in v1, so it can open
+`/run/td-compositor/1000/td-portal-wayland-0` directly and drive
 `td_portal_manager_v1` with no portal UI in the way. The currently landed
 manager cannot read another client's pixels or input already delivered to it,
 but it can promote the escaped application's own surface above application
@@ -7921,14 +7917,14 @@ middle.
 | component | uid | why |
 |---|---|---|
 | `td-svc` | root | the supervisor |
-| `td-seatd` | root, oneshot | assigns `/dev/fb0` and `/dev/input/*`; makes `/run/user/1000` and the audio-owned `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
-| `td-compositor` | 1000 | owns the session |
+| `td-seatd` | root, oneshot | assigns `/dev/fb0` and `/dev/input/*`; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
+| `td-compositor` | 993 (`tdc1000`) | owns display/input devices and the private root authority endpoint |
 | `td-busd` | 1000 | **required**, see below |
 | `td-portal` | 1000 | reads the user's files in order to show them |
 | `td-jail` (stage 0/1) | 1000 | fully unprivileged — resolve, register, unshare. It writes only under `~/.td/app` (§B.4), where `td-firstboot` may already have placed a first configuration as the user's own files; packages are read-only store paths (§B.1) |
-| `td-authd` | root | §L.1 — elevation, and the ONLY component that grants it |
+| `td-authd` | root | fixed terminal launcher; §L.1 elevation remains unimplemented |
 | `td-jail` | 1000 | it *is* the boundary; it holds nothing |
-| `td-audio` | **`audio`** | §K.5 — the one dedicated uid |
+| `td-audio` | **`audio`** | §K.5 — dedicated audio uid |
 | the app | 1000, identity-mapped | upstream's model; see below |
 
 **`td-busd` must be uid 1000**, and the reasons are mechanical rather
@@ -7966,11 +7962,11 @@ set of service/application UIDs, and filesystem grants must remain
 ACL-compatible. The retained AUTH EXTERNAL rules below account for uid 1000
 inside differing from the external kernel identity.
 
-Activation requires one atomic migration of application state ownership,
-compositor/broker/portal identities, cgroups, socket permissions, and peer
-credential checks. The current ledger only reserves identities. Until that
-migration lands, the image continues to use the v1 same-uid model and cannot
-claim a secure consent boundary.
+The compositor identity, devices, sockets and terminal launcher cut over
+atomically to UID 993. Broker, portal and application assignments remain
+reservations. Activating those requires an atomic migration of application
+state, cgroups, socket permissions and peer credential checks. Their current
+same-uid model still prevents a secure consent claim.
 
 **Two consequences must be designed for now even though the work is
 v2**, because both are silent breakages rather than missing features:
@@ -8064,12 +8060,12 @@ than a compromise.
 
 #### The prerequisite, without which none of it works
 
-§L's table runs `td-compositor`, `td-busd`, `td-portal` and the v1
-application all at **uid 1000**. Under that layout `td-authd` receives
-"the human approved" from a uid-1000 peer and cannot tell the compositor
-from a rogue application — and with no LSM and therefore no Yama
-restriction, a uid-1000 process can `ptrace` the compositor and steal
-whatever channel it holds.
+The compositor now runs at dedicated UID 993, while broker, portal and
+applications retain UID 1000. The root authority pins the compositor's kernel
+sender over its private channel. Unprivileged human-UID processes cannot
+ptrace that service
+or read its input/display devices. Per-application identity and trusted input
+remain prerequisites for consent.
 
 > **`td-compositor` must NOT share a uid with anything an application can
 > become.** That means per-app uids (§L, v2) *and* the compositor at its
@@ -8095,13 +8091,12 @@ service account. The uid-1000 login path is ineligible: it moves into the
 application session cgroup, outside the paired service's leaf. This does not
 provide arbitrary fd-number assignment or named socket activation.
 
-The optional compositor client and root terminal-launch authority are built
-but remain disabled in the image. The client pins the root sender before
+The compositor client and root terminal-launch authority run as a paired
+image service. The client pins the root sender before
 starting workers, then owns the endpoint in a bounded serial worker; input
 queues only a terminal launch. The root launcher verifies the enrolled session
 and starts the human terminal through td-login. Neither exposes a consent,
-secret-release or elevation API. The atomic UID/device/socket cutover remains
-required before enabling the client. A separate `channel-check` diagnostic
+secret-release or elevation API. A separate `channel-check` diagnostic
 proves only transport.
 `SO_PEERCRED` on the delivered socketpair identifies its creator, not the
 eventual holder of the opposite endpoint. The transport instead pins a live
@@ -8112,35 +8107,19 @@ startup, or descriptor delegation: the first sender is pinned, and the
 transport alone cannot recover the intended peer after early delegation. The
 root creator and configured sender uid are separate checks. See
 `td-authd/DESIGN.md` for framing, deadlines, descriptor ownership and proof.
-This enables no consent path and changes no stock service identity.
+This enables ordinary terminal launches, with no consent path.
 
-#### Three things the secure path needs that the tree does not have
+#### Device ownership and secure-path prerequisites
 
-They share one shape: the compositor's ownership of the console is a
-convention among cooperating processes, not a boundary.
-
-1. **`td-seatd` does not hand the compositor exclusive devices; it
-   CHOWNS them to the seat user.** `assign_path`
-   (`td-seatd/src/main.rs`) `lchown`s `/dev/fb0` and every
-   `/dev/input/event*` to the seat account at mode 0600, so **every
-   uid-1000 process can open them** — read every keystroke including the
-   approval one, and open `/dev/fb0` `O_RDWR` to paint over a
-   compositor-drawn prompt and read back what it drew.
-
-   **The fix is the uid split above, not `EVIOCGRAB`**, and getting that
-   round the right way saves an `UNSAFE.md` amendment. The nodes are
-   0600 and owned by the seat account; once the compositor has an
-   account of its own, "the seat account" IS that account and an
-   application at uid 1000 gets `EACCES` from the same `open` — for the
-   framebuffer as well, which has no grab and so could not have been
-   fixed the other way at all. A draft concluded that §L.1 carries an
-   amendment to `UNSAFE.md` §6, whose stated ground for refusing
-   `EVIOCGRAB` is that the compositor "owns the console outright, so
-   there is nothing to take it from". That premise is false TODAY and
-   the uid split is what makes it true, rather than the grab. What a
-   grab would still add is exclusion against other processes at the
-   compositor's OWN uid — a much smaller claim, and not one this section
-   needs.
+1. **Device access belongs to the compositor.** `td-seatd` assigns mode-0600
+   `/dev/fb0` and `/dev/input/event*` to UID/GID 993. The human identity has
+   no supplementary membership in the compositor group. A required boot probe
+   runs as UID 1000, verifies the assigned metadata, and requires `EACCES` when
+   opening each node. Missing devices or an unexpectedly successful open
+   fail the probe and deployment health. The boot oracle separately requires
+   `TD-COMPOSITOR-DEVICES-PRIVATE`. Deployment reboot discards pre-cutover
+   open descriptors. This requires no `EVIOCGRAB`; processes at the
+   compositor's own UID are inside the same trust boundary.
 2. **`.Screenshot` captures full output** and `td_portal_manager_v1`
    exposes `capture_output`, with nothing excluding a prompt from a
    capture. The prompt must be excluded from every capture path by
@@ -9214,9 +9193,10 @@ The secure-attention prerequisites reserve distinct compositor, broker,
 portal, and application identities in immutable `/etc/td-principals.tsv`.
 Firstboot checks those reservations against all account databases and
 persists their union in `/var/lib/td/principals.tsv`, retaining retired
-assignments so updates cannot reuse their UIDs. This is reservation only;
-the image still uses its existing session identities. Activating the split
-must migrate state and socket authorization together. `td-authd/DESIGN.md`
+assignments so updates cannot reuse their UIDs. The image consumes the
+compositor assignment at UID/GID 993 and reserves the broker, portal and
+application assignments. Their remaining activation must migrate state and
+socket authorization together. `td-authd/DESIGN.md`
 specifies the canonical table, account classes, and durable ledger.
 
 **Remaining increments, in order on the rolling workstream.** (c) Gate release

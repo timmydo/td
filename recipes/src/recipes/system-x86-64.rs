@@ -200,7 +200,10 @@ const PROFILER_OBJECT_INDEX: &str = "/etc/td-profiler-objects.tsv";
 const PROFILER_APPLICATION_ROOTS: &str = "/etc/td-profiler-application-roots.tsv";
 const PROFILER_CAPTURE_ROOT: &str = "/var/lib/td-profiler/captures";
 const PRINCIPALS_PATH: &str = "/etc/td-principals.tsv";
-const COMPOSITOR_RESERVED_UID: u32 = 993;
+const COMPOSITOR_RESERVED_UID: u32 = td_engine::permissions::TD_COMPOSITOR_UID;
+const COMPOSITOR_USER: &str = "tdc1000";
+const COMPOSITOR_RUNTIME: &str = td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH;
+const WAYLAND_SOCKET: &str = td_engine::permissions::TD_WAYLAND_SOCKET_PATH;
 const BROKER_RESERVED_UID: u32 = 992;
 const PORTAL_RESERVED_UID: u32 = 991;
 const PROFILER_USER: &str = "profiler";
@@ -260,12 +263,12 @@ const FIREFOX_TLS_POLICY: &str = concat!(
     "\"/etc/firefox/policies/td-firefox-autotest-ca.pem\"",
     "]}}}\n",
 );
-const FIREFOX_WINDOW_READY_SOCKET: &str = "/run/user/1000/td-firefox-window-ready";
-const PORTAL_WAYLAND_SOCKET: &str = "/run/user/1000/td-portal-wayland-0";
+const FIREFOX_WINDOW_READY_SOCKET: &str = "/run/td-compositor/1000/td-firefox-window-ready";
+const PORTAL_WAYLAND_SOCKET: &str = "/run/td-compositor/1000/td-portal-wayland-0";
 /// Where the compositor answers `td-ctl`. One constant for the flag the
 /// compositor binds and the variable its children inherit, so a session
 /// cannot advertise a socket it did not bind.
-const CONTROL_SOCKET: &str = "/run/user/1000/td-control";
+const CONTROL_SOCKET: &str = "/run/td-compositor/1000/td-control";
 const PORTAL_SERVICE_LOG: &str = "/run/td-portal.log";
 const PORTAL_FILE_CHOOSER_COMPLETED: &str =
     "TD-PORTAL-FILE-CHOOSER-COMPLETED";
@@ -461,6 +464,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == AUDIO_UID {
         return home == AUDIO_RUNTIME;
     }
+    if uid == COMPOSITOR_RESERVED_UID {
+        return home == COMPOSITOR_RUNTIME;
+    }
     home.strip_prefix("/home/").is_some_and(|name| {
         name != "."
             && name != ".."
@@ -508,6 +514,17 @@ const SYSTEM: SystemDef = SystemDef {
             groups: &[],
             passwordless: false,
             service_only: false,
+        },
+        User {
+            name: COMPOSITOR_USER,
+            uid: COMPOSITOR_RESERVED_UID,
+            gid: COMPOSITOR_RESERVED_UID,
+            gecos: "System Compositor",
+            home: COMPOSITOR_RUNTIME,
+            shell: "/bin/false",
+            groups: &[],
+            passwordless: false,
+            service_only: true,
         },
         User {
             name: AUDIO_USER,
@@ -1071,8 +1088,8 @@ fn build_group(sys: &SystemDef) -> String {
 }
 
 fn gets_generic_persistent_home_setup(user: &User) -> bool {
-    // Root is handled explicitly; audio's home is volatile.
-    user.uid != 0 && user.name != AUDIO_USER
+    // Root is handled explicitly; supervised service homes are volatile.
+    user.uid != 0 && !user.service_only
 }
 
 fn build_shadow(sys: &SystemDef) -> String {
@@ -1175,7 +1192,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 35] = [
+const TD_SVC_UNITS: [&str; 37] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -1190,6 +1207,7 @@ const TD_SVC_UNITS: [&str; 35] = [
     "portal",
     "portal-evidence",
     "wayland",
+    "seat-access-evidence",
     "portal-channel-evidence",
     "terminal",
     "applications-workspace",
@@ -1204,6 +1222,7 @@ const TD_SVC_UNITS: [&str; 35] = [
     "firefox-autotest",
     "firefox",
     "firefox-evidence",
+    "terminal-authority-evidence",
     "firefox-input",
     "firefox-soak",
     "claude-evidence",
@@ -1373,10 +1392,10 @@ fn build_td_svc_conf() -> String {
          log=/var/log/svc/td-profiler-evidence.log\n\
          console=yes\n\
          \n\
-         # The graphical user owns the framebuffer and evdev seat; audio gets its volatile runtime.\n\
+         # The compositor owns display/input; the human and audio retain separate runtimes.\n\
          [seat]\n\
          type=oneshot\n\
-         exec=/bin/td-seatd assign --uid {ui_uid} --gid {ui_gid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
+         exec=/bin/td-seatd assign --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
          after=rootcheck\n\
          timeout={seat}\n\
          \n\
@@ -1384,7 +1403,7 @@ fn build_td_svc_conf() -> String {
          # socket. A live connect is required before applications may launch.\n\
          [audio]\n\
          type=daemon\n\
-         exec=/bin/td-seatd exec-audio --uid {ui_uid} --gid {ui_gid} --audio-uid {audio_uid} --audio-gid {audio_gid} -- /bin/td-login exec-service-as {audio_user} -- /bin/td-audio serve --socket {audio_socket}\n\
+         exec=/bin/td-seatd exec-audio --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid} -- /bin/td-login exec-service-as {audio_user} -- /bin/td-audio serve --socket {audio_socket}\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/td-login exec-service-as {audio_user} -- /bin/td-audio probe --socket {audio_socket}\n\
@@ -1490,17 +1509,25 @@ fn build_td_svc_conf() -> String {
          log=/var/log/svc/td-portal-evidence.log\n\
          console=yes\n\
          \n\
-         # No shell-owned device setup: td-seatd assigned the nodes, td-login drops\n\
-         # credentials, and the compositor opens only those fixed paths.\n\
+         # The private pair admits the enrolled compositor before display access.\n\
          [wayland]\n\
          type=daemon\n\
-         cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --portal-socket {portal_wayland_socket} --control-socket {control_socket} --launcher-application {firefox_name} --terminal-client /bin/td-term --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}'\n\
+         cgroup=service\n\
+         exec=/bin/td-authd terminal-serve --user {ui_user} --uid {ui_uid} --peer-uid {compositor_uid}\n\
+         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --launcher-application {firefox_name} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
          after=seat\n\
          requires=seat\n\
-         ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor probe /run/user/{ui_uid}/wayland-0'\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe {wayland_socket}\n\
          ready-timeout=30\n\
          restart=always\n\
+         \n\
+         [seat-access-evidence]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/td-seatd probe-access --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
+         after=wayland,firefox-tls-setup\n\
+         requires=wayland\n\
+         timeout=30\n\
          \n\
          # The private path is the privileged portal transport boundary. This\n\
          # separate uid-1000 client proves its exact eleven-global registry and\n\
@@ -1527,7 +1554,7 @@ fn build_td_svc_conf() -> String {
          [terminal]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-term-ready'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/{ui_uid}/td-term-ready'\n\
          after=wayland\n\
          requires=wayland\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-term-ready'\n\
@@ -1563,7 +1590,7 @@ fn build_td_svc_conf() -> String {
          [mail]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-mail-ready --command /bin/{mail_name}'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/{ui_uid}/td-mail-ready --command /bin/{mail_name}'\n\
          after=terminal,busd,portal,fetchd,applications-workspace,firefox-tls-setup\n\
          requires=wayland,busd,fetchd\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-mail-ready'\n\
@@ -1589,7 +1616,7 @@ fn build_td_svc_conf() -> String {
          [news]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-news-ready --command /bin/{news_name}'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/{ui_uid}/td-news-ready --command /bin/{news_name}'\n\
          after=terminal,busd,fetchd,applications-workspace\n\
          requires=wayland,busd,fetchd\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-news-ready'\n\
@@ -1713,10 +1740,19 @@ fn build_td_svc_conf() -> String {
          # fresh result session, so automation supplies no competing input or\n\
          # DOM mutation. A separate bounded unit then holds one Marionette\n\
          # session across 31 exact local HTTPS navigations over five minutes.\n\
+         [terminal-authority-evidence]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-terminal-authority\n\
+         after=firefox-evidence,placement-evidence\n\
+         requires=wayland,terminal\n\
+         timeout=90\n\
+         \n\
          [firefox-input]\n\
          type=daemon\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/rm -f {firefox_download_path} {firefox_download_part_path} || exit 1; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input focus || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input clipboard && break; n=$((n+1)); case \"$n\" in 1) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_one};; 2) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_two};; *) :;; esac; /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input download || exit 1; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && break; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_download_observe_wait} ] || exit 1; portal_done=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_done\" ] || portal_done=0; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser-focus || exit 1; n=0; while [ \"$n\" -lt {firefox_file_chooser_wait} ]; do portal_now=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_now\" ] || portal_now=0; [ \"$portal_now\" -gt \"$portal_done\" ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_file_chooser_wait} ] || exit 1; /bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-input file-chooser-result || exit 1; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
-         after=firefox-evidence\n\
+         after=terminal-authority-evidence\n\
+         requires=terminal-authority-evidence\n\
          restart=never\n\
          \n\
          # The staged input marker is private coordination, not success. Only\n\
@@ -1750,7 +1786,7 @@ fn build_td_svc_conf() -> String {
          # for.\n\
          [claude-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-as {ui_user} -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-as {ui_user} -- /bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-as {ui_user} -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-as {ui_user} -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/{ui_uid}/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
          after=firefox-soak\n\
          restart=never\n\
          \n\
@@ -1760,8 +1796,8 @@ fn build_td_svc_conf() -> String {
          # Keep the process-heavy runtime probe farm out of the profiler's first\n\
          # bounded capture. This is ordering only: profiler evidence cannot decide\n\
          # whether a deployment is healthy, and a failed evidence unit still settles.\n\
-         after={sysinit},busd,wayland,terminal,profiler-evidence,sshd\n\
-         requires=terminal\n\
+         after={sysinit},busd,wayland,terminal,seat-access-evidence,profiler-evidence,sshd\n\
+         requires=terminal,seat-access-evidence\n\
          timeout={bootsuccess}\n\
          \n\
          [bootfail]\n\
@@ -1810,6 +1846,9 @@ fn build_td_svc_conf() -> String {
         ui_user = UI_USER,
         ui_uid = UI_UID,
         ui_home = UI_HOME,
+        compositor_uid = COMPOSITOR_RESERVED_UID,
+        compositor_user = COMPOSITOR_USER,
+        wayland_socket = WAYLAND_SOCKET,
         audio_uid = AUDIO_UID,
         audio_gid = AUDIO_GID,
         audio_user = AUDIO_USER,
@@ -3144,7 +3183,7 @@ fn build_profile(sys: &SystemDef) -> String {
     // (every /bin entry resolves into /td/store), so keep PATH honest and minimal.
     s.push_str("export PATH=/bin\n");
     s.push_str(&format!("export XDG_RUNTIME_DIR=/run/user/{UI_UID}\n"));
-    s.push_str("export WAYLAND_DISPLAY=wayland-0\n");
+    s.push_str(&format!("export WAYLAND_DISPLAY={WAYLAND_SOCKET}\n"));
     s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
     s.push_str(&format!(
         "if /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
@@ -3958,6 +3997,14 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::CopyTree {
         from: "{in:td-firstboot}".into(),
         dest: "{root}/real-root{in:td-firstboot}".into(),
+    });
+    steps.push(Step::CopyTree {
+        from: "{in:td-authd}".into(),
+        dest: "{root}/real-root{in:td-authd}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-authd}/bin/td-authd".into(),
+        link: "{root}/real-root/bin/td-authd".into(),
     });
     // td-login the same way, and for the same reason as td-util plus one of its own: a
     // `login` that cannot run without the dynamic closure locks an operator out of the
@@ -4926,6 +4973,7 @@ pub fn recipe() -> Recipe {
             "td-init",
             "td-firstboot",
             "td-login",
+            "td-authd",
             "td-svc",
             "td-profiler",
             "td-jail",
@@ -5222,7 +5270,7 @@ mod tests {
             unit_key("audio", "exec"),
             Some(format!(
                 "/bin/td-seatd exec-audio --uid {UI_UID} --gid {UI_GID} \
-                 --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID} -- \
+                 --compositor-uid {COMPOSITOR_RESERVED_UID} --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID} -- \
                  /bin/td-login exec-service-as {AUDIO_USER} -- /bin/td-audio \
                  serve --socket {}",
                 td_engine::permissions::TD_AUDIO_SOCKET_PATH
@@ -5334,7 +5382,7 @@ mod tests {
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal"),
+            Some("terminal,seat-access-evidence"),
             "profiler evidence is an ordering boundary, not deployment health"
         );
 
@@ -5515,7 +5563,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         // hopeful grep.
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal")
+            Some("terminal,seat-access-evidence")
         );
         assert!(unit_after("bootsuccess").contains(&"terminal".to_string()));
         assert!(!unit_after("bootsuccess").contains(&"firefox".to_string()));
@@ -5792,7 +5840,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                  *) exit 0;; esac'"
             )
         );
-        let wayland = unit_key("wayland", "exec").unwrap_or_default();
+        let wayland = unit_key("wayland", "pair-exec").unwrap_or_default();
         assert!(wayland.contains(&format!(
             "--application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
              --application-app-id {FIREFOX_APP_ID} \
@@ -6099,10 +6147,19 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         assert!(input.contains(&format!(
             "/bin/mv {FIREFOX_INPUT_COMPLETION_TMP_PATH} {FIREFOX_INPUT_COMPLETION_PATH}"
         )));
-        assert_eq!(unit_after("firefox-input"), vec!["firefox-evidence"]);
+        assert_eq!(
+            unit_after("firefox-input"),
+            vec!["terminal-authority-evidence"]
+        );
         assert_eq!(unit_key("firefox-input", "type").as_deref(), Some("daemon"));
-        assert_eq!(unit_key("firefox-input", "restart").as_deref(), Some("never"));
-        assert!(unit_key("firefox-input", "requires").is_none());
+        assert_eq!(
+            unit_key("firefox-input", "restart").as_deref(),
+            Some("never")
+        );
+        assert_eq!(
+            unit_key("firefox-input", "requires").as_deref(),
+            Some("terminal-authority-evidence")
+        );
 
         let soak = unit_key("firefox-soak", "exec").unwrap_or_default();
         let audit_case = format!(
@@ -6421,90 +6478,134 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         );
     }
 
-    /// Every native client path the compositor is handed is a name the image STAGES.
-    ///
-    /// The compositor cannot resolve any of them: each is an absolute `/bin`
-    /// name, and the launcher refuses a relative program rather than
-    /// searching. A flag naming a binary this recipe does not symlink is a
-    /// native launcher entry that spawns nothing. Firefox is activation-only
-    /// and therefore has no client-path flag.
-    ///
-    /// What this test uniquely holds is the MAPPING. That the path is staged
-    /// is already covered by `direct_bin_calls_resolve_to_a_packed_name`,
-    /// which sweeps every `/bin/NAME` in the table; what nothing else sees is
-    /// WHICH flag carries the terminal program.
-    ///
-    /// The client flags are enumerated out of the unit rather than only listed,
-    /// so a renamed or vanished flag reds the count instead of quietly leaving
-    /// the mapping unchecked.
+    /// The stock compositor uses only the fixed root terminal authority.
+    /// Both sides of that launch must resolve into the staged image.
     #[test]
-    fn native_launcher_client_flags_name_binaries_the_image_stages() {
-        let exec = unit_key("wayland", "exec").unwrap_or_default();
-        let steps = real_root_steps(&SYSTEM);
-        let words: Vec<&str> = exec.split_ascii_whitespace().collect();
-        let flags: Vec<(&str, &str)> = words
+    fn stock_session_identities_paths_and_programs_agree() {
+        let authority = include_str!("../../../td-authd/src/launch.rs");
+        assert!(authority.contains(r#"format!("/run/td-compositor/{uid}/wayland-0")"#));
+        assert!(authority.contains(r#"format!("/run/td-compositor/{uid}/td-control")"#));
+        assert_eq!(
+            WAYLAND_SOCKET,
+            format!("/run/td-compositor/{UI_UID}/wayland-0")
+        );
+        assert_eq!(
+            CONTROL_SOCKET,
+            format!("/run/td-compositor/{UI_UID}/td-control")
+        );
+        let jail = include_str!("../../../td-jail/src/authority.rs");
+        assert!(jail.contains(&format!("if owner != {UI_UID} {{")));
+        assert!(jail.contains(&format!("PathBuf::from(\"/run/user/{UI_UID}\")")));
+        let probe = include_str!("../../../td-compositor/src/session.rs");
+        assert!(probe.contains(&format!(
+            "const HUMAN_RUNTIME: &str = \"/run/user/{UI_UID}\";"
+        )));
+        assert_eq!(unit_key("terminal-authority-evidence", "log"), None);
+        assert_eq!(unit_key("terminal-authority-evidence", "console"), None);
+
+        assert!(probe.contains(&format!("const CONTROL: &str = \"{CONTROL_SOCKET}\";")));
+        assert!(probe.contains(&format!(
+            "const INPUT_TOKEN: &str = \"{FIREFOX_INPUT_CMDLINE_TOKEN}\";"
+        )));
+        assert_eq!(
+            unit_key("terminal-authority-evidence", "exec").as_deref(),
+            Some("/bin/td-login exec-as tester -- /bin/td-compositor probe-terminal-authority")
+        );
+        assert_eq!(
+            unit_key("terminal-authority-evidence", "timeout").as_deref(),
+            Some("90")
+        );
+        assert_eq!(
+            unit_key("terminal-authority-evidence", "cgroup").as_deref(),
+            Some("session")
+        );
+
+        let portal = include_str!("../../../td-portal/src/main.rs");
+        assert!(portal.contains(&format!(
+            "const FILE_CHOOSER_SOCKET: &str = \"{PORTAL_WAYLAND_SOCKET}\";"
+        )));
+        assert!(portal.contains(&format!(
+            "const FILE_CHOOSER_RUNTIME: &str = \"/run/user/{UI_UID}\";"
+        )));
+        let session = include_str!("../../../td-compositor/src/session.rs");
+        assert!(session.contains(&format!("pub(crate) const HUMAN_UID: u32 = {UI_UID};")));
+        let server = include_str!("../../../td-compositor/src/server.rs");
+        assert!(server.contains(&format!("const PORTAL_UID: u32 = {UI_UID};")));
+        let seat = include_str!("../../../td-seatd/src/main.rs");
+        assert!(seat.contains(r#"const COMPOSITOR_RUNTIME_NAME: &str = "td-compositor";"#));
+        assert!(seat.contains("Ok(run.join(COMPOSITOR_RUNTIME_NAME).join(owner))"));
+        assert_eq!(
+            td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH,
+            format!("/run/td-compositor/{UI_UID}")
+        );
+        assert!(seat.contains(&format!(
+            "\"--compositor-uid\".into(),\n                \"{COMPOSITOR_RESERVED_UID}\".into(),"
+        )));
+
+        assert!(seat.contains(&format!(
+            "const PRIVATE_DEVICES_MARKER: &str = \"{}\";",
+            crate::ladder::TD_COMPOSITOR_DEVICES_PRIVATE_MARKER
+        )));
+        assert_eq!(unit_key("seat-access-evidence", "log"), None);
+        assert_eq!(unit_key("seat-access-evidence", "console"), None);
+        assert_eq!(
+            unit_after("seat-access-evidence"),
+            vec!["wayland", "firefox-tls-setup"]
+        );
+        let private_runtime_accounts: Vec<_> = SYSTEM
+            .users
             .iter()
-            .enumerate()
-            .filter(|(_, word)| word.starts_with("--") && word.ends_with("-client"))
-            .map(|(index, word)| {
-                // The unit's exec is a `su -c '…'` word, so the LAST flag's
-                // value carries the closing quote — strip it as the shell does.
-                let value = words
-                    .get(index.saturating_add(1))
-                    .copied()
-                    .unwrap_or_default()
-                    .trim_end_matches('\'');
-                (*word, value)
-            })
+            .filter(|user| user.service_only)
+            .map(|user| user.name)
             .collect();
-        // The enumeration is only a proof if it FOUND them, and the count is
-        // what says so: a renamed flag would silently yield a shorter list.
-        assert_eq!(flags.len(), 1, "expected one native --*-client flag");
-        for (flag, path) in &flags {
-            let program = path.strip_prefix("/bin/").unwrap_or_default();
-            assert!(
-                !program.is_empty() && !program.contains('/'),
-                "{flag} passes {path}, which is not a /bin name"
-            );
-            let link = format!("{{root}}/real-root{path}");
-            let expected_target = match *flag {
-                "--terminal-client" => "{in:td-compositor}/bin/td-term",
-                _ => "",
-            };
-            assert!(steps.iter().any(|step| matches!(
-                step,
-                Step::Symlink { link: at, target }
-                    if at == &link && target == expected_target
-            )), "{flag} passes {path}, but nothing stages it through {expected_target}");
+        assert_eq!(private_runtime_accounts, [COMPOSITOR_USER, AUDIO_USER]);
+        assert_eq!(unit_key("wayland", "exec"), Some(format!(
+            "/bin/td-authd terminal-serve --user {UI_USER} --uid {UI_UID} --peer-uid {COMPOSITOR_RESERVED_UID}"
+        )));
+        let peer = unit_key("wayland", "pair-exec").unwrap_or_default();
+        assert!(peer.starts_with(&format!(
+            "/bin/td-login exec-service-as {COMPOSITOR_USER} -- /bin/td-compositor run "
+        )));
+        assert!(peer.contains("--terminal-authority stdin "));
+        assert!(!peer.contains("--terminal-client"));
+        let client_flags: Vec<_> = peer
+            .split_ascii_whitespace()
+            .filter(|word| word.starts_with("--") && word.ends_with("-client"))
+            .collect();
+        assert!(
+            client_flags.is_empty(),
+            "unstaged direct client flags: {client_flags:?}"
+        );
+        assert_eq!(unit_key("wayland", "cgroup").as_deref(), Some("service"));
+        let steps = real_root_steps(&SYSTEM);
+        for (name, package) in [("td-authd", "td-authd"), ("td-term", "td-compositor")] {
+            assert!(steps.iter().any(|step| matches!(step,
+                Step::Symlink { link, target }
+                if link == &format!("{{root}}/real-root/bin/{name}")
+                    && target == &format!("{{in:{package}}}/bin/{name}")
+            )));
         }
-        assert_eq!(flags, vec![("--terminal-client", "/bin/td-term")]);
     }
 
     #[test]
     fn wayland_service_uses_activation_only_firefox_and_a_native_terminal() {
-        // The control socket is named TWICE and must be the same path both
-        // times: the flag is what the compositor binds, and the variable is
-        // what every program it launches finds. A session that advertised one
-        // socket and bound another would be a `td-ctl` that reports no
-        // compositor on a machine running one. Moving the constant moves both
-        // and this follows it, which is the point of there being a constant;
-        // what this catches is one of the two spellings edited by hand.
+        // The peer uses a literal service credential switch and fixed socket
+        // paths, with no shell interpreting authority arguments.
         let expected = format!(
-            "/bin/su -s /bin/sh tester -c 'TD_CONTROL_SOCKET={CONTROL_SOCKET} \
-             /bin/td-compositor run \
+            "/bin/td-login exec-service-as {COMPOSITOR_USER} -- /bin/td-compositor run \
              --framebuffer /dev/fb0 --input /dev/input \
-             --socket /run/user/1000/wayland-0 \
+             --socket {WAYLAND_SOCKET} \
              --portal-socket {PORTAL_WAYLAND_SOCKET} \
              --control-socket {CONTROL_SOCKET} \
              --launcher-application {FIREFOX_NAME} \
-             --terminal-client /bin/td-term \
+             --terminal-authority stdin \
              --application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
              --application-app-id {FIREFOX_APP_ID} \
              --application-content-rgb-a {FIREFOX_CONTENT_RGB_A} \
-             --application-content-rgb-b {FIREFOX_CONTENT_RGB_B}'"
+             --application-content-rgb-b {FIREFOX_CONTENT_RGB_B}"
         );
         assert_eq!(
-            unit_key("wayland", "exec").as_deref(),
+            unit_key("wayland", "pair-exec").as_deref(),
             Some(expected.as_str())
         );
     }
@@ -6755,7 +6856,11 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 ],
             ),
             ("firefox-evidence", vec!["firefox", "netup"]),
-            ("firefox-input", vec!["firefox-evidence"]),
+            (
+                "terminal-authority-evidence",
+                vec!["firefox-evidence", "placement-evidence"],
+            ),
+            ("firefox-input", vec!["terminal-authority-evidence"]),
             ("firefox-soak", vec!["firefox-input"]),
             ("claude-evidence", vec!["firefox-soak"]),
             (
@@ -6767,6 +6872,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                         "busd",
                         "wayland",
                         "terminal",
+                        "seat-access-evidence",
                         "profiler-evidence",
                         "sshd",
                     ])
@@ -6933,7 +7039,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ),
             format!(
                 "ran=$(/bin/td-login exec-as tester -- /bin/td-term run --socket \
-                 /run/user/1000/wayland-0 --ready-socket /run/user/1000/td-claude-evidence-ready \
+                 {WAYLAND_SOCKET} --ready-socket /run/user/1000/td-claude-evidence-ready \
                  --command /bin/{CLAUDE_NAME} --version 2>&1 </dev/null)"
             ),
             format!(
@@ -7091,19 +7197,18 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     #[test]
     fn private_portal_channel_evidence_is_exact_and_separate() {
         assert_eq!(
-            unit_key("wayland", "exec"),
+            unit_key("wayland", "pair-exec"),
             Some(format!(
-                "/bin/su -s /bin/sh {UI_USER} -c 'TD_CONTROL_SOCKET={CONTROL_SOCKET} \
-                 /bin/td-compositor run \
+                "/bin/td-login exec-service-as {COMPOSITOR_USER} -- /bin/td-compositor run \
                  --framebuffer /dev/fb0 --input /dev/input \
-                 --socket /run/user/{UI_UID}/wayland-0 \
+                 --socket {WAYLAND_SOCKET} \
                  --portal-socket {PORTAL_WAYLAND_SOCKET} \
                  --control-socket {CONTROL_SOCKET} \
-                 --launcher-application {FIREFOX_NAME} --terminal-client /bin/td-term \
+                 --launcher-application {FIREFOX_NAME} --terminal-authority stdin \
                  --application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
                  --application-app-id {FIREFOX_APP_ID} \
                  --application-content-rgb-a {FIREFOX_CONTENT_RGB_A} \
-                 --application-content-rgb-b {FIREFOX_CONTENT_RGB_B}'"
+                 --application-content-rgb-b {FIREFOX_CONTENT_RGB_B}"
             ))
         );
         assert_eq!(
@@ -7204,7 +7309,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal"),
+            Some("terminal,seat-access-evidence"),
             "deployment health must be skipped when the terminal failed, while the \
              mutable Firefox launch remains independent QEMU evidence"
         );
@@ -7590,7 +7695,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                         && user.home == UI_HOME
                 }),
             "the first UI profile is deliberately one fixed seat: build_td_svc_conf, \
-             td-seatd, XDG_RUNTIME_DIR, and WAYLAND_DISPLAY all bind tester 1000:1000; \
+             the human runtime binds tester 1000:1000; compositor sockets belong to UID 993; \
              make those generated before changing the graphical account"
         );
         assert_eq!(
@@ -7602,9 +7707,9 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             unit_key("seat", "exec"),
             Some(format!(
                 "/bin/td-seatd assign --uid {UI_UID} --gid {UI_GID} \
-                 --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID}"
+                 --compositor-uid {COMPOSITOR_RESERVED_UID} --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID}"
             )),
-            "the seat service must create both compiled runtime identities"
+            "the seat service must create all three compiled runtime identities"
         );
         assert_eq!(
             unit_key("td-firstboot", "exec"),
@@ -9625,7 +9730,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             } else if user.uid == 0 {
                 assert!(init.contains("/sysroot/var/root"));
             } else {
-                assert_eq!(user.name, AUDIO_USER);
+                assert!(user.service_only);
                 assert!(!init.contains(&path));
             }
         }
@@ -10356,7 +10461,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
         assert!(
             profile.contains("export XDG_RUNTIME_DIR=/run/user/1000")
-                && profile.contains("export WAYLAND_DISPLAY=wayland-0"),
+                && profile.contains(&format!("export WAYLAND_DISPLAY={WAYLAND_SOCKET}")),
             "the graphical login environment must name the seat-owned runtime \
              directory and compositor socket"
         );

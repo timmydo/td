@@ -187,6 +187,11 @@ const TD_JAIL_KILL_REAPS_MARKER: &str = td_recipe::ladder::TD_JAIL_KILL_REAPS_MA
 const TD_FIREFOX_BOOT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_BOOT_MARKER;
 const TD_FIREFOX_CONTENT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_CONTENT_MARKER;
 const TD_FIREFOX_SUPPORT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SUPPORT_MARKER;
+const TD_TERMINAL_AUTHORITY_ARMED_MARKER: &str =
+    td_recipe::ladder::TD_TERMINAL_AUTHORITY_ARMED_MARKER;
+const TD_TERMINAL_AUTHORITY_READY_MARKER: &str =
+    td_recipe::ladder::TD_TERMINAL_AUTHORITY_READY_MARKER;
+const TD_TERMINAL_AUTHORITY_MARKER: &str = td_recipe::ladder::TD_TERMINAL_AUTHORITY_MARKER;
 const TD_FIREFOX_INPUT_ARMED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_ARMED_MARKER;
 const TD_FIREFOX_INPUT_FOCUSED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_FOCUSED_MARKER;
 const TD_FIREFOX_INPUT_MENU_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_MENU_MARKER;
@@ -289,6 +294,8 @@ const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_OWNER_MA
 const SYSTEM_ETC_MUTABLE_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_MUTABLE_MARKER;
 const TD_FIRSTBOOT_NEW_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_NEW_MARKER;
 const TD_FIRSTBOOT_STABLE_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_STABLE_MARKER;
+const TD_COMPOSITOR_DEVICES_PRIVATE_MARKER: &str =
+    td_recipe::ladder::TD_COMPOSITOR_DEVICES_PRIVATE_MARKER;
 const TD_PRINCIPALS_MARKER: &str = td_recipe::ladder::TD_PRINCIPALS_MARKER;
 const TD_FIRSTBOOT_HOST_KEY_PREFIX: &str = td_recipe::ladder::TD_FIRSTBOOT_HOST_KEY_PREFIX;
 const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_WRITE_MARKER;
@@ -458,6 +465,7 @@ struct ConsoleEvidence {
     firstboot_new: bool,
     firstboot_stable: bool,
     principals_enrolled: bool,
+    compositor_devices_private: bool,
     /// This machine's SSH host-key fingerprint, as td-firstboot printed it. An
     /// Option rather than a bool because its VALUE is the evidence: comparing it
     /// across reboots is what proves the identity persisted rather than merely
@@ -495,6 +503,9 @@ struct ConsoleEvidence {
     td_firefox: bool,
     td_firefox_content: bool,
     td_firefox_support: bool,
+    td_terminal_authority_armed: bool,
+    td_terminal_authority_ready: bool,
+    td_terminal_authority: bool,
     td_firefox_input_armed: bool,
     td_firefox_input_focused: bool,
     td_firefox_input_menu: bool,
@@ -1482,6 +1493,21 @@ fn validate_claude_terminal(result: &BootResult) -> Result<(), String> {
 fn validate_firefox_input(result: &BootResult, expect_audio_capture: bool) -> Result<(), String> {
     for (seen, marker, description) in [
         (
+            result.evidence.td_terminal_authority_armed,
+            TD_TERMINAL_AUTHORITY_ARMED_MARKER,
+            "the terminal authority diagnostic did not arm for physical input",
+        ),
+        (
+            result.evidence.td_terminal_authority_ready,
+            TD_TERMINAL_AUTHORITY_READY_MARKER,
+            "physical Super+T did not produce a focused terminal with a ready PTY",
+        ),
+        (
+            result.evidence.td_terminal_authority,
+            TD_TERMINAL_AUTHORITY_MARKER,
+            "physical Super+T did not launch and close a real terminal through the root authority",
+        ),
+        (
             result.evidence.td_firefox_input_armed,
             TD_FIREFOX_INPUT_ARMED_MARKER,
             "Firefox did not arm its content and chrome listeners",
@@ -1769,6 +1795,9 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
+    if !result.evidence.compositor_devices_private {
+        return Err(format!("the {ordinal} boot did not deny human device access ({TD_COMPOSITOR_DEVICES_PRIVATE_MARKER} absent). Last serial output:\n{}", tail(&result.console, 80)));
+    }
     // td-firstboot's own report. A fresh @var must be provisioned exactly once, and
     // every later boot must find that identity intact: the marker that appears says
     // which happened, and the marker that does NOT is the load-bearing half —
@@ -2032,7 +2061,7 @@ fn validate_system_boot(
         return Err(format!(
             "the public portal proof passed, but the private compositor-channel marker \
              ({TD_PORTAL_CHANNEL_CONSOLE_MARKER:?}) was absent — the uid-1000 probe did not \
-             connect to /run/user/1000/td-portal-wayland-0, receive its exact eleven-global \
+             connect to /run/td-compositor/1000/td-portal-wayland-0, receive its exact eleven-global \
              private registry, bind td_portal_manager_v1, or complete standalone dialog \
              association and dismissal through it. Last serial output:\n{}",
             tail(&result.console, 80)
@@ -2380,8 +2409,8 @@ fn validate_system_boot(
         return Err(format!(
             "the serial boot and userland health checks passed, but the graphical runtime \
              marker ({TD_WAYLAND_RUNTIME_MARKER:?}) was absent — td-seatd did not assign \
-             /dev/fb0 and the evdev seat to uid 1000, the unprivileged compositor could not \
-             paint the virtio-gpu framebuffer, or its mode-0600 Wayland socket never began \
+             /dev/fb0 and the evdev seat to uid 993, the unprivileged compositor could not \
+             paint the virtio-gpu framebuffer, or its peer-admitted Wayland socket never began \
              listening. The serial greeter remains the recovery path. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -5194,6 +5223,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_FIRSTBOOT_NEW_MARKER.len(),
         TD_FIRSTBOOT_STABLE_MARKER.len(),
         TD_PRINCIPALS_MARKER.len(),
+        exact_line_window(TD_COMPOSITOR_DEVICES_PRIVATE_MARKER),
         TD_FIRSTBOOT_HOST_KEY_PREFIX.len() + HOST_KEY_MAX,
         SYSTEM_STATE_WRITABLE_MARKER.len(),
         SYSTEM_STATE_OWNER_MARKER.len(),
@@ -5228,6 +5258,9 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FIREFOX_BOOT_MARKER),
         exact_line_window(TD_FIREFOX_CONTENT_MARKER),
         exact_line_window(TD_FIREFOX_SUPPORT_MARKER),
+        exact_line_window(TD_TERMINAL_AUTHORITY_ARMED_MARKER),
+        exact_line_window(TD_TERMINAL_AUTHORITY_READY_MARKER),
+        exact_line_window(TD_TERMINAL_AUTHORITY_MARKER),
         exact_line_window(TD_FIREFOX_INPUT_ARMED_MARKER),
         exact_line_window(TD_FIREFOX_INPUT_FOCUSED_MARKER),
         exact_line_window(TD_FIREFOX_INPUT_MENU_MARKER),
@@ -5422,6 +5455,12 @@ fn latch_console_evidence_from(
         buf,
         TD_FIRSTBOOT_NEW_MARKER.as_bytes(),
     );
+    latch_line_marker(
+        &mut evidence.compositor_devices_private,
+        buf,
+        TD_COMPOSITOR_DEVICES_PRIVATE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
     latch_marker(
         &mut evidence.principals_enrolled,
         buf,
@@ -5579,6 +5618,24 @@ fn latch_console_evidence_from(
         &mut evidence.td_firefox_support,
         buf,
         TD_FIREFOX_SUPPORT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_terminal_authority_armed,
+        buf,
+        TD_TERMINAL_AUTHORITY_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_terminal_authority_ready,
+        buf,
+        TD_TERMINAL_AUTHORITY_READY_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_terminal_authority,
+        buf,
+        TD_TERMINAL_AUTHORITY_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -6365,6 +6422,9 @@ fn qmp_arg(path: &Path) -> OsString {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhysicalInputPhase {
+    AuthorityArm,
+    AuthorityLaunch,
+    AuthorityClose,
     Arm,
     Cursor,
     Focus,
@@ -6440,18 +6500,43 @@ impl PhysicalInputController {
         Self {
             path,
             qmp: None,
-            phase: PhysicalInputPhase::Arm,
+            phase: PhysicalInputPhase::AuthorityArm,
             terminal_focus_floor: None,
             clipboard_focus_retries: 0,
         }
     }
 
     fn progress(&mut self, evidence: &mut ConsoleEvidence) -> Result<(), String> {
-        if self.phase == PhysicalInputPhase::Arm && evidence.td_firefox_input_armed {
+        if self.phase == PhysicalInputPhase::AuthorityArm && evidence.td_terminal_authority_armed {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
             let mut qmp = Qmp::connect_until(&self.path, deadline)?;
-            qmp.move_absolute_until(24_576, 16_384, deadline)?;
+            qmp.key_chord_until(&["meta_l", "t"], deadline)?;
             self.qmp = Some(qmp);
+            self.phase = PhysicalInputPhase::AuthorityLaunch;
+        }
+        if self.phase == PhysicalInputPhase::AuthorityLaunch && evidence.td_terminal_authority_ready
+        {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            self.qmp
+                .as_mut()
+                .ok_or_else(|| {
+                    "QMP controller disappeared before authority terminal close".to_string()
+                })?
+                .key_chord_until(&["ctrl", "d"], deadline)?;
+            self.phase = PhysicalInputPhase::AuthorityClose;
+        }
+        if self.phase == PhysicalInputPhase::AuthorityClose && evidence.td_terminal_authority {
+            self.phase = PhysicalInputPhase::Arm;
+        }
+        if self.phase == PhysicalInputPhase::Arm && evidence.td_firefox_input_armed {
+            let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+            if self.qmp.is_none() {
+                self.qmp = Some(Qmp::connect_until(&self.path, deadline)?);
+            }
+            self.qmp
+                .as_mut()
+                .ok_or_else(|| "QMP controller disappeared before Firefox input".to_string())?
+                .move_absolute_until(24_576, 16_384, deadline)?;
             self.phase = PhysicalInputPhase::Cursor;
         }
         if self.phase == PhysicalInputPhase::Cursor && evidence.td_application_cursor {
@@ -6771,7 +6856,20 @@ impl Qmp {
             || keys.iter().any(|key| {
                 !matches!(
                     *key,
-                    "ctrl" | "shift" | "c" | "e" | "l" | "m" | "o" | "ret" | "v" | "w" | "x"
+                    "ctrl"
+                        | "shift"
+                        | "meta_l"
+                        | "c"
+                        | "d"
+                        | "e"
+                        | "l"
+                        | "m"
+                        | "o"
+                        | "ret"
+                        | "t"
+                        | "v"
+                        | "w"
+                        | "x"
                 )
             })
         {
@@ -7911,6 +8009,128 @@ mod tests {
     }
 
     #[test]
+    fn authority_qmp_input_waits_for_launch_and_teardown_acknowledgements() {
+        let seq = AtomicU64::new(8_201);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let path = dir.join("qmp.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"{\"QMP\":{\"version\":{}}}\r\n").unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+            for _ in 0..3 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                commands.push(line);
+                stream.write_all(b"{\"return\":{}}\r\n").unwrap();
+            }
+            commands
+        });
+        let mut controller = PhysicalInputController::new(path);
+        let mut evidence = ConsoleEvidence::default();
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::AuthorityArm);
+        assert!(controller.qmp.is_none());
+        evidence.td_terminal_authority_armed = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::AuthorityLaunch);
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::AuthorityLaunch);
+        evidence.td_terminal_authority_ready = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::AuthorityClose);
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::AuthorityClose);
+        evidence.td_terminal_authority = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::Arm);
+        let commands = server.join().unwrap();
+        assert!(commands[0].contains("qmp_capabilities"));
+        assert!(commands[1].contains("meta_l"));
+        assert!(commands[1].contains("\"data\":\"t\""));
+        assert!(commands[2].contains("ctrl"));
+        assert!(commands[2].contains("\"data\":\"d\""));
+    }
+
+    #[test]
+    fn physical_input_cannot_pass_without_terminal_authority_teardown() {
+        let mut result = BootResult {
+            evidence: ConsoleEvidence::default(),
+            exited_clean: true,
+            reason: String::new(),
+            console: String::new(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        for (field, marker) in [
+            (0, TD_TERMINAL_AUTHORITY_ARMED_MARKER),
+            (1, TD_TERMINAL_AUTHORITY_READY_MARKER),
+        ] {
+            assert!(validate_firefox_input(&result, false)
+                .unwrap_err()
+                .contains(marker));
+            if field == 0 {
+                result.evidence.td_terminal_authority_armed = true;
+            } else {
+                result.evidence.td_terminal_authority_ready = true;
+            }
+        }
+        assert!(validate_firefox_input(&result, false)
+            .unwrap_err()
+            .contains(TD_TERMINAL_AUTHORITY_MARKER));
+        result.evidence.td_terminal_authority = true;
+        assert!(!validate_firefox_input(&result, false)
+            .unwrap_err()
+            .contains(TD_TERMINAL_AUTHORITY_MARKER));
+    }
+
+    #[test]
+    fn device_denial_evidence_requires_its_own_complete_line() {
+        for text in [
+            "TD-COMPOSITOR-DEVICES-PRIVATE-extra\n",
+            "xTD-COMPOSITOR-DEVICES-PRIVATE\n",
+        ] {
+            let mut evidence = ConsoleEvidence::default();
+            latch_console_evidence(&mut evidence, text.as_bytes(), b"unrelated");
+            assert!(!evidence.compositor_devices_private);
+        }
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            b"\nTD-COMPOSITOR-DEVICES-PRIVATE\r\n",
+            b"unrelated",
+        );
+        assert!(evidence.compositor_devices_private);
+    }
+
+    #[test]
+    fn authority_markers_are_exact_lines_from_the_guest_probe() {
+        let source = include_str!("../../../../../td-compositor/src/session.rs");
+        for marker in [
+            TD_TERMINAL_AUTHORITY_ARMED_MARKER,
+            TD_TERMINAL_AUTHORITY_READY_MARKER,
+            TD_TERMINAL_AUTHORITY_MARKER,
+        ] {
+            assert!(source.contains(&format!("\"{marker}\"")));
+        }
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            b"\nTD-TERMINAL-AUTHORITY-OK-extra\n",
+            b"unrelated",
+        );
+        assert!(!evidence.td_terminal_authority);
+        latch_console_evidence(
+            &mut evidence,
+            b"\nTD-TERMINAL-AUTHORITY-OK\r\n",
+            b"unrelated",
+        );
+        assert!(evidence.td_terminal_authority);
+    }
+
+    #[test]
     fn staged_qmp_input_waits_for_each_guest_acknowledgement() {
         assert_eq!(qmp_absolute_pixel(960, QMP_OUTPUT_WIDTH).unwrap(), 24_576);
         assert_eq!(qmp_absolute_pixel(1_020, QMP_OUTPUT_WIDTH).unwrap(), 26_112);
@@ -7950,6 +8170,7 @@ mod tests {
         });
 
         let mut controller = PhysicalInputController::new(path);
+        controller.phase = PhysicalInputPhase::Arm;
         let mut evidence = ConsoleEvidence::default();
         controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::Arm);
@@ -9041,8 +9262,9 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 83] {
+    fn all_console_markers() -> [&'static str; 87] {
         [
+            TD_COMPOSITOR_DEVICES_PRIVATE_MARKER,
             MARKER,
             EROFS_MARKER,
             td_boot_protocol::CURRENT_REJECTED_MARKER,
@@ -9092,6 +9314,9 @@ mod tests {
             TD_FIREFOX_BOOT_MARKER,
             TD_FIREFOX_CONTENT_MARKER,
             TD_FIREFOX_SUPPORT_MARKER,
+            TD_TERMINAL_AUTHORITY_ARMED_MARKER,
+            TD_TERMINAL_AUTHORITY_READY_MARKER,
+            TD_TERMINAL_AUTHORITY_MARKER,
             TD_FIREFOX_INPUT_ARMED_MARKER,
             TD_FIREFOX_INPUT_FOCUSED_MARKER,
             TD_FIREFOX_INPUT_MENU_MARKER,
@@ -9447,31 +9672,32 @@ mod tests {
     /// no real boot produces -- every selection outcome at once -- which the
     /// selection check rightly refuses.
     fn healthy_evidence() -> ConsoleEvidence {
-    let mut evidence = ConsoleEvidence::default();
-    evidence.boot_success = true;
-    evidence.codex_runtime = true;
-    evidence.etc_mutable = true;
-    evidence.etc_read_only = true;
-    evidence.firstboot_new = true;
-    evidence.principals_enrolled = true;
-    evidence.git_runtime = true;
-    evidence.host_key = Some("ssh-ed25519 AAAA".to_string());
-    evidence.persist_read = true;
-    evidence.persist_write = true;
-    evidence.ripgrep_fd_runtime = true;
-    evidence.root_read_only = true;
-    evidence.selected_current = true;
-    evidence.sshd = true;
-    evidence.state_owner = true;
-    evidence.state_writable = true;
-    evidence.target = true;
-    evidence.td_busd_runtime = true;
-    evidence.td_firefox = true;
-    evidence.td_firefox_content = true;
-    evidence.td_firefox_support = true;
-    evidence.td_init_runtime = true;
-    evidence.td_compositor_drm = Some(
-        "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 \
+        let mut evidence = ConsoleEvidence::default();
+        evidence.boot_success = true;
+        evidence.codex_runtime = true;
+        evidence.etc_mutable = true;
+        evidence.etc_read_only = true;
+        evidence.firstboot_new = true;
+        evidence.principals_enrolled = true;
+        evidence.compositor_devices_private = true;
+        evidence.git_runtime = true;
+        evidence.host_key = Some("ssh-ed25519 AAAA".to_string());
+        evidence.persist_read = true;
+        evidence.persist_write = true;
+        evidence.ripgrep_fd_runtime = true;
+        evidence.root_read_only = true;
+        evidence.selected_current = true;
+        evidence.sshd = true;
+        evidence.state_owner = true;
+        evidence.state_writable = true;
+        evidence.target = true;
+        evidence.td_busd_runtime = true;
+        evidence.td_firefox = true;
+        evidence.td_firefox_content = true;
+        evidence.td_firefox_support = true;
+        evidence.td_init_runtime = true;
+        evidence.td_compositor_drm = Some(
+            "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 \
          mode=1280x800@60 name=1280x800 preferred=true mm=0x0 output=1280x800 \
          buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok"
             .to_string(),
@@ -9603,6 +9829,11 @@ mod tests {
             )
         };
         assert_eq!(validate(&result), Ok(()));
+        result.evidence.compositor_devices_private = false;
+        assert!(validate(&result)
+            .unwrap_err()
+            .contains(TD_COMPOSITOR_DEVICES_PRIVATE_MARKER));
+        result.evidence.compositor_devices_private = true;
         result.evidence.principals_enrolled = false;
         assert!(validate(&result).unwrap_err().contains(TD_PRINCIPALS_MARKER));
     }
@@ -10992,6 +11223,7 @@ mod tests {
             TD_FIRSTBOOT_NEW_MARKER,
             TD_FIRSTBOOT_STABLE_MARKER,
             TD_PRINCIPALS_MARKER,
+            TD_COMPOSITOR_DEVICES_PRIVATE_MARKER,
             host_key_line.as_str(),
             SYSTEM_STATE_WRITABLE_MARKER,
             SYSTEM_STATE_OWNER_MARKER,
@@ -11061,6 +11293,7 @@ mod tests {
         assert!(evidence.firstboot_new);
         assert!(evidence.firstboot_stable);
         assert!(evidence.principals_enrolled);
+        assert!(evidence.compositor_devices_private);
         assert_eq!(evidence.host_key.as_deref(), Some("SHA256:aGVsbG8gd29ybGQ"));
         assert!(evidence.state_writable);
         assert!(evidence.state_owner);

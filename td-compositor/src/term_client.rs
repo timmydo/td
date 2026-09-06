@@ -89,7 +89,7 @@ const CLIPBOARD_FOCUS_PREFIX: &str = "TD-TERM-CLIPBOARD-FOCUS-READY serial=";
 
 /// What an operator sees in a title bar. td's own compositor now KEEPS this
 /// rather than discarding it, so it is the name this window will carry.
-const TITLE: &str = "td terminal";
+pub(crate) const TITLE: &str = "td terminal";
 
 /// The grid a terminal falls back to when the compositor proposes no size.
 /// 80 by 24 is what a terminfo entry, a shell prompt and anything that draws
@@ -2207,6 +2207,7 @@ fn start_child(
     command: &pty::ChildCommand,
     program: Option<String>,
     account: &pty::Account,
+    wayland_socket: &Path,
     input: Arc<pty::Input>,
 ) -> Result<Started, String> {
     let output = pty
@@ -2226,6 +2227,9 @@ fn start_child(
         &pty::environment(
             account,
             std::env::var("TD_CONTROL_SOCKET").ok().as_deref(),
+            wayland_socket
+                .to_str()
+                .ok_or("Wayland socket path is not UTF-8")?,
         ),
         Path::new(&account.home),
         slave,
@@ -2294,7 +2298,15 @@ fn start(
     let account = pty::current_account(inputs.status, inputs.passwd)?;
     let command = pty::child_command(Path::new(pty::CTTYHACK), inputs.command)?;
     let program = launched_program_name(inputs.command);
-    let (children, child) = start_child(pty, events, &command, program, &account, input)?;
+    let (children, child) = start_child(
+        pty,
+        events,
+        &command,
+        program,
+        &account,
+        inputs.wayland_socket,
+        input,
+    )?;
     let (rows, columns) = cells;
     let published = ready::publish(inputs.ready_socket, rows, columns)?;
     Ok((children, child, published))
@@ -2303,6 +2315,7 @@ fn start(
 /// What `start` reads and runs: the account files, where readiness is
 /// published, and the child's literal argv (empty for the default shell).
 struct StartInputs<'a> {
+    wayland_socket: &'a Path,
     status: &'a Path,
     passwd: &'a Path,
     ready_socket: &'a Path,
@@ -2565,12 +2578,18 @@ fn clipboard_proof_enabled(path: &Path) -> Result<bool, String> {
     Ok(cmdline_has_clipboard_proof(&bytes))
 }
 
+// Readiness and buffers belong to the client; the display may be another UID's.
+fn client_directory(options: &Options) -> Result<&Path, String> {
+    options
+        .ready_socket
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "terminal readiness socket has no parent directory".to_string())
+}
+
 pub fn run(options: &Options) -> Result<(), String> {
     let clipboard_proof = clipboard_proof_enabled(Path::new(PROC_CMDLINE))?;
-    let runtime_directory = options
-        .socket
-        .parent()
-        .ok_or_else(|| format!("Wayland socket {} has no parent", options.socket.display()))?;
+    let runtime_directory = client_directory(options)?;
     let font = font::pinned()?;
     let palette = render::Palette::pinned();
     let fallback = default_size(&font)?;
@@ -2620,6 +2639,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         &pty,
         &sender,
         &StartInputs {
+            wayland_socket: &options.socket,
             status: Path::new(PROC_STATUS),
             passwd: Path::new(ETC_PASSWD),
             ready_socket: &options.ready_socket,
@@ -2745,6 +2765,21 @@ mod tests {
 
     fn font() -> Font {
         font::pinned().unwrap()
+    }
+
+    #[test]
+    fn shared_display_does_not_choose_the_terminal_buffer_directory() {
+        let mut options = Options {
+            socket: "/run/td-compositor/1000/wayland-0".into(),
+            ready_socket: "/run/user/1000/terminal.ready".into(),
+            command: Vec::new(),
+        };
+        assert_eq!(
+            client_directory(&options).unwrap(),
+            Path::new("/run/user/1000")
+        );
+        options.ready_socket = "terminal.ready".into();
+        assert!(client_directory(&options).is_err());
     }
 
     /// The fallback is expressed in cells, so the grid it yields is exactly
@@ -5117,6 +5152,7 @@ mod tests {
             &pty,
             &sender,
             &StartInputs {
+                wayland_socket: Path::new("/run/td-compositor/1000/wayland-0"),
                 status: Path::new(PROC_STATUS),
                 passwd: &missing,
                 ready_socket: &ready_socket,
@@ -5166,6 +5202,7 @@ mod tests {
             &pty,
             &sender,
             &StartInputs {
+                wayland_socket: Path::new("/run/td-compositor/1000/wayland-0"),
                 status: Path::new(PROC_STATUS),
                 passwd: &passwd,
                 ready_socket: &ready_socket,
@@ -5223,6 +5260,7 @@ mod tests {
             &pty,
             &sender,
             &StartInputs {
+                wayland_socket: Path::new("/run/td-compositor/1000/wayland-0"),
                 status: Path::new(PROC_STATUS),
                 passwd: &passwd,
                 ready_socket: &ready_socket,
@@ -5723,6 +5761,7 @@ mod tests {
             &fixture_command("term_client_abort_fixture"),
             None,
             &account,
+            Path::new("/run/td-compositor/1000/wayland-0"),
             pty::Input::new(),
         )
         .unwrap();
@@ -7252,6 +7291,7 @@ mod tests {
             &fixture_command("term_client_echo_fixture"),
             None,
             &account,
+            Path::new("/run/td-compositor/1000/wayland-0"),
             Arc::clone(&queued),
         )
         .unwrap();
@@ -7361,6 +7401,7 @@ mod tests {
             &fixture_command("term_client_child_fixture"),
             None,
             &account,
+            Path::new("/run/td-compositor/1000/wayland-0"),
             pty::Input::new(),
         )
         .unwrap();

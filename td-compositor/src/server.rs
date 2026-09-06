@@ -20,6 +20,7 @@ use crate::scene::{
 };
 #[cfg(test)]
 use crate::scene::{GAP, TITLE_HEIGHT};
+use crate::session::SocketPolicy;
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -3913,13 +3914,15 @@ impl Client {
         let fd = fds
             .pop_front()
             .ok_or_else(|| "wl_shm.create_pool arrived without a descriptor".to_string())?;
-        let file = sys::duplicate_received(fd)?;
-        let actual = usize::try_from(
-            file.metadata()
-                .map_err(|e| format!("stat wl_shm pool: {e}"))?
-                .len(),
-        )
-        .map_err(|_| "wl_shm backing file is too large".to_string())?;
+        let file = sys::take_received(fd)?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("stat wl_shm pool: {e}"))?;
+        if !metadata.is_file() {
+            return Err("wl_shm pool must be a regular file".into());
+        }
+        let actual = usize::try_from(metadata.len())
+            .map_err(|_| "wl_shm backing file is too large".to_string())?;
         if size > actual {
             return Err(format!(
                 "wl_shm declared {size} bytes but backing file has {actual}"
@@ -7420,6 +7423,7 @@ pub fn watch_application(
     app_id: &str,
     content_rgb_a: &str,
     content_rgb_b: &str,
+    policy: SocketPolicy,
 ) -> Result<ApplicationObserver, String> {
     if !valid_expected_app_id(app_id) {
         return Err(
@@ -7482,12 +7486,8 @@ pub fn watch_application(
                     std::process::exit(1);
                 }
             };
-            match socket::publish_while(
-                &path,
-                "application-ready",
-                answer,
-                publisher_live,
-            ) {
+            match socket::publish_while(&path, "application-ready", answer, publisher_live, policy)
+            {
                 Ok(published) => {
                     if let Err(error) = announce_application_ready(
                         &mut std::io::stdout().lock(),
@@ -7523,11 +7523,11 @@ pub fn watch_application(
     })
 }
 
-fn bind_listener(path: &Path, label: &str) -> Result<UnixListener, String> {
+fn bind_listener(path: &Path, label: &str, policy: SocketPolicy) -> Result<UnixListener, String> {
     socket::remove_stale(path, label)?;
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("bind {label} socket {}: {e}", path.display()))?;
-    fs::set_permissions(path, Permissions::from_mode(0o600))
+    fs::set_permissions(path, Permissions::from_mode(policy.mode()))
         .map_err(|e| format!("chmod {label} socket {}: {e}", path.display()))?;
     Ok(listener)
 }
@@ -7567,7 +7567,9 @@ fn prepare_client_stream(
     stream: UnixStream,
     access: ClientAccess,
     portal_timeout: Duration,
+    policy: SocketPolicy,
 ) -> Result<UnixStream, String> {
+    policy.admit(&stream)?;
     if access == ClientAccess::Public {
         return Ok(stream);
     }
@@ -7586,19 +7588,43 @@ fn set_portal_client_timeout(stream: &UnixStream, timeout: Duration) -> Result<(
         .map_err(|error| format!("set private portal client write timeout: {error}"))
 }
 
+#[derive(Default)]
+struct RejectionBudget {
+    last_report: Option<Instant>,
+    pending: u64,
+}
+
+impl RejectionBudget {
+    fn take_report(&mut self, now: Instant) -> Option<u64> {
+        self.pending = self.pending.saturating_add(1);
+        if self
+            .last_report
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(60))
+        {
+            return None;
+        }
+        self.last_report = Some(now);
+        Some(std::mem::take(&mut self.pending))
+    }
+}
+
 fn accept_clients(
     listener: UnixListener,
     channel: &'static str,
     access: ClientAccess,
     runtime: Arc<Mutex<Runtime>>,
     keymap: KeymapFile,
+    policy: SocketPolicy,
 ) -> Result<(), String> {
+    let mut rejections = RejectionBudget::default();
     for connection in listener.incoming() {
         let stream = connection.map_err(|e| format!("accept {channel} client: {e}"))?;
-        let stream = match prepare_client_stream(stream, access, PORTAL_CLIENT_IO_TIMEOUT) {
+        let stream = match prepare_client_stream(stream, access, PORTAL_CLIENT_IO_TIMEOUT, policy) {
             Ok(stream) => stream,
             Err(error) => {
-                eprintln!("td-compositor: {channel}: reject client: {error}");
+                if let Some(count) = rejections.take_report(Instant::now()) {
+                    eprintln!("td-compositor: {channel}: {count} rejected connection(s): {error}");
+                }
                 continue;
             }
         };
@@ -7631,6 +7657,7 @@ pub fn serve(
     path: &Path,
     portal_path: &Path,
     runtime: Arc<Mutex<Runtime>>,
+    policy: SocketPolicy,
 ) -> Result<(), String> {
     let keymap_dir = keymap_directory(path)?.to_path_buf();
     let keymap = keymap_file(&keymap_dir)?;
@@ -7640,7 +7667,7 @@ pub fn serve(
         path,
         portal_path,
         &mut std::io::stdout().lock(),
-        bind_listener,
+        |path, label| bind_listener(path, label, policy),
         move |portal_listener| {
             thread::Builder::new()
                 .name("portal-wayland-accept".into())
@@ -7651,6 +7678,7 @@ pub fn serve(
                         ClientAccess::Portal,
                         portal_runtime,
                         portal_keymap,
+                        policy,
                     ) {
                         eprintln!("td-compositor: {error}");
                         std::process::exit(1);
@@ -7666,6 +7694,7 @@ pub fn serve(
         ClientAccess::Public,
         runtime,
         keymap,
+        policy,
     )
 }
 
@@ -7794,6 +7823,26 @@ pub fn probe_application(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connection_rejection_diagnostics_bound_a_flood_and_count_suppressed_errors() {
+        let start = Instant::now();
+        let mut budget = RejectionBudget::default();
+        assert_eq!(budget.take_report(start), Some(1));
+        for _ in 0..1000 {
+            assert_eq!(budget.take_report(start), None);
+        }
+        assert_eq!(budget.take_report(start + Duration::from_secs(59)), None);
+        assert_eq!(
+            budget.take_report(start + Duration::from_secs(60)),
+            Some(1002)
+        );
+        assert_eq!(budget.take_report(start + Duration::from_secs(61)), None);
+        assert_eq!(
+            budget.take_report(start + Duration::from_secs(120)),
+            Some(2)
+        );
+    }
+
     /// The bytes the boot oracle greps, taken from the EMIT rather than from
     /// a string beside it — including the newline `println!` added for free.
     #[test]
@@ -7838,7 +7887,7 @@ mod tests {
                     "Wayland" => "bind-public",
                     _ => "bind-unknown",
                 });
-                super::bind_listener(path, label)
+                super::bind_listener(path, label, SocketPolicy::Private)
             },
             |listener| {
                 events.borrow_mut().push("start-private");
@@ -7919,6 +7968,7 @@ mod tests {
             app_id,
             APPLICATION_CONTENT_RGB_A_TEXT,
             APPLICATION_CONTENT_RGB_B_TEXT,
+            SocketPolicy::Private,
         )
         .unwrap();
         assert_eq!(observer.content_rgbs, APPLICATION_CONTENT_RGBS);
@@ -8007,6 +8057,7 @@ mod tests {
                 app_id,
                 APPLICATION_CONTENT_RGB_A_TEXT,
                 APPLICATION_CONTENT_RGB_B_TEXT,
+                SocketPolicy::Private,
             )
             .is_err());
         }
@@ -8016,6 +8067,7 @@ mod tests {
                 "org.mozilla.firefox",
                 rgb,
                 APPLICATION_CONTENT_RGB_B_TEXT,
+                SocketPolicy::Private,
             )
             .is_err());
         }
@@ -8024,6 +8076,7 @@ mod tests {
             "org.mozilla.firefox",
             APPLICATION_CONTENT_RGB_A_TEXT,
             APPLICATION_CONTENT_RGB_A_TEXT,
+            SocketPolicy::Private,
         )
         .is_err());
         let mut out = Vec::new();
@@ -8651,7 +8704,7 @@ mod tests {
         assert_eq!(keymap_args.u32().unwrap(), 1);
         let size = keymap_args.u32().unwrap();
         keymap_args.finish().unwrap();
-        let file = sys::duplicate_received(*descriptors.first().unwrap()).unwrap();
+        let file = sys::take_received(descriptors.pop().unwrap()).unwrap();
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         let mut keymap_bytes = vec![0; usize::try_from(size).unwrap()];
         file.read_exact_at(&mut keymap_bytes, 0).unwrap();
@@ -11195,17 +11248,40 @@ mod tests {
     }
 
     #[test]
+    fn session_admission_precedes_public_protocol_and_portal_timeouts() {
+        for access in [ClientAccess::Public, ClientAccess::Portal] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let uid = sys::peer_uid(&stream).unwrap();
+            let inspection = stream.try_clone().unwrap();
+            let timeout = Duration::from_millis(25);
+            let prepared =
+                prepare_client_stream(stream, access, timeout, SocketPolicy::HumanSession);
+            assert_eq!(prepared.is_ok(), uid == 1000);
+            let expected = if uid == 1000 && access == ClientAccess::Portal {
+                Some(timeout)
+            } else {
+                None
+            };
+            assert_eq!(inspection.read_timeout().unwrap(), expected);
+            assert_eq!(inspection.write_timeout().unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn client_stream_preparation_composes_peer_authentication_and_timeouts() {
         let timeout = Duration::from_millis(25);
         let (public, _public_peer) = UnixStream::pair().unwrap();
-        let public = prepare_client_stream(public, ClientAccess::Public, timeout).unwrap();
+        let public =
+            prepare_client_stream(public, ClientAccess::Public, timeout, SocketPolicy::Private)
+                .unwrap();
         assert_eq!(public.read_timeout().unwrap(), None);
         assert_eq!(public.write_timeout().unwrap(), None);
 
         let (portal, _portal_peer) = UnixStream::pair().unwrap();
         let uid = sys::peer_uid(&portal).unwrap();
         let inspection = portal.try_clone().unwrap();
-        let prepared = prepare_client_stream(portal, ClientAccess::Portal, timeout);
+        let prepared =
+            prepare_client_stream(portal, ClientAccess::Portal, timeout, SocketPolicy::Private);
         if uid == PORTAL_UID {
             let prepared = prepared.unwrap();
             assert_eq!(prepared.read_timeout().unwrap(), Some(timeout));
@@ -14673,6 +14749,14 @@ mod tests {
         let (server, _peer) = UnixStream::pair().unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
+        let directory = File::open(std::env::temp_dir()).unwrap();
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(directory);
+        let mut descriptors = VecDeque::from([raw]);
+        assert_eq!(
+            client.create_pool(2, 1, &mut descriptors).unwrap_err(),
+            "wl_shm pool must be a regular file"
+        );
+        assert!(descriptors.is_empty());
         assert!(client
             .create_buffer(pool.clone(), 2, 0, 4, 4, 15, SHM_XRGB8888)
             .is_err());

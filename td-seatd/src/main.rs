@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::fs::{self, FileType, Metadata, Permissions};
+use std::fs::{self, File, FileType, Metadata, Permissions};
+use std::io::{Read, Write};
 use std::os::unix::fs::{self as unix_fs, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -13,12 +14,15 @@ const SOUND_DIR: &str = "/dev/snd";
 const MAX_PLAYBACK_DEVICES: usize = 64;
 const RUNTIME_BASE: &str = "/run/user";
 const AUDIO_RUNTIME: &str = "/run/td-audio";
+const COMPOSITOR_RUNTIME_NAME: &str = "td-compositor";
 const READY_MARKER: &str = "TD-SEAT-READY";
+const PRIVATE_DEVICES_MARKER: &str = "TD-COMPOSITOR-DEVICES-PRIVATE";
 
 fn usage() -> String {
-    "usage: td-seatd assign --uid UID --gid GID --audio-uid UID --audio-gid GID | \
-     td-seatd probe --uid UID --gid GID --audio-uid UID --audio-gid GID | \
-     td-seatd exec-audio --uid UID --gid GID --audio-uid UID --audio-gid GID \
+    "usage: td-seatd assign --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID | \
+     td-seatd probe --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID | \
+     td-seatd probe-access --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID | \
+     td-seatd exec-audio --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID \
      -- PROGRAM [ARG...] | \
      td-seatd selftest"
         .into()
@@ -33,6 +37,7 @@ struct Account {
 #[derive(Clone, Copy)]
 struct Assignment {
     seat: Account,
+    compositor: Account,
     audio: Account,
 }
 
@@ -45,6 +50,7 @@ struct AudioExec<'a> {
 fn parse_assignment(args: &[String]) -> Result<Assignment, String> {
     let mut uid = None;
     let mut gid = None;
+    let mut compositor_uid = None;
     let mut audio_uid = None;
     let mut audio_gid = None;
     let mut index = 0;
@@ -70,6 +76,13 @@ fn parse_assignment(args: &[String]) -> Result<Assignment, String> {
                         .map_err(|_| format!("invalid gid '{value}'"))?,
                 );
             }
+            "--compositor-uid" if compositor_uid.is_none() => {
+                let service_uid = value.parse::<u32>().map_err(|_| "invalid compositor uid")?;
+                if !(1..=999).contains(&service_uid) || service_uid.to_string() != *value {
+                    return Err("compositor uid must be a canonical service identity".into());
+                }
+                compositor_uid = Some(service_uid);
+            }
             "--audio-uid" if audio_uid.is_none() => {
                 audio_uid = Some(
                     value
@@ -84,7 +97,7 @@ fn parse_assignment(args: &[String]) -> Result<Assignment, String> {
                         .map_err(|_| format!("invalid audio gid '{value}'"))?,
                 );
             }
-            "--uid" | "--gid" | "--audio-uid" | "--audio-gid" => {
+            "--uid" | "--gid" | "--compositor-uid" | "--audio-uid" | "--audio-gid" => {
                 return Err(format!("duplicate flag '{flag}'"))
             }
             _ => return Err(format!("unrecognised argument '{flag}'")),
@@ -93,16 +106,27 @@ fn parse_assignment(args: &[String]) -> Result<Assignment, String> {
     }
     let uid = uid.ok_or_else(|| "--uid is required".to_string())?;
     let gid = gid.ok_or_else(|| "--gid is required".to_string())?;
+    let compositor_uid = compositor_uid.ok_or("--compositor-uid is required")?;
     let audio_uid = audio_uid.ok_or_else(|| "--audio-uid is required".to_string())?;
     let audio_gid = audio_gid.ok_or_else(|| "--audio-gid is required".to_string())?;
     if uid == 0 || gid == 0 || audio_uid == 0 || audio_gid == 0 {
         return Err("the graphical and audio identities must not use uid or gid 0".into());
     }
-    if uid == audio_uid || gid == audio_gid {
-        return Err("the graphical and audio identities must be distinct".into());
+    if uid == audio_uid
+        || gid == audio_gid
+        || uid == compositor_uid
+        || gid == compositor_uid
+        || audio_uid == compositor_uid
+        || audio_gid == compositor_uid
+    {
+        return Err("the human, compositor and audio identities must be distinct".into());
     }
     Ok(Assignment {
         seat: Account { uid, gid },
+        compositor: Account {
+            uid: compositor_uid,
+            gid: compositor_uid,
+        },
         audio: Account {
             uid: audio_uid,
             gid: audio_gid,
@@ -327,6 +351,31 @@ fn prepare_audio_runtime(
     prepare_owned_runtime(path, account, 0o755)
 }
 
+fn compositor_runtime(human_runtime: &Path) -> Result<PathBuf, String> {
+    let owner = human_runtime
+        .file_name()
+        .ok_or("human runtime has no owner")?;
+    let run = human_runtime
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("human runtime has no runtime root")?;
+    Ok(run.join(COMPOSITOR_RUNTIME_NAME).join(owner))
+}
+
+fn prepare_compositor_runtime(
+    path: &Path,
+    account: Account,
+    require_root: bool,
+) -> Result<(), String> {
+    let base = path.parent().ok_or("compositor runtime has no parent")?;
+    let run = base
+        .parent()
+        .ok_or("compositor runtime has no runtime root")?;
+    verify_runtime_base(run, require_root)?;
+    prepare_runtime_base(base, require_root)?;
+    prepare_owned_runtime(path, account, 0o755)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Counts {
     inputs: usize,
@@ -343,11 +392,16 @@ fn assign(
     require_char: bool,
 ) -> Result<Counts, String> {
     prepare_runtime(runtime, assignment.seat, require_char)?;
+    prepare_compositor_runtime(
+        &compositor_runtime(runtime)?,
+        assignment.compositor,
+        require_char,
+    )?;
     prepare_audio_runtime(audio_runtime, assignment.audio, require_char)?;
-    assign_path(framebuffer, assignment.seat, require_char)?;
+    assign_path(framebuffer, assignment.compositor, require_char)?;
     let inputs = input_paths(input_dir)?;
     for path in &inputs {
-        assign_path(path, assignment.seat, require_char)?;
+        assign_path(path, assignment.compositor, require_char)?;
     }
     let playback = assign_playback(sound_dir, assignment.audio, require_char)?;
     Ok(Counts {
@@ -385,13 +439,21 @@ fn probe(
     require_char: bool,
 ) -> Result<Counts, String> {
     verify_owner_mode(runtime, assignment.seat, 0o700)?;
+    let compositor_runtime = compositor_runtime(runtime)?;
+    verify_runtime_base(
+        compositor_runtime
+            .parent()
+            .ok_or("missing compositor parent")?,
+        require_char,
+    )?;
+    verify_owner_mode(&compositor_runtime, assignment.compositor, 0o755)?;
     verify_owner_mode(audio_runtime, assignment.audio, 0o755)?;
     checked_metadata(framebuffer, require_char)?;
-    verify_owner_mode(framebuffer, assignment.seat, 0o600)?;
+    verify_owner_mode(framebuffer, assignment.compositor, 0o600)?;
     let inputs = input_paths(input_dir)?;
     for path in &inputs {
         checked_metadata(path, require_char)?;
-        verify_owner_mode(path, assignment.seat, 0o600)?;
+        verify_owner_mode(path, assignment.compositor, 0o600)?;
     }
     let playback = playback_paths(sound_dir)?;
     for path in &playback {
@@ -402,6 +464,56 @@ fn probe(
         inputs: inputs.len(),
         playback: playback.len(),
     })
+}
+
+fn require_human_process(status: &str, account: Account) -> Result<(), String> {
+    if status.len() > 8192 {
+        return Err("seat access probe status exceeds 8192 bytes".into());
+    }
+    if account.uid == 0 || account.gid == 0 {
+        return Err("seat access probe requires the unprivileged human identity".into());
+    }
+    for (key, expected) in [("Uid:", account.uid), ("Gid:", account.gid)] {
+        let columns = status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .ok_or("seat access probe has no kernel credentials")?;
+        let fields: Vec<_> = columns.split_whitespace().collect();
+        let expected = expected.to_string();
+        if fields.len() != 4 || fields.iter().any(|field| *field != expected) {
+            return Err("seat access probe has the wrong kernel credentials".into());
+        }
+    }
+    Ok(())
+}
+
+fn denied_device_read(path: &Path) -> Result<(), String> {
+    match File::open(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        Err(error) => Err(format!(
+            "seat access probe could not test {}: {error}",
+            path.display()
+        )),
+        Ok(_) => Err(format!(
+            "human session can read compositor device {}",
+            path.display()
+        )),
+    }
+}
+
+fn probe_access(assignment: Assignment) -> Result<(), String> {
+    let mut status = String::new();
+    File::open("/proc/self/status")
+        .map_err(|e| e.to_string())?
+        .take(8193)
+        .read_to_string(&mut status)
+        .map_err(|e| e.to_string())?;
+    require_human_process(&status, assignment.seat)?;
+    denied_device_read(Path::new(FRAMEBUFFER))?;
+    for path in input_paths(Path::new(INPUT_DIR))? {
+        denied_device_read(&path)?;
+    }
+    writeln!(std::io::stdout().lock(), "\n{PRIVATE_DEVICES_MARKER}").map_err(|e| e.to_string())
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -416,6 +528,8 @@ fn run(args: &[String]) -> Result<(), String> {
                 uid.into(),
                 "--gid".into(),
                 gid.into(),
+                "--compositor-uid".into(),
+                "993".into(),
                 "--audio-uid".into(),
                 audio_uid.into(),
                 "--audio-gid".into(),
@@ -465,6 +579,9 @@ fn run(args: &[String]) -> Result<(), String> {
         return exec_audio(args.get(1..).ok_or_else(usage)?);
     }
     let assignment = parse_assignment(args.get(1..).ok_or_else(usage)?)?;
+    if command == "probe-access" {
+        return probe_access(assignment);
+    }
     let runtime = PathBuf::from(RUNTIME_BASE).join(assignment.seat.uid.to_string());
     let counts = match command.as_str() {
         "assign" => assign(
@@ -489,12 +606,16 @@ fn run(args: &[String]) -> Result<(), String> {
     };
     println!(
         "{READY_MARKER} uid={} gid={} framebuffer={} inputs={} runtime={} \
+         compositor-uid={} compositor-gid={} compositor-runtime={} \
          audio-uid={} audio-gid={} audio-runtime={AUDIO_RUNTIME} audio-pcms={}",
         assignment.seat.uid,
         assignment.seat.gid,
         FRAMEBUFFER,
         counts.inputs,
         runtime.display(),
+        assignment.compositor.uid,
+        assignment.compositor.gid,
+        compositor_runtime(&runtime)?.display(),
         assignment.audio.uid,
         assignment.audio.gid,
         counts.playback,
@@ -541,11 +662,97 @@ mod tests {
     }
 
     #[test]
+    fn access_evidence_checks_kernel_denial_without_requiring_live_assignment() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn probe_access(")
+            .nth(1)
+            .unwrap()
+            .split("fn run(")
+            .next()
+            .unwrap();
+        assert!(body.contains("require_human_process(&status, assignment.seat)?"));
+        assert!(body.contains("denied_device_read(Path::new(FRAMEBUFFER))?"));
+        assert!(body.contains("input_paths(Path::new(INPUT_DIR))?"));
+        assert!(body.contains("denied_device_read(&path)?"));
+        assert!(!body.contains("probe("));
+        assert!(!body.contains("verify_owner_mode"));
+    }
+
+    #[test]
     fn event_names_are_narrow() {
         assert!(event_name("event0"));
         assert!(event_name("event123"));
         for bad in ["event", "event-1", "mouse0", "event0.bak"] {
             assert!(!event_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn compositor_identity_is_canonical_dedicated_and_required() {
+        for uid in ["0", "0993", "1000", "994", "65536", "-1", "4294967296"] {
+            let arguments = [
+                "--uid",
+                "1000",
+                "--gid",
+                "1000",
+                "--compositor-uid",
+                uid,
+                "--audio-uid",
+                "994",
+                "--audio-gid",
+                "994",
+            ]
+            .map(str::to_string);
+            assert!(parse_assignment(&arguments).is_err(), "{uid}");
+        }
+        let missing = [
+            "--uid",
+            "1000",
+            "--gid",
+            "1000",
+            "--audio-uid",
+            "994",
+            "--audio-gid",
+            "994",
+        ]
+        .map(str::to_string);
+        assert!(parse_assignment(&missing).is_err());
+    }
+
+    #[test]
+    fn device_denial_probe_requires_all_human_credentials_and_real_denial() {
+        let account = Account {
+            uid: 1000,
+            gid: 1000,
+        };
+        let good = "Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
+        assert!(require_human_process(good, account).is_ok());
+        for column in 0..4 {
+            for key in ["Uid:", "Gid:"] {
+                let bad: String = good
+                    .lines()
+                    .map(|line| {
+                        if line.starts_with(key) {
+                            let mut fields = ["1000"; 4];
+                            fields[column] = "0";
+                            format!("{key}\t{}\n", fields.join("\t"))
+                        } else {
+                            format!("{line}\n")
+                        }
+                    })
+                    .collect();
+                assert!(require_human_process(&bad, account).is_err());
+            }
+        }
+        let scratch = Scratch::new();
+        let device = scratch.path.join("device");
+        assert!(denied_device_read(&device).is_err());
+        fs::write(&device, b"readable").unwrap();
+        assert!(denied_device_read(&device).is_err());
+        if fs::metadata(&device).unwrap().uid() != 0 {
+            fs::set_permissions(&device, Permissions::from_mode(0o0)).unwrap();
+            assert!(denied_device_read(&device).is_ok());
         }
     }
 
@@ -592,6 +799,8 @@ mod tests {
                 uid.into(),
                 "--gid".into(),
                 gid.into(),
+                "--compositor-uid".into(),
+                "993".into(),
                 "--audio-uid".into(),
                 audio_uid.into(),
                 "--audio-gid".into(),
@@ -649,6 +858,8 @@ mod tests {
             "1000",
             "--gid",
             "1000",
+            "--compositor-uid",
+            "993",
             "--audio-uid",
             "994",
             "--audio-gid",
@@ -673,12 +884,12 @@ mod tests {
             ["exec-service-as", "audio", "--", "/bin/td-audio", "serve"]
         );
 
-        let missing_separator = args[..8].to_vec();
+        let missing_separator = args[..10].to_vec();
         assert!(parse_audio_exec(&missing_separator).is_err());
-        let missing_program = args[..9].to_vec();
+        let missing_program = args[..11].to_vec();
         assert!(parse_audio_exec(&missing_program).is_err());
         for program in ["td-login", "/"] {
-            let mut invalid = args[..9].to_vec();
+            let mut invalid = args[..11].to_vec();
             invalid.push(program.into());
             assert!(parse_audio_exec(&invalid).is_err(), "{program}");
         }
@@ -707,6 +918,10 @@ mod tests {
         let metadata = fs::metadata(&scratch.path).unwrap();
         let assignment = Assignment {
             seat: Account {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            },
+            compositor: Account {
                 uid: metadata.uid(),
                 gid: metadata.gid(),
             },
@@ -787,6 +1002,32 @@ mod tests {
             fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o7777,
             0o700
         );
+    }
+
+    #[test]
+    fn compositor_runtime_is_separate_and_refuses_redirected_parents() {
+        let scratch = Scratch::new();
+        let run = scratch.path.join("run");
+        fs::create_dir(&run).unwrap();
+        fs::set_permissions(&run, Permissions::from_mode(0o755)).unwrap();
+        let metadata = fs::metadata(&scratch.path).unwrap();
+        let account = Account {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        let path = compositor_runtime(&run.join("user/1000")).unwrap();
+        assert_eq!(path, run.join("td-compositor/1000"));
+        prepare_compositor_runtime(&path, account, false).unwrap();
+        verify_owner_mode(&path, account, 0o755).unwrap();
+        fs::remove_dir(&path).unwrap();
+        fs::remove_dir(run.join("td-compositor")).unwrap();
+        let target = scratch.path.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o700)).unwrap();
+        unix_fs::symlink(&target, run.join("td-compositor")).unwrap();
+        assert!(prepare_compositor_runtime(&path, account, false).is_err());
+        assert!(!target.join("1000").exists());
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o700);
     }
 
     #[test]

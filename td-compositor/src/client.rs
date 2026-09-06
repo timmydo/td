@@ -18,7 +18,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -997,15 +997,20 @@ fn verify_jail_fixture(
     Ok(())
 }
 
+fn client_directory(options: &Options) -> Result<&Path, String> {
+    options
+        .ready_socket
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "demo readiness socket has no parent directory".to_string())
+}
+
 pub fn run(options: &Options) -> Result<(), ClientRunFailure> {
     let jail_fixture = is_jail_fixture();
     if jail_fixture {
         verify_jail_fixture(true, true)?;
     }
-    let runtime_directory = options
-        .socket
-        .parent()
-        .ok_or_else(|| format!("Wayland socket {} has no parent", options.socket.display()))?;
+    let runtime_directory = client_directory(options)?;
     let deadline = Instant::now()
         .checked_add(PRESENT_TIMEOUT)
         .ok_or_else(|| "could not bound the Wayland presentation handshake".to_string())?;
@@ -1178,7 +1183,8 @@ pub fn selftest(shared_network: bool) -> Result<(), ClientRunFailure> {
     sys::send_with_fd(&sender, b"demo", file.as_raw_fd())
         .map_err(|e| format!("send descriptor self-test: {e}"))?;
     let mut bytes = [0u8; 16];
-    let received = sys::recv_with_fds(&receiver, &mut bytes).map_err(|error| error.to_string())?;
+    let mut received =
+        sys::recv_with_fds(&receiver, &mut bytes).map_err(|error| error.to_string())?;
     if received.count != 4 || bytes.get(..4) != Some(b"demo") || received.fds.len() != 1 {
         sys::discard_received(&received.fds);
         return Err(
@@ -1189,14 +1195,22 @@ pub fn selftest(shared_network: bool) -> Result<(), ClientRunFailure> {
     }
     let fd = received
         .fds
-        .first()
-        .copied()
+        .pop()
         .ok_or_else(|| "demo descriptor transport returned no fd".to_string())?;
-    let mut duplicate = sys::duplicate_received(fd)?;
-    let mut content = Vec::new();
-    duplicate
-        .read_to_end(&mut content)
-        .map_err(|e| format!("read duplicated demo descriptor: {e}"))?;
+    let file = sys::take_received(fd)?;
+    if file
+        .metadata()
+        .map_err(|e| format!("stat demo descriptor: {e}"))?
+        .len()
+        != first.len() as u64
+    {
+        return Err("demo descriptor transport changed the pixel extent"
+            .to_string()
+            .into());
+    }
+    let mut content = vec![0; first.len()];
+    file.read_exact_at(&mut content, 0)
+        .map_err(|e| format!("read received demo descriptor: {e}"))?;
     if content != first {
         return Err(
             "demo descriptor transport did not preserve pixels"
@@ -1227,6 +1241,20 @@ mod tests {
     use crate::conn::{DISPLAY, MAX_PENDING_FDS};
     use crate::keyboard::XKB_KEYMAP;
     use std::os::fd::IntoRawFd;
+
+    #[test]
+    fn shared_display_does_not_choose_the_demo_buffer_directory() {
+        let mut options = Options {
+            socket: "/run/td-compositor/1000/wayland-0".into(),
+            ready_socket: "/run/user/1000/demo.ready".into(),
+        };
+        assert_eq!(
+            client_directory(&options).unwrap(),
+            Path::new("/run/user/1000")
+        );
+        options.ready_socket = "demo.ready".into();
+        assert!(client_directory(&options).is_err());
+    }
 
     #[test]
     fn jail_fixture_failures_have_phase_specific_exit_codes() {
@@ -1599,9 +1627,9 @@ mod tests {
         }
         let message = connection.next().unwrap();
         assert_eq!((message.object, message.opcode), (KEYBOARD, 0));
-        let mut received = connection.take_fd("test descriptor").unwrap();
-        let mut bytes = Vec::new();
-        received.read_to_end(&mut bytes).unwrap();
+        let received = connection.take_fd("test descriptor").unwrap();
+        let mut bytes = vec![0; descriptor_bytes.len()];
+        received.read_exact_at(&mut bytes, 0).unwrap();
         assert_eq!(bytes, descriptor_bytes);
         assert_eq!(connection.pending_fd_count(), 0);
     }
@@ -1650,10 +1678,10 @@ mod tests {
         let message = connection.next().unwrap();
         assert_eq!((message.object, message.opcode), (KEYBOARD, 0));
         assert_eq!(connection.pending_fd_count(), 1);
-        let mut received = connection.take_fd("coalesced test").unwrap();
-        let mut contents = Vec::new();
-        received.read_to_end(&mut contents).unwrap();
-        assert_eq!(contents, b"coalesced-fd");
+        let received = connection.take_fd("coalesced test").unwrap();
+        let mut contents = [0; 12];
+        received.read_exact_at(&mut contents, 0).unwrap();
+        assert_eq!(&contents, b"coalesced-fd");
         assert_eq!(connection.pending_fd_count(), 0);
     }
 

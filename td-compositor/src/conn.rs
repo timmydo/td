@@ -190,9 +190,8 @@ impl Reader {
         self.pending_fds.len()
     }
 
-    /// Claim the exact descriptor carried by the event just read. Unlike the
-    /// handshake keymap path this does not reopen through `/proc`: a selection
-    /// endpoint may be a pipe or socket, and its open-file description is the
+    /// Claim the exact descriptor carried by the event just read. A selection
+    /// endpoint may be a pipe or socket; its open-file description is the
     /// capability the destination supplied.
     pub fn take_file(&mut self, purpose: &str) -> Result<File, String> {
         let fd = self
@@ -285,12 +284,14 @@ pub fn verify_keymap(file: &File, format: u32, size: u32) -> Result<(), String> 
             "wl_keyboard keymap has size {announced_size}, expected {expected_size}"
         ));
     }
-    let metadata_size = usize::try_from(
-        file.metadata()
-            .map_err(|e| format!("stat wl_keyboard keymap: {e}"))?
-            .len(),
-    )
-    .map_err(|_| "wl_keyboard keymap file size escaped usize".to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("stat wl_keyboard keymap: {e}"))?;
+    if !metadata.is_file() {
+        return Err("wl_keyboard keymap must be a regular file".into());
+    }
+    let metadata_size = usize::try_from(metadata.len())
+        .map_err(|_| "wl_keyboard keymap file size escaped usize".to_string())?;
     if metadata_size != expected_size {
         return Err(format!(
             "wl_keyboard keymap file has size {metadata_size}, expected {expected_size}"
@@ -311,14 +312,9 @@ pub fn verify_keymap(file: &File, format: u32, size: u32) -> Result<(), String> 
 /// on the wire the read offset is SHARED, and a sequential read would leave it
 /// at end-of-file for whoever binds a keyboard next.
 ///
-/// That does not bite today, and the reason is worth naming so nobody removes
-/// this thinking it does nothing: `Connection::take_fd` REOPENS the received
-/// descriptor through `/proc/self/fd/N`, which is a new description with its
-/// own offset. That reopen exists for descriptor safety; the separate exact
-/// clipboard-endpoint adoption cannot replace it. A change here would
-/// therefore be reviewed for descriptor ownership and not necessarily for what
-/// it does to a file offset. This is the guard §11 names, and the two are
-/// independent.
+/// `Connection::take_fd` preserves that received open-file description.
+/// Positioned reads therefore keep one client's keymap validation from
+/// changing any other client's offset.
 ///
 /// The size is already pinned by the caller's metadata check, so this asks
 /// for exactly that many bytes and treats a short answer as the file being
@@ -665,7 +661,7 @@ impl Connection {
             .pending_fds
             .pop_front()
             .ok_or_else(|| format!("{purpose} event arrived without a descriptor"))?;
-        sys::duplicate_received(fd)
+        sys::take_received(fd)
     }
 
     /// The next id this connection would hand out. A test reads it to show
@@ -881,6 +877,13 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::{IntoRawFd, OwnedFd};
     use std::time::Duration;
+    #[test]
+    fn keymap_rejects_a_directory_before_reading_it() {
+        let directory = File::open(std::env::temp_dir()).unwrap();
+        let size = u32::try_from(XKB_KEYMAP.len() + 1).unwrap();
+        let error = verify_keymap(&directory, 1, size).unwrap_err();
+        assert_eq!(error, "wl_keyboard keymap must be a regular file");
+    }
 
     /// The read leaves the offset exactly where it found it, which is §11's
     /// rule stated as the property rather than as a mechanism. Reading twice
@@ -888,10 +891,6 @@ mod tests {
     /// reads sequentially answers twice and still leaves the description at
     /// end-of-file for whoever holds it next.
     ///
-    /// Nothing in td depends on this today — `sys::duplicate_received` reopens
-    /// a received descriptor through `/proc/self/fd/N`, so every client gets a
-    /// private offset and a sequential read would work anyway. That reopen is
-    /// the guard that is load-bearing; this is the one §11 names.
     #[test]
     fn reading_the_keymap_leaves_the_offset_alone() {
         let expected = {
@@ -900,7 +899,7 @@ mod tests {
             bytes
         };
         let file = backing_file(&std::env::temp_dir(), "td-ui-demo-test", &expected).unwrap();
-        let file = sys::duplicate_received(file.into_raw_fd()).unwrap();
+        let file = sys::take_received(file.into_raw_fd()).unwrap();
         // Somewhere that is neither the start nor the end, so neither a
         // rewind nor a read-to-end can leave it looking untouched.
         let parked = 3;
@@ -925,7 +924,7 @@ mod tests {
     fn a_keymap_shorter_than_announced_is_refused() {
         let bytes = vec![7u8; 8];
         let file = backing_file(&std::env::temp_dir(), "td-ui-demo-test", &bytes).unwrap();
-        let file = sys::duplicate_received(file.into_raw_fd()).unwrap();
+        let file = sys::take_received(file.into_raw_fd()).unwrap();
         let error = read_keymap_bytes(&file, 16).unwrap_err();
         assert!(error.contains("read 8 bytes, expected 16"), "{error}");
     }
@@ -934,7 +933,7 @@ mod tests {
     fn keymap_read_is_bounded_against_growth_after_metadata() {
         let bytes = vec![7u8; 17];
         let file = backing_file(&std::env::temp_dir(), "td-ui-demo-test", &bytes).unwrap();
-        let file = sys::duplicate_received(file.into_raw_fd()).unwrap();
+        let file = sys::take_received(file.into_raw_fd()).unwrap();
         let error = read_keymap_bytes(&file, 16).unwrap_err();
         assert!(error.contains("read 17 bytes, expected 16"));
     }

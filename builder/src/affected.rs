@@ -4396,9 +4396,13 @@ mod tests {
             out.sort_unstable();
             out
         };
-        // authd names the compositor runtime directory in its fixed argv.
+        // authd, jail and seatd name the compositor runtime directory in
+        // fixed argv, resolution tests and seat assignment.
         // The conservative textual edge widens checks even without a read.
-        assert_eq!(readers_of("td-compositor"), ["td-authd", "td-editor", "td-portal"]);
+        assert_eq!(
+            readers_of("td-compositor"),
+            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd"]
+        );
         assert_eq!(readers_of("td-authd"), ["td-compositor"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
@@ -4432,7 +4436,14 @@ mod tests {
         let paths = |ps: &[&str]| ps.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
         assert_eq!(
             check_scope(&root, &paths(&["td-compositor/src/main.rs"]), &check),
-            Some(paths(&["td-authd", "td-compositor", "td-editor", "td-portal"]))
+            Some(paths(&[
+                "td-authd",
+                "td-compositor",
+                "td-editor",
+                "td-jail",
+                "td-portal",
+                "td-seatd"
+            ]))
         );
         assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check), Some(paths(&["td-sh"])));
         assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs", "builder/src/x.rs"]), &check), None);
@@ -6483,8 +6494,18 @@ mod tests {
         // modules out of td-compositor sources, so a change there is a change
         // to what they compile; td-busd is read by three.
         let comp = one("td-compositor/src/pty.rs");
-        assert_eq!(names(&comp), ["td-authd", "td-compositor", "td-editor", "td-portal"]);
-        assert_eq!(comp.len(), 10, "{comp:?}");
+        assert_eq!(
+            names(&comp),
+            [
+                "td-authd",
+                "td-compositor",
+                "td-editor",
+                "td-jail",
+                "td-portal",
+                "td-seatd"
+            ]
+        );
+        assert_eq!(comp.len(), 14, "{comp:?}");
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
             [

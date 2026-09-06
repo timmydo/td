@@ -4,7 +4,7 @@ use crate::{message, name, store, sys, wire};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::RawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -248,7 +248,7 @@ fn retrieve_at(path: PathBuf, name: &str) -> Result<Vec<u8>, String> {
         _ => return Err("invalid credential receipt token".into()),
     };
     let fd = frame.fds.0.pop().ok_or("credential descriptor is absent")?;
-    let file: File = sys::duplicate_received(fd)?;
+    let file: File = sys::take_received(fd)?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_file()
         || metadata.nlink() != 0
@@ -257,11 +257,15 @@ fn retrieve_at(path: PathBuf, name: &str) -> Result<Vec<u8>, String> {
     {
         return Err("invalid credential backing file".into());
     }
-    let mut bytes = Vec::new();
-    file.take((store::MAX_SECRET + 1) as u64)
-        .read_to_end(&mut bytes)
+    let mut bytes = vec![0; metadata.len() as usize];
+    file.read_exact_at(&mut bytes, 0)
         .map_err(|e| e.to_string())?;
-    if bytes.len() != metadata.len() as usize {
+    let mut extra = [0u8; 1];
+    if file
+        .read_at(&mut extra, metadata.len())
+        .map_err(|e| e.to_string())?
+        != 0
+    {
         return Err("credential size changed during transfer".into());
     }
     let acknowledgement = client.call(
@@ -287,7 +291,7 @@ fn retrieve_at(path: PathBuf, name: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
 
     #[test]
@@ -308,7 +312,10 @@ mod tests {
                 .unwrap();
             fs::remove_file(&file_path).unwrap();
             file.write_all(b"a credential\n").unwrap();
-            let file = File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+            let mut file = File::open(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(5)).unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o000))
+                .unwrap();
             let server = std::thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
                 let mut server = Client {
@@ -363,6 +370,7 @@ mod tests {
                 let (ack, _) = message::decode(&ack.bytes, 0).unwrap();
                 assert_eq!(ack.fields.member, Some("Received"));
                 assert_eq!(ack.args(), &[wire::Value::Str(token)]);
+                assert_eq!(std::io::Seek::stream_position(&mut file).unwrap(), 5);
                 server
                     .write(
                         &message::Builder::method_return(wire::Endian::Little, ack.serial)
@@ -395,7 +403,7 @@ mod tests {
             .unwrap();
         for site in [
             "sys::recv_with_fds(",
-            "sys::duplicate_received(",
+            "sys::take_received(",
             "sys::discard_received(",
         ] {
             assert_eq!(source.matches(site).count(), 1);

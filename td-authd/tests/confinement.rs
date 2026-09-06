@@ -141,4 +141,4 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0xa4a667cc8a5df0dd;
+const LAUNCH_FINGERPRINT: u64 = 0x669bfcca5d49e145;

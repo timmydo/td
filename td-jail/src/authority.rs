@@ -473,9 +473,9 @@ where
     let (wayland_socket, bus_socket, runtime_root) = if config.host_mode {
         host_session_sockets(outside_identity, config.runtime_root.as_deref())?
     } else {
-        let runtime_root = PathBuf::from(format!("/run/user/{}", outside_identity.0));
+        let (display, compositor_uid, runtime_root) = stock_session(outside_identity.0)?;
         (
-            session_socket("wayland-0", "Wayland authority", outside_identity.0)?,
+            resolved_socket(display, compositor_uid, "Wayland authority")?,
             session_socket("bus", "session bus", outside_identity.0)?,
             runtime_root,
         )
@@ -696,6 +696,20 @@ where
         enforce_cgroup: config.enforce_cgroup,
         host_mode: config.host_mode,
     })
+}
+
+/// The stock display is compositor-owned; its client runtime stays human-owned.
+fn stock_session(owner: u32) -> io::Result<(&'static Path, u32, PathBuf)> {
+    if owner != 1000 {
+        return Err(invalid(
+            "the stock graphical session requires human uid 1000",
+        ));
+    }
+    Ok((
+        Path::new(crate::permissions::TD_WAYLAND_SOCKET_PATH),
+        crate::permissions::TD_COMPOSITOR_UID,
+        PathBuf::from("/run/user/1000"),
+    ))
 }
 
 /// The names an application's permission file says it may OWN.
@@ -1792,6 +1806,7 @@ impl GrantBoundary {
         runtime_files: &Path,
         wayland_socket: &Path,
         bus_socket: &Path,
+        fetch_runtime: &Path,
     ) -> io::Result<Self> {
         let reserved = vec![
             state.state_root.clone(),
@@ -1805,9 +1820,7 @@ impl GrantBoundary {
             runtime_files.to_path_buf(),
             wayland_socket.to_path_buf(),
             bus_socket.to_path_buf(),
-            // The fetch service's directory beside the sockets, as `new`
-            // reserves it.
-            canonical_candidate(&wayland_socket.with_file_name(FETCH_RUNTIME_NAME))?,
+            canonical_candidate(fetch_runtime)?,
         ];
         Ok(Self {
             reserved_mounts: mount_identities_for_roots(mountinfo, &reserved)?,
@@ -3480,6 +3493,32 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[test]
+    fn stock_display_belongs_to_the_compositor_and_runtime_to_the_human() {
+        let (display, uid, runtime) = stock_session(1000).unwrap();
+        assert_eq!(display, Path::new("/run/td-compositor/1000/wayland-0"));
+        assert_eq!(uid, 993);
+        assert_eq!(runtime, Path::new("/run/user/1000"));
+        for owner in [0, 993, 1001, 65536, u32::MAX] {
+            assert!(stock_session(owner).is_err());
+        }
+    }
+
+    #[test]
+    fn resolved_display_accepts_shared_mode_but_requires_its_selected_owner() {
+        let root = TestDirectory::new("shared-display").unwrap();
+        let path = root.join("wayland-0");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        assert_eq!(
+            resolved_socket(&path, owner, "display").unwrap(),
+            fs::canonicalize(&path).unwrap()
+        );
+        let other = if owner == 0 { 1 } else { 0 };
+        assert!(resolved_socket(&path, other, "display").is_err());
+    }
+
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     struct TestDirectory(PathBuf);
@@ -4291,14 +4330,26 @@ mod tests {
         };
         let package = fs::canonicalize(root.join("package")).unwrap();
         let runtime = fs::canonicalize(root.join("runtime")).unwrap();
-        let wayland = root.join("wayland-0");
+        let display_runtime = root.join("run/td-compositor/1000");
+        let human_runtime = root.join("run/user/1000");
+        fs::create_dir_all(&display_runtime).unwrap();
+        fs::create_dir_all(&human_runtime).unwrap();
+        let fetch_runtime = human_runtime.join(FETCH_RUNTIME_NAME);
+        fs::create_dir(&fetch_runtime).unwrap();
+        let wayland = display_runtime.join("wayland-0");
         fs::write(&wayland, b"socket-placeholder").unwrap();
-        let bus = root.join("bus");
+        let bus = human_runtime.join("bus");
         fs::write(&bus, b"socket-placeholder").unwrap();
         let resolve = |policy: &PermissionPolicy| {
             resolve_filesystem_grants_with_boundary(policy, &state, |mountinfo| {
                 GrantBoundary::for_test(
-                    mountinfo, &state, &package, &runtime, &wayland, &bus,
+                    mountinfo,
+                    &state,
+                    &package,
+                    &runtime,
+                    &wayland,
+                    &bus,
+                    &fetch_runtime,
                 )
             })
         };
@@ -4376,12 +4427,19 @@ mod tests {
             .unwrap()
             .with_filesystem("~/state-alias", FilesystemAccess::ReadOnly, false)
             .unwrap();
-        assert!(
-            resolve(&reserved)
-                .unwrap_err()
-                .to_string()
-                .contains("aliases reserved tree")
-        );
+        assert!(resolve(&reserved)
+            .unwrap_err()
+            .to_string()
+            .contains("aliases reserved tree"));
+
+        symlink(&fetch_runtime, real_home.join("fetch-alias")).unwrap();
+        let fetch_alias = PermissionPolicy::new()
+            .with_filesystem("~/fetch-alias", FilesystemAccess::ReadOnly, false)
+            .unwrap();
+        assert!(resolve(&fetch_alias)
+            .unwrap_err()
+            .to_string()
+            .contains("aliases reserved tree"));
 
         let private_state = PermissionPolicy::new()
             .with_socket(PermissionSocket::Wayland)

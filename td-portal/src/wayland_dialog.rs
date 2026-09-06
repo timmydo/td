@@ -423,7 +423,7 @@ impl Connection {
             .pending_fds
             .pop_front()
             .ok_or_else(|| format!("{purpose} event arrived without a descriptor"))?;
-        sys::duplicate_received(fd)
+        sys::take_received(fd)
     }
 }
 
@@ -1105,14 +1105,14 @@ fn verify_keymap(file: &File, format: u32, size: u32) -> Result<(), String> {
         .len()
         .checked_add(1)
         .ok_or_else(|| "private keymap size overflow".to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat keymap: {error}"))?;
+    if !metadata.is_file() {
+        return Err("private keymap must be a regular file".into());
+    }
     if usize::try_from(size).ok() != Some(expected)
-        || usize::try_from(
-            file.metadata()
-                .map_err(|error| format!("stat keymap: {error}"))?
-                .len(),
-        )
-        .ok()
-            != Some(expected)
+        || usize::try_from(metadata.len()).ok() != Some(expected)
     {
         return Err(format!(
             "private wl_keyboard keymap size differs from {expected}"
@@ -1229,9 +1229,16 @@ fn pixel_checksum(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::io::Read;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
+
+    #[test]
+    fn keymap_rejects_a_directory_before_reading_it() {
+        let directory = File::open(std::env::temp_dir()).unwrap();
+        let size = u32::try_from(XKB_KEYMAP.len() + 1).unwrap();
+        let error = verify_keymap(&directory, 1, size).unwrap_err();
+        assert_eq!(error, "private keymap must be a regular file");
+    }
 
     struct Temp(PathBuf);
 
@@ -1319,7 +1326,12 @@ mod tests {
             sys::send_with_fd(&self.stream, &message, file.as_raw_fd()).unwrap();
         }
 
-        fn expect_frame(&mut self, width: usize, height: usize) -> (u32, u32, u64) {
+        fn expect_frame(
+            &mut self,
+            width: usize,
+            height: usize,
+            directory: &Path,
+        ) -> (u32, u32, u64) {
             let create_pool = self.expect(SHM, 0);
             let mut args = wire::Cursor::new(&create_pool.payload);
             let pool = args.u32().unwrap();
@@ -1327,10 +1339,15 @@ mod tests {
             args.finish().unwrap();
             assert_eq!(byte_count, width * height * file_chooser::BYTES_PER_PIXEL);
             let descriptor = self.fds.pop_front().expect("wl_shm descriptor");
-            let mut pixels = sys::duplicate_received(descriptor).unwrap();
-            let mut pixel_bytes = Vec::new();
-            pixels.read_to_end(&mut pixel_bytes).unwrap();
-            assert_eq!(pixel_bytes.len(), byte_count);
+            let pixels = sys::take_received(descriptor).unwrap();
+            let backing = fs::read_link(format!("/proc/self/fd/{}", pixels.as_raw_fd())).unwrap();
+            assert_eq!(
+                backing.parent(),
+                Some(fs::canonicalize(directory).unwrap().as_path())
+            );
+            let mut pixel_bytes = vec![0; byte_count];
+            pixels.read_exact_at(&mut pixel_bytes, 0).unwrap();
+            assert_eq!(pixels.metadata().unwrap().len(), byte_count as u64);
             let checksum = pixel_checksum(&pixel_bytes);
 
             let create_buffer = self.expect(pool, 0);
@@ -1659,11 +1676,17 @@ mod tests {
     #[test]
     fn fake_compositor_observes_pixels_and_physical_acceptance() {
         let temp = Temp::new("round-trip");
-        let socket = temp.0.join("wayland-0");
+        let display_directory = temp.0.join("display");
+        let runtime_directory = temp.0.join("client-runtime");
+        fs::create_dir(&display_directory).unwrap();
+        fs::create_dir(&runtime_directory).unwrap();
+        let socket = display_directory.join("wayland-0");
         let root = temp.0.join("Downloads");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("report.txt"), b"authenticated fixture").unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
+        // A writable display directory catches the wrong backing path even as root.
+        let server_runtime = runtime_directory.clone();
         let (notice_tx, notice_rx) = mpsc::channel();
         let server_root = temp.0.clone();
         let server = thread::spawn(move || {
@@ -1753,7 +1776,8 @@ mod tests {
             let mut args = wire::Cursor::new(&ack.payload);
             assert_eq!(args.u32().unwrap(), 23);
             args.finish().unwrap();
-            let (buffer, callback, rendered_checksum) = peer.expect_frame(640, 432);
+            let (buffer, callback, rendered_checksum) =
+                peer.expect_frame(640, 432, &server_runtime);
             let mut toplevel = wire::Builder::new();
             toplevel.i32(600);
             toplevel.i32(402);
@@ -1771,7 +1795,7 @@ mod tests {
             frame_done.u32(99);
             peer.send(callback, 0, frame_done);
             peer.expect(buffer, 0);
-            let (buffer, callback, resized_checksum) = peer.expect_frame(600, 402);
+            let (buffer, callback, resized_checksum) = peer.expect_frame(600, 402, &server_runtime);
             assert_ne!(resized_checksum, rendered_checksum);
             peer.send(buffer, 0, wire::Builder::new());
             let mut frame_done = wire::Builder::new();
@@ -1803,7 +1827,7 @@ mod tests {
         spawn(
             DialogConfig {
                 socket,
-                runtime_directory: temp.0.clone(),
+                runtime_directory,
                 title: "Choose a report".into(),
                 parent_handle: "0123456789abcdef".into(),
                 app_id: "firefox".into(),

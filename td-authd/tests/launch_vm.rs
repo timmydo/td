@@ -86,7 +86,21 @@ fn terminal() {
     assert_eq!(fds, [0, 1, 2, 3]);
     let mut keys: Vec<_> = std::env::vars().map(|(k, _)| k).collect();
     keys.sort();
-    assert_eq!(keys, ["HOME", "LOGNAME", "PATH", "SHELL", "USER"]);
+    assert_eq!(
+        keys,
+        [
+            "HOME",
+            "LOGNAME",
+            "PATH",
+            "SHELL",
+            "TD_CONTROL_SOCKET",
+            "USER"
+        ]
+    );
+    assert_eq!(
+        std::env::var("TD_CONTROL_SOCKET").unwrap(),
+        "/run/td-compositor/1000/td-control"
+    );
     fs::write(
         "/run/user/1000/terminal-evidence",
         "uid 1000; null stdio; no authority descriptor\n",

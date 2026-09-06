@@ -55,8 +55,9 @@ The activated desktop portal serves `td.Secret1` version 1:
   bounded file and requires the exact reply before handing bytes to
   td-mail.
 - Pending lookups plus unacknowledged deliveries are capped at 16; each owner
-  may have four pending lookups and deliveries combined. Lookups and receipts expire after 20 seconds,
-  with the service's ten-second audit retiring expired entries. Disconnect
+  may have four pending lookups and deliveries combined. Lookups and receipts
+  expire after 20 seconds, with the service's ten-second audit retiring expired
+  entries. Disconnect
   notification also retires that caller's entries. Replies from a peer other
   than the broker cannot resolve a pending identity.
 
@@ -64,8 +65,11 @@ The service refuses incoming descriptors. Its ancillary reader closes every
 received fd and preserves the count for decoding and InvalidArgs replies.
 The helper negotiates descriptor transfer, reads one bounded frame at a time,
 owns every installed descriptor through rejection, and accepts only the
-reply from the broker-resolved activated portal name. It validates file type,
-unlinked status and length, and holds one 20-second exchange deadline.
+reply from the broker-resolved activated portal name. It consumes the exact
+received descriptor into File ownership, validates file type, unlinked status
+and length, and reads positionally from offset zero
+without reopening procfs or changing a shared offset. A byte beyond the
+advertised extent refuses growth. It holds one 20-second exchange deadline.
 The transport surface and source confinement are recorded in UNSAFE.md §15.
 
 ## Writers and migration
@@ -213,7 +217,7 @@ normal cargo pass with those tests ignored is not TPM integration evidence.
 ## Portal evidence
 
 Tests include RFC HKDF and AEAD vectors, Poly1305, bytewise ciphertext/tag
-tampering, identity substitution, file metadata, reopen and migration
+tampering, identity substitution, file metadata, exact descriptor adoption and migration
 idempotence, broker identity refusals, descriptor ownership and live
 transfer. The image requires both the unconfined probe's exact credential
 refusal and the supervised mail receipt marker. This composes the

@@ -126,15 +126,30 @@ mod confinement {
             let keyword = format!("un{}", "safe");
             let lint = format!("{keyword}_code");
             let raw = production.matches(&keyword).count() - production.matches(&lint).count();
-            assert_eq!(raw, usize::from(name == "sys.rs"), "{name}");
+            assert_eq!(raw, 2 * usize::from(name == "sys.rs"), "{name}");
             assert_eq!(
                 production.matches(&format!("#[allow({lint})]")).count(),
-                usize::from(name == "sys.rs")
+                2 * usize::from(name == "sys.rs")
             );
         }
         let sys = include_str!("sys.rs");
         assert_eq!(sys.matches("core::arch::asm!").count(), 1);
         assert_eq!(sys.matches("const SYS_").count(), 3);
+        let production = sys.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(production.matches("File::from_raw_fd(").count(), 1);
+        assert!(!production.contains("/proc/self/fd"));
+        assert!(production.contains(
+            r#"#[allow(unsafe_code)]
+pub fn take_received(fd: RawFd) -> Result<File, String> {
+    if fd < 0 {
+        return Err(format!("invalid received descriptor {fd}"));
+    }
+    // SAFETY: callers pass one live descriptor just installed by recvmsg,
+    // removed from its sole disposal queue. File now owns its only close.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}"#
+        ));
+
         for pin in [
             "const SYS_CLOSE: usize = 3;",
             "const SYS_SENDMSG: usize = 46;",

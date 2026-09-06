@@ -3,7 +3,7 @@
 This supplies the private channel and fixed terminal-launch prerequisite for
 secure attention and subsequent one-operation elevation. It enables no secret
 access, FIDO2 release, consent prompt, or public request listener. The image
-does not yet start it or use its terminal launcher.
+starts it paired with the dedicated compositor and uses its terminal launcher.
 The eventual operation policy follows APPLICATIONS.md §L.1 and principle 7:
 one named operation, typed and descriptor-pinned arguments, one protected
 consent bound to that request, no remembered approval. Protector changes
@@ -205,11 +205,14 @@ primary group exists and admits no other members. Orphan shadow records for
 reserved names are refused. Aliases, shared primary gids, missing active
 human owners, duplicate account records, and human-login shadow classes fail
 enrollment. The image generator validates these same tables with the
-provisioner's parser. These names reserve future service accounts; they do
-not activate a service by appearing in the registry. The subsequent atomic
-identity cutover must consume these same assignments and verify the ledger
-before launching any process at a reserved uid. A failed firstboot unit
-settles service ordering but does not block later units; ordering is not
+provisioner's parser. A registry row alone does not activate a service. The
+image consumes the compositor assignment through its paired root authority;
+broker, portal and application accounts remain reserved. Each atomic identity
+cutover consumes these assignments. The paired compositor may enter its
+inert credential and channel startup at its reserved UID before ledger
+admission; the authority verifies the ledger before allowing device access,
+worker creation, or human terminal launch. A failed firstboot unit settles
+service ordering but does not block later units; ordering is not
 authorization. The boot oracle requires the exact `TD-PRINCIPALS-ENROLLED`
 line on every successful boot. Retired human accounts may disappear while
 their service and application reservations remain.
@@ -258,12 +261,11 @@ make an unverified deployment pass the boot oracle.
 ## Fixed terminal launch prerequisite
 
 `terminal-serve --user USER --uid UID --peer-uid UID` is a root-configured
-consumer of the private channel. It is not enabled in the image yet. The
-compositor must eventually run at its reserved identity and use this channel
-instead of directly creating user processes. The configured application card
-already activates a supervised window; only terminal creation needs this
-request. The existing compositor launch path remains active until that
-atomic UID, device, socket and launch cutover is implemented.
+consumer of the private channel. The image compositor runs at its reserved
+identity and uses this channel for human terminal creation. The configured
+application card already activates a supervised window; only terminal creation
+needs this request. Direct compositor spawning remains a host-development
+mode.
 
 Startup requires all four root uid/gid columns, one thread, and only fd
 0/1/2 inherited from the trusted supervisor. It proves each standard
@@ -352,15 +354,12 @@ authorization. Opening one's ordinary terminal is session behavior and opens
 an ordinary shell with the human account's existing authority; it grants
 neither store access nor an elevated shell.
 
-The future cutover must create the compositor-owned runtime directory with
-human traversal and socket access, enable this channel, and atomically
-remove the direct compositor spawner. It must also update the shell's
-Wayland/control socket defaults in td-compositor/src/pty.rs and the jail's
-socket-owner checks. That PTY module constructs a separate fixed shell
-environment, including TERM, TERMINFO, WAYLAND_DISPLAY and XDG_RUNTIME_DIR;
-it does not inherit the five-variable helper environment. The CLI contract
-belongs to `td-compositor/DESIGN.md` and `td-login/THREAT-MODEL.md`. These
-paths are not claimed to work on the current image before that cutover.
+The compositor-owned runtime directory permits human traversal and socket
+access, with kernel peer admission before protocol handling. The image uses
+the private terminal channel. The PTY module constructs a separate shell
+environment from its account and actual Wayland/control paths; it does not
+inherit the six-variable helper environment. The CLI contract belongs to
+`td-compositor/DESIGN.md` and `td-login/THREAT-MODEL.md`.
 
 Started terminals belong to the human session cgroup and their own process
 group. A paired-authority restart therefore does not terminate them through
@@ -392,7 +391,7 @@ the fixture itself is a host diagnostic, never an input to a target recipe
 or part of an image. It requires td's pidfs-capable kernel and QEMU on the
 host. It proves the real channel-to-validator-to-credential-helper chain,
 verifies the terminal's uid/gid, empty capabilities, independent process
-group, exact session cgroup, five-variable environment and absence of
+group, exact session cgroup, six-variable environment and absence of
 inherited authority fds. A wrong sender, missing ledger and failed cgroup
 placement all withhold terminal execution. A missing persistent state
 directory is also refused without recreating it. The fixture's terminal
@@ -413,10 +412,15 @@ executes the ordinary suite; its two ignored exec-only fixtures are invoked
 by their parent tests with sanitized descriptors and environment. Running
 all ignored fixtures directly is not a supported suite invocation.
 
-The optional compositor client is specified by td-compositor/DESIGN.md. It
+The compositor client is specified by td-compositor/DESIGN.md. It
 shares this transport, greets before workers exist, then keeps the endpoint
-exclusive in one worker. The image UID/device/socket cutover remains pending.
+exclusive in one worker. The image activates that client at UID 993.
 Linux's `include/net/scm.h::scm_send` supplies `task_tgid(current)`; a worker
 thread retains the process pin while a forked descendant does not. The kernel
 fixture exercises both cases. The shared module imports its sibling sys
 module so each consumer's transport remains private to that consumer.
+
+The terminal helper sets `TD_CONTROL_SOCKET` to the fixed compositor runtime
+path before exec. The terminal passes its actual Wayland socket path to its
+PTY child, preserving the connection endpoint across the compositor UID
+cutover. No root authority operation accepts either path from a requester.

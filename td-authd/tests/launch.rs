@@ -90,6 +90,13 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
     let terminal = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 17);
     assert_eq!(terminal.get_program(), "/bin/td-term");
     assert_eq!(
+        terminal.get_envs().collect::<Vec<_>>(),
+        [(
+            std::ffi::OsStr::new("TD_CONTROL_SOCKET"),
+            Some(std::ffi::OsStr::new("/run/td-compositor/1000/td-control")),
+        )]
+    );
+    assert_eq!(
         terminal.get_args().collect::<Vec<_>>(),
         [
             "run",

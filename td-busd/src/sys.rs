@@ -147,9 +147,11 @@ fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize
 /// callers reach it; the allow stays one, which is the property the
 /// confinement test pins.
 ///
-/// td-compositor reopens a received descriptor through `/proc/self/fd/N`
-/// instead, and that is unavailable here: opening a `/proc/self/fd` entry that
-/// names a SOCKET fails, and a broker's freight is whatever a client sends.
+/// Like td-compositor, this preserves the received open-file description.
+/// Reopening through `/proc/self/fd/N` repeats inode permission checks and
+/// cannot open sockets. The broker adopts directly into `OwnedFd`: forwarding
+/// needs no file conversion, and std closes the owner without a crate-owned
+/// close syscall.
 ///
 /// # Safety
 ///

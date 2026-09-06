@@ -664,6 +664,10 @@ pub const TD_FIRSTBOOT_NEW_MARKER: &str = "TD-FIRSTBOOT-NEW-OK";
 /// DUPLICATED as `STABLE_MARKER` in td-firstboot/src/main.rs.
 pub const TD_FIRSTBOOT_STABLE_MARKER: &str = "TD-FIRSTBOOT-STABLE-OK";
 
+/// Human reads of the compositor's assigned devices were denied.
+/// Duplicated as PRIVATE_DEVICES_MARKER in td-seatd/src/main.rs.
+pub const TD_COMPOSITOR_DEVICES_PRIVATE_MARKER: &str = "TD-COMPOSITOR-DEVICES-PRIVATE";
+
 /// Firstboot validated the current accounts and durably reserved all active
 /// and retired principal identities. Duplicated in td-firstboot's main.rs.
 pub const TD_PRINCIPALS_MARKER: &str = "TD-PRINCIPALS-ENROLLED";
@@ -1189,6 +1193,10 @@ pub const TD_FIREFOX_CONTENT_MARKER: &str = "TD-FIREFOX-HTTPS-CONTENT-READY";
 /// live content, GPU, socket and media-role process retains a nested filter.
 pub const TD_FIREFOX_SUPPORT_MARKER: &str = "TD-FIREFOX-SUPPORT-READY";
 
+/// Physical Super+T launch and Control+D teardown through the root authority.
+pub const TD_TERMINAL_AUTHORITY_ARMED_MARKER: &str = "TD-TERMINAL-AUTHORITY-ARMED";
+pub const TD_TERMINAL_AUTHORITY_READY_MARKER: &str = "TD-TERMINAL-AUTHORITY-READY";
+pub const TD_TERMINAL_AUTHORITY_MARKER: &str = "TD-TERMINAL-AUTHORITY-OK";
 /// Staged markers emitted by td-jail's bounded Firefox physical-input probe.
 pub const TD_FIREFOX_INPUT_ARMED_MARKER: &str = "TD-FIREFOX-INPUT-ARMED";
 pub const TD_FIREFOX_INPUT_FOCUSED_MARKER: &str = "TD-FIREFOX-INPUT-FOCUSED";

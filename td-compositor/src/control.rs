@@ -14,13 +14,10 @@
 //! session confining it, where an extension on the public Wayland socket would
 //! be reachable by everything that can open a window.
 //!
-//! Nothing here reaches a confined syscall. The socket is mode 0600 and the
-//! kernel enforces that at `connect(2)`, so only the session's own uid can
-//! open one; the private portal listener asks `SO_PEERCRED` as well, but that
-//! query answers the same question its own mode already did, and widening the
-//! audited caller list (§4) to ask a redundant one buys nothing. What the mode
-//! does not cover is the instant between `bind` and `chmod`, and what covers
-//! that is the mode-0700 runtime directory both sockets sit in.
+//! The stock service admits the human kernel peer through the shared session
+//! policy before reading a request. Its socket is cross-UID connectable beneath
+//! the compositor-owned runtime directory. Direct development sessions retain
+//! mode-0600 sockets in their private runtime directories.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -33,6 +30,7 @@ use std::time::{Duration, Instant};
 use crate::layout::{Command, Direction, Presentation, Rect, FINAL_WORKSPACE, INITIAL_WORKSPACE};
 use crate::runtime::{Runtime, Sent};
 use crate::scene::SurfaceKey;
+use crate::session::SocketPolicy;
 use crate::socket;
 
 /// A request is one line and every verb is short, so anything approaching this
@@ -47,10 +45,6 @@ const REQUEST_LIMIT: usize = 1024;
 /// makes the bound the one §15 claims. The runtime lock is never held across
 /// either wait, so a slow caller cannot stop the session either.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Private to the user the compositor runs as, and the whole of the access
-/// control: `connect(2)` needs write permission on the socket inode.
-const CONTROL_MODE: u32 = 0o600;
 
 /// Consecutive failed accepts before the listener gives up. The reasoning is
 /// `socket::publish`'s: one failure is a caller that hung up or a moment
@@ -745,17 +739,21 @@ pub fn answer(runtime: &Mutex<Runtime>, line: &str) -> String {
 /// way past it is a path something LIVE owns — and coming up anyway would
 /// advertise that path through `TD_CONTROL_SOCKET` while the incumbent
 /// answered on it, handing a caller someone else's report at exit 0.
-pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
+pub fn serve(
+    path: &Path,
+    runtime: Arc<Mutex<Runtime>>,
+    policy: SocketPolicy,
+) -> Result<(), String> {
     socket::remove_stale(path, "control")?;
     let listener = UnixListener::bind(path)
         .map_err(|error| format!("bind control socket {}: {error}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(CONTROL_MODE))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(policy.mode()))
         .map_err(|error| format!("chmod control socket {}: {error}", path.display()))?;
     // `thread::Builder`, not `thread::spawn`: the latter panics when the OS
     // refuses a thread, and this crate does not panic.
     thread::Builder::new()
         .name("td-control".to_string())
-        .spawn(move || accept(listener.incoming(), &runtime))
+        .spawn(move || accept(listener.incoming(), &runtime, policy))
         .map(|_| ())
         .map_err(|error| format!("start control listener {}: {error}", path.display()))
 }
@@ -763,7 +761,11 @@ pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
 /// Takes the connections rather than the listener, for `socket::serve`'s
 /// reason: a bound on a run of failed accepts that no test can reach is a
 /// bound nobody can trust.
-fn accept(connections: impl Iterator<Item = io::Result<UnixStream>>, runtime: &Mutex<Runtime>) {
+fn accept(
+    connections: impl Iterator<Item = io::Result<UnixStream>>,
+    runtime: &Mutex<Runtime>,
+    policy: SocketPolicy,
+) {
     let mut consecutive = 0;
     for connection in connections {
         let Ok(stream) = connection else {
@@ -775,6 +777,9 @@ fn accept(connections: impl Iterator<Item = io::Result<UnixStream>>, runtime: &M
             continue;
         };
         consecutive = 0;
+        if policy.admit(&stream).is_err() {
+            continue;
+        }
         // Serially, one caller at a time. A control request is a line and an
         // answer, every wait it can do is bounded, and the alternative is a
         // thread per caller whose only purpose would be to let two callers
@@ -1522,7 +1527,7 @@ mod tests {
         };
         let (runtime, _frame) = session_of(&[first, second]);
         let socket = temporary("control-sock");
-        serve(&socket.0, Arc::clone(&runtime)).expect("serve");
+        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private).expect("serve");
 
         // The LAST committed window is the focused one, so `first` is
         // deliberately not it: an order that quietly acted on the focused
@@ -1566,7 +1571,7 @@ mod tests {
         };
         let (runtime, _frame) = session_of(&[first, second]);
         let socket = temporary("control-sock");
-        serve(&socket.0, Arc::clone(&runtime)).expect("serve");
+        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private).expect("serve");
 
         let listed = ask(&socket.0, Request::Layout).expect("layout");
         let named = handle_of(&listed, first);
@@ -2649,7 +2654,7 @@ mod tests {
         };
         let (runtime, _frame) = session(window);
         let socket = temporary("control-sock");
-        serve(&socket.0, Arc::clone(&runtime)).expect("serve");
+        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private).expect("serve");
 
         // THE QUESTION. One window, on workspace 1, which is where a session
         // starts and what the strip would be showing.
@@ -2748,7 +2753,7 @@ mod tests {
         };
         let (runtime, _frame) = session(window);
         let socket = temporary("control-mode");
-        serve(&socket.0, runtime).expect("serve");
+        serve(&socket.0, runtime, SocketPolicy::Private).expect("serve");
         let mode = std::fs::metadata(&socket.0)
             .expect("stat control socket")
             .permissions()
@@ -2759,7 +2764,21 @@ mod tests {
         // a socket changed to 0666 would ship with the gate green. `socket.rs`
         // pins its own mode this way for the same reason.
         assert_eq!(mode, 0o600, "the control socket is not private");
-        assert_eq!(CONTROL_MODE, 0o600);
+        assert_eq!(SocketPolicy::Private.mode(), 0o600);
+    }
+
+    #[test]
+    fn the_dedicated_control_socket_has_cross_uid_connect_permissions() {
+        let (runtime, _frame) = session(SurfaceKey {
+            client: 1,
+            object: 1,
+        });
+        let socket = temporary("human-control-mode");
+        serve(&socket.0, runtime, SocketPolicy::HumanSession).unwrap();
+        assert_eq!(
+            std::fs::metadata(&socket.0).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
     }
 
     #[test]
@@ -2773,7 +2792,7 @@ mod tests {
         };
         let (runtime, _frame) = session(window);
         let socket = temporary("control-refuse");
-        serve(&socket.0, Arc::clone(&runtime)).expect("serve");
+        serve(&socket.0, Arc::clone(&runtime), SocketPolicy::Private).expect("serve");
         // Straight onto the wire, since `Request` cannot spell a bad request:
         // this is the shape another program writing the protocol would send.
         let mut stream = UnixStream::connect(&socket.0).expect("connect");
@@ -2808,7 +2827,7 @@ mod tests {
         };
         let (runtime, _frame) = session(window);
         let socket = temporary("control-flood");
-        serve(&socket.0, runtime).expect("serve");
+        serve(&socket.0, runtime, SocketPolicy::Private).expect("serve");
         let mut stream = UnixStream::connect(&socket.0).expect("connect");
         // No newline, so nothing bounds this but the limit itself.
         let flood = vec![b'x'; REQUEST_LIMIT * 4];
@@ -3073,7 +3092,7 @@ mod tests {
         let connections = std::iter::repeat_with(refuse)
             .take(MAX_ACCEPT_FAILURES as usize)
             .chain(std::iter::once(Ok(theirs)));
-        accept(connections, &runtime);
+        accept(connections, &runtime, SocketPolicy::Private);
         assert_eq!(
             answer_of(&mut mine),
             "ok\n",
@@ -3092,7 +3111,7 @@ mod tests {
         let connections = std::iter::repeat_with(refuse)
             .take((MAX_ACCEPT_FAILURES as usize).saturating_add(1))
             .chain(std::iter::once(Ok(theirs)));
-        accept(connections, &runtime);
+        accept(connections, &runtime, SocketPolicy::Private);
         assert_eq!(
             answer_of(&mut mine),
             "",
@@ -3102,6 +3121,34 @@ mod tests {
             runtime.lock().expect("runtime").control_snapshot().active_workspace,
             2,
             "a caller past the bound was served anyway"
+        );
+    }
+
+    #[test]
+    fn session_control_refuses_other_identities_before_changing_workspace() {
+        let (runtime, _frame) = session(SurfaceKey {
+            client: 1,
+            object: 1,
+        });
+        let (mut caller, stream) = UnixStream::pair().unwrap();
+        caller
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        caller.write_all(b"workspace 2\n").unwrap();
+        accept(
+            std::iter::once(Ok(stream)),
+            &runtime,
+            SocketPolicy::HumanSession,
+        );
+        let mut answer = String::new();
+        if let Err(error) = caller.read_to_string(&mut answer) {
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        }
+        let uid = crate::session::process_uid().unwrap();
+        assert_eq!(answer, if uid == 1000 { "ok\n" } else { "" });
+        assert_eq!(
+            runtime.lock().unwrap().control_snapshot().active_workspace,
+            if uid == 1000 { 2 } else { 1 }
         );
     }
 

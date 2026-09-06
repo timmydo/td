@@ -197,6 +197,10 @@ fn require_session_process(uid: u32, status: &str, cgroup: &str) -> Result<(), S
 
 fn terminal_command(uid: u32, generation: &str, handle: u64) -> Command {
     let mut command = Command::new("/bin/td-term");
+    command.env(
+        "TD_CONTROL_SOCKET",
+        format!("/run/td-compositor/{uid}/td-control"),
+    );
     command.args([
         "run",
         "--socket",

@@ -141,7 +141,7 @@ const MAX_ACTIVE_FILE_CHOOSERS: usize = 1;
 const MAX_QUEUED_SERVICE_EVENTS: usize = 32;
 const MAX_FILE_CHOOSER_TITLE_BYTES: usize = 256;
 const OWNER_AUDIT_INTERVAL: Duration = Duration::from_secs(10);
-const FILE_CHOOSER_SOCKET: &str = "/run/user/1000/td-portal-wayland-0";
+const FILE_CHOOSER_SOCKET: &str = "/run/td-compositor/1000/td-portal-wayland-0";
 const FILE_CHOOSER_RUNTIME: &str = "/run/user/1000";
 const FIREFOX_HOST_DOWNLOADS: &str = "/var/home/tester/Downloads";
 const FIREFOX_GUEST_DOWNLOADS: &str = "/home/td/Downloads";
@@ -3588,7 +3588,7 @@ mod confinement {
     }
 
     #[test]
-    fn unsafe_is_one_scoped_syscall_instruction() {
+    fn unsafe_is_the_instruction_and_received_descriptor_adoption() {
         let keyword = format!("un{}", "safe");
         let lint = format!("{keyword}_code");
         assert_eq!(
@@ -3601,8 +3601,13 @@ mod confinement {
                 .count()
                 .saturating_sub(production(source).matches(&lint).count());
             if *name == "sys.rs" {
-                assert_eq!(bare, 1, "{name}");
-                assert_eq!(source.matches(&format!("#[allow({lint})]")).count(), 1);
+                assert_eq!(bare, 2, "{name}");
+                assert_eq!(
+                    production(source)
+                        .matches(&format!("#[allow({lint})]"))
+                        .count(),
+                    2
+                );
             } else {
                 assert_eq!(bare, 0, "{name}");
             }
@@ -3627,15 +3632,22 @@ mod confinement {
         assert_eq!(production(SYS).matches("syscall5(SYS_CLOSE,").count(), 1);
         assert_eq!(production(SYS).matches("SYS_SENDMSG,").count(), 1);
         assert_eq!(production(SYS).matches("SYS_RECVMSG,").count(), 1);
-        assert_eq!(production(SYS).matches("/proc/self/fd/{fd}").count(), 1);
+        assert!(!production(SYS).contains("/proc/self/fd"));
+        assert_eq!(production(SYS).matches("File::from_raw_fd(").count(), 1);
+        assert!(production(SYS).contains(
+            r#"#[allow(unsafe_code)]
+pub fn take_received(fd: RawFd) -> Result<File, String> {
+    if fd < 0 {
+        return Err(format!("invalid received descriptor {fd}"));
+    }
+    // SAFETY: callers pass one live descriptor just installed by recvmsg,
+    // removed from its sole disposal queue. File now owns its only close.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}"#
+        ));
         assert_eq!(production(DIALOG).matches("sys::send_with_fd(").count(), 1);
         assert_eq!(production(DIALOG).matches("sys::recv_with_fds(").count(), 1);
-        assert_eq!(
-            production(DIALOG)
-                .matches("sys::duplicate_received(")
-                .count(),
-            1
-        );
+        assert_eq!(production(DIALOG).matches("sys::take_received(").count(), 1);
         assert_eq!(
             production(DIALOG).matches("sys::discard_received(").count(),
             4
@@ -3826,9 +3838,9 @@ mod tests {
         assert_eq!(
             parse_channel_path(&strings(&[
                 "--wayland",
-                "/run/user/1000/td-portal-wayland-0"
+                "/run/td-compositor/1000/td-portal-wayland-0"
             ])),
-            Ok(PathBuf::from("/run/user/1000/td-portal-wayland-0"))
+            Ok(PathBuf::from("/run/td-compositor/1000/td-portal-wayland-0"))
         );
         for bad in [
             strings(&["--wayland", "relative"]),

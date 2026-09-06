@@ -1,9 +1,9 @@
 //! The two ancillary-data syscalls used by td-portal's Wayland client.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 const SYS_CLOSE: usize = 3;
@@ -390,26 +390,21 @@ pub fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<
     Ok(())
 }
 
-pub fn duplicate_received(fd: RawFd) -> Result<File, String> {
+/// Consume one fresh SCM_RIGHTS descriptor; callers remove its raw owner first.
+#[allow(unsafe_code)]
+pub fn take_received(fd: RawFd) -> Result<File, String> {
     if fd < 0 {
         return Err(format!("invalid received descriptor {fd}"));
     }
-    let duplicate = OpenOptions::new()
-        .read(true)
-        .open(format!("/proc/self/fd/{fd}"))
-        .map_err(|error| format!("duplicate received descriptor {fd}: {error}"));
-    let close = close_raw(fd);
-    match (duplicate, close) {
-        (Ok(file), Ok(())) => Ok(file),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(open), Err(close)) => Err(format!("{open}; {close}")),
-    }
+    // SAFETY: callers pass one live descriptor just installed by recvmsg,
+    // removed from its sole disposal queue. File now owns its only close.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::IntoRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -478,17 +473,17 @@ mod tests {
     }
 
     #[test]
-    fn one_descriptor_crosses_and_is_reopened_then_closed() {
+    fn one_descriptor_crosses_and_is_owned_then_closed() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let mut file = tempfile("descriptor");
         file.write_all(b"portal").unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         send_with_fd(&sender, b"frame", file.as_raw_fd()).unwrap();
         let mut bytes = [0u8; 16];
-        let received = recv_with_fds(&receiver, &mut bytes).unwrap();
+        let mut received = recv_with_fds(&receiver, &mut bytes).unwrap();
         assert_eq!(&bytes[..received.count], b"frame");
         assert_eq!(received.fds.len(), 1);
-        let mut duplicate = duplicate_received(received.fds[0]).unwrap();
+        let mut duplicate = take_received(received.fds.pop().unwrap()).unwrap();
         let mut contents = String::new();
         duplicate.read_to_string(&mut contents).unwrap();
         assert_eq!(contents, "portal");
@@ -600,39 +595,27 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_consumes_the_received_descriptor() {
-        let file = tempfile("consume");
-        let received = file_identity(&file);
-        let raw = file.into_raw_fd();
-        // Held open past the check on purpose: it keeps the inode alive, so
-        // `received` cannot be recycled onto some other file mid-test.
-        let duplicate = duplicate_received(raw).unwrap();
-        // The duplicate is a second handle on the same file, so its own number
-        // must still name that file. A negative below means nothing if the
-        // oracle is mute or answers with somebody else's.
-        assert_eq!(
-            identity_of_number(duplicate.as_raw_fd()),
-            Some(received),
-            "the duplicate must still name the file it duplicated"
-        );
-
-        // Reclaim the number deliberately — the kernel hands back the lowest
-        // free descriptor — so the reuse case is exercised rather than waited
-        // for. This does not make the test any better at catching a missing
-        // close; it keeps the reuse-tolerant path from going unobserved.
-        let reclaimed = tempfile("reclaim");
-        let now = identity_of_number(raw);
-        if reclaimed.as_raw_fd() == raw {
-            assert_eq!(
-                now,
-                Some(file_identity(&reclaimed)),
-                "a number this thread now holds must name the file holding it"
-            );
-        }
-        assert_ne!(
-            now,
-            Some(received),
-            "the received descriptor must not still name the received file"
-        );
+    fn received_ownership_preserves_the_descriptor_and_revoked_inode_access() {
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut file = tempfile("exact-owner");
+        file.write_all(b"portal").unwrap();
+        file.seek(SeekFrom::Start(3)).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        send_with_fd(&sender, b"x", file.as_raw_fd()).unwrap();
+        let mut byte = [0];
+        let mut received = recv_with_fds(&receiver, &mut byte).unwrap();
+        let raw = received.fds.pop().unwrap();
+        let owned = take_received(raw).unwrap();
+        assert_eq!(owned.as_raw_fd(), raw);
+        assert_eq!(file_identity(&owned), file_identity(&file));
+        let mut bytes = [0; 6];
+        owned.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"portal");
+        assert_eq!(file.stream_position().unwrap(), 3);
+        drop(owned);
+        assert_ne!(identity_of_number(raw), Some(file_identity(&file)));
+        assert!(take_received(-1).is_err());
     }
 }

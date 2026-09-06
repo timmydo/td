@@ -16,39 +16,42 @@ Linux devtmpfs + sysfs + fbdev + evdev
   -> td-ui-demo and later wl_shm Wayland clients
 ```
 
-`td-seatd` is not compatible with seatd or libseat. It is a root oneshot for
-one permanently configured local seat. It creates `/run/user/1000`, validates
-`/dev/fb0` and every `/dev/input/eventN` as real character devices rather than
-symlinks, assigns them to the graphical user with mode 0600, verifies the
-result, and exits. It also verifies the root-owned mode-0755 `/run` parent and
-creates the audio-owned mode-0755 `/run/td-audio` directory for the future
-audio service. It assigns no sound device and starts no audio process yet; the
-kernel builds ALSA as of rung 25, but no seat assigns `/dev/snd`. This gives
-the active user the seat capability directly without making the future audio
-identity a compositor capability. It deliberately provides no multi-user
-arbitration, descriptor revocation, hotplug, suspend/resume, or VT
-switching. `APPLICATIONS.md` §K.5 owns the audio boundary.
+`td-seatd` is a root oneshot for one permanently configured local seat.
+It creates the private human runtime `/run/user/1000` and the compositor's
+`/run/td-compositor/1000` below root-owned parents. It validates framebuffer
+and evdev nodes as character devices, assigns them to compositor UID/GID 993
+with mode 0600, and verifies the result. The human cannot open those devices.
+It also assigns only playback PCM nodes to the dedicated audio account and
+creates `/run/td-audio`; `APPLICATIONS.md` §K.5 owns that boundary.
+There is no multi-user arbitration, hotplug, suspend/resume, VT switching or
+live seat reassignment. Deployment reboot discards earlier open descriptors.
 
-The assignment is path-based because safe `std` exposes path ownership and
-permission operations, not `fchown(2)`. There is consequently a check/use
-window between rejecting a symlink and changing the node. The fixed `/dev`,
-`/run`, and `/run/user` parents remain root-owned, so neither assigned identity
-can replace a checked entry even if another unprivileged service is already
-running. No audio process exists in this precursor. Supporting hot seat
-reassignment after login would require an fd-based, separately reviewed
-syscall surface.
+Assignment uses safe std path ownership and permission operations, with a
+check/use window between rejecting a symlink and changing the node. The fixed
+`/dev` and `/run` parents remain root-owned, so unprivileged identities cannot
+replace checked device or runtime entries. Supporting hot reassignment would
+require a separately reviewed descriptor-based syscall surface.
 
-`td-compositor` runs as uid 1000. It opens only the assigned framebuffer and
-evdev nodes. It renders XRGB8888 pixels in software, reads Linux input events,
-and owns the public and private-portal Wayland sockets below the user's
-mode-0700 runtime directory. It owns a third socket there when asked for one:
-the CONTROL channel of section 15, which is not Wayland, is bound only when
-`--control-socket` names a path, and is what `td-ctl` talks to. It does not
-run as root and has no device-broker protocol. Readiness is not announced
-until the framebuffer has accepted an initial paint, every enumerated input
-node has been opened, and both Wayland listeners have been bound. The control
-socket is bound before that marker too, when one was asked for, and a bind
-that fails is fatal exactly as a Wayland one is (§15).
+`td-compositor` runs as service UID/GID 993. It opens the assigned framebuffer
+and evdev nodes, renders software pixels, and reads Linux input events. Its
+Wayland, private portal, optional control and application-readiness sockets
+live beneath the compositor-owned runtime directory. Stock sockets permit
+cross-UID connection and require kernel peer UID 1000 before protocol access.
+Root is deliberately refused too; diagnostics use the checked human identity.
+The image's socket clients already run through td-login as that identity.
+Mode 0666 avoids giving shared supplementary groups authority over service
+state or devices; unrelated local UIDs can reach only accept-and-refuse.
+These accepts run serially on each listener: a local connection flood can
+consume accept/credential-check/close work, though it obtains no protocol
+access or admitted client slot.
+
+The authority flag selects one complete deployment profile: a root-paired
+service with cross-UID sockets. Direct development mode has private sockets
+and a direct launcher. The two mixed combinations are deliberately absent.
+The root greeting and enrolled-session check precede devices and workers.
+Readiness follows the initial framebuffer paint, opening all input nodes and
+binding both Wayland listeners. The optional control socket binds before
+that marker as well, and a failed bind is fatal.
 
 All target-side UI code is dependency-free Rust built by td's source-built
 stage2 toolchain. The target closure contains no Mesa, libdrm userspace,
@@ -892,24 +895,24 @@ the reader active so the launcher can be closed or retried.
 ## 3. Wayland surface
 
 The server accepts local Unix-stream clients at
-`/run/user/1000/wayland-0` and the trusted portal at
-`/run/user/1000/td-portal-wayland-0`. Both socket endpoints are resolved once,
-are mode 0600 below the uid-1000 mode-0700 runtime directory, and are bound
-before the ordinary readiness marker is emitted. Distinctness is checked over
-every endpoint the compositor takes, not just these two: the pair above,
-application readiness, and the control socket of section 15 are compared each
-against each, so no two of the four may name one path. It is one walk rather
-than a comparison per pair because four endpoints are six pairs, and the pair
-nobody remembers to add is two services sharing a socket. The private endpoint
-is bound first, then the public endpoint and private accept loop become live
-before that marker. Public clients have 30 slots and private portal clients
-have two reserved slots, retaining the previous 32-client total while
-preventing public load from starving the portal. `td-jail` exposes only the
-first socket to applications. After authentication, private sockets have
-30-second read and write inactivity timeouts, so idle or backpressured peers
-release the two reserved slots. An active unconfined uid-1000 peer can keep a
-slot live; the private path and application jail remain the isolation
-boundary.
+`/run/td-compositor/1000/wayland-0` and the trusted portal at
+`/run/td-compositor/1000/td-portal-wayland-0`. Both socket endpoints are
+resolved once, use the stock session admission policy below the compositor
+runtime, and bind before the ordinary readiness marker is emitted.
+Distinctness is checked over every endpoint the compositor takes, not just
+these two: the pair above, application readiness, and the control socket of
+section 15 are compared each against each, so no two of the four may name one
+path. It is one walk rather than a comparison per pair because four endpoints
+are six pairs, and the pair nobody remembers to add is two services sharing a
+socket. The private endpoint is bound first, then the public endpoint and
+private accept loop become live before that marker. Public clients have 30
+slots and private portal clients have two reserved slots, retaining the
+previous 32-client total while preventing public load from starving the
+portal. `td-jail` exposes only the first socket to applications. After
+authentication, private sockets have 30-second read and write inactivity
+timeouts, so idle or backpressured peers release the two reserved slots. An
+active unconfined uid-1000 peer can keep a slot live; the private path and
+application jail remain the isolation boundary.
 
 The first protocol surface is:
 
@@ -2620,7 +2623,7 @@ retention is new — the comparison still reads the request rather than what is
 stored. When the compositor is given one expected application id and a
 readiness-socket path, the request is compared at the wire boundary. A matching surface key is held only until the
 configured application's first successfully painted mapped toplevel wakes a
-capacity-one channel. A dedicated thread then publishes the mode-0600 socket;
+capacity-one channel. A dedicated thread publishes a session-admitted socket;
 before that commit the path does not exist. The match must precede the commit;
 a later app id cannot bless a mapped scene whose framebuffer paint may have
 failed. Replacing an id before mapping clears the candidate. The socket is
@@ -3766,9 +3769,7 @@ the kernel's conforming ancillary framing.
   keymap descriptor, or a test request;
 - recvmsg(2), to receive wl_shm pool descriptors or the demo client's XKB
   keymap descriptor;
-- close(2), to release a received descriptor after it has either been safely
-  duplicated through `/proc/self/fd/N` or exactly transferred as an owned
-  clipboard endpoint;
+- close(2), to release discarded raw descriptors or owned clipboard endpoints;
 - getsockopt(2), with fixed `SOL_SOCKET` and `SO_PEERCRED`, an exact 12-byte
   result, and one server caller, to admit only uid 1000 on the private portal
   listener;
@@ -3885,11 +3886,11 @@ ioctl rather than from a file. It is the only one, it happens only at a
 recovery, and §2 is where what it means is argued.
 
 The second block consumes one `ReceivedFd` as a `File` with
-`File::from_raw_fd`. This is the client-side end of a selection transfer: a
-source receives a pipe or socket supplied by the selecting client, so reopening
-through `/proc/self/fd/N` can fail and would not preserve the original open-file
-description. `ManuallyDrop` suppresses the raw owner's close after `File`
-assumes sole ownership. No lock is held across the eventual write. The writer
+`File::from_raw_fd`. This serves received SHM pools, keymaps and the client-side
+end of a selection transfer. Reopening through `/proc/self/fd/N` can fail across
+UIDs or for a socket and would not preserve the original open-file description.
+`ManuallyDrop` suppresses the raw owner's close after `File` assumes sole
+ownership. No lock is held across the eventual write. The writer
 temporarily adds `O_NONBLOCK`, retries against a five-second absolute deadline,
 and restores the complete prior status word before closing the endpoint. A
 receiver can therefore lose its own transfer but cannot park every later one.
@@ -3900,15 +3901,22 @@ other target source file. Each developer tool is a separate crate root that
 also denies unsafe. Adding a syscall or another scoped allow amends this
 document and the repository-wide unsafe inventory.
 
-File-backed wl_shm and keymap descriptors are reopened before their raw
-numbers are closed. A clipboard receiver may instead supply a pipe or socket,
-and reopening would either fail or create another open-file description. The
-syscall module therefore owns that exact raw number in `ReceivedFd`. Its one
-server-side adoption site is pinned by the confinement test, the runtime sees
-only the server's opaque `TransferEndpoint`, and `Drop` reaches the already
-rostered close wrapper. The client transport has one separately pinned
-adoption site and one conversion site for the source endpoint; after conversion
-ordinary `File` ownership performs every close.
+Standalone demo and terminal clients create their frame buffers beside their
+own readiness socket, independently of the display socket's owner. Embedded
+demo sessions retain their explicitly supplied client runtime. The portal
+dialog uses its separate configured human runtime for both initial and resized
+buffers.
+
+Received wl_shm and keymap descriptors are consumed through
+`sys::take_received`, using the existing `ReceivedFd::into_file` conversion.
+The source-pinned consumers are the server SHM pool, client keymap and shipped
+descriptor selftest paths. Each removes the number from its raw disposal queue
+before adoption; all file reads are positional so their shared offset stays
+unchanged.
+Server clipboard endpoints remain in the opaque `TransferEndpoint` raw owner;
+its drop reaches the rostered close wrapper. The client clipboard source has
+its separately pinned adoption/conversion path. PTY slave acquisition retains
+its existing reopen-and-close helper and does not receive cross-UID files.
 
 The four surfaces behind that one body are pinned to their modules: descriptor
 transport is reachable only from `client.rs`, `conn.rs`, and `server.rs`,
@@ -3998,8 +4006,8 @@ The landing must prove:
 - the seat assigner rejects symlinks/non-devices and verifies ownership/mode;
 - the compositor resolves and refuses aliases among its public, private
   portal, and application-readiness endpoints, binds the private then public
-  mode-0600 Wayland listeners before readiness through independent 30-public
-  and two-private client ceilings, authenticates private peers as uid 1000,
+  session-admitted Wayland listeners before readiness with independent ceilings
+  of 30 public and two private clients, authenticates private peers as uid 1000,
   and the shipped portal probe accepts only the exact private registry before
   completing the manager's standalone and dismissed dialog states;
 - wire parsing rejects truncation, overflow, invalid object use, and a
@@ -4255,7 +4263,7 @@ The landing must prove:
 - software composition clips surfaces to tiles and never indexes outside a
   frame;
 - the image contains all three binaries, the service order is checkable, and
-  the compositor and client run as uid 1000;
+  the compositor runs as uid 993 and its clients as uid 1000;
 - existing serial boot checks remain green.
 
 ## 7. Testability contract for tiling
@@ -4531,7 +4539,11 @@ values are `TERM=td-term`, `COLORTERM=truecolor`, `PATH=/bin`,
 entry under its store `share/terminfo`, and the system closure exposes that
 immutable directory through `/etc/terminfo`; no new top-level image root is
 needed. `XDG_RUNTIME_DIR=/run/user/UID` comes from the verified numeric uid and
-`WAYLAND_DISPLAY=wayland-0` names the compositor socket. A dependency-free
+`WAYLAND_DISPLAY` carries the terminal launcher's actual socket path. The
+stock image uses `/run/td-compositor/1000/wayland-0`; host development carries
+its supplied endpoint. Consumers must honor absolute-display semantics
+(`Path::join` does); concatenating the runtime and display strings is invalid.
+A dependency-free
 encoder produces the entry from a human-readable capability source; `tic`,
 ncurses, and a host terminfo database are not build inputs. Every boolean,
 number, output sequence, and input key in that entry names a blocking native
@@ -5084,12 +5096,11 @@ rather than a pointer, and the flags are pinned in `sys.rs` rather than chosen
 by a caller, so `O_NOCTTY` cannot be forgotten by the one call site that must
 not acquire the terminal.
 
-Its nonnegative return is adopted exactly once, through the same
-`/proc/self/fd/N` duplication the received-descriptor path already uses, and
-the raw number is closed. The crate's `File::from_raw_fd` allowance is confined
-to exact clipboard source endpoints that cannot be reopened. Extending that
-conversion to the PTY would widen its caller roster without need: this
-file-backed descriptor can be reopened by identity. The reopen is by descriptor
+Its nonnegative return is reopened exactly once through `/proc/self/fd/N`,
+and the raw number is closed. The crate's `File::from_raw_fd` allowance is
+confined to received SCM_RIGHTS descriptors. Extending that conversion to the
+PTY would widen its caller roster without need: the slave inode belongs to
+this terminal identity and can be reopened. The reopen is by descriptor
 number, not by terminal name: no `/dev/pts/N` path is resolved, so it retains
 the property the peer request was chosen for.
 
@@ -5494,8 +5505,8 @@ The complete terminal landing must prove:
   connection, so one caller's answer is not the end of the listener; a refusal
   crosses as a refusal and leaves the session where it was; a request with no
   terminating newline is one request; a flood longer than the limit is refused
-  rather than buffered; and the socket is mode 0600, which is the whole of its
-  access control and therefore the whole of what there is to prove about it;
+  rather than buffered; stock peer admission is tested before a request can
+  change the workspace, while development sockets retain mode 0600;
 - every request the parser takes, the help text names, and every request the
   client can spell parses back to what wrote it — one list, walked in both
   directions, so the two halves of the protocol cannot drift;
@@ -5512,9 +5523,8 @@ The complete terminal landing must prove:
   socket tests build their own listener, so deleting the call left the feature
   dead in the image with every test green. It is pinned in the source, as the
   terminal's selftest layers are;
-- the socket's mode is asserted against the LITERAL 0600 and not against the
-  constant under test, which passes for whatever the constant says — a socket
-  changed to 0666 shipped green before this;
+- each policy's mode is asserted against literal 0600 or 0666, and the
+  cross-UID policy separately requires the kernel human peer;
 - the conversation's deadline ends a read that a partial line would not, and
   the same read waits when the deadline has time left, so what ended it was
   the bound and not the shape of the request;
@@ -5657,17 +5667,15 @@ told, with the session's authority, whatever the incumbent said.
 
 ### Access control
 
-The socket is mode 0600 under the mode-0700 runtime directory. That is the
-whole of the access control and it is enough: `connect(2)` requires write
-permission on the socket inode, so the kernel refuses every other uid before
-any code here runs.
+The stock control socket uses the shared session policy: mode 0666 beneath
+compositor-owned directories, with exact human kernel credentials checked
+before reading a command. The public and private Wayland listeners and
+application readiness use that same policy. Bind/chmod timing grants no
+protocol access to a peer that fails admission.
 
-The private portal listener additionally asks `SO_PEERCRED`, and this one
-deliberately does not. That query answers the question the mode has already
-answered, and asking it would put a sixth module on the audited caller list of
-section 4 to buy nothing. What the mode does not cover is the instant between
-`bind` and `chmod`, and what covers that is the mode-0700 directory both
-sockets sit in — the same window the Wayland listeners already have.
+Direct development sockets remain mode 0600 in private runtime directories.
+`socket::publish` is reserved for the human td-term and td-ui-demo clients;
+compositor application evidence uses the policy-aware `publish_while`.
 
 ### One line in, one answer out
 
@@ -6083,9 +6091,9 @@ in the report answers today.
 `--terminal-authority stdin` selects the root-created private channel in place
 of `--terminal-client PATH`. Exactly one is required. Authority mode requires
 the supervised application card; that card activates its existing Wayland
-surface and never invokes a program. The image does not enable this client
-until its atomic identity, device and socket cutover. The existing direct
-launcher remains the current image and host-development path.
+surface and never invokes a program. The image selects this client through
+the paired service at UID 993.
+The direct launcher remains available for host development.
 
 Before opening the framebuffer or starting any worker, the client verifies one
 thread, identical service uid/gid columns in 1..=999, and only inherited fd
@@ -6141,3 +6149,57 @@ Worker failure always ends the paired generation, including loss of the input
 owner during startup. That failure can race the main thread's more specific
 startup diagnostic; preserving the paired lifetime takes precedence. It never
 turns an uncertain request into a retry or leaves a live unauthenticated UI.
+
+## Dedicated compositor socket ownership
+
+The stock session launches the compositor at service UID/GID 993 through
+its private td-authd pair. td-seatd gives that identity mode-0600 framebuffer
+and evdev nodes, and creates `/run/td-compositor/1000` mode 0755 below a
+root-owned parent. Human runtime `/run/user/1000` remains mode 0700.
+A human-identity boot probe requires permission denial opening every input
+node and the framebuffer. No existing descriptor survives deployment reboot.
+
+Authority-mode Wayland, control and application readiness sockets admit only
+kernel peer UID 1000 before any protocol access. Socket mode 0666 permits
+cross-UID connection, while the peer check supplies session admission.
+The existing private portal listener additionally retains its UID-1000
+check; separating that backend from applications remains a later identity
+increment. This does not yet provide secure attention or token consent.
+Host-development direct mode retains its private socket permissions.
+
+The session policy is the only additional caller of the existing peer-UID
+wrapper. Control, readiness and public Wayland paths share that policy;
+none accepts a caller-supplied identity. No new raw syscall is introduced.
+
+The physical-input boot also runs `probe-terminal-authority` as the human
+after initial application placement. It arms only with the exact
+`td.firefox-input=1` kernel token. The host supplies Super+T, waits for a new
+focused terminal window and its generation-specific private readiness socket
+(the real td-term first-frame/PTY readiness), then supplies Control+D. The
+probe requires the new window and socket to disappear while baseline windows
+remain before publishing `TD-TERMINAL-AUTHORITY-OK`. Three exact console
+markers gate the host stages. Each guest stage has 30 seconds and the
+oneshot has a 90-second backstop, including Unix connect stalls. This is a
+controlled stock-image integration regression, not adversarial process
+attestation or secure attention. Normal boots skip it without synthetic input.
+
+The human seat-access evidence checks actual read denial on the framebuffer
+and current input nodes. It does not require late-arriving nodes to have
+already received the compositor's ownership; a root-owned unreadable node
+still satisfies the privacy check. Initial seat assignment retains its
+separate ownership/readiness probe. This does not add compositor hotplug.
+
+Public Wayland, private portal, control and readiness sockets reject other
+UIDs with EOF before protocol I/O. Each Wayland listener reports its first
+rejection and at most one aggregate diagnostic per minute, including the
+latest error and the count since its previous report. Control and readiness
+peer refusals remain silent. Admission failures cannot produce an unbounded
+Wayland log stream. The controlled terminal probe deliberately rejects
+unexpected extra toplevel windows or launches, preserving the initial browser
+fixture.
+Native popups are not toplevel rows in the control layout.
+
+The terminal creates its shared-memory buffers in the parent of its own
+readiness socket. That writable client directory is independent of the
+compositor-owned display socket directory; startup and resize use the same
+client directory. A bare readiness filename without a directory is refused.

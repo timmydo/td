@@ -284,12 +284,14 @@ pub fn current_account(status: &Path, passwd: &Path) -> Result<Account, String> 
 /// variable absent here is absent from the shell whatever the terminal was
 /// started with.
 ///
-/// `control_socket` is the one value that is not a constant or a property of
-/// the account. It is threaded in rather than read from this process, so the
-/// list stays a pure function of its arguments and a test cannot be changed by
-/// the environment that runs it; the production caller reads it from its own
-/// environment, where the session's own unit put it.
-pub fn environment(account: &Account, control_socket: Option<&str>) -> Vec<(String, String)> {
+/// Socket paths come from the terminal launch configuration. They are
+/// arguments so this remains a pure function. The production caller supplies
+/// its connected Wayland path and the control path from its environment.
+pub fn environment(
+    account: &Account,
+    control_socket: Option<&str>,
+    wayland_socket: &str,
+) -> Vec<(String, String)> {
     let mut environment = vec![
         ("COLORTERM".into(), "truecolor".into()),
         ("HOME".into(), account.home.clone()),
@@ -299,7 +301,7 @@ pub fn environment(account: &Account, control_socket: Option<&str>) -> Vec<(Stri
         ("TERM".into(), "td-term".into()),
         ("TERMINFO".into(), "/etc/terminfo".into()),
         ("USER".into(), account.name.clone()),
-        ("WAYLAND_DISPLAY".into(), "wayland-0".into()),
+        ("WAYLAND_DISPLAY".into(), wayland_socket.into()),
         (
             "XDG_RUNTIME_DIR".into(),
             format!("/run/user/{}", account.uid),
@@ -778,7 +780,7 @@ pub fn selftest() -> Result<(), String> {
     if effective_uid("Name:\tsh\nUid:\t1000\t1000\t1000\t1000\n")? != 1000 {
         return Err("PTY selftest misread its own uid".into());
     }
-    let environment = environment(&account, None);
+    let environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
     let named = |name: &str| {
         let mut value = None;
         for (key, candidate) in &environment {
@@ -833,17 +835,21 @@ mod tests {
             uid: 1000,
             home: "/var/home/tester".into(),
         };
-        let without = environment(&account, None);
+        let without = environment(&account, None, "/run/td-compositor/1000/wayland-0");
         assert!(
             !without.iter().any(|(name, _)| name == "TD_CONTROL_SOCKET"),
             "a session with no control socket advertised one"
         );
-        let with = environment(&account, Some("/run/user/1000/td-control"));
+        let with = environment(
+            &account,
+            Some("/run/td-compositor/1000/td-control"),
+            "/run/td-compositor/1000/wayland-0",
+        );
         assert_eq!(
             with.iter()
                 .find(|(name, _)| name == "TD_CONTROL_SOCKET")
                 .map(|(_, value)| value.as_str()),
-            Some("/run/user/1000/td-control"),
+            Some("/run/td-compositor/1000/td-control"),
             "the shell was not told where the control socket is"
         );
         // And it is the only difference, so nothing else changed shape.
@@ -932,7 +938,7 @@ mod tests {
     #[test]
     fn the_child_environment_is_constructed_rather_than_inherited() {
         let account = account(PASSWD, 1000).unwrap();
-        let environment = environment(&account, None);
+        let environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
         let names: Vec<&str> = environment.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
@@ -963,7 +969,10 @@ mod tests {
         assert_eq!(value("USER"), "td");
         assert_eq!(value("LOGNAME"), "td");
         assert_eq!(value("XDG_RUNTIME_DIR"), "/run/user/1000");
-        assert_eq!(value("WAYLAND_DISPLAY"), "wayland-0");
+        assert_eq!(
+            value("WAYLAND_DISPLAY"),
+            "/run/td-compositor/1000/wayland-0"
+        );
         assert_eq!(value("TERMINFO"), "/etc/terminfo");
     }
 
@@ -1118,7 +1127,7 @@ mod tests {
             ],
         };
         let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account, None);
+        let mut environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
         environment.push((FIXTURE.into(), "1".into()));
         let home = std::env::temp_dir();
         let mut child = spawn(&command, &environment, &home, slave).unwrap();
@@ -1275,7 +1284,7 @@ mod tests {
             ],
         };
         let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account, None);
+        let mut environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
         environment.push((SILENT_FIXTURE.into(), "1500".into()));
         // `spawn` consumes the slave and both clones into the child's stdio,
         // so the child is the only holder and its exit is the last close.
@@ -1562,7 +1571,7 @@ mod tests {
             ],
         };
         let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account, None);
+        let mut environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
         environment.push((FIXTURE.into(), "1".into()));
         let child = spawn(&command, &environment, &std::env::temp_dir(), slave).unwrap();
 
@@ -1614,7 +1623,7 @@ mod tests {
             ],
         };
         let account = account(PASSWD, 1000).unwrap();
-        let mut environment = environment(&account, None);
+        let mut environment = environment(&account, None, "/run/td-compositor/1000/wayland-0");
         // A child that outlives this test by a wide margin, because the kill
         // is the half a self-exiting fixture cannot prove: reaping one that
         // was never signalled would simply wait for it and still pass. In

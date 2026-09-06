@@ -80,6 +80,10 @@ const MODULES: &[(&str, &str)] = &[
         "server",
         include_str!("../../../td-compositor/src/server.rs"),
     ),
+    (
+        "session",
+        include_str!("../../../td-compositor/src/session.rs"),
+    ),
     ("socket", include_str!("../../../td-compositor/src/socket.rs")),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
     ("term", include_str!("../../../td-compositor/src/term.rs")),

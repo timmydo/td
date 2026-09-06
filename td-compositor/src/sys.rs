@@ -522,10 +522,9 @@ pub fn unlock_pty(master: &impl AsRawFd) -> Result<(), String> {
 /// rather than a pointer and returns a new descriptor for the same peer the
 /// master already names, so no `/dev/pts/N` name is resolved.
 ///
-/// The returned number is adopted exactly once, through the same
-/// `/proc/self/fd/N` duplication the received-descriptor path uses: a safe
-/// `OwnedFd` conversion would be a second, differently-shaped `unsafe` surface
-/// for a descriptor this crate can reopen by identity instead.
+/// The returned number is reopened exactly once through `/proc/self/fd/N`
+/// and closed. The descriptor's inode belongs to this terminal identity.
+/// The received-file unsafe conversion remains scoped to SCM_RIGHTS.
 pub fn pty_peer(master: &impl AsRawFd) -> Result<File, String> {
     let raw = ioctl(
         master.as_raw_fd(),
@@ -1974,8 +1973,9 @@ fn reopen_and_close(fd: RawFd, options: &OpenOptions, what: &str) -> Result<File
     }
 }
 
-pub fn duplicate_received(fd: RawFd) -> Result<File, String> {
-    reopen_and_close(fd, OpenOptions::new().read(true), "received")
+/// Consume one fresh SCM_RIGHTS descriptor without another permission check.
+pub fn take_received(fd: RawFd) -> Result<File, String> {
+    ReceivedFd::adopt(fd).map(ReceivedFd::into_file)
 }
 
 /// Own one descriptor obtained from `SCM_RIGHTS` without reopening it.
@@ -2075,15 +2075,45 @@ mod tests {
         let source = File::open(&path).unwrap();
         send_with_fd(&left, b"wayland", source.as_raw_fd()).unwrap();
         let mut bytes = [0u8; 32];
-        let received = recv_with_fds(&right, &mut bytes).unwrap();
+        let mut received = recv_with_fds(&right, &mut bytes).unwrap();
         assert_eq!(received.count, 7);
         assert_eq!(bytes.get(..7).unwrap(), b"wayland");
         assert_eq!(received.fds.len(), 1);
-        let mut duplicate = duplicate_received(*received.fds.first().unwrap()).unwrap();
+        let mut duplicate = take_received(received.fds.pop().unwrap()).unwrap();
         let mut content = Vec::new();
         duplicate.read_to_end(&mut content).unwrap();
         assert_eq!(content, b"pixels");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn received_file_ownership_survives_revoked_inode_access() {
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::fs::{FileExt, PermissionsExt};
+        let (left, right) = UnixStream::pair().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "td-compositor-owned-fd-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, b"pixels").unwrap();
+        let mut source = File::open(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        source.seek(SeekFrom::Start(3)).unwrap();
+        source
+            .set_permissions(fs::Permissions::from_mode(0o000))
+            .unwrap();
+        send_with_fd(&left, b"x", source.as_raw_fd()).unwrap();
+        let mut byte = [0];
+        let mut received = recv_with_fds(&right, &mut byte).unwrap();
+        let raw = received.fds.pop().unwrap();
+        let file = take_received(raw).unwrap();
+        assert_eq!(file.as_raw_fd(), raw);
+        let mut pixels = [0; 6];
+        file.read_exact_at(&mut pixels, 0).unwrap();
+        assert_eq!(&pixels, b"pixels");
+        assert_eq!(source.stream_position().unwrap(), 3);
+        assert!(take_received(-1).is_err());
     }
 
     #[test]
