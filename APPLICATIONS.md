@@ -7986,10 +7986,18 @@ service account. The uid-1000 login path is ineligible: it moves into the
 application session cgroup, outside the paired service's leaf. This does not
 provide arbitrary fd-number assignment or named socket activation.
 
-The compositor/authd consumer and peer pidfd pinning remain unbuilt.
+The compositor consumer remains unbuilt. `td-authd` now provides the private
+transport and a `channel-check` proof path, with no operation or consent API.
 `SO_PEERCRED` on the delivered socketpair identifies its creator, not the
-eventual holder of the opposite endpoint, so descriptor delivery alone is
-not peer authentication and enables no consent path.
+eventual holder of the opposite endpoint. The transport instead pins a live
+kernel-supplied `SCM_PIDFD` and checks `SCM_CREDENTIALS` on every receive;
+another sender, even a child inheriting the stream after the greeting, is
+refused. Trusted startup must complete the greeting before any fork, worker
+startup, or descriptor delegation: the first sender is pinned, and the
+transport alone cannot recover the intended peer after early delegation. The
+root creator and configured sender uid are separate checks. See
+`td-authd/DESIGN.md` for framing, deadlines, descriptor ownership and proof.
+This enables no consent path and changes no stock service identity.
 
 #### Three things the secure path needs that the tree does not have
 

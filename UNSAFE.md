@@ -14,7 +14,7 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are FOURTEEN
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are SIXTEEN
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
@@ -33,7 +33,10 @@ it uses is `SNDRV_PCM_ACCESS_RW_INTERLEAVED` and that mode has none. It is
 the first surface to pin its allowance to the entry point rather than the
 module — see §13 for the escape a module-level one permits. The fourteenth,
 `td-editor`, also uses function-level allowances: one syscall instruction and
-one adoption site for freshly installed descriptors, with no mapping.
+one adoption site for freshly installed descriptors, with no mapping. The
+fifteenth, `td-secret`, shares the portal transport. The sixteenth,
+`td-authd`, confines kernel sender credentials and pidfds to one instruction
+and one descriptor-adoption site.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -70,6 +73,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport for bounded credential replies |
+| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -1895,7 +1899,7 @@ adoption and no mapping — this is the plain shape §§1–5 and 7–9 have.
 `ioctl(2)` is,** so the surface is the (level, option) PAIR rather than the
 number in `rax`: `SOL_SOCKET` (1) and `SO_PEERCRED` (17), both pinned by
 value, with the 12-byte length pinned too and the length the kernel writes
-back checked rather than assumed. `SO_PASSCRED` is 18 and `setsockopt(2)` is
+back checked rather than assumed. `SO_PASSCRED` is 16 and `setsockopt(2)` is
 syscall 54 — the neighbours a slip reaches — and the confinement tests refuse
 both by name. A second option, or `setsockopt`, is an amendment here.
 
@@ -2180,3 +2184,35 @@ wrapper. It discards every received fd immediately, counts them only for
 bounded D-Bus decoding, and answers calls with InvalidArgs rather than
 terminating the service. Oversized frames retain the existing bounded drain.
 This receive-and-discard pair is confined to secret.rs and pinned in tests.
+
+## 16. `td-authd` — the secure-attention authority channel
+
+The initial private-channel surface has four x86-64 Linux syscalls through one
+function-scoped instruction: recvmsg(47), setsockopt(54), getsockopt(55), and
+poll(7). Another function-scoped allowance adopts freshly installed nonnegative
+descriptors into OwnedFd. Safe std owns byte sends, stdin duplication, socket
+timeouts/shutdown, descriptor metadata and every close. Other architectures
+are refused. This prerequisite enables no consent or privileged operation.
+
+The socket options are fixed to SOL_SOCKET(1), SO_PASSCRED(16)=1,
+SO_PASSPIDFD(76)=1, and SO_PEERCRED(17) with an exact twelve-byte ucred result.
+The latter authenticates the root socketpair creator, not its later peer.
+Each receive instead admits one SCM_CREDENTIALS(2) and one SCM_PIDFD(4).
+The kernel supplies the message sender's identity. Its uid must match the
+configured peer, and a retained live pidfd's device/inode identity must match
+each subsequent receive. A PID is never used to authenticate or signal it.
+
+Recvmsg fixes MSG_CMSG_CLOEXEC(0x40000000), one borrowed byte slice, and 128
+aligned control bytes. Recognizable SCM_RIGHTS(1) and SCM_PIDFD descriptors
+are immediately owned, including after a policy refusal while framing remains
+trustworthy. Truncation, unsupported records, duplicate/missing identities,
+invalid fields or bounds drop all delivered owners. No received descriptor is
+exposed beyond the private channel implementation. Only the admitted peer
+pidfd remains open. Poll uses one borrowed pidfd, POLLIN(1), and timeout zero;
+any event or error refuses liveness, including when stream bytes remain.
+
+Confinement tests inventory the complete production source, pin keyword counts
+without prose slack, function-only allowances, both bodies, ABI layouts, all
+syscall and option values and production callers. A fifth syscall, new option,
+caller, descriptor consumer or allowance amends this section and
+td-authd/DESIGN.md in the same landing.

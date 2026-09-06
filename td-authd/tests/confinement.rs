@@ -1,0 +1,102 @@
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+use std::path::Path;
+
+#[test]
+fn the_production_source_and_raw_boundary_are_closed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<String> = std::fs::read_dir(root.join("src"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            assert!(
+                entry.file_type().unwrap().is_file(),
+                "nested source directory"
+            );
+            entry.file_name().into_string().unwrap()
+        })
+        .collect();
+    files.sort();
+    assert_eq!(files, ["channel.rs", "main.rs", "sys.rs"]);
+    for (name, count) in [("main.rs", 1), ("channel.rs", 0), ("sys.rs", 4)] {
+        let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
+        assert_eq!(source.matches("unsafe").count(), count, "{name}");
+        // The first sender is authoritative only when trusted startup has
+        // not delegated its inherited endpoint before the greeting.
+        for forbidden in [
+            "::Command",
+            "::thread",
+            ".spawn(",
+            ".exec(",
+            "fork(",
+            "cfg_attr",
+            "/*",
+            "include!",
+            "include_str!",
+            "include_bytes!",
+        ] {
+            assert!(!source.contains(forbidden), "{name}: {forbidden}");
+        }
+    }
+    let main = include_str!("../src/main.rs");
+    assert!(main.starts_with("#![deny(unsafe_code)]"));
+    assert_eq!(main.matches("mod channel;").count(), 1);
+    assert_eq!(main.matches("mod sys;").count(), 1);
+    let raw = include_str!("../src/sys.rs");
+    assert!(raw.contains("#[allow(unsafe_code)]\nfn syscall5("));
+    assert!(raw.contains("#[allow(unsafe_code)]\nfn adopt("));
+    assert_eq!(raw.matches("core::arch::asm!").count(), 1);
+    assert_eq!(raw.matches("OwnedFd::from_raw_fd").count(), 1);
+    for constant in [
+        "const SYS_POLL: usize = 7;",
+        "const SYS_RECVMSG: usize = 47;",
+        "const SYS_SETSOCKOPT: usize = 54;",
+        "const SYS_GETSOCKOPT: usize = 55;",
+        "const SO_PASSCRED: usize = 16;",
+        "const SO_PASSPIDFD: usize = 76;",
+        "const SO_PEERCRED: usize = 17;",
+        "const SOL_SOCKET: usize = 1;",
+        "const SCM_PIDFD: i32 = 4;",
+        "const SCM_CREDENTIALS: i32 = 2;",
+        "const SCM_RIGHTS: i32 = 1;",
+        "const CONTROL: usize = 128;",
+        "const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;",
+    ] {
+        assert!(raw.contains(constant), "{constant}");
+    }
+    assert_eq!(raw.matches("const SYS_").count(), 4);
+    assert_eq!(raw.matches("syscall5(").count(), 5);
+    assert_eq!(raw.matches("adopt(").count(), 2);
+    let channel = include_str!("../src/channel.rs");
+    assert_eq!(channel.matches("sys::prepare(").count(), 1);
+    assert_eq!(channel.matches("sys::receive(").count(), 1);
+    assert_eq!(channel.matches("sys::alive(").count(), 2);
+    assert!(channel.contains("Self::connect(stream, expected_uid, 0)"));
+    assert_eq!(channel.matches("Self::connect(").count(), 1);
+    assert_eq!(channel.matches("fn connect(").count(), 1);
+    assert!(!main.contains("sys::"));
+    // Whole-source pin makes argument layout and adoption provenance an edit
+    // to the review record rather than slack in keyword counts.
+    let digest = raw.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+    });
+    assert_eq!(digest, RAW_FINGERPRINT);
+    // Pin startup as well as raw code: aliases can evade API-name scans.
+    assert_eq!(
+        fingerprint(main),
+        0x4502604364ba3cb7,
+        "main.rs: production startup changed"
+    );
+    assert_eq!(
+        fingerprint(channel),
+        0x231d315ff835e41a,
+        "channel.rs: production startup changed"
+    );
+}
+
+const RAW_FINGERPRINT: u64 = 0x42363c39df98214d;
+
+fn fingerprint(source: &str) -> u64 {
+    source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+    })
+}

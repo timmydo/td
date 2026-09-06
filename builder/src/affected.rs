@@ -338,6 +338,7 @@ const DQUOTE: u8 = 0x22;
 /// tree, so an entry cannot be quietly omitted.
 const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-audio/src", "recipes/src/recipes/td-audio.rs"),
+    ("td-authd/src", "recipes/src/recipes/td-authd.rs"),
     ("td-boot/src", "recipes/src/recipes/td-boot.rs"),
     ("td-busd/src", "recipes/src/recipes/td-busd.rs"),
     ("td-compositor/src", "recipes/src/recipes/td-compositor.rs"),
@@ -1415,6 +1416,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         "td-seatd/*|td-seatd/src/*|td-seatd/Cargo.toml|td-seatd/Cargo.lock|td-compositor/*|td-compositor/src/*|td-compositor/Cargo.toml|td-compositor/Cargo.lock",
         p,
     ) {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
+    if p.starts_with("td-authd/") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");

@@ -168,6 +168,7 @@ mod tests {
     fn every_direct_target_rust_recipe_uses_the_global_profile_and_companion_step() {
         let expected = [
             "td-audio",
+            "td-authd",
             "td-boot",
             "td-busd",
             "td-compositor",
