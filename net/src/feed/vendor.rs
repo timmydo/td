@@ -1,6 +1,8 @@
 //! Resolve recipe-owned vendor jobs and prepare private caches without egress.
 use super::*;
 
+mod metadata;
+
 const MAX_JOBS: usize = 128;
 const MAX_PLAN_BYTES: u64 = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -184,19 +186,6 @@ fn recipe_jobs(root: &Path, target: Option<&str>) -> Result<Vec<Job>, String> {
     parse_jobs(&command_text(command, "vendor planner", MAX_PLAN_BYTES)?)
 }
 
-fn extract_metadata(
-    archive: &Path,
-    member: &str,
-    destination: &Path,
-    limit: u64,
-) -> Result<(), String> {
-    let mut command = Command::new("tar");
-    command.arg("-xOzf").arg(archive).arg("--").arg(member);
-    let label = format!("tar metadata {} member {member}", archive.display());
-    let text = command_text(command, &label, limit)?;
-    write_atomic(destination, text.as_bytes())
-}
-
 fn source_pin<'a>(job: &Job, pins: &'a [SourcePin]) -> Result<Option<&'a SourcePin>, String> {
     let (file, checksum) = match &job.source {
         Source::Local => return Ok(None),
@@ -356,23 +345,11 @@ fn consume_job(
                 let src = stage.join("src").join(&package);
                 std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
                 let archive = work.join(&pin.file);
-                // Keep the original for repeat preparation and warm-tool probes. Only
-                // the two bounded metadata members enter the preparation tree;
-                // tar never gets a destination in which to create archive paths.
+                let selected = metadata::read_pinned(&archive, &pin.sha256, &package)?;
                 let lock_path = src.join("Cargo.lock");
                 let manifest = src.join("Cargo.toml");
-                extract_metadata(
-                    &archive,
-                    &format!("{package}/Cargo.lock"),
-                    &lock_path,
-                    MAX_CARGO_LOCK_BYTES,
-                )?;
-                extract_metadata(
-                    &archive,
-                    &format!("{package}/Cargo.toml"),
-                    &manifest,
-                    MAX_MANIFEST_BYTES,
-                )?;
+                write_atomic(&lock_path, selected.lock.as_bytes())?;
+                write_atomic(&manifest, selected.manifest.as_bytes())?;
                 detach_from_workspace(&manifest)?;
                 lock_path
             }
@@ -495,7 +472,7 @@ mod tests {
     use super::*;
     use crate::feed::tests::ConsumerServer;
 
-    fn scratch(tag: &str) -> PathBuf {
+    pub(super) fn scratch(tag: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "td-vendor-{tag}-{}-{}",
@@ -839,15 +816,17 @@ mod tests {
         )
         .unwrap();
         let archive = dir.join("fixture-1.0.0.crate");
-        assert!(Command::new("tar")
-            .arg("-czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(dir.join("source"))
-            .arg("fixture-1.0.0")
-            .status()
-            .unwrap()
-            .success());
+        let mut tar = Vec::new();
+        for member in ["Cargo.lock", "Cargo.toml", "not-preparation-state"] {
+            metadata::tests::entry(
+                &mut tar,
+                &format!("fixture-1.0.0/{member}"),
+                b'0',
+                &std::fs::read(source.join(member)).unwrap(),
+            );
+        }
+        tar.resize(tar.len() + 1024, 0);
+        std::fs::write(&archive, metadata::tests::gzip(&tar)).unwrap();
         let pin = SourcePin {
             key: "fixture-source".into(),
             file: "fixture-1.0.0.crate".into(),
@@ -880,14 +859,6 @@ mod tests {
             b"dependency"
         );
         assert!(!cv.join("src/fixture-1.0.0/not-preparation-state").exists());
-        assert!(extract_metadata(
-            &archive,
-            "fixture-1.0.0/Cargo.lock",
-            &dir.join("too-small"),
-            4
-        )
-        .is_err());
-        assert!(!dir.join("too-small").exists());
         assert_eq!(feed.count(), 2);
         drop(feed);
         consume_job(

@@ -394,15 +394,25 @@ crate uses the lock shipped in its pinned archive, matching ordinary warming.
 Consume stages a fresh private generated cache for each recipe. It reuses
 verified private archives before contacting the host and obtains missing bytes
 only from the selected feed. For a packaged crate, it retains the verified
-original archive for repeat preparation and existing warm-tool probes, and
-reads only bounded Cargo.lock
-and Cargo.toml members through tar's stdout; preparation does not extract the
-archive's arbitrary paths into the filesystem. The tar and planner subprocesses
-have bounded output and a two-minute deadline. This increment requires `tar` on the consumer, in addition to the
-builder/evaluator prerequisite; the stock image does not yet expose it.
-Missing tar is a named preparation error. The existing target-built build
-path authenticates and extracts its source archive from the source cache;
-`consume sources` supplies that cache separately.
+original archive for repeat preparation and existing warm-tool probes. It reads
+only bounded Cargo.lock and Cargo.toml members with td's native gzip and metadata readers. Preparation
+requires no tar or gzip executable and creates no archive-supplied paths.
+The compressed input is a no-follow regular-file read bounded to 64 MiB and
+reverified against the source pin from the same bytes the decoder receives.
+The shared gzip decoder checks CRC/length and limits expanded output to
+256 MiB, 4,096 members and 1,048,576 DEFLATE blocks. Compressed and expanded
+buffers coexist (up to 320 MiB of data), plus up to 17 MiB of selected text.
+The tar metadata reader accepts ordinary GNU/USTAR regular-file and directory headers, including
+USTAR prefixes, with at most 32,768 headers. It requires the GNU/USTAR magic
+and a total length aligned to 512-byte blocks. It checks header checksums,
+nonempty octal sizes, member bounds, zero member padding and both zero end
+markers; links, GNU/PAX extension records, absolute/traversing paths and duplicate selected members are refused.
+A future pin needing another header form requires extending this reader.
+Cargo.lock and Cargo.toml must be UTF-8 and fit their respective 16 MiB and
+1 MiB limits. The planner subprocess retains bounded output and a two-minute
+deadline. The existing target-built build path authenticates and extracts its
+source archive from the source cache; `consume sources` supplies that cache
+separately.
 
 Only a complete registry set with the selected lock digest receives the
 `.warm-complete` marker. A changed local lock refuses publication. Preparation
