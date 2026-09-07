@@ -362,6 +362,32 @@ TD_EDITOR_TEST_WAYLAND=/absolute/path/to/weston-socket cargo test --frozen --man
 This waits for actual frame completion. The ordinary tests need no display
 and check transferred pool pixels and lifecycle behavior with Unix sockets.
 
+For the production editor/control-worker acceptance test, no existing display
+is needed. Supply an absolute Weston executable path and the matching
+upstream build-tree `test-plugin.so` (normally not installed). The test starts
+and reaps its own headless Pixman/kiosk compositor and editor:
+
+```text
+TD_TEST_TRUSTED_ROOT=1 \
+TD_EDITOR_TEST_WESTON=/absolute/path/to/weston \
+TD_EDITOR_TEST_WESTON_MODULE=/absolute/path/to/test-plugin.so \
+cargo test --frozen --manifest-path td-editor/Cargo.toml --test control_process \
+  disposable_weston_runs_the_production_editor_and_control_workers -- --ignored
+```
+
+This was exercised with Weston 10.0.2 and its unmodified upstream test plugin.
+That plugin provides a test seat: stock 10.0.2 headless advertises none, and
+the file window deliberately requires a seat. Use the matching Weston source
+and build ABI; loading an unrelated module is not supported. The test plugin
+exposes privileged test operations and belongs only on this private disposable
+socket, never your desktop. Kiosk mode avoids desktop-shell helper processes.
+The test supplies no user configuration, display environment, GPU backend,
+Xwayland or network backend, and disables the idle timeout. It checks callbacks
+at 1024x768, keyboard readiness and decoded Find/cancel, undo/redo, spelling/save
+jobs, exact BOM/CRLF output and foreground/cleanup behavior. It does not inject
+physical input or prove GPU, scanout, captured pixels, or td-jail integration.
+Weston is optional host test tooling, not an editor or ordinary-gate dependency.
+
 The default process-level control tests launch the actual editor executable
 against a bounded test Wayland peer and use only its private control socket.
 The trusted-root flag supplies the endpoint's trusted-ancestor ownership

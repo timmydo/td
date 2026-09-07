@@ -537,6 +537,11 @@ impl Window {
         self.bind("wl_compositor", 4, COMPOSITOR)?;
         self.bind("wl_shm", 1, SHM)?;
         self.bind("xdg_wm_base", 1, WM)?;
+        // Fill fixed IDs 7..9 before publishing dynamic IDs starting at 10.
+        // libwayland's server object map refuses gaps in new client IDs.
+        self.connection.words(COMPOSITOR, 0, &[SURFACE])?;
+        self.connection.words(WM, 2, &[XDG_SURFACE, SURFACE])?;
+        self.connection.words(XDG_SURFACE, 1, &[TOPLEVEL])?;
         if let Some(version) = self
             .globals
             .values()
@@ -552,10 +557,7 @@ impl Window {
             }
             self.notify("No wl_seat v5+; scratch input unavailable");
         }
-        self.connection.words(COMPOSITOR, 0, &[SURFACE])?;
         self.initialize_clipboard()?;
-        self.connection.words(WM, 2, &[XDG_SURFACE, SURFACE])?;
-        self.connection.words(XDG_SURFACE, 1, &[TOPLEVEL])?;
         for (opcode, value) in [
             (
                 2,
@@ -13060,6 +13062,64 @@ mod tests {
         assert!(ep(None, Some("relative"), None).is_err());
         assert!(ep(None, None, Some("relative")).is_err());
         assert!(ep(None, Some(""), Some("/tmp")).is_err());
+    }
+
+    #[test]
+    fn initial_constructors_fill_reserved_ids_before_dynamic_seat_and_clipboard() {
+        // Scratch construction uses the same initialize path as file windows.
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut w = Window::new(stream, std::env::temp_dir()).unwrap();
+        for event in [
+            global(1, "wl_compositor", 4),
+            global(2, "wl_shm", 1),
+            global(3, "xdg_wm_base", 1),
+            global(4, "wl_seat", 7),
+            global(5, "wl_data_device_manager", 3),
+        ] {
+            w.event(event).unwrap();
+        }
+        w.event(message(SYNC, 0, &[0])).unwrap();
+        let manager = w.clipboard.manager.unwrap().1;
+        let (requests, descriptors) = drain(&peer);
+        assert!(descriptors.is_empty());
+        let mut created = Vec::new();
+        for request in requests {
+            let mut payload = Cursor::new(&request.payload);
+            if request.object == REGISTRY {
+                payload.u32().unwrap();
+                payload.string().unwrap();
+                payload.u32().unwrap();
+                created.push(payload.u32().unwrap());
+                payload.finish().unwrap();
+            } else if matches!(
+                (request.object, request.opcode),
+                (COMPOSITOR, 0) | (WM, 2) | (XDG_SURFACE, 1)
+            ) || (request.object == manager && request.opcode == 1)
+            {
+                created.push(payload.u32().unwrap());
+                if (request.object, request.opcode) == (WM, 2)
+                    || (request.object == manager && request.opcode == 1)
+                {
+                    payload.u32().unwrap();
+                }
+                payload.finish().unwrap();
+            } else {
+                assert!(
+                    matches!(
+                        (request.object, request.opcode),
+                        (TOPLEVEL, 2 | 3) | (SURFACE, 6)
+                    ),
+                    "unexpected initialization request"
+                );
+                if request.object == TOPLEVEL {
+                    payload.string().unwrap();
+                }
+                payload.finish().unwrap();
+            }
+        }
+        assert_eq!(created, (4..=12).collect::<Vec<_>>());
     }
 
     #[test]

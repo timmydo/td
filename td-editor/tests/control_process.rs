@@ -89,6 +89,22 @@ fn field<'a>(state: &'a str, name: &str) -> Option<&'a str> {
         (key == name).then_some(value)
     })
 }
+fn quit_reply_valid(response: &Result<String>) -> bool {
+    match response {
+        Ok(reply) => reply == "ok\tclosed",
+        Err(error) => error.starts_with("transport: "),
+    }
+}
+
+#[test]
+fn quit_reply_requires_closed_or_transport_loss() {
+    assert!(quit_reply_valid(&Ok("ok\tclosed".into())));
+    assert!(quit_reply_valid(&Err("transport: unexpected EOF".into())));
+    for reply in ["ok\t", "ok\tdialog\t1", "error\tunavailable\t-"] {
+        assert!(!quit_reply_valid(&Ok(reply.into())));
+    }
+    assert!(!quit_reply_valid(&Err("response identity".into())));
+}
 fn send(stream: &mut UnixStream, object: u32, opcode: u16, payload: &[u8]) -> Result<()> {
     let size = u32::try_from(payload.len() + 8).map_err(|_| "display size")?;
     if size > u16::MAX as u32 || !size.is_multiple_of(4) {
@@ -132,6 +148,7 @@ enum Object {
     Toplevel,
     Pool,
     Buffer,
+    Callback,
 }
 #[derive(Default)]
 struct DisplayStats {
@@ -178,6 +195,7 @@ impl Display {
                 .map_err(|e| e.to_string())?;
             let lifetime = Instant::now() + Duration::from_secs(30);
             let mut objects = BTreeMap::from([(1, Object::Display)]);
+            let mut creation_frontier = 2;
             let mut pending = Vec::new();
             let mut input = [0; 4096];
             let mut stats = DisplayStats::default();
@@ -225,13 +243,40 @@ impl Display {
                     let payload = pending[8..size].to_vec();
                     pending.drain(..size);
                     let opcode = (header & 0xffff) as u16;
-                    match (
-                        objects
-                            .get(&object)
-                            .copied()
-                            .ok_or("unknown display object")?,
-                        opcode,
-                    ) {
+                    let kind = objects
+                        .get(&object)
+                        .copied()
+                        .ok_or("unknown display object")?;
+                    // Only the fixture's advertised/supported interfaces.
+                    // Unknown requests fail below; grow both tables together.
+                    let constructor = match (kind, opcode) {
+                        (Object::Registry, 0) => Some(word(
+                            &payload,
+                            payload.len().checked_sub(4).ok_or("bind size")?,
+                        )?),
+                        (Object::Display, 0 | 1)
+                        | (Object::Compositor, 0)
+                        | (Object::Seat, 0)
+                        | (Object::Wm, 2)
+                        | (Object::XdgSurface, 1)
+                        | (Object::Shm, 0)
+                        | (Object::Pool, 0)
+                        | (Object::Surface, 3) => Some(word(&payload, 0)?),
+                        _ => None,
+                    };
+                    if let Some(id) = constructor {
+                        // Match libwayland's fresh-ID frontier, including callbacks.
+                        // Lower IDs may be reused after their delete_id event.
+                        if id == 0 || id > creation_frontier || objects.contains_key(&id) {
+                            return Err(format!(
+                                "invalid new object {id}; frontier {creation_frontier}"
+                            ));
+                        }
+                        if id == creation_frontier {
+                            creation_frontier += 1;
+                        }
+                    }
+                    match (kind, opcode) {
                         (Object::Display, 1) => {
                             let registry = word(&payload, 0)?;
                             objects.insert(registry, Object::Registry);
@@ -246,8 +291,10 @@ impl Display {
                         }
                         (Object::Display, 0) => {
                             let sync = word(&payload, 0)?;
+                            objects.insert(sync, Object::Callback);
                             send(&mut stream, sync, 0, &words(&[0]))?;
                             send(&mut stream, 1, 1, &words(&[sync]))?;
+                            objects.remove(&sync);
                         }
                         (Object::Registry, 0) => {
                             let kind = match word(&payload, 0)? {
@@ -257,8 +304,7 @@ impl Display {
                                 4 => Object::Seat,
                                 _ => return Err("unexpected global bind".into()),
                             };
-                            let id =
-                                word(&payload, payload.len().checked_sub(4).ok_or("bind size")?)?;
+                            let id = constructor.ok_or("missing bind constructor")?;
                             objects.insert(id, kind);
                             if matches!(kind, Object::Shm) {
                                 send(&mut stream, id, 0, &words(&[1]))?;
@@ -313,7 +359,11 @@ impl Display {
                             attached = Some(word(&payload, 0)?);
                         }
                         (Object::Surface, 3) => {
+                            if callback.is_some() {
+                                return Err("fixture supports one pending frame callback".into());
+                            }
                             callback = Some(word(&payload, 0)?);
+                            objects.insert(word(&payload, 0)?, Object::Callback);
                         }
                         (Object::Surface, 6) if !configured => {
                             if toplevel == 0 || xdg == 0 {
@@ -339,6 +389,7 @@ impl Display {
                             if let Some(id) = callback.take() {
                                 send(&mut stream, id, 0, &words(&[1]))?;
                                 send(&mut stream, 1, 1, &words(&[id]))?;
+                                objects.remove(&id);
                                 stats.callbacks += 1;
                             }
                             if let Some(buffer) = newly_attached.filter(|buffer| *buffer != 0) {
@@ -530,10 +581,13 @@ impl EditorProcess {
         ));
     }
     fn rendered(&mut self) {
+        self.rendered_at(640, 480);
+    }
+    fn rendered_at(&mut self, width: u32, height: u32) {
         let state = self.ok("state");
         let generation = field(&state, "window-generation").unwrap();
         let frame = self.ok(&format!("wait-frame\t{generation}"));
-        assert!(frame.ends_with(",640,480,1"), "{frame}");
+        assert!(frame.ends_with(&format!(",{width},{height},1")), "{frame}");
         assert!(
             frame.split(',').next().unwrap().parse::<u64>().unwrap()
                 >= generation.parse::<u64>().unwrap()
@@ -542,10 +596,8 @@ impl EditorProcess {
     fn quit(&mut self) {
         // Shutdown may lose the last transport reply, but a received
         // protocol refusal must never be mistaken for successful quit.
-        match self.request("quit") {
-            Ok(reply) => assert_eq!(reply, "ok\t"),
-            Err(error) => assert!(error.starts_with("transport: "), "{error}"),
-        }
+        let reply = self.request("quit");
+        assert!(quit_reply_valid(&reply), "{reply:?}");
         assert!(
             self.exit().success(),
             "{}",
@@ -564,11 +616,171 @@ impl EditorProcess {
         }
     }
 }
+
 impl Drop for EditorProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+struct WestonProcess {
+    child: Child,
+    directory: PathBuf,
+}
+impl WestonProcess {
+    fn diagnostics(&self) -> String {
+        format!(
+            "Weston log: {}\nWeston stderr: {}",
+            std::fs::read_to_string(self.directory.join("weston.log")).unwrap_or_default(),
+            std::fs::read_to_string(self.directory.join("weston-stderr")).unwrap_or_default()
+        )
+    }
+}
+impl Drop for WestonProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if std::thread::panicking() {
+            eprintln!("{}", self.diagnostics());
+        }
+    }
+}
+
+fn display_roundtrip(mut stream: UnixStream) {
+    let deadline = Instant::now() + TIMEOUT;
+    send(&mut stream, 1, 0, &words(&[2])).unwrap();
+    let mut reply = [0; 12];
+    read_until(&mut stream, &mut reply, deadline).unwrap();
+    assert_eq!(word(&reply, 0).unwrap(), 2, "display sync callback");
+    assert_eq!(word(&reply, 4).unwrap(), 12 << 16, "display sync schema");
+}
+
+#[test]
+#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+fn disposable_weston_runs_the_production_editor_and_control_workers() {
+    let executable = PathBuf::from(
+        std::env::var_os("TD_EDITOR_TEST_WESTON").expect("explicit Weston executable"),
+    );
+    let module = PathBuf::from(
+        std::env::var_os("TD_EDITOR_TEST_WESTON_MODULE")
+            .expect("explicit matching upstream Weston test-plugin"),
+    );
+    assert!(
+        executable.is_absolute(),
+        "absolute Weston executable required"
+    );
+    assert!(
+        module.is_absolute(),
+        "absolute matching Weston test module required"
+    );
+    let directory = Directory::new();
+    let display = directory.0.join("wayland");
+    let log = directory.0.join("weston.log");
+    let mut module_arg = std::ffi::OsString::from("--modules=");
+    module_arg.push(&module);
+    let mut log_arg = std::ffi::OsString::from("--log=");
+    log_arg.push(&log);
+    let mut weston = WestonProcess {
+        directory: directory.0.clone(),
+        child: Command::new(executable)
+            .env_clear()
+            .env("XDG_RUNTIME_DIR", &directory.0)
+            .args([
+                "--backend=headless-backend.so",
+                "--use-pixman",
+                "--shell=kiosk-shell.so",
+                "--no-config",
+                "--width=1024",
+                "--height=768",
+                "--idle-time=0",
+                "--socket=wayland",
+            ])
+            .arg(module_arg)
+            .arg(log_arg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(directory.0.join("weston-stderr")).unwrap())
+            .spawn()
+            .unwrap(),
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    let ready = loop {
+        if let Ok(stream) = UnixStream::connect(&display) {
+            break stream;
+        }
+        assert!(
+            weston.child.try_wait().unwrap().is_none(),
+            "{}",
+            weston.diagnostics()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "Weston startup timeout: {}",
+            weston.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    display_roundtrip(ready);
+    let file = directory.0.join("-draft with spaces.txt");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"\xef\xbb\xbfone\r\nwrng\r\n").unwrap();
+    std::fs::write(&dictionary, b"one\nwrong\n").unwrap();
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.rendered_at(1024, 768);
+    let deadline = Instant::now() + TIMEOUT;
+    let state = loop {
+        let state = editor.ok("state");
+        if field(&state, "key-ready") == Some("1") {
+            break state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "keyboard readiness: {state}; {}",
+            editor.ok("prompt-state")
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let token = field(&state, "input-generation").unwrap();
+    editor.ok(&format!("key\t1\t0\t{token}\t432d66")); // Native Ctrl+F.
+    let prompt = editor.ok("prompt-state");
+    assert_eq!(field(&prompt, "prompt"), Some("find-forward"));
+    let token = field(&prompt, "input-generation").unwrap();
+    editor.ok(&format!(
+        "prompt-answer\t1\t0\t{token}\tfind-forward\tcancel"
+    ));
+    assert_eq!(field(&editor.ok("prompt-state"), "prompt"), Some("none"));
+    editor.ok("replace\t1\t0\t77726e67\t77726f6e67");
+    editor.ok("undo\t1\t1");
+    assert!(editor
+        .ok("text\t1\t2\t0\t100")
+        .contains(&td_editor::control::hex(b"one\nwrng\n")));
+    editor.ok("redo\t1\t2");
+    assert!(editor
+        .ok("text\t1\t3\t0\t100")
+        .ends_with(&td_editor::control::hex(b"one\nwrong\n")));
+    let spelling = editor.job("check-spelling\t1\t3");
+    let scan = spelling.split(',').nth(4).unwrap();
+    assert_eq!(
+        editor.ok(&format!("spelling-results\t1\t3\t{scan}\t0\t10")),
+        format!("1\t3\t{scan}\tcomplete\t0\t0\t2\t0\t0\t0\t-")
+    );
+    editor.rendered_at(1024, 768);
+    assert!(editor.job("save\t1\t3").contains(",save,1,3,"));
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"\xef\xbb\xbfone\r\nwrong\r\n"
+    );
+    assert!(
+        editor.child.try_wait().unwrap().is_none(),
+        "Save must not exit the editor"
+    );
+    editor.quit();
+    display_roundtrip(UnixStream::connect(&display).unwrap());
+    assert!(
+        weston.child.try_wait().unwrap().is_none(),
+        "Editor quit must not stop Weston"
+    );
 }
 
 #[test]

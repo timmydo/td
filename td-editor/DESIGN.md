@@ -1241,8 +1241,12 @@ leaves a presentation-only window with a notice; this scratch-mode exception doe
 weaken the version-1 required-seat contract below. Other globals are ignored,
 subject to 128 live registry entries and 256 bytes per interface name.
 Client IDs are dense in a 128-slot table and are reused only after delete_id;
-object exhaustion produces a diagnostic. A 16 KiB read buffer feeds a 128 KiB
-pending-byte budget and at most 256 messages are processed before checking
+object exhaustion produces a diagnostic.
+Initial constructors publish the fixed IDs 4 through 9 in order before
+dynamic seat and clipboard IDs starting at 10. Reserving a slot locally does
+not create it in libwayland's server object map: a fresh-ID gap is refused.
+A 16 KiB read buffer feeds a 128 KiB pending-byte budget and at most 256
+messages are processed before checking
 redraw/close again. Invalid events and removal of the bound compositor, SHM
 or xdg-shell global disconnect
 with a diagnostic. The first buffer must be submitted within 20 seconds of
@@ -2147,6 +2151,23 @@ an accompanying fixture update. It emits callbacks/releases but
 deliberately discards SHM descriptors. Existing transport/pixel tests own
 the mapped-buffer oracle. This process proof neither substitutes for a real
 compositor nor proves GPU, jail or caller `$EDITOR` integration.
+
+The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`
+test requires explicit absolute paths to a Weston executable and its matching
+upstream `test-plugin.so`. It starts an owned headless Pixman/kiosk compositor
+with a private runtime/socket, an empty inherited environment and no user
+configuration. The upstream plugin supplies the test seat; stock Weston 10.0.2
+headless has no seat and the file-window required-seat policy remains intact.
+The test checks 1024x768 frame callbacks, real keyboard-map/focus readiness,
+decoded remote Find and prompt cancellation, editing/undo/redo, spelling/save
+workers, exact BOM/CRLF bytes, foreground lifetime and clean control shutdown.
+Child guards reap the editor before Weston before removing the fixture.
+The native constructor-order regression and the synthetic peer's fresh-ID
+frontier run without Weston in the ordinary gate. Weston and its test plugin
+are host test tooling only, never Cargo dependencies or shipped artifacts.
+This proves real-compositor protocol/callback interoperability, not physical
+input injection, scanout/pixel correctness, GPU rendering, or td-mail/jail
+integration. See README for the explicit opt-in invocation.
 
 The safe `control` library now supplies the one-frame decoder/encoder,
 `state`/`text` queries and a bounded revision-checked editing subset. It
