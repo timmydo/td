@@ -28,6 +28,7 @@ const LOAD_EXTERNAL: u32 = 0x167;
 const VERIFY_SIGNATURE: u32 = 0x177;
 const SEALED_ATTRIBUTES: u32 = 0x492;
 pub const MAX_PACKET: usize = 4096;
+const MAX_BOUND_KEY: usize = 4096;
 
 pub trait Transport {
     fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String>;
@@ -186,6 +187,46 @@ impl SealedKey {
     }
 }
 
+/// A sealed child whose storage primary is personalized by enrollment metadata.
+pub struct BoundKey {
+    binding: [u8; 32],
+    key: SealedKey,
+}
+
+impl BoundKey {
+    /// Unverified disk metadata until a successful unseal checks the payload.
+    pub fn uid(&self) -> u32 {
+        self.key.uid
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = b"TDBOUND1".to_vec();
+        bytes.extend_from_slice(&self.binding);
+        put_blob(&mut bytes, &self.key.encode()?)?;
+        if bytes.len() > MAX_BOUND_KEY {
+            return Err("oversized bound TPM key".into());
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_BOUND_KEY {
+            return Err("oversized bound TPM key".into());
+        }
+        let mut reader = Reader(bytes);
+        if reader.take(8)? != b"TDBOUND1" {
+            return Err("invalid bound TPM key format".into());
+        }
+        let binding = reader
+            .take(32)?
+            .try_into()
+            .map_err(|_| "short metadata binding")?;
+        let key = SealedKey::decode(reader.blob()?)?;
+        reader.end()?;
+        Ok(Self { binding, key })
+    }
+}
+
 pub struct Client<T: Transport> {
     transport: T,
     handles: Vec<u32>,
@@ -248,7 +289,8 @@ impl<T: Transport> Client<T> {
             ticket.end()
         })();
         // Repeated assertions must not exhaust the TPM's transient object slots.
-        let flushed = self.call(FLUSH_CONTEXT, &[handle], None, &[], false)
+        let flushed = self
+            .call(FLUSH_CONTEXT, &[handle], None, &[], false)
             .and_then(|(_, out)| Reader(&out).end());
         if flushed.is_ok() {
             self.handles.retain(|value| *value != handle);
@@ -369,15 +411,21 @@ impl<T: Transport> Client<T> {
         result
     }
 
-    fn parent(&mut self) -> Result<u32, String> {
+    fn parent(&mut self, binding: Option<&[u8; 32]>) -> Result<(u32, Vec<u8>), String> {
         let mut public = Vec::new();
         put16(&mut public, 0x23); // ECC
         put16(&mut public, SHA256);
         put32(&mut public, 0x30472); // fixed, generated, restricted decrypt parent
         put_blob(&mut public, &[])?;
-        for value in [6, 128, 0x43, ALG_NULL, 3, ALG_NULL, 0, 0] {
+        for value in [6, 128, 0x43, ALG_NULL, 3, ALG_NULL] {
             put16(&mut public, value);
         }
+        let prefix_len = public.len();
+        put_blob(
+            &mut public,
+            binding.map_or(&[][..], |value| value.as_slice()),
+        )?;
+        put_blob(&mut public, &[])?;
         let mut parameters = Vec::new();
         put_blob(&mut parameters, &[0, 0, 0, 0])?;
         put_blob(&mut parameters, &public)?;
@@ -387,10 +435,6 @@ impl<T: Transport> Client<T> {
             self.call(CREATE_PRIMARY, &[OWNER], Some(PASSWORD), &parameters, true)?;
         let mut reader = Reader(&out);
         let returned_public = reader.blob()?;
-        let prefix_len = public
-            .len()
-            .checked_sub(4)
-            .ok_or("invalid parent template")?;
         if returned_public.get(..prefix_len) != public.get(..prefix_len) {
             return Err("TPM changed the storage parent template".into());
         }
@@ -407,7 +451,19 @@ impl<T: Transport> Client<T> {
         let name = reader.blob()?;
         check_name(returned_public, name)?;
         reader.end()?;
-        handle.ok_or_else(|| "missing TPM parent handle".into())
+        Ok((handle.ok_or("missing TPM parent handle")?, name.to_vec()))
+    }
+
+    fn bound_parent(&mut self, binding: &[u8; 32]) -> Result<u32, String> {
+        let (unbound, unbound_name) = self.parent(None)?;
+        let (_, out) = self.call(FLUSH_CONTEXT, &[unbound], None, &[], false)?;
+        Reader(&out).end()?;
+        self.handles.retain(|handle| *handle != unbound);
+        let (bound, bound_name) = self.parent(Some(binding))?;
+        if bound_name == unbound_name {
+            return Err("TPM ignored storage primary personalization".into());
+        }
+        Ok(bound)
     }
 
     fn snapshot(&mut self, pcrs: Pcrs) -> Result<[u8; 32], String> {
@@ -480,7 +536,33 @@ impl<T: Transport> Client<T> {
         Ok(handle)
     }
 
-    pub fn seal(mut self, uid: u32, pcrs: Pcrs, master: &[u8; 32]) -> Result<SealedKey, String> {
+    pub fn seal(self, uid: u32, pcrs: Pcrs, master: &[u8; 32]) -> Result<SealedKey, String> {
+        self.seal_inner(uid, pcrs, master, None)
+    }
+
+    /// The digest must bind the complete canonical enrollment and recovery policy.
+    pub fn seal_bound(
+        self,
+        uid: u32,
+        pcrs: Pcrs,
+        master: &[u8; 32],
+        binding: &[u8; 32],
+    ) -> Result<BoundKey, String> {
+        let key = BoundKey {
+            binding: *binding,
+            key: self.seal_inner(uid, pcrs, master, Some(binding))?,
+        };
+        key.encode()?;
+        Ok(key)
+    }
+
+    fn seal_inner(
+        mut self,
+        uid: u32,
+        pcrs: Pcrs,
+        master: &[u8; 32],
+        binding: Option<&[u8; 32]>,
+    ) -> Result<SealedKey, String> {
         let pcr_digest = self.snapshot(pcrs)?;
         let mut key = SealedKey {
             uid,
@@ -490,7 +572,10 @@ impl<T: Transport> Client<T> {
             private: Vec::new(),
         };
         self.policy(&key, true)?;
-        let parent = self.parent()?;
+        let parent = match binding {
+            Some(binding) => self.bound_parent(binding)?,
+            None => self.parent(None)?.0,
+        };
         let mut public = Vec::new();
         put16(&mut public, 8);
         put16(&mut public, SHA256);
@@ -521,9 +606,25 @@ impl<T: Transport> Client<T> {
         Ok(key)
     }
 
-    pub fn unseal(mut self, key: &SealedKey) -> Result<[u8; 32], String> {
+    pub fn unseal(self, key: &SealedKey) -> Result<[u8; 32], String> {
+        self.unseal_inner(key, None)
+    }
+
+    /// Metadata integrity only: the caller must authorize the user before this call.
+    pub fn unseal_bound(self, key: &BoundKey, binding: &[u8; 32]) -> Result<[u8; 32], String> {
+        if binding != &key.binding {
+            return Err("sealed token metadata digest mismatch".into());
+        }
+        self.unseal_inner(&key.key, Some(binding))
+    }
+
+    fn unseal_inner(
+        mut self,
+        key: &SealedKey,
+        binding: Option<&[u8; 32]>,
+    ) -> Result<[u8; 32], String> {
         key.validate_public()?;
-        let parent = self.parent()?;
+        let (parent, _) = self.parent(binding)?;
         let mut parameters = Vec::new();
         put_blob(&mut parameters, &key.private)?;
         put_blob(&mut parameters, &key.public)?;
@@ -831,7 +932,10 @@ pub(crate) mod tests {
     fn es256_rejects_malformed_names_tickets_and_failed_cleanup() {
         use std::cell::Cell;
         use std::rc::Rc;
-        struct DeviceReply { fault: u8, flushes: Rc<Cell<usize>> }
+        struct DeviceReply {
+            fault: u8,
+            flushes: Rc<Cell<usize>>,
+        }
         impl Transport for DeviceReply {
             fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
                 let code = u32::from_be_bytes(command[6..10].try_into().unwrap());
@@ -846,23 +950,46 @@ pub(crate) mod tests {
                         request.end().unwrap();
                         let mut name = SHA256.to_be_bytes().to_vec();
                         name.extend_from_slice(&crypto::digest(public));
-                        if self.fault == 1 { name[2] ^= 1; }
-                        put32(&mut out, if self.fault == 12 { 0x8100_0000 } else { 0x8000_0000 });
+                        if self.fault == 1 {
+                            name[2] ^= 1;
+                        }
+                        put32(
+                            &mut out,
+                            if self.fault == 12 {
+                                0x8100_0000
+                            } else {
+                                0x8000_0000
+                            },
+                        );
                         put_blob(&mut out, &name).unwrap();
-                        if self.fault == 2 { out.push(0); }
-                        if self.fault == 11 { rc = 0x101; out.clear(); }
+                        if self.fault == 2 {
+                            out.push(0);
+                        }
+                        if self.fault == 11 {
+                            rc = 0x101;
+                            out.clear();
+                        }
                     }
                     VERIFY_SIGNATURE => {
                         put16(&mut out, if self.fault == 3 { 0x8021 } else { 0x8022 });
                         put32(&mut out, if self.fault == 4 { OWNER } else { NULL });
                         put_blob(&mut out, if self.fault == 5 { &[1] } else { &[] }).unwrap();
-                        if self.fault == 6 { out.push(0); }
-                        if matches!(self.fault, 8 | 10) { rc = 0x2db; out.clear(); }
-                        if self.fault == 9 { out.pop(); }
+                        if self.fault == 6 {
+                            out.push(0);
+                        }
+                        if matches!(self.fault, 8 | 10) {
+                            rc = 0x2db;
+                            out.clear();
+                        }
+                        if self.fault == 9 {
+                            out.pop();
+                        }
                     }
                     FLUSH_CONTEXT => {
                         self.flushes.set(self.flushes.get() + 1);
-                        if matches!(self.fault, 7 | 10) && self.flushes.get() == 1 { rc = 0x101; }
+                        if matches!(self.fault, 7 | 10) && self.flushes.get() == 1 {
+                            rc = 0x101;
+                        }
                     }
                     _ => panic!("unexpected verification command {code:#x}"),
                 }
@@ -876,7 +1003,10 @@ pub(crate) mod tests {
         let [x, y, digest, r, s] = es256_fixture();
         for fault in 0..=12 {
             let flushes = Rc::new(Cell::new(0));
-            let mut client = Client::new(DeviceReply { fault, flushes: flushes.clone() });
+            let mut client = Client::new(DeviceReply {
+                fault,
+                flushes: flushes.clone(),
+            });
             let result = client.verify_es256(&x, &y, &digest, &r, &s);
             assert_eq!(result.is_ok(), fault == 0, "fault {fault}");
             if fault == 10 {
@@ -884,11 +1014,206 @@ pub(crate) mod tests {
                 assert!(error.contains("0x177") && error.contains("0x165"));
             }
             let loaded = usize::from(fault < 11);
-            assert_eq!(flushes.get(), loaded, "only admitted transient objects are retired");
+            assert_eq!(
+                flushes.get(),
+                loaded,
+                "only admitted transient objects are retired"
+            );
             assert_eq!(client.handles.len(), usize::from(matches!(fault, 7 | 10)));
             drop(client);
-            assert_eq!(flushes.get(), if matches!(fault, 7 | 10) { 2 } else { loaded });
+            assert_eq!(
+                flushes.get(),
+                if matches!(fault, 7 | 10) { 2 } else { loaded }
+            );
         }
+    }
+
+    #[test]
+    fn primary_binding_is_marshaled_and_ignored_personalization_is_refused() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Reply {
+            binding: [u8; 32],
+            ignore: bool,
+            creates: Rc<Cell<usize>>,
+            flushes: Rc<Cell<usize>>,
+        }
+        impl Transport for Reply {
+            fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
+                let code = u32::from_be_bytes(command[6..10].try_into().unwrap());
+                if code == FLUSH_CONTEXT {
+                    self.flushes.set(self.flushes.get() + 1);
+                    let mut response = NO_SESSIONS.to_be_bytes().to_vec();
+                    put32(&mut response, 10);
+                    put32(&mut response, 0);
+                    return Ok(response);
+                }
+                assert_eq!(code, CREATE_PRIMARY);
+                let mut input = Reader(&command[10..]);
+                assert_eq!(input.u32().unwrap(), OWNER);
+                let auth_size = input.u32().unwrap() as usize;
+                input.take(auth_size).unwrap();
+                assert_eq!(input.blob().unwrap(), [0, 0, 0, 0]);
+                let public = input.blob().unwrap();
+                let prefix = [
+                    0, 0x23, 0, 0x0b, 0, 3, 4, 0x72, 0, 0, 0, 6, 0, 128, 0, 0x43, 0, 0x10, 0, 3, 0,
+                    0x10,
+                ];
+                assert_eq!(&public[..22], prefix);
+                let bound = self.creates.get() == 1;
+                let mut unique = Reader(&public[22..]);
+                assert_eq!(
+                    unique.blob().unwrap(),
+                    if bound { &self.binding[..] } else { &[] }
+                );
+                assert!(unique.blob().unwrap().is_empty());
+                unique.end().unwrap();
+                assert!(input.blob().unwrap().is_empty());
+                assert_eq!(input.u32().unwrap(), 0);
+                input.end().unwrap();
+                self.creates.set(self.creates.get() + 1);
+                let mut returned = prefix.to_vec();
+                put_blob(
+                    &mut returned,
+                    &[if bound && !self.ignore { 2 } else { 1 }; 32],
+                )
+                .unwrap();
+                put_blob(&mut returned, &[3; 32]).unwrap();
+                let mut parameters = Vec::new();
+                put_blob(&mut parameters, &returned).unwrap();
+                put_blob(&mut parameters, &[]).unwrap();
+                put_blob(&mut parameters, &[4; 32]).unwrap();
+                put16(&mut parameters, 0x8021);
+                put32(&mut parameters, OWNER);
+                put_blob(&mut parameters, &[5; 32]).unwrap();
+                let mut name = SHA256.to_be_bytes().to_vec();
+                name.extend_from_slice(&crypto::digest(&returned));
+                put_blob(&mut parameters, &name).unwrap();
+                let mut response = SESSIONS.to_be_bytes().to_vec();
+                put32(&mut response, (23 + parameters.len()) as u32);
+                put32(&mut response, 0);
+                put32(&mut response, 0x80000000 + u32::from(bound));
+                put32(&mut response, parameters.len() as u32);
+                response.extend_from_slice(&parameters);
+                response.extend_from_slice(&[0, 0, 1, 0, 0]);
+                Ok(response)
+            }
+        }
+        for binding in [[0; 32], [9; 32]] {
+            for ignore in [false, true] {
+                let creates = Rc::new(Cell::new(0));
+                let flushes = Rc::new(Cell::new(0));
+                let mut client = Client::new(Reply {
+                    binding,
+                    ignore,
+                    creates: creates.clone(),
+                    flushes: flushes.clone(),
+                });
+                let result = client.bound_parent(&binding);
+                assert_eq!(result.is_err(), ignore);
+                if ignore {
+                    assert!(result.unwrap_err().contains("ignored"));
+                }
+                assert_eq!(creates.get(), 2);
+                assert_eq!(flushes.get(), 1);
+                drop(client);
+                assert_eq!(flushes.get(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_key_codec_rejects_truncation_and_mismatched_metadata_before_io() {
+        struct NoIo;
+        impl Transport for NoIo {
+            fn exchange(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
+                panic!("metadata mismatch reached TPM");
+            }
+        }
+        let key = BoundKey {
+            binding: [9; 32],
+            key: SealedKey::decode(&fixture(1000)).unwrap(),
+        };
+        let bytes = key.encode().unwrap();
+        assert_eq!(BoundKey::decode(&bytes).unwrap().uid(), 1000);
+        assert_eq!(BoundKey::decode(&bytes).unwrap().encode().unwrap(), bytes);
+        for size in 0..bytes.len() {
+            assert!(BoundKey::decode(&bytes[..size]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(BoundKey::decode(&trailing).is_err());
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 1;
+        assert!(BoundKey::decode(&bad_magic).is_err());
+        let mut oversized = bytes.clone();
+        oversized.resize(MAX_BOUND_KEY + 1, 0);
+        assert_eq!(
+            BoundKey::decode(&oversized).err().unwrap(),
+            "oversized bound TPM key"
+        );
+        assert!(Client::new(NoIo).unseal_bound(&key, &[8; 32]).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    fn emulator_metadata_binding_survives_restart_and_refuses_substitution() {
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!("td-bound-key-oracle-{}", std::process::id()));
+        assert!(!root.exists());
+        let _directory = Directory(root.clone());
+        let emulator = Emulator::start(&root);
+        emulator.extend(&[7; 32]);
+        let original = crypto::digest(b"test token metadata: primary A, recovery B, uid 1000");
+        let key = emulator
+            .client()
+            .seal_bound(1000, Pcrs::parse("7").unwrap(), &[0x34; 32], &original)
+            .unwrap();
+        let bytes = key.encode().unwrap();
+        assert_eq!(
+            emulator.client().unseal_bound(&key, &original).unwrap(),
+            [0x34; 32]
+        );
+        for changed in [crypto::digest(b"test substituted primary key"), [0; 32]] {
+            let mut edited = bytes.clone();
+            edited[8..40].copy_from_slice(&changed);
+            let edited = BoundKey::decode(&edited).unwrap();
+            assert!(emulator.client().unseal_bound(&edited, &changed).is_err());
+        }
+        let zero = emulator
+            .client()
+            .seal_bound(1000, Pcrs::parse("7").unwrap(), &[0x35; 32], &[0; 32])
+            .unwrap();
+        assert_eq!(
+            emulator.client().unseal_bound(&zero, &[0; 32]).unwrap(),
+            [0x35; 32]
+        );
+        assert!(emulator.client().unseal(&zero.key).is_err());
+        // Removing the wrapper cannot select the old, empty-unique storage parent.
+        assert!(emulator.client().unseal(&key.key).is_err());
+        let mut edited = BoundKey::decode(&bytes).unwrap();
+        edited.key.uid = 1001;
+        assert!(emulator.client().unseal_bound(&edited, &original).is_err());
+        assert_eq!(
+            emulator.client().unseal_bound(&key, &original).unwrap(),
+            [0x34; 32]
+        );
+        drop(emulator);
+        let restarted = Emulator::start(&root);
+        restarted.extend(&[7; 32]);
+        let key = BoundKey::decode(&bytes).unwrap();
+        assert_eq!(
+            restarted.client().unseal_bound(&key, &original).unwrap(),
+            [0x34; 32]
+        );
+        restarted.extend(&[8; 32]);
+        assert!(restarted.client().unseal_bound(&key, &original).is_err());
+        drop(restarted);
     }
 
     fn es256_fixture() -> [[u8; 32]; 5] {
@@ -899,9 +1224,10 @@ pub(crate) mod tests {
             "4994c7bb96286fd9ef8d505d8ab3dea532624cf615bc59f44df535ada05dd5f9",
             "49298c57698034a7fb139bb67afd8019356759df90fc1d118f0ecfa66f0c463b",
             "8683952a24bd4b70eb95c04b1e0f560ffd94cfb31688836a20cfd7381b76983d",
-        ].map(|value| std::array::from_fn(|i| {
-            u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).unwrap()
-        }))
+        ]
+        .map(|value| {
+            std::array::from_fn(|i| u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).unwrap())
+        })
     }
 
     #[test]
@@ -920,7 +1246,10 @@ pub(crate) mod tests {
             let mut values = [x, y, digest, r, s];
             values[field][0] ^= 1;
             let [x, y, digest, r, s] = values;
-            assert!(client.verify_es256(&x, &y, &digest, &r, &s).is_err(), "field {field}");
+            assert!(
+                client.verify_es256(&x, &y, &digest, &r, &s).is_err(),
+                "field {field}"
+            );
             assert!(client.handles.is_empty());
         }
         drop(client);

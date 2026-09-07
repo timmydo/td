@@ -366,6 +366,62 @@ signature bytes. Only public fixture material is committed; OpenSSL is not a
 test dependency. This is a software protocol oracle, not a physical-token or
 secure-attention demonstration.
 
+## TPM binding for enrollment metadata
+
+The safe TPM API offers a `BoundKey` prerequisite for token enrollment.
+It personalizes the existing ECC storage primary with a caller-computed
+32-byte enrollment digest in the input public template's `unique.x`, with
+empty `unique.y`. The TPM derives its primary key from its hierarchy seed
+and input template, so another digest selects another parent and cannot
+load the original sealed child. The generated parent public point is
+structurally checked separately: each coordinate contains 1 through 32 bytes,
+its extent has no trailing data, and the returned Name hashes the complete
+public area. The trusted TPM generates the point; td does not implement an
+independent curve-membership check for the storage parent. This uses the
+existing CreatePrimary/Create/Load/PCR/Unseal commands and no new syscall.
+Before sealing, td compares the bound parent's Name with the empty-unique
+parent's Name and refuses equality. It retires the extra parent before
+creating the bound one. This checks for ignored personalization on the
+connected TPM; it does not independently prove a trusted TPM's derivation
+algorithm or distinguish every possible digest.
+The primary derivation follows [TPM 1.83 Part 1 sections 27.2.7 and 27.6.3](https://trustedcomputinggroup.org/wp-content/uploads/TPM-2.0-1.83-Part-1-Architecture.pdf).
+
+A bound envelope is `TDBOUND1`, the 32-byte digest, and a two-byte
+big-endian length followed by the ordinary encoded sealed child. The whole
+envelope is at most 4096 bytes and rejects truncation, unknown magic and
+trailing data. Its inner child retains the existing PCR-only policy and
+sealed logical UID. `unseal_bound` first compares the envelope digest to
+one computed by its caller from actual metadata. Editing both the digest
+and metadata still fails when the TPM loads the child under the changed
+parent. Removing the wrapper and using the old empty-unique parent also
+fails. The zero digest remains a distinct 32-byte personalization, not an
+alias for the empty unique field.
+
+This is metadata integrity, not TPM validation of FIDO2 presence. The later
+caller must hash a domain-separated canonical representation of the complete
+UID, relying-party, enrolled-key and recovery policy; require the matching
+FIDO assertion on the trusted operation; and only then invoke unseal.
+The current oracle is the pinned software TPM; no particular hardware vendor
+is certified by this increment. A device refusing this published primary
+template fails closed, without selecting another parent. No store file,
+console command or boot-release behavior consumes this API yet.
+The existing unbound API remains for current stores until the atomic FIDO
+cutover. This API does not authorize token replacement or rollback a lost
+recovery policy. A metadata change requires authorized unseal with the old
+metadata, resealing under the new digest, and verification of the new sealed
+key before atomically publishing metadata and envelope as one durable record.
+Until publication completes, the old record must remain usable. Publishing
+new metadata alone would make the old child unloadable and lose the store.
+The current root/TPM/measurement trust boundary is unchanged.
+
+An opt-in pinned emulator oracle proves original-metadata release, changed
+metadata-plus-envelope refusal, stripped-wrapper refusal, UID substitution
+refusal, restart persistence, and changed-PCR refusal. Ordinary tests cover
+complete codec bounds, metadata mismatch before any TPM I/O, exact primary
+template bytes for bound/zero/unbound inputs, and refusal when the TPM returns
+the same primary Name for bound and unbound input. The emulator also proves
+that a key sealed with a zero digest cannot use the unbound parent.
+
 ## TPM validation
 
 The optional host oracle uses upstream swtpm 0.10.1 and libtpms 0.10.2,
