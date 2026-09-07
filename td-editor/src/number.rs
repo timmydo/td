@@ -70,6 +70,10 @@ impl Prompt {
         Ok((self.point.tab, self.point.revision))
     }
 
+    pub fn entry(&self) -> (&str, bool) {
+        (&self.text, self.invalid)
+    }
+
     pub fn kind(&self) -> Kind {
         self.kind
     }

@@ -13,6 +13,55 @@ pub const INSERT_BYTES: usize = 256 * 1024;
 pub const SEARCH_BYTES: usize = crate::search::QUERY_BYTES;
 pub const SPELLING_RANGES: usize = 256;
 pub const KEY_BYTES: usize = 32;
+pub const PROMPT_BYTES: usize = 8192;
+
+pub(crate) struct PromptState<'a> {
+    pub kind: &'static str,
+    pub target: Option<Result<(TabId, u64)>>,
+    pub field: &'static str,
+    pub text: &'a str,
+    pub replacement: &'a str,
+    pub refused: Option<bool>,
+    pub status: &'a str,
+}
+
+impl PromptState<'_> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            kind: "none",
+            target: None,
+            field: "-",
+            text: "",
+            replacement: "",
+            refused: None,
+            status: "",
+        }
+    }
+
+    pub(crate) fn fields(&self, generation: u64, notice: &str) -> Result<String> {
+        // Input tokens start at one; reject invalid serializer inputs too.
+        if generation == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if [self.text, self.replacement, self.status, notice]
+            .iter()
+            .any(|text| text.len() > PROMPT_BYTES)
+        {
+            return Err(Error::Limit);
+        }
+        let (target, target_error) = match self.target {
+            None => ("-".into(), "-"),
+            Some(Ok((tab, revision))) => (format!("{tab},{revision}"), "-"),
+            Some(Err(error)) => ("-".into(), error.code()),
+        };
+        Ok(format!(
+            "input-generation={generation}\tprompt={}\ttarget={target}\ttarget-error={target_error}\tfield={}\ttext={}\treplacement={}\trefused={}\tstatus={}\tnotice={}",
+            self.kind, self.field, hex(self.text.as_bytes()), hex(self.replacement.as_bytes()),
+            self.refused.map_or("-", |refused| if refused { "1" } else { "0" }),
+            hex(self.status.as_bytes()), hex(notice.as_bytes())
+        ))
+    }
+}
 
 /// One length-prefixed frame. Any refusal poisons it and drops partial text.
 #[derive(Default)]
@@ -99,6 +148,7 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
 #[derive(Clone, Eq, PartialEq)]
 pub enum Operation {
     State,
+    PromptState,
     New,
     Open(PathBuf),
     Save {
@@ -168,6 +218,7 @@ impl std::fmt::Debug for Operation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::State => f.write_str("State"),
+            Self::PromptState => f.write_str("PromptState"),
             Self::New => f.write_str("New"),
             Self::Open(path) => f
                 .debug_struct("Open")
@@ -433,6 +484,7 @@ impl Request {
         let result = (|| {
             let operation = match name {
                 "state" => Operation::State,
+                "prompt-state" => Operation::PromptState,
                 "new" => Operation::New,
                 "open" => Operation::Open(os_path(args.next().ok_or(Error::Protocol)?)?),
                 "save" | "save-as" => Operation::Save {
@@ -613,7 +665,8 @@ impl Request {
                 offset,
                 limit,
             } => page(ui, *tab, *revision, *offset, *limit),
-            Operation::Edit { .. }
+            Operation::PromptState
+            | Operation::Edit { .. }
             | Operation::New
             | Operation::Open(_)
             | Operation::Save { .. }
@@ -1065,6 +1118,75 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn prompt_state_is_a_read_only_native_query_with_exact_arity() {
+        let request = Request::parse(b"1\t33\tprompt-state").unwrap();
+        assert_eq!(request.operation, Operation::PromptState);
+        assert!(!request.is_mutating() && !request.is_edit());
+        assert_eq!(format!("{:?}", request.operation), "PromptState");
+        let mut ui = Controller::default();
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        assert_eq!(
+            Request::parse(b"1\t33\tprompt-state\textra").unwrap_err(),
+            Refusal {
+                id: 33,
+                error: Error::Protocol
+            }
+        );
+        assert_eq!(PromptState::empty().fields(1, "").unwrap(),
+            "input-generation=1\tprompt=none\ttarget=-\ttarget-error=-\tfield=-\ttext=-\treplacement=-\trefused=-\tstatus=-\tnotice=-");
+    }
+
+    #[test]
+    fn prompt_state_text_is_exact_hex_bounded_before_encoding_and_separate_from_validity() {
+        let mut snapshot = PromptState::empty();
+        snapshot.kind = "replace";
+        snapshot.field = "replacement";
+        snapshot.text = "é\t\n";
+        snapshot.replacement = "λ";
+        snapshot.status = "No match";
+        snapshot.target = Some(Err(Error::StaleRevision));
+        let fields = snapshot.fields(2, "feedback").unwrap();
+        assert!(fields.contains("target=-\ttarget-error=stale-revision\t"));
+        assert!(fields.contains("\ttext=c3a9090a\treplacement=cebb\t"));
+        assert!(fields.ends_with("status=4e6f206d61746368\tnotice=666565646261636b"));
+        assert_eq!(snapshot.fields(0, ""), Err(Error::InvalidArgument));
+        for (refused, wire) in [(false, "0"), (true, "1")] {
+            snapshot.refused = Some(refused);
+            assert!(snapshot
+                .fields(2, "")
+                .unwrap()
+                .contains(&format!("\trefused={wire}\t")));
+        }
+        let boundary = "x".repeat(PROMPT_BYTES);
+        let oversized = "x".repeat(PROMPT_BYTES + 1);
+        for field in ["text", "replacement", "status", "notice"] {
+            let mut snapshot = PromptState::empty();
+            let mut notice = "";
+            let slot = match field {
+                "text" => &mut snapshot.text,
+                "replacement" => &mut snapshot.replacement,
+                "status" => &mut snapshot.status,
+                _ => &mut notice,
+            };
+            *slot = &boundary;
+            assert!(snapshot.fields(1, notice).is_ok());
+            match field {
+                "text" => snapshot.text = &oversized,
+                "replacement" => snapshot.replacement = &oversized,
+                "status" => snapshot.status = &oversized,
+                _ => notice = &oversized,
+            }
+            assert_eq!(snapshot.fields(1, notice), Err(Error::Limit));
+        }
+        let mut snapshot = PromptState::empty();
+        snapshot.text = &boundary;
+        snapshot.replacement = &boundary;
+        snapshot.status = &boundary;
+        assert!(frame(snapshot.fields(u64::MAX, &boundary).unwrap().as_bytes()).is_ok());
+    }
 
     #[test]
     fn decoded_wheel_grammar_bounds_signed_normalized_deltas() {

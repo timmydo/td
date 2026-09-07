@@ -353,6 +353,54 @@ fn control_worker_keeps_bounded_nonblocking_transport_separate_from_editor_state
 }
 
 #[test]
+fn native_prompt_inspection_is_borrow_only_and_cannot_dispatch_or_poll() {
+    let source = include_str!("../src/wayland.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    let query = production
+        .split("fn control_prompt_state(&self)")
+        .nth(1)
+        .unwrap();
+    let query = query.split("\n    fn ").next().unwrap();
+    for pin in [
+        "snapshot.fields(",
+        "self.frames.input_generation()?",
+        "self.control_dialog_fields()",
+        "self.control_key_available()",
+    ] {
+        assert!(query.contains(pin), "{pin}");
+    }
+    for forbidden in [
+        "dispatch(",
+        ".take(",
+        ".poll(",
+        ".step(",
+        ".repeat(",
+        "invalidate(",
+        "self.connection",
+        "self.control_mutation_accepted",
+        "self.notify(",
+    ] {
+        assert!(!query.contains(forbidden), "{forbidden}");
+    }
+    let dispatch = production.split("fn control_response(").nth(1).unwrap();
+    let dispatch = dispatch.split("\n    fn ").next().unwrap();
+    assert!(
+        dispatch.find("Operation::PromptState").unwrap()
+            < dispatch.find("request.is_mutating()").unwrap()
+    );
+    let control = include_str!("../src/control.rs");
+    let fields = control
+        .split("fn fields(&self, generation: u64, notice: &str)")
+        .nth(1)
+        .unwrap();
+    let fields = fields.split("\nimpl ").next().unwrap();
+    assert!(
+        fields.find("text.len() > PROMPT_BYTES").unwrap()
+            < fields.find("hex(self.text.as_bytes())").unwrap()
+    );
+}
+
+#[test]
 fn remote_wheel_reuses_native_scroll_after_all_input_guards() {
     let native = include_str!("../src/pointer.rs");
     let control = include_str!("../src/control.rs");

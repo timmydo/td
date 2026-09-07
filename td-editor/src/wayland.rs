@@ -1674,6 +1674,16 @@ impl Window {
             }
             .response();
         }
+        if matches!(request.operation, crate::control::Operation::PromptState) {
+            return match self.control_prompt_state() {
+                Ok(body) => format!("1\t{}\tok\t{body}", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if matches!(request.operation, crate::control::Operation::Pointer { .. }) {
             return match self.control_pointer_event(&request.operation) {
                 Ok(()) => format!("1\t{}\tok\t", request.id),
@@ -2532,12 +2542,83 @@ impl Window {
         self.frames.invalidate(true);
     }
 
+    fn control_prompt_state(&self) -> crate::Result<String> {
+        let mut snapshot = crate::control::PromptState::empty();
+        if let Some(prompt) = &self.prompt {
+            snapshot.kind = match prompt.action {
+                PathAction::Open => "path-open",
+                PathAction::Dictionary => "path-dictionary",
+                PathAction::Save { .. } if prompt.identity.is_none() => "close-save-as",
+                PathAction::Save { .. } => "path-save-as",
+            };
+            snapshot.field = "text";
+            snapshot.text = &prompt.text;
+            snapshot.target = Some(if let Some(identity) = &prompt.identity {
+                self.ui
+                    .editor()
+                    .check_revision(&identity.point)
+                    .map(|()| (identity.point.tab, identity.point.revision))
+            } else {
+                self.closing
+                    .as_ref()
+                    .ok_or(crate::Error::Unavailable)
+                    .and_then(|closing| closing.next(self.ui.editor()))
+                    .and_then(|target| target.ok_or(crate::Error::Unavailable))
+                    .map(|target| (target.tab, target.revision))
+            });
+        } else if let Some(prompt) = &self.search {
+            snapshot.kind = if prompt.backward {
+                "find-backward"
+            } else {
+                "find-forward"
+            };
+            snapshot.target = Some(prompt.target(self.ui.editor()));
+            snapshot.field = "text";
+            snapshot.text = &prompt.text;
+        } else if let Some(prompt) = &self.replace {
+            let (query, replacement, with, status) = prompt.entry();
+            snapshot.kind = "replace";
+            snapshot.target = Some(prompt.target(self.ui.editor()));
+            snapshot.field = if with { "replacement" } else { "text" };
+            snapshot.text = query;
+            snapshot.replacement = replacement;
+            snapshot.status = status;
+        } else if let Some(prompt) = &self.number {
+            let (text, refused) = prompt.entry();
+            snapshot.kind = match prompt.kind() {
+                crate::number::Kind::Line => "go-to-line",
+                crate::number::Kind::FillColumn => "fill-column",
+            };
+            snapshot.target = Some(prompt.target(self.ui.editor()));
+            snapshot.field = "text";
+            snapshot.text = text;
+            snapshot.refused = Some(refused);
+        } else if let Some(prompt) = &self.command {
+            let (text, refused) = prompt.entry();
+            snapshot.kind = "command";
+            snapshot.target = Some(prompt.target(self.ui.editor()));
+            snapshot.field = "text";
+            snapshot.text = text;
+            snapshot.refused = Some(refused);
+        }
+        let mut fields = snapshot.fields(
+            self.frames.input_generation()?,
+            self.notice.as_deref().unwrap_or(""),
+        )?;
+        fields.push_str(&format!(
+            "\tkey-ready={}\t",
+            u8::from(self.control_key_available())
+        ));
+        fields.push_str(&self.control_dialog_fields());
+        Ok(fields)
+    }
+
     fn native_state(&self, mut response: String) -> crate::Result<String> {
         if response.split('\t').nth(2) == Some("ok") {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-wheel\tkey-ready={}\tpointer-ready={}\twheel-ready={}\tpointer-drag={}\tnative={},{},{},{}",
+                    "\tadapter=native-prompt-state\tkey-ready={}\tpointer-ready={}\twheel-ready={}\tpointer-drag={}\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.control_key_available()),
@@ -6185,6 +6266,297 @@ mod tests {
         }
     }
 
+    fn prompt_snapshot(w: &mut Window) -> String {
+        let query = crate::control::Request::parse(b"1\t33\tprompt-state").unwrap();
+        let before = crate::control::state(&w.ui).unwrap();
+        let frames = w.frames.fields().unwrap();
+        let notice = w.notice.clone();
+        let answer = w.control_response(&query);
+        assert!(answer.starts_with("1\t33\tok\t"), "{answer}");
+        assert_eq!(crate::control::state(&w.ui).unwrap(), before);
+        assert_eq!(w.frames.fields().unwrap(), frames);
+        assert_eq!(w.notice, notice);
+        answer
+    }
+
+    #[test]
+    fn prompt_state_reports_full_search_replace_and_numeric_entries_without_edits() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.ui.dispatch(Event::Load("λ a λ".as_bytes())).unwrap();
+        decoded_key(&mut w, "C-f");
+        let text = "λ".repeat(200);
+        for _ in 0..200 {
+            decoded_key(&mut w, "λ");
+        }
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tprompt=find-forward\ttarget=2,0\ttarget-error=-\tfield=text\t"));
+        assert!(answer.contains(&format!(
+            "\ttext={}\t",
+            crate::control::hex(text.as_bytes())
+        )));
+        assert_eq!(answer, prompt_snapshot(&mut w));
+        decoded_key(&mut w, "Escape");
+        assert!(prompt_snapshot(&mut w).contains("\tprompt=none\t"));
+        for chord in ["F6", "0", "Return"] {
+            decoded_key(&mut w, chord);
+        }
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tprompt=go-to-line\t"));
+        assert!(answer.contains("\ttext=30\t") && answer.contains("\trefused=1\t"));
+        decoded_key(&mut w, "Backspace");
+        assert!(prompt_snapshot(&mut w).contains("\trefused=0\t"));
+        decoded_key(&mut w, "Escape");
+        decoded_key(&mut w, "C-h");
+        assert!(prompt_snapshot(&mut w).contains("\tfield=text\t"));
+        for chord in ["C-u", "λ", "Tab", "x", "M-r"] {
+            decoded_key(&mut w, chord);
+        }
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tprompt=replace\t"));
+        assert!(answer.contains("\tfield=replacement\ttext=cebb\treplacement=78\t"));
+        assert!(answer.contains(&format!(
+            "\tstatus={}\t",
+            crate::control::hex(b"Select a match with Return first.")
+        )));
+        decoded_key(&mut w, "M-a");
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\ttarget=2,1\ttarget-error=-\t"));
+        assert!(answer.contains(&format!(
+            "\tstatus={}\t",
+            crate::control::hex(b"Replaced 2 matches.")
+        )));
+        assert_eq!(w.ui.editor().document(2).unwrap().text(), "x a x");
+    }
+
+    #[test]
+    fn prompt_state_reports_command_completion_and_fill_column_refusal() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        for chord in ["M-x", "z", "Return"] {
+            decoded_key(&mut w, chord);
+        }
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tprompt=command\t"));
+        assert!(answer.contains("\ttext=7a\t") && answer.contains("\trefused=1\t"));
+        for chord in ["C-u", "s", "Tab"] {
+            decoded_key(&mut w, chord);
+        }
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains(&format!(
+            "\ttext={}\t",
+            crate::control::hex(b"set-fill-column")
+        )));
+        assert!(answer.contains("\trefused=0\t"));
+        for chord in ["Return", "1", "9", "Return"] {
+            decoded_key(&mut w, chord);
+        }
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tprompt=fill-column\t"));
+        assert!(answer.contains("\ttext=3139\t") && answer.contains("\trefused=1\t"));
+        assert_eq!(w.ui.editor().document(1).unwrap().fill_column(), 72);
+        assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (0, 0));
+    }
+
+    #[test]
+    fn prompt_state_keeps_path_text_and_live_dialog_authority_in_one_snapshot() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        assert!(!w.file_request("open", 99, 0));
+        assert!(w.prompt.is_none());
+        assert_eq!(w.last_dialog_id, 0);
+        for (name, kind) in [
+            ("open", "path-open"),
+            ("save-as", "path-save-as"),
+            ("dictionary", "path-dictionary"),
+        ] {
+            assert!(w.file_request(name, 1, 0));
+            assert!(w.prompt.as_ref().unwrap().identity.is_some());
+            w.chord("λ", false).unwrap();
+            let answer = prompt_snapshot(&mut w);
+            assert!(answer.contains(&format!("\tprompt={kind}\ttarget=1,0\t")));
+            assert!(answer.contains("\ttext=cebb\t"));
+            assert!(answer.contains("\tkey-ready=0\t"));
+            assert!(answer.ends_with(&w.control_dialog_fields()));
+            let cancel = crate::control::Request::parse(
+                format!("1\t1\tdialog-answer\t{}\t1\t0\tcancel", w.last_dialog_id).as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(w.control_response(&cancel), "1\t1\tok\t");
+        }
+        decoded_key(&mut w, "x");
+        w.close_tab(1, 1);
+        let save = crate::control::Request::parse(
+            format!("1\t1\tdialog-answer\t{}\t1\t1\tsave", w.last_dialog_id).as_bytes(),
+        )
+        .unwrap();
+        assert!(w.control_response(&save).starts_with("1\t1\tok\tdialog\t"));
+        w.chord("p", false).unwrap();
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tprompt=close-save-as\ttarget=1,1\t"));
+        assert!(answer.contains("\ttext=70\t"));
+        assert!(answer.ends_with(&w.control_dialog_fields()));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "x");
+    }
+
+    #[test]
+    fn prompt_state_retains_find_behind_an_asynchronous_save_conflict() {
+        let directory = DialogDirectory::new();
+        let file = directory.path("draft");
+        std::fs::write(&file, b"original").unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        w.files.as_mut().unwrap().open(file.clone()).unwrap();
+        finish_file(&mut w);
+        std::fs::write(&file, b"external").unwrap();
+        assert!(w.file_request("save", 2, 0));
+        w.search_request("find", 2, 0).unwrap();
+        w.search_chord("x", false).unwrap();
+        finish_file(&mut w);
+        assert!(w.conflict.is_some());
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tprompt=find-forward\ttarget=2,0\t"));
+        assert!(answer.contains("\ttext=78\t") && answer.contains("\tkey-ready=0\t"));
+        assert!(answer.ends_with(&w.control_dialog_fields()));
+        assert!(answer.contains(",conflict,question,2,0,"));
+        w.chord("x", false).unwrap();
+        assert_eq!(w.search.as_ref().unwrap().text, "x");
+    }
+
+    #[test]
+    fn prompt_state_preserves_stale_ordinary_and_close_save_path_entries() {
+        for closing in [false, true] {
+            let (mut w, _peer) = file_dialog_fixture();
+            w.chord("x", false).unwrap();
+            if closing {
+                w.close_tab(1, 1);
+                let save = crate::control::Request::parse(
+                    format!("1\t1\tdialog-answer\t{}\t1\t1\tsave", w.last_dialog_id).as_bytes(),
+                )
+                .unwrap();
+                assert!(w.control_response(&save).starts_with("1\t1\tok\tdialog\t"));
+            } else {
+                assert!(w.file_request("open", 1, 1));
+            }
+            w.path_chord("p", false);
+            w.ui.dispatch(Event::Edit {
+                tab: 1,
+                revision: 1,
+                command: crate::model::Command::Insert("z".into()),
+            })
+            .unwrap();
+            let answer = prompt_snapshot(&mut w);
+            assert!(answer.contains("\ttarget=-\ttarget-error=stale-revision\t"));
+            assert!(answer.contains("\ttext=70\t"));
+            assert!(w.prompt.is_some());
+        }
+    }
+
+    #[test]
+    fn prompt_state_reports_stale_targets_without_dismissing_partial_entries() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.ui.dispatch(Event::Load(b"abc")).unwrap();
+        w.search_request("find-backward", 2, 0).unwrap();
+        decoded_key(&mut w, "x");
+        assert!(prompt_snapshot(&mut w).contains("\tprompt=find-backward\ttarget=2,0\t"));
+        w.ui.dispatch(Event::Edit {
+            tab: 2,
+            revision: 0,
+            command: crate::model::Command::Select(crate::model::Selection {
+                anchor: 0,
+                caret: 1,
+            }),
+        })
+        .unwrap();
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\ttarget=-\ttarget-error=stale-revision\t"));
+        assert!(answer.contains("\ttext=78\t"));
+        assert!(w.search.is_some());
+        w.input.focused = false;
+        w.configured = false;
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tkey-ready=0\t") && answer.contains("\ttext=78\t"));
+        assert!(w.search.is_some());
+    }
+
+    #[test]
+    fn prompt_state_does_not_cancel_paste_repeat_or_damage_and_bounds_notices() {
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        configure(&mut w, 800, 600);
+        drain(&peer);
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        decoded_key(&mut w, "C-v");
+        let (_, _writers) = drain(&peer);
+        w.input.key(106, true).unwrap();
+        w.input.arm(106, w.clock);
+        let answer = prompt_snapshot(&mut w);
+        assert!(answer.contains("\tprompt=none\t"));
+        assert!(w.clipboard.incoming.is_some());
+        assert!(w.input.repeat(w.clock + 1000).unwrap().is_some());
+        let query = crate::control::Request::parse(b"1\t33\tprompt-state").unwrap();
+        w.notice = Some("x".repeat(crate::control::PROMPT_BYTES + 1));
+        let frames = w.frames.fields().unwrap();
+        assert!(w.control_response(&query).contains("\terror\tlimit\t"));
+        assert_eq!(w.frames.fields().unwrap(), frames);
+        assert!(w.clipboard.incoming.is_some());
+        assert_eq!(
+            w.notice.as_ref().unwrap().len(),
+            crate::control::PROMPT_BYTES + 1
+        );
+        w.control_input_error = Some("transport".into());
+        assert!(w
+            .control_response(&query)
+            .contains("\terror\tunavailable\t"));
+    }
+
+    #[test]
+    fn prompt_state_socket_token_drives_the_same_entry_and_reports_native_feedback() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.ui.dispatch(Event::Load("a λ".as_bytes())).unwrap();
+        decoded_key(&mut w, "C-f");
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        let state = job_request(&mut w, &peer, &socket, "1\t33\tprompt-state");
+        assert!(state.contains("\tprompt=find-forward\ttarget=2,0\t"));
+        let generation = state
+            .split('\t')
+            .find_map(|f| f.strip_prefix("input-generation="))
+            .unwrap();
+        let command = format!("1\t1\tkey\t2\t0\t{generation}\tcebb");
+        assert_eq!(job_request(&mut w, &peer, &socket, &command), "1\t1\tok\t");
+        let state = job_request(&mut w, &peer, &socket, "1\t33\tprompt-state");
+        assert!(state.contains("\ttext=cebb\t"));
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t33\tprompt-state"),
+            state
+        );
+        let generation = state
+            .split('\t')
+            .find_map(|f| f.strip_prefix("input-generation="))
+            .unwrap();
+        let command = format!("1\t2\tkey\t2\t0\t{generation}\t52657475726e");
+        assert_eq!(job_request(&mut w, &peer, &socket, &command), "1\t2\tok\t");
+        let state = job_request(&mut w, &peer, &socket, "1\t33\tprompt-state");
+        assert!(state.contains("\tprompt=none\t"));
+        assert!(state.contains(&format!(
+            "\tnotice={}\t",
+            crate::control::hex(b"Match found.")
+        )));
+        assert_eq!(w.ui.editor().document(2).unwrap().selection().range(), 2..4);
+        assert_eq!(w.ui.editor().document(2).unwrap().history_depth(), (0, 0));
+        w.stop_control();
+    }
+
     fn file_dialog_fixture() -> (Window, UnixStream) {
         let (mut w, peer, device) = seat_fixture();
         send_map(&mut w, &peer, device, &map_file());
@@ -7241,7 +7613,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-wheel\tkey-ready=0\tpointer-ready=0\twheel-ready=0\tpointer-drag=-\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\tinput-generation={input}\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-prompt-state\tkey-ready=0\tpointer-ready=0\twheel-ready=0\tpointer-drag=-\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\tinput-generation={input}\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -10341,7 +10713,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-wheel\t"));
+            assert!(response.contains("\tadapter=native-prompt-state\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

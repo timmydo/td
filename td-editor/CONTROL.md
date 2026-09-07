@@ -9,6 +9,8 @@ path answers. Decoded keys drive ordinary editing and menu/Find/Replace/
 numeric/command input under the stricter input contract below. Decoded pointer
 press/move/release share native hit testing, and normalized wheel deltas use
 the native scrolling path.
+`prompt-state` reads full text entries, target validity and native feedback
+without changing any input or dialog state.
 Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
@@ -66,6 +68,7 @@ In the examples below, field spaces denote literal Tab separators.
 | Payload fields | Meaning |
 | --- | --- |
 | `1 ID state` | Snapshot the current controller. |
+| `1 ID prompt-state` | Inspect native text-entry state and existing dialog IDs without mutation. |
 | `1 ID new` | Create and activate an empty tab; return its stable ID. |
 | `1 ID open HEX_PATH` | Queue ordinary file Open and return a background-job ID. |
 | `1 ID save TAB REVISION` | Queue a revision-pinned save to the associated file. |
@@ -104,6 +107,76 @@ lowercase hex. Empty byte strings use `-`; nonempty hex has two lowercase
 digits per byte. `hex`/`unhex` and the frame/page limits are shared with
 replay, whose old public helper names remain re-exports, not duplicate codecs.
 Replay also uses the bounded response-frame encoder.
+
+## Prompt inspection
+
+`1 ID prompt-state` is a native-only read-only query, available without
+keyboard/pointer readiness, focus or visible prompt geometry. It does not
+type, dismiss, answer, validate an entered value, cancel Paste/repeat/drag,
+advance a generation, poll a job or request a frame. The controller-only
+adapter returns `unavailable`; the native worker uses its existing bounded
+query budget. Fatal adapter state and exhausted frame/input counters retain
+their ordinary fail-stop behavior. Worker shutdown ends socket service.
+
+Success is `1 ID ok` followed by these fields, in order:
+
+| Field | Meaning |
+| --- | --- |
+| `input-generation=N` | Exact current input-context fence, not a frame acknowledgement. |
+| `prompt=KIND` | Retained text-entry kind below; `none` means no entry, not no modal. |
+| `target=TAB,REVISION` or `-` | Current validated prompt owner, or no valid target. |
+| `target-error=CODE` or `-` | Ordinary model refusal when a retained prompt target is invalid. |
+| `field=text\|replacement\|-` | Selected field within the retained entry; `replacement` occurs only in Replace. |
+| `text=HEX` | Entire literal primary entry, including a value clipped in the UI. |
+| `replacement=HEX` | Entire Replace replacement field; otherwise empty. |
+| `refused=0\|1\|-` | Prior numeric/command refusal flag; otherwise not applicable. |
+| `status=HEX` | Replace's stored human-readable result/status; otherwise empty. |
+| `notice=HEX` | Last stored native feedback, possibly hidden by a modal. |
+| `key-ready=0\|1` | Existing decoded-key availability, not target/value validation. |
+| `dialog-last=N` | Existing shared close/conflict/path ID counter. |
+| `dialog=...` | Existing close/conflict/path identity/phase/answers from `state`. |
+
+Kinds are `none`, `path-open`, `path-save-as`, `path-dictionary`,
+`close-save-as`, `find-forward`, `find-backward`, `replace`, `go-to-line`,
+`fill-column`, and `command`. `close-save-as` is Save As answered through
+the close dialog's ID rather than an independent path ID, including after
+a save conflict during close. Other ordinary paths always have their own
+revision-bound identity; opening one without a valid tab is refused.
+
+An async save conflict can cover a retained Find/Replace/numeric/command
+entry. The snapshot still exposes that retained entry, not the surface
+currently receiving input. Path entry takes precedence; otherwise a live
+close/conflict/Reload question outranks non-file entry for input. Consult
+`dialog` for this question authority; `key-ready=0` alone also covers loss
+of focus/readiness. Menus and questions with no retained entry report
+`none`. `state` supplies coarse modal flags. There are no new prompt IDs
+or answer operations in this increment.
+
+Each of `text`, `replacement`, `status` and `notice` is UTF-8 encoded as
+lowercase hex, with `-` for empty. Each is limited to 8,192 original bytes;
+the whole query returns `limit` before hex encoding if any exceeds the
+ceiling. Values are never truncated. Four bounded hex fields plus fixed
+metadata fit the existing one-MiB response bound without paging. Existing
+entry limits remain smaller or equal; this query does not enlarge them.
+Current producers fit below the snapshot ceiling (stored notices are capped
+at 512 characters); the outer bound also protects against future producer
+growth or internal misuse.
+
+Target checks use the existing owner/revision/selection/setting rules of
+the prompt. A stale retained entry remains inspectable: `target=-` and its
+`target-error` describe refusal without discarding text. A valid target does
+not mean the typed number or command is valid, and `refused=0` means only
+that no prior refusal is retained. `status` and `notice` are diagnostic prose,
+not stable machine enums, completion receipts, or claims about visible pixels.
+Readiness and all fields are captured in one UI-thread observation. Paths
+include their ordinary live dialog fields in that same snapshot; inspection
+does not bypass the explicit ID/tab/revision checks for an answer. Other
+text prompts still use decoded keys and their real-input readiness policy.
+
+This explicitly opted-in private endpoint already grants document read/write
+access. Prompt entries and feedback may also contain user text and file paths;
+do not publish them as non-sensitive diagnostics. `Request` Debug contains
+only the query operation, never a response or prompt value.
 
 ## Tab creation
 
@@ -490,7 +563,8 @@ completion. No cancellation RPC or download/bundled dictionary is added.
 Terminal rows are historical; later replacements do not rewrite them.
 Native keyboard Return still submits through its ordinary path without a
 remote job row. This endpoint now answers all file/close/conflict dialogs;
-other UI modals retain coarse flags and accept decoded keys as specified next.
+other UI modals accept decoded keys as specified next. `prompt-state`
+complements their coarse flags with exact read-only entry inspection.
 
 ## Decoded keys
 
@@ -1054,8 +1128,8 @@ snapshot. Its generation means local UI state, **not** a submitted buffer,
 frame callback or scanout. The native extension below adds its own redraw
 generations/snapshots, coarse flags, bounded spelling/file outcomes and close
 and conflict/path dialog identity/answers. Decoded key and pointer admission
-are connected, including normalized wheel frames; prompt-entry text queries
-remain later work.
+are connected, including normalized wheel frames. The separate `prompt-state`
+query exposes native entry values and feedback under its contract above.
 
 ## Experimental native adapter
 
@@ -1099,7 +1173,7 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-wheel` | Explicit implemented adapter identity. |
+| `adapter=native-prompt-state` | Explicit implemented adapter identity. |
 | `key-ready=0\|1` | Native key availability, before target/generation/counter validation. |
 | `pointer-ready=0\|1` | Native pointer availability, before target/generation/counter validation. |
 | `wheel-ready=0\|1` | Native wheel availability; pointer readiness with no menu. |
@@ -1123,9 +1197,10 @@ close/conflict coordinators and path prompts; job rows expose spelling and
 file outcomes. Other modal IDs remain absent, including menus, Find,
 Replace, numeric and command entry. No path or entry text
 is disclosed by these added fields. Query `text` separately for document
-bytes. Controller generation does not cover native-only modal/job changes,
-and is not a submitted/callback-completed frame generation. Clients must not
-use it as a native snapshot version or presentation fence. Use
+bytes and `prompt-state` for entries/feedback. Controller generation does
+not cover native-only modal/job changes, and is not a submitted or
+callback-completed frame generation. Clients must not use it as a native
+snapshot version or presentation fence. Use
 `input-generation` for decoded keys, pointers and wheel frames, and the separate
 `window-generation` with `wait-frame` under the frame contract above.
 

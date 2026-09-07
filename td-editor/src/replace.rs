@@ -57,6 +57,10 @@ impl Prompt {
         Ok((self.point.tab, self.point.revision))
     }
 
+    pub fn entry(&self) -> (&str, &str, bool, &str) {
+        (&self.query, &self.replacement, self.with, &self.status)
+    }
+
     pub fn apply(
         &mut self,
         ui: &mut Controller,

@@ -49,8 +49,8 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-Native query/edit/file/dialog and decoded key/pointer control are explicit.
-Remote wheel input, GPU rendering and td-mail integration remain
+Native query/edit/file/dialog and decoded key/pointer/wheel control are explicit.
+GPU rendering and td-mail integration remain
 unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
@@ -122,8 +122,12 @@ Close confirmation still requires explicit dialog answers. `wheel` supplies
 bounded signed visual-row/cell-column deltas with the same input token and
 real pointer readiness; menus/modals refuse it. Every admitted frame cancels
 prior drag/repeat/Paste context, including zero/clamped frames. It does not
-change text/history or share physical wheel fractions. Prompt-entry text
-queries are not connected yet.
+change text/history or share physical wheel fractions. `prompt-state` reads
+full Find/Replace/numeric/command/path entries, target validity and feedback,
+including clipped or unfocused prompts. It returns the current input token
+and existing file-dialog IDs without typing, answering or changing state.
+These values can contain private document text and paths. Non-file entry
+still uses decoded keys with ordinary real-input readiness.
 `check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback

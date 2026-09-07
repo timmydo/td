@@ -46,6 +46,10 @@ impl Prompt {
         Ok((self.point.tab, self.point.revision))
     }
 
+    pub fn entry(&self) -> (&str, bool) {
+        (&self.text, self.refused)
+    }
+
     pub fn action(&self) -> Result<Item> {
         NAMES
             .iter()

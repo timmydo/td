@@ -19,6 +19,7 @@ const HELP: &str = concat!(
     "Control pointer press/move/release uses native hit testing, not cursor warps.\n",
     "Remote drags are separate; real pointer input and keys cancel them.\n",
     "Control wheel uses bounded signed row/column deltas and the input fence.\n",
+    "Control prompt-state reads full entries and feedback without answering.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -197,6 +198,7 @@ mod tests {
             "Control pointer press/move/release uses native hit testing",
             "Remote drags are separate",
             "Control wheel uses bounded signed row/column deltas and the input fence",
+            "Control prompt-state reads full entries and feedback without answering",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }

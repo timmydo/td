@@ -38,8 +38,9 @@ entry with an exact native input-context fence. It requires real input
 readiness and cannot answer file/close/conflict flows. Decoded pointer
 press/move/release share native hit testing with separately tracked remote
 drags. Normalized wheel frames use the shared native scroll handler and input
-fence without physical axis accumulation. Other UI prompts still expose only
-coarse presence flags.
+fence without physical axis accumulation. Read-only `prompt-state` exposes
+full entry values, target validity and stored feedback alongside existing
+live file-dialog IDs. It grants no new answer authority.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -2227,7 +2228,14 @@ readiness with no menu/modal, and cancel existing input context even for a
 zero/clamped frame. Signed bounded row/column deltas use native scrolling
 without synthetic serials, cursor motion or shared physical fractions.
 CONTROL.md fixes units, grammar, guards, cleanup and delivery-only replies.
-Prompt-entry text queries remain later work.
+Read-only `prompt-state` now exposes full Find/Replace/numeric/command/path
+entry values, selected Replace field, target validity, prior numeric/command
+refusals and stored feedback. It preserves input, jobs, text and generations,
+works without focus/visible geometry, and repeats existing live dialog IDs
+atomically with the input token. Each textual response field is bounded to
+8,192 UTF-8 bytes before hex encoding; no truncation, new prompt ID or answer
+operation is added. CONTROL.md defines field order, empty/stale target
+meaning, diagnostic-only status and the private endpoint's disclosure scope.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 
@@ -2273,14 +2281,15 @@ unknown commands/versions, bad hex, overflow and truncated frames before
 dispatch. A response echoes version/request ID, then `ok`, `error`, or
 `pending`; errors carry a stable code and hex-encoded diagnostic.
 
-Version 1 exposes `state`, `text`, `new`, `open`, `select-tab`, `select-range`,
-`insert`, `delete`, `undo`, `redo`, `find`, `go-to-line`, `replace`,
-`fill-paragraph`,
+Version 1 exposes `state`, `prompt-state`, `text`, `new`, `open`, `select-tab`,
+`select-range`, `insert`, `delete`, `undo`, `redo`, `find`, `go-to-line`,
+`replace`, `fill-paragraph`,
 `set-auto-fill`, `set-fill-column`, `set-key-profile`, `check-spelling`,
 `spelling-results`, `save`, `save-as`, `close-tab`, `quit`, `dialog-answer`,
 `key`, `pointer`, `wheel`, and `wait-frame`. Text mutations and close requests
-name a stable tab ID and expected revision. Stale commands return `stale-revision`
-without side effects. `state` reports the active tab, all tab IDs/revisions,
+name a stable tab ID and expected revision. Stale commands return
+`stale-revision` without side effects. `state` reports the active tab,
+all tab IDs/revisions,
 dirty flags, cursors/selections, modes, current dialog, spelling job/status,
 and submitted/callback-completed frame generations. `text` takes tab ID,
 revision, byte offset and byte limit; it returns a scalar-aligned page and
