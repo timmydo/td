@@ -1249,9 +1249,9 @@ impl Window {
                 self.input.modifiers(modifiers);
                 if ready {
                     self.notify(if self.files.is_some() {
-                        "Keymap ready. Experimental file window; Escape dismisses."
+                        "Keymap ready. Experimental file window."
                     } else {
-                        "Keymap ready; Escape dismisses this notice. Scratch only: no Save."
+                        "Keymap ready. Scratch only: no Save."
                     });
                 }
             }
@@ -2893,19 +2893,7 @@ impl Window {
         let replace_notice = self.replace_notice();
         let closing_notice = self.closing_notice();
         let conflict_notice = self.conflict_notice();
-        let mut raster =
-            Raster::new(&mut self.pixels, &self.font, geometry, width * 4).map_err(error)?;
-        raster
-            .paint(
-                &self
-                    .ui
-                    .scene(&labels)
-                    .map_err(error)?
-                    .spelling(&self.spelling),
-                geometry.bounds(),
-            )
-            .map_err(error)?;
-        let notice = if self.quitting {
+        let prompt = if self.quitting {
             Some(close_notice)
         } else if path_notice.is_some() {
             path_notice.as_deref()
@@ -2922,10 +2910,28 @@ impl Window {
         } else if replace_notice.is_some() {
             replace_notice.as_deref()
         } else {
-            self.notice.as_deref()
+            None
         };
-        if let Some(notice) = notice {
-            paint_notice(&mut raster, geometry, notice);
+        let status_notice = if prompt.is_none() {
+            self.notice.as_deref()
+        } else {
+            None
+        };
+        let mut raster =
+            Raster::new(&mut self.pixels, &self.font, geometry, width * 4).map_err(error)?;
+        raster
+            .paint(
+                &self
+                    .ui
+                    .scene(&labels)
+                    .map_err(error)?
+                    .spelling(&self.spelling)
+                    .notice(status_notice),
+                geometry.bounds(),
+            )
+            .map_err(error)?;
+        if let Some(prompt) = prompt {
+            paint_prompt(&mut raster, geometry, prompt);
         }
         if let Some(menu) = &self.menu {
             menu.paint(&mut raster, geometry);
@@ -4770,7 +4776,7 @@ fn read_keymap(fd: OwnedFd, format: u32, size: u32) -> Result<Keymap> {
     Keymap::parse(source).map_err(error)
 }
 
-fn paint_notice(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
+fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
     let (width, height) = geometry.dimensions();
     let y = if height >= 160 { 48 } else { 0 };
     let clip = Rect {
@@ -5907,6 +5913,70 @@ mod tests {
         reader.read_to_string(&mut text).unwrap();
         assert_eq!(text, "é");
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "changed abc\n");
+    }
+
+    #[test]
+    fn ordinary_notices_and_completed_paste_never_cover_document_pixels() {
+        let finish_frame = |w: &mut Window, peer: &UnixStream| {
+            done(w);
+            let buffers: Vec<_> = w.buffers.iter().filter(|b| b.busy).map(|b| b.id).collect();
+            for id in buffers {
+                w.event(message(id, 0, &[])).unwrap();
+            }
+            drain(peer);
+        };
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, peer, keyboard, device) = clipboard_fixture();
+            w.labels.clear();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            configure(&mut w, 800, 600);
+            w.event(message(SHM, 0, &[1])).unwrap();
+            w.draw().unwrap();
+            let original = w.pixels.clone();
+            finish_frame(&mut w, &peer);
+            w.notify("Keymap ready.");
+            w.draw().unwrap();
+            let status_start = 800 * (600 - 24) * 4;
+            assert!(
+                w.pixels[..status_start] == original[..status_start],
+                "notice covered document"
+            );
+            assert!(
+                w.pixels[status_start..] != original[status_start..],
+                "notice absent from status"
+            );
+            finish_frame(&mut w, &peer);
+
+            // Do not dismiss the notice before a real clipboard transfer.
+            selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+            w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
+            key(
+                &mut w,
+                keyboard,
+                if profile == Profile::Windows { 47 } else { 21 },
+            );
+            let (_, mut files) = drain(&peer);
+            let mut writer = files.pop().unwrap();
+            writer.write_all(b"pasted").unwrap();
+            drop(writer);
+            w.tick(1, true).unwrap();
+            assert_eq!(w.ui.editor().document(1).unwrap().text(), "pasted abc\n");
+            assert_eq!(w.notice.as_deref(), Some("Paste complete."));
+            w.draw().unwrap();
+            let pasted = w.pixels.clone();
+            finish_frame(&mut w, &peer);
+            w.chord("Escape", false).unwrap();
+            w.draw().unwrap();
+            assert!(w.notice.is_none());
+            assert!(
+                w.pixels[..status_start] == pasted[..status_start],
+                "paste notice covered document"
+            );
+            assert!(
+                w.pixels[status_start..] != pasted[status_start..],
+                "status was not restored"
+            );
+        }
     }
 
     #[test]

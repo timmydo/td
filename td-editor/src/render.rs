@@ -399,6 +399,7 @@ pub struct Scene<'a> {
     caret: Option<Position>,
     spelling: &'a [std::ops::Range<usize>],
     spelling_status: Option<String>,
+    notice: Option<&'a str>,
 }
 
 impl<'a> Scene<'a> {
@@ -468,6 +469,7 @@ impl<'a> Scene<'a> {
             caret,
             spelling: &[],
             spelling_status: None,
+            notice: None,
         })
     }
 
@@ -478,6 +480,12 @@ impl<'a> Scene<'a> {
         let (status, marks) = state.view(self.editor);
         self.spelling_status = Some(status);
         self.spelling = marks;
+        self
+    }
+
+    /// Non-modal feedback replaces the status text, never document pixels.
+    pub fn notice(mut self, notice: Option<&'a str>) -> Self {
+        self.notice = notice.filter(|text| !text.is_empty());
         self
     }
 
@@ -598,6 +606,31 @@ impl<'a> Scene<'a> {
             BORDER,
             sink,
         );
+        if let Some(notice) = self.notice {
+            let scale = self.geometry.scale.value();
+            let columns = self.geometry.width.saturating_sub(16 * scale) / (CELL_WIDTH * scale);
+            let columns = columns.min(512);
+            let mut chars = notice.chars().peekable();
+            let shown = (0..columns).map_while(|column| {
+                let scalar = chars.next()?;
+                Some(if column + 1 == columns && chars.peek().is_some() {
+                    '…'
+                } else if scalar.is_control() {
+                    ' '
+                } else {
+                    scalar
+                })
+            });
+            self.label(
+                shown,
+                (8 * s, status_rect.y + 4 * s),
+                status_rect,
+                GlyphStyle::medium(INK, CHROME),
+                clip,
+                sink,
+            );
+            return;
+        }
         let spelling = if self.editor.active().is_some() {
             self.spelling_status
                 .as_deref()

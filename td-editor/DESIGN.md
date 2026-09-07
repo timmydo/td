@@ -984,7 +984,9 @@ Cancelling preserves document selection, undo and text. Opening a prompt
 clears the previous notice so cancellation does not resurrect stale feedback.
 Submission closes the
 prompt and displays pending/success/failure; retry starts a fresh prompt.
-Prompts and notices share the existing clipped top-six-document-row overlay.
+Interactive prompts keep the clipped top-six-document-row overlay. Ordinary
+non-modal notices use the bottom status row as specified below; routine
+feedback does not cover editable text.
 When input is unavailable or not synchronized, the prompt instead prefixes
 readiness instructions without erasing the entered path.
 Path and confirmation dialogs remain keyboard-only for physical interaction;
@@ -1207,8 +1209,19 @@ The title and fixture say NO SAVE. Typing, selection, visual motion, undo,
 tab switching, native pointer input, menus and core commands are connected.
 Unavailable commands produce a visible, bounded notice,
 retained until Escape/C-g or another explicit notice-producing action.
-Notices wrap over the document's top six rows and clip on small surfaces;
-they do not mutate document text. The binary refuses filenames and ordinary
+Non-modal notices replace the bottom status text without changing document
+geometry, scrolling, hit testing or pixels. They use the warm chrome and
+medium ink, showing one line of whole font cells with an ellipsis when the
+message exceeds the available width or 512-scalar drawing budget. Control
+characters display as spaces. Very narrow windows may show no complete cell.
+The retained notice is unchanged by clipping and remains available through
+the read-only control `prompt-state` query. Escape/C-g dismisses it and
+restores the normal line/column, mode and spelling status; dismissal is never
+required to continue editing. No timer silently dismisses an error. Modal
+Find/Replace/path/numeric/command and close/conflict questions retain their
+existing overlay, precedence and input rules; ordinary status feedback is
+not painted while one of these prompts is active.
+Notices do not mutate document text. The binary refuses filenames and ordinary
 `$EDITOR` invocation.
 
 Closing a clean tab removes it, and closing the last clean tab exits. Dirty

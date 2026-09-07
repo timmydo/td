@@ -340,7 +340,10 @@ Mouse selection, tab clicks, scrolling and menus work. Open/Save remain
 disabled in the scratch preview, as is dictionary loading. F7 reports no
 dictionary there. Clipboard
 commands require an available data-device v3 and keyboard focus.
-Unavailable commands show a notice; Escape/Ctrl+G dismisses it. Closing a
+Routine feedback and unavailable-command notices appear in the bottom status
+bar, never over document text. Long messages end with an ellipsis;
+Escape/Ctrl+G restores the usual status, but editing needs no dismissal.
+Interactive prompts and confirmation dialogs remain modal. Closing a
 dirty tab refuses; undo to clean or close the window to discard all scratch
 text. Dirty window close asks for Ctrl+D to discard everything, or
 Escape/Ctrl+G to cancel. Killing the process still loses text: do not keep

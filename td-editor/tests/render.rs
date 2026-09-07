@@ -48,6 +48,82 @@ fn inside(rect: Rect, x: usize, y: usize) -> bool {
 }
 
 #[test]
+#[allow(clippy::unwrap_used, reason = "validated renderer fixtures")]
+fn notices_change_only_status_pixels_at_every_scale_and_restore_cleanly() {
+    let font = font::pinned().unwrap();
+    let editor = editor("first line\nsecond line\nthird line", Selection::default());
+    for scale in 1..=4 {
+        for (width, height) in [(400 * usize::from(scale), 200 * usize::from(scale)), (7, 9)] {
+            let geometry = geometry(width, height, scale);
+            let scene =
+                Scene::new(&editor, geometry, View::default(), &[], Profile::Windows).unwrap();
+            let mut original = vec![0u8; width * height * 4];
+            Raster::new(&mut original, &font, geometry, width * 4)
+                .unwrap()
+                .paint(&scene, geometry.bounds())
+                .unwrap();
+            let scene = scene.notice(Some(
+                "Paste completed. This feedback must never cover the text.",
+            ));
+            let mut actual = original.clone();
+            Raster::new(&mut actual, &font, geometry, width * 4)
+                .unwrap()
+                .paint(&scene, geometry.bounds())
+                .unwrap();
+            for (index, (before, after)) in original.iter().zip(&actual).enumerate() {
+                if before != after {
+                    assert!(inside(
+                        geometry.status(),
+                        index / 4 % width,
+                        index / (4 * width)
+                    ));
+                }
+            }
+            if width > 7 {
+                assert_ne!(actual, original, "status feedback was not drawn");
+            }
+            Raster::new(&mut actual, &font, geometry, width * 4)
+                .unwrap()
+                .paint(&scene.notice(None), geometry.bounds())
+                .unwrap();
+            assert_eq!(
+                actual, original,
+                "dismissal did not restore ordinary status"
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used, reason = "validated renderer fixture")]
+fn notice_status_uses_whole_cells_and_marks_truncation() {
+    let editor = Editor::default();
+    let status_text = |width, text: &str| {
+        let geometry = geometry(width, 160, 1);
+        let scene = Scene::new(&editor, geometry, View::default(), &[], Profile::Windows)
+            .unwrap()
+            .notice(Some(text));
+        let mut shown = String::new();
+        scene.emit(geometry.bounds(), &mut |draw| {
+            if let Primitive::Glyph { y, scalar, .. } = draw.primitive {
+                if y == geometry.status().y + 4 {
+                    shown.push(scalar);
+                }
+            }
+        });
+        shown
+    };
+    assert_eq!(status_text(80, "Paste completed."), "Paste c…");
+    assert_eq!(status_text(80, "12345678"), "12345678");
+    assert_eq!(status_text(80, "hi\nx\ty"), "hi x y");
+    assert_eq!(status_text(8192, &"é".repeat(512)), "é".repeat(512));
+    assert_eq!(
+        status_text(8192, &"é".repeat(513)),
+        format!("{}…", "é".repeat(511))
+    );
+}
+
+#[test]
 fn fills_match_a_pixel_reference_and_leave_padding_and_tail_untouched() {
     let font = font::pinned().unwrap();
     let geometry = geometry(17, 13, 1);
