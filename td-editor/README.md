@@ -49,8 +49,8 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-Native query/edit/Open control is available explicitly; remote writes,
-GPU rendering and td-mail integration remain unimplemented. Do not set
+Native query/edit/file control is available explicitly; remote path/conflict
+answers, GPU rendering and td-mail integration remain unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
@@ -85,9 +85,16 @@ pending scans expose no partial marks. Remote `open` queues the ordinary file
 worker and records the selected/created tab ID and revision in shared bounded
 job history, including duplicate-file and missing-file behavior. Paths use
 literal OS bytes. Remote Close Tab, Quit and close-dialog Cancel/Discard
-are also connected; remote writes and other dialog answers remain later work.
+are also connected; other dialog answers remain later work.
 These answers pin the live dialog ID, tab and revision and work independently
 of physical focus/prompt visibility, without bypassing the close coordinator.
+Remote `save` and `save-as` also return job IDs. They recheck the requested
+revision before handing a snapshot to the worker; edits after handoff remain
+unsaved and cannot change the bytes being written. Save requires an associated
+file; Save As takes an explicit literal OS-byte path and cannot overwrite an
+existing destination. Job errors may require inspecting disk and the native
+warning before retrying. Close-dialog Save/path and conflict answers are not
+remotely connected yet.
 `check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback

@@ -11,6 +11,20 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 
 type Result<T> = std::result::Result<T, String>;
 
+#[derive(Debug)]
+pub(crate) struct PollFailure {
+    pub(crate) code: crate::Error,
+    pub(crate) detail: String,
+}
+impl PollFailure {
+    fn unavailable(detail: String) -> Self {
+        Self {
+            code: crate::Error::Unavailable,
+            detail,
+        }
+    }
+}
+
 enum Operation {
     Dictionary(PathBuf),
     Open(PathBuf),
@@ -41,8 +55,17 @@ enum Completion {
 enum Pending {
     Dictionary,
     Open,
-    Reload { permit: Option<crate::Reload> },
-    Save { tab: TabId, point: SavePoint },
+    Reload {
+        permit: Option<crate::Reload>,
+    },
+    Save {
+        tab: TabId,
+        point: SavePoint,
+    },
+    QueuedSave {
+        point: crate::model::RevisionPoint,
+        path: Option<PathBuf>,
+    },
 }
 struct Association {
     file: FileId,
@@ -184,6 +207,38 @@ impl Session {
         revision: u64,
         path: Option<PathBuf>,
     ) -> Result<()> {
+        let file = self.save_arguments(ui, tab, revision, &path)?;
+        let (point, bytes) = ui.editor().save_snapshot(tab).map_err(|e| e.to_string())?;
+        self.submit(
+            Operation::Save { file, path, bytes },
+            Pending::Save { tab, point },
+        )
+    }
+
+    /// Remote admission reserves the single file slot, but no bytes yet.
+    pub(crate) fn queue_save(
+        &mut self,
+        ui: &Controller,
+        tab: TabId,
+        revision: u64,
+        path: Option<PathBuf>,
+    ) -> Result<()> {
+        self.save_arguments(ui, tab, revision, &path)?;
+        let point = ui
+            .editor()
+            .revision_point(tab, revision)
+            .map_err(|e| e.to_string())?;
+        self.pending = Some(Pending::QueuedSave { point, path });
+        Ok(())
+    }
+
+    fn save_arguments(
+        &self,
+        ui: &Controller,
+        tab: TabId,
+        revision: u64,
+        path: &Option<PathBuf>,
+    ) -> Result<Option<FileId>> {
         self.available()?;
         if path
             .as_ref()
@@ -201,15 +256,31 @@ impl Session {
         if file.is_none() && path.is_none() {
             return Err("Save As needs a path".into());
         }
-        let (point, bytes) = ui.editor().save_snapshot(tab).map_err(|e| e.to_string())?;
-        self.submit(
-            Operation::Save { file, path, bytes },
-            Pending::Save { tab, point },
-        )
+        Ok(file)
     }
 
     /// Nonblocking; at most one completion and one encoded snapshot can exist.
-    pub(crate) fn poll(&mut self, ui: &mut Controller) -> Option<Result<String>> {
+    pub(crate) fn poll(
+        &mut self,
+        ui: &mut Controller,
+    ) -> Option<std::result::Result<String, PollFailure>> {
+        if let Some(Pending::QueuedSave { point, path }) = self
+            .pending
+            .take_if(|pending| matches!(pending, Pending::QueuedSave { .. }))
+        {
+            if let Err(code) = ui.editor().check_revision(&point) {
+                return Some(Err(PollFailure {
+                    code,
+                    detail: format!("Queued Save refused ({code}); no write submitted"),
+                }));
+            }
+            // This is the handoff boundary: validate before capturing bytes.
+            // Later edits cannot change the immutable ordinary Save snapshot.
+            return self
+                .save(ui, point.tab, point.revision, path)
+                .err()
+                .map(|detail| Err(PollFailure::unavailable(detail)));
+        }
         let result = match self.receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return None,
@@ -220,7 +291,10 @@ impl Session {
             }
         };
         let pending = self.pending.take();
-        Some(self.finish(ui, pending, result))
+        Some(
+            self.finish(ui, pending, result)
+                .map_err(PollFailure::unavailable),
+        )
     }
 
     fn finish(
@@ -549,7 +623,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(result) = session.poll(ui) {
-                return result;
+                return result.map_err(|error| error.detail);
             }
             assert!(std::time::Instant::now() < deadline, "file worker timeout");
             std::thread::yield_now();
@@ -722,7 +796,10 @@ mod tests {
             let job = self.jobs.try_recv().unwrap();
             let result = execute(&mut self.files, &mut self.known, job);
             self.results.send(result).ok().unwrap();
-            self.session.poll(&mut self.ui).unwrap()
+            self.session
+                .poll(&mut self.ui)
+                .unwrap()
+                .map_err(|error| error.detail)
         }
         fn open(&mut self, path: PathBuf) -> TabId {
             self.session.open(path).unwrap();
@@ -742,6 +819,75 @@ mod tests {
         fn save(&mut self, tab: TabId, path: Option<PathBuf>) {
             let revision = self.ui.editor().document(tab).unwrap().revision();
             self.session.save(&self.ui, tab, revision, path).unwrap();
+        }
+    }
+
+    #[test]
+    fn queued_save_checks_revision_before_handoff_and_owns_bytes_after_it() {
+        for save_as in [false, true] {
+            let directory = Directory::new();
+            let path = directory.path("text");
+            let destination = directory.path("new-path");
+            fs::write(&path, b"disk").unwrap();
+            let mut h = Harness::new();
+            let tab = h.open(path.clone());
+            h.edit(tab, Command::Insert("a".into()));
+            let target = save_as.then(|| destination.clone());
+            h.session.queue_save(&h.ui, tab, 1, target.clone()).unwrap();
+            assert!(h.session.busy());
+            assert!(matches!(h.jobs.try_recv(), Err(TryRecvError::Empty)));
+            assert!(h.session.save(&h.ui, tab, 1, target.clone()).is_err());
+            assert!(h.session.open(path.clone()).is_err());
+            h.edit(tab, Command::Insert("b".into()));
+            h.edit(tab, Command::Undo);
+            assert_eq!(h.ui.editor().document(tab).unwrap().text(), "adisk");
+            let error = h.session.poll(&mut h.ui).unwrap().unwrap_err();
+            assert_eq!(error.code, crate::Error::StaleRevision);
+            assert!(!h.session.busy());
+            assert!(matches!(h.jobs.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(fs::read(&path).unwrap(), b"disk");
+            assert!(!destination.exists());
+            h.session.queue_save(&h.ui, tab, 3, target).unwrap();
+            assert!(h.session.poll(&mut h.ui).is_none());
+            assert!(h.session.busy());
+            h.edit(tab, Command::Insert("c".into()));
+            h.complete().unwrap();
+            assert_eq!(
+                fs::read(if save_as { &destination } else { &path }).unwrap(),
+                b"adisk"
+            );
+            assert_eq!(h.ui.editor().document(tab).unwrap().text(), "acdisk");
+            assert!(h.ui.editor().document(tab).unwrap().dirty());
+        }
+    }
+
+    #[test]
+    fn queued_save_model_point_rejects_other_editor_and_missing_tab_before_io() {
+        for missing in [false, true] {
+            let directory = Directory::new();
+            let path = directory.path("text");
+            fs::write(&path, b"disk").unwrap();
+            let mut h = Harness::new();
+            let tab = h.open(path.clone());
+            h.session.queue_save(&h.ui, tab, 0, None).unwrap();
+            let code = if missing {
+                h.ui.dispatch(Event::Close { tab, revision: 0 }).unwrap();
+                h.session.poll(&mut h.ui).unwrap().unwrap_err().code
+            } else {
+                let mut other = Controller::default();
+                other.dispatch(Event::Load(b"disk")).unwrap();
+                h.session.poll(&mut other).unwrap().unwrap_err().code
+            };
+            assert_eq!(
+                code,
+                if missing {
+                    crate::Error::MissingTab
+                } else {
+                    crate::Error::InvalidArgument
+                }
+            );
+            assert!(matches!(h.jobs.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(fs::read(path).unwrap(), b"disk");
         }
     }
 
@@ -1026,6 +1172,7 @@ mod tests {
             .poll(&mut h.ui)
             .unwrap()
             .unwrap_err()
+            .detail
             .contains("may have reached disk"));
         assert!(!h.session.busy());
         assert!(h.session.poll(&mut h.ui).is_none());

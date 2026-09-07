@@ -358,10 +358,15 @@ struct Window {
     searches: crate::search::History,
     spelling: crate::spelling::WindowState,
     control_jobs: crate::control_jobs::Jobs,
-    control_open_job: Option<u64>,
+    control_file_job: Option<ControlFile>,
     control: Option<crate::control_worker::Worker>,
     frame_waiters: VecDeque<crate::control_worker::Job>,
     control_cleanup_error: Option<String>,
+}
+
+enum ControlFile {
+    Open(u64),
+    Save(u64),
 }
 
 enum PathAction {
@@ -460,7 +465,7 @@ impl Window {
             searches: crate::search::History::default(),
             spelling: crate::spelling::WindowState::default(),
             control_jobs: crate::control_jobs::Jobs::default(),
-            control_open_job: None,
+            control_file_job: None,
             control: None,
             frame_waiters: VecDeque::new(),
             control_cleanup_error: None,
@@ -1392,24 +1397,30 @@ impl Window {
             .and_then(|files| files.poll(&mut self.ui))
         {
             let mut job_error = None;
-            if let Some(id) = self.control_open_job.take() {
-                // One file operation is in flight. Session publishes success only
-                // after Open selected or created its tab on this same UI thread.
-                let opened = if result.is_ok() {
-                    self.ui
-                        .editor()
-                        .active()
-                        .ok_or(crate::Error::MissingTab)
-                        .and_then(|tab| {
-                            Ok(Target {
-                                tab,
-                                revision: self.ui.editor().document(tab)?.revision(),
-                            })
-                        })
-                } else {
-                    Err(crate::Error::Unavailable)
+            if let Some(job) = self.control_file_job.take() {
+                // Session completes the single file job on this UI thread.
+                let outcome = match job {
+                    ControlFile::Open(id) => {
+                        // Open success follows selection or creation of its tab.
+                        let opened = result.as_ref().map_err(|error| error.code).and_then(|_| {
+                            self.ui
+                                .editor()
+                                .active()
+                                .ok_or(crate::Error::MissingTab)
+                                .and_then(|tab| {
+                                    Ok(Target {
+                                        tab,
+                                        revision: self.ui.editor().document(tab)?.revision(),
+                                    })
+                                })
+                        });
+                        self.control_jobs.opened(id, opened)
+                    }
+                    ControlFile::Save(id) => self
+                        .control_jobs
+                        .saved(id, result.as_ref().map(|_| ()).map_err(|error| error.code)),
                 };
-                if let Err(detail) = self.control_jobs.opened(id, opened) {
+                if let Err(detail) = outcome {
                     job_error = Some(detail);
                 }
                 self.frames.invalidate(true);
@@ -1429,10 +1440,10 @@ impl Window {
             }
             let mut notice = match result {
                 Ok(notice) => notice,
-                Err(detail) => format!("File operation failed: {detail}"),
+                Err(error) => format!("File operation failed: {}", error.detail),
             };
             if let Some(detail) = job_error {
-                notice.push_str(&format!("; Open job outcome unavailable: {detail}"));
+                notice.push_str(&format!("; File job outcome unavailable: {detail}"));
             }
             self.notify(notice);
             if self.closing_save {
@@ -1650,11 +1661,63 @@ impl Window {
                 .response(),
             };
         }
+        if let crate::control::Operation::Save {
+            tab,
+            revision,
+            path,
+        } = &request.operation
+        {
+            let result = (|| -> crate::Result<u64> {
+                if self.files.is_none()
+                    || self.files.as_ref().is_some_and(|files| files.busy())
+                    || self.control_file_job.is_some()
+                {
+                    return Err(crate::Error::Unavailable);
+                }
+                self.ui.editor().revision_point(*tab, *revision)?;
+                if self.ui.editor().active() != Some(*tab)
+                    || (path.is_none()
+                        && !self
+                            .files
+                            .as_ref()
+                            .is_some_and(|files| files.associated(*tab)))
+                {
+                    return Err(crate::Error::InvalidArgument);
+                }
+                self.ui
+                    .generation()
+                    .checked_add(1)
+                    .ok_or(crate::Error::Exhausted)?;
+                let id = self
+                    .control_jobs
+                    .begin_save(*tab, *revision, path.is_some())?;
+                let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
+                match files.queue_save(&self.ui, *tab, *revision, path.clone()) {
+                    Ok(()) => self.control_file_job = Some(ControlFile::Save(id)),
+                    Err(detail) => {
+                        self.control_jobs
+                            .saved(id, Err(crate::Error::Unavailable))?;
+                        self.notify(format!("Save failed: {detail}"));
+                    }
+                }
+                self.stop_pointer();
+                self.control_mutation_accepted();
+                Ok(id)
+            })();
+            return match result {
+                Ok(id) => format!("1\t{}\tpending\t{id}", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if let crate::control::Operation::Open(path) = &request.operation {
             let result = (|| -> crate::Result<u64> {
                 if self.files.is_none()
                     || self.files.as_ref().is_some_and(|files| files.busy())
-                    || self.control_open_job.is_some()
+                    || self.control_file_job.is_some()
                 {
                     return Err(crate::Error::Unavailable);
                 }
@@ -1665,7 +1728,7 @@ impl Window {
                 let id = self.control_jobs.begin_open()?;
                 let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
                 match files.open(path.clone()) {
-                    Ok(()) => self.control_open_job = Some(id),
+                    Ok(()) => self.control_file_job = Some(ControlFile::Open(id)),
                     Err(detail) => {
                         self.control_jobs
                             .opened(id, Err(crate::Error::Unavailable))?;
@@ -1864,7 +1927,7 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-open\tnative={},{},{},{}",
+                    "\tadapter=native-save\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.configured),
@@ -5476,7 +5539,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-open\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-save\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -5571,6 +5634,203 @@ mod tests {
     ) -> String {
         let mut client = control_client(path, payload.as_bytes());
         control_answer_pump(w, &mut client, peer, false) // Explicitly withhold background steps.
+    }
+
+    #[test]
+    fn remote_save_jobs_recheck_queued_revisions_and_report_exact_snapshot_outcomes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let file = directory.path("draft");
+        let destination = directory
+            .0
+            .join(std::ffi::OsString::from_vec(b"saved-\xff".to_vec()));
+        std::fs::write(&file, b"disk").unwrap();
+        let (mut w, peer) = file_dialog_fixture();
+        w.files.as_mut().unwrap().open(file.clone()).unwrap();
+        finish_file(&mut w);
+        w.chord("a", false).unwrap();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t1\tsave\t2\t1"),
+            "1\t1\tpending\t1"
+        );
+        let before = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        assert!(before.contains("job=1,save,2,1,0,pending,-"));
+        for command in [
+            "save\t2\t1",
+            "save-as\t2\t1\t61",
+            "open\t61",
+            "quit",
+            "close-tab\t2\t1",
+        ] {
+            assert!(
+                job_request(&mut w, &peer, &socket, &format!("1\t2\t{command}"))
+                    .contains("\terror\tunavailable\t")
+            );
+            assert_eq!(job_request(&mut w, &peer, &socket, "1\t0\tstate"), before);
+        }
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t3\tinsert\t2\t1\t1\t1\t62"),
+            "1\t3\tok\t"
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t4\tundo\t2\t2"),
+            "1\t4\tok\t"
+        );
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+        assert_eq!(w.ui.editor().document(2).unwrap().text(), "adisk");
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=1,save,2,1,0,error,stale-revision"));
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t5\tsave\t2\t3"),
+            "1\t5\tpending\t2"
+        );
+        w.tick(w.clock + 1, false).unwrap(); // Exact ordinary worker handoff.
+        assert!(w.files.as_ref().unwrap().busy());
+        w.chord("c", false).unwrap();
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(&file).unwrap(), b"adisk");
+        assert_eq!(w.ui.editor().document(2).unwrap().text(), "acdisk");
+        assert!(w.ui.editor().document(2).unwrap().dirty());
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=2,save,2,3,0,complete,-"));
+        let save_as = format!(
+            "1\t6\tsave-as\t2\t4\t{}",
+            crate::control::hex(destination.as_os_str().as_bytes())
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, &save_as),
+            "1\t6\tpending\t3"
+        );
+        w.chord("C-n", false).unwrap();
+        finish_file(&mut w);
+        assert_eq!(w.ui.editor().active(), Some(3));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"acdisk");
+        assert!(!w.ui.editor().document(2).unwrap().dirty());
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=3,save-as,2,4,0,complete,-"));
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t7\tselect-tab\t2\t4"),
+            "1\t7\tok\t"
+        );
+        w.chord("d", false).unwrap();
+        std::fs::write(&destination, b"external").unwrap();
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t8\tsave\t2\t5"),
+            "1\t8\tpending\t4"
+        );
+        finish_file(&mut w);
+        assert!(w.conflict.is_some());
+        assert!(w.ui.editor().document(2).unwrap().dirty());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"external");
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=4,save,2,5,0,error,unavailable"));
+        w.chord("Escape", false).unwrap();
+        let existing = format!(
+            "1\t9\tsave-as\t2\t5\t{}",
+            crate::control::hex(file.as_os_str().as_bytes())
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, &existing),
+            "1\t9\tpending\t5"
+        );
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(file).unwrap(), b"adisk");
+        assert_eq!(std::fs::read(destination).unwrap(), b"external");
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=5,save-as,2,5,0,error,unavailable"));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_save_refusals_do_not_reserve_jobs_or_change_native_state() {
+        let (mut w, _peer) = file_dialog_fixture();
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        w.ui.dispatch(Event::New).unwrap();
+        for (command, code) in [
+            ("save\t99\t0", "missing-tab"),
+            ("save\t2\t1", "stale-revision"),
+            ("save-as\t1\t0\t61", "invalid-argument"),
+            ("save\t2\t0", "invalid-argument"),
+        ] {
+            let before = w.control_response(&state);
+            let notice = w.notice.clone();
+            let request =
+                crate::control::Request::parse(format!("1\t1\t{command}").as_bytes()).unwrap();
+            assert!(w
+                .control_response(&request)
+                .contains(&format!("\terror\t{code}\t")));
+            assert_eq!(w.control_response(&state), before);
+            assert_eq!(w.notice, notice);
+        }
+        for guard in ["scratch", "closed", "counter", "jobs"] {
+            let (mut w, _peer) = file_dialog_fixture();
+            match guard {
+                "scratch" => w.files = None,
+                "closed" => w.closed = true,
+                "counter" => w.ui.generation_for_test(u64::MAX),
+                "jobs" => w.control_jobs.exhaust_for_test(),
+                _ => panic!("unknown guard"),
+            }
+            let before = w.control_response(&state);
+            let notice = w.notice.clone();
+            let request = crate::control::Request::parse(b"1\t2\tsave-as\t1\t0\t61").unwrap();
+            let code = if matches!(guard, "counter" | "jobs") {
+                "exhausted"
+            } else {
+                "unavailable"
+            };
+            assert!(w
+                .control_response(&request)
+                .contains(&format!("\terror\t{code}\t")));
+            assert_eq!(w.control_response(&state), before);
+            assert_eq!(w.notice, notice);
+        }
+        let directory = DialogDirectory::new();
+        let path = directory.path("untitled-save-as");
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        let request = crate::control::Request::parse(
+            format!(
+                "1\t3\tsave-as\t1\t1\t{}",
+                crate::control::hex(path.as_os_str().as_encoded_bytes())
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(w.control_response(&request), "1\t3\tpending\t1");
+        assert!(w.prompt.is_none());
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(path).unwrap(), b"a");
+        assert!(!w.ui.editor().document(1).unwrap().dirty());
+        assert!(w.files.as_ref().unwrap().associated(1));
+        assert!(w
+            .control_response(&state)
+            .contains("job=1,save-as,1,1,0,complete,-"));
+        for observed in [false, true] {
+            let (mut w, _peer) = file_dialog_fixture();
+            w.files = Some(crate::session::Session::disconnected_for_test());
+            if observed {
+                w.tick(w.clock + 1, false).unwrap();
+            }
+            let request = crate::control::Request::parse(b"1\t4\tsave-as\t1\t0\t61").unwrap();
+            assert_eq!(w.control_response(&request), "1\t4\tpending\t1");
+            finish_file(&mut w);
+            assert!(w
+                .control_response(&state)
+                .contains("job=1,save-as,1,0,0,error,unavailable"));
+            assert!(!w.files.as_ref().unwrap().associated(1));
+            assert!(w.control_file_job.is_none());
+        }
     }
 
     #[test]
@@ -5705,7 +5965,7 @@ mod tests {
                 format!("1\t1\tpending\t{id}")
             );
             assert!(!w.files.as_ref().unwrap().busy());
-            assert!(w.control_open_job.is_none());
+            assert!(w.control_file_job.is_none());
             assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
                 .contains(&format!("job={id},open,0,0,0,error,unavailable")));
             assert_eq!(format!("{:?}", w.ui.editor()), documents);
@@ -6649,6 +6909,8 @@ mod tests {
             let before = w.control_response(&state);
             let notice = w.notice.clone();
             for command in [
+                "save\t1\t1",
+                "save-as\t1\t1\t61",
                 "open\t61",
                 "new",
                 "close-tab\t1\t1",
@@ -7405,7 +7667,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-open\t"));
+            assert!(response.contains("\tadapter=native-save\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

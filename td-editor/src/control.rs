@@ -100,6 +100,11 @@ pub enum Operation {
     State,
     New,
     Open(PathBuf),
+    Save {
+        tab: TabId,
+        revision: u64,
+        path: Option<PathBuf>,
+    },
     Quit,
     CloseTab {
         tab: TabId,
@@ -144,6 +149,19 @@ impl std::fmt::Debug for Operation {
             Self::Open(path) => f
                 .debug_struct("Open")
                 .field("path_bytes", &path.as_os_str().len())
+                .finish(),
+            Self::Save {
+                tab,
+                revision,
+                path,
+            } => f
+                .debug_struct("Save")
+                .field("tab", tab)
+                .field("revision", revision)
+                .field(
+                    "path_bytes",
+                    &path.as_ref().map(|path| path.as_os_str().len()),
+                )
                 .finish(),
             Self::Quit => f.write_str("Quit"),
             Self::CloseTab { tab, revision } => f
@@ -324,17 +342,16 @@ impl Request {
             let operation = match name {
                 "state" => Operation::State,
                 "new" => Operation::New,
-                "open" => {
-                    let encoded = args.next().ok_or(Error::Protocol)?;
-                    if encoded.len() > 8192 {
-                        return Err(Error::Limit);
-                    }
-                    let path = unhex(encoded)?;
-                    if path.is_empty() || path.contains(&0) {
-                        return Err(Error::InvalidArgument);
-                    }
-                    Operation::Open(std::ffi::OsString::from_vec(path).into())
-                }
+                "open" => Operation::Open(os_path(args.next().ok_or(Error::Protocol)?)?),
+                "save" | "save-as" => Operation::Save {
+                    tab: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    revision: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    path: if name == "save-as" {
+                        Some(os_path(args.next().ok_or(Error::Protocol)?)?)
+                    } else {
+                        None
+                    },
+                },
                 "quit" => Operation::Quit,
                 "close-tab" => Operation::CloseTab {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -466,6 +483,7 @@ impl Request {
             Operation::Edit { .. }
             | Operation::New
             | Operation::Open(_)
+            | Operation::Save { .. }
             | Operation::Quit
             | Operation::CloseTab { .. }
             | Operation::DialogAnswer { .. }
@@ -506,6 +524,7 @@ impl Request {
                 self.operation,
                 Operation::New
                     | Operation::Open(_)
+                    | Operation::Save { .. }
                     | Operation::Quit
                     | Operation::CheckSpelling { .. }
                     | Operation::CloseTab { .. }
@@ -670,6 +689,17 @@ fn bounded_text(encoded: &str, limit: usize) -> Result<String> {
         return Err(Error::Limit);
     }
     String::from_utf8(unhex(encoded)?).map_err(|_| Error::InvalidText)
+}
+
+fn os_path(encoded: &str) -> Result<PathBuf> {
+    if encoded.len() > 8192 {
+        return Err(Error::Limit);
+    }
+    let path = unhex(encoded)?;
+    if path.is_empty() || path.contains(&0) {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(std::ffi::OsString::from_vec(path).into())
 }
 
 pub(crate) struct Envelope<'a> {
@@ -853,6 +883,53 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn save_grammar_pins_revision_and_explicit_save_as_path_without_replay_authority() {
+        let secret = "private-save-path";
+        let request =
+            Request::parse(format!("1\t0\tsave-as\t1\t0\t{}", hex(secret.as_bytes())).as_bytes())
+                .unwrap();
+        let debug = format!("{request:?}");
+        assert!(debug.contains("path_bytes"));
+        assert!(!debug.contains(secret) && !debug.contains(&hex(secret.as_bytes())));
+        for payload in ["1\t1\tsave\t2\t3", "1\t2\tsave-as\t2\t3\t2fff"] {
+            let request = Request::parse(payload.as_bytes()).unwrap();
+            let mut ui = Controller::default();
+            assert!(request.is_mutating());
+            assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+            assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        }
+        for payload in [
+            "save",
+            "save\t1",
+            "save\t1\t0\t61",
+            "save-as\t1\t0",
+            "save-as\t1\t0\t61\textra",
+            "save\t1\t-1",
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t3\t{payload}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                Error::Protocol
+            );
+        }
+        for path in ["-", "00"] {
+            assert_eq!(
+                Request::parse(format!("1\t4\tsave-as\t1\t0\t{path}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                Error::InvalidArgument
+            );
+        }
+        assert_eq!(
+            Request::parse(format!("1\t5\tsave-as\t1\t0\t{}", "61".repeat(4097)).as_bytes())
+                .unwrap_err()
+                .error,
+            Error::Limit
+        );
+    }
 
     #[test]
     fn open_accepts_only_bounded_nonempty_non_nul_os_paths() {
@@ -1952,8 +2029,8 @@ mod tests {
             "open\t2f746d702f78\textra",
             "close-tab\t1\t0\textra",
             "quit\textra",
-            "save\t1\t0",
-            "save-as\t1\t0\t78",
+            "save\t1\t0\textra",
+            "save-as\t1\t0\t78\textra",
             "dialog-answer\t1\t0\tdiscard",
             "key\t1\t0\tC-s",
             "load\t61",

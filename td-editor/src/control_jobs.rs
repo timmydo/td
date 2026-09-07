@@ -20,6 +20,8 @@ enum Status {
 enum Kind {
     Spelling,
     Open,
+    Save,
+    SaveAs,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +56,14 @@ impl Jobs {
 
     pub(crate) fn begin_open(&mut self) -> Result<u64> {
         self.reserve(Kind::Open, 0, 0)
+    }
+
+    pub(crate) fn begin_save(&mut self, tab: TabId, revision: u64, save_as: bool) -> Result<u64> {
+        self.reserve(
+            if save_as { Kind::SaveAs } else { Kind::Save },
+            tab,
+            revision,
+        )
     }
 
     fn reserve(&mut self, kind: Kind, tab: TabId, revision: u64) -> Result<u64> {
@@ -120,6 +130,22 @@ impl Jobs {
         Ok(())
     }
 
+    pub(crate) fn saved(&mut self, id: u64, result: Result<()>) -> Result<()> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(Error::InvalidArgument)?;
+        if !matches!(record.kind, Kind::Save | Kind::SaveAs) || record.status != Status::Pending {
+            return Err(Error::InvalidArgument);
+        }
+        record.status = match result {
+            Ok(()) => Status::Complete,
+            Err(error) => Status::Failed(error),
+        };
+        Ok(())
+    }
+
     /// Terminal outcomes are historical facts, not promises of current marks.
     pub(crate) fn observe(&mut self, editor: &Editor, spelling: &WindowState) -> bool {
         let mut changed = false;
@@ -162,6 +188,8 @@ impl Jobs {
                 match record.kind {
                     Kind::Spelling => "spelling",
                     Kind::Open => "open",
+                    Kind::Save => "save",
+                    Kind::SaveAs => "save-as",
                 },
                 record.tab,
                 record.revision,
@@ -184,6 +212,43 @@ mod tests {
     use crate::model::{Command, Selection};
     use crate::spelling::Dictionary;
     use crate::ui::{Controller, Event};
+
+    #[test]
+    fn save_jobs_keep_the_requested_revision_and_reject_cross_kind_completion() {
+        let mut jobs = Jobs::default();
+        let save = jobs.begin_save(3, 7, false).unwrap();
+        assert_eq!(jobs.started(save, Ok(Some(1))), Err(Error::InvalidArgument));
+        assert_eq!(
+            jobs.opened(
+                save,
+                Ok(crate::dialog::Target {
+                    tab: 4,
+                    revision: 8
+                })
+            ),
+            Err(Error::InvalidArgument)
+        );
+        assert!(!jobs.observe(&Editor::default(), &WindowState::default()));
+        jobs.saved(save, Ok(())).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,save,3,7,0,complete,-"));
+        assert_eq!(
+            jobs.saved(save, Err(Error::StaleRevision)),
+            Err(Error::InvalidArgument)
+        );
+        let save_as = jobs.begin_save(3, 8, true).unwrap();
+        jobs.saved(save_as, Err(Error::StaleRevision)).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=2,save-as,3,8,0,error,stale-revision"));
+        let open = jobs.begin_open().unwrap();
+        assert_eq!(jobs.saved(open, Ok(())), Err(Error::InvalidArgument));
+        let spelling = jobs.begin(3, 8).unwrap();
+        assert_eq!(jobs.saved(spelling, Ok(())), Err(Error::InvalidArgument));
+    }
 
     #[test]
     fn open_outcomes_share_ids_but_cannot_be_finished_as_spelling() {

@@ -423,7 +423,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(open.find("files.busy()").unwrap() < open.find("begin_open()").unwrap());
     assert!(open.find(".checked_add(1)").unwrap() < open.find("begin_open()").unwrap());
     assert!(open.find("begin_open()").unwrap() < open.find("files.open(path.clone())").unwrap());
-    assert!(open.contains("self.control_open_job = Some(id)"));
+    assert!(open.contains("self.control_file_job = Some(ControlFile::Open(id))"));
     assert!(!open.contains("Event::Load") && !open.contains("std::fs::"));
     let tick = production
         .split("fn tick(")
@@ -436,11 +436,41 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         tick.find("files.poll(&mut self.ui)").unwrap()
             < tick.find("self.control_jobs.opened(id, opened)").unwrap()
     );
-    assert!(tick.contains("self.control_open_job.take()"));
+    assert!(tick.contains("self.control_file_job.take()"));
     assert_eq!(
-        production.matches("self.control_open_job.take()").count(),
+        production.matches("self.control_file_job.take()").count(),
         1
     );
+    assert!(dispatch.contains("files.queue_save(&self.ui, *tab, *revision, path.clone())"));
+    assert!(!dispatch.contains("files.save("));
+    let save = dispatch
+        .split("if let crate::control::Operation::Save {")
+        .nth(1)
+        .unwrap()
+        .split("if let crate::control::Operation::Open(path)")
+        .next()
+        .unwrap();
+    assert!(save.find("files.busy()").unwrap() < save.find(".begin_save(").unwrap());
+    assert!(save.find(".checked_add(1)").unwrap() < save.find(".begin_save(").unwrap());
+    assert!(save.find(".begin_save(").unwrap() < save.find("files.queue_save(").unwrap());
+    let session = include_str!("../src/session.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    let handoff = session
+        .split("pub(crate) fn poll(")
+        .nth(1)
+        .unwrap()
+        .split("fn finish(")
+        .next()
+        .unwrap();
+    assert!(
+        handoff.find("check_revision(&point)").unwrap()
+            < handoff
+                .find(".save(ui, point.tab, point.revision, path)")
+                .unwrap()
+    );
+    assert!(session.contains("self.pending = Some(Pending::QueuedSave { point, path })"));
     let answer = production
         .split("fn control_dialog_answer(")
         .nth(1)

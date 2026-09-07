@@ -26,9 +26,9 @@ state/text and scan-pinned spelling queries, plus revision/selection-checked
 edits. Native redraw/submitted/callback generations and bounded `wait-frame`
 acknowledgement are connected. Remote Check Spelling returns a job ID with
 bounded completion/error/cancellation history in native state. Remote New
-creates an ordinary empty tab and returns its stable ID. Remote Open uses
-the ordinary file worker and bounded job history. Remote writes and other
-dialog answers remain unimplemented. Remote Close Tab, Quit and
+creates an ordinary empty tab and returns its stable ID. Remote Open and
+revision-pinned Save/Save As use the ordinary file worker and bounded job
+history. Other dialog answers remain unimplemented. Remote Close Tab, Quit and
 live close-dialog Cancel/Discard use the ordinary close coordinator.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
@@ -977,13 +977,17 @@ native menu contract; clipboard uses the data-device contract below.
 
 `session::Session` keeps FileId-to-TabId associations and an opaque model save
 token per pending save. One `std::thread::Builder` worker exclusively owns
-`files::Session`. There is exactly one submitted job and no waiting queue in
-this increment; additional requests are refused visibly before allocating
-another snapshot. Version 1's eight queued descriptors remain future work.
+`files::Session`. There is one file-operation slot in this increment, either
+reserved for a queued remote Save or occupied by a submitted job; additional
+requests are refused visibly before allocating another snapshot. Version 1's
+eight queued descriptors remain future work.
 Two capacity-one channels carry jobs/completions; the UI never waits on them
-or joins a file operation. It captures the encoded snapshot at admission and
-polls completions from the existing at-most-100ms event-loop wake. Protocol
-events, redraw, resize, tab switching and ordinary edits continue during I/O.
+or joins a file operation. Native Save captures its encoded snapshot at
+admission; remote Save pins a revision at admission and captures bytes only
+after revalidation at the next file poll. It polls completions from the
+existing at-most-100ms event-loop wake (at most 10ms with control enabled).
+Protocol events, redraw, resize, tab switching and ordinary edits continue
+during I/O.
 An Open completion that changes the active tab cancels held-key repeat so it
 cannot continue typing into the new document. Save completion keeps repeat.
 Saves verify the requested tab revision before snapshot creation. Only a
@@ -2131,7 +2135,15 @@ the exact selected/created tab and revision before later UI actions.
 Duplicate Open retains edits and missing files remain unwritten.
 CONTROL.md defines OS-byte
 paths, admission guards, coarse file failure codes and historical outcomes.
-Remote writes and other dialog answers remain unimplemented.
+Remote Save/Save As reserve the single file slot with an editor-bound
+revision point. The next file poll revalidates it before snapshot handoff;
+queued edits fail stale without a write, while later edits cannot change
+the handed-off snapshot and remain unsaved. Saved-state acknowledgement and
+conflict/new-destination policy stay on the ordinary file/controller path.
+Shared historical job rows retain the requested tab/revision; CONTROL.md
+defines coarse I/O failures and possible publication despite an error.
+Direct Save needs an association and Save As takes an explicit OS-byte path.
+Other dialog answers remain unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 
@@ -2193,7 +2205,12 @@ defines their implemented status/count/range fields and 256-range ceiling.
 Save and spelling return a job ID with `pending` when work is queued;
 `state` supplies completion/error. A queued save pins its expected revision;
 if it differs when the worker is ready, the job fails stale instead of
-saving unrequested later edits. One save per tab may be queued/in flight.
+saving unrequested later edits. The implemented handoff boundary is the
+next ordinary file poll: it checks the pinned editor identity/revision,
+captures the immutable snapshot and submits it without UI interleaving.
+Worker scheduling after handoff cannot replace that snapshot. The current
+single global file slot is reserved while queued or in flight; the target
+ceiling permits at most one save per tab queued/in flight.
 File prompts return a dialog ID and its allowed answers; `dialog-answer`
 must name that live ID and revision, so a
 late reply cannot discard a different tab. `key` and `pointer` use the same
