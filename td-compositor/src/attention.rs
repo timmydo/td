@@ -215,6 +215,7 @@ mod tests {
             [1; 32],
             1000,
             Operation::Set {
+                role: crate::authority::consent::Role::Primary,
                 application: "mail".into(),
                 name: name.into(),
                 application_uid: 65537,

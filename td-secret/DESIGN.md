@@ -1106,3 +1106,77 @@ neither a runtime key nor persistent plaintext was produced. Host structural
 cases reject invalid targets, legacy backends, changed protectors and full
 stores before their unseal callback can execute. These are store-backend
 oracles, not evidence of descriptor intake, a physical touch or UI consent.
+
+## Private named-write worker
+
+`write-operation --uid UID` admits only the existing root-owned unnamed
+socketpair startup contract. Before receiving credential bytes it requires
+no active swap and a zero core-dump soft limit. It accepts one canonical
+Set description for its configured owner and verifies the application name
+and UID against the active account set from the immutable installed registry
+and verified account databases. A reservation whose application account is
+absent refuses before credential intake. The request includes an
+explicit primary or recovery token role, and the trusted text displays it.
+The role-bearing Set wire tag is 4; the earlier unused tag 3 is refused.
+All codec consumers move together; unlock and enrollment encodings retain
+their existing bytes and challenge vectors.
+
+After the description, this private root channel carries exactly one
+big-endian u16 length and 1..4096 credential bytes. This separate receiving
+method does not widen ordinary public-description or acknowledgement frames.
+The whole input frame shares the existing five-second deadline. Its owned
+buffer is retained before the first presentation invitation and cleared on
+ordinary return or partial-read failure, with the same best-effort erasure
+limitation as the store. No credential bytes or credential digest appear in
+the public description, stdout, stderr, or any reply.
+
+The parent must authenticate and admit the requester, pin the submitted
+credential descriptor and capture its immutable contents, assign a fresh
+unpredictable operation nonce, and pass only that snapshot to this worker.
+The root child independently admits the application assignment and keeps
+the exclusive store lock through completion. This hidden entry is an
+inactive controller prerequisite, not a public elevation listener. The
+interim console writer remains until the complete public intake and paired
+UI consumer replace it atomically.
+
+The worker requires the exact fresh `10`/`11` presentation round before
+one token assertion, using the selected enrolled role. It opens the TPM
+transport before requesting presentation, so an unavailable device refuses
+before any token touch. SHA-256 of
+`td-secret/presented-write/v1`, a zero byte and the entire canonical request
+is the assertion challenge. The parent owns the private association between
+this fresh nonce and the captured credential; a public password digest is
+neither needed nor exposed. There is no token fallback or retry after an
+uncertain response. The fresh `12`/`13` commit round then authorizes exactly
+one `Store::set_token` call. A presentation round cannot be prequeued as a
+commit round. The worker sends `14` after publication, and the parent must
+also observe successful exit before reporting success. A lost success
+response can follow a completed atomic write; it never authorizes retry.
+
+Write proof preparation and completion neither read nor change the runtime
+key. An already unlocked session remains usable; a locked session stays
+locked. Unlike unlock or enrollment, a refused write does not revoke an
+existing release. Generation-loss relocking remains the root authority's
+separate responsibility. The parent must serialize commit against cancel,
+peer loss and expiry and kill/reap any abandoned child; the same 120-second
+lifetime bounds token I/O and TPM work. Cooperative child timeouts cannot
+bound a blocked TPM syscall by themselves.
+
+Socket tests exercise the actual controller with primary and recovery
+requests, maximum-sized captured input, omitted or mismatched presentation
+and commit replies, and replayed rounds. They assert exact committed bytes
+and that missing consent cannot execute the corresponding token or write
+callback. Structural tests refuse unknown application assignments, wrong
+owners, legacy Set encodings, invalid roles and truncated, empty, oversized
+or expired credential frames. These tests do not claim a public descriptor
+intake, physical token touch, or completed authority supervision.
+
+The ignored `root_worker_refuses_a_retained_reservation_without_an_installed_account`
+fixture requires `td.write-fixture=1` on a disposable root VM, initially
+absent account files, tmpfs `/run` and the production binary at
+`/bin/td-secret`. It installs an actual reserved application row without
+its account and executes both write roles on real root socketpairs. Each
+must fail at application admission without credential intake or a reply,
+while preserving a seeded runtime key. Adding the canonical application
+account/group/service-shadow entries makes the same description admissible.
+The pre-fix source-built binary fails this oracle at the admission result.

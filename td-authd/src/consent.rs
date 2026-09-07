@@ -39,6 +39,7 @@ pub enum Operation {
         role: Role,
     },
     Set {
+        role: Role,
         application: String,
         name: String,
         application_uid: u32,
@@ -67,6 +68,7 @@ impl Request {
                 step: Enrollment::CreateRecovery | Enrollment::ProveRecovery,
             } => return Err("unrecoverable enrollment cannot enroll a recovery token".into()),
             Operation::Set {
+                role: _,
                 application,
                 name,
                 application_uid,
@@ -161,12 +163,17 @@ impl Request {
                 });
             }
             Operation::Set {
+                role,
                 application,
                 name,
                 application_uid,
                 requester,
             } => {
-                bytes.push(3);
+                bytes.push(4);
+                bytes.push(match role {
+                    Role::Primary => 1,
+                    Role::Recovery => 2,
+                });
                 bytes.extend_from_slice(&application_uid.to_be_bytes());
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 // Construction bounds both strings to 64 ASCII bytes.
@@ -223,10 +230,16 @@ impl Request {
                     _ => return Err("invalid consent token role".into()),
                 },
             },
-            3 => {
+            4 => {
+                let role = match input.byte()? {
+                    1 => Role::Primary,
+                    2 => Role::Recovery,
+                    _ => return Err("invalid write token role".into()),
+                };
                 let application_uid = input.number()?;
                 let requester = input.number()?;
                 Operation::Set {
+                    role,
                     application: input.text()?,
                     name: input.text()?,
                     application_uid,
@@ -299,6 +312,7 @@ impl Request {
                 );
             }
             Operation::Set {
+                role,
                 application,
                 name,
                 application_uid,
@@ -309,7 +323,13 @@ impl Request {
                 lines.push(format!("APPLICATION UID {application_uid}"));
                 lines.push(format!("APPLICATION: {application}"));
                 lines.push(format!("CREDENTIAL: {name}"));
-                lines.push("TOUCH AN ENROLLED TOKEN".into());
+                lines.push(
+                    match role {
+                        Role::Primary => "TOUCH THE PRIMARY TOKEN",
+                        Role::Recovery => "TOUCH THE RECOVERY TOKEN",
+                    }
+                    .into(),
+                );
             }
         }
         lines.push("ESC TO CANCEL".into());
@@ -424,6 +444,7 @@ mod tests {
                 role: Role::Recovery,
             },
             Operation::Set {
+                role: Role::Primary,
                 application: "mail".into(),
                 name: "Main".into(),
                 application_uid: 65537,
@@ -537,6 +558,7 @@ mod tests {
             [42; 32],
             1001,
             Operation::Set {
+                role: Role::Primary,
                 application: "mail".into(),
                 name: "Main_Account-2026".into(),
                 application_uid: 65537,
@@ -554,7 +576,7 @@ mod tests {
                 "APPLICATION UID 65537",
                 "APPLICATION: mail",
                 "CREDENTIAL: Main_Account-2026",
-                "TOUCH AN ENROLLED TOKEN",
+                "TOUCH THE PRIMARY TOKEN",
                 "ESC TO CANCEL",
             ]
         );
@@ -591,6 +613,7 @@ mod tests {
                 [1; 32],
                 1000,
                 Operation::Set {
+                    role: Role::Primary,
                     application: app.into(),
                     name: name.into(),
                     application_uid: uid,

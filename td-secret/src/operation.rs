@@ -82,6 +82,19 @@ impl Wire {
         Ok(bytes)
     }
 
+    pub(super) fn receive_credential(&mut self) -> Result<Credential, String> {
+        let deadline = self.frame_deadline()?;
+        let mut header = [0; 2];
+        self.read(&mut header, deadline)?;
+        let length = usize::from(u16::from_be_bytes(header));
+        if length == 0 || length > store::MAX_SECRET {
+            return Err("invalid private credential length".into());
+        }
+        let mut credential = Credential(vec![0; length]);
+        self.read(&mut credential.0, deadline)?;
+        Ok(credential)
+    }
+
     pub(super) fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         if bytes.is_empty() || bytes.len() > LIMIT {
             return Err("invalid operation frame length".into());
@@ -137,6 +150,18 @@ impl Wire {
             return Err("operation acknowledgement does not match its request and round".into());
         }
         Ok(())
+    }
+}
+
+pub(super) struct Credential(Vec<u8>);
+impl Credential {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.0.fill(0);
     }
 }
 
@@ -438,6 +463,7 @@ mod tests {
             [42; 32],
             1000,
             consent::Operation::Set {
+                role: consent::Role::Primary,
                 application: "mail".into(),
                 name: "main".into(),
                 application_uid: 65537,

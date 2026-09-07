@@ -2,6 +2,7 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("write_operation", include_str!("../../../td-secret/src/write_operation.rs")),
     ("operation", include_str!("../../../td-secret/src/operation.rs")),
     ("enrollment_operation", include_str!("../../../td-secret/src/enrollment_operation.rs")),
     ("consent", include_str!("../../../td-authd/src/consent.rs")),

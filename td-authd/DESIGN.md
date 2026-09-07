@@ -733,8 +733,8 @@ adds platform profile 1 (TPM PCR 7), the recovery policy (1 second token,
 0 explicitly unrecoverable, matching TDENROL1) and
 step (1 create primary, 2 prove primary, 3 create recovery, 4 prove recovery).
 An unrecoverable request refuses either recovery-token step. Unlock (2) adds
-role 1 primary or 2 recovery. Credential write (3) adds big-endian u32
-application and requester UIDs, then a one-byte length and ASCII bytes for
+role 1 primary or 2 recovery. Credential write (4) adds role 1 primary
+or 2 recovery, then big-endian u32 application and requester UIDs, then a one-byte length and ASCII bytes for
 each application and credential name. The whole value is at most 256 bytes;
 unknown tags, truncation and trailing bytes refuse.
 

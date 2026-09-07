@@ -477,6 +477,17 @@ impl Store {
     ) -> Result<super::fido_metadata::BoundRelease, String> {
         require_root()?;
         lock_runtime(&runtime_directory(self.uid, true)?)?;
+        self.bound_token_request(role, challenge, info)
+    }
+
+    /// Obtain a token proof without changing an existing session release.
+    pub fn bound_token_request(
+        &self,
+        role: super::fido_metadata::Role,
+        challenge: [u8; 32],
+        info: &super::fido_enroll::Info,
+    ) -> Result<super::fido_metadata::BoundRelease, String> {
+        require_root()?;
         let bundle = self.bundle()?.ok_or("credential store is not token enrolled")?;
         if !bundle.token_protected() {
             return Err("credential store is not token enrolled".into());
@@ -988,12 +999,16 @@ fn with_memory_state<T>(
     operation()
 }
 
-fn runtime_directory(uid: u32, create: bool) -> Result<File, String> {
+pub fn require_protected_memory() -> Result<(), String> {
     with_memory_state(
         fs::read_to_string("/proc/swaps"),
         fs::read_to_string("/proc/self/limits"),
         || Ok(()),
-    )?;
+    )
+}
+
+fn runtime_directory(uid: u32, create: bool) -> Result<File, String> {
+    require_protected_memory()?;
     // /run is an image-owned tmpfs. No environment variable can relocate keys.
     let mut mounts = String::new();
     File::open("/proc/self/mountinfo")

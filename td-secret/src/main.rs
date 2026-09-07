@@ -15,6 +15,7 @@ mod client;
 mod consent;
 mod operation;
 mod enrollment_operation;
+mod write_operation;
 #[allow(dead_code, reason = "shared physical token transport")]
 mod fido_device;
 #[allow(dead_code, reason = "shared FIDO2 framing and cancellation codec")]
@@ -55,6 +56,9 @@ use std::io::{self, Read};
 fn run(args: &[String]) -> Result<(), String> {
     match args {
         [command] if command == "selftest" => crypto::selftest(),
+        [command, flag, uid] if command == "write-operation" && flag == "--uid" => {
+            write_operation::run(parse_uid(uid)?)
+        }
         [command, flag, uid] if command == "enroll-operation" && flag == "--uid" => {
             enrollment_operation::run(parse_uid(uid)?)
         }
@@ -157,9 +161,10 @@ mod confinement {
     fn private_unlock_controller_and_shared_description_are_pinned() {
         let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
             |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
-        assert_eq!(fingerprint(include_str!("operation.rs")), 0x0029c6ebab9e3c8e);
+        assert_eq!(fingerprint(include_str!("operation.rs")), 0x9e52120007bef08f);
+        assert_eq!(fingerprint(include_str!("write_operation.rs")), 0x2f5050ddd2493660);
         assert_eq!(fingerprint(include_str!("enrollment_operation.rs")), 0x30dcb428ed75a535);
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xd3593686debcc228, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x8105ec9fbaf8b219, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
     }
 
     #[test]
@@ -180,6 +185,7 @@ mod confinement {
             ("client.rs", include_str!("client.rs")),
             ("operation.rs", include_str!("operation.rs")),
             ("enrollment_operation.rs", include_str!("enrollment_operation.rs")),
+            ("write_operation.rs", include_str!("write_operation.rs")),
             ("crypto.rs", include_str!("crypto.rs")),
             ("fido_cbor.rs", include_str!("fido_cbor.rs")),
             ("fido_ctap.rs", include_str!("fido_ctap.rs")),
@@ -251,7 +257,8 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "operation.rs",
                 "store.rs",
                 "sys.rs",
-                "tpm.rs"
+                "tpm.rs",
+                "write_operation.rs"
             ]
         );
     }
