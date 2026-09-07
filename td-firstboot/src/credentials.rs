@@ -229,10 +229,10 @@ pub(super) fn provision(
         .transpose()
         .map_err(|_| Failure::Failed("mail configuration is not UTF-8".into()))?;
     let mut legacy = optional(&pinned, "password", owner.uid, secret_store::MAX_SECRET)?;
-    if store.token_protected().map_err(Failure::Failed)? {
+    if store.sealed().map_err(Failure::Failed)? {
         if let Some(bytes) = legacy.as_mut() {
             bytes.fill(0);
-            return Err(Failure::Failed("token-enrolled store has an unmigrated plaintext credential".into()));
+            return Err(Failure::Failed("sealed store has an unmigrated plaintext credential".into()));
         }
         migrate_config(config.as_deref(), false)?;
         return Ok(());
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly selected disposable root VM without a TPM"]
-    fn unavailable_tpm_locks_only_credentials_and_accepts_later_release() {
+    fn legacy_tpm_boot_never_unseals_and_rejects_a_stale_release() {
         secret_store::require_root().unwrap();
         assert_eq!(std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap(), "/bin/busybox");
         assert!(!Path::new("/dev/tpmrm0").exists());
@@ -384,21 +384,23 @@ mod tests {
         let owner = ApplicationHome { home: root.clone(), uid: 1000, gid: 1000 };
         write_durably_owned(&path.join("sealed"), &bundle, 0o600, Some(&owner)).unwrap();
         let registry = crate::principals::Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
-        // This returns boot success even though the real release opens a missing TPM.
+        // Boot isolation succeeds without any TPM device.
         isolate_stores(&root, &registry).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().uid(), 991);
         let store = secret_store::Store::open_owned(&path, 1000, 991, false).unwrap();
         assert!(store.get("mail", "main").is_err());
         assert!(!Path::new("/run/td-secret/1000/key").exists());
-        // Model the checked volatile publication made by a later root release.
-        // TPM seal/unseal correctness is exercised separately by the emulator tests.
+        // A stale TPM-only runtime key cannot satisfy application policy.
         let mut released = crate::crypto::digest(&envelope).to_vec();
         released.extend_from_slice(&master);
         let service = ApplicationHome { home: root.clone(), uid: 991, gid: 991 };
         write_durably_owned(Path::new("/run/td-secret/1000/key"), &released, 0o600, Some(&service)).unwrap();
         assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"recoverable credential");
+        assert_eq!(store.application_secret("mail", "main").unwrap_err(), "credential store requires token enrollment");
+        store.prepare_boot().unwrap();
+        assert!(!Path::new("/run/td-secret/1000/key").exists());
+        assert_eq!(fs::read(path.join("sealed")).unwrap(), bundle);
         drop(store);
-        fs::remove_file("/run/td-secret/1000/key").unwrap();
         for published in [false, true] {
             fs::remove_dir_all(&path).unwrap();
             let store = secret_store::Store::open(&path, 1000, true).unwrap();

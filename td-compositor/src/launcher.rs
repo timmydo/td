@@ -135,6 +135,13 @@ pub(crate) enum LaunchBackend {
 }
 
 impl LaunchBackend {
+    pub fn unlock(&self, attempt: std::sync::Arc<crate::secret_client::Attempt>) -> Result<(), String> {
+        match self {
+            Self::Authority(authority) => authority.unlock(attempt),
+            Self::Direct(_) => Err("secret unlock requires the paired authority".into()),
+        }
+    }
+
     pub fn activates_application(&self) -> bool {
         match self {
             Self::Direct(processes) => processes.activates_application(),

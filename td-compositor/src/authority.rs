@@ -21,15 +21,20 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VERSION: &[u8] = b"TDLA001\n";
 const CAPACITY: usize = 16;
 const QUEUE_CAPACITY: usize = 1;
 const TICK: Duration = Duration::from_millis(250);
 
+enum Work {
+    Terminal,
+    Secret(std::sync::Arc<crate::secret_client::Attempt>),
+}
+
 pub(crate) struct Launcher {
-    send: SyncSender<()>,
+    send: SyncSender<Work>,
 }
 
 impl Launcher {
@@ -44,6 +49,7 @@ impl Launcher {
         if wire.receive().map_err(|e| e.to_string())? != [0x80] {
             return Err("terminal authority refused session admission".into());
         }
+        prepare_session(&mut wire)?;
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("terminal-authority".into())
@@ -61,11 +67,22 @@ impl Launcher {
         Ok(Self { send })
     }
 
-    pub fn launch(&self) -> Result<(), String> {
-        match self.send.try_send(()) {
+    pub fn unlock(
+        &self,
+        attempt: std::sync::Arc<crate::secret_client::Attempt>,
+    ) -> Result<(), String> {
+        match self.send.try_send(Work::Secret(attempt)) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(())) => Err("terminal launch is already pending".into()),
-            Err(TrySendError::Disconnected(())) => Err("terminal authority is unavailable".into()),
+            Err(TrySendError::Full(_)) => Err("authority request already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("secret authority unavailable".into()),
+        }
+    }
+
+    pub fn launch(&self) -> Result<(), String> {
+        match self.send.try_send(Work::Terminal) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err("terminal launch is already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("terminal authority is unavailable".into()),
         }
     }
 }
@@ -147,7 +164,7 @@ fn check_status(status: &str) -> Result<(), String> {
     Ok(())
 }
 
-trait Exchange {
+pub(crate) trait Exchange {
     fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, String>;
 }
 
@@ -155,6 +172,27 @@ impl Exchange for channel::Channel {
     fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, String> {
         self.send(request).map_err(|e| e.to_string())?;
         self.receive().map_err(|e| e.to_string())
+    }
+}
+
+/// Complete prior-generation cleanup before any device or input admission.
+fn prepare_session(wire: &mut impl Exchange) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or("secret session preparation deadline overflow")?;
+    if wire.exchange(&[0x10])? != [0x90] {
+        return Err("authority refused secret session preparation".into());
+    }
+    loop {
+        let response = wire.exchange(&[0x11])?;
+        if Instant::now() >= deadline {
+            return Err("secret session preparation expired".into());
+        }
+        match response.as_slice() {
+            [0x91, 2] => return Ok(()),
+            [0x91, 1] => std::thread::sleep(Duration::from_millis(10)),
+            _ => return Err("invalid secret session preparation response".into()),
+        }
     }
 }
 
@@ -218,11 +256,13 @@ impl Processes {
     }
 }
 
-fn worker(mut wire: impl Exchange, receive: Receiver<()>) -> Result<(), String> {
+fn worker(mut wire: impl Exchange, receive: Receiver<Work>) -> Result<(), String> {
     let mut processes = Processes::new();
+    let mut secrets = crate::secret_client::Client::default();
     loop {
         match receive.recv_timeout(TICK) {
-            Ok(()) => {
+            Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
+            Ok(Work::Terminal) => {
                 if let Some(error) = processes.start(&mut wire)? {
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
                 }
@@ -233,6 +273,7 @@ fn worker(mut wire: impl Exchange, receive: Receiver<()>) -> Result<(), String> 
         if let Some(error) = processes.poll(&mut wire)? {
             let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
         }
+        secrets.tick(&mut wire)?;
     }
 }
 
@@ -261,6 +302,31 @@ mod tests {
         let mut bytes = vec![0x81];
         bytes.extend_from_slice(&number.to_be_bytes());
         bytes
+    }
+
+    #[test]
+    fn preparation_waits_for_cleanup_and_never_retries_uncertain_requests() {
+        let mut pending = wire(vec![vec![0x90], vec![0x91, 1], vec![0x91, 2]]);
+        prepare_session(&mut pending).unwrap();
+        assert_eq!(pending.requests, [vec![0x10], vec![0x11], vec![0x11]]);
+        for replies in [
+            vec![vec![0x90, 0]],
+            vec![vec![0x90], vec![0x91, 0]],
+            vec![vec![0x90], vec![0x91, 3]],
+            vec![vec![0x90], vec![0x91, 2, 0]],
+            vec![],
+        ] {
+            let mut refused = wire(replies);
+            assert!(prepare_session(&mut refused).is_err());
+            assert_eq!(
+                refused
+                    .requests
+                    .iter()
+                    .filter(|request| **request == [0x10])
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
@@ -396,7 +462,7 @@ mod tests {
             }
         }
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
-        send.try_send(()).unwrap();
+        assert!(send.try_send(Work::Terminal).is_ok());
         drop(send);
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         assert!(worker(Broken(calls.clone()), receive).is_err());
@@ -409,7 +475,7 @@ mod tests {
         let launcher = Launcher { send };
         assert!(launcher.launch().is_ok());
         assert!(launcher.launch().is_err());
-        assert_eq!(receive.try_recv(), Ok(()));
+        assert!(matches!(receive.try_recv(), Ok(Work::Terminal)));
         assert!(receive.try_recv().is_err());
         drop(receive);
         assert!(launcher.launch().is_err());

@@ -1,6 +1,19 @@
 use crate::authority::consent::Request;
 use crate::ui;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Notice {
+    #[default]
+    Menu,
+    Pending,
+    Unlocked,
+    Enrolled,
+    Unenrolled,
+    Unavailable,
+    Failed,
+    Busy,
+}
+
 /// Rasterize once, retaining the exact immutable description beside its pixels.
 #[derive(Debug)]
 pub(crate) struct Prepared {
@@ -10,11 +23,17 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    pub fn new(
+    #[cfg(test)]
+    pub fn new(request: Request, width: usize, height: usize, stride: usize) -> Result<Self, String> {
+        Self::with_time(request, width, height, stride, None)
+    }
+
+    pub fn with_time(
         request: Request,
         width: usize,
         height: usize,
         stride: usize,
+        remaining: Option<u64>,
     ) -> Result<Self, String> {
         let length = stride
             .checked_mul(height)
@@ -41,7 +60,12 @@ impl Prepared {
             .checked_div(cell_width)
             .filter(|value| *value >= 24)
             .ok_or("output cannot hold a complete trusted prompt")?;
-        let lines = request.lines();
+        let mut lines = request.lines();
+        if let Some(seconds) = remaining {
+            if !(1..=120).contains(&seconds) { return Err("invalid trusted operation time budget".into()); }
+            let unit = if seconds == 1 { "SECOND" } else { "SECONDS" };
+            lines.push(format!("TIME LEFT WHEN SHOWN: {seconds} {unit}"));
+        }
         let mut rows = Vec::new();
         for line in &lines {
             if !line.is_ascii() || !line.chars().all(|character| font.covers(character)) {
@@ -127,13 +151,35 @@ impl Prepared {
 }
 
 /// Display-only pixels: ordinary scene rendering never calls this painter.
-pub(crate) fn paint(frame: &mut [u8], width: usize, height: usize, stride: usize, draining: bool) {
+pub(crate) fn paint(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    draining: bool,
+    notice: Notice,
+) {
     let bounds = (0, 0, width, height);
     ui::fill(frame, width, height, stride, bounds, [0x28, 0x20, 0x18, 0]);
-    let top = height.saturating_sub(104) / 2;
+    let top = height.saturating_sub(176) / 2;
     for (index, text) in [
         "TD SECURE ATTENTION",
-        "NO AUTHORIZATION REQUEST",
+        if draining {
+            "CANCELLING REQUEST"
+        } else {
+            match notice {
+                Notice::Menu => "U: UNLOCK  R: RECOVERY TOKEN",
+                Notice::Pending => "PREPARING SECRET REQUEST",
+                Notice::Unlocked => "SECRETS UNLOCKED",
+                Notice::Enrolled => "STORE ENROLLED - REOPEN AND PRESS U TO UNLOCK",
+                Notice::Unenrolled => "STORE NOT ENROLLED - REOPEN TO TRY AGAIN",
+                Notice::Unavailable => "STORE STATE UNAVAILABLE",
+                Notice::Failed => "SECRET REQUEST FAILED",
+                Notice::Busy => "PREVIOUS REQUEST IS STILL FINISHING",
+            }
+        },
+        if notice == Notice::Menu && !draining { "E: ENROLL TWO TOKENS (HAVE BOTH READY)" } else { "" },
+        if notice == Notice::Menu && !draining { "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL" } else { "" },
         if draining {
             "RELEASE KEYS AND BUTTONS"
         } else {

@@ -5850,7 +5850,7 @@ not for a persistent Session lifecycle.
 | — | `.Background` | — | `RequestBackground` returns denied; persistent background execution needs a td-svc user-service design. |
 | — | `.Documents` | FUSE | **absent** (§0: no `CONFIG_FUSE_FS`). See below. |
 | — | `.Print`, `.Camera`, `.ScreenCast`, `.RemoteDesktop` | spooler / PipeWire | **not exported.** A fake PipeWire descriptor would make successful setup indistinguishable from a broken stream. |
-| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); unenrolled stores retain the file-master offline gap, and both backends still lack token-gated session release. |
+| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); unenrolled stores retain the file-master offline gap but cannot serve applications. Enrolled stores require a secure-attention FIDO2 assertion before session release. |
 
 **The Documents consequence, stated honestly rather than buried.**
 Without it, a file chooser can only grant what the sandbox can already
@@ -9305,8 +9305,9 @@ get` helper receives and reads the descriptor, acknowledges its receipt, and
 writes the credential into td-mail's captured stdout pipe. Neither td-mail
 nor td-news needs a cryptography dependency. The portal logs the mail receipt only after
 the same broker-authenticated connection acknowledges its one-use token;
-QEMU requires the exact supervised `portal: TD-SECRET-READY app=mail name=main`
-line. The token is liveness evidence, not authorization or cryptographic
+The unenrolled QEMU boot requires the exact supervised
+`portal: TD-SECRET-LOCKED app=mail name=main` refusal instead. Successful
+receipt logging remains available after an enrolled session is unlocked. The token is liveness evidence, not authorization or cryptographic
 proof of a client's read. The shipped helper's ordering and live transfer
 tests establish the read-before-acknowledgement behavior.
 
@@ -9328,46 +9329,49 @@ removed with the ownership migration. This remains the explicit console
 provisioning interim, with no token consent, remembered authorization, shell
 or privileged helper invocation. It is not an elevation claim.
 
-**TPM enrollment, increment (b).** The root console can atomically migrate an
-existing store with `td-secret seal --uid UID --pcrs LIST --unrecoverable`.
-It rotates the master, verifies a real TPM seal/unseal roundtrip, publishes
-one sealed bundle, and retires the old master and records. An enrolled store
-never falls back to a file key. Explicit nonzero SHA-256 static PCR selections
-bind release to the recorded platform state; they do not establish which boot
-components the platform measures. The stock direct-kernel QEMU path has no
-measured-deployment policy and remains unenrolled. The kernel carries ACPI
-TPM discovery and the TIS/FIFO and CRB drivers.
+**Hardware enrollment and session release.** Physical Ctrl+Alt+Esc opens
+the trusted screen. E selects enrollment with a second recovery token;
+X explicitly selects unrecoverability. Keep both tokens ready before a
+two-token enrollment. Each creation and proof step has a complete immutable
+prompt, including the remaining overall time when shown, before device I/O.
+The operation has one 120-second deadline, not a renewed per-step allowance.
+The exact PCR profile is SHA-256 PCR 7; measurements must be nonzero. This
+checks recorded platform state, not coverage of a particular boot chain.
+The stock direct-kernel QEMU path has no measured-deployment policy and
+remains unenrolled. Real-device timing is not established by VM fixtures.
 
-Firstboot automatically releases existing TPM-only stores for every
-deployed session into checked `/run` tmpfs after identity enrollment and
-before application-home provisioning. Invalid homes cannot leave an old
-store human-owned after a successful migration. A refused migration
-quarantines an admitted store leaf as root-only and skips its release,
-while unrelated services continue. Failure before quarantine is
-diagnosed as unconfirmed isolation, with existing filesystem access
-potentially remaining. After a successful cutover, failed TPM release
-leaves credentials unavailable and can be retried with `td-secret
-release --uid UID` at the root console. Volatile keys belong to the
-portal identity, with their logical human UID retained in the path and
-TPM envelope. Release still has no token consent. There is no recovery
-or policy migration yet; the enrollment command explicitly requires
-acceptance of unrecoverability. Old snapshots may retain the former file
-master and credentials. `td-secret/DESIGN.md` specifies the PCR, memory,
-physical-bus, rollback and update boundaries, plus the pinned
-host-emulator oracle. That oracle covers TPM restart, changed
-measurements, a different TPM and actual store migration; it is separate
-from the desktop boot check.
+Enrollment rotates and atomically publishes the master and all credentials
+with primary/recovery metadata and the matching TPM-bound key. An existing
+TPM-only store can migrate directly from its locked state; its old master
+is unsealed only in the private worker. Token-enrolled stores cannot be
+replaced by enrollment. Before enrollment and after any reported failure,
+the compositor queries admitted read-only store state. An uncertain reply
+never triggers automatic replay. A published token store remains locked
+and requires a fresh unlock operation, including after successful enrollment.
 
-The persistent FIDO prerequisite adds a versioned store joining canonical
-primary/recovery metadata with its matching TPM-bound key. Atomic enrollment
-rotates the master and records together; release owns the exact protector
-snapshot, verifies the selected assertion, and only then unseals. Firstboot
-recognizes token-protected stores and leaves them locked without touching the
-TPM or writing placeholder credentials. There is no enrollment or release UI
-consumer yet; the current console cannot enroll tokens or bypass their
-assertion requirement. `td-secret/DESIGN.md` specifies these formats and the
-pinned-emulator store oracle. Existing TPM-only automatic release remains
-limited to that backend pending the trusted-input activation cutover.
+U selects the primary token; R selects the enrolled recovery token. Release
+verifies a fresh assertion bound to the immutable displayed operation before
+TPM unseal and volatile publication. Escape cancels before the private
+execution decision; after that decision, completion can race cancellation.
+Closing the authority generation reaps its worker before removing the runtime
+key. Startup removes old releases before opening input or accepting clients.
+
+Firstboot never releases a key, including for legacy TPM-only stores. It
+isolates ownership before application-home provisioning and leaves sealed
+stores locked without placeholder writes or token I/O. File and TPM-only
+stores are migration inputs only: the portal refuses their credentials.
+The console `seal` and `release` commands are removed in this cutover.
+A refused ownership migration quarantines an admitted leaf as root-only;
+failure before quarantine is diagnosed as unconfirmed isolation. Other
+services can continue under the rules in `td-secret/DESIGN.md`.
+
+There is no password, file-key or TPM-only fallback after token enrollment.
+Old snapshots may retain prior file keys and credentials. Neither token
+recovery nor the read-only status query recovers a lost TPM seed or a changed
+PCR policy. The TPM device stays root-owned; the portal receives only the
+volatile release, and applications receive only their credential bytes.
+`td-secret/DESIGN.md` specifies the memory, physical-bus, rollback and update
+boundaries and the separate pinned-emulator oracles.
 
 The secure-attention prerequisites reserve distinct compositor, broker,
 portal, and application identities in immutable
@@ -9387,8 +9391,8 @@ application units now consume those accounts and require successful
 firstboot; grant-bearing units also require successful root filesystem
 preparation.
 
-The paired compositor's physical attention screen is implemented but
-accepts no request or approval. Secret operations require a complete,
+The paired compositor's physical attention screen selects enrollment and
+unlock operations. Secret operations require a complete,
 immutable prompt confirmed presented before token acquisition; a queued
 frame is not a presentation receipt. Bind the FIDO2 challenge to a fresh
 nonce and a domain-separated, versioned, length-prefixed encoding of the
@@ -9399,10 +9403,7 @@ policy: a token left available to a walk-up attacker remains usable by
 that attacker. This is distinct from the hardware PIN disk/session policy
 in `td-install/ENCRYPTION.md`.
 
-**Remaining increments, in order on the rolling workstream.** (c) Gate release
-on FIDO2 user presence at session start, after the compositor provides secure
-attention and trusted input. Enroll a second recovery token
-at creation or explicitly mark the store unrecoverable. (d) Move the console
+**Remaining increment on the rolling workstream.** (d) Move the console
 writer behind `td-authd` as one named operation, with typed application/name
 and descriptor-pinned credential bytes, and one token touch bound to that
 operation. Remove each interim mechanism atomically when its replacement

@@ -9,7 +9,9 @@ locking, or guaranteed erasure of Rust/compiler copies of secret
 buffers. Filling owned buffers with zero is best effort. The portal
 service owns the master; the human user and jailed applications cannot
 traverse or mount the store. Offline disk readers can still recover the
-unenrolled master. No server or external synchronization exists.
+unenrolled master. The application portal refuses this backend; it exists
+only for firstboot provisioning and migration into token enrollment.
+No server or external synchronization exists.
 
 `/var/lib/td/secrets/<uid>` is a mode-0700 directory, with regular
 mode-0600 single-link files owned by the session's reserved portal UID.
@@ -47,7 +49,13 @@ protection against a writer able to replace the store or disk state.
 
 ## Credential interface
 
-The activated desktop portal serves `td.Secret1` version 1:
+The activated desktop portal serves `td.Secret1` version 1. Application
+lookup requires a valid token protector and the current volatile release;
+file and legacy TPM-only backends are refused even if their keys are readable.
+The unenrolled boot oracle requires a broker-authenticated mail refusal,
+`portal: TD-SECRET-LOCKED app=mail name=main`, instead of a credential receipt.
+
+The interface is:
 
 - `Retrieve(s name) -> (h credential, s receipt)` performs a broker
   `GetConnectionCredentials` lookup for the original unique sender. Only an
@@ -138,23 +146,21 @@ interim console operation authorized in §W.4, with no consent UI. The target
 replacement binds a secure-attention token touch to one typed request and one
 credential descriptor through td-authd. An enrolled store fails closed when
 its TPM or volatile release is absent; no error selects a file master.
-Console writes require root until increment (d); increment (c) must first
-gate release on token presence.
+Console writes require root until increment (d); session release already
+requires a presented token operation.
 
-## TPM enrollment and boot release: increment (b)
+## TPM protection and legacy migration
 
-The root console can enroll an existing store with `td-secret seal --uid UID
---pcrs LIST --unrecoverable`. Arguments have fixed positions; UID is decimal
-and LIST contains one to eight distinct SHA-256 PCR indices from 0 through
-15. The eight-entry cap matches a single TPM PCR read; larger selections are
-rejected before contacting the TPM. There is no default PCR selection. Every
-selected PCR must be nonzero, and the exact selection and its composite
-digest travel in the sealed object. This checks that measurements exist,
+Physical enrollment fixes SHA-256 PCR 7 through the immutable request.
+The selected PCR must be nonzero, and the selection and composite digest
+travel in the sealed object. This checks that measurements exist,
 **not what measured components they represent**. The operator must establish
 that the platform's measurement chain covers the intended firmware and boot
 path. The current QEMU direct-kernel deployment path does not establish a
 measured-deployment policy. It remains unenrolled; TPM presence alone never
-enrolls it.
+enrolls it. The previous console `seal` and `release` commands are removed.
+Legacy TPM-only bundles are accepted only as locked migration inputs to
+presented FIDO enrollment; they cannot release application credentials.
 
 The implementation speaks bounded TPM 2.0 packets through safe file I/O to
 `/dev/tpmrm0`. ACPI discovery and the TIS/FIFO and CRB drivers are built into
@@ -189,20 +195,20 @@ Duplicate names, invalid lengths and trailing bytes are errors. The TPM
 envelope is `TDTPM001`, a big-endian u32 owner UID, a big-endian u16 PCR
 mask, a 32-byte PCR composite digest, and public/private TPM2B fields. Its
 fixed format implies no recovery path. Losing the TPM owner seed or the
-selected PCR state loses access: enrollment explicitly requires
-`--unrecoverable`. Re-enrollment and policy-authorized upgrades are not yet
-provided. Do not enroll a store whose measured updates require recovery.
+selected PCR state loses access. This legacy format remains readable for
+migration; no production command creates it. Token recovery does not replace
+the TPM or authorize a changed PCR policy. Policy-authorized upgrades are not
+yet provided. Do not enroll a store whose measured updates require recovery.
 
-Firstboot isolates every deployed session's existing store and releases
-TPM-only enrolled stores after identity enrollment and before application-home
-provisioning. An invalid home cannot leave the existing store
-human-owned after a successful migration. Migration refusal is handled
-as described above. Once the store is isolated, a failed open or TPM
-release logs a diagnostic and leaves credentials unavailable while
-unrelated services continue. A root-console `td-secret release --uid
-UID` retries a failed automatic release for a deployed identity. Release
-removes an old volatile key before attempting the TPM and publishes a
-replacement only after successful unseal and legacy cleanup. The portal
+Firstboot isolates every deployed session's existing store and removes
+volatile releases before application-home provisioning. An invalid home
+cannot leave an existing store human-owned after successful migration.
+Migration refusal is handled as described above. File stores are provisioned
+but cannot serve applications; all sealed stores remain locked without TPM
+or token I/O and without placeholder writes. No root-console release bypass
+remains. The private presented unlock worker removes the old volatile key
+before contacting the token and publishes a replacement only after a verified
+assertion, successful unseal and legacy cleanup. The portal
 reads that release at `/run/td-secret/UID/key`: a 32-byte envelope
 fingerprint followed by the 32-byte master. Root owns the traversable
 runtime directories; the single-link 0600 file belongs to the reserved
@@ -905,8 +911,8 @@ The authority uses it for generation preparation and teardown as well
 as after killing and reaping an abandoned unlock child. Cleanup never
 replaces a still-owned unlock worker; reversing that order would permit
 a late publication after cleanup. This entry grants no secret access and has no
-human consent flow. Paired generation activation remains pending in
-`td-authd/DESIGN.md`.
+human consent flow. Paired generation startup and teardown invoke it under
+the supervision rules in `td-authd/DESIGN.md`.
 
 The disposable root fixture also runs `lock-session` against a seeded
 portal-owned runtime key and requires successful exit with the key absent.
@@ -918,8 +924,10 @@ unnamed socketpair, descriptor inventory, bounded framing and deadline
 checks. It is a private child entry, with no human CLI or automatic caller.
 The first canonical request must select Enroll, SHA-256 PCR 7, one explicit
 recovery policy, and CreatePrimary for the configured session owner. The root
-parent supplies the fresh unpredictable nonce. This increment does not
-activate enrollment or remove the interim console/boot paths.
+parent supplies the fresh unpredictable nonce. The paired compositor
+activates this entry only after an explicit physical enrollment choice and
+read-only store inspection. It presents every exact step before replying;
+legacy console enrollment and automatic boot release are removed.
 
 The child clears any runtime release before receiving the request, retains
 the installed store's exclusive lock, and refuses an already token-enrolled

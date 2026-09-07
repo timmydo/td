@@ -708,5 +708,6 @@ pub fn selftest() -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "target-recipe"))]
 #[path = "render_spec.rs"]
 mod spec;

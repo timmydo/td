@@ -6154,8 +6154,9 @@ kernel sender-pinning greeting before this process starts a worker or could
 delegate an endpoint. The application protocol then completes its version and
 session-admission handshake before graphical startup proceeds.
 
-One worker owns the channel and every process handle. Input submits only a
-terminal-launch notification through a capacity-one nonblocking queue; an
+One worker owns the channel and every process handle. Input submits terminal
+launches or private physical secret attempts through a capacity-one
+nonblocking queue; an
 already-pending request is a reported refusal, never an input-thread wait.
 The worker serializes starts and polls one retained handle per loop iteration.
 It waits at most 250 ms for a new request before polling; sustained launches
@@ -6171,8 +6172,12 @@ The original stdin remains open and private for the compositor's lifetime.
 Authority-mode launch requests never reach CommandSpawner; all ordinary
 terminal processes are created by the root authority through td-login. The
 compositor neither reads nor removes human-owned readiness paths. It observes
-new terminals as ordinary Wayland surfaces. No secret release, token operation
-or consent is carried by this protocol.
+new terminals as ordinary Wayland surfaces. The paired secret extension
+carries only typed operation descriptions and acknowledgements; no master or
+credential bytes enter the compositor. Before graphical startup opens input
+or accepts clients, preparation clears old volatile releases and must finish
+within five seconds. The worker polls an active secret operation at most
+250 ms apart, including during terminal traffic.
 
 The client compiles the exact td-authd channel/sys sources under its private
 authority module. Their fixed syscall/descriptor contract is UNSAFE.md §16;
@@ -6194,6 +6199,10 @@ The target-recipe feature selects paths generated only in the target build
 sandbox, as in td-jail. Host tests and clippy use default features and all
 host targets; --all-features is not a supported host source layout. A separate
 staged-layout compilation and the target producer test the generated paths.
+The producer compiles the session tests from the real main crate and runs
+authority, secret-client and physical-selection cases. Source confinement
+and the large render/terminal specification fixtures remain host tests;
+they are not staged into this target session fixture.
 
 Worker failure always ends the paired generation, including loss of the input
 owner during startup. That failure can race the main thread's more specific
@@ -6218,7 +6227,7 @@ session admission. The private portal listener instead admits only the
 dedicated portal UID 991; it does not apply human-session admission
 first. The portal keeps its dialog buffers in its own 0700 runtime and
 transfers descriptors directly. The physical attention screen below
-supplies no token consent. Host-development direct mode retains its
+supplies immutable enrollment and unlock presentations before token I/O. Host-development direct mode retains its
 private socket permissions.
 
 The session policy is the only additional caller of the existing
@@ -6315,14 +6324,49 @@ The application pixel-evidence oracle returns zero while attention is up,
 so it cannot attribute private screen pixels to an application. No pixel
 capture or synthetic-input portal is implemented by this increment.
 
-This screen accepts no credential or approval and invokes no root operation.
-FIDO2 release and typed one-operation elevation remain unimplemented. Their
-future token acquisition must begin only after the complete immutable prompt
-is confirmed presented: Submission::Queued is not a presentation receipt.
-APPLICATIONS.md §W.4 requires a token assertion bound to each secret
-request, with exclusive CTAP mediation; keyboard consent cannot approve
-those requests. Ordinary elevation and hardware PIN policy retain their
-separate contracts in §L.1 and td-install/ENCRYPTION.md.
+A fresh physical U selects primary unlock, R recovery unlock, E enrollment
+with a second recovery token, and X explicit unrecoverability. Only one
+selection is allowed per successfully opened and closed attention lifetime.
+Held keys, repeats and a second device pressing an already-held logical key
+cannot select an operation. Ordinary control, Wayland and portal input APIs
+cannot construct that physical selection. The screen accepts no credential
+bytes. Typed one-operation writes remain a subsequent increment.
+
+Enrollment first asks root for admitted read-only protector state. Only file
+or legacy TPM state permits enrollment; token state displays a fresh-unlock
+instruction. Successful enrollment remains locked. Every reported enrollment
+failure triggers a fresh state query, because publication can precede a lost
+reply; the client never automatically repeats enrollment. An unavailable
+query or malformed channel response never licenses enrollment. Query state
+is advisory and root independently validates the store before each operation.
+
+A complete immutable prompt must be confirmed presented before each token
+creation/proof or unlock assertion; `Submission::Queued` is not a receipt.
+The request fixes owner, nonce, platform and recovery policy throughout the
+operation. The two-token path presents creation and proof for each token;
+the unrecoverable path ends after primary proof. Both tokens must be ready
+before starting. Every prompt includes the remaining 120-second overall
+budget when shown, without renewing that deadline. This is a time snapshot,
+not a live countdown. Hardware timing remains unverified by host/VM fixtures.
+
+The physical attempt records cancellation atomically before waiting for the
+runtime lock. Presentation checks its lifetime before and after painting;
+commit competes with cancellation in one atomic state transition. The
+winning execution decision is recorded before sending root the commit, so a
+lost reply cannot trigger a retry. Cancellation after that decision cannot
+promise the operation was not performed. Closing suppresses late status
+painting, and only successful input drain and attention close release the
+selection slot. A failed initial status repaint retains that consumed slot
+and input capture without dispatching the request or ending the device
+reader; Escape remains available. Worker failure ends the paired generation;
+root reaps its
+child before clearing the runtime release. Runtime locks never span channel
+I/O. Root retains its independent deadlines and exact step checks.
+
+APPLICATIONS.md §W.4 requires an assertion bound to each secret request,
+with exclusive CTAP mediation; keyboard selection alone cannot approve it.
+Ordinary elevation and hardware PIN policy retain their separate contracts
+in §L.1 and td-install/ENCRYPTION.md.
 
 Trusted evdev clients explicitly select `CLOCK_MONOTONIC` before reading.
 After cancellation has drained known held input, the runtime repaints the
@@ -6358,7 +6402,7 @@ Direct-profile readers retain their per-device partial-report fast path;
 they never claim secure attention or use the trusted timestamp cutoff.
 
 
-### Immutable prompt presentation prerequisite
+### Immutable prompt presentation
 
 The shared `td-authd/src/consent.rs` value describes one session and one
 operation: enrollment with an encoded platform profile, explicit recovery policy and proof step,
@@ -6377,15 +6421,18 @@ arguments never produce a receipt. The raster is bounded to 64 MiB and one
 exact output geometry. A mismatched render target fails before backend submission. Public scene rendering excludes these pixels.
 
 `present_attention_request` requires the physical-input origin witness,
-active paired attention outside cancellation drain, no compound commit and
-no prior request on that attention screen. It installs the prepared frame,
+active paired attention outside cancellation drain and no compound commit.
+The first request consumes the presentation slot. Only its exact next
+enrollment step may replace it; owner, nonce, platform and recovery remain
+fixed. Unlock has no successor. It installs the prepared frame,
 owes the entire output and repaints synchronously. Only an immediate
 `Submission::Presented` with no pending paint returns a `PresentedRequest`
 containing the exact description. A failed or queued paint returns no
 receipt, discards the prepared prompt and retains capture. A later flush
-paints the inert attention screen. Replacement and repeated receipt requests
-refuse even after failure or repeated entry; only a successfully completed
-close followed by reopening creates a fresh presentation opportunity.
+paints the attention menu. Repeated, skipped or changed requests refuse and
+consume the retained predecessor. A failed successor preparation or paint
+also leaves no predecessor to retry. Only a successfully completed close
+followed by reopening creates a fresh initial presentation opportunity.
 Failed-close recovery preserves the consumed slot. Draining or closing discards the retained prompt.
 
 The current fbdev backend presents immediately. A future queued backend can
@@ -6396,14 +6443,16 @@ cancellation or superseding-frame guarantees. It must also release any
 frame state when rendering refuses before submission; dropping the current
 fbdev shadow-buffer borrow already does so.
 
-This receipt records a completed paint, not live authorization. The later
-channel consumer must bind it to its outstanding nonce, serialize the whole
-operation, invalidate it on cancellation/channel loss and start token I/O
-only after accepting that exact receipt. A receipt already handed out does
-not revoke itself when attention closes. No production caller uses this
-receipt API yet. The private root unlock worker consumes the request codec
-as specified in `td-secret/DESIGN.md`, but its paired-authority caller is
-not activated. The stock attention screen remains inert.
+This receipt records a completed paint, not live authorization. The private
+session client retains it only for the exact outstanding description and
+accepts each next enrollment step only after its predecessor was presented.
+Only the final proof permits the private execution acknowledgement; it is
+not another user prompt or token touch. Cancellation, expiration and channel
+loss prevent further acknowledgement. The private root workers independently
+check that sequence under `td-secret/DESIGN.md`. A handed-out receipt does
+not revoke itself: the physical attempt and channel lifecycle enforce that
+obligation. File and TPM-only application credential access and automatic
+boot release are removed when this consumer is activated.
 
 ## Native headless automation
 

@@ -318,15 +318,15 @@ The future hardware-backed disk and session unlock contract lives in
 authentication to one enrolled account and distinguishes recovery from login;
 the current auto-login and credential-switching behavior below is unchanged.
 
-TPM credential-store enrollment and boot release are separate root-owned
-operations in td-secret and td-firstboot, specified by
-`td-secret/DESIGN.md`. They do not switch process credentials or
-authenticate a human. Firstboot unseals an explicitly TPM-only enrolled store
-into volatile storage before the existing auto-login path runs; the TPM
-policy authenticates selected platform state, not that login's user.
-Token-protected stores instead remain locked during boot; their safe
-release API requires a verified assertion and has no login/UI consumer
-yet. td-login's session authorization table is unchanged. Firstboot reserves
+Credential-store enrollment and token-gated session release are separate
+root-owned operations in td-secret and td-authd, specified by
+`td-secret/DESIGN.md`. They do not switch process credentials or replace
+td-login's auto-login policy. Firstboot clears volatile keys and leaves
+all sealed stores locked. The paired compositor selects physical enrollment
+or unlock and presents each immutable request before token I/O. Only a
+verified assertion and the recorded TPM platform state permit release;
+file and TPM-only stores cannot serve applications. td-login's session
+authorization table is unchanged. Firstboot reserves
 compositor, broker, portal, and per-app identities in a persistent
 ledger, and refuses account records that alias a reservation. The image
 activates the compositor assignment as service account `tdc1000` at
@@ -334,8 +334,9 @@ UID/GID 993 and the broker as `tdb1000` at UID/GID 992. Firstboot
 prepares the broker and portal runtimes after durable enrollment, whose
 success td-svc requires before startup. The portal consumes UID/GID 991;
 firstboot transfers credential-store ownership to it before human
-sessions and releases enrolled stores independently of application-home
-validation. Stock application assignments are active service accounts.
+sessions and clears volatile releases independently of application-home
+validation. Sealed stores remain locked until a presented token operation
+succeeds; file and TPM-only stores cannot serve application credentials. Stock application assignments are active service accounts.
 The broker loads an immutable deployment table binding each reserved
 application UID to one installed name and exact bus grants. An
 application UID outside a jail receives registration authority only; its
@@ -353,10 +354,13 @@ terminal-exec wrapper refuses a failed session-cgroup placement before
 terminal code runs, and a new process group keeps the user terminal
 independent of the authority generation. This adds no credential-switch
 mechanism or human authentication policy here. The paired compositor now
-reserves physical Ctrl+Alt+Esc for an inert trusted screen with
-exclusive input; it accepts no authorization. FIDO2 release still
-requires token enrollment/recovery, protected ownership and a presented
-prompt bound to its assertion. No login, `su` or keyboard-consent
+reserves physical Ctrl+Alt+Esc for a trusted screen with exclusive input.
+It selects enrollment with a second token or explicit unrecoverability,
+and primary or recovery unlock. Each immutable step must be presented
+before root token I/O; an assertion binds the exact request. Session
+startup clears old releases before graphical input begins, and generation
+teardown reaps any worker before clearing its release. Typed writes remain
+an explicit root-console interim pending one-operation elevation. No login, `su` or keyboard-consent
 behavior substitutes for that authorization.
 
 ## 4. Privilege can only be dropped, never gained

@@ -14,7 +14,7 @@ use crate::scene::Fraction;
 use crate::sys;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -136,6 +136,7 @@ enum AttentionState {
 struct KeyBindings {
     attention_enabled: bool,
     attention: AttentionState,
+    secret_selected: bool,
     cutoff: Option<u128>,
     pressed: BTreeSet<(usize, u16)>,
     forwarded: BTreeSet<(usize, u16)>,
@@ -152,6 +153,7 @@ struct KeyBindings {
 #[derive(Debug, Eq, PartialEq)]
 struct KeyDecision {
     attention: Option<bool>,
+    secret: Option<crate::secret_client::Selection>,
     draining: bool,
     command: Option<Command>,
     launcher: Option<LauncherAction>,
@@ -170,6 +172,7 @@ impl KeyBindings {
     fn feed_device(&mut self, device: usize, event: Event) -> KeyDecision {
         let mut decision = KeyDecision {
             attention: None,
+            secret: None,
             draining: false,
             command: None,
             launcher: None,
@@ -197,6 +200,16 @@ impl KeyBindings {
             return decision;
         }
         if self.attention != AttentionState::Closed {
+            if self.attention == AttentionState::Open && !self.secret_selected && !logical_pressed && event.value == KEY_PRESS {
+                decision.secret = match event.code {
+                    KEY_U => Some(crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Primary)),
+                    KEY_R => Some(crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery)),
+                    KEY_E => Some(crate::secret_client::Selection::Enroll(crate::authority::consent::Recovery::SecondToken)),
+                    KEY_X => Some(crate::secret_client::Selection::Enroll(crate::authority::consent::Recovery::Unrecoverable)),
+                    _ => None,
+                };
+                self.secret_selected |= decision.secret.is_some();
+            }
             if self.attention == AttentionState::Open
                 && event.code == KEY_ESC
                 && event.value == KEY_PRESS
@@ -216,6 +229,7 @@ impl KeyBindings {
             && (self.pressed(KEY_LEFTALT) || self.pressed(KEY_RIGHTALT))
         {
             self.attention = AttentionState::Open;
+            self.secret_selected = false;
             self.forwarded.clear();
             self.pointer_forwarded.clear();
             self.consumed.clear();
@@ -684,6 +698,11 @@ struct PointerFrame {
 }
 
 trait InputTarget {
+    fn secret_request(&mut self, _role: crate::secret_client::Selection) -> Result<(), String> {
+        Err("secret requests unavailable on this input target".into())
+    }
+    fn attention_closed(&mut self) {}
+
     fn attention(&mut self, visible: bool) -> Result<u128, String>;
     fn drain_attention(&mut self) -> Result<(), String>;
     fn command(&mut self, command: Command) -> Result<(), String>;
@@ -726,6 +745,7 @@ trait InputTarget {
 struct LiveInputTarget {
     runtime: Arc<Mutex<Runtime>>,
     launches: LaunchBackend,
+    secret_attempt: Option<Arc<crate::secret_client::Attempt>>,
 }
 
 /// One synthetic seat for an explicitly enabled headless process generation.
@@ -971,7 +991,29 @@ impl LiveInputTarget {
 }
 
 impl InputTarget for LiveInputTarget {
+    fn secret_request(&mut self, role: crate::secret_client::Selection) -> Result<(), String> {
+        if self.secret_attempt.is_some() { return Err("physical attention already consumed a request".into()); }
+        let attempt = crate::secret_client::Attempt::new(EvdevOrigin { _private: () }, Arc::clone(&self.runtime), role);
+        self.secret_attempt = Some(Arc::clone(&attempt));
+        if let Err(error) = attempt.notice(crate::attention::Notice::Pending) {
+            let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+            return Ok(());
+        }
+        if let Err(error) = self.launches.unlock(Arc::clone(&attempt)) {
+            let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+            if let Err(error) = attempt.notice(crate::attention::Notice::Failed) {
+                let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+            }
+        }
+        Ok(())
+    }
+
+    fn attention_closed(&mut self) {
+        self.secret_attempt = None;
+    }
+
     fn drain_attention(&mut self) -> Result<(), String> {
+        if let Some(attempt) = &self.secret_attempt { attempt.cancel(); }
         self.runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
@@ -979,6 +1021,9 @@ impl InputTarget for LiveInputTarget {
     }
 
     fn attention(&mut self, visible: bool) -> Result<u128, String> {
+        if !visible {
+            if let Some(attempt) = &self.secret_attempt { attempt.cancel(); }
+        }
         self.runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
@@ -1512,6 +1557,9 @@ fn deliver_key_decision<T: InputTarget>(
             finish_attention(runtime, bindings)?;
         }
     }
+    if let Some(role) = decision.secret {
+        runtime.secret_request(role)?;
+    }
     if let Some(command) = decision.command {
         runtime.command(command)?;
     }
@@ -1555,6 +1603,7 @@ fn finish_attention<T: InputTarget>(
         }
         bindings.cutoff = Some(cutoff);
         bindings.attention = AttentionState::Closed;
+        runtime.attention_closed();
     }
     Ok(())
 }
@@ -1948,7 +1997,7 @@ pub fn start(
         attention_enabled,
         ..KeyBindings::default()
     }));
-    let target = Arc::new(Mutex::new(LiveInputTarget { runtime, launches }));
+    let target = Arc::new(Mutex::new(LiveInputTarget { runtime, launches, secret_attempt: None }));
     for (device, (path, mut file)) in devices.into_iter().enumerate() {
         if attention_enabled {
             sys::input_monotonic_clock(&file)?;
@@ -2734,6 +2783,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingTarget {
         attention_events: Vec<bool>,
+        secret_roles: Vec<crate::secret_client::Selection>,
         attention_cutoff: u128,
         attention_error: Option<String>,
         draining_events: usize,
@@ -2773,6 +2823,11 @@ mod tests {
     }
 
     impl InputTarget for RecordingTarget {
+        fn secret_request(&mut self, role: crate::secret_client::Selection) -> Result<(), String> {
+            self.secret_roles.push(role);
+            Ok(())
+        }
+
         fn drain_attention(&mut self) -> Result<(), String> {
             self.draining_events += 1;
             match self.draining_error.take() {
@@ -4819,6 +4874,7 @@ mod tests {
         let target = Mutex::new(LiveInputTarget {
             runtime: Arc::clone(&runtime),
             launches: LaunchBackend::Direct(launches),
+            secret_attempt: None,
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
@@ -4867,6 +4923,7 @@ mod tests {
         let target = Mutex::new(LiveInputTarget {
             runtime: Arc::clone(&runtime),
             launches: LaunchBackend::Direct(launches),
+            secret_attempt: None,
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
@@ -5528,6 +5585,93 @@ mod tests {
             assert_eq!(bindings.modifiers().locked, 0);
         }
     }
+    #[test]
+    fn physical_attention_notice_failure_retains_capture_and_accepts_escape() {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!("td-input-secret-notice-{}-{}", std::process::id(), TEST_SEQ.fetch_add(1, Ordering::Relaxed))));
+        let framebuffer = crate::framebuffer::Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        runtime.lock().unwrap().enable_attention(true);
+        let launches = LaunchProcesses::new(LaunchOptions {
+            socket: PathBuf::from("/run/user/1000/wayland-0"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            terminal: PathBuf::from("/bin/td-term"), application: None,
+        }).unwrap();
+        let mut target = LiveInputTarget { runtime: Arc::clone(&runtime), launches: LaunchBackend::Direct(launches), secret_attempt: None };
+        let mut bindings = KeyBindings { attention_enabled: true, ..KeyBindings::default() };
+        for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS), key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE), key(KEY_LEFTCTRL, KEY_RELEASE), key(KEY_LEFTALT, KEY_RELEASE)] {
+            let decision = bindings.feed(event);
+            deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+        }
+        runtime.lock().unwrap().fail_next_repaint();
+        let decision = bindings.feed(key(KEY_U, KEY_PRESS));
+        deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+        assert!(target.secret_attempt.is_some());
+        assert!(bindings.attention != AttentionState::Closed);
+        let decision = bindings.feed(key(KEY_U, KEY_RELEASE));
+        deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+        assert!(bindings.feed(key(KEY_R, KEY_PRESS)).secret.is_none());
+        bindings.feed(key(KEY_R, KEY_RELEASE));
+        for event in [key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE)] {
+            let decision = bindings.feed(event);
+            deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+        }
+        assert!(bindings.attention == AttentionState::Closed);
+        assert!(target.secret_attempt.is_none());
+    }
+
+    #[test]
+    fn physical_attention_requires_a_fresh_explicit_enrollment_choice() {
+        use crate::authority::consent::Recovery;
+        use crate::secret_client::Selection;
+        for (code, policy) in [(KEY_E, Recovery::SecondToken), (KEY_X, Recovery::Unrecoverable)] {
+            let mut bindings = KeyBindings { attention_enabled: true, ..KeyBindings::default() };
+            let mut target = RecordingTarget::default();
+            assert!(bindings.feed(key(code, KEY_PRESS)).secret.is_none());
+            for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS), key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE), key(KEY_LEFTCTRL, KEY_RELEASE), key(KEY_LEFTALT, KEY_RELEASE)] {
+                let decision = bindings.feed(event);
+                deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+            }
+            assert!(bindings.feed(key(code, KEY_REPEAT)).secret.is_none());
+            assert!(bindings.feed_device(1, key(code, KEY_PRESS)).secret.is_none());
+            bindings.feed_device(1, key(code, KEY_RELEASE));
+            bindings.feed(key(code, KEY_RELEASE));
+            for event in [key(code, KEY_PRESS), key(code, KEY_REPEAT), key(code, KEY_RELEASE), key(KEY_U, KEY_PRESS), key(KEY_U, KEY_RELEASE)] {
+                let decision = bindings.feed(event);
+                deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+            }
+            assert_eq!(target.secret_roles, [Selection::Enroll(policy)]);
+        }
+    }
+
+    #[test]
+    fn physical_attention_selects_only_one_token_role_per_open() {
+        let mut bindings = KeyBindings { attention_enabled: true, ..KeyBindings::default() };
+        let mut target = RecordingTarget::default();
+        for event in [key(KEY_U, KEY_PRESS), key(KEY_U, KEY_RELEASE)] {
+            assert!(bindings.feed(event).secret.is_none());
+        }
+        for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS), key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE), key(KEY_LEFTCTRL, KEY_RELEASE), key(KEY_LEFTALT, KEY_RELEASE)] {
+            let decision = bindings.feed(event);
+            deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+        }
+        for event in [key(KEY_R, KEY_PRESS), key(KEY_R, KEY_REPEAT), key(KEY_R, KEY_RELEASE), key(KEY_U, KEY_PRESS), key(KEY_U, KEY_RELEASE)] {
+            let decision = bindings.feed(event);
+            deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+        }
+        assert_eq!(target.secret_roles, [crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery)]);
+        assert!(target.keys.iter().all(|key| key.key != u32::from(KEY_U) && key.key != u32::from(KEY_R)));
+        for event in [key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE)] {
+            let decision = bindings.feed(event);
+            deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+        }
+        assert!(bindings.attention == AttentionState::Closed);
+        for event in [key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS), key(KEY_ESC, KEY_PRESS), key(KEY_U, KEY_PRESS)] {
+            let decision = bindings.feed(event);
+            deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+        }
+        assert_eq!(target.secret_roles, [crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery), crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Primary)]);
+    }
+
     #[test]
     fn secure_attention_reserves_the_chord_and_drains_all_devices() {
         let target = Mutex::new(RecordingTarget::default());

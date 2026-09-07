@@ -1728,21 +1728,31 @@ impl Runtime {
     }
 
     /// Only the physical-input owner may present an authenticated root request.
-    #[allow(dead_code, reason = "trusted authority request consumer follows")]
+    #[cfg(test)]
     pub(crate) fn present_attention_request(
+        &mut self,
+        origin: &crate::input::EvdevOrigin,
+        request: crate::authority::consent::Request,
+    ) -> Result<PresentedRequest, String> {
+        self.present_attention_request_with_time(origin, request, None)
+    }
+
+    pub(crate) fn present_attention_request_with_time(
         &mut self,
         _origin: &crate::input::EvdevOrigin,
         request: crate::authority::consent::Request,
+        remaining: Option<u64>,
     ) -> Result<PresentedRequest, String> {
         if !self.attention_enabled || self.compound_settle.is_some() {
             return Err("trusted prompt cannot be presented in this runtime state".into());
         }
         let size = self.framebuffer.dimensions();
-        self.scene.prepare_attention_request(
+        self.scene.prepare_attention_request_with_time(
             request,
             size.width,
             size.height,
             self.framebuffer.stride(),
+            remaining,
         )?;
         self.owed_damage = Damage::Whole;
         let painted = self.repaint().and_then(|()| {
@@ -1764,6 +1774,19 @@ impl Runtime {
             .ok_or("trusted prompt was cancelled")?
             .clone();
         Ok(PresentedRequest { request })
+    }
+
+    pub(crate) fn attention_notice(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+        notice: crate::attention::Notice,
+    ) -> Result<(), String> {
+        if !self.attention_enabled || !self.scene.attention_visible() || self.scene.attention_draining() {
+            return Err("secret notice requires active physical attention".into());
+        }
+        self.scene.set_attention_notice(notice);
+        self.owed_damage = Damage::Whole;
+        self.repaint()
     }
 
     pub(crate) fn drain_attention(

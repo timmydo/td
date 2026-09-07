@@ -33,6 +33,7 @@ mod ready;
 mod render;
 mod runtime;
 mod scene;
+mod secret_client;
 mod server;
 mod session;
 mod socket;
@@ -1209,6 +1210,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "target-recipe"))]
 mod confinement {
     const IMPORTERS: &[(&str, &str)] = &[
         ("import-libvterm.rs", include_str!("../tools/import-libvterm.rs")),
@@ -1218,7 +1220,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x72a18a246867a53d;
+    const AUTHORITY_FINGERPRINT: u64 = 0x197670d040323c76;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xbad9a1ce43bb1449;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1256,6 +1258,7 @@ mod confinement {
         ("render.rs", include_str!("render.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
+        ("secret_client.rs", include_str!("secret_client.rs")),
         ("server.rs", include_str!("server.rs")),
         ("session.rs", include_str!("session.rs")),
         ("socket.rs", include_str!("socket.rs")),

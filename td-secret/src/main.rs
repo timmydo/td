@@ -80,27 +80,6 @@ fn run(args: &[String]) -> Result<(), String> {
         [command, index, inode, rdev] if command == "hid-worker" => {
             fido_device::worker(index, inode, rdev)
         }
-        [command, uid_flag, uid, pcr_flag, pcrs, recovery]
-            if command == "seal"
-                && uid_flag == "--uid"
-                && pcr_flag == "--pcrs"
-                && recovery == "--unrecoverable" =>
-        {
-            store::require_root()?;
-            let uid = parse_uid(uid)?;
-            let pcrs = tpm::Pcrs::parse(pcrs)?;
-            let store = owned_store(uid)?;
-            store.seal(pcrs)?;
-            eprintln!(
-                "td-secret: store TPM sealed; no recovery; boot release without token consent"
-            );
-            Ok(())
-        }
-        [command, uid_flag, uid] if command == "release" && uid_flag == "--uid" => {
-            store::require_root()?;
-            let uid = parse_uid(uid)?;
-            owned_store(uid)?.release()
-        }
         [command, name] if command == "get" => {
             let mut secret = client::retrieve(name)?;
             use std::io::Write;
@@ -130,8 +109,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         _ => Err(concat!(
             "usage: td-secret set --uid UID APPLICATION/NAME < credential-file; ",
-            "td-secret seal --uid UID --pcrs LIST --unrecoverable; ",
-            "td-secret release --uid UID"
+            "use physical secure attention to enroll or unlock the store"
         )
         .into()),
     }

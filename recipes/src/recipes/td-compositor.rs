@@ -10,6 +10,7 @@ use crate::types::{Recipe, Step};
 // of td-compositor's is on it.
 const MAIN_RS: &str = include_str!("../../../td-compositor/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("secret_client", include_str!("../../../td-compositor/src/secret_client.rs")),
     ("app_policy", include_str!("../../../td-busd/src/app_policy.rs")),
     (
         "attention",
@@ -278,7 +279,7 @@ pub fn recipe() -> Recipe {
                 "2021",
                 "--test",
                 "--crate-name",
-                "td_compositor_authority_tests",
+                "td_compositor_session_tests",
                 "--cfg",
                 "feature=\"target-recipe\"",
                 "--target",
@@ -295,13 +296,15 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-L{root}/eh",
                 "-Clink-arg=-static-libgcc",
                 "-o",
-                "{root}/authority-tests",
-                "{src}/authority.rs",
+                "{root}/session-tests",
+                "{src}/main.rs",
             ],
         )
         .env("PATH", &path)
         .env("SOURCE_DATE_EPOCH", "1"),
-        Step::run("{root}", &["{root}/authority-tests"]),
+        Step::run("{root}", &["{root}/session-tests", "authority::"]),
+        Step::run("{root}", &["{root}/session-tests", "secret_client::"]),
+        Step::run("{root}", &["{root}/session-tests", "physical_attention_"]),
         split_target_debug("{out}"),
         Step::assert_static(&[
             "{out}/bin/td-compositor",
@@ -423,17 +426,20 @@ mod tests {
             .iter()
             .position(|argv| {
                 argv.iter()
-                    .any(|arg| arg == "td_compositor_authority_tests")
+                    .any(|arg| arg == "td_compositor_session_tests")
             })
             .unwrap();
         let execute = runs
             .iter()
-            .position(|argv| argv.as_slice() == ["{root}/authority-tests"])
+            .position(|argv| argv.as_slice() == ["{root}/session-tests", "authority::"])
             .unwrap();
         assert!(compile < execute);
+        for filter in ["secret_client::", "physical_attention_"] {
+            assert!(runs.iter().any(|argv| argv.as_slice() == ["{root}/session-tests", filter]));
+        }
         let args = runs[compile];
         assert!(args.iter().any(|arg| arg == "--test"));
-        assert!(args.iter().any(|arg| arg == "{src}/authority.rs"));
+        assert!(args.iter().any(|arg| arg == "{src}/main.rs"));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--cfg", "feature=\"target-recipe\""]));
@@ -442,7 +448,7 @@ mod tests {
             .any(|pair| pair == ["--target", "x86_64-unknown-linux-gnu"]));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["-o", "{root}/authority-tests"]));
+            .any(|pair| pair == ["-o", "{root}/session-tests"]));
     }
 
     #[test]

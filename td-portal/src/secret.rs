@@ -133,7 +133,7 @@ pub(super) fn identity_reply(
         return Ok(true);
     };
     let result = secret_store::Store::open_owned(&secret_store::user_path(UI_UID), UI_UID, PORTAL_UID, false)
-        .and_then(|store| store.get(&app, &pending.name))
+        .and_then(|store| store.application_secret(&app, &pending.name))
         .and_then(|secret| secret.ok_or_else(|| "credential is not provisioned".into()));
     let mut secret = match result {
         Ok(secret) => secret,
@@ -142,8 +142,11 @@ pub(super) fn identity_reply(
                 connection,
                 &pending,
                 "org.freedesktop.portal.Error.Failed",
-                "credential is unavailable",
+                "credential is unavailable; enroll or unlock through secure attention",
             )?;
+            if app == "mail" && pending.name == "main" {
+                eprintln!("TD-SECRET-LOCKED app=mail name=main");
+            }
             return Ok(true);
         }
     };

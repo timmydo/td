@@ -864,6 +864,7 @@ pub struct Scene {
     attention_draining: bool,
     attention_request: Option<crate::attention::Prepared>,
     attention_request_attempted: bool,
+    attention_notice: crate::attention::Notice,
     status: String,
 }
 
@@ -902,6 +903,7 @@ impl Scene {
             attention_draining: false,
             attention_request: None,
             attention_request_attempted: false,
+            attention_notice: crate::attention::Notice::Menu,
             status: String::new(),
         }
     }
@@ -3162,6 +3164,9 @@ impl Scene {
         self.attention_request = None;
         self.attention = visible;
         self.attention_draining = false;
+        if visible && !self.attention_request_attempted {
+            self.attention_notice = crate::attention::Notice::Menu;
+        }
         if visible {
             self.launcher.apply(LauncherAction::Close);
             self.help.set(false);
@@ -3177,6 +3182,12 @@ impl Scene {
         self.attention_draining = true;
     }
 
+    pub(crate) fn set_attention_notice(&mut self, notice: crate::attention::Notice) {
+        self.attention_request = None;
+        self.attention_notice = notice;
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepare_attention_request(
         &mut self,
         request: crate::authority::consent::Request,
@@ -3184,12 +3195,30 @@ impl Scene {
         height: usize,
         stride: usize,
     ) -> Result<(), String> {
-        if !self.attention || self.attention_draining || self.attention_request_attempted {
-            return Err("trusted prompt requires a fresh active attention screen".into());
+        self.prepare_attention_request_with_time(request, width, height, stride, None)
+    }
+
+    pub(crate) fn prepare_attention_request_with_time(
+        &mut self,
+        request: crate::authority::consent::Request,
+        width: usize,
+        height: usize,
+        stride: usize,
+        remaining: Option<u64>,
+    ) -> Result<(), String> {
+        if !self.attention || self.attention_draining {
+            return Err("trusted prompt requires active attention".into());
+        }
+        if self.attention_request_attempted {
+            let following = self.attention_request().map(|previous| previous.following_enrollment_step()).transpose()?.flatten();
+            self.attention_request = None;
+            if following.as_ref() != Some(&request) {
+                return Err("trusted prompt must follow the exact enrollment step".into());
+            }
         }
         self.attention_request_attempted = true;
-        self.attention_request = Some(crate::attention::Prepared::new(
-            request, width, height, stride,
+        self.attention_request = Some(crate::attention::Prepared::with_time(
+            request, width, height, stride, remaining,
         )?);
         Ok(())
     }
@@ -3219,7 +3248,7 @@ impl Scene {
                     Err("trusted prompt raster does not match output target".into())
                 };
             }
-            crate::attention::paint(frame, width, height, stride, self.attention_draining);
+            crate::attention::paint(frame, width, height, stride, self.attention_draining, self.attention_notice);
         } else {
             self.render(frame, width, height, stride);
         }

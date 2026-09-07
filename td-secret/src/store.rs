@@ -218,21 +218,7 @@ impl Store {
         }
     }
 
-    /// Enrollment is a root console operation until secure attention exists.
-    pub fn seal(&self, pcrs: tpm::Pcrs) -> Result<(), String> {
-        require_root()?;
-        runtime_directory(self.uid, true)?;
-        self.seal_with(
-            |master| {
-                tpm::Client::new(tpm::Device::open()?)
-                    .seal(self.uid, pcrs, master)?
-                    .encode()
-            },
-            |blob| tpm::Client::new(tpm::Device::open()?).unseal(&tpm::SealedKey::decode(blob)?),
-        )?;
-        self.release()
-    }
-
+    #[cfg(test)]
     fn seal_with(
         &self,
         seal: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, String>,
@@ -252,6 +238,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     fn rotate_with(
         &self,
         seal: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, String>,
@@ -353,21 +340,7 @@ impl Store {
         self.directory.sync_all().map_err(|e| e.to_string())
     }
 
-    /// Firstboot releases enrolled stores; the portal never opens the TPM.
-    pub fn release(&self) -> Result<(), String> {
-        let Some(bundle) = self.bundle()? else {
-            return Ok(());
-        };
-        require_root()?;
-        if bundle.token_protected() {
-            return Err("credential store requires a presented FIDO2 release".into());
-        }
-        let runtime = runtime_directory(self.uid, true)?;
-        self.release_into(&bundle, &runtime, |blob| {
-            tpm::Client::new(tpm::Device::open()?).unseal(&tpm::SealedKey::decode(blob)?)
-        })
-    }
-
+    #[cfg(test)]
     fn release_into(
         &self,
         bundle: &Bundle,
@@ -412,16 +385,25 @@ impl Store {
         Ok(self.bundle()?.is_some_and(|bundle| bundle.token_protected()))
     }
 
-    /// Firstboot never converts platform possession into token authorization.
+    pub fn sealed(&self) -> Result<bool, String> {
+        Ok(self.bundle()?.is_some())
+    }
+
+    /// Firstboot never releases a key, including for legacy platform stores.
     pub fn prepare_boot(&self) -> Result<(), String> {
-        if !self.token_protected()? {
-            return self.release();
-        }
+        if self.bundle()?.is_none() { return Ok(()); }
         require_root()?;
         lock_runtime(&runtime_directory(self.uid, true)?)?;
         self.retire_legacy()?;
-        eprintln!("td-secret: enrolled session {} remains token locked", self.uid);
+        eprintln!("td-secret: session {} remains locked pending secure attention", self.uid);
         Ok(())
+    }
+
+    /// Only a token-protected and currently released store serves applications.
+    pub fn application_secret(&self, app: &str, name: &str) -> Result<Option<Vec<u8>>, String> {
+        let bundle = self.bundle()?.ok_or("credential store requires token enrollment")?;
+        if !bundle.token_protected() { return Err("credential store requires token enrollment".into()); }
+        self.get_from(app, name, Some(&bundle))
     }
 
     /// The caller must have completed enrollment on the trusted input path.
@@ -1728,6 +1710,28 @@ mod tests {
         assert!(Store::open(&base.join("alias"), uid, false).is_err());
         fs::remove_dir_all(base).unwrap();
     }
+    #[test]
+    fn applications_refuse_unenrolled_backends_even_with_readable_credentials() {
+        let root = std::env::temp_dir().join(format!("td-app-secret-{}-{}", std::process::id(), u64::from_le_bytes(random::<8>().unwrap())));
+        fs::create_dir(&root).unwrap();
+        let owner = fs::metadata(&root).unwrap().uid();
+        let path = root.join("store");
+        let store = Store::open_owned(&path, 1000, owner, true).unwrap();
+        store.set("mail", "main", b"unenrolled credential").unwrap();
+        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"unenrolled credential");
+        assert_eq!(store.application_secret("mail", "main").unwrap_err(), "credential store requires token enrollment");
+        store.write("sealed", &Bundle { key: tpm::tests::fixture(1000), records: BTreeMap::new() }.encode().unwrap()).unwrap();
+        assert_eq!(store.application_secret("mail", "main").unwrap_err(), "credential store requires token enrollment");
+        for recovery in [false, true] {
+            let key = super::super::fido_metadata::tests::protection_fixture(1000, recovery).encode().unwrap();
+            store.write("sealed", &Bundle { key, records: BTreeMap::new() }.encode().unwrap()).unwrap();
+            // The enrolled policy admits lookup; a missing entry stays missing.
+            assert_eq!(store.application_secret("mail", "absent").unwrap(), None);
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn inspection_preserves_store_bytes_and_refuses_missing_or_invalid_state() {
         let root = std::env::temp_dir().join(format!("td-inspect-{}-{}", std::process::id(), u64::from_le_bytes(random::<8>().unwrap())));

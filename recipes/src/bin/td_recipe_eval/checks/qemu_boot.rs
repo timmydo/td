@@ -118,7 +118,7 @@ const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::ladder::TD_BUSD_RUNTIME_MARKER;
 /// Printed by the unprivileged live portal probe after a routed Properties.Get
 /// and Settings.ReadAll return the exact immutable session policy.
 const TD_PORTAL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_RUNTIME_MARKER;
-const TD_SECRET_CONSOLE_MARKER: &str = "portal: TD-SECRET-READY app=mail name=main";
+const TD_SECRET_CONSOLE_MARKER: &str = "portal: TD-SECRET-LOCKED app=mail name=main";
 const TD_PORTAL_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-READY namespaces=2 settings=11 version=1";
 const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str = td_recipe::ladder::TD_PORTAL_REQUEST_RUNTIME_MARKER;
@@ -2032,7 +2032,7 @@ fn validate_system_boot(
         ));
     }
     if !result.evidence.td_secret_runtime {
-        return Err(format!("the jailed mail client did not acknowledge a credential descriptor from td.Secret1 ({TD_SECRET_CONSOLE_MARKER}). Last serial output:\n{}", tail(&result.console, 80)));
+        return Err(format!("the unenrolled boot did not refuse the authenticated jailed mail credential request ({TD_SECRET_CONSOLE_MARKER}). Last serial output:\n{}", tail(&result.console, 80)));
     }
     if !result.evidence.td_portal_request_runtime {
         return Err(format!(
@@ -11079,13 +11079,13 @@ mod tests {
     }
 
     #[test]
-    fn credential_evidence_requires_the_exact_supervised_receipt() {
+    fn credential_evidence_requires_the_exact_supervised_locked_refusal() {
         for line in [
-            "TD-SECRET-READY app=mail name=main",
-            "mail: TD-SECRET-READY app=mail name=main",
-            "portal: TD-SECRET-READY app=news name=main",
-            "portal: TD-SECRET-READY app=mail name=other",
-            "portal: TD-SECRET-READY app=mail name=main extra",
+            "TD-SECRET-LOCKED app=mail name=main",
+            "mail: TD-SECRET-LOCKED app=mail name=main",
+            "portal: TD-SECRET-LOCKED app=news name=main",
+            "portal: TD-SECRET-LOCKED app=mail name=other",
+            "portal: TD-SECRET-LOCKED app=mail name=main extra",
         ] {
             let mut evidence = ConsoleEvidence::default();
             latch_console_evidence(&mut evidence, format!("\n{line}\n").as_bytes(), b"target");

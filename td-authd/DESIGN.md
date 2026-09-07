@@ -757,23 +757,24 @@ tests assert the complete public argument display.
 These are structural checks, not caller admission or proof of
 randomness. The private root unlock and enrollment workers in
 `td-secret/DESIGN.md` consume this codec. The paired authority exposes its typed private
-session extension; the compositor receipt integration is not activated; there is no
-public operation listener.
+session extension; the paired compositor supplies physical enrollment and
+unlock choices and their exact presentation receipts. There is no public
+operation listener.
 The future authority must pin the requester and credential input, admit
 the application from deployment policy, own an immutable operation under
 its fresh nonce, and bind its token challenge to the complete canonical
 description. The compositor's presentation receipt is necessary but
 insufficient: cancellation, peer loss, deadline or request replacement
 must invalidate authority before committing any write or release. The
-renderer and its current unconsumed receipt API are specified in
+renderer and its private session client are specified in
 `td-compositor/DESIGN.md`.
 
-## Private unlock child supervision prerequisite
+## Private token child supervision
 
 `unlock.rs` owns one root-private `td-secret unlock-operation --uid
 1000` or `td-secret enroll-operation --uid 1000` child. The paired service calls this controller through the
-private session extension below. The compositor receipt integration
-remains the activation prerequisite.
+private session extension below. The paired compositor enforces physical
+selection, exact immutable step presentation and cancellation before commit.
 There is no public listener, automatic release, or new keyboard
 authorization. The live caller must enforce root startup and
 paired-session admission before constructing the production controller.
@@ -938,14 +939,17 @@ populated. Root authority workers remain in that containment, unlike
 terminals intentionally handed to the human session. SIGKILL cannot run
 this cleanup, so the next compositor generation must complete Prepare
 before device/input admission or any secret request. That activation
-ordering is mandatory for the upcoming compositor integration.
+ordering is enforced before graphical input or client admission.
 
-This extension stages the root API. The current compositor uses only
-terminal records and keeps secure attention inert. Before sending the
-new records, its client must bind a physical attention lifetime to one
-operation and each required immutable presentation receipt, serialize
-observed cancellation against
-commit and withhold input admission until generation cleanup succeeds.
+The compositor's private client binds one physical attention lifetime to one
+operation and each required immutable presentation receipt. It serializes
+cancellation against commit atomically before channel I/O, never renews its
+overall deadline, and withholds graphical input admission until generation
+preparation succeeds. Enrollment uses read-only inspection before beginning
+and after failure; a lost completion reply cannot authorize a retry. An
+already-enrolled store requires a separate fresh unlock. Typed credential
+writes remain a root-console interim until descriptor-pinned elevation is
+implemented.
 The root verifies the authenticated peer and exact public description;
 it cannot independently observe the peer's framebuffer. A matching
 public byte string alone is not evidence of presentation or token touch.
