@@ -320,6 +320,43 @@ impl Framebuffer {
         self.stride
     }
 
+    /// Only completed bytes that match a public-scene render may be captured.
+    /// In particular, neither a failed write nor private attention pixels can
+    /// be relabeled as a public frame by the caller.
+    pub(crate) fn completed_public_ppm(&mut self, scene: &Scene) -> Result<Vec<u8>, String> {
+        if self.resend_all || self.written.len() != self.frame.len() {
+            return Err("output completion is not established".into());
+        }
+        if self.comparison.len() != self.frame.len() {
+            let additional = self.frame.len().saturating_sub(self.comparison.len());
+            self.comparison.try_reserve_exact(additional)
+                .map_err(|_| "reserve public capture comparison")?;
+            self.comparison.resize(self.frame.len(), 0);
+        }
+        scene.render(&mut self.comparison, self.width, self.height, self.stride);
+        if self.comparison != self.written {
+            return Err("completed output does not match the public scene".into());
+        }
+        let pixels = self.width.checked_mul(self.height).and_then(|n| n.checked_mul(3))
+            .ok_or("capture byte count overflow")?;
+        let header = format!("P6\n{} {}\n255\n", self.width, self.height);
+        let length = pixels.checked_add(header.len()).ok_or("capture size overflow")?;
+        let mut ppm = Vec::new();
+        ppm.try_reserve_exact(length).map_err(|_| "reserve public capture")?;
+        ppm.extend_from_slice(header.as_bytes());
+        let row_bytes = self.width.checked_mul(4).ok_or("capture row overflow")?;
+        for row in self.written.chunks_exact(self.stride).take(self.height) {
+            let row = row.get(..row_bytes).ok_or("capture row is truncated")?;
+            for [blue, green, red, _] in row.as_chunks::<4>().0 {
+                ppm.extend_from_slice(&[*red, *green, *blue]);
+            }
+        }
+        if ppm.len() != length {
+            return Err("capture frame is truncated".into());
+        }
+        Ok(ppm)
+    }
+
     /// Exact final-output pixels attributable to `surface`. Re-rendering with
     /// only that surface omitted makes hidden, clipped and occluded pixels
     /// disappear from the count while leaving its descendants in place.
@@ -538,6 +575,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
         }
+    }
+
+    #[test]
+    fn public_capture_is_completed_rgb_without_stride_padding() {
+        let cleanup = Cleanup(scratch("capture-stride"));
+        let mut framebuffer = Framebuffer::test_file(&cleanup.0, 8, 4, 40).unwrap();
+        let scene = Scene::new();
+        assert!(framebuffer.completed_public_ppm(&scene).is_err());
+        framebuffer.paint(&scene, Damage::Unknown).unwrap();
+        let ppm = framebuffer.completed_public_ppm(&scene).unwrap();
+        let pixels = ppm.strip_prefix(b"P6\n8 4\n255\n").unwrap();
+        let backing = fs::read(&cleanup.0).unwrap();
+        let expected: Vec<u8> = backing.as_chunks::<40>().0.iter().flat_map(|row| {
+            row[..32].as_chunks::<4>().0.iter()
+                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]])
+        }).collect();
+        assert_eq!(pixels, expected);
+        assert_eq!(pixels.len(), 8 * 4 * 3);
+    }
+
+    #[test]
+    fn public_capture_refuses_private_stale_and_failed_output() {
+        let cleanup = Cleanup(scratch("capture-private"));
+        let mut framebuffer = Framebuffer::test_file(&cleanup.0, 320, 200, 1280).unwrap();
+        let mut scene = Scene::new();
+        framebuffer.paint(&scene, Damage::Unknown).unwrap();
+        let public = framebuffer.completed_public_ppm(&scene).unwrap();
+        scene.set_attention(true);
+        framebuffer.paint(&scene, Damage::Unknown).unwrap();
+        assert!(framebuffer.completed_public_ppm(&scene).is_err());
+        scene.set_attention(false);
+        // Merely declaring the scene public does not relabel private output.
+        assert!(framebuffer.completed_public_ppm(&scene).is_err());
+        framebuffer.paint(&scene, Damage::Unknown).unwrap();
+        assert_eq!(framebuffer.completed_public_ppm(&scene).unwrap(), public);
+        framebuffer.fail_next_write();
+        assert!(framebuffer.paint(&scene, Damage::Whole).is_err());
+        assert!(framebuffer.completed_public_ppm(&scene).is_err());
+        framebuffer.paint(&scene, Damage::Whole).unwrap();
+        assert_eq!(framebuffer.completed_public_ppm(&scene).unwrap(), public);
     }
 
     #[test]

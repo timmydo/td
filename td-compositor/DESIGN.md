@@ -5671,9 +5671,9 @@ selected by argv[0] beside `td-ui-demo` and `td-term`, and what it does is
 write one line to a Unix socket and print what comes back.
 
 The normal deployment channel remains layout-only. Disposable `headless`
-sessions also offer separately enabled keyboard/pointer routing, specified in
-[AUTOMATION.md](AUTOMATION.md#opt-in-input-control); that grant cannot be
-enabled by a request or reach physical-origin trusted attention.
+sessions also offer separately enabled input and public capture, specified in
+[AUTOMATION.md](AUTOMATION.md). Neither grant can be enabled by a request or
+reach physical-origin trusted attention.
 
 ### Why a socket and not a protocol
 
@@ -6408,8 +6408,8 @@ not activated. The stock attention screen remains inert.
 ## Native headless automation
 
 [AUTOMATION.md](AUTOMATION.md) specifies disposable hardware-free sessions,
-their lifecycle, opt-in normal seat routing and proof boundary, and the
-subsequent capture/observation work. This is the primary native integration
+their lifecycle, opt-in normal seat routing, completed public capture, and
+subsequent observation work. This is the primary native integration
 platform; it does not replace independent compositor interoperability checks.
 
 ## td-owned development VM bridge

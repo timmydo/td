@@ -72,7 +72,7 @@ fn usage() -> String {
      --application-content-rgb-a RGB --application-content-rgb-b RGB) \
      (--terminal-client PATH | --terminal-authority stdin) | \
      td-compositor headless --session-dir NEW_ABSOLUTE_PATH --width N --height N \
-     [--input-control enabled] | \
+     [--input-control enabled] [--capture-control enabled] | \
      td-compositor probe-terminal-authority | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
@@ -910,6 +910,9 @@ fn run_control(args: &[String]) -> Result<(), control::ControlFailure> {
                 ))
             })?,
     };
+    if request == control::Request::Capture {
+        return say_bytes(&control::ask_capture(&socket)?);
+    }
     let body = control::ask(&socket, request)?;
     say(&body)
 }
@@ -921,8 +924,12 @@ fn run_control(args: &[String]) -> Result<(), control::ControlFailure> {
 /// UNREACHABLE rather than a refusal: the compositor answered, and what went
 /// wrong is on this side of it.
 fn say(text: &str) -> Result<(), control::ControlFailure> {
+    say_bytes(text.as_bytes())
+}
+
+fn say_bytes(bytes: &[u8]) -> Result<(), control::ControlFailure> {
     let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes())
+    out.write_all(bytes)
         .and_then(|()| out.flush())
         .map_err(|error| {
             control::ControlFailure::Unreachable(format!("write control output: {error}"))

@@ -43,6 +43,14 @@ struct Process {
 }
 
 impl Process {
+    fn to_file(command: &mut Command, log: &Path, output: &Path) -> Self {
+        let child = command.stdin(Stdio::null())
+            .stdout(fs::File::create(output).unwrap())
+            .stderr(fs::File::create(log).unwrap()).spawn().unwrap();
+        let (_send, output) = mpsc::channel();
+        Self { child, output }
+    }
+
     fn start(command: &mut Command, log: &Path, marker: &'static str) -> Self {
         let mut child = command
             .stdin(Stdio::piped())
@@ -119,6 +127,75 @@ fn request(path: &Path, line: &[u8]) -> String {
     stream.take(65537).read_to_string(&mut answer).unwrap();
     assert!(answer.len() <= 65536);
     answer
+}
+
+fn capture(path: &Path, root: &Path, name: &str) -> (ExitStatus, Vec<u8>) {
+    let output = root.join(format!("{name}.ppm"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
+    command.arg0("td-ctl").arg("--socket").arg(path).arg("capture");
+    let mut client = Process::to_file(&mut command, &root.join(format!("{name}.log")), &output);
+    let status = client.wait();
+    (status, fs::read(output).unwrap())
+}
+
+#[test]
+fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
+    let root = Root::new();
+    for (input, capture_enabled) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = root.0.join(format!("case-{input}-{capture_enabled}"));
+        fs::create_dir(&case).unwrap();
+        let session = root.0.join(format!("session-{input}-{capture_enabled}"));
+        let mut command = headless(&session);
+        if input {
+            command.args(["--input-control", "enabled"]);
+        }
+        if capture_enabled {
+            command.args(["--capture-control", "enabled"]);
+        }
+        let mut compositor = Process::start(
+            &mut command, &case.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
+        );
+        compositor.ready();
+        let control = session.join("td-control");
+        let (status, empty) = capture(&control, &case, "empty");
+        let mut mapped_client = None;
+        if !capture_enabled {
+            assert_eq!(status.code(), Some(2));
+            assert!(empty.is_empty());
+        } else {
+            assert!(status.success());
+            assert!(empty.starts_with(b"P6\n800 600\n255\n"));
+            assert_eq!(empty.len(), b"P6\n800 600\n255\n".len() + 800 * 600 * 3);
+            let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
+            command.arg0("td-ui-demo").args(["run", "--socket"])
+                .arg(session.join("wayland-0")).arg("--ready-socket")
+                .arg(case.join("client.ready"));
+            let client = Process::start(
+                &mut command, &case.join("client.log"), "TD-UI-CLIENT-READY",
+            );
+            client.ready();
+            let (status, mapped) = capture(&control, &case, "mapped");
+            assert!(status.success());
+            assert_eq!(mapped.len(), empty.len());
+            assert_ne!(mapped, empty, "capture did not contain the real mapped client");
+            assert_eq!(request(&control, b"workspace 2\n"), "ok\n");
+            let (status, hidden) = capture(&control, &case, "hidden");
+            assert!(status.success());
+            assert_ne!(hidden, mapped, "capture returned stale visible-client output");
+            assert!(request(&control, b"capture extra\n").starts_with("error "));
+            if !input {
+                assert_eq!(request(&control, b"key 1 30 down\n"),
+                    "error input automation is disabled\n");
+            }
+            mapped_client = Some(client);
+        }
+        compositor.child.stdin.take();
+        assert!(compositor.wait().success());
+        if let Some(mut client) = mapped_client {
+            assert!(!client.wait().success());
+        }
+        assert!(!session.exists());
+    }
 }
 
 #[test]

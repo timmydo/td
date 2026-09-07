@@ -672,6 +672,21 @@ impl Runtime {
         self.framebuffer.output()
     }
 
+    /// Capture requests take a fresh public paint, not an unfenced preview.
+    pub(crate) fn capture_public_ppm(&mut self) -> Result<Vec<u8>, String> {
+        if self.attention_enabled || self.scene.attention_visible() {
+            return Err("capture refuses a trusted-attention runtime".into());
+        }
+        if self.compound_settle.is_some() {
+            return Err("capture cannot interrupt a compound scene update".into());
+        }
+        self.repaint()?;
+        if self.pending_paint || self.last_submission != Some(Submission::Presented) {
+            return Err("capture requires completed output, not queued submission".into());
+        }
+        self.framebuffer.completed_public_ppm(&self.scene)
+    }
+
     /// Pessimistic across the paint, as the framebuffer's shadow copy is across
     /// its write: a paint that failed leaves the screen owed, not settled.
     ///

@@ -140,8 +140,57 @@ follow mutation; requests are not rollback transactions, and an unavailable
 or lost reply must not be blindly retried as exactly-once input. Use
 `release-input` to recover depressed state or dispose of the session. The
 existing request-size and whole-conversation deadline bounds remain in force.
-Pixel capture and application/output observation fences remain separate
-increments.
+Application/output observation identities and client-processing fences remain
+separate increments.
+
+## Opt-in public capture
+
+Append `--capture-control enabled` to grant capture on the private headless
+control endpoint. This is independent of `--input-control enabled`; either,
+both or neither may be enabled. Ordinary `run` sessions cannot enable capture.
+The grant must exist at startup, never be obtained through a control request.
+The CLI command is `td-ctl --socket PATH capture`. It writes binary PPM to
+stdout on success; the caller may redirect that stream to its own file.
+The compositor never accepts a capture output pathname.
+
+Capture requests perform a fresh production paint under the runtime lock.
+They refuse trusted-attention-enabled runtimes, any visible private attention
+scene, incomplete compound updates, failed paint, and queued rather than
+completed submission. Before releasing pixels, the backend verifies its
+completed byte image equals a separate public `Scene::render` result. The
+comparison never uses `Scene::render_display`. This also refuses a previously
+private frame merely relabeled as a public scene, or bytes made uncertain by
+a partial write. The response is built before the lock is released, so later
+scene changes cannot alter it while the client reads. This proves completed
+headless software output, not GPU execution, scanout timing or physical glass.
+
+Wire success is `ok\n` followed by exactly:
+
+```text
+P6\n
+WIDTH HEIGHT\n
+255\n
+```
+
+The header is followed by width × height × 3 RGB bytes, with no row padding,
+alpha, trailing bytes or newline. Header line endings are single LF bytes;
+the notation above spells them explicitly. Errors retain the ordinary
+`error ...\n` or `unavailable ...\n` framing and CLI exit codes 2 or 1.
+The CLI validates framing, dimensions and exact byte count before publishing
+any stdout bytes. It accepts at most 24 MiB of pixels plus 128 framing bytes,
+derived from the existing 32 MiB XRGB frame ceiling, and uses fallible buffer
+reservation. Its capture exchange has one five-second read/write deadline
+after connection, not a fresh budget per read; connect retains the existing
+Unix control client's blocking behavior. Server conversation deadlines also
+cover capture generation and writes. A timeout or truncated response fails;
+it is never a partial successful image.
+
+Capture deliberately causes a paint. It is not a passive query of a historical
+frame, and a fresh capture alone does not prove that a client processed an
+earlier input event or committed new content. Session/action/commit/output
+identities and bounded observation are the next increment. For now an owned
+headless process and its private endpoints define the test session lifetime;
+there is no cross-session capture token or client-processing fence.
 
 ## Planned control and observation increments
 
@@ -150,16 +199,15 @@ These are the next implementation requirements, not available commands:
 1. Maintain the input boundary: do not mutate editor state or bypass
    compositor routing. Automation must never manufacture a physical-origin
    witness, enter/confirm trusted attention, or authorize secret release.
-2. Add a separately enabled capture capability on `td-ctl`, absent by default.
-   A public Wayland socket grants neither synthetic input nor capture.
+2. Preserve separate input and capture grants. A public Wayland socket grants
+   neither capability.
 3. Report monotonic session/action/commit/output identities with bounded
    observation. Distinguish accepted input, a client's subsequent commit and
    completed output. A compositor sync cannot prove an application processed
    input. Queued output is not presented output.
-4. Add bounded public-scene captures through the control grant. Capture must
-   exclude the private attention screen (`Scene::render_display` is not a
-   capture API). Correlate captured pixels with completed output; fail closed
-   where that cannot be proved. No raw private-screen backing file is exposed.
+4. Correlate public captures with those completed-output identities while
+   preserving the public-scene comparison and fail-closed completion proof.
+   No raw private-screen backing file is exposed.
 5. Run td-editor's native key-profile, selection, menu, wheel and inter-client
    clipboard scenarios in disposable td-compositor processes. Combine real
    routed input and output evidence with editor remote exact-state assertions.
