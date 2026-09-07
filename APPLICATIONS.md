@@ -8919,6 +8919,27 @@ The landed hierarchy leaves PID 1 and system services at the hierarchy root,
 which cgroup v2 explicitly exempts from the no-internal-process rule, beside
 the empty delegated `td-user-1000` root. Application sessions and per-instance
 leaves are the only descendants placed under the delegated subtree.
+The jail also supports the reserved application identity range through
+separate direct children `/sys/fs/cgroup/td-app-UID`, selected only from
+the externally verified launch UID. These are siblings of the human
+delegation, never descendants of a human-owned cgroup. Creation and live
+probes require the selected delegation and its control files to have the
+actual external UID/GID and the same controller policy as above. Cleanup
+parses a canonical membership and refuses a different external UID before
+filesystem access. The inner namespace's UID 1000 does not select this root.
+The reserved application UID range is owned by `td-authd/DESIGN.md`'s
+Principal registry prerequisite. Its Fixed terminal launch prerequisite
+already limits the current human launcher to UID 1000; the broader human
+registry range does not provision additional session cgroups. Accordingly,
+the sole human delegation remains `td-user-1000`; other human/service IDs
+have no application delegation. Applications assigned to another human
+session still select their own reserved external UID, not that human UID. This support creates no accounts or
+cgroups and enables no new launch path. Root provisioning, app state and
+socket ownership must activate each reserved identity atomically before
+its application can run there; the current image still uses the human
+subtree. The membership parser proves shape and matching ownership, not
+that an application principal was enrolled.
+
 Per-app values live in the same per-package permission file as the filesystem
 and device grants (decision 9). Omission means 1 GiB high, 1.25 GiB max, 1024
 tasks, and one fair-scheduler CPU rather than unlimited — *unlimited* is the

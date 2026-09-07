@@ -4213,7 +4213,7 @@ pub fn probe_kill_reaps() -> io::Result<()> {
     let watchdog = start_probe_watchdog("the kill-reaps driver")?;
     let executable = std::env::current_exe()?;
     let instance = instance_name(KILL_REAPS_APPLICATION)?;
-    let membership = cgroup::membership_for_instance(&instance)?;
+    let membership = cgroup::membership_for_instance(&instance, identity.uid)?;
     let mut stage1 = Command::new(executable)
         .arg(KILL_REAPS_STAGE1_ARG)
         .arg(std::process::id().to_string())
@@ -5801,7 +5801,7 @@ impl ManagedCgroup {
         identity: Identity,
         terminal: bool,
     ) -> io::Result<Self> {
-        let membership = cgroup::membership_for_instance(instance)?;
+        let membership = cgroup::membership_for_instance(instance, identity.uid)?;
         let cleanup = CgroupCleanup::spawn(executable, &membership, terminal)?;
         match cgroup::Instance::create(instance, limits, identity.uid, identity.gid) {
             Ok(instance) => Ok(Self {

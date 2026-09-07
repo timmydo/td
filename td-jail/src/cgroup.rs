@@ -8,6 +8,82 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DELEGATE_COMPONENT: &str = "td-user-1000";
+// Reserved range: td-authd/DESIGN.md, Principal registry prerequisite.
+const APPLICATION_UIDS: std::ops::RangeInclusive<u32> = 65536..=2147483647;
+
+struct Delegation {
+    uid: u32,
+    component: String,
+}
+
+impl Delegation {
+    fn for_uid(uid: u32) -> io::Result<Self> {
+        let component = match uid {
+            1000 => DELEGATE_COMPONENT.to_string(),
+            uid if APPLICATION_UIDS.contains(&uid) => format!("td-app-{uid}"),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "identity has no configured application cgroup delegation",
+                ))
+            }
+        };
+        Ok(Self { uid, component })
+    }
+
+    fn root(&self) -> PathBuf {
+        Path::new(CGROUP_ROOT).with_file_name(&self.component)
+    }
+
+    fn membership(&self, instance: &str) -> io::Result<String> {
+        validate_instance_name(instance)?;
+        Ok(format!("/{}/{instance}", self.component))
+    }
+
+    fn parse_membership(membership: &str) -> io::Result<(Self, &str)> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "application cgroup membership is outside the delegated subtree",
+            )
+        };
+        let (component, instance) = membership
+            .strip_prefix('/')
+            .and_then(|rest| rest.split_once('/'))
+            .ok_or_else(invalid)?;
+        let uid = if component == DELEGATE_COMPONENT {
+            1000
+        } else {
+            component
+                .strip_prefix("td-app-")
+                .ok_or_else(invalid)?
+                .parse::<u32>()
+                .map_err(|_| invalid())?
+        };
+        let delegation = Self::for_uid(uid)?;
+        if delegation.component != component {
+            return Err(invalid());
+        }
+        if instance.contains('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "application cgroup membership is not one direct child",
+            ));
+        }
+        validate_instance_name(instance)?;
+        Ok((delegation, instance))
+    }
+
+    fn require_uid(&self, uid: u32) -> io::Result<()> {
+        if self.uid != uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "application cgroup belongs to a different external identity",
+            ));
+        }
+        Ok(())
+    }
+}
 const MAX_CONTROL_BYTES: u64 = 4096;
 const MAX_ACTIVE_SCAN: usize = 256;
 const MAX_PROCESS_TOKEN_BYTES: usize = 64;
@@ -82,8 +158,8 @@ impl Instance {
         gid: u32,
     ) -> io::Result<Self> {
         validate_instance_name(instance)?;
-        let root = Path::new(CGROUP_ROOT);
-        require_delegation(root, uid, gid)?;
+        let root = Delegation::for_uid(uid)?.root();
+        require_delegation(&root, uid, gid)?;
         let directory = root.join(instance);
         fs::create_dir(&directory).map_err(|error| {
             io::Error::new(
@@ -93,7 +169,7 @@ impl Instance {
         })?;
         let mut cgroup = Self {
             directory,
-            membership: membership_for_instance(instance)?,
+            membership: membership_for_instance(instance, uid)?,
             remove_on_drop: true,
         };
         if let Err(error) = configure(&cgroup.directory, limits) {
@@ -202,9 +278,8 @@ pub(crate) fn validate_expected_membership(expected: &str) -> io::Result<()> {
     validate_membership(expected)
 }
 
-pub(crate) fn membership_for_instance(instance: &str) -> io::Result<String> {
-    validate_instance_name(instance)?;
-    Ok(format!("/{DELEGATE_COMPONENT}/{instance}"))
+pub(crate) fn membership_for_instance(instance: &str, uid: u32) -> io::Result<String> {
+    Delegation::for_uid(uid)?.membership(instance)
 }
 
 pub(crate) fn validate_instance_for_application(
@@ -223,11 +298,8 @@ pub(crate) fn validate_instance_for_application(
 }
 
 pub(crate) fn wait_until_removed(expected: &str, timeout: Duration) -> io::Result<()> {
-    validate_membership(expected)?;
-    let instance = expected
-        .strip_prefix(&format!("/{DELEGATE_COMPONENT}/"))
-        .ok_or_else(|| io::Error::other("validated cgroup membership lost its prefix"))?;
-    let directory = Path::new(CGROUP_ROOT).join(instance);
+    let (delegation, instance) = Delegation::parse_membership(expected)?;
+    let directory = delegation.root().join(instance);
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| io::Error::other("cgroup removal deadline overflow"))?;
@@ -254,14 +326,16 @@ pub(crate) fn wait_until_removed(expected: &str, timeout: Duration) -> io::Resul
     }
 }
 
+fn owned_membership(expected: &str, uid: u32) -> io::Result<(Delegation, &str)> {
+    let (delegation, instance) = Delegation::parse_membership(expected)?;
+    delegation.require_uid(uid)?;
+    Ok((delegation, instance))
+}
+
 pub(crate) fn remove_abandoned(expected: &str, uid: u32, gid: u32) -> io::Result<()> {
-    validate_membership(expected)?;
-    let prefix = format!("/{DELEGATE_COMPONENT}/");
-    let instance = expected
-        .strip_prefix(&prefix)
-        .ok_or_else(|| io::Error::other("validated cgroup membership lost its prefix"))?;
-    let root = Path::new(CGROUP_ROOT);
-    match fs::symlink_metadata(root) {
+    let (delegation, instance) = owned_membership(expected, uid)?;
+    let root = delegation.root();
+    match fs::symlink_metadata(&root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
         Ok(_) => {}
@@ -278,7 +352,7 @@ pub(crate) fn remove_abandoned(expected: &str, uid: u32, gid: u32) -> io::Result
         }
         Ok(_) => {}
     }
-    require_delegation(root, uid, gid)?;
+    require_delegation(&root, uid, gid)?;
     if let Err(error) = wait_until_empty(&directory) {
         if error.kind() == io::ErrorKind::NotFound {
             return Ok(());
@@ -318,9 +392,9 @@ fn active_instance(
     gid: u32,
 ) -> io::Result<(String, PathBuf, Report)> {
     authority::validate_application_name(application)?;
-    let root = Path::new(CGROUP_ROOT);
-    require_delegation(root, uid, gid)?;
-    let entries = fs::read_dir(root)?;
+    let root = Delegation::for_uid(uid)?.root();
+    require_delegation(&root, uid, gid)?;
+    let entries = fs::read_dir(&root)?;
     let mut active: Option<(String, PathBuf, Report)> = None;
     let mut seen = 0usize;
     for entry in entries {
@@ -457,7 +531,7 @@ pub(crate) fn probe_process_token(
         ));
     }
     let (instance, directory, _) = active_instance(application, limits, uid, gid)?;
-    let membership = membership_for_instance(&instance)?;
+    let membership = membership_for_instance(&instance, uid)?;
     let processes = read_control(&directory.join("cgroup.procs"))?;
     for line in processes.lines() {
         let pid = line.parse::<u32>().map_err(|error| {
@@ -516,7 +590,7 @@ pub(crate) fn process_sandboxes(
         ));
     }
     let (instance, directory, _) = active_instance(application, limits, uid, gid)?;
-    let membership = membership_for_instance(&instance)?;
+    let membership = membership_for_instance(&instance, uid)?;
     let processes = read_control(&directory.join("cgroup.procs"))?;
     let mut sandboxes = Vec::new();
     for line in processes.lines() {
@@ -1072,20 +1146,7 @@ fn instance_belongs_to(instance: &str, application: &str) -> bool {
 }
 
 fn validate_membership(membership: &str) -> io::Result<()> {
-    let prefix = format!("/{DELEGATE_COMPONENT}/");
-    let instance = membership.strip_prefix(&prefix).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "application cgroup membership is outside the delegated subtree",
-        )
-    })?;
-    if instance.contains('/') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "application cgroup membership is not one direct child",
-        ));
-    }
-    validate_instance_name(instance)
+    Delegation::parse_membership(membership).map(|_| ())
 }
 
 fn require_membership_text(text: &str, expected: &str) -> io::Result<()> {
@@ -1108,10 +1169,8 @@ mod tests {
 
     #[test]
     fn the_post_exit_report_tolerates_a_leaf_already_reaped() {
-        let base = std::env::temp_dir().join(format!(
-            "td-jail-cgroup-report-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("td-jail-cgroup-report-{}", std::process::id()));
         let present = base.join("present");
         fs::create_dir_all(&present).unwrap();
         fs::write(
@@ -1179,7 +1238,7 @@ mod tests {
         assert!(validate_instance_for_application(instance, "fire").is_err());
         assert!(require_process_membership(0, "/td-user-1000/firefox-0123456789abcdef").is_err());
         let membership = format!("/{DELEGATE_COMPONENT}/{instance}");
-        assert_eq!(membership_for_instance(instance).unwrap(), membership);
+        assert_eq!(membership_for_instance(instance, 1000).unwrap(), membership);
         validate_membership(&membership).unwrap();
         require_membership_text(&format!("0::{membership}\n"), &membership).unwrap();
         for invalid in [
@@ -1195,6 +1254,72 @@ mod tests {
         }
         assert!(require_membership_text("1:name:/elsewhere\n", &membership).is_err());
         assert!(require_membership_text("0::/elsewhere\n", &membership).is_err());
+    }
+
+    #[test]
+    fn external_identities_select_disjoint_delegations() {
+        let instance = "mail-0123456789abcdef";
+        for uid in [1000, 65536, 65537, 2147483647] {
+            let delegation = Delegation::for_uid(uid).unwrap();
+            let membership = membership_for_instance(instance, uid).unwrap();
+            let (parsed, leaf) = Delegation::parse_membership(&membership).unwrap();
+            assert_eq!(parsed.uid, uid);
+            assert_eq!(leaf, instance);
+            assert_eq!(parsed.root(), delegation.root());
+            assert_eq!(
+                delegation.root().join(instance),
+                Path::new("/sys/fs/cgroup").join(membership.trim_start_matches('/'))
+            );
+            assert!(parsed.require_uid(uid).is_ok());
+            assert!(parsed.require_uid(uid + 1).is_err());
+        }
+        assert_eq!(
+            membership_for_instance(instance, 65536).unwrap(),
+            "/td-app-65536/mail-0123456789abcdef"
+        );
+        assert_eq!(
+            Delegation::for_uid(1000).unwrap().root(),
+            Path::new(CGROUP_ROOT)
+        );
+        assert_ne!(
+            Delegation::for_uid(65536).unwrap().root(),
+            Delegation::for_uid(65537).unwrap().root()
+        );
+        for uid in [0, 991, 1001, 65534, 65535, 2147483648, u32::MAX] {
+            assert!(Delegation::for_uid(uid).is_err());
+        }
+        for component in [
+            "td-app-1000",
+            "td-app-065536",
+            "td-app-+65536",
+            "td-app-65535",
+            "td-app-2147483648",
+            "td-user-1001",
+        ] {
+            assert!(
+                validate_membership(&format!("/{component}/{instance}")).is_err(),
+                "{component}"
+            );
+        }
+        let first = membership_for_instance(instance, 65536).unwrap();
+        let second = membership_for_instance(instance, 65537).unwrap();
+        assert!(require_membership_text(&format!("0::{second}\n"), &first).is_err());
+        for nested in [
+            "../mail-0123456789abcdef",
+            "/mail-0123456789abcdef",
+            "a/mail-0123456789abcdef",
+        ] {
+            assert_eq!(
+                validate_membership(&format!("/td-app-65536/{nested}"))
+                    .unwrap_err()
+                    .to_string(),
+                "application cgroup membership is not one direct child"
+            );
+        }
+        // Exercise the production cleanup planner without touching host cgroups.
+        let error = owned_membership(&first, 65537).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(owned_membership(&first, 65536).is_ok());
     }
 
     #[test]
@@ -1274,12 +1399,18 @@ mod tests {
         // as an argument is not the program, and the namespace-init stage,
         // which carries the entry path after `--launch`, names no program
         // by the path as a word either. A flag token reads the words alone.
-        assert!(!command_has_token(b"/usr/bin/strace\0-o\0log\0tmc\0", "tmc"));
+        assert!(!command_has_token(
+            b"/usr/bin/strace\0-o\0log\0tmc\0",
+            "tmc"
+        ));
         assert!(!command_has_token(STAGE2_COMMAND, "tmc"));
         assert!(!command_has_token(STAGE2_COMMAND, "/app/bin/tmc"));
         assert!(!valid_process_token("/app/bin/tmc"));
         assert!(command_has_token(STAGE2_COMMAND, "td-jail"));
-        assert!(!command_has_token(b"/app/bin/-contentproc\0", "-contentproc"));
+        assert!(!command_has_token(
+            b"/app/bin/-contentproc\0",
+            "-contentproc"
+        ));
     }
 
     const STAGE2_COMMAND: &[u8] =

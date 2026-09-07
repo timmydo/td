@@ -685,8 +685,22 @@ mod confinement {
             .0;
         assert!(
             abandoned.find("fs::symlink_metadata(&directory)")
-                < abandoned.find("require_delegation(root, uid, gid)?")
+                .unwrap_or_else(|| panic!("abandoned leaf inspection is absent"))
+                < abandoned.find("require_delegation(&root, uid, gid)?")
+                    .unwrap_or_else(|| panic!("delegation ownership check is absent"))
         );
+        assert!(
+            abandoned.find("owned_membership(expected, uid)?")
+                .unwrap_or_else(|| panic!("cleanup identity planner is absent"))
+                < abandoned.find("fs::symlink_metadata(&root)")
+                    .unwrap_or_else(|| panic!("delegation inspection is absent"))
+        );
+        let planner = CGROUP.split_once("fn owned_membership(")
+            .unwrap_or_else(|| panic!("cleanup identity planner definition is absent"))
+            .1.split_once("pub(crate) fn remove_abandoned")
+            .unwrap_or_else(|| panic!("abandoned cleanup definition is absent"))
+            .0;
+        assert!(planner.contains("delegation.require_uid(uid)?"));
 
         // The target-kernel lifecycle proof uses this exact production
         // protocol, not a second cleanup implementation. Stage 1 creates
