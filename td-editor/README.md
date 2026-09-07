@@ -403,6 +403,9 @@ Separate Copy cases use Windows Ctrl+C and Emacs M-w, check unchanged
 selection/revision/text/disk before replacing the source, and prove the
 original snapshot still pastes in the other editor. No Cut replaces the
 Copy offer in these cases; both retain owner-exit and pixel checks.
+All four clipboard variants also try Copy with no selection: the prior
+snapshot must remain available to the other editor, with source state
+and saved bytes unchanged.
 Vertical and horizontal wheel cases also test page-bound clamping and
 inward movement after repeated outward reports. Horizontal scrolling is
 checked with Soft Wrap enabled, then disabled through the native menu;

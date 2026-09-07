@@ -2272,6 +2272,11 @@ Both cases retain the source/destination capture fences and owner-exit
 refusal, profile-specific collapse and saved-byte checks above. Offered
 feedback means local publication, not compositor acknowledgement; the
 actual inter-client transfer independently proves the usable selection.
+All four clipboard cases also issue native Copy with a collapsed source
+selection after saving `b`. Fresh no-selection feedback fences this
+no-op before exact revision, selection, text and disk checks. The second
+editor must still paste the original UTF-8 snapshot, proving that empty
+Copy preserves both prior Copy and prior Cut ownership in each profile.
 Weston remains separate optional interoperability evidence below.
 
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`

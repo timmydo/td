@@ -639,6 +639,14 @@ enum ClipboardOperation {
     Cut,
 }
 
+fn copy_clipboard_text(compositor: &mut Compositor, profile: &str) {
+    if profile == "emacs" {
+        compositor.chord(Some(KEY_LEFT_ALT), KEY_W);
+    } else {
+        compositor.chord(Some(KEY_LEFT_CTRL), KEY_C);
+    }
+}
+
 fn select_clipboard_text(compositor: &mut Compositor, profile: &str) {
     if profile == "emacs" {
         compositor.chord(Some(KEY_LEFT_CTRL), KEY_HOME);
@@ -693,11 +701,7 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
                 Some(offered.as_str()),
                 "Copy must start without prior selection-offered feedback"
             );
-            if profile == "emacs" {
-                compositor.chord(Some(KEY_LEFT_ALT), KEY_W);
-            } else {
-                compositor.chord(Some(KEY_LEFT_CTRL), KEY_C);
-            }
+            copy_clipboard_text(&mut compositor, profile);
             source.wait_field("prompt-state", "notice", &offered);
             source.wait_field("state", "tab", &initial_selection);
             source.wait_tab(0, text);
@@ -711,6 +715,19 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     compositor.rendered_text(&mut source, &source_window, source_revision, before, "b", 1);
     source.job(&format!("save\t1\t{source_revision}"));
     assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    let collapsed = format!("1,{source_revision},0,1,1,1,0,72,0,lf");
+    source.wait_field("state", "tab", &collapsed);
+    let empty_copy = td_editor::control::hex(b"Nothing selected to copy.");
+    assert_ne!(
+        field(&source.ok("prompt-state"), "notice"),
+        Some(empty_copy.as_str())
+    );
+    copy_clipboard_text(&mut compositor, profile);
+    source.wait_field("prompt-state", "notice", &empty_copy);
+    source.wait_field("state", "tab", &collapsed);
+    source.wait_tab(source_revision, "b");
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    // The destination must still receive the original offer, not empty text.
     // Reveal tiling before mapping the destination. The reply fences the
     // compositor layout change; no intermediate source frame is sampled.
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
