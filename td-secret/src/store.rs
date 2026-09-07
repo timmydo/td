@@ -72,6 +72,131 @@ pub struct Store {
     directory: File,
     lock: File,
     uid: u32,
+    file_owner: u32,
+}
+
+/// Firstboot holds the root-owned secrets parent before the human session starts.
+/// A root-owned leaf is the restartable intermediate state of this transfer.
+#[derive(Debug)]
+pub struct MigrationFailure {
+    pub quarantined: bool,
+    pub message: String,
+}
+
+pub fn migrate_owner(parent: &File, uid: u32, owner: u32) -> Result<(), MigrationFailure> {
+    let mut quarantined = false;
+    migrate_owner_inner(parent, uid, owner, &mut quarantined)
+        .map_err(|message| MigrationFailure { quarantined, message })
+}
+
+fn migrate_owner_inner(parent: &File, uid: u32, owner: u32, quarantined: &mut bool) -> Result<(), String> {
+    require_root()?;
+    if !(1000..=65533).contains(&uid) || !(1..=999).contains(&owner) {
+        return Err("invalid credential service ownership assignment".into());
+    }
+    private_metadata(parent, 0, 0o755, true)?;
+    let path = pinned(parent).join(uid.to_string());
+    let directory = match directory(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("open credential ownership migration: {e}")),
+    };
+    let metadata = directory.metadata().map_err(|e| e.to_string())?;
+    if ![0, uid, owner].contains(&metadata.uid()) {
+        return Err("credential directory has an invalid migration identity".into());
+    }
+    let already_published = metadata.uid() == owner;
+    // Restrict traversal before inspecting children. No user process from the
+    // preceding boot survives this sysinit migration; root remains trusted.
+    directory.set_permissions(fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    std::os::unix::fs::fchown(&directory, Some(0), Some(0)).map_err(|e| e.to_string())?;
+    directory.sync_all().map_err(|e| e.to_string())?;
+    *quarantined = true;
+    let lock_path = pinned(&directory).join("lock");
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(file) => {
+            file.set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+            file
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(lock_path)
+            .map_err(|e| e.to_string())?,
+        Err(e) => return Err(format!("open credential ownership lock: {e}")),
+    };
+    let metadata = lock.metadata().map_err(|e| e.to_string())?;
+    let mode = metadata.mode() & 0o7777;
+    private_metadata(&lock, metadata.uid(), mode, false)?;
+    if ![0, uid, owner].contains(&metadata.uid()) || metadata.len() != 0 || mode & !0o600 != 0 {
+        return Err("credential ownership lock has an invalid identity or length".into());
+    }
+    // An interrupted empty-lock creation may have only umask-masked owner bits.
+    lock.set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    lock.try_lock().map_err(|e| format!("lock credential ownership migration: {e}"))?;
+    let result = (|| {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(pinned(&directory)).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().into_string().map_err(|_| "invalid credential filename")?;
+            if name == "lock" {
+                continue;
+            }
+            let record = name.split_once('.').is_some_and(|(app, name)| valid_name(app) && valid_name(name));
+            let temporary = name.strip_prefix("tmp-").is_some_and(|suffix| {
+                suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+            if name != "master" && name != "sealed" && !record && !temporary {
+                return Err("unknown entry in credential ownership migration".into());
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+                .open(pinned(&directory).join(&name))
+                .map_err(|e| e.to_string())?;
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            let mode = metadata.mode() & 0o7777;
+            let interrupted_root = temporary && metadata.uid() == 0 && metadata.len() == 0
+                && mode & !0o600 == 0;
+            private_metadata(&file, metadata.uid(), if interrupted_root { mode } else { 0o600 }, false)?;
+            if (!interrupted_root && metadata.uid() != owner && (already_published || metadata.uid() != uid))
+                || metadata.len() > MAX_BUNDLE as u64
+            {
+                return Err("credential file has an invalid migration identity or length".into());
+            }
+            files.push((file, name, interrupted_root));
+            if files.len() > MAX_ENTRIES + 32 {
+                return Err("too many files in credential ownership migration".into());
+            }
+        }
+        // Validate and retain every inode before changing any file ownership.
+        for (file, name, interrupted_root) in &files {
+            if *interrupted_root {
+                // atomic_write has not written bytes before its ownership switch.
+                fs::remove_file(pinned(&directory).join(name)).map_err(|e| e.to_string())?;
+            } else {
+                std::os::unix::fs::fchown(file, Some(owner), Some(owner)).map_err(|e| e.to_string())?;
+                file.sync_all().map_err(|e| e.to_string())?;
+            }
+        }
+        std::os::unix::fs::fchown(&lock, Some(owner), Some(owner)).map_err(|e| e.to_string())?;
+        lock.sync_all().map_err(|e| e.to_string())?;
+        directory.sync_all().map_err(|e| e.to_string())?;
+        std::os::unix::fs::fchown(&directory, Some(owner), Some(owner)).map_err(|e| e.to_string())?;
+        *quarantined = false;
+        directory.sync_all().map_err(|e| e.to_string())?;
+        parent.sync_all().map_err(|e| e.to_string())
+    })();
+    let unlocked = lock.unlock().map_err(|e| format!("unlock credential ownership migration: {e}"));
+    result.and(unlocked)
 }
 
 impl Store {
@@ -180,7 +305,7 @@ impl Store {
                 .custom_flags(O_NOFOLLOW | O_NONBLOCK)
                 .open(pinned(&self.directory).join(&name))
                 .map_err(|e| e.to_string())?;
-            private_metadata(&file, self.uid, 0o600, false)?;
+            private_metadata(&file, self.file_owner, 0o600, false)?;
             if file.metadata().map_err(|e| e.to_string())?.len() > MAX_BUNDLE as u64 {
                 return Err("oversized credential store entry".into());
             }
@@ -236,7 +361,7 @@ impl Store {
             self.retire_legacy()?;
             let mut bytes = crypto::digest(&bundle.key).to_vec();
             bytes.extend_from_slice(&master);
-            let result = atomic_write(runtime, self.uid, "key", &bytes);
+            let result = atomic_write(runtime, self.file_owner, "key", &bytes);
             bytes.fill(0);
             result
         })();
@@ -246,6 +371,16 @@ impl Store {
 
     /// Only firstboot creates the uid leaf. All ancestors must already exist.
     pub fn open(path: &Path, uid: u32, create: bool) -> Result<Self, String> {
+        Self::open_owned(path, uid, uid, create)
+    }
+
+    /// TPM identity remains the human session when a service owns the files.
+    pub fn open_owned(
+        path: &Path,
+        uid: u32,
+        file_owner: u32,
+        create: bool,
+    ) -> Result<Self, String> {
         if !path.is_absolute() {
             return Err("credential store path must be absolute".into());
         }
@@ -269,7 +404,8 @@ impl Store {
             let opened =
                 directory(&child).map_err(|e| format!("open credential store directory: {e}"))?;
             if created {
-                std::os::unix::fs::fchown(&opened, Some(uid), None).map_err(|e| e.to_string())?;
+                std::os::unix::fs::fchown(&opened, Some(file_owner), None)
+                    .map_err(|e| e.to_string())?;
                 opened
                     .set_permissions(fs::Permissions::from_mode(0o700))
                     .and_then(|()| opened.sync_all())
@@ -277,11 +413,11 @@ impl Store {
                 parent.sync_all().map_err(|e| e.to_string())?;
             }
             if last {
-                private_metadata(&opened, uid, 0o700, true)?;
+                private_metadata(&opened, file_owner, 0o700, true)?;
             }
             parent = opened;
         }
-        private_metadata(&parent, uid, 0o700, true)?;
+        private_metadata(&parent, file_owner, 0o700, true)?;
         let lock_path = pinned(&parent).join("lock");
         let lock = match OpenOptions::new()
             .read(true)
@@ -294,7 +430,8 @@ impl Store {
             Ok(file) => {
                 file.set_permissions(fs::Permissions::from_mode(0o600))
                     .map_err(|e| e.to_string())?;
-                std::os::unix::fs::fchown(&file, Some(uid), None).map_err(|e| e.to_string())?;
+                std::os::unix::fs::fchown(&file, Some(file_owner), None)
+                    .map_err(|e| e.to_string())?;
                 file
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
@@ -305,13 +442,14 @@ impl Store {
                 .map_err(|e| e.to_string())?,
             Err(e) => return Err(format!("open credential lock: {e}")),
         };
-        private_metadata(&lock, uid, 0o600, false)?;
+        private_metadata(&lock, file_owner, 0o600, false)?;
         lock.try_lock()
             .map_err(|e| format!("lock credential store: {e}"))?;
         let store = Self {
             directory: parent,
             lock,
             uid,
+            file_owner,
         };
         if store.bundle()?.is_some() {
             return Ok(store);
@@ -338,7 +476,7 @@ impl Store {
             .read(true)
             .custom_flags(O_NOFOLLOW | O_NONBLOCK)
             .open(pinned(&self.directory).join(name))?;
-        private_metadata(&file, self.uid, 0o600, false).map_err(io::Error::other)?;
+        private_metadata(&file, self.file_owner, 0o600, false).map_err(io::Error::other)?;
         let mut bytes = Vec::new();
         file.take((max + 1) as u64).read_to_end(&mut bytes)?;
         if bytes.len() > max {
@@ -348,12 +486,12 @@ impl Store {
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
-        atomic_write(&self.directory, self.uid, name, bytes)
+        atomic_write(&self.directory, self.file_owner, name, bytes)
     }
 
     fn key(&self, app: &str, bundle: Option<&Bundle>) -> Result<[u8; 32], String> {
         let mut bytes = if let Some(bundle) = bundle {
-            runtime_key(self.uid, &bundle.key)?.to_vec()
+            runtime_key(self.uid, self.file_owner, &bundle.key)?.to_vec()
         } else {
             self.read("master", 32).map_err(|e| e.to_string())?
         };
@@ -612,17 +750,17 @@ fn check_runtime_mount(mounts: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn runtime_key(uid: u32, sealed: &[u8]) -> Result<[u8; 32], String> {
-    runtime_key_in(&runtime_directory(uid, false)?, uid, sealed)
+fn runtime_key(uid: u32, file_owner: u32, sealed: &[u8]) -> Result<[u8; 32], String> {
+    runtime_key_in(&runtime_directory(uid, false)?, file_owner, sealed)
 }
 
-fn runtime_key_in(runtime: &File, uid: u32, sealed: &[u8]) -> Result<[u8; 32], String> {
+fn runtime_key_in(runtime: &File, file_owner: u32, sealed: &[u8]) -> Result<[u8; 32], String> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(pinned(runtime).join("key"))
         .map_err(|_| "TPM credential store is locked")?;
-    private_metadata(&file, uid, 0o600, false)?;
+    private_metadata(&file, file_owner, 0o600, false)?;
     let mut bytes = Vec::new();
     file.take(65)
         .read_to_end(&mut bytes)
@@ -692,6 +830,137 @@ mod tests {
             &aad,
             &record[20..],
         )
+    }
+
+    /// Run only in a disposable root VM with TD_TEST_ROOT_BUSYBOX=/bin/busybox.
+    #[test]
+    #[ignore = "requires a disposable root VM and explicit busybox fixture"]
+    fn ownership_transfer_preserves_bytes_and_removes_human_access() {
+        use std::os::unix::process::CommandExt;
+        require_root().unwrap();
+        let busybox = std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap();
+        assert!(Path::new(&busybox).is_absolute());
+        let root = std::env::temp_dir().join(format!("td-owner-migration-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let parent = directory(&root).unwrap();
+        let make = |uid: u32| {
+            let path = root.join(uid.to_string());
+            let store = Store::open(&path, uid, true).unwrap();
+            store.set("mail", "main", b"preserved credential").unwrap();
+            drop(store);
+            path
+        };
+        let read = |uid: u32, path: &Path| {
+            std::process::Command::new(&busybox).arg("cat").arg(path)
+                .uid(uid).gid(uid).output().unwrap()
+        };
+        let path = make(1000);
+        let master = fs::read(path.join("master")).unwrap();
+        let record = fs::read(path.join("mail.main")).unwrap();
+        assert!(read(1000, &path.join("master")).status.success());
+        migrate_owner(&parent, 1000, 991).unwrap();
+        migrate_owner(&parent, 1000, 991).unwrap();
+        for name in ["master", "mail.main", "lock"] {
+            let file = path.join(name);
+            assert_eq!(fs::metadata(&file).unwrap().uid(), 991);
+            assert!(!read(1000, &file).status.success());
+            assert!(!read(65536, &file).status.success());
+        }
+        assert_eq!(read(991, &path.join("master")).stdout, master);
+        assert_eq!(fs::read(path.join("mail.main")).unwrap(), record);
+        assert_eq!(Store::open_owned(&path, 1000, 991, false).unwrap()
+            .get("mail", "main").unwrap().unwrap(), b"preserved credential");
+
+        // A crash after the leaf restriction and one file transfer is resumable.
+        let path = make(1001);
+        std::os::unix::fs::chown(&path, Some(0), Some(0)).unwrap();
+        std::os::unix::fs::chown(path.join("master"), Some(991), Some(991)).unwrap();
+        migrate_owner(&parent, 1001, 991).unwrap();
+        assert_eq!(Store::open_owned(&path, 1001, 991, false).unwrap()
+            .get("mail", "main").unwrap().unwrap(), b"preserved credential");
+
+        for (uid, bad) in [(1002, "unknown"), (1003, "symlink"), (1004, "hardlink"), (1005, "owner")] {
+            let path = make(uid);
+            match bad {
+                "unknown" => fs::write(path.join("foreign"), b"foreign").unwrap(),
+                "symlink" => std::os::unix::fs::symlink("master", path.join("mail.other")).unwrap(),
+                "hardlink" => fs::hard_link(path.join("master"), path.join("mail.other")).unwrap(),
+                _ => std::os::unix::fs::chown(path.join("mail.main"), Some(999), None).unwrap(),
+            }
+            assert!(migrate_owner(&parent, uid, 991).unwrap_err().quarantined);
+            assert_eq!(fs::metadata(&path).unwrap().uid(), 0);
+            assert_eq!(fs::metadata(path.join("master")).unwrap().uid(), uid);
+            assert!(!read(uid, &path.join("master")).status.success());
+        }
+        let path = make(1006);
+        let store = Store::open(&path, 1006, false).unwrap();
+        assert!(migrate_owner(&parent, 1006, 991).is_err());
+        drop(store);
+        migrate_owner(&parent, 1006, 991).unwrap();
+        for (uid, mode, published) in [(1007, 0o600, false), (1008, 0, false), (1009, 0o600, true), (1010, 0, true)] {
+            let path = make(uid);
+            if published { migrate_owner(&parent, uid, 991).unwrap(); }
+            let scratch = path.join("tmp-0123456789abcdef0123456789abcdef");
+            fs::write(&scratch, b"").unwrap();
+            fs::set_permissions(&scratch, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(fs::metadata(&scratch).unwrap().uid(), 0);
+            migrate_owner(&parent, uid, 991).unwrap();
+            assert!(!scratch.exists());
+            assert_eq!(Store::open_owned(&path, uid, 991, false).unwrap()
+                .get("mail", "main").unwrap().unwrap(), b"preserved credential");
+        }
+        let path = make(1011);
+        std::os::unix::fs::chown(path.join("lock"), Some(0), Some(0)).unwrap();
+        fs::set_permissions(path.join("lock"), fs::Permissions::from_mode(0o000)).unwrap();
+        migrate_owner(&parent, 1011, 991).unwrap();
+        assert_eq!(Store::open_owned(&path, 1011, 991, false).unwrap()
+            .get("mail", "main").unwrap().unwrap(), b"preserved credential");
+        let path = make(1012);
+        std::os::unix::fs::chown(&path, Some(999), Some(999)).unwrap();
+        assert!(!migrate_owner(&parent, 1012, 991).unwrap_err().quarantined);
+        assert_eq!(fs::metadata(&path).unwrap().uid(), 999);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn service_ownership_does_not_change_the_sealed_session_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "td-service-secret-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap())
+        ));
+        fs::create_dir(&root).unwrap();
+        let file_owner = fs::metadata(&root).unwrap().uid();
+        let session = if file_owner == 1000 { 1001 } else { 1000 };
+        let path = root.join("store");
+        let store = Store::open_owned(&path, session, file_owner, true).unwrap();
+        store.set("mail", "main", b"credential").unwrap();
+        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"credential");
+        let key = std::cell::Cell::new([0; 32]);
+        store
+            .seal_with(
+                |master| {
+                    key.set(*master);
+                    Ok(tpm::tests::fixture(session))
+                },
+                |_| Ok(key.get()),
+            )
+            .unwrap();
+        let bundle = store.bundle().unwrap().unwrap();
+        assert_eq!(tpm::SealedKey::decode(&bundle.key).unwrap().uid, session);
+        assert_eq!(fs::metadata(path.join("sealed")).unwrap().uid(), file_owner);
+        let runtime = root.join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let runtime = directory(&runtime).unwrap();
+        store.release_into(&bundle, &runtime, |_| Ok(key.get())).unwrap();
+        assert_eq!(runtime_key_in(&runtime, file_owner, &bundle.key).unwrap(), key.get());
+        assert!(runtime_key_in(&runtime, session, &bundle.key).is_err());
+        drop(store);
+        assert!(Store::open_owned(&path, file_owner, file_owner, false).is_err());
+        assert!(Store::open_owned(&path, session, session, false).is_err());
+        assert!(Store::open_owned(&path, session, file_owner, false).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

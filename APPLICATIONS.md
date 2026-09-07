@@ -500,11 +500,18 @@ ready=/bin/td-login exec-as tester -- /bin/td-busd probe /run/td-bus/1000/bus
 ready-timeout=30
 restart=always
 
+[portal-files]
+type=oneshot
+exec=/bin/td-authd prepare-portal-files
+after=td-firstboot
+requires=td-firstboot
+timeout=30
+
 [portal]
 type=daemon
 exec=/bin/td-portal supervise --bus /run/td-bus/1000/bus \
      --settings /etc/td-portal-settings
-after=busd
+after=busd,portal-files
 requires=busd
 ready=/bin/td-login exec-as tester -- /bin/td-portal probe \
       --bus /run/td-bus/1000/bus --settings /etc/td-portal-settings
@@ -545,24 +552,24 @@ broker as the human UID and prints the marker the image oracle requires;
 §D states the exact endpoint-evidence boundary.
 
 **The Settings/Request `[portal]` and `[portal-evidence]` units have now
-LANDED.**
-The root supervisor prepares one broker activation capability and starts one
-literal `td-login exec-as tester -- /bin/td-portal run ...` direct child while
-retaining its own bus connection. The child activates that capability before
-claiming `org.freedesktop.portal.Desktop`. Readiness is a separate uid-1000
+LANDED.** The root supervisor prepares one broker activation capability
+and starts one literal `td-login exec-service-as tdp1000 --
+/bin/td-portal run ...` direct child while retaining its own bus
+connection. The child activates that capability before claiming
+`org.freedesktop.portal.Desktop`. Readiness is a separate uid-1000
 client performing live `Properties.Get(version)`, synchronous
-`Settings.ReadAll`, a pre-subscribed `Background.RequestBackground` whose
-caller-derived handle receives a directed denial `Request.Response`, and the
-§H item 14 checks that each unsupported portal is unpublished and refuses;
-td-svc discards readiness output, so `portal-evidence` repeats the same
-bounded exchanges through its captured service log and `console=yes` for
-QEMU. Readiness therefore depends on those five portals staying
-unimplemented: whoever implements one must drop it from the probe's roster
-in the same change, or the daemon never comes ready.
-Firefox is ordered after `portal` but does not
-`require` it, and neither portal unit is a dependency of `bootsuccess`: a
-user-service failure is evidence failure, not authority to reject an otherwise
-healthy deployment.
+`Settings.ReadAll`, a pre-subscribed `Background.RequestBackground`
+whose caller-derived handle receives a directed denial
+`Request.Response`, and the §H item 14 checks that each unsupported
+portal is unpublished and refuses; td-svc discards readiness output, so
+`portal-evidence` repeats the same bounded exchanges through its
+captured service log and `console=yes` for QEMU. Readiness therefore
+depends on those five portals staying unimplemented: whoever implements
+one must drop it from the probe's roster in the same change, or the
+daemon never comes ready. Firefox is ordered after `portal` but does not
+`require` it, and neither portal unit is a dependency of `bootsuccess`:
+a user-service failure is evidence failure, not authority to reject an
+otherwise healthy deployment.
 
 **`exec-as` has LANDED** (rung 2), with three details this sketch did not
 settle. It is a SUBCOMMAND rather than an applet — `td-login exec-as`,
@@ -3588,25 +3595,26 @@ One **session** bus at `/run/td-bus/1000/bus`, owned by the reserved
 broker UID/GID 992 (`tdb1000`). Firstboot creates `/run/td-bus` as
 root-owned 0755 and its `1000` child as broker-owned 0755 after durable
 identity enrollment. The socket is 0666; the listener admits only kernel
-UID 0 (portal supervision), UID 1000 (current human, portal and jail
-clients), and application UIDs in the immutable deployment policy before
-connection quota reservation or authentication. Other reserved service
-UIDs and applications absent from that deployment remain refused. Refusals allocate
-no connection worker and share the existing first-and-every-64 log
-sampling. The public socket does not promise availability against local
-connection floods. `run-session` requires UID 992 and checks every
-directory's owner and type; it cannot create a missing runtime. The
-`td-bus` directories require exact mode 0755. Root and `/run` must be
-traversable, without special mode bits or group/other writers; a read-only
-0555 root remains valid. Firstboot repairs only a root-owned
-creation interrupted before ownership publication; a broker-owned child
-with altered permissions is refused. This profile is fixed to the stock
-human owner 1000. Generic `run --socket PATH` retains its private 0600
-host/test endpoint and never widens a caller's parent. The stock jail
-binds the protected host endpoint at its own `/run/user/1000/bus`;
-clients inside keep their existing bus address. There is no system bus:
-nothing on td speaks one, and the first thing that wants one is a design
-review rather than a config file.
+UID 0 (portal supervision), UID 991 (dedicated portal), UID 1000
+(current human and jail clients), and application UIDs in the immutable
+deployment policy before connection quota reservation or authentication.
+Other reserved service UIDs and applications absent from that deployment
+remain refused. Refusals allocate no connection worker and share the
+existing first-and-every-64 log sampling. The public socket does not
+promise availability against local connection floods. `run-session`
+requires UID 992 and checks every directory's owner and type; it cannot
+create a missing runtime. The `td-bus` directories require exact mode
+0755. Root and `/run` must be traversable, without special mode bits or
+group/other writers; a read-only 0555 root remains valid. Firstboot
+repairs only a root-owned creation interrupted before ownership
+publication; a broker-owned child with altered permissions is refused.
+This profile is fixed to the stock human owner 1000. Generic `run
+--socket PATH` retains its private 0600 host/test endpoint and never
+widens a caller's parent. The stock jail binds the protected host
+endpoint at its own `/run/user/1000/bus`; clients inside keep their
+existing bus address. There is no system bus: nothing on td speaks one,
+and the first thing that wants one is a design review rather than a
+config file.
 
 **Deployment application identity.** `run-session` loads
 `/etc/td-bus-applications.tsv` before binding. The image generates this
@@ -5298,7 +5306,7 @@ through `RequestName`; that capability check and ownership change are one
 directory operation. Pid reuse and an ordinary same-uid peer inherit neither
 the capability nor a queued claim. The bare namespace roots never cross the
 reservation. The landed root `td-portal supervise` process calls `Prepare`,
-retains that connection, and starts the direct uid-1000 child which calls
+retains that connection, and starts the direct uid-991 child which calls
 `Activate` before `RequestName`. The exact Settings name is therefore the
 first system-image consumer of this broker substrate; later portal interfaces
 reuse it.
@@ -5764,24 +5772,25 @@ without granting mutable user service state authority over deployment
 acknowledgement.
 
 A second, likewise non-health-authoritative evidence unit exercises the
-private compositor channel described below. As uid 1000 it performs
-`wl_display.get_registry` followed by `wl_display.sync`, requires the private
-registry's exact eleven globals in their pinned order and versions, binds the
-private-only `td_portal_manager_v1`, constructs an xdg-toplevel, and requires
-the exact standalone and dismissal acknowledgements for an intentionally
-empty parent handle before a second sync. Only then does it emit
-`TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2`; QEMU accepts only
-the exact td-svc-prefixed
-`portal-channel-evidence:` line. This composes the shipped socket, compositor
-server, uid-1000 peer check, shared safe Wayland codec, manager dispatch,
-portal binary, service argv, and uid. One 20-second deadline begins before the
-Unix connect, so an unavailable or backlog-stalled endpoint cannot leave this
-diagnostic client waiting forever; 32 messages and 256 KiB bound the exchange.
-The byte bound is cumulative across both exchanges, including messages already
-decoded into the retained global table. This target probe proves the shipped
-private transport and standalone request lifecycle; a host wire regression
-uses a live mapped export to prove parent association, asynchronous revocation,
-re-association, and dismissal.
+private compositor channel described below. As portal uid 991 it
+performs `wl_display.get_registry` followed by `wl_display.sync`,
+requires the private registry's exact eleven globals in their pinned
+order and versions, binds the private-only `td_portal_manager_v1`,
+constructs an xdg-toplevel, and requires the exact standalone and
+dismissal acknowledgements for an intentionally empty parent handle
+before a second sync. Only then does it emit `TD-PORTAL-CHANNEL-READY
+globals=11 privileged=1 dialog=2`; QEMU accepts only the exact
+td-svc-prefixed `portal-channel-evidence:` line. This composes the
+shipped socket, compositor server, uid-991 peer check, shared safe
+Wayland codec, manager dispatch, portal binary, service argv, and uid.
+One 20-second deadline begins before the Unix connect, so an unavailable
+or backlog-stalled endpoint cannot leave this diagnostic client waiting
+forever; 32 messages and 256 KiB bound the exchange. The byte bound is
+cumulative across both exchanges, including messages already decoded
+into the retained global table. This target probe proves the shipped
+private transport and standalone request lifecycle; a host wire
+regression uses a live mapped export to prove parent association,
+asynchronous revocation, re-association, and dismissal.
 
 ### Request — landed core; Session — staged core
 
@@ -5837,7 +5846,7 @@ not for a persistent Session lifecycle.
 | — | `.Background` | — | `RequestBackground` returns denied; persistent background execution needs a td-svc user-service design. |
 | — | `.Documents` | FUSE | **absent** (§0: no `CONFIG_FUSE_FS`). See below. |
 | — | `.Print`, `.Camera`, `.ScreenCast`, `.RemoteDesktop` | spooler / PipeWire | **not exported.** A fake PipeWire descriptor would make successful setup indistinguishable from a broken stream. |
-| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); unenrolled stores retain the file-master offline gap, and both backends retain unconfined same-uid access after release. |
+| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); unenrolled stores retain the file-master offline gap, and both backends retain human-UID application impersonation until the app identity cutover. |
 
 **The Documents consequence, stated honestly rather than buried.**
 Without it, a file chooser can only grant what the sandbox can already
@@ -6028,18 +6037,16 @@ cannot treat absence as authority.
 The landed FileChooser rule is deliberately narrower than a general portal
 identity design: it requires exact uid 1000 and exact `td.AppId="firefox"`.
 Missing, duplicate, mistyped, or any other app identity is `NotAllowed` before
-a Request is exported or the `/var/home/tester/Downloads` descriptor root is
+a Request is exported or the `/var/td-portal-files/1000/Downloads` root is
 opened. The host and guest roots are compiled as that one application's
 authenticated grant pair. This fails closed for the unresolved/unconfined
 ambiguity and prevents another jailed app from receiving Firefox's paths.
 
-This does not make the portal a boundary against a genuinely unsandboxed
-uid-1000 process: such a process can already name the private compositor socket
-and read the user's Downloads directory directly. It does mean that an absence
-of broker lineage evidence never increases authority through this method.
-Generalizing a future grant-bearing interface to unconfined desktop clients
-requires the broker to land a positive `Jailed`/`Unconfined`/`Unknown`
-distinction; FileChooser does not pretend that distinction exists today.
+The human can read the original Downloads directory but cannot enter the
+portal's private compositor protocol or credential-store runtime. Human-UID
+application registration remains an interim: another human-UID launcher can
+still impersonate installed Firefox with its exact grants. Absence of broker
+lineage evidence never increases FileChooser authority.
 
 ### The private portal ↔ compositor protocol
 
@@ -6061,25 +6068,26 @@ the compositor listens on a second socket,
 the privileged interface is not reachable to be mis-served. That is td-seatd's
 argument in the same words: the boundary is what a process can *name*, and an
 absent socket fails safe in a way a conditional does not. Both mechanisms are
-now used together — the private socket also checks exact uid-1000
+now used together — the private socket also checks exact uid-991
 `SO_PEERCRED` — but the socket is the boundary and the credential is the belt.
 
-**The private transport and first privileged manager slice have LANDED.**
-`td-compositor` resolves the public, private, and application-evidence
-endpoints once, refuses aliases, binds both Wayland listeners before
-its ordinary readiness marker, and admits at most 30 public clients plus two
-independently reserved private clients. That preserves the former 32-client
-total without letting public load starve the portal. The private endpoint is
-bound before the public readiness endpoint, so a successful ordinary readiness
-connection implies both names exist. Its accept loop reads one exact 12-byte
-`SO_PEERCRED` result before consuming a private slot and accepts only uid 1000.
+**The private transport and first privileged manager slice have
+LANDED.** `td-compositor` resolves the public, private, and
+application-evidence endpoints once, refuses aliases, binds both Wayland
+listeners before its ordinary readiness marker, and admits at most 30
+public clients plus two independently reserved private clients. That
+preserves the former 32-client total without letting public load starve
+the portal. The private endpoint is bound before the public readiness
+endpoint, so a successful ordinary readiness connection implies both
+names exist. Its accept loop reads one exact 12-byte `SO_PEERCRED`
+result before consuming a private slot and accepts only portal uid 991.
 The accepted socket receives finite 30-second read and write inactivity
-timeouts, so two idle or backpressured peers release both reserved slots. The
-path remains the jail boundary; the credential is defence in depth. Uid 1000
-is the system's fixed UI identity and the target QEMU proof cross-checks it.
-An active unconfined same-uid process can keep either slot live by speaking the
-protocol, which is part of the already stated v1 same-uid exposure rather than
-a substitute isolation boundary.
+timeouts, so two idle or backpressured peers release both reserved
+slots. The private peer check survives a filesystem escape that retains
+the human UID. Only the dedicated portal identity can drive this
+protocol. An active process under that trusted service identity can
+still occupy both slots; the quotas and timeouts provide bounded
+resource use, not protection from the service.
 
 The private listener advertises the same exact ten globals as
 `/run/td-compositor/1000/wayland-0`, followed by private-only
@@ -6138,30 +6146,13 @@ states on the system image. The normal portal's separate dialog client retains
 one private connection per active FileChooser and uses only the confined
 descriptor transport in `UNSAFE.md` §12 for keymap and shared-memory messages.
 
-**What that boundary does not survive is an escape, and it is worth naming the
-consequence rather than leaving it implied by §L.** Path visibility is a
-mount-namespace property. An application that breaks out of the filesystem
-jail will still be uid 1000 in v1, so it can open
-`/run/td-compositor/1000/td-portal-wayland-0` directly and drive
-`td_portal_manager_v1` with no portal UI in the way. The currently landed
-manager cannot read another client's pixels or input already delivered to it,
-but it can promote the escaped application's own surface above application
-popups and give that surface modal keyboard and pointer focus. An escape can
-therefore spoof portal-owned UI, withhold input from other applications, and
-receive what the operator types or clicks into the impostor. Capture or
-inhibition would expand that already security-relevant bypass. The jail is the
-boundary; the socket path is an organizing convention behind it, not a second
-lock.
-
-This is the same v1 same-uid exposure §L records, but it is worth
-separating because its blast radius is worse than the general case: most
-of what an escaped app gains at uid 1000 it could already ask for
-through the portal *with* a prompt, whereas the modal operation can imitate the
-prompt itself and a future capture operation would convert a prompted
-capability into a silent one. Per-app uids close it, which is a further
-argument for scheduling them before that operation; until then, the honest
-statement is that the portal authorizes **confined** applications and stops
-meaning anything the moment confinement fails.
+A filesystem escape does not authorize this private protocol: UID 1000 is
+refused before a slot or dialog is created. The portal is a separate trusted
+service at UID 991. Its compromise can still create modal UI and read the
+credential store, while root and the compositor remain outside this boundary.
+Application UID isolation is still required to prevent human-account escape
+and broker registration impersonation. This private dialog protocol is not
+the secure-attention screen and grants no token consent or elevation.
 
 ```
 td_portal_manager_v1
@@ -6179,7 +6170,7 @@ td_portal_manager_v1
 ```
 
 The future capture frame crosses as a descriptor into a plain unlinked temp
-file the portal creates under `/run/user/1000` — no memfd syscall, no new
+file the portal creates under `/run/td-portal/1000` — no memfd syscall, no new
 surface, since td-portal rides `conn.rs`.
 
 **"No new surface" is right about SYSCALLS and wrong about the roster**,
@@ -8035,7 +8026,7 @@ middle.
 | `td-seatd` | root, oneshot | assigns `/dev/fb0` and `/dev/input/*`; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
 | `td-compositor` | 993 (`tdc1000`) | owns display/input devices and the private root authority endpoint |
 | `td-busd` | 992 (`tdb1000`) | protected runtime and explicit kernel-UID admission |
-| `td-portal` | 1000 | reads the user's files in order to show them |
+| `td-portal` | 991 (`tdp1000`) | owns the credential store and reads a fixed read-only Downloads view |
 | `td-jail` (stage 0/1) | 1000 | fully unprivileged — resolve, register, unshare. It writes only under `~/.td/app` (§B.4), where `td-firstboot` may already have placed a first configuration as the user's own files; packages are read-only store paths (§B.1) |
 | `td-authd` | root | fixed terminal launcher; §L.1 elevation remains unimplemented |
 | `td-jail` | 1000 | it *is* the boundary; it holds nothing |
@@ -8049,8 +8040,9 @@ claim is only an authentication spelling; authorization retains the
 external kernel UID and proven lineage. A broker compromise still
 controls bus routing. UID 992 does not grant access to the human's private
 files or credential store. Publicly readable content in immutable `/td/store`
-remains accessible; its immutability prevents modification. The portal still
-shares the human UID and can read those private files and secrets.
+remains accessible; its immutability prevents modification. The portal owns
+the credential store and has a read-only mapped Downloads grant, with no
+access to the remaining private human home.
 
 **The app runs as uid 1000 in v1, and the consequence is stated rather
 than buried.** `SO_PEERCRED` distinguishes a confined client only while
@@ -8072,16 +8064,19 @@ on every supported launch path, selecting only the immutable application
 and its account; it must accept no caller-selected executable or uid.
 
 Credential checks must consume the admitted external UID or an explicit
-set of service/application UIDs, and filesystem grants must remain
-ACL-compatible. The retained AUTH EXTERNAL rules below account for uid 1000
-inside differing from the external kernel identity.
+set of service/application UIDs, and filesystem grants must preserve
+private modes across the external identity mapping. The retained AUTH
+EXTERNAL rules below account for uid 1000 inside differing from the
+external kernel identity.
 
 The compositor identity, devices, sockets and terminal launcher cut over
-atomically to UID 993. The broker also consumes UID 992. Portal and
-application assignments remain reservations. Activating those requires
-an atomic migration of application state, cgroups, socket permissions
-and peer credential checks. Their current same-uid model still prevents
-a secure consent claim.
+atomically to UID 993. The broker consumes UID 992 and the portal UID 991.
+The portal cutover transfers credential-store ownership and isolates its
+runtime and private compositor admission, while preserving FileChooser
+through a fixed read-only idmapped Downloads view. Application assignments
+remain reservations. Their activation requires an atomic migration of state,
+cgroups, socket permissions and peer checks. Human-UID application
+registration still prevents a secure consent claim.
 
 **Two consequences must be designed for now even though the work is
 v2**, because both are silent breakages rather than missing features:
@@ -9252,13 +9247,17 @@ package lives rather than of how many copies of it exist.
 
 Unenrolled stores use the increment-(a) backend: one per-user store at
 `/var/lib/td/secrets/<uid>` beside the machine identity. `td-firstboot`
-creates the master and the initial `mail/main` placeholder. The mode-0700
-directory and mode-0600 files are owned by that user; credentials use
-ChaCha20-Poly1305 and per-application HKDF keys. The file-backed master is
-deliberately an interim backend: a same-uid unconfined process or an offline
-disk reader can read it. This unenrolled backend provides no TPM protection,
-authenticated session lock, token recovery, or protection from other
-unconfined programs running as the user.
+creates the master and the initial `mail/main` placeholder. The
+mode-0700 directory and mode-0600 files belong to the session's
+dedicated portal UID (991 for human UID 1000); credentials use
+ChaCha20-Poly1305 and per-application HKDF keys. Firstboot transfers
+existing stores before human sessions, with a restartable root-owned
+intermediate leaf; logical UID and credential bytes remain unchanged.
+The file-backed master remains an interim backend: an offline disk
+reader can recover it. This backend provides no TPM protection,
+authenticated session lock or token recovery. Human-UID launchers can
+still impersonate installed applications through registration until
+their cutover.
 
 **Applications receive credentials, not encryption keys.** td owns the
 `td.Secret1` interface on the activated `org.freedesktop.portal.Desktop`
@@ -9292,13 +9291,13 @@ refusal; source data is retained for operator resolution. Migration is
 restartable after any completed publication. There is no dual plaintext
 fallback in the shipped td-mail client.
 
-**Interim console writer.** `td-secret set <application>/<name>` reads at most
-4096 credential bytes from stdin and atomically replaces that entry. This
-increment authorizes the store's uid through ordinary file ownership, at the
-same trust level as the provisioner. It offers no token consent and no
-remembered authorization. The command runs as the user and does not invoke
-`su`, a shell, or a privileged helper. This is the explicit interim exception
-to principle 7 through increment (b), not an elevation claim.
+**Interim console writer.** `td-secret set --uid UID <application>/<name>`
+reads at most 4096 credential bytes from stdin and atomically replaces that
+entry. It requires root and resolves the portal owner through the immutable
+identity table and installed-account checks. The human-UID direct writer is
+removed with the ownership migration. This remains the explicit console
+provisioning interim, with no token consent, remembered authorization, shell
+or privileged helper invocation. It is not an elevation claim.
 
 **TPM enrollment, increment (b).** The root console can atomically migrate an
 existing store with `td-secret seal --uid UID --pcrs LIST --unrecoverable`.
@@ -9310,13 +9309,19 @@ components the platform measures. The stock direct-kernel QEMU path has no
 measured-deployment policy and remains unenrolled. The kernel carries ACPI
 TPM discovery and the TIS/FIFO and CRB drivers.
 
-Firstboot automatically releases the configured mail user's enrolled store
-into a checked `/run` tmpfs while provisioning that user's valid application
-home. Other enrolled UIDs require the root console release command at each
-boot; release is not yet a general session service. This has no token consent:
-the interim console writer remains uid-authorized, and unconfined same-uid
-code can read the
-volatile release. There is no recovery or policy migration yet; the enrollment
+Firstboot automatically releases existing enrolled stores for every deployed
+session into checked `/run` tmpfs after identity enrollment and before
+application-home provisioning. Invalid homes cannot leave an old store
+human-owned after a successful migration. A refused migration quarantines
+an admitted store leaf as root-only and skips its release, while unrelated
+services continue. Failure before quarantine is diagnosed as unconfirmed
+isolation, with existing filesystem access potentially remaining. After a
+successful cutover, failed TPM release leaves credentials unavailable and
+can be retried with `td-secret release --uid UID` at the root console.
+Volatile keys belong to the portal identity, with their logical
+human UID retained in the path and TPM envelope. Release has no token consent,
+and application registration impersonation remains until the app UID cutover.
+There is no recovery or policy migration yet; the enrollment
 command explicitly requires acceptance of unrecoverability. Old snapshots
 may retain the former file master and credentials. `td-secret/DESIGN.md`
 specifies the PCR, memory, physical-bus, rollback and update boundaries, plus
@@ -9330,9 +9335,9 @@ portal, and application identities in immutable
 all account databases and persists their union in
 `/var/lib/td/principals.tsv`, retaining retired assignments so updates
 cannot reuse their UIDs. The image consumes the compositor assignment at
-UID/GID 993 and broker assignment at UID/GID 992, reserving the portal
-and application assignments. Their remaining activation must migrate
-state and socket authorization together. `td-authd/DESIGN.md` specifies
+UID/GID 993, broker assignment at UID/GID 992, and portal assignment at
+UID/GID 991. Application activation must migrate state and socket
+authorization together. `td-authd/DESIGN.md` specifies
 the canonical table, account classes, and durable ledger.
 
 The paired compositor's physical attention screen is implemented but

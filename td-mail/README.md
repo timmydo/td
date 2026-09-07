@@ -32,7 +32,7 @@
 - A password source per account: td's credential portal for
   `secret = "portal"` (the secret stored as mail/NAME for `[account.NAME]`,
   read through the `/app/bin/td-secret` helper packaged beside td-mail, so
-  inside a td jail only; store it with `td-secret set mail/NAME < file`), or
+  inside a td jail only; store it from the root console with `td-secret set --uid UID mail/NAME < file` (UID is the human session UID)), or
   a non-interactive credential command for `password_command` (for example
   `pass`).
 

@@ -244,7 +244,7 @@ Consequences worth stating plainly:
   account passwordless to satisfy ordinary `exec-as` would therefore red both
   the image contract and the credential policy.
 
-  The shipped image has five locked service identities. OpenSSH's `sshd`
+  The shipped image has six locked service identities. OpenSSH's `sshd`
   privilege-separation account and `td-profiler`'s `profiler` account are not
   td-svc `exec-as` targets; each daemon performs its own fixed-purpose drop.
   The `sshd` account has a `/bin/false` shell and an empty root-owned
@@ -254,7 +254,9 @@ Consequences worth stating plainly:
   993, a `/bin/false` shell and `/run/td-compositor/1000` home; its paired
   service uses the same checked service path. The broker account `tdb1000`
   has UID/GID 992, a `/bin/false` shell and `/run/td-bus/1000` home, and
-  also uses `exec-service-as`. None can be entered through
+  also uses `exec-service-as`. The portal `tdp1000` has UID/GID 991, a
+  `/bin/false` shell and private `/run/td-portal/1000` home, and uses the
+  same service path. None can be entered through
   td-login's human forced modes or an interactive login.
 - **A class is a property of a name; the uid is what the kernel
   enforces.** `classify` reads one account's shadow field, so
@@ -315,30 +317,33 @@ compositor, broker, portal, and per-app identities in a persistent
 ledger, and refuses account records that alias a reservation. The image
 activates the compositor assignment as service account `tdc1000` at
 UID/GID 993 and the broker as `tdb1000` at UID/GID 992. Firstboot
-prepares the broker runtime after durable enrollment, whose success
-td-svc requires before broker startup. Portal and app assignments remain
-reserved. The broker loads an immutable deployment table binding each
-reserved application UID to one installed name and exact bus grants. An
-application UID outside a jail receives registration authority only;
-its name is not exposed as a jailed portal identity until lineage is
-proven. Human-UID launchers remain an explicit interim and can still
-register any installed application, with its fixed grants. This does
-not activate application accounts or isolate their state yet.
-Activation consumes the same service-only class defined here.
-`td-authd/DESIGN.md` specifies that reservation contract. The image's
-paired td-authd terminal launcher uses ordinary `exec-as` after a
-read-only reservation check and private-channel authentication. It fixes
-the human account in root-owned service configuration and replaces every
-standard descriptor before spawning this helper. Its unprivileged
-terminal-exec wrapper refuses a failed session-cgroup placement before
-terminal code runs, and a new process group keeps the user terminal
-independent of the authority generation. This adds no credential-switch
-mechanism or human authentication policy here. The paired compositor now
-reserves physical Ctrl+Alt+Esc for an inert trusted screen with exclusive
-input; it accepts no authorization. FIDO2 release still requires token
+prepares the broker and portal runtimes after durable enrollment, whose
+success td-svc requires before startup. The portal consumes UID/GID 991;
+firstboot transfers credential-store ownership to it before human
+sessions and releases enrolled stores independently of application-home
+validation. Application assignments remain reserved. The broker loads an
+immutable deployment table binding each reserved application UID to one
+installed name and exact bus grants. An application UID outside a jail
+receives registration authority only; its name is not exposed as a
+jailed portal identity until lineage is proven. Human-UID launchers
+remain an explicit interim and can still register any installed
+application, with its fixed grants. This does not activate application
+accounts or isolate their state yet. Activation consumes the same
+service-only class defined here. `td-authd/DESIGN.md` specifies that
+reservation contract. The image's paired td-authd terminal launcher uses
+ordinary `exec-as` after a read-only reservation check and
+private-channel authentication. It fixes the human account in root-owned
+service configuration and replaces every standard descriptor before
+spawning this helper. Its unprivileged terminal-exec wrapper refuses a
+failed session-cgroup placement before terminal code runs, and a new
+process group keeps the user terminal independent of the authority
+generation. This adds no credential-switch mechanism or human
+authentication policy here. The paired compositor now reserves physical
+Ctrl+Alt+Esc for an inert trusted screen with exclusive input; it
+accepts no authorization. FIDO2 release still requires token
 enrollment/recovery, protected ownership and a presented prompt bound to
-its assertion. No login, `su` or keyboard-consent behavior substitutes for
-that authorization.
+its assertion. No login, `su` or keyboard-consent behavior substitutes
+for that authorization.
 
 ## 4. Privilege can only be dropped, never gained
 

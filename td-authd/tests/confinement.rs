@@ -24,12 +24,24 @@ fn the_production_source_and_raw_boundary_are_closed() {
         })
         .collect();
     files.sort();
-    assert_eq!(files, ["channel.rs", "launch.rs", "main.rs", "sys.rs"]);
+    assert_eq!(
+        files,
+        [
+            "channel.rs",
+            "launch.rs",
+            "main.rs",
+            "mount_sys.rs",
+            "portal_files.rs",
+            "sys.rs"
+        ]
+    );
     for (name, count) in [
         ("main.rs", 1),
         ("channel.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
+        ("mount_sys.rs", 4),
+        ("portal_files.rs", 0),
     ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         assert_eq!(source.matches("unsafe").count(), count, "{name}");
@@ -49,9 +61,11 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "println!",
             "eprintln!",
         ] {
-            if name != "launch.rs"
-                || !["::Command", "::thread", ".spawn(", ".exec("].contains(&forbidden)
-            {
+            let child_api = name == "launch.rs"
+                && ["::Command", "::thread", ".spawn(", ".exec("].contains(&forbidden);
+            let mapping_child_api =
+                name == "portal_files.rs" && ["::Command", ".spawn("].contains(&forbidden);
+            if !child_api && !mapping_child_api {
                 assert!(!source.contains(forbidden), "{name}: {forbidden}");
             }
         }
@@ -106,6 +120,41 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(raw.matches("const SYS_").count(), 4);
     assert_eq!(raw.matches("syscall5(").count(), 5);
     assert_eq!(raw.matches("adopt(").count(), 2);
+    let mounts = include_str!("../src/mount_sys.rs");
+    assert_eq!(fingerprint(mounts), 0xa245d04766973f8c, "fixed mount boundary changed");
+    for constant in [
+        "const SYS_UNSHARE: usize = 272;",
+        "const SYS_OPEN_TREE: usize = 428;",
+        "const SYS_MOVE_MOUNT: usize = 429;",
+        "const SYS_MOUNT_SETATTR: usize = 442;",
+        "const CLONE_NEWUSER: usize = 0x1000_0000;",
+        "const AT_EMPTY_PATH: usize = 0x1000;",
+        "const OPEN_TREE_FLAGS: usize = 1 | 0x80000 | AT_EMPTY_PATH;",
+        "const PORTAL_ATTRIBUTES: u64 = 0x100000 | 1 | 2 | 4 | 8;",
+        "const MOVE_FLAGS: usize = 4 | 0x40;",
+    ] {
+        assert!(mounts.contains(constant), "{constant}");
+    }
+    assert_eq!(mounts.matches("const SYS_").count(), 4);
+    assert_eq!(mounts.matches("core::arch::asm!").count(), 1);
+    assert_eq!(mounts.matches("OwnedFd::from_raw_fd").count(), 1);
+    assert_eq!(mounts.matches("#[allow(unsafe_code)]").count(), 2);
+    assert_eq!(mounts.matches("syscall5(").count(), 5);
+    assert_eq!(mounts.matches("adopt(").count(), 2);
+    let files = include_str!("../src/portal_files.rs");
+    assert_eq!(fingerprint(files), 0x4b003b1d31aba476, "root portal grant controller changed");
+    assert_eq!(files.matches("Command::new(\"/bin/td-authd\")").count(), 1);
+    assert_eq!(files.matches("Command::new(\"/bin/umount\")").count(), 1);
+    assert!(files.contains(".arg(VIEW)"));
+    assert_eq!(files.matches(".spawn(").count(), 1);
+    assert_eq!(
+        files.matches("launch::require_launch_startup()?").count(),
+        3
+    );
+    assert_eq!(files.matches("mount_sys::new_user_namespace(").count(), 1);
+    assert_eq!(files.matches("mount_sys::clone_directory(").count(), 1);
+    assert_eq!(files.matches("mount_sys::portal_attributes(").count(), 1);
+    assert_eq!(files.matches("mount_sys::publish(").count(), 1);
     let channel = include_str!("../src/channel.rs");
     assert_eq!(channel.matches("sys::prepare(").count(), 1);
     assert_eq!(channel.matches("sys::receive(").count(), 1);
@@ -123,7 +172,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x9ac6b0aedb4b0204,
+        0xd75fc116519ed531,
         "main.rs: production startup changed"
     );
     assert_eq!(

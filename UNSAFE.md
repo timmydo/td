@@ -79,7 +79,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies |
-| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption |
+| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
 | 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
 
@@ -346,11 +346,11 @@ also carries `getsockopt(2)` once per
 accepted private-portal connection, with level fixed to `SOL_SOCKET=1`, option
 fixed to x86-64 `SO_PEERCRED=17`, and an exact 12-byte `[u32; 3]` result. The
 wrapper refuses a different returned length and exposes only the uid word;
-`server.rs` has one pinned caller and accepts only uid 1000 before allocating a
-private client slot. The dedicated compositor additionally admits the compiled
-human UID 1000 on its public Wayland, private portal, control and readiness
-sockets through one pinned `session.rs` caller of the same peer-uid wrapper.
-The private portal also retains its separate UID check before slot admission.
+`server.rs` has one pinned caller and accepts only portal UID 991 before
+allocating a private client slot. The dedicated compositor admits the compiled
+human UID 1000 on its public Wayland, control and readiness sockets through
+one pinned `session.rs` caller of the same peer-uid wrapper. The private
+portal listener uses its separate UID-991 check, not that human admission.
 These sockets use mode 0666 under compositor-owned directories; the
 credential check precedes protocol reads, writes and slot admission. Host development retains private
 mode-0600 sockets. No new syscall, request, or scoped allowance is added.
@@ -2305,6 +2305,28 @@ creates no child process. Original stdin remains exclusive in the compositor.
 Both crates pin the shared source, while compositor confinement pins the two
 shared include paths and the startup/worker caller roster. The target recipe
 stages those exact sources and runs their transport and client-policy tests.
+
+### Portal file-grant mount boundary
+
+`td-authd/src/mount_sys.rs` is separate from the channel module shared with
+the compositor. It has one function-scoped syscall instruction and one
+function-scoped adoption of a freshly returned mount descriptor. On Linux
+x86-64, unshare(272) accepts only CLONE_NEWUSER (0x10000000), in the
+dedicated root-started namespace helper. open_tree(428) clones one borrowed
+directory descriptor with an empty path and exactly OPEN_TREE_CLONE(1),
+OPEN_TREE_CLOEXEC(0x80000), and AT_EMPTY_PATH(0x1000). It is nonrecursive.
+mount_setattr(442) accepts that detached mount and one borrowed namespace
+descriptor. Its fixed 32-byte mount_attr sets MOUNT_ATTR_IDMAP(0x100000),
+RDONLY(1), NOSUID(2), NODEV(4), and NOEXEC(8), with zero attr_clr and
+propagation; flags are exactly AT_EMPTY_PATH. move_mount(429) publishes
+through borrowed source and destination descriptors, two empty paths, and
+exactly MOVE_MOUNT_F_EMPTY_PATH(4)|MOVE_MOUNT_T_EMPTY_PATH(0x40).
+
+The wrappers accept neither paths nor flags. Safe std owns all descriptors
+and closes the detached mount on failure. No descriptor from this boundary
+is received over D-Bus or the attention channel. The production consumer
+selects the fixed human Downloads source and read-only portal destination;
+it does not provide a general mount or application-launch operation.
 
 ## 17. `td-mail` — the terminal surface of a screen application
 

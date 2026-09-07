@@ -213,6 +213,8 @@ const BROKER_RESERVED_UID: u32 = td_engine::permissions::TD_BROKER_UID;
 const BROKER_USER: &str = "tdb1000";
 const BROKER_RUNTIME: &str = td_engine::permissions::TD_BUS_RUNTIME_PATH;
 const PORTAL_RESERVED_UID: u32 = 991;
+const PORTAL_USER: &str = "tdp1000";
+const PORTAL_RUNTIME: &str = "/run/td-portal/1000";
 const PROFILER_USER: &str = "profiler";
 const PROFILER_UID: u32 = 997;
 const PROFILER_GID: u32 = 997;
@@ -471,6 +473,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == AUDIO_UID {
         return home == AUDIO_RUNTIME;
     }
+    if uid == PORTAL_RESERVED_UID {
+        return home == PORTAL_RUNTIME;
+    }
     if uid == BROKER_RESERVED_UID {
         return home == BROKER_RUNTIME;
     }
@@ -524,6 +529,17 @@ const SYSTEM: SystemDef = SystemDef {
             groups: &[],
             passwordless: false,
             service_only: false,
+        },
+        User {
+            name: PORTAL_USER,
+            uid: PORTAL_RESERVED_UID,
+            gid: PORTAL_RESERVED_UID,
+            gecos: "Session Portal",
+            home: PORTAL_RUNTIME,
+            shell: "/bin/false",
+            groups: &[],
+            passwordless: false,
+            service_only: true,
         },
         User {
             name: BROKER_USER,
@@ -1213,7 +1229,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 37] = [
+const TD_SVC_UNITS: [&str; 38] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -1225,6 +1241,7 @@ const TD_SVC_UNITS: [&str; 37] = [
     "busd",
     "fetchd",
     "fetch-evidence",
+    "portal-files",
     "portal",
     "portal-evidence",
     "wayland",
@@ -1484,15 +1501,19 @@ fn build_td_svc_conf() -> String {
          requires=fetchd\n\
          timeout={application_evidence}\n\
          \n\
-         # Root holds td-busd's one-shot portal capability and supervises one\n\
-         # literal td-login exec-as child. The child is therefore both uid 1000\n\
-         # and the live direct descendant the broker authorizes to own the\n\
-         # reserved public name. Settings needs no Wayland surface, so this first\n\
-         # portal landing is ordered only after the bus it serves on.\n\
+         # Root prepares one read-only mapped Downloads view for the portal.\n\
+         [portal-files]\n\
+         type=oneshot\n\
+         exec=/bin/td-authd prepare-portal-files\n\
+         after=td-firstboot\n\
+         requires=td-firstboot\n\
+         timeout=30\n\
+         \n\
+         # Root supervises the dedicated service child and retains activation.\n\
          [portal]\n\
          type=daemon\n\
          exec=/bin/td-portal supervise --bus {bus_socket} --settings {portal_settings}\n\
-         after=busd\n\
+         after=busd,portal-files\n\
          requires=busd\n\
          ready=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus {bus_socket} --settings {portal_settings}\n\
          ready-timeout=30\n\
@@ -1542,15 +1563,14 @@ fn build_td_svc_conf() -> String {
          timeout=30\n\
          \n\
          # The private path is the privileged portal transport boundary. This\n\
-         # separate uid-1000 client proves its exact eleven-global registry and\n\
+         # separate portal-UID client proves its exact eleven-global registry and\n\
          # exercises td_portal_manager_v1 standalone and dismissal acknowledgements.\n\
          # Wait for TLS setup for the same line-framing reason as portal-evidence:\n\
          # its key generator writes raw progress dots to the shared console.\n\
          # td-recipe-eval requires the exact {portal_channel_runtime_marker} line.\n\
          [portal-channel-evidence]\n\
          type=oneshot\n\
-         cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-portal channel-probe --wayland {portal_wayland_socket}\n\
+         exec=/bin/td-login exec-service-as {portal_user} -- /bin/td-portal channel-probe --wayland {portal_wayland_socket}\n\
          after=wayland,firefox-tls-setup\n\
          requires=wayland\n\
          timeout=30\n\
@@ -1859,6 +1879,7 @@ fn build_td_svc_conf() -> String {
         ui_uid = UI_UID,
         ui_home = UI_HOME,
         broker_user = BROKER_USER,
+        portal_user = PORTAL_USER,
         compositor_uid = COMPOSITOR_RESERVED_UID,
         compositor_user = COMPOSITOR_USER,
         wayland_socket = WAYLAND_SOCKET,
@@ -2141,6 +2162,7 @@ fn build_shutdown() -> String {
         "#!/bin/sh\n\
          ok=1\n\
          /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
+         /bin/td-authd release-portal-files || {{ echo 'td-shutdown: portal file release failed' >&2; ok=0; }}\n\
          if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then\n\
            /bin/umount {FIREFOX_DOWNLOAD_SOURCE} || {{ echo 'td-shutdown: umount Firefox Downloads failed' >&2; ok=0; }}\n\
          fi\n\
@@ -6595,16 +6617,34 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             "const FILE_CHOOSER_SOCKET: &str = \"{PORTAL_WAYLAND_SOCKET}\";"
         )));
         assert!(portal.contains(&format!(
-            "const FILE_CHOOSER_RUNTIME: &str = \"/run/user/{UI_UID}\";"
+            "const FILE_CHOOSER_RUNTIME: &str = \"{PORTAL_RUNTIME}\";"
         )));
+        let provisioner = include_str!("../../../td-firstboot/src/principal_store.rs");
+        assert!(provisioner.contains(r#"Directory::open(Path::new("/run"), 0, 0)?"#));
+        assert!(provisioner.contains(r#"runtime_child(&run, "td-portal", (0, 0))?"#));
+        assert!(provisioner.contains("&session.owner.to_string(),"));
+        assert!(provisioner.contains("(session.portal, session.portal),"));
+        assert_eq!(PORTAL_RUNTIME, format!("/run/td-portal/{UI_UID}"));
         let session = include_str!("../../../td-compositor/src/session.rs");
         assert!(session.contains(&format!("pub(crate) const HUMAN_UID: u32 = {UI_UID};")));
         let server = include_str!("../../../td-compositor/src/server.rs");
-        assert!(server.contains(&format!("const PORTAL_UID: u32 = {UI_UID};")));
         assert!(include_str!("../../../td-compositor/src/vm_wire.rs")
             .contains(&format!("\"/run/td-compositor/{UI_UID}/vm-feed\"")));
         assert!(include_str!("../../../td-compositor/src/vm_bridge.rs")
             .contains(&format!("\"/run/td-compositor/{UI_UID}/vm-port\"")));
+        assert!(server.contains(&format!("const PORTAL_UID: u32 = {PORTAL_RESERVED_UID};")));
+        assert!(portal.contains(&format!("const PORTAL_UID: u32 = {PORTAL_RESERVED_UID};")));
+        assert!(portal.contains(&format!("const PORTAL_USER: &str = \"{PORTAL_USER}\";")));
+        let policy = include_str!("../../../td-busd/src/app_policy.rs");
+        assert!(policy.contains(&format!("pub const PORTAL_UID: u32 = {PORTAL_RESERVED_UID};")));
+        let grants = include_str!("../../../td-authd/src/portal_files.rs");
+        assert!(grants.contains(&format!("const HUMAN: u32 = {UI_UID};")));
+        assert!(grants.contains(&format!("const PORTAL: u32 = {PORTAL_RESERVED_UID};")));
+        assert_eq!(UI_HOME, format!("/home/{UI_USER}"));
+        assert_eq!(FIREFOX_DOWNLOAD_SOURCE, format!("/var{UI_HOME}/Downloads"));
+        assert!(grants.contains(&format!("let human = child(&home, \"{UI_USER}\", HUMAN, true)?;")));
+        assert_eq!(unit_key("portal-files", "exec").as_deref(), Some("/bin/td-authd prepare-portal-files"));
+        assert_eq!(unit_key("portal-files", "requires").as_deref(), Some("td-firstboot"));
         let seat = include_str!("../../../td-seatd/src/main.rs");
         assert!(seat.contains(r#"const COMPOSITOR_RUNTIME_NAME: &str = "td-compositor";"#));
         assert!(seat.contains("Ok(run.join(COMPOSITOR_RUNTIME_NAME).join(owner))"));
@@ -6634,7 +6674,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             .collect();
         assert_eq!(
             private_runtime_accounts,
-            [BROKER_USER, COMPOSITOR_USER, AUDIO_USER]
+            [PORTAL_USER, BROKER_USER, COMPOSITOR_USER, AUDIO_USER]
         );
         assert_eq!(unit_key("wayland", "exec"), Some(format!(
             "/bin/td-authd terminal-serve --user {UI_USER} --uid {UI_UID} --peer-uid {COMPOSITOR_RESERVED_UID}"
@@ -6896,7 +6936,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("busd", vec!["seat"]),
             ("fetchd", vec!["seat", "netup"]),
             ("fetch-evidence", vec!["fetchd", "firefox-tls-setup"]),
-            ("portal", vec!["busd"]),
+            ("portal-files", vec!["td-firstboot"]),
+            ("portal", vec!["busd", "portal-files"]),
             ("portal-evidence", vec!["portal", "firefox-tls-setup"]),
             ("wayland", vec!["seat"]),
             (
@@ -7225,7 +7266,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             "root must retain the broker capability while supervising its direct child"
         );
         assert_eq!(unit_key("portal", "ready"), Some(probe.clone()));
-        assert_eq!(unit_key("portal", "after").as_deref(), Some("busd"));
+        assert_eq!(unit_key("portal", "after").as_deref(), Some("busd,portal-files"));
         assert_eq!(unit_key("portal", "requires").as_deref(), Some("busd"));
         assert_eq!(unit_key("portal", "restart").as_deref(), Some("always"));
         assert_eq!(unit_key("portal", "ready-timeout").as_deref(), Some("30"));
@@ -7290,7 +7331,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         assert_eq!(
             unit_key("portal-channel-evidence", "exec"),
             Some(format!(
-                "/bin/td-login exec-as {UI_USER} -- /bin/td-portal \
+                "/bin/td-login exec-service-as {PORTAL_USER} -- /bin/td-portal \
                  channel-probe --wayland {PORTAL_WAYLAND_SOCKET}"
             ))
         );
@@ -9817,6 +9858,9 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 && shutdown.contains(SYSTEM_SHUTDOWN_MARKER),
             "the teardown must attempt every safety step and emit its marker only when all pass"
         );
+        let portal_release = "/bin/td-authd release-portal-files || {";
+        assert_eq!(shutdown.matches(portal_release).count(), 1);
+        assert!(shutdown.find(portal_release) < shutdown.find(&download_unmount));
         assert_eq!(shutdown.matches(&xdg_guard).count(), 1);
         assert!(
             shutdown.find(&xdg_guard) < shutdown.find(&download_unmount)

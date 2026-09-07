@@ -132,11 +132,7 @@ fn optional(
     Ok(Some(bytes))
 }
 
-pub(super) fn provision(
-    state: &Path,
-    owner: &ApplicationHome,
-    directory: &File,
-) -> Result<(), Failure> {
+fn store_parent(state: &Path) -> Result<File, Failure> {
     let parent = state.join("secrets");
     match fs::DirBuilder::new().mode(0o755).create(&parent) {
         Ok(()) => (),
@@ -167,9 +163,57 @@ pub(super) fn provision(
     File::open(state)
         .and_then(|file| file.sync_all())
         .map_err(|e| Failure::Failed(e.to_string()))?;
-    let store = secret_store::Store::open(&parent.join(owner.uid.to_string()), owner.uid, true)
+    Ok(parent_directory)
+}
+
+/// Protect every existing session store even when its application home is broken.
+pub(super) fn isolate_stores(state: &Path, registry: &crate::principals::Registry) -> Result<(), Failure> {
+    let parent = store_parent(state)?;
+    for session in registry.sessions() {
+        if let Err(error) = secret_store::migrate_owner(&parent, session.owner, session.portal) {
+            let disposition = if error.quarantined {
+                "store quarantined; credentials unavailable"
+            } else {
+                "isolation not confirmed; existing filesystem access may remain"
+            };
+            super::emit_err(&format!(
+                "td-firstboot: credential migration for uid {} refused ({disposition}): {}\n",
+                session.owner, error.message,
+            ));
+            continue;
+        }
+        let name = session.owner.to_string();
+        let held_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(&name);
+        match fs::symlink_metadata(held_path) {
+            Ok(_) => {
+                if let Err(error) = secret_store::Store::open_owned(
+                    &state.join("secrets").join(name), session.owner, session.portal, true,
+                ).and_then(|store| store.release()) {
+                    super::emit_err(&format!(
+                        "td-firstboot: credentials for uid {} remain unavailable: {error}\n",
+                        session.owner,
+                    ));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(Failure::Failed(format!("inspect session credential store: {e}"))),
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn provision(
+    state: &Path,
+    owner: &ApplicationHome,
+    directory: &File,
+    file_owner: u32,
+) -> Result<(), Failure> {
+    let _parent = store_parent(state)?;
+    let store = secret_store::Store::open_owned(&state.join("secrets").join(owner.uid.to_string()), owner.uid, file_owner, true)
         .map_err(Failure::Failed)?;
-    store.release().map_err(Failure::Failed)?;
+    if file_owner == owner.uid {
+        store.release().map_err(Failure::Failed)?;
+    }
     let pinned = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     let config = optional(&pinned, "config.toml", owner.uid, 64 * 1024)?;
     let config = config
@@ -215,6 +259,75 @@ pub(super) fn provision(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an explicitly selected disposable root VM without a TPM"]
+    fn unavailable_tpm_locks_only_credentials_and_accepts_later_release() {
+        secret_store::require_root().unwrap();
+        assert_eq!(std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap(), "/bin/busybox");
+        assert!(!Path::new("/dev/tpmrm0").exists());
+        let root = std::env::temp_dir().join(format!("td-isolated-release-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(store_parent(&root).unwrap());
+        let path = root.join("secrets/1000");
+        let store = secret_store::Store::open(&path, 1000, true).unwrap();
+        store.set("mail", "main", b"recoverable credential").unwrap();
+        drop(store);
+        let master = fs::read(path.join("master")).unwrap();
+        let record = fs::read(path.join("mail.main")).unwrap();
+        let envelope = crate::tpm::tests::fixture(1000);
+        let mut bundle = b"TDSEAL01".to_vec();
+        bundle.extend_from_slice(&(envelope.len() as u32).to_be_bytes());
+        bundle.extend_from_slice(&envelope);
+        bundle.extend_from_slice(&1u32.to_be_bytes());
+        for field in [b"mail.main".as_slice(), record.as_slice()] {
+            bundle.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            bundle.extend_from_slice(field);
+        }
+        let owner = ApplicationHome { home: root.clone(), uid: 1000, gid: 1000 };
+        write_durably_owned(&path.join("sealed"), &bundle, 0o600, Some(&owner)).unwrap();
+        let registry = crate::principals::Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
+        // This returns boot success even though the real release opens a missing TPM.
+        isolate_stores(&root, &registry).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().uid(), 991);
+        let store = secret_store::Store::open_owned(&path, 1000, 991, false).unwrap();
+        assert!(store.get("mail", "main").is_err());
+        assert!(!Path::new("/run/td-secret/1000/key").exists());
+        // Model the checked volatile publication made by a later root release.
+        // TPM seal/unseal correctness is exercised separately by the emulator tests.
+        let mut released = crate::crypto::digest(&envelope).to_vec();
+        released.extend_from_slice(&master);
+        let service = ApplicationHome { home: root.clone(), uid: 991, gid: 991 };
+        write_durably_owned(Path::new("/run/td-secret/1000/key"), &released, 0o600, Some(&service)).unwrap();
+        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"recoverable credential");
+        drop(store);
+        fs::remove_file("/run/td-secret/1000/key").unwrap();
+        for published in [false, true] {
+            fs::remove_dir_all(&path).unwrap();
+            let store = secret_store::Store::open(&path, 1000, true).unwrap();
+            store.set("mail", "main", b"quarantined credential").unwrap();
+            drop(store);
+            if published { isolate_stores(&root, &registry).unwrap(); }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(path.join("notes"), b"unrecognized entry").unwrap();
+            isolate_stores(&root, &registry).unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            assert_eq!((metadata.uid(), metadata.mode() & 0o7777), (0, 0o700));
+            assert!(secret_store::Store::open_owned(&path, 1000, 991, false).is_err());
+            for uid in [1000, 991] {
+                use std::os::unix::process::CommandExt;
+                assert!(!std::process::Command::new("/bin/busybox")
+                    .arg("cat").arg(path.join("master")).uid(uid).gid(uid)
+                    .output().unwrap().status.success());
+            }
+        }
+        fs::remove_dir_all(&path).unwrap();
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        isolate_stores(&root, &registry).unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(secret_store::Store::open_owned(&path, 1000, 991, false).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     #[test]
     fn custom_or_ambiguous_sources_are_not_migrated() {
@@ -264,12 +377,12 @@ mod tests {
             Some(&owner),
         )
         .unwrap();
-        provision(&root, &owner, &directory).unwrap();
+        provision(&root, &owner, &directory, owner.uid).unwrap();
         assert_eq!(
             fs::metadata(root.join("secrets")).unwrap().mode() & 0o7777,
             0o755
         );
-        provision(&root, &owner, &directory).unwrap();
+        provision(&root, &owner, &directory, owner.uid).unwrap();
         assert!(!root.join("password").exists());
         assert!(fs::read_to_string(root.join("config.toml"))
             .unwrap()
@@ -294,7 +407,7 @@ mod tests {
                 Some(&owner),
             )
             .unwrap();
-            assert!(provision(&root, &owner, &directory).is_err());
+            assert!(provision(&root, &owner, &directory, owner.uid).is_err());
             assert_eq!(
                 fs::read_to_string(root.join("config.toml")).unwrap(),
                 custom

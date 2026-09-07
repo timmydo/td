@@ -313,3 +313,19 @@ fn broker_runtimes_repeat_without_following_links_or_accepting_other_writers() {
     assert!(runtime_child(parent, "file", owner).is_err());
     assert_eq!(fs::read(parent.path("file")).unwrap(), b"untouched");
 }
+
+#[test]
+fn portal_runtime_repeats_privately_and_refuses_redirects() {
+    let fixture = Fixture::new();
+    let parent = &fixture.directory;
+    let owner = (parent.uid, parent.gid);
+    let child = runtime_child_mode(parent, "portal", owner, 0o700).unwrap();
+    let inode = child.file.metadata().unwrap().ino();
+    assert_eq!(child.file.metadata().unwrap().mode() & 0o7777, 0o700);
+    let again = runtime_child_mode(parent, "portal", owner, 0o700).unwrap();
+    assert_eq!(again.file.metadata().unwrap().ino(), inode);
+    std::os::unix::fs::symlink(parent.path("portal"), parent.path("redirected")).unwrap();
+    assert!(runtime_child_mode(parent, "redirected", owner, 0o700).is_err());
+    fs::set_permissions(parent.path("portal"), Permissions::from_mode(0o777)).unwrap();
+    assert!(runtime_child_mode(parent, "portal", owner, 0o700).is_err());
+}

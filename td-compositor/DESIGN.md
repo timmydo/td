@@ -986,7 +986,7 @@ and return a live toplevel to the tiling tree without erasing a later local or
 ordinary xdg-foreign parent. Screenshots, notifications, and inhibitors remain
 outside this manager version.
 
-A separate uid-1000 `td-portal channel-probe` sends `get_registry` plus
+A separate portal-uid-991 `td-portal channel-probe` sends `get_registry` plus
 `sync`, validates the ordered eleven names and versions through this crate's
 safe framing codec, binds the compositor, xdg shell, and private manager,
 constructs an unmapped toplevel, and requires exact standalone and dismissed
@@ -3776,7 +3776,7 @@ The `syscall5` body carries:
   keymap descriptor;
 - close(2), to release discarded raw descriptors or owned clipboard endpoints;
 - getsockopt(2), with fixed `SOL_SOCKET` and `SO_PEERCRED`, an exact 12-byte
-  result, and one server caller, to admit only uid 1000 on the private portal
+  result, and one server caller, to admit only uid 991 on the private portal
   listener;
 - fcntl(2), with only `F_GETFL` and `F_SETFL`, to add `O_NONBLOCK` while one
   clipboard source writes and restore the destination's prior status;
@@ -6195,13 +6195,15 @@ root-owned parent. Human runtime `/run/user/1000` remains mode 0700.
 A human-identity boot probe requires permission denial opening every input
 node and the framebuffer. No existing descriptor survives deployment reboot.
 
-Authority-mode Wayland, control and application readiness sockets admit only
-kernel peer UID 1000 before any protocol access. Socket mode 0666 permits
-cross-UID connection, while the peer check supplies session admission.
-The existing private portal listener additionally retains its UID-1000
-check; separating that backend from applications remains a later identity
-increment. The physical attention screen below supplies no token consent.
-Host-development direct mode retains its private socket permissions.
+Authority-mode Wayland, control and application readiness sockets admit
+only kernel peer UID 1000 before any protocol access. Socket mode 0666
+permits cross-UID connection, while the peer check supplies session
+admission. The private portal listener instead admits only the dedicated
+portal UID 991; it does not apply human-session admission first. The
+portal keeps its dialog buffers in its own 0700 runtime and transfers
+descriptors directly. The physical attention screen below supplies no
+token consent. Host-development direct mode retains its private socket
+permissions.
 
 The session policy is the only additional caller of the existing peer-UID
 wrapper. Control, readiness and public Wayland paths share that policy;

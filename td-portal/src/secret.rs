@@ -132,7 +132,7 @@ pub(super) fn identity_reply(
         )?;
         return Ok(true);
     };
-    let result = secret_store::Store::open(&secret_store::user_path(UI_UID), UI_UID, false)
+    let result = secret_store::Store::open_owned(&secret_store::user_path(UI_UID), UI_UID, PORTAL_UID, false)
         .and_then(|store| store.get(&app, &pending.name))
         .and_then(|secret| secret.ok_or_else(|| "credential is not provisioned".into()));
     let mut secret = match result {
@@ -195,7 +195,7 @@ fn credential_file(secret: &[u8]) -> io::Result<(File, String)> {
     let mut nonce = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut nonce)?;
     let name = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let path = PathBuf::from(format!("/run/user/{UI_UID}")).join(format!(".td-secret-{name}"));
+    let path = PathBuf::from(FILE_CHOOSER_RUNTIME).join(format!(".td-secret-{name}"));
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)

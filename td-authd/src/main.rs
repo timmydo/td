@@ -2,6 +2,8 @@
 
 mod channel;
 mod launch;
+mod mount_sys;
+mod portal_files;
 mod sys;
 
 use std::io::Write;
@@ -9,9 +11,19 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd terminal-serve --user USER --uid UID --peer-uid UID | \
-    td-authd terminal-exec UID GENERATION HANDLE";
+    td-authd terminal-exec UID GENERATION HANDLE | td-authd prepare-portal-files | \
+    td-authd release-portal-files";
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if arguments == ["prepare-portal-files"] {
+        return portal_files::prepare();
+    }
+    if arguments == ["release-portal-files"] {
+        return portal_files::release();
+    }
+    if arguments == ["portal-file-namespace"] {
+        return portal_files::namespace_helper();
+    }
     if let Some((verb, rest)) = arguments.split_first() {
         if verb == "terminal-exec" {
             return launch::terminal_exec(rest);

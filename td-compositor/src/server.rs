@@ -176,7 +176,7 @@ const MAX_PENDING_FDS: usize = 64;
 const MAX_OBJECTS: usize = 512;
 const MAX_PUBLIC_CLIENTS: usize = 30;
 const MAX_PORTAL_CLIENTS: usize = 2;
-const PORTAL_UID: u32 = 1000;
+const PORTAL_UID: u32 = 991;
 const PORTAL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CACHED_SUBSURFACE_COMMITS: usize = 128;
 const MAX_PENDING_FRAME_CALLBACKS: usize = 256;
@@ -7572,8 +7572,8 @@ fn prepare_client_stream(
     portal_timeout: Duration,
     policy: SocketPolicy,
 ) -> Result<UnixStream, String> {
-    policy.admit(&stream)?;
     if access == ClientAccess::Public {
+        policy.admit(&stream)?;
         return Ok(stream);
     }
     let uid = sys::peer_uid(&stream)?;
@@ -11244,9 +11244,10 @@ mod tests {
     }
 
     #[test]
-    fn private_portal_peer_admission_is_exactly_uid_1000() {
+    fn private_portal_peer_admission_is_exactly_uid_991() {
         assert_eq!(require_portal_peer(PORTAL_UID), Ok(()));
         assert!(require_portal_peer(0).is_err());
+        assert!(require_portal_peer(1000).is_err());
         assert!(require_portal_peer(PORTAL_UID + 1).is_err());
     }
 
@@ -11259,8 +11260,8 @@ mod tests {
             let timeout = Duration::from_millis(25);
             let prepared =
                 prepare_client_stream(stream, access, timeout, SocketPolicy::HumanSession);
-            assert_eq!(prepared.is_ok(), uid == 1000);
-            let expected = if uid == 1000 && access == ClientAccess::Portal {
+            assert_eq!(prepared.is_ok(), uid == if access == ClientAccess::Public { 1000 } else { PORTAL_UID });
+            let expected = if uid == PORTAL_UID && access == ClientAccess::Portal {
                 Some(timeout)
             } else {
                 None

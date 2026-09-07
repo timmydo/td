@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 
+pub const PORTAL_UID: u32 = 991;
+
 pub const PATH: &str = "/etc/td-bus-applications.tsv";
 pub const MAX_BYTES: usize = 64 * 1024;
 const MAX_APPS: usize = 256;
@@ -125,7 +127,11 @@ impl Policy {
     }
 
     pub fn admits(&self, uid: u32) -> bool {
-        uid == 0 || uid == self.owner || self.for_uid(uid).is_some()
+        uid == 0 || uid == self.owner || self.is_portal(uid) || self.for_uid(uid).is_some()
+    }
+
+    pub fn is_portal(&self, uid: u32) -> bool {
+        self.owner == 1000 && uid == PORTAL_UID
     }
 
     pub fn registration(
@@ -218,7 +224,7 @@ mod tests {
         let grants = vec!["org.mozilla.firefox".into()];
         policy.registration(65536, "firefox", &[], &grants).unwrap();
         policy.registration(1000, "firefox", &[], &grants).unwrap();
-        for uid in [0, 992, 1001, 65537, u32::MAX] {
+        for uid in [0, 991, 992, 1001, 65537, u32::MAX] {
             assert!(policy.registration(uid, "firefox", &[], &grants).is_err());
         }
         assert!(policy.registration(65536, "mail", &[], &[]).is_err());
@@ -227,12 +233,19 @@ mod tests {
         assert!(policy
             .registration(65536, "firefox", &grants, &grants)
             .is_err());
-        for uid in [0, 1000, 65536, 65537] {
+        for uid in [0, 991, 1000, 65536, 65537] {
             assert!(policy.admits(uid));
         }
-        for uid in [991, 992, 993, 1001, 65534, 65538] {
+        for uid in [992, 993, 1001, 65534, 65538] {
             assert!(!policy.admits(uid));
         }
+    }
+
+    #[test]
+    fn the_fixed_portal_belongs_only_to_the_stock_session() {
+        let policy = Policy::new(1001, Vec::new()).unwrap();
+        assert!(!policy.admits(PORTAL_UID));
+        assert!(!policy.is_portal(PORTAL_UID));
     }
 
     #[test]

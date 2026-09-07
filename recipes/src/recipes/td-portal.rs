@@ -353,11 +353,34 @@ mod tests {
     }
 
     #[test]
+    fn shared_download_view_is_outside_private_reserved_mount_trees() {
+        let view = MAIN_RS
+            .split_once("const FIREFOX_HOST_DOWNLOADS: &str = \"")
+            .unwrap().1.split('"').next().unwrap();
+        let view = std::path::Path::new(view);
+        for reserved in crate::permissions::RESERVED_FILESYSTEM_TREES {
+            let reserved = std::path::Path::new(reserved);
+            assert!(!view.starts_with(reserved) && !reserved.starts_with(view),
+                "shared Downloads view {} would reserve the original grant through {}",
+                view.display(), reserved.display());
+        }
+    }
+
+    #[test]
     fn portal_and_firefox_share_the_exact_download_grant_pair() {
         assert_eq!(TD_JAIL_FIXTURE_DOWNLOAD_TARGET, "/home/td/Downloads");
         assert!(MAIN_RS
-            .contains("const FIREFOX_HOST_DOWNLOADS: &str = \"/var/home/tester/Downloads\";"));
+            .contains("const FIREFOX_HOST_DOWNLOADS: &str = \"/var/td-portal-files/1000/Downloads\";"));
         assert!(MAIN_RS.contains("const FIREFOX_GUEST_DOWNLOADS: &str = \"/home/td/Downloads\";"));
+        let grant = include_str!("../../../td-authd/src/portal_files.rs");
+        assert!(grant.contains("const VIEW: &str = \"/var/td-portal-files/1000/Downloads\";"));
+        for step in [
+            "let root = directory(Path::new(\"/\"), 0, true)?;",
+            "let var = child(&root, \"var\", 0, true)?;",
+            "let home = child(&var, \"home\", 0, true)?;",
+            "let human = child(&home, \"tester\", HUMAN, true)?;",
+            "let source = child(&human, \"Downloads\", HUMAN, false)?;",
+        ] { assert!(grant.contains(step), "{step}"); }
         assert!(SYSTEM_X86_64_RS
             .contains("const FIREFOX_DOWNLOAD_SOURCE: &str = \"/var/home/tester/Downloads\";"));
         assert!(SYSTEM_X86_64_RS.contains(

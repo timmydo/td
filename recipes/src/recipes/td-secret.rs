@@ -30,6 +30,7 @@ pub fn recipe() -> Recipe {
     let mut steps = Vec::new();
     for directory in [
         "{src}/td-secret/src",
+        "{src}/td-firstboot/src",
         "{src}/td-busd/src",
         "{src}/engine/src",
     ] {
@@ -58,6 +59,13 @@ pub fn recipe() -> Recipe {
             content: (*source).into(),
             exec: false,
         });
+    }
+    for (path, source) in [
+        ("{src}/td-firstboot/src/principals.rs", include_str!("../../../td-firstboot/src/principals.rs")),
+        ("{src}/td-firstboot/src/principals_tests.rs", include_str!("../../../td-firstboot/src/principals_tests.rs")),
+        ("{src}/engine/src/principals.rs", include_str!("../../../engine/src/principals.rs")),
+    ] {
+        steps.push(Step::WriteFile { path: path.into(), content: source.into(), exec: false });
     }
     steps.push(Step::WriteFile {
         path: "{src}/engine/src/sha256.rs".into(),

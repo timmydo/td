@@ -255,10 +255,17 @@ fn run(args: &[String]) -> Result<(), Failure> {
     // machine on the next boot.
     sync_directories(&plan.key_dir, boundary.as_deref())?;
 
+    let mut credential_owner = config.applications.as_ref().map(|home| home.uid);
     if config.enroll_principals {
         let desired = principals::Registry::load().map_err(Failure::Failed)?;
         principal_store::provision(&desired).map_err(Failure::Failed)?;
         principal_store::prepare_broker_runtimes(&desired).map_err(Failure::Failed)?;
+        principal_store::prepare_portal_runtimes(&desired).map_err(Failure::Failed)?;
+        credentials::isolate_stores(&config.state, &desired)?;
+        if let Some(home) = &config.applications {
+            credential_owner = Some(desired.sessions().find(|session| session.owner == home.uid)
+                .ok_or_else(|| Failure::Failed("credential owner has no configured session".into()))?.portal);
+        }
         emit(&format!("{PRINCIPALS_MARKER}\n")).map_err(Failure::Failed)?;
     }
 
@@ -294,7 +301,8 @@ fn run(args: &[String]) -> Result<(), Failure> {
     // fail this unit. The home is the user's to break; what breaks there is
     // said on the console and shows up as the application's own failure.
     if let Some(applications) = &config.applications {
-        match provision_applications(applications, &config.state) {
+        let credential_owner = credential_owner.ok_or_else(|| Failure::Failed("credential owner is missing".into()))?;
+        match provision_applications(applications, &config.state, credential_owner) {
             Ok(outcomes) => {
                 for (application, outcome) in outcomes {
                     emit_err(&format!(
@@ -496,6 +504,7 @@ fn parse_owner(value: &str) -> Result<(u32, u32), Failure> {
 fn provision_applications(
     owner: &ApplicationHome,
     state_dir: &Path,
+    credential_owner: u32,
 ) -> Result<Vec<(&'static str, Outcome)>, Failure> {
     let home = match open_directory(&owner.home) {
         Ok(home) => home,
@@ -554,7 +563,7 @@ fn provision_applications(
         let program_dir = owned_dir(&directory, owner, &configuration)?;
         if config.application == "mail" {
             if let Err(Failure::Failed(reason) | Failure::Usage(reason)) =
-                credentials::provision(state_dir, owner, &program_dir)
+                credentials::provision(state_dir, owner, &program_dir, credential_owner)
             {
                 emit_err(&format!("td-firstboot: mail credential/configuration not provisioned: {reason}\n"));
                 continue;
@@ -1395,7 +1404,7 @@ mod tests {
             gid: metadata.gid(),
         };
 
-        let first = provision_applications(&owner, &root).unwrap();
+        let first = provision_applications(&owner, &root, owner.uid).unwrap();
         assert_eq!(
             first,
             vec![("mail", Outcome::Created), ("news", Outcome::Created)]
@@ -1436,14 +1445,14 @@ mod tests {
         // is created without touching it.
         std::fs::write(&mail, "edited\n").unwrap();
 
-        let second = provision_applications(&owner, &root).unwrap();
+        let second = provision_applications(&owner, &root, owner.uid).unwrap();
         assert_eq!(
             second,
             vec![("mail", Outcome::Present), ("news", Outcome::Present)]
         );
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
         assert!(!password.exists());
-        let third = provision_applications(&owner, &root).unwrap();
+        let third = provision_applications(&owner, &root, owner.uid).unwrap();
         assert_eq!(
             third,
             vec![("mail", Outcome::Present), ("news", Outcome::Present)]
@@ -1452,7 +1461,7 @@ mod tests {
         // A mail credential failure does not withhold another application's configuration.
         std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::remove_file(&news).unwrap();
-        assert_eq!(provision_applications(&owner, &root).unwrap(), vec![("news", Outcome::Created)]);
+        assert_eq!(provision_applications(&owner, &root, owner.uid).unwrap(), vec![("news", Outcome::Created)]);
         assert_eq!(std::fs::read_to_string(&news).unwrap(), NEWS_CONFIG);
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
 
@@ -1461,12 +1470,12 @@ mod tests {
             uid: owner.uid.wrapping_add(1),
             ..owner.clone()
         };
-        assert_eq!(provision_applications(&foreign, &root).unwrap(), Vec::new());
+        assert_eq!(provision_applications(&foreign, &root, foreign.uid).unwrap(), Vec::new());
         let absent = ApplicationHome {
             home: root.join("nobody"),
             ..owner.clone()
         };
-        assert_eq!(provision_applications(&absent, &root).unwrap(), Vec::new());
+        assert_eq!(provision_applications(&absent, &root, absent.uid).unwrap(), Vec::new());
         // A symlink where a state directory should be is refused outright.
         let linked_home = root.join("linked");
         std::fs::create_dir_all(&linked_home).unwrap();
@@ -1475,7 +1484,7 @@ mod tests {
             home: linked_home,
             ..owner.clone()
         };
-        assert!(provision_applications(&linked, &root).is_err());
+        assert!(provision_applications(&linked, &root, linked.uid).is_err());
         // So is a file, or anything else that is not a directory.
         let filed_home = root.join("filed");
         std::fs::create_dir_all(filed_home.join(".td")).unwrap();
@@ -1484,7 +1493,7 @@ mod tests {
             home: filed_home,
             ..owner.clone()
         };
-        assert!(provision_applications(&filed, &root).is_err());
+        assert!(provision_applications(&filed, &root, filed.uid).is_err());
         // A home that is itself a link, or a file, is skipped like an absent
         // one: the jail resolves a home through its own rules, not this one.
         std::os::unix::fs::symlink(&home, root.join("home-link")).unwrap();
@@ -1494,7 +1503,7 @@ mod tests {
                 home: root.join(odd),
                 ..owner.clone()
             };
-            assert_eq!(provision_applications(&odd, &root).unwrap(), Vec::new());
+            assert_eq!(provision_applications(&odd, &root, odd.uid).unwrap(), Vec::new());
         }
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -10,6 +10,9 @@
 )]
 
 mod client;
+#[path = "../../td-firstboot/src/principals.rs"]
+#[allow(dead_code, reason = "shared immutable session identity loader")]
+mod principals;
 #[allow(dead_code, reason = "the portal shares the authenticated store reader")]
 mod crypto;
 #[path = "../../td-busd/src/message.rs"]
@@ -44,7 +47,7 @@ fn run(args: &[String]) -> Result<(), String> {
             store::require_root()?;
             let uid = parse_uid(uid)?;
             let pcrs = tpm::Pcrs::parse(pcrs)?;
-            let store = store::Store::open(&store::user_path(uid), uid, false)?;
+            let store = owned_store(uid)?;
             store.seal(pcrs)?;
             eprintln!(
                 "td-secret: store TPM sealed; no recovery; boot release without token consent"
@@ -54,7 +57,7 @@ fn run(args: &[String]) -> Result<(), String> {
         [command, uid_flag, uid] if command == "release" && uid_flag == "--uid" => {
             store::require_root()?;
             let uid = parse_uid(uid)?;
-            store::Store::open(&store::user_path(uid), uid, false)?.release()
+            owned_store(uid)?.release()
         }
         [command, name] if command == "get" => {
             let mut secret = client::retrieve(name)?;
@@ -67,11 +70,11 @@ fn run(args: &[String]) -> Result<(), String> {
             secret.fill(0);
             result
         }
-        [command, target] if command == "set" => {
+        [command, uid_flag, uid, target] if command == "set" && uid_flag == "--uid" => {
+            store::require_root()?;
+            let uid = parse_uid(uid)?;
             let (app, name) = store::target(target)?;
-            let uid = std::fs::metadata("/proc/self").map_err(|e| e.to_string())?;
-            use std::os::unix::fs::MetadataExt;
-            let store = store::Store::open(&store::user_path(uid.uid()), uid.uid(), false)?;
+            let store = owned_store(uid)?;
             let mut secret = Vec::new();
             io::stdin()
                 .take((store::MAX_SECRET + 1) as u64)
@@ -84,7 +87,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err(concat!(
-            "usage: td-secret set APPLICATION/NAME < credential-file; ",
+            "usage: td-secret set --uid UID APPLICATION/NAME < credential-file; ",
             "td-secret seal --uid UID --pcrs LIST --unrecoverable; ",
             "td-secret release --uid UID"
         )
@@ -92,11 +95,23 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn owned_store(uid: u32) -> Result<store::Store, String> {
+    let registry = principals::Registry::load()?;
+    registry.verify_installed_accounts(&registry)?;
+    let owner = registry.sessions().find(|session| session.owner == uid)
+        .ok_or("credential user has no deployment reservation")?.portal;
+    store::Store::open_owned(&store::user_path(uid), uid, owner, false)
+}
+
 fn parse_uid(value: &str) -> Result<u32, String> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("UID must be a decimal user id".into());
     }
-    value.parse().map_err(|_| "UID is out of range".into())
+    let uid: u32 = value.parse().map_err(|_| "UID is out of range")?;
+    if !(1000..=65533).contains(&uid) || uid.to_string() != value {
+        return Err("UID must be a canonical human session id".into());
+    }
+    Ok(uid)
 }
 
 fn main() -> std::process::ExitCode {
@@ -111,6 +126,17 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod confinement {
+    #[test]
+    fn console_targets_require_one_canonical_human_identity() {
+        for value in ["0", "991", "01000", "+1000", "65534", "4294967296", "1000 "] {
+            assert!(super::parse_uid(value).is_err(), "{value}");
+        }
+        for value in ["1000", "65533"] {
+            assert_eq!(super::parse_uid(value).unwrap().to_string(), value);
+        }
+        assert!(super::run(&["set".into(), "mail/main".into()]).is_err());
+    }
+
     #[test]
     fn descriptor_transport_is_the_only_raw_surface() {
         let sources = [

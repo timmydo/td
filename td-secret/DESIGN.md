@@ -3,20 +3,27 @@
 ## File-backed stores before enrollment
 
 This is a dependency-free Rust implementation of APPLICATIONS.md §W.4.
-The unenrolled backend is authorized by ordinary uid ownership. It does not
-claim hardware protection, user authentication, elevation, memory locking,
-or guaranteed erasure of Rust/compiler copies of secret buffers. Filling
-owned buffers with zero is best effort. The unconfined user can read the
-master; jailed applications cannot traverse or mount the store. No server
-or external synchronization exists.
+The unenrolled backend is authorized by ordinary uid ownership. It does
+not claim hardware protection, user authentication, elevation, memory
+locking, or guaranteed erasure of Rust/compiler copies of secret
+buffers. Filling owned buffers with zero is best effort. The portal
+service owns the master; the human user and jailed applications cannot
+traverse or mount the store. Offline disk readers can still recover the
+unenrolled master. No server or external synchronization exists.
 
-`/var/lib/td/secrets/<uid>` is a mode-0700 directory, with regular mode-0600
-single-link files owned by uid. Directory traversal pins every component
-and rejects symlinks. Reads reject wrong ownership, mode, type, links and
-oversized input. The store lock serializes each complete read or update;
-contention fails closed. Publication uses a random exclusive temporary,
-file fsync, rename and directory fsync. An existing malformed master is
-never replaced, and a missing master in a nonempty store is an error.
+`/var/lib/td/secrets/<uid>` is a mode-0700 directory, with regular
+mode-0600 single-link files owned by the session's reserved portal UID.
+Ownership checks pin the UID; these private modes grant no group
+authority. New files may retain the creator's GID, while migration
+assigns the service GID. The directory name and TPM envelope retain the
+logical human UID; filesystem ownership is a separate argument, never an
+identity inferred from the directory owner. Directory traversal pins
+every component and rejects symlinks. Reads reject wrong ownership,
+mode, type, links and oversized input. The store lock serializes each
+complete read or update; contention fails closed. Publication uses a
+random exclusive temporary, file fsync, rename and directory fsync. An
+existing malformed master is never replaced, and a missing master in a
+nonempty store is an error.
 
 The `master` file contains exactly 32 bytes from the kernel random source.
 HKDF-SHA256 (RFC 5869) extracts with salt `td-secret/store/v1`, then expands
@@ -85,14 +92,52 @@ credential sources.
 A mail refusal leaves its source data intact and does not prevent news
 configuration from being provisioned.
 
-`td-secret set APP/NAME` reads credential bytes from stdin. Application and
+Before any human session starts, firstboot transfers each deployed
+session's existing store from the human UID to its reserved portal UID.
+It pins the root-owned secrets parent, changes the private leaf to root
+ownership, acquires its stable lock, validates and retains all known
+single-link private files, transfers their ownership, syncs them, then
+publishes the portal-owned leaf and syncs both directories. A root-owned
+leaf and mixed old/new file owners are restartable intermediate states.
+Every admitted leaf, including an already portal-owned one, is
+restricted to root ownership and mode 0700 before entry validation. This
+safely narrows a widened legacy leaf mode. An empty root-owned temporary
+left before its ownership assignment is removed after validation; only
+mode bits within 0600 are accepted. An empty interrupted lock with those
+private bits is normalized to 0600. Committed root-owned data is never
+accepted. Invalid entries or contention refuse migration and leave the
+quarantined leaf unavailable to both human and portal. Firstboot logs
+that refusal and skips release for this session while unrelated
+provisioning continues. A wrong-owner object, symlink, or failure before
+quarantine is reported as unconfirmed isolation: existing filesystem
+access may remain. The portal independently requires its exact owner and
+private metadata; a refused object is never treated as a successful
+cutover. A published service-owned leaf accepts only service-owned data
+files. Once service ownership is published, a subsequent sync or unlock
+failure is conservatively reported as unconfirmed isolation: the leaf
+is no longer root-quarantined. This report does not assert that the human
+actually retains access. No credential or master bytes change. Existing
+open descriptors and historical copies cannot be revoked; this operation belongs to
+sysinit before user code.
+
+This availability rule applies to per-session migration and TPM release.
+Failure to establish the trusted root-owned secrets parent, or an unexpected
+filesystem error inspecting a successfully migrated leaf, still fails
+firstboot. These are failures of the shared trusted filesystem prerequisite,
+not a malformed entry supplied inside one user's old store. The broker
+requires successful firstboot and remains unavailable in that case.
+
+`td-secret set --uid UID APP/NAME` reads credential bytes from stdin at the
+root console. It uses the immutable identity parser and installed-account
+checks to resolve the logical user's portal owner; there is no implicit root
+store, caller-selected filesystem owner, or human-UID writer. Application and
 entry names are parsed separately and never interpreted as paths. This is the
 interim console operation authorized in §W.4, with no consent UI. The target
 replacement binds a secure-attention token touch to one typed request and one
 credential descriptor through td-authd. An enrolled store fails closed when
 its TPM or volatile release is absent; no error selects a file master.
-Console writes remain uid-authorized until increment (d); increment (c) must
-first gate release on token presence.
+Console writes require root until increment (d); increment (c) must first
+gate release on token presence.
 
 ## TPM enrollment and boot release: increment (b)
 
@@ -146,32 +191,39 @@ selected PCR state loses access: enrollment explicitly requires
 `--unrecoverable`. Re-enrollment and policy-authorized upgrades are not yet
 provided. Do not enroll a store whose measured updates require recovery.
 
-Firstboot releases the configured mail user's enrolled store as part of
-provisioning that user's valid application home. A missing or invalid home
-prevents that automatic release. Other enrolled UIDs need a root-console
-`td-secret release --uid UID` at each boot; the same command retries a failed
-automatic release. Release removes an old volatile key before attempting the
-TPM and publishes a replacement only after successful unseal and legacy
-cleanup. The portal reads that release at `/run/td-secret/UID/key`: a 32-byte
-envelope fingerprint followed by the 32-byte master. Root owns the
-traversable runtime directories; the single-link 0600 file belongs to UID.
-Every directory and file is opened without following links. `/run` must be
-tmpfs, with no nested mount beneath the secret directory, no active swap, and
-a zero process core-dump soft limit. A missing `/proc/swaps` is accepted:
-Linux omits it when swap support is compiled out. Other swap-table read
-errors and an empty or active table are refused. The fingerprint rejects a
-release for another enrolled key. Updates rewrite the encrypted bundle
-atomically and never persist a plaintext key. There is no additional daemon
-or external service.
+Firstboot isolates and releases every deployed session's existing
+enrolled store after identity enrollment and before application-home
+provisioning. An invalid home cannot leave the existing store
+human-owned after a successful migration. Migration refusal is handled
+as described above. Once the store is isolated, a failed open or TPM
+release logs a diagnostic and leaves credentials unavailable while
+unrelated services continue. A root-console `td-secret release --uid
+UID` retries a failed automatic release for a deployed identity. Release
+removes an old volatile key before attempting the TPM and publishes a
+replacement only after successful unseal and legacy cleanup. The portal
+reads that release at `/run/td-secret/UID/key`: a 32-byte envelope
+fingerprint followed by the 32-byte master. Root owns the traversable
+runtime directories; the single-link 0600 file belongs to the reserved
+portal UID. Every directory and file is opened without following links.
+`/run` must be tmpfs, with no nested mount beneath the secret directory,
+no active swap, and a zero process core-dump soft limit. A missing
+`/proc/swaps` is accepted: Linux omits it when swap support is compiled
+out. Other swap-table read errors and an empty or active table are
+refused. The fingerprint rejects a release for another enrolled key.
+Updates rewrite the encrypted bundle atomically and never persist a
+plaintext key. There is no additional daemon or external service.
 
 This release is **automatic at boot and has no human authentication**.
-Unconfined same-uid programs can still read the released key or credentials;
-TPM possession is not user identity. PCR changes after release do not revoke
-already released bytes. Memory zeroing remains best effort. The kernel, root,
-DMA and physical TPM-bus interception are outside this increment's boundary;
-its TPM sessions are not salted or parameter-encrypted. PCR policy cannot
-compensate for a boot path that fails to measure attacker-controlled code.
-These limits are not FIDO2, secure attention or elevation claims.
+The portal service can read the released key and credentials. Human-UID
+launchers can still register any installed application with its fixed
+grants, so application impersonation through the broker remains until
+the app UID and state cutover. TPM possession is not user identity. PCR
+changes after release do not revoke already released bytes. Memory
+zeroing remains best effort. The kernel, root, DMA and physical TPM-bus
+interception are outside this increment's boundary; its TPM sessions are
+not salted or parameter-encrypted. PCR policy cannot compensate for a
+boot path that fails to measure attacker-controlled code. These limits
+are not FIDO2, secure attention or elevation claims.
 
 Publication provides crash atomicity, not rollback protection or secure disk
 erasure. Btrfs snapshots, backups and old extents can retain the former
@@ -198,7 +250,7 @@ libraries are prerequisites for that scratch build, never inputs to td's
 target graph. Then run:
 
 ```
-TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-secret/Cargo.toml -- --include-ignored
+TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-secret/Cargo.toml emulator_ -- --ignored
 ```
 
 The ignored tests require that explicit executable path, create fresh
@@ -226,3 +278,39 @@ broker-fixed identity, authenticated decryption, descriptor transport and
 acknowledgement.
 It is not evidence for FIDO2 release or elevation; TPM evidence is separate
 from this existing desktop boot check.
+
+## Portal filesystem isolation
+
+The stock portal runs as locked service `tdp1000` (UID/GID 991), started by
+its root supervisor through `exec-service-as`. Firstboot prepares its private
+0700 `/run/td-portal/1000` runtime under a root-owned 0755 parent. Credential
+and dialog temporaries use that runtime. The broker admits this service only
+for the stock human session 1000, preserves a positively proved unconfined
+lineage, and still refuses unknown lineage or application registration. Root's
+live direct-child activation capability remains necessary to claim the portal
+name. The private compositor socket admits only UID 991; ordinary human
+clients use the public socket.
+
+The FileChooser reads only `/var/td-portal-files/1000/Downloads`, a
+root-created read-only idmapped view of the existing human Downloads
+directory. The fixed root helper and its syscall contract are specified
+in td-authd/DESIGN.md and UNSAFE.md §16. No writable human-home grant,
+ACL fallback, or file ownership rewrite is provided. The portal starts
+after grant preparation settles, even if preparation fails. FileChooser
+then refuses requests before exporting a Request unless the fixed grant
+root is a real directory owned by the portal; a root-owned empty
+mountpoint is insufficient. Settings and Secret remain available. No
+failure selects the old human-owned service profile. The empty
+root-owned mountpoint directories persist under `/var`; no file contents
+are copied there. The mount is recreated at boot. Shared views stay
+outside the jail's reserved private-runtime trees: putting this alias
+under `/run` would correctly reserve the original Downloads grant and
+refuse application launch.
+
+The ignored `ownership_transfer_preserves_bytes_and_removes_human_access`
+test requires a disposable root VM and `TD_TEST_ROOT_BUSYBOX=/bin/busybox`.
+It exercises real UID changes, repeat migration, an interrupted transfer,
+unknown files, links, foreign ownership and contention. It checks that the
+old human and an application UID cannot read the master or records, the
+service can read them, and the encrypted and plaintext credential bytes
+survive unchanged. It never runs by default on the development host.

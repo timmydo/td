@@ -12,6 +12,62 @@ add fresh hardware-backed authentication under
 compositor/application identities and exclusive device ownership precede
 enabling that path.
 
+## Portal file preparation
+
+The root-only `prepare-portal-files` startup operation exposes the fixed
+human Downloads directory `/var/home/tester/Downloads` at
+`/var/td-portal-files/1000/Downloads`. It changes neither on-disk ownership
+nor file contents. A detached, nonrecursive idmapped mount maps filesystem
+UID/GID 1000 to portal UID/GID 991 and requires read-only, nosuid, nodev and
+noexec mount attributes before publication. This lets FileChooser retain
+its bounded Downloads view when the portal stops sharing the human UID,
+including files created with mode 0600. It grants no access to the rest of
+the human home. The portal does not receive a mount or namespace descriptor. The empty
+root-owned destination directories persist under `/var`, with the mount
+recreated at boot. This shared view stays outside reserved private-runtime
+trees so the jail's alias refusal does not also reserve human Downloads.
+
+There are no caller-selected paths, IDs, flags or permissions. Startup uses
+the same single-root-thread, no-controlling-terminal and standard-descriptor
+admission as the terminal authority. Each path component is opened through
+a retained parent descriptor without following links. Root ancestors and
+the human home must exclude other writers; Downloads must be directly
+owned by human UID/GID 1000. Root owns all destination parents and permits
+traversal. Repeated preparation accepts only the same source inode exposed
+at the fixed mountpoint with all four restrictive mount flags and portal
+ownership. A replaced Downloads root, stacked mounts or changed parent
+metadata is refused; this helper does not repair a live altered grant.
+The portal waits for this unit to settle but does not require its success.
+An unavailable grant refuses FileChooser requests; Settings and Secret
+remain available.
+
+The internal `portal-file-namespace` child also requires root startup and
+has only the standard descriptors. Its parent clears the environment,
+replaces stdin with a private socketpair endpoint, and replaces both log
+descriptors with `/dev/null` before execing the fixed td-authd binary. The
+child creates only a user namespace, reports readiness, then waits for its
+parent to write the fixed one-entry UID/GID maps with setgroups denied.
+The parent retains this unreaped direct child while opening its namespace
+descriptor, so the numeric PID cannot identify a replacement process.
+Each socket read/write has a five-second timeout. A child guard kills and
+reaps the helper on failure; the namespace remains alive through the
+retained descriptor after normal helper exit. This IPC carries no secret
+or consent and does not use the attention channel.
+
+`mount_sys.rs` confines four fixed calls and descriptor adoption separately
+from the channel transport. The compositor does not include this module.
+UNSAFE.md §16 records the exact syscall numbers, flags and layouts. The
+kernel or filesystem refusing idmapped mounts fails preparation; there is
+no chmod, ownership rewrite, writable view or ACL fallback.
+
+The fixed root-only `release-portal-files` operation runs after services stop
+and before `/var` is unmounted. It accepts no arguments and checks the bounded
+mount table. An absent view succeeds, including failed preparation. A present
+view invokes the existing td-init `/bin/umount` applet with exactly that path,
+from `/`, with a cleared environment and null standard descriptors, then
+requires the mount to be absent. It reports unmount failure; it does not use
+lazy detach or fall back to another path. This uses no new raw syscall surface.
+
 ## Private channel
 
 Root td-svc creates the socketpair through `pair-exec`; each peer receives
@@ -209,7 +265,10 @@ image generator validates these same tables with the provisioner's
 parser. A registry row alone does not activate a service. The image
 consumes the compositor assignment through its paired root authority;
 the broker consumes UID 992 through its service-only login path and
-protected runtime. Portal and application accounts remain reserved. Each
+protected runtime. The portal account `tdp1000` consumes UID/GID 991 and
+its private `/run/td-portal/1000` runtime. Firstboot transfers credential
+files and volatile release ownership to it; application accounts remain
+reserved. Each
 atomic identity cutover consumes these assignments. The paired
 compositor may enter its inert credential and channel startup at its
 reserved UID before ledger admission; the authority verifies the ledger

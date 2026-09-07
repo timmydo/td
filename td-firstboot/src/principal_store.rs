@@ -28,40 +28,54 @@ pub(crate) fn prepare_broker_runtimes(registry: &Registry) -> Result<(), String>
     Ok(())
 }
 
+/// The portal keeps credential and dialog temporaries out of the human runtime.
+pub(crate) fn prepare_portal_runtimes(registry: &Registry) -> Result<(), String> {
+    let run = Directory::open(Path::new("/run"), 0, 0)?;
+    let base = runtime_child(&run, "td-portal", (0, 0))?;
+    for session in registry.sessions() {
+        runtime_child_mode(&base, &session.owner.to_string(), (session.portal, session.portal), 0o700)?;
+    }
+    Ok(())
+}
+
 fn runtime_child(parent: &Directory, name: &str, owner: (u32, u32)) -> Result<Directory, String> {
+    runtime_child_mode(parent, name, owner, 0o755)
+}
+
+fn runtime_child_mode(parent: &Directory, name: &str, owner: (u32, u32), mode: u32) -> Result<Directory, String> {
     let path = parent.path(name);
-    match fs::DirBuilder::new().mode(0o755).create(&path) {
+    match fs::DirBuilder::new().mode(mode).create(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(format!("create broker runtime {}: {error}", path.display())),
+        Err(error) => return Err(format!("create service runtime {}: {error}", path.display())),
     }
     let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| format!("inspect broker runtime {}: {error}", path.display()))?;
+        .map_err(|error| format!("inspect service runtime {}: {error}", path.display()))?;
     if !metadata.is_dir() || metadata.mode() & 0o7022 != 0 {
         return Err(format!(
-            "broker runtime {} must be an unredirected directory without other writers",
+            "service runtime {} must be an unredirected directory without other writers",
             path.display()
         ));
     }
     if (metadata.uid(), metadata.gid()) == (parent.uid, parent.gid) {
         // The parent is root-controlled; resume a creation interrupted before
         // chown. The service cannot replace its entry in that parent.
-        fs::set_permissions(&path, Permissions::from_mode(0o755))
-            .map_err(|error| format!("finish broker runtime mode {}: {error}", path.display()))?;
+        fs::set_permissions(&path, Permissions::from_mode(mode))
+            .map_err(|error| format!("finish service runtime mode {}: {error}", path.display()))?;
         std::os::unix::fs::lchown(&path, Some(owner.0), Some(owner.1))
-            .map_err(|error| format!("assign broker runtime {}: {error}", path.display()))?;
+            .map_err(|error| format!("assign service runtime {}: {error}", path.display()))?;
     }
     let child = Directory::open(&path, owner.0, owner.1)?;
     if child
         .file
         .metadata()
-        .map_err(|error| format!("inspect broker runtime {}: {error}", path.display()))?
+        .map_err(|error| format!("inspect service runtime {}: {error}", path.display()))?
         .mode()
         & 0o7777
-        != 0o755
+        != mode
     {
         return Err(format!(
-            "broker runtime {} must have mode 0755",
+            "service runtime {} must have mode {mode:04o}",
             path.display()
         ));
     }

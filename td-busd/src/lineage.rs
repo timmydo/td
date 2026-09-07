@@ -562,7 +562,7 @@ impl Instances {
         let Some(policy) = &self.policy else {
             return identity;
         };
-        if uid == 0 || uid == policy.owner() {
+        if uid == 0 || uid == policy.owner() || policy.is_portal(uid) {
             return identity;
         }
         let Some(rule) = policy.for_uid(uid) else {
@@ -1554,11 +1554,12 @@ mod tests {
         assert!(instances
             .constrain(65537, Identity::Unconfined)
             .is_unknown());
-        for uid in [0, 1000] {
+        for uid in [0, 991, 1000] {
             assert_eq!(
                 instances.constrain(uid, Identity::Unconfined),
                 Identity::Unconfined
             );
+            assert!(instances.constrain(uid, Identity::Unknown("unproved".into())).is_unknown());
         }
     }
 

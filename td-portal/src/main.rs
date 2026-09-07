@@ -14,7 +14,7 @@
 //! The service owns the synchronous Settings interface and the bounded shared
 //! portal handle core. A root supervisor obtains td-busd's one-shot ownership
 //! capability, starts its direct unprivileged child through `td-login
-//! exec-as`, and stays alive while that child owns
+//! exec-service-as`, and stays alive while that child owns
 //! `org.freedesktop.portal.Desktop`.
 
 #[path = "../../td-secret/src/crypto.rs"]
@@ -126,7 +126,8 @@ const REQUEST_NAME_PRIMARY_OWNER: u32 = 1;
 const UI_UID: u32 = 1000;
 const PORTAL_LOGIN: &str = "/bin/td-login";
 const PORTAL_PROGRAM: &str = "/bin/td-portal";
-const PORTAL_USER: &str = "tester";
+const PORTAL_UID: u32 = 991;
+const PORTAL_USER: &str = "tdp1000";
 const ACTIVATION_TOKEN_BYTES: usize = 32;
 const MAX_PORTAL_FRAME: usize = 256 * 1024;
 const MAX_UNRELATED_MESSAGES: usize = 16;
@@ -142,8 +143,8 @@ const MAX_QUEUED_SERVICE_EVENTS: usize = 32;
 const MAX_FILE_CHOOSER_TITLE_BYTES: usize = 256;
 const OWNER_AUDIT_INTERVAL: Duration = Duration::from_secs(10);
 const FILE_CHOOSER_SOCKET: &str = "/run/td-compositor/1000/td-portal-wayland-0";
-const FILE_CHOOSER_RUNTIME: &str = "/run/user/1000";
-const FIREFOX_HOST_DOWNLOADS: &str = "/var/home/tester/Downloads";
+const FILE_CHOOSER_RUNTIME: &str = "/run/td-portal/1000";
+const FIREFOX_HOST_DOWNLOADS: &str = "/var/td-portal-files/1000/Downloads";
 const FIREFOX_GUEST_DOWNLOADS: &str = "/home/td/Downloads";
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const OWNER_MATCH: &str = "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged'";
@@ -1074,7 +1075,7 @@ fn subscribe_to_owner_departures(connection: &mut Connection) -> io::Result<()> 
 
 fn child_argv(paths: &Paths, token: &str) -> Vec<OsString> {
     vec![
-        OsString::from("exec-as"),
+        OsString::from("exec-service-as"),
         OsString::from(PORTAL_USER),
         OsString::from("--"),
         OsString::from(PORTAL_PROGRAM),
@@ -1116,15 +1117,15 @@ fn supervise(paths: &Paths) -> Result<(), String> {
 }
 
 fn run(paths: &Paths) -> Result<(), String> {
-    if current_uid()? != UI_UID {
-        return Err(format!("td-portal run must run as uid {UI_UID}"));
+    if current_uid()? != PORTAL_UID {
+        return Err(format!("td-portal run must run as uid {PORTAL_UID}"));
     }
     let settings = Settings::load(&paths.settings)?;
     let token = paths
         .token
         .as_deref()
         .ok_or_else(|| "the portal child has no activation token".to_string())?;
-    let mut connection = Connection::open(&paths.bus, UI_UID)
+    let mut connection = Connection::open(&paths.bus, PORTAL_UID)
         .map_err(|error| format!("cannot connect the portal child to the session bus: {error}"))?;
     activate(&mut connection, token)
         .map_err(|error| format!("cannot activate the portal child: {error}"))?;
@@ -1569,6 +1570,10 @@ fn consume_identity_reply(
     }
     if state.active.len() >= MAX_ACTIVE_FILE_CHOOSERS {
         return refuse_open_file_limit(connection, &pending).map(|()| true);
+    }
+    if !download_grant_ready(Path::new(FIREFOX_HOST_DOWNLOADS), PORTAL_UID) {
+        return refuse_open_file_identity(connection, &pending, "FileChooser Downloads grant is unavailable")
+            .map(|()| true);
     }
     let path = match state
         .handles
@@ -2762,6 +2767,12 @@ fn credentials_app_id(reply: &Message<'_>) -> io::Result<Option<String>> {
     Ok(app_id)
 }
 
+fn download_grant_ready(path: &Path, owner: u32) -> bool {
+    // The fixed parent is root-owned. A failed preparer may leave an empty
+    // root-owned mountpoint; only the mapped human directory belongs to us.
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir() && metadata.uid() == owner)
+}
+
 fn refuse_open_file_identity(
     connection: &mut Connection,
     pending: &PendingOpen,
@@ -3679,6 +3690,23 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn download_grant_requires_an_owned_directory_without_following_links() {
+        let root = std::env::temp_dir().join(format!("td-portal-grant-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let owner = fs::metadata(&root).unwrap().uid();
+        assert!(download_grant_ready(&root, owner));
+        assert!(!download_grant_ready(&root, owner.wrapping_add(1)));
+        let file = root.join("file");
+        fs::write(&file, b"data").unwrap();
+        assert!(!download_grant_ready(&file, owner));
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(!download_grant_ready(&link, owner));
+        assert!(!download_grant_ready(&root.join("missing"), owner));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -4743,8 +4771,8 @@ mod tests {
         assert_eq!(
             args,
             strings(&[
-                "exec-as",
-                "tester",
+                "exec-service-as",
+                "tdp1000",
                 "--",
                 "/bin/td-portal",
                 "run",
