@@ -68,15 +68,15 @@ const XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER: u32 = 3;
 const XDG_SURFACE_ERROR_INVALID_SIZE: u32 = 5;
 const XDG_TOPLEVEL_ERROR_INVALID_PARENT: u32 = 1;
 /// `invalid_input` is the positioner's own error and is raised ON the
-/// positioner, since that is the object the client got wrong. The five
+/// positioner, since that is the object the client got wrong. The six
 /// `xdg_wm_base` codes belong to the SHELL object and are raised on it
-/// wherever the request that broke the rule arrived — which for all but
-/// `defunct_surfaces` is some other object.
+/// even when the offending request arrives on another object.
 const XDG_POSITIONER_ERROR_INVALID_INPUT: u32 = 0;
 const XDG_WM_BASE_ERROR_ROLE: u32 = 0;
 const XDG_WM_BASE_ERROR_DEFUNCT_SURFACES: u32 = 1;
 const XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP: u32 = 2;
 const XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT: u32 = 3;
+const XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE: u32 = 4;
 const XDG_WM_BASE_ERROR_INVALID_POSITIONER: u32 = 5;
 /// The `xdg_wm_base` td advertises, and the only one it binds. Named rather
 /// than spelled `1` at both sites because `XdgPopup::configure_sent` turns on
@@ -460,10 +460,9 @@ struct SurfaceState {
     input_region: Option<SharedInputRegion>,
     frame_callbacks: Vec<u32>,
     role: Option<SurfaceRole>,
-    /// Pixels committed while the permanent subsurface role has no live
-    /// wl_subsurface object. They remain current but unmapped until the role
-    /// object is recreated, without duplicating the scene's owned copy.
-    inactive_subsurface: Option<Arc<Surface>>,
+    /// Current pixels before a role exists, or while a permanent subsurface
+    /// role has no live object. Charged to the scene but never tiled.
+    inactive_contents: Option<Arc<Surface>>,
 }
 
 #[derive(Clone, Default)]
@@ -4322,7 +4321,7 @@ impl Client {
     ) -> Result<(), String> {
         let (content, input_region) = match self.objects.get_mut(&surface) {
             Some(Object::Surface(state)) => {
-                (state.inactive_subsurface.take(), state.input_region.clone())
+                (state.inactive_contents.take(), state.input_region.clone())
             }
             _ => return Err(format!("missing subsurface wl_surface {surface}")),
         };
@@ -4333,10 +4332,10 @@ impl Client {
             Ok(content) => content,
             Err(content) => {
                 if let Some(Object::Surface(state)) = self.objects.get_mut(&surface) {
-                    state.inactive_subsurface = Some(content);
+                    state.inactive_contents = Some(content);
                 }
                 return Err(format!(
-                    "wl_surface {surface} retained a shared inactive subsurface image"
+                    "wl_surface {surface} retained a shared inactive surface image"
                 ));
             }
         };
@@ -4493,13 +4492,13 @@ impl Client {
             }
             if let Some(Object::Surface(state)) = self.objects.get_mut(&surface) {
                 state.role = Some(SurfaceRole::SubsurfaceRetired);
-                state.inactive_subsurface = retained.map(Arc::new);
+                state.inactive_contents = retained.map(Arc::new);
             } else {
                 if retained.is_some() {
                     self.runtime
                         .lock()
                         .map_err(|_| "runtime lock poisoned".to_string())?
-                        .detach_inactive_subsurface(SurfaceKey {
+                        .detach_inactive_surface(SurfaceKey {
                             client: self.id,
                             object: surface,
                         });
@@ -4649,12 +4648,9 @@ impl Client {
             .entry(parent)
             .or_insert_with(|| vec![None]);
         stack.push(Some(surface));
-        // The old role object's destruction made the permanent role's current
-        // pixels inactive, not pending. Move them back into the scene now that
-        // a role object exists again. They remain invisible until the parent's
-        // commit applies this new association, but a desynchronized child may
-        // legally replace them before that commit and a second role-object
-        // destruction must be able to take them back out again.
+        // Pre-role or retired-role contents are current, not pending. Restore
+        // them without displaying them before the parent commits this new
+        // association. A child may replace or retire them again beforehand.
         let shared = Arc::clone(&self.runtime);
         let mut runtime = shared
             .lock()
@@ -4844,7 +4840,8 @@ impl Client {
         let was_mapped = self.mapped_charges.contains_key(&id);
         let cursor = state.role == Some(SurfaceRole::Cursor);
         let subsurface = matches!(state.role, Some(SurfaceRole::Subsurface(_)));
-        let inactive_subsurface = state.role == Some(SurfaceRole::SubsurfaceRetired);
+        let inactive_contents =
+            state.role.is_none() || state.role == Some(SurfaceRole::SubsurfaceRetired);
         if state.role == Some(SurfaceRole::XdgRetired) {
             return Err(format!(
                 "wl_surface {id} was committed after its xdg_surface was destroyed"
@@ -5054,8 +5051,6 @@ impl Client {
                     geometry = pending_geometry.take();
                 }
             }
-        } else if state.role.is_none() && attaching_buffer {
-            return Err(format!("wl_surface {id} attached a buffer without a role"));
         }
         if !cursor && !(is_popup && popup.is_none()) {
             if let Some(PendingBuffer::Buffer { buffer, .. }) = &state.pending_buffer {
@@ -5076,12 +5071,12 @@ impl Client {
                 PendingBuffer::Detach { offset } => *offset,
                 PendingBuffer::Buffer { offset, .. } => *offset,
             };
-            if inactive_subsurface {
+            if inactive_contents {
                 match pending {
                     PendingBuffer::Detach { .. } => {
-                        runtime.detach_inactive_subsurface(key);
+                        runtime.detach_inactive_surface(key);
                         self.clear_surface_charge(id);
-                        state.inactive_subsurface = None;
+                        state.inactive_contents = None;
                     }
                     PendingBuffer::Buffer { object, buffer, .. } => {
                         let charge = buffer.declared_charge()?;
@@ -5092,9 +5087,9 @@ impl Client {
                             .unwrap_or_else(BufferCharge::none);
                         let next = client_surface_total(self.mapped_total, prior, charge)?;
                         let surface = Self::copy_buffer(&buffer)?;
-                        runtime.replace_inactive_subsurface(key, charge)?;
+                        runtime.replace_inactive_surface(key, charge)?;
                         self.resources.observe_copied(next);
-                        state.inactive_subsurface = Some(Arc::new(surface));
+                        state.inactive_contents = Some(Arc::new(surface));
                         self.mapped_charges.insert(id, charge);
                         self.mapped_total = next;
                         self.give_back_buffer(object, &buffer)?;
@@ -5309,7 +5304,7 @@ impl Client {
         } else if (input_region_changed || geometry.is_some())
             && !cursor
             && !is_popup
-            && !inactive_subsurface
+            && !inactive_contents
         {
             // No buffer, so the state this commit carries is whichever of the
             // two arrived — the geometry alone being the ordinary opening
@@ -5336,7 +5331,7 @@ impl Client {
             current.pending_input_region = None;
             current.input_region = input_region;
             current.frame_callbacks.clear();
-            current.inactive_subsurface = state.inactive_subsurface;
+            current.inactive_contents = state.inactive_contents;
         }
         Ok(())
     }
@@ -5799,7 +5794,21 @@ impl Client {
                             );
                         }
                     }
+                    // A delayed first cursor request may follow its buffer.
+                    let retained = state.inactive_contents.take();
                     self.objects.insert(surface, Object::Surface(state));
+                    if let Some(retained) = retained {
+                        let image = Arc::try_unwrap(retained).map_err(|_| {
+                            format!("wl_surface {surface} retained a shared inactive cursor image")
+                        })?;
+                        let key = SurfaceKey {
+                            client: self.id,
+                            object: surface,
+                        };
+                        runtime.detach_inactive_surface(key);
+                        self.clear_surface_charge(surface);
+                        runtime.commit_cursor(key, image, (0, 0))?;
+                    }
                     runtime.set_cursor(
                         self.id,
                         Some(CursorRequest {
@@ -6080,6 +6089,17 @@ impl Client {
                     };
                     if state.role.is_some() {
                         return Err(format!("wl_surface {surface} already has a role"));
+                    }
+                    if state.inactive_contents.is_some()
+                        || matches!(state.pending_buffer, Some(PendingBuffer::Buffer { .. }))
+                    {
+                        return self.fail_protocol_on(
+                            message.object,
+                            XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
+                            &format!(
+                                "wl_surface {surface} already has an attached or committed buffer"
+                            ),
+                        );
                     }
                     self.insert(
                         id,
@@ -13012,9 +13032,13 @@ mod tests {
         assert!(observe().contains("commit=2 "), "desync publication was missed");
         runtime.lock().unwrap().capture_public_ppm().unwrap();
         assert!(observe().contains("commit=2 "), "compositor paint counted as client commit");
+        let Some(Object::Surface(retired)) = client.objects.get_mut(&7) else {
+            panic!("missing fixture surface");
+        };
+        retired.role = Some(SurfaceRole::XdgRetired);
         attach_surface(&mut client, 7, 42).unwrap();
         assert!(client.dispatch(request(7, 6, wire::Builder::new()).unwrap(),
-            &mut VecDeque::new()).is_err(), "roleless surface accepted a buffer");
+            &mut VecDeque::new()).is_err(), "retired XDG surface accepted a commit");
         runtime.lock().unwrap().capture_public_ppm().unwrap();
         assert!(observe().contains("commit=2 "), "rejected operation got a number");
         assert!(observe().ends_with("current=no\n"));
@@ -13325,6 +13349,109 @@ mod tests {
     }
 
     #[test]
+    fn unroled_contents_replace_detach_and_gain_subsurface_visibility() {
+        let (mut client, mut peer, runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("unroled-content");
+        let key = SurfaceKey { client: 88, object: 6 };
+        for (buffer, color) in [(40, [0x21, 0x43, 0x65, 0]), (41, [0x76, 0x54, 0x32, 0])] {
+            attach_surface(&mut client, 6, buffer).unwrap();
+            let mut frame = wire::Builder::new();
+            frame.u32(50);
+            client.dispatch(request(6, 3, frame).unwrap(), &mut VecDeque::new()).unwrap();
+            client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new()).unwrap();
+            let replies = receive_messages(&mut peer, 3);
+            assert_eq!(replies.iter().map(|reply| (reply.object, reply.opcode)).collect::<Vec<_>>(),
+                [(buffer, WL_BUFFER_RELEASE), (50, WL_CALLBACK_DONE), (1, 1)]);
+            assert_eq!(client.mapped_total.host_bytes(), 4);
+            assert_eq!(runtime.lock().unwrap().surface_size(key), None);
+            assert!(!runtime.lock().unwrap().layout_snapshot().contains_key(&key));
+            assert!(!fs::read(&framebuffer_path).unwrap().as_chunks::<4>().0.contains(&color));
+        }
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+        assert_eq!(client.mapped_total.host_bytes(), 4);
+        assert!(!fs::read(&framebuffer_path).unwrap().as_chunks::<4>().0
+            .contains(&[0x76, 0x54, 0x32, 0]));
+        client.dispatch(request(5, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        assert!(fs::read(&framebuffer_path).unwrap().as_chunks::<4>().0
+            .contains(&[0x76, 0x54, 0x32, 0]));
+        client.dispatch(request(6, 0, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        assert_eq!(client.mapped_total.host_bytes(), 0);
+        for buffer in [40, 0, 41] {
+            attach_surface(&mut client, 7, buffer).unwrap();
+            client.dispatch(request(7, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new()).unwrap();
+            assert_eq!(client.mapped_total.host_bytes(), if buffer == 0 { 0 } else { 4 });
+        }
+        client.dispatch(request(7, 0, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        assert_eq!(client.mapped_total.host_bytes(), 0);
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn xdg_construction_refuses_pending_and_committed_unroled_buffers() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("unroled-xdg");
+        client.insert(21, Object::XdgWmBase).unwrap();
+        attach_surface(&mut client, 6, 40).unwrap();
+        for committed in [false, true] {
+            if committed {
+                client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new()).unwrap();
+            }
+            let mut xdg = wire::Builder::new();
+            xdg.u32(30);
+            xdg.u32(6);
+            assert!(client.dispatch(request(21, 2, xdg).unwrap(),
+                &mut VecDeque::new()).unwrap_err().contains("attached or committed buffer"));
+            assert_eq!(client.protocol_error_code, XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE);
+            assert_eq!(client.protocol_error_object, Some(21));
+            assert!(!client.objects.contains_key(&30));
+        }
+        // Direct dispatch can recover; production disconnects on either error.
+        attach_surface(&mut client, 6, 0).unwrap();
+        client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        // A pending null attach on this empty core surface carries no buffer.
+        attach_surface(&mut client, 6, 0).unwrap();
+        let mut xdg = wire::Builder::new();
+        xdg.u32(30);
+        xdg.u32(6);
+        client.dispatch(request(21, 2, xdg).unwrap(), &mut VecDeque::new()).unwrap();
+        assert_eq!(client.mapped_total.host_bytes(), 0);
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn unroled_content_enforces_client_and_dimension_bounds_before_copying() {
+        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+            subsurface_fixture("unroled-bounds");
+        fs::write(&pool_path, []).unwrap(); // Any attempted copy would fail.
+        client.mapped_total = BufferCharge::shm(MAX_UI_FRAME_BYTES);
+        attach_surface(&mut client, 6, 40).unwrap();
+        let error = client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap_err();
+        assert!(error.contains("client surfaces need"), "{error}");
+        client.mapped_total = BufferCharge::none();
+        let Some(Object::Buffer(buffer)) = client.objects.get_mut(&40) else {
+            panic!("missing fixture buffer");
+        };
+        buffer.width = 80 * MAX_SURFACE_OUTPUT_MULTIPLIER + 1;
+        attach_surface(&mut client, 6, 40).unwrap();
+        let error = client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap_err();
+        assert!(error.contains("scale-1 output bound"), "{error}");
+        assert_eq!(client.mapped_total.host_bytes(), 0);
+        fs::remove_file(pool_path).unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
     fn retired_subsurface_accepts_commits_and_restores_current_content() {
         let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
             subsurface_fixture("retired-commit");
@@ -13364,7 +13491,7 @@ mod tests {
             client.objects.get(&6),
             Some(Object::Surface(SurfaceState {
                 role: Some(SurfaceRole::SubsurfaceRetired),
-                inactive_subsurface: Some(_),
+                inactive_contents: Some(_),
                 ..
             }))
         ));
@@ -13388,7 +13515,7 @@ mod tests {
             client.objects.get(&6),
             Some(Object::Surface(SurfaceState {
                 role: Some(SurfaceRole::Subsurface(31)),
-                inactive_subsurface: None,
+                inactive_contents: None,
                 ..
             }))
         ));
@@ -13442,7 +13569,7 @@ mod tests {
             client.objects.get(&6),
             Some(Object::Surface(SurfaceState {
                 role: Some(SurfaceRole::Subsurface(32)),
-                inactive_subsurface: None,
+                inactive_contents: None,
                 ..
             }))
         ));
@@ -15645,6 +15772,17 @@ mod tests {
         client
             .insert(6, Object::Region(Arc::new(InputRegion::new())))
             .unwrap();
+        // A displayed surface needs a role; unroled input state stays inert.
+        client.insert(7, Object::XdgWmBase).unwrap();
+        let mut xdg = wire::Builder::new();
+        xdg.u32(8);
+        xdg.u32(5);
+        client.dispatch(request(7, 2, xdg).unwrap(), &mut VecDeque::new()).unwrap();
+        let mut toplevel = wire::Builder::new();
+        toplevel.u32(9);
+        client.dispatch(request(8, 1, toplevel).unwrap(), &mut VecDeque::new()).unwrap();
+        client.dispatch(request(5, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
 
         let mut add = wire::Builder::new();
         for value in [1, 2, 3, 4] {
@@ -15894,9 +16032,9 @@ mod tests {
         fs::write(&pool_path, [1, 2, 3, 0]).unwrap();
         let framebuffer = Framebuffer::test_file(
             &framebuffer_path,
-            80,
+            MAX_CURSOR_DIMENSION + 1,
             crate::scene::least_output_height(8),
-            80 * 4,
+            (MAX_CURSOR_DIMENSION + 1) * 4,
         )
         .unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
@@ -15997,6 +16135,29 @@ mod tests {
             client.objects.get(&5),
             Some(Object::Surface(SurfaceState { role: None, .. }))
         ));
+        let first_buffer = Buffer {
+            serial: 2,
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            pool_charge: Arc::new(AtomicUsize::new(4)),
+            offset: 0,
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: SHM_XRGB8888,
+        };
+        client.insert(14, Object::Buffer(first_buffer)).unwrap();
+        attach_surface(&mut client, 5, 14).unwrap();
+        client.dispatch(request(5, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        let release = receive_messages(&mut peer, 1);
+        assert_eq!((release[0].object, release[0].opcode), (14, 0));
+        assert!(matches!(client.objects.get(&5), Some(Object::Surface(state))
+            if state.role.is_none() && state.inactive_contents.is_some()));
+        assert_eq!(client.mapped_total.host_bytes(), 4);
+        assert_eq!(runtime.lock().unwrap().surface_size(SurfaceKey {
+            client: 2, object: 5,
+        }), None);
+        assert_eq!(runtime.lock().unwrap().cursor_image(), None);
         runtime
             .lock()
             .unwrap()
@@ -16028,6 +16189,9 @@ mod tests {
                 ..
             }))
         ));
+        assert_eq!(client.mapped_total.host_bytes(), 0);
+        assert_eq!(runtime.lock().unwrap().cursor_image(), Some((1, 2, 1, 1)),
+            "valid set_cursor adopts the pre-role pixels without another commit");
         client
             .insert(
                 12,
@@ -16130,6 +16294,53 @@ mod tests {
             Some((1, 2, 1, 1)),
             "the set_cursor hotspot and the committed image reach the scene"
         );
+
+        // This is valid ordinary content but exceeds the cursor dimension cap.
+        let wide = MAX_CURSOR_DIMENSION + 1;
+        let wide_path = pool_path.with_extension("wide");
+        fs::write(&wide_path, vec![1; wide * 4]).unwrap();
+        client.insert(16, Object::Surface(SurfaceState::default())).unwrap();
+        client.insert(17, Object::Buffer(Buffer {
+            serial: 3,
+            file: Arc::new(File::open(&wide_path).unwrap()),
+            pool_charge: Arc::new(AtomicUsize::new(wide * 4)),
+            offset: 0,
+            width: wide,
+            height: 1,
+            stride: wide * 4,
+            format: SHM_XRGB8888,
+        })).unwrap();
+        attach_surface(&mut client, 16, 17).unwrap();
+        client.dispatch(request(16, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        let release = receive_messages(&mut peer, 1);
+        assert_eq!((release[0].object, release[0].opcode), (17, WL_BUFFER_RELEASE));
+        assert_eq!(client.mapped_total.host_bytes(), wide * 4);
+        let mut oversized = wire::Builder::new();
+        oversized.u32(serial);
+        oversized.u32(16);
+        oversized.i32(0);
+        oversized.i32(0);
+        client.dispatch(request(6, 0, oversized).unwrap(), &mut VecDeque::new()).unwrap();
+        assert_eq!(client.mapped_total.host_bytes(), 0);
+        assert!(!client.mapped_charges.contains_key(&16));
+        let oversized_key = SurfaceKey { client: 2, object: 16 };
+        assert_eq!(runtime.lock().unwrap().surface_size(oversized_key), None);
+        assert_eq!(runtime.lock().unwrap().cursor_image(), None);
+        let error = runtime.lock().unwrap().restore_inactive_subsurface(
+            oversized_key,
+            Surface::from_shm_pixels(1, 1, vec![1; 4], SHM_XRGB8888).unwrap(),
+            None,
+        ).unwrap_err();
+        assert!(error.contains("no inactive charge reservation"), "{error}");
+        let mut restore = wire::Builder::new();
+        restore.u32(serial);
+        restore.u32(5);
+        restore.i32(1);
+        restore.i32(2);
+        client.dispatch(request(6, 0, restore).unwrap(), &mut VecDeque::new()).unwrap();
+        assert_eq!(runtime.lock().unwrap().cursor_image(), Some((1, 2, 1, 1)));
+        fs::remove_file(wide_path).unwrap();
 
         // A null surface asks for NO cursor, and it drops the image the
         // client had already committed rather than leaving it standing.

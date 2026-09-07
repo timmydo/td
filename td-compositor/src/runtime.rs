@@ -1059,16 +1059,16 @@ impl Runtime {
         Ok(surface)
     }
 
-    pub fn replace_inactive_subsurface(
+    pub fn replace_inactive_surface(
         &mut self,
         key: SurfaceKey,
         charge: BufferCharge,
     ) -> Result<(), String> {
-        self.scene.replace_inactive_subsurface(key, charge)
+        self.scene.replace_inactive_surface(key, charge)
     }
 
-    pub fn detach_inactive_subsurface(&mut self, key: SurfaceKey) {
-        self.scene.detach_inactive_subsurface(key);
+    pub fn detach_inactive_surface(&mut self, key: SurfaceKey) {
+        self.scene.detach_inactive_surface(key);
     }
 
     pub fn restore_inactive_subsurface(

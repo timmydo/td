@@ -1523,7 +1523,7 @@ one.
 **What buffers cost, per kind.** Nothing counts a surface's bytes any more.
 `Surface::charge` answers a `BufferCharge`, every BUFFER ledger holds one, and
 every buffer ceiling is fed one: the scene's surface total and its
-inactive-subsurface reservations, the per-client cursor allowance, the
+inactive-surface reservations, the per-client cursor allowance, the
 per-client copied-buffer ceiling `client_surface_total` enforces. What a
 ceiling BOUNDS is still a byte count named per kind — `BufferCeiling` carries
 `host_bytes` — so `MAX_SCENE_BYTES` and its neighbours keep their names, and
@@ -3505,6 +3505,30 @@ consuming a role even when socket delivery of the leave is delayed; a valid
 incompatible role uses `wl_pointer.error.role`. Cursor buffers are released as
 soon as their pixels are copied and never enter the tiling scene: a cursor is
 arranged by nothing, focuses nothing and is drawn over everything.
+
+A buffer committed before any role is assigned is retained but undisplayed.
+This matters when the first cursor response arrives after pointer focus has
+left: the ignored `set_cursor` consumes no role, but its following buffer
+commit must not disconnect the client. Such contents share the inactive
+surface storage and the ordinary per-client/scene byte and output-relative
+dimension ceilings with retired subsurfaces. Input regions commit normally;
+callbacks receive done/delete-id at this commit, not at later role
+assignment. Buffer releases follow copying, and no tile or hit target is
+created. Replacement, null attach, surface destruction and disconnect
+refund the same reservations. Stale cursor serials and focus checks are
+unchanged.
+
+A later valid cursor-role assignment transfers the retained image into the
+existing cursor bounds without copying it again; oversized images are
+discarded by the cursor policy, not displayed as windows. A subsurface-role
+assignment restores the image through the existing parent-commit visibility
+rules. Creating an XDG surface while a buffer is pending or retained is
+refused with `xdg_wm_base.error.invalid_surface_state`, preserving XDG's
+bufferless construction/configure handshake. A pending null attach on an
+already empty core surface carries no buffer and does not prevent XDG
+creation. Pre-role attach offsets do not
+adjust a later cursor hotspot: no cursor was selected when those contents
+committed, and the valid `set_cursor` supplies its hotspot anew.
 
 That image is what the pointer PAINTS, at the position the hotspot names —
 the pixel of the image that sits on the pointer's own coordinate, so the

@@ -836,10 +836,9 @@ pub struct Scene {
     pointer_x: i32,
     pointer_y: i32,
     surface_charge: BufferCharge,
-    /// Copied current buffers whose permanent subsurface role temporarily has
-    /// no role object. The server owns the pixels, but this reservation keeps
-    /// them inside the one scene-wide ceiling until they are restored or
-    /// discarded.
+    /// Current pre-role or retired-subsurface pixels owned by the server.
+    /// These reservations keep them inside the shared scene ceiling until
+    /// role assignment or disposal, without making them visible surfaces.
     inactive_surface_charges: BTreeMap<SurfaceKey, BufferCharge>,
     /// What a drag is drawing INSTEAD of `layout`. Not a second source of
     /// truth: it is derived from `layout` on every pointer frame and dropped
@@ -1380,7 +1379,7 @@ impl Scene {
         Ok(Some(surface))
     }
 
-    pub fn replace_inactive_subsurface(
+    pub fn replace_inactive_surface(
         &mut self,
         key: SurfaceKey,
         charge: BufferCharge,
@@ -1410,7 +1409,7 @@ impl Scene {
         Ok(())
     }
 
-    pub fn detach_inactive_subsurface(&mut self, key: SurfaceKey) {
+    pub fn detach_inactive_surface(&mut self, key: SurfaceKey) {
         if let Some(charge) = self.inactive_surface_charges.remove(&key) {
             self.surface_charge = self.surface_charge.saturating_sub(charge);
         }
@@ -1440,7 +1439,7 @@ impl Scene {
     pub fn remove_subsurface(&mut self, key: SurfaceKey) -> bool {
         self.remove_subsurface_association(key);
         let changed = self.discard_pixels(key);
-        self.detach_inactive_subsurface(key);
+        self.detach_inactive_surface(key);
         changed
     }
 
@@ -6867,6 +6866,26 @@ mod tests {
     }
 
     #[test]
+    fn unroled_reservations_share_scene_budget_without_creating_tiles() {
+        let mut scene = Scene::new();
+        let first = SurfaceKey { client: 4, object: 20 };
+        let second = SurfaceKey { client: 5, object: 20 };
+        scene.replace_inactive_surface(first, BufferCharge::shm(MAX_SCENE_BYTES)).unwrap();
+        assert!(!scene.layout.contains(first));
+        assert!(!scene.surfaces.contains_key(&first));
+        assert!(scene.replace_inactive_surface(second, BufferCharge::shm(4)).is_err());
+        assert_eq!(scene.surface_charge.host_bytes(), MAX_SCENE_BYTES);
+        scene.replace_inactive_surface(first, BufferCharge::shm(4)).unwrap();
+        scene.replace_inactive_surface(second, BufferCharge::shm(4)).unwrap();
+        assert_eq!(scene.surface_charge.host_bytes(), 8);
+        scene.remove(first);
+        assert_eq!(scene.surface_charge.host_bytes(), 4);
+        scene.remove_client(5);
+        assert_eq!(scene.surface_charge.host_bytes(), 0);
+        assert!(scene.inactive_surface_charges.is_empty());
+    }
+
+    #[test]
     fn inactive_subsurface_pixels_remain_inside_the_scene_byte_ceiling() {
         let mut scene = Scene::new();
         let parent = SurfaceKey {
@@ -6897,14 +6916,14 @@ mod tests {
         drop(held);
 
         scene
-            .replace_inactive_subsurface(child, BufferCharge::shm(16))
+            .replace_inactive_surface(child, BufferCharge::shm(16))
             .unwrap();
         assert_eq!(
             scene.surface_charge.host_bytes(),
             active_bytes.saturating_sub(48)
         );
         assert!(scene
-            .replace_inactive_subsurface(child, BufferCharge::shm(MAX_SCENE_BYTES))
+            .replace_inactive_surface(child, BufferCharge::shm(MAX_SCENE_BYTES))
             .is_err());
         assert_eq!(
             scene
