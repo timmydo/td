@@ -369,6 +369,12 @@ enum ControlFile {
     Save(u64),
 }
 
+enum ControlAnswer {
+    Done,
+    Dialog(u64),
+    Job(u64),
+}
+
 enum PathAction {
     Open,
     Dictionary,
@@ -1598,10 +1604,19 @@ impl Window {
             tab,
             revision,
             answer,
-        } = request.operation
+        } = &request.operation
         {
-            return match self.control_dialog_answer(dialog, Target { tab, revision }, answer) {
-                Ok(()) => format!("1\t{}\tok\t", request.id),
+            return match self.control_dialog_answer(
+                *dialog,
+                Target {
+                    tab: *tab,
+                    revision: *revision,
+                },
+                answer,
+            ) {
+                Ok(ControlAnswer::Done) => format!("1\t{}\tok\t", request.id),
+                Ok(ControlAnswer::Dialog(id)) => format!("1\t{}\tok\tdialog\t{id}", request.id),
+                Ok(ControlAnswer::Job(id)) => format!("1\t{}\tpending\t{id}", request.id),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
                     error,
@@ -1684,25 +1699,13 @@ impl Window {
                 {
                     return Err(crate::Error::InvalidArgument);
                 }
-                self.ui
-                    .generation()
-                    .checked_add(1)
-                    .ok_or(crate::Error::Exhausted)?;
-                let id = self
-                    .control_jobs
-                    .begin_save(*tab, *revision, path.is_some())?;
-                let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
-                match files.queue_save(&self.ui, *tab, *revision, path.clone()) {
-                    Ok(()) => self.control_file_job = Some(ControlFile::Save(id)),
-                    Err(detail) => {
-                        self.control_jobs
-                            .saved(id, Err(crate::Error::Unavailable))?;
-                        self.notify(format!("Save failed: {detail}"));
-                    }
-                }
-                self.stop_pointer();
-                self.control_mutation_accepted();
-                Ok(id)
+                self.control_save_job(
+                    Target {
+                        tab: *tab,
+                        revision: *revision,
+                    },
+                    path.clone(),
+                )
             })();
             return match result {
                 Ok(id) => format!("1\t{}\tpending\t{id}", request.id),
@@ -1839,12 +1842,43 @@ impl Window {
         }
     }
 
+    fn control_save_job(&mut self, target: Target, path: Option<PathBuf>) -> crate::Result<u64> {
+        if self.files.is_none()
+            || self.files.as_ref().is_some_and(|files| files.busy())
+            || self.control_file_job.is_some()
+        {
+            return Err(crate::Error::Unavailable);
+        }
+        self.ui
+            .editor()
+            .revision_point(target.tab, target.revision)?;
+        self.ui
+            .generation()
+            .checked_add(1)
+            .ok_or(crate::Error::Exhausted)?;
+        let id = self
+            .control_jobs
+            .begin_save(target.tab, target.revision, path.is_some())?;
+        let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
+        match files.queue_save(&self.ui, target.tab, target.revision, path) {
+            Ok(()) => self.control_file_job = Some(ControlFile::Save(id)),
+            Err(detail) => {
+                self.control_jobs
+                    .saved(id, Err(crate::Error::Unavailable))?;
+                self.notify(format!("Save failed: {detail}"));
+            }
+        }
+        self.stop_pointer();
+        self.control_mutation_accepted();
+        Ok(id)
+    }
+
     fn control_dialog_answer(
         &mut self,
         dialog: u64,
         target: Target,
-        answer: crate::control::DialogAnswer,
-    ) -> crate::Result<()> {
+        answer: &crate::control::DialogAnswer,
+    ) -> crate::Result<ControlAnswer> {
         if self.closed || self.files.is_none() {
             return Err(crate::Error::Unavailable);
         }
@@ -1867,6 +1901,7 @@ impl Window {
                 if self.closing_save
                     || self.prompt.is_some()
                     || self.files.as_ref().is_some_and(|files| files.busy())
+                    || self.control_file_job.is_some()
                 {
                     return Err(crate::Error::Unavailable);
                 }
@@ -1876,9 +1911,61 @@ impl Window {
                     .ok_or(crate::Error::Exhausted)?;
                 self.discard_close(target)?;
             }
+            crate::control::DialogAnswer::Save => {
+                if self.closing_save
+                    || self.prompt.is_some()
+                    || self.files.as_ref().is_some_and(|files| files.busy())
+                    || self.control_file_job.is_some()
+                {
+                    return Err(crate::Error::Unavailable);
+                }
+                if self
+                    .files
+                    .as_ref()
+                    .is_some_and(|files| files.associated(target.tab))
+                {
+                    return self.control_close_save_job(target, None);
+                }
+                self.ui
+                    .generation()
+                    .checked_add(1)
+                    .ok_or(crate::Error::Exhausted)?;
+                // The ordinary close Save flow asks for a path for untitled tabs.
+                if !self.file_request("save", target.tab, target.revision) {
+                    self.close_failed();
+                    return Err(crate::Error::Unavailable);
+                }
+                self.control_mutation_accepted();
+                return Ok(ControlAnswer::Dialog(dialog));
+            }
+            crate::control::DialogAnswer::Path(path) => {
+                if self.closing_save
+                    || !self.prompt.as_ref().is_some_and(|prompt| {
+                        matches!(prompt.action, PathAction::Save { tab, revision }
+                        if tab == target.tab && revision == target.revision)
+                    })
+                {
+                    return Err(crate::Error::Unavailable);
+                }
+                return self.control_close_save_job(target, Some(path.clone()));
+            }
         }
         self.control_mutation_accepted();
-        Ok(())
+        Ok(ControlAnswer::Done)
+    }
+
+    fn control_close_save_job(
+        &mut self,
+        target: Target,
+        path: Option<PathBuf>,
+    ) -> crate::Result<ControlAnswer> {
+        let id = self.control_save_job(target, path)?;
+        self.prompt = None;
+        self.closing_save = self.files.as_ref().is_some_and(|files| files.busy());
+        if !self.closing_save {
+            self.close_failed();
+        }
+        Ok(ControlAnswer::Job(id))
     }
 
     fn control_dialog_fields(&self) -> String {
@@ -1894,9 +1981,9 @@ impl Window {
         let (phase, answers) = if self.closing_save {
             ("saving", "cancel")
         } else if self.prompt.is_some() {
-            ("path", "cancel")
+            ("path", "cancel+path")
         } else {
-            ("question", "cancel+discard")
+            ("question", "cancel+discard+save")
         };
         match close.next(self.ui.editor()) {
             Ok(Some(target)) => fields.push_str(&format!(
@@ -1927,7 +2014,7 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-save\tnative={},{},{},{}",
+                    "\tadapter=native-close-save\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.configured),
@@ -5539,7 +5626,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-save\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-close-save\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -6061,6 +6148,326 @@ mod tests {
     }
 
     #[test]
+    fn remote_close_save_targets_unfocused_dialog_and_writes_before_closing() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let file = directory.path("draft");
+        std::fs::write(&file, b"disk").unwrap();
+        let (mut w, peer) = file_dialog_fixture();
+        w.files.as_mut().unwrap().open(file.clone()).unwrap();
+        finish_file(&mut w);
+        w.chord("a", false).unwrap();
+        w.close_tab(2, 1);
+        configure(&mut w, 100, 80);
+        let device = w.device.unwrap();
+        w.event(message(device, 2, &[99, SURFACE])).unwrap();
+        assert!(!w.input.focused && !w.close_answer_visible());
+        w.close_chord("C-s", false);
+        assert!(!w.files.as_ref().unwrap().busy());
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        let before = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        for (answer, code) in [
+            ("0\t2\t1\tsave", "invalid-argument"),
+            ("2\t2\t1\tsave", "invalid-argument"),
+            ("1\t1\t1\tsave", "invalid-argument"),
+            ("1\t2\t0\tsave", "stale-revision"),
+            ("1\t2\t1\tpath\t61", "unavailable"),
+        ] {
+            assert!(job_request(
+                &mut w,
+                &peer,
+                &socket,
+                &format!("1\t1\tdialog-answer\t{answer}")
+            )
+            .contains(&format!("\terror\t{code}\t")));
+            assert_eq!(job_request(&mut w, &peer, &socket, "1\t0\tstate"), before);
+        }
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t2\tdialog-answer\t1\t2\t1\tsave"),
+            "1\t2\tpending\t1"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+        assert!(w
+            .control_dialog_fields()
+            .contains("1,close-tab,saving,2,1,cancel"));
+        for answer in ["save", "discard", "path\t61"] {
+            assert!(job_request(
+                &mut w,
+                &peer,
+                &socket,
+                &format!("1\t3\tdialog-answer\t1\t2\t1\t{answer}")
+            )
+            .contains("\terror\tunavailable\t"));
+        }
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(file).unwrap(), b"adisk");
+        assert!(w.ui.editor().document(2).is_err());
+        assert_eq!(w.ui.editor().active(), Some(1));
+        assert!(w.closing.is_none());
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=1,save,2,1,0,complete,-"));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_close_path_preserves_live_identity_and_targets_inactive_window_tabs() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let first = directory.path("first");
+        let second = directory
+            .0
+            .join(std::ffi::OsString::from_vec(b"second-\xff".to_vec()));
+        let (mut w, peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        w.ui.dispatch(Event::New).unwrap();
+        w.chord("b", false).unwrap();
+        w.close();
+        configure(&mut w, 100, 80);
+        let device = w.device.unwrap();
+        w.event(message(device, 2, &[99, SURFACE])).unwrap();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        for (tab, destination, bytes) in [(2, &second, b"b"), (1, &first, b"a")] {
+            assert_eq!(w.ui.editor().active(), Some(2));
+            assert_eq!(
+                job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    &format!("1\t1\tdialog-answer\t1\t{tab}\t1\tsave")
+                ),
+                "1\t1\tok\tdialog\t1"
+            );
+            assert!(w
+                .control_dialog_fields()
+                .contains(&format!("1,close-window,path,{tab},1,cancel+path")));
+            w.prompt.as_mut().unwrap().text = "partial native entry".into();
+            let before = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+            for (args, code) in [
+                (format!("1\t{tab}\t1\tsave"), "unavailable"),
+                (format!("1\t{tab}\t1\tdiscard"), "unavailable"),
+                (format!("1\t{tab}\t0\tpath\t61"), "stale-revision"),
+                (format!("2\t{tab}\t1\tpath\t61"), "invalid-argument"),
+            ] {
+                assert!(job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    &format!("1\t2\tdialog-answer\t{args}")
+                )
+                .contains(&format!("\terror\t{code}\t")));
+                assert_eq!(job_request(&mut w, &peer, &socket, "1\t0\tstate"), before);
+                assert_eq!(w.prompt.as_ref().unwrap().text, "partial native entry");
+            }
+            let command = format!(
+                "1\t3\tdialog-answer\t1\t{tab}\t1\tpath\t{}",
+                crate::control::hex(destination.as_os_str().as_encoded_bytes())
+            );
+            assert_eq!(
+                job_request(&mut w, &peer, &socket, &command),
+                format!("1\t3\tpending\t{}", 3 - tab)
+            );
+            assert!(w.prompt.is_none());
+            assert!(!destination.exists());
+            finish_file(&mut w);
+            assert_eq!(std::fs::read(destination).unwrap(), bytes);
+            assert_eq!(w.last_dialog_id, 1);
+            if tab == 2 {
+                assert!(!w.closed);
+                assert!(!w.ui.editor().document(2).unwrap().dirty());
+                assert!(w
+                    .control_dialog_fields()
+                    .contains("1,close-window,question,1,1,cancel+discard+save"));
+            }
+        }
+        assert!(w.closed);
+        // Whole-window exit retains the model until the Window owner drops.
+        assert_eq!(w.ui.editor().tabs().count(), 2);
+        assert!(w.ui.editor().tabs().all(|(_, doc)| !doc.dirty()));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_close_save_cancel_keeps_accepted_jobs_and_later_edits() {
+        for (handoff, edit) in [(false, false), (false, true), (true, true)] {
+            let directory = DialogDirectory::new();
+            let file = directory.path("draft");
+            std::fs::write(&file, b"disk").unwrap();
+            let (mut w, _peer) = file_dialog_fixture();
+            w.files.as_mut().unwrap().open(file.clone()).unwrap();
+            finish_file(&mut w);
+            w.chord("a", false).unwrap();
+            w.close_tab(2, 1);
+            let answer = |action: &str| {
+                crate::control::Request::parse(
+                    format!("1\t1\tdialog-answer\t1\t2\t1\t{action}").as_bytes(),
+                )
+                .unwrap()
+            };
+            assert_eq!(w.control_response(&answer("save")), "1\t1\tpending\t1");
+            if handoff {
+                w.tick(w.clock, false).unwrap();
+            }
+            assert_eq!(w.control_response(&answer("cancel")), "1\t1\tok\t");
+            assert!(w.files.as_ref().unwrap().busy());
+            assert!(w.closing.is_none() && !w.closing_save);
+            if edit {
+                w.chord("b", false).unwrap();
+            }
+            finish_file(&mut w);
+            let doc = w.ui.editor().document(2).unwrap();
+            assert_eq!(doc.text(), if edit { "abdisk" } else { "adisk" });
+            assert_eq!(doc.dirty(), edit);
+            assert!(!w.closed);
+            let stale = !handoff && edit;
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                if stale {
+                    b"disk".as_slice()
+                } else {
+                    b"adisk".as_slice()
+                }
+            );
+            let state =
+                w.control_response(&crate::control::Request::parse(b"1\t0\tstate").unwrap());
+            assert!(state.contains(if stale {
+                "job=1,save,2,1,0,error,stale-revision"
+            } else {
+                "job=1,save,2,1,0,complete,-"
+            }));
+        }
+    }
+
+    #[test]
+    fn remote_close_save_refusals_keep_prompt_and_approvals() {
+        for guard in ["generation", "jobs"] {
+            let (mut w, _peer) = file_dialog_fixture();
+            w.chord("a", false).unwrap();
+            w.close_tab(1, 1);
+            let request = |action: &str| {
+                crate::control::Request::parse(
+                    format!("1\t1\tdialog-answer\t1\t1\t1\t{action}").as_bytes(),
+                )
+                .unwrap()
+            };
+            assert_eq!(w.control_response(&request("save")), "1\t1\tok\tdialog\t1");
+            w.prompt.as_mut().unwrap().text = "keep entry".into();
+            if guard == "generation" {
+                w.ui.generation_for_test(u64::MAX);
+            } else {
+                w.control_jobs.exhaust_for_test();
+            }
+            let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+            let before = w.control_response(&state);
+            let notice = w.notice.clone();
+            assert!(w
+                .control_response(&request("path\t61"))
+                .contains("\terror\texhausted\t"));
+            assert_eq!(w.control_response(&state), before);
+            assert_eq!(w.notice, notice);
+            assert_eq!(w.prompt.as_ref().unwrap().text, "keep entry");
+            assert!(!w.files.as_ref().unwrap().busy());
+            assert!(w.closing.is_some());
+        }
+    }
+
+    #[test]
+    fn remote_close_save_failures_retain_tabs_and_cancel_the_close_plan() {
+        for associated in [false, true] {
+            let directory = DialogDirectory::new();
+            let file = directory.path("draft");
+            std::fs::write(&file, b"disk").unwrap();
+            let (mut w, _peer) = file_dialog_fixture();
+            let tab = if associated {
+                w.files.as_mut().unwrap().open(file.clone()).unwrap();
+                finish_file(&mut w);
+                2
+            } else {
+                1
+            };
+            w.chord("a", false).unwrap();
+            w.close_tab(tab, 1);
+            let request = |action: &str| {
+                crate::control::Request::parse(
+                    format!("1\t1\tdialog-answer\t1\t{tab}\t1\t{action}").as_bytes(),
+                )
+                .unwrap()
+            };
+            if associated {
+                std::fs::write(&file, b"external").unwrap();
+                assert_eq!(w.control_response(&request("save")), "1\t1\tpending\t1");
+            } else {
+                assert_eq!(w.control_response(&request("save")), "1\t1\tok\tdialog\t1");
+                let path = format!(
+                    "path\t{}",
+                    crate::control::hex(file.as_os_str().as_encoded_bytes())
+                );
+                assert_eq!(w.control_response(&request(&path)), "1\t1\tpending\t1");
+            }
+            finish_file(&mut w);
+            assert!(w.closing.is_none() && w.prompt.is_none() && !w.closing_save && !w.closed);
+            assert_eq!(w.conflict.is_some(), associated);
+            assert!(w.ui.editor().document(tab).unwrap().dirty());
+            assert_eq!(
+                w.ui.editor().document(tab).unwrap().text(),
+                if associated { "adisk" } else { "a" }
+            );
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                if associated {
+                    b"external".as_slice()
+                } else {
+                    b"disk".as_slice()
+                }
+            );
+            let state =
+                w.control_response(&crate::control::Request::parse(b"1\t0\tstate").unwrap());
+            assert!(state.contains(&format!(
+                "job=1,{},{tab},1,0,error,unavailable",
+                if associated { "save" } else { "save-as" }
+            )));
+            assert!(w
+                .control_response(&request("save"))
+                .contains("\terror\tunavailable\t"));
+        }
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        w.close_tab(1, 1);
+        let request = |action: &str| {
+            crate::control::Request::parse(
+                format!("1\t1\tdialog-answer\t1\t1\t1\t{action}").as_bytes(),
+            )
+            .unwrap()
+        };
+        assert_eq!(w.control_response(&request("save")), "1\t1\tok\tdialog\t1");
+        w.files = Some(crate::session::Session::disconnected_for_test());
+        // Poll observes the failed worker before admission: the accepted job ID
+        // reports immediate startup failure and the native close plan is cleared.
+        w.tick(w.clock, false).unwrap();
+        assert_eq!(w.control_response(&request("path\t61")), "1\t1\tpending\t1");
+        assert!(w.closing.is_none() && w.prompt.is_none() && !w.closing_save);
+        assert!(w.control_file_job.is_none());
+        assert!(w.ui.editor().document(1).unwrap().dirty());
+        assert!(w
+            .control_response(&crate::control::Request::parse(b"1\t0\tstate").unwrap())
+            .contains("job=1,save-as,1,1,0,error,unavailable"));
+    }
+
+    #[test]
     fn remote_close_dialog_ids_and_revisions_guard_unfocused_discard() {
         use std::os::unix::fs::PermissionsExt;
         let directory = DialogDirectory::new();
@@ -6082,7 +6489,7 @@ mod tests {
             "1\t1\tok\tdialog\t1"
         );
         let state = job_request(&mut w, &peer, &path, "1\t0\tstate");
-        assert!(state.contains("\tdialog=1,close-tab,question,2,1,cancel+discard\t"));
+        assert!(state.contains("\tdialog=1,close-tab,question,2,1,cancel+discard+save\t"));
         assert_eq!(format!("{:?}", w.ui.editor()), documents);
         assert_eq!(
             job_request(&mut w, &peer, &path, "1\t2\tdialog-answer\t1\t2\t1\tcancel"),
@@ -6158,7 +6565,7 @@ mod tests {
         };
         assert!(w
             .control_dialog_fields()
-            .contains("dialog=1,close-window,question,2,1,cancel+discard"));
+            .ends_with("dialog=1,close-window,question,2,1,cancel+discard+save"));
         assert_eq!(
             w.control_response(&request("1\t2\t1\tdiscard")),
             "1\t1\tok\t"
@@ -6166,7 +6573,7 @@ mod tests {
         assert_eq!(format!("{:?}", w.ui.editor()), before);
         assert!(w
             .control_dialog_fields()
-            .contains("dialog=1,close-window,question,1,1,cancel+discard"));
+            .ends_with("dialog=1,close-window,question,1,1,cancel+discard+save"));
         assert!(w
             .control_response(&request("1\t2\t1\tdiscard"))
             .contains("\terror\tinvalid-argument\t"));
@@ -6181,7 +6588,7 @@ mod tests {
         w.close_chord("C-d", false); // Physical approval advances the remotely visible target.
         assert!(w
             .control_dialog_fields()
-            .contains("dialog=2,close-window,question,1,1,cancel+discard"));
+            .ends_with("dialog=2,close-window,question,1,1,cancel+discard+save"));
         assert_eq!(
             w.control_response(&request("2\t1\t1\tdiscard")),
             "1\t1\tok\t"
@@ -6306,7 +6713,7 @@ mod tests {
         path_window.close_chord("C-s", false);
         assert!(path_window
             .control_dialog_fields()
-            .contains("dialog=1,close-tab,path,2,1,cancel"));
+            .ends_with("dialog=1,close-tab,path,2,1,cancel+path"));
         let before = path_window.control_dialog_fields();
         assert!(path_window
             .control_response(&request("discard"))
@@ -7667,7 +8074,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-save\t"));
+            assert!(response.contains("\tadapter=native-close-save\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

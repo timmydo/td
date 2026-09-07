@@ -9,8 +9,8 @@ const HELP: &str = concat!(
     "Window option: --control-socket PATH enables private state/text and edits.\n",
     "Control edits and queued Save/Save As check expected revisions.\n",
     "Control Open queues a file job; state reports its resulting tab and revision.\n",
-    "Control can read/edit tabs and answer live Close/Quit with Cancel/Discard.\n",
-    "Remote Discard also answers human-opened dialogs, without physical focus.\n",
+    "Control answers live Close/Quit with Cancel/Discard/Save and Save As paths.\n",
+    "Remote control answers human-opened dialogs, without physical focus.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -179,7 +179,7 @@ mod tests {
             "private state/text and edits",
             "queued Save/Save As check expected revisions",
             "Control Open queues a file job",
-            "answer live Close/Quit with Cancel/Discard",
+            "answers live Close/Quit with Cancel/Discard/Save and Save As paths",
             "human-opened dialogs, without physical focus",
         ] {
             assert!(HELP.contains(feature), "{feature}");

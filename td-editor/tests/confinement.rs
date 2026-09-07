@@ -441,18 +441,20 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         production.matches("self.control_file_job.take()").count(),
         1
     );
-    assert!(dispatch.contains("files.queue_save(&self.ui, *tab, *revision, path.clone())"));
+    assert!(dispatch.contains("self.control_save_job("));
     assert!(!dispatch.contains("files.save("));
-    let save = dispatch
-        .split("if let crate::control::Operation::Save {")
+    let save = production
+        .split("fn control_save_job(")
         .nth(1)
         .unwrap()
-        .split("if let crate::control::Operation::Open(path)")
+        .split("\n    fn ")
         .next()
         .unwrap();
+    assert!(save.contains("files.queue_save(&self.ui, target.tab, target.revision, path)"));
     assert!(save.find("files.busy()").unwrap() < save.find(".begin_save(").unwrap());
     assert!(save.find(".checked_add(1)").unwrap() < save.find(".begin_save(").unwrap());
     assert!(save.find(".begin_save(").unwrap() < save.find("files.queue_save(").unwrap());
+    assert!(!save.contains("files.save("));
     let session = include_str!("../src/session.rs")
         .split("#[cfg(test)]")
         .next()
@@ -483,6 +485,8 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(answer.contains("current.revision != target.revision"));
     assert!(answer.contains("self.discard_close(target)?"));
     assert!(answer.contains("self.cancel_close()"));
+    assert!(answer.contains("self.control_close_save_job(target, None)"));
+    assert!(answer.contains("self.control_close_save_job(target, Some(path.clone()))"));
     assert!(!answer.contains("Event::"));
     assert!(!answer.contains("close_answer_visible"));
     assert!(!dispatch.contains("Event::Discard"));

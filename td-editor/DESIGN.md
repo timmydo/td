@@ -28,8 +28,9 @@ acknowledgement are connected. Remote Check Spelling returns a job ID with
 bounded completion/error/cancellation history in native state. Remote New
 creates an ordinary empty tab and returns its stable ID. Remote Open and
 revision-pinned Save/Save As use the ordinary file worker and bounded job
-history. Other dialog answers remain unimplemented. Remote Close Tab, Quit and
-live close-dialog Cancel/Discard use the ordinary close coordinator.
+history. Remote Close Tab, Quit and live close-dialog Cancel/Discard/Save/path
+answers use the ordinary close coordinator. Other dialog answers remain
+unimplemented.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -1104,14 +1105,15 @@ by `Event::Discard`, which rechecks its editor/revision binding before
 removing a tab. The controller's generation admission still precedes mutation.
 The window's single-threaded dispatcher supplies explicit choices; there is
 no wire shortcut for minting a permit. Remote Close Tab, Quit and
-Cancel/Discard now use this coordinator with a checked window-local dialog
-ID plus current question tab/revision. A trusted control client may answer
-while unfocused,
-without a synchronized seat/keymap, or with a clipped prompt: its explicit
+Cancel/Discard/Save/path use this coordinator with a checked window-local
+dialog ID plus current question tab/revision. A trusted control client may
+answer while unfocused, without a synchronized seat/keymap, or with a clipped
+prompt: its explicit
 live-token answer is the authority, not synthetic physical input. Physical
 confirmation retains its visibility/input requirements. This approved remote
-policy also governs future Save/path answers; CONTROL.md defines the current
-Cancel/Discard subset and its refusal, phase and shutdown semantics.
+policy governs Save/path answers too. They queue the same revision-pinned
+remote Save jobs; untitled Save first asks for a literal path with the same
+dialog ID. CONTROL.md defines refusal, phase, handoff and shutdown semantics.
 
 Window-close discard approvals are deferred: no tab is removed and no dirty
 state is cleared while further decisions remain. Cancel drops the approvals
@@ -2128,8 +2130,8 @@ transport-lifetime semantics. Remote New uses the ordinary controller event,
 returns the created tab ID, and preserves existing text and file associations.
 It has no revision target or file authority; CONTROL.md pins its non-idempotent
 admission and refusal rules. Remote Close Tab, Quit and close-dialog
-Cancel/Discard are connected, with IDs shared by physical and remote close
-and deferred window-close approvals. Remote Open uses the ordinary file
+Cancel/Discard/Save/path are connected, with IDs shared by physical and remote
+close and deferred window-close approvals. Remote Open uses the ordinary file
 worker and shares the bounded job history with spelling. Completion captures
 the exact selected/created tab and revision before later UI actions.
 Duplicate Open retains edits and missing files remain unwritten.
@@ -2143,6 +2145,10 @@ conflict/new-destination policy stay on the ordinary file/controller path.
 Shared historical job rows retain the requested tab/revision; CONTROL.md
 defines coarse I/O failures and possible publication despite an error.
 Direct Save needs an association and Save As takes an explicit OS-byte path.
+Close-dialog Save may instead open the ordinary path entry; an explicit Path
+answer queues Save As for the coordinator's target, including an inactive tab
+in a window close. Cancel never rolls back accepted saves; queued revision
+validation and immutable post-handoff snapshots still apply.
 Other dialog answers remain unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.

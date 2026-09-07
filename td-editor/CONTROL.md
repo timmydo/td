@@ -3,7 +3,7 @@
 The experimental `--window --control-socket PATH` endpoint implements the
 query and revision-checked editing subset below. It is off by default;
 scratch preview and replay do not accept the option. Remote Close Tab, Quit and
-close-dialog Cancel/Discard and file Open/Save/Save As are connected;
+close-dialog Cancel/Discard/Save/path and file Open/Save/Save As are connected;
 other dialog answers remain unimplemented. Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
@@ -66,7 +66,8 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID save-as TAB REVISION HEX_PATH` | Queue a revision-pinned save to a new destination. |
 | `1 ID close-tab TAB REVISION` | Start ordinary active-tab close, without approving discard. |
 | `1 ID quit` | Start ordinary whole-window close, without approving discard. |
-| `1 ID dialog-answer DIALOG TAB REVISION ANSWER` | Answer the current close question with `cancel` or `discard`. |
+| `1 ID dialog-answer DIALOG TAB REVISION ANSWER` | Answer the live close question with `cancel`, `discard` or `save`. |
+| `1 ID dialog-answer DIALOG TAB REVISION path HEX_PATH` | Supply a literal path for close-driven Save As. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
@@ -169,7 +170,7 @@ separately. No path, title or document bytes are retained in job rows. The
 same eviction and transport-lifetime rules as spelling apply. In particular,
 disconnect or a lost reply cannot cancel an admitted Open, and clients must
 not blindly retry it. Native Open/dictionary/Save operations do not create
-remote job rows. Remote path/conflict answers remain later work.
+remote job rows. Remote conflict and non-close path answers remain later work.
 
 ## Save and Save As jobs
 
@@ -225,8 +226,9 @@ partially succeeded, so inspect the native warning and destination before
 retrying. Only a revision/identity rejection before handoff proves that this
 job submitted no write. Terminal rows, eviction and transport ambiguity use
 the shared job contract. Ordinary conflict dialogs may appear after Save
-fails; remote conflict/reload answers and close-dialog Save/path answers
-remain unimplemented. No force answer or conflict bypass is added.
+fails; remote conflict/reload answers remain unimplemented. Close-driven
+Save/path answers below share these jobs. No force answer or conflict bypass
+is added.
 
 ## Close requests and dialog answers
 
@@ -262,8 +264,9 @@ Native state adds `dialog-last=N`, initially zero, and exactly one
 `dialog=ID,SCOPE,PHASE,TAB,REVISION,ANSWERS` field, or `dialog=-` when no close
 coordinator exists. `SCOPE` is `close-tab` or `close-window`; `PHASE` is
 `question`, `path` (Save As entry during closing), or `saving`. The answers
-are `cancel+discard` for a question and `cancel` for path/saving. An invalid
-coordinator reports `invalid,-,-,-` after scope and offers no remote answer.
+are `cancel+discard+save` for a question, `cancel+path` for path entry, and
+`cancel` while saving. An invalid coordinator reports `invalid,-,-,-` after
+scope and offers no remote answer.
 This covers stale pinned targets and a defensive no-question fallback;
 ordinary completion removes a fully answered coordinator synchronously,
 before the next control request. The coarse native file-busy flag remains
@@ -288,8 +291,8 @@ or a coordinator invalidated by later text is `stale-revision`. A vanished
 pinned tab may report `missing-tab`. The existing coordinator revalidates
 every pinned model point, not just the named tab. Repeated answers cannot
 approve the next window-close target. Missing fields are `protocol`;
-unsupported/case-mismatched answers, including a `save` dialog answer, are
-`invalid-argument`. Fields are decoded left to right, so an invalid answer
+unsupported/case-mismatched answers are `invalid-argument`. Fields are decoded
+left to right, so an invalid answer
 precedes a trailing-field error; an otherwise valid answer with extra fields
 is `protocol`. No force/discard bypass exists.
 
@@ -300,8 +303,8 @@ visibility conditions. This does not fabricate input state or a physical
 serial. The remote authority is the private control endpoint plus an explicit
 answer bound to the live dialog, tab and revision. This includes a dialog
 opened by a human through ordinary input or the window manager; the client
-need not have opened it. The same policy will apply to future remote
-Save/path answers; those are not implemented by this subset.
+need not have opened it. Save and close-driven path answers use this same
+approved policy; they do not fabricate key events or physical serials.
 
 `discard` is accepted only in the question phase, with no pending file work,
 and prechecks room for its possible controller dispatch. It invokes the same
@@ -313,13 +316,43 @@ it drops the close coordinator and its path entry, but never cancels or rolls
 back an accepted write. Completed saves stay saved and later edits stay dirty.
 Neither answer alters the physical confirmation checks.
 
-Answer success is `1 ID ok` plus a trailing Tab. It acknowledges that explicit
-choice, not file persistence or presentation; state may now name the next
-question or no dialog. Queries are immutable. Rare admitted coordinator
+Cancel/Discard success is `1 ID ok` plus a trailing Tab. It acknowledges that
+explicit choice, not file persistence or presentation; state may now name
+the next question or no dialog. Queries are immutable. Rare admitted coordinator
 completion failures report their error and retain unapproved text, but may
 clear the failed dialog and update its native diagnostic; they are not
-side-effect-free validation refusals. Conflict/reload answers and
-close-dialog Save/path answers remain later work.
+side-effect-free validation refusals. Conflict/reload and non-close path
+answers remain later work.
+
+`dialog-answer DIALOG TAB REVISION save` is accepted only in the question
+phase with no pending file work. An associated target queues the same remote
+Save described above and returns `1 ID pending JOB`. An untitled target
+instead opens the ordinary close-driven path entry and returns
+`1 ID ok dialog DIALOG` with Tab separators and no trailing Tab, retaining
+the same coordinator ID without reserving
+a job. The target may be inactive during a whole-window close; only the
+coordinator's current question can authorize it, never the selected tab.
+
+`dialog-answer DIALOG TAB REVISION path HEX_PATH` is accepted only for that
+coordinator's live Save path entry. The explicit literal OS-byte path replaces
+any partially typed entry and follows Open/Save As's 1..4096-byte, non-NUL
+hex encoding. Path bytes are redacted in Debug and never serialized in state.
+It queues Save As and returns `1 ID pending JOB`. Busy or exhausted-counter
+refusals retain the exact path entry and close plan, without reserving a job.
+Neither Save in path/saving phases nor Path in question/saving phases is
+accepted; these phase refusals are `unavailable`. Path is not a general
+answer for native Open, Dictionary or non-close Save As prompts.
+
+Both save paths reserve capacity/counters before admission and recheck the
+owner-bound revision at handoff; subsequent writes use immutable snapshots.
+Accepted jobs use the same `save`/`save-as` historical rows as direct commands.
+Completion advances the existing close plan only while it remains live;
+file failure cancels closing and retains tabs, with the ordinary diagnostic
+and possible conflict prompt. Cancel drops the plan, not the accepted job:
+without an edit the queued write still proceeds; an edit before handoff makes
+it stale, while an edit after handoff remains unsaved. Successful earlier
+saves are not rolled back. A final save can exit the window before its job
+outcome is queried; a pending reply or connection EOF is not persistence proof.
 
 ## Revision-checked editing
 
@@ -712,7 +745,7 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-save` | Explicit implemented adapter identity. |
+| `adapter=native-close-save` | Explicit implemented adapter identity. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |
