@@ -372,15 +372,64 @@ with only local packages succeeds with zero registry transfers. The shared
 files without blocking before rejecting their type. Neither command starts a daemon or copies host Cargo configuration. They
 report Git package counts explicitly and never attempt a Git transport.
 
-These commands transfer registry archives only. They do not extract sources,
-remove unrelated destination files, write a `.warm-complete` marker, or claim
-a complete build workspace. Use a private destination for each selected lock.
-Automatic warm-job selection and vendor-set publication still need integration;
-until then, invoking an ordinary host `warm` command inside a guest can still
-fetch upstream. `warm sources` likewise remains a host producer operation,
-including when `TD_FEED_BASE` is set. Reviewed Git-source archives and other
-declared transfer objects remain visible coverage gaps wherever they are not
-already exposed by the recipe source-pin table.
+The explicit `cargo LOCK ARCHIVES` commands transfer registry archives only.
+They do not extract sources, remove unrelated destination files, or write a
+`.warm-complete` marker. Use a private destination for each selected lock.
+
+For automatic recipe selection and vendor preparation, use `td-feed export
+vendors [TARGET]` on the host and `td-feed consume vendors [TARGET]` in the
+guest. The default target is `system-x86-64`. Both use the checkout's existing
+`td-recipe-eval vendor-warm-args` roster; an unplannable declared vendor fails
+the roster instead of silently dropping that recipe. The same builder/evaluator
+prerequisite as source-pin resolution applies. The current system closure
+selects five jobs: uutils, ripgrep, fd, Codex, and td-net.
+
+Export publishes the jobs' root source archives as well as their locked
+registry archives. Source archives come from the existing source cache; a
+packaged crate can also reuse its warm job's retained `work/NAME-VERSION.crate`.
+It never warms missing inputs or fetches upstream. A local crate uses its own
+lock, a fixed-output workspace uses its committed recipe lock, and a packaged
+crate uses the lock shipped in its pinned archive, matching ordinary warming.
+
+Consume stages a fresh private generated cache for each recipe. It reuses
+verified private archives before contacting the host and obtains missing bytes
+only from the selected feed. For a packaged crate, it retains the verified
+original archive for repeat preparation and existing warm-tool probes, and
+reads only bounded Cargo.lock
+and Cargo.toml members through tar's stdout; preparation does not extract the
+archive's arbitrary paths into the filesystem. The tar and planner subprocesses
+have bounded output and a two-minute deadline. This increment requires `tar` on the consumer, in addition to the
+builder/evaluator prerequisite; the stock image does not yet expose it.
+Missing tar is a named preparation error. The existing target-built build
+path authenticates and extracts its source archive from the source cache;
+`consume sources` supplies that cache separately.
+
+Only a complete registry set with the selected lock digest receives the
+`.warm-complete` marker. A changed local lock refuses publication. Preparation
+keeps the previous generated cache until the complete staged directory can
+replace it; retry restores a retained previous directory after interruption
+or removes it after a successful replacement. A reader can briefly find the
+current directory absent during replacement and should retry. Export, consume,
+and ordinary Cargo warm jobs share a per-recipe preparation lock with a bounded
+wait, so they do not overwrite one another's generated state. These operations
+replace generated `.td-build-cache/crate-vendor/RECIPE` state, never the user's
+source checkout. The builder's early td-net preparation uses the same
+`warm crate-local` operation and canonical `RECIPE/vendor` layout; it no longer
+writes a separate flat archive cache. Existing host caches need that ordinary
+warm operation before export if they contain only the retired flat layout.
+A published cache remains successful if old-backup cleanup fails: the command
+warns and the next preparation retries cleanup. Repeated consume operations
+reverify private archive bytes; a completion marker alone is not integrity
+proof. Other recipes and other VMs keep independent state.
+
+The vendor marker covers the registry subset; Git packages remain represented
+by separately reviewed recipe source archives. Run `consume sources` as well
+to acquire the source-pin table. Ordinary host `warm` commands retain their
+producer behavior and can fetch upstream, including with `TD_FEED_BASE` set.
+Other declared transfer objects, including reviewed OSTree application graphs,
+still need guest feed integration. These commands do not claim a complete
+development image, private build-store setup, or an upstream-disabled full
+system build.
 
 Warm the selected repository revision's declared inputs on the host once.
 Guests have read access to the resulting artifacts, not a general cache upload

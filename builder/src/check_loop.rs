@@ -338,7 +338,7 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
          chain from the seed first (hours, once)",
         LOOP_USERLAND_STEMS.join(" ")
     );
-    // Cold-cache branch (map miss): warm the td-tool crate closure (td-fetch)
+    // Cold-cache branch (map miss): warm the td-net crate closure (td-feed)
     // BEFORE the build-run that consumes it. This is where cold runs of EVERY
     // tier pass — light tiers too — so the closure is vendored offline whenever
     // the chain is (re-)provisioned from cold, not only on the heavy warm
@@ -885,123 +885,45 @@ fn host_net_applet(root: &Path, applet: &str, deadline: Option<Instant>) -> Opti
 }
 
 
-/// Warm a td crate's OWN dependency closure (native since this port — was
-/// tools/warm-td-fetch-crates.sh, the prelude's last `sh tools/…` spawn;
-/// #318 axis 2): host-side NETWORK PREP that GETs each `.crate` of
-/// `LOCK_REL`'s Cargo.lock GUIX-FREE with td's OWN fetcher (td-fetch), pinned
-/// by the UPSTREAM lock checksum (NOT a guix artifact), into the flat vendor
-/// dir the crate's recipe check interns and builds from (TD_VENDOR_DIR):
-/// `.td-build-cache/crate-vendor/NAME`. The fetcher is always td-fetch — td
-/// dogfoods its own fetcher for every td-tool closure — and it honors
-/// TD_FEED_BASE so the reads route through the shared feed when it is up.
-/// Best-effort like every warm (no td-fetch binary / no network → warn and
-/// return; the gate reports if it actually runs cold), and the whole warm —
-/// cargo fallback included — shares ONE warm_timeout_secs budget exactly as
-/// the shell's single `timeout` over the script did: one hung mirror must
-/// not stall the prelude.
-///
-/// NAME selects both the vendor subdir and the log label ("td-fetch"): the
-/// crate closure is a declared offline vendor set warmed before the chain that
-/// consumes it — a live crates.io resolution is not a fixed-output fetch.
-fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
-    let lock_path = root.join(lock_rel);
-    let Ok(lock) = std::fs::read_to_string(&lock_path) else {
-        eprintln!(
-            "td-builder check: warm {name} crates: no {} — skipping",
-            lock_path.display()
-        );
-        return;
-    };
-    let dest = root.join(format!(".td-build-cache/crate-vendor/{name}"));
-    if std::fs::create_dir_all(&dest).is_err() {
-        eprintln!(
-            "td-builder check: warm {name} crates: cannot create {} — skipping",
-            dest.display()
-        );
-        return;
-    }
-    // The deadline covers the WHOLE warm including a cargo build of the
-    // fetcher, exactly as the shell's one `timeout` over the script did.
-    let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
-    // Locate or build td-fetch (the fetcher), reused across crates.
-    let Some(tdf) = newstore_bin(
-        root,
-        ".td-build-cache/td-fetch-recipe-check/sd/newstore",
-        "td-fetch",
-    )
-    .or_else(|| host_net_applet(root, "td-fetch", deadline)) else {
-        eprintln!(
-            "td-builder check: warm {name} crates: no td-fetch binary — skipping (PREP best-effort)"
-        );
-        return;
-    };
-    let mut complete = true;
-    for (crate_name, ver, sum) in crate::cargo_lock::parse_lock_checksums(&lock) {
-        let nv = format!("{crate_name}-{ver}");
-        let out = dest.join(format!("{nv}.crate"));
-        if crate::sha256::sha256_file(&out).ok().as_deref() == Some(sum.as_str()) {
-            continue; // already warm + verified
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            eprintln!("td-builder check: warm {name} crates: TD_WARM_TIMEOUT budget exhausted — stopping");
-            complete = false;
-            break;
-        }
-        let url = format!("https://static.crates.io/crates/{crate_name}/{nv}.crate");
-        // td-fetch serializes this destination, rechecks it after admission,
-        // streams into its own crash-swept partial, verifies the pin, and only
-        // then atomically publishes `out`. Concurrent preludes therefore share
-        // one fetch without leaving PID-named caller temporaries after SIGKILL.
-        // Its one success line STREAMS to
-        // our stderr (the shell's `>&2` — a dup'd fd, never a pipe, so a
-        // chatty child cannot deadlock the warm), and a fetch outliving the
-        // budget is killed rather than left to stall the prelude.
-        let mut cmd = Command::new(&tdf);
-        cmd.args(["fetch", &url, &sum]).arg(&out).current_dir(root);
-        {
-            use std::os::fd::AsFd as _;
-            if let Ok(err_fd) = std::io::stderr().as_fd().try_clone_to_owned() {
-                cmd.stdout(Stdio::from(err_fd));
-            }
-        }
-        arm_check_child(&mut cmd);
-        let fetched = match cmd.spawn() {
-            Ok(mut child) => wait_with_deadline(&mut child, deadline),
-            Err(_) => false,
-        };
-        if !fetched || crate::sha256::sha256_file(&out).ok().as_deref() != Some(sum.as_str()) {
-            eprintln!("td-builder check: warm {name} crates: could not td-fetch/verify {nv}");
-        }
-    }
-    let n = std::fs::read_dir(&dest)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "crate"))
-                .count()
-        })
-        .unwrap_or(0);
-    eprintln!(
-        "td-builder check: warm {name} crates: {n} crates in {} (td-fetched, Cargo.lock-pinned, guix-free){}",
-        dest.display(),
-        if complete { "" } else { " — INCOMPLETE (TD_WARM_TIMEOUT exhausted)" }
-    );
+/// Prepare the target td-net recipe's canonical vendor set before provisioning
+/// the loop userland. Use the same td-feed operation and recipe lock as the
+/// later warm prelude; an already prepared VM cache needs no registry access.
+/// A cold cache uses the current source-built host applet so every writer takes
+/// the preparation lock. Its Cargo build and warming share one best-effort
+/// budget; this ordinary producer warm does not retain partial-job progress.
+fn warm_td_crate_closure(root: &Path) {
+    warm_td_crate_closure_resolving(root, |deadline| host_net_applet(root, "td-feed", deadline));
 }
 
-/// The heavy-tier warm prelude: source-bootstrap tarballs + rust crate closures
-/// (td-feed), all BEST-EFFORT (the gates enforce presence), fanned out in
-/// batches sized from the hosted request's memory grant.
-/// The td-tool crate-closure warm (td-fetch): host-side network PREP that
-/// populates the offline vendor set `.td-build-cache/crate-vendor/{name}`
-/// BEFORE the chain that consumes it is provisioned. This MUST run ahead of
-/// `provision_userland` — the loop userland realizes the bootstrap chain
-/// (mes → tcc → … → busybox/make). Gating the warm behind provisioning is the
-/// deadlock the review flagged: provisioning fails at the first host-bash rung,
-/// so a warm placed after it never runs. Best-effort (a missing fetcher / no
-/// network warns; the recipe checks enforce presence).
-fn warm_td_crate_closure(root: &Path) {
-    // td-net's own crate closure (the merged fetch/feed/subst deps — its own warm, not
-    // the cargo-proxy). The fetcher used to warm it is the td-fetch applet of td-net.
-    warm_crate_closure(root, "net/Cargo.lock", "td-net");
+fn warm_td_crate_closure_resolving(
+    root: &Path,
+    resolve: impl FnOnce(Option<Instant>) -> Option<PathBuf>,
+) {
+    // Match td-feed's warm fast path before resolving a tool: resolution itself
+    // can run host Cargo. The recipe stager still verifies the archive bytes.
+    if vendor_is_complete(root, "td-net", Some("net/Cargo.lock")) {
+        return;
+    }
+    let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
+    let Some(feed) = resolve(deadline) else {
+        eprintln!(
+            "td-builder check: warm td-net crates: no td-feed binary — skipping (PREP best-effort)"
+        );
+        return;
+    };
+    let mut command = Command::new(feed);
+    command
+        .args(["warm", "crate-local", "net", "td-net"])
+        .stdin(Stdio::null())
+        .current_dir(root);
+    arm_check_child(&mut command);
+    let complete = match command.spawn() {
+        Ok(mut child) => wait_with_deadline(&mut child, deadline),
+        Err(_) => false,
+    };
+    if !complete || !vendor_is_complete(root, "td-net", Some("net/Cargo.lock")) {
+        eprintln!("td-builder check: warm td-net crates: preparation incomplete; the recipe gate enforces presence");
+    }
 }
 
 /// Generate the host-produced Linux UAPI header seeds
@@ -1111,7 +1033,7 @@ fn kh_seed_present(sources: &Path, arch: &str) -> bool {
 }
 
 fn heavy_warms(root: &Path) {
-    // The td-tool crate closure (td-fetch) is warmed earlier, before
+    // The td-net crate closure (td-feed) is warmed earlier, before
     // provision_userland (warm_td_crate_closure) — not here.
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
@@ -2046,5 +1968,50 @@ mod scope_key_tests {
         assert_eq!(check_scope(false, Some("  ")), None);
         assert_eq!(check_scope(false, None), None);
         assert_eq!(check_scope(true, Some("td-sh")), None);
+    }
+}
+
+#[cfg(test)]
+mod vendor_prelude_tests {
+    use super::*;
+
+    #[test]
+    fn consumed_cache_is_checked_before_any_network_capable_tool_resolution() {
+        let root = std::env::temp_dir().join(format!("td-vendor-prelude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join(".td-build-cache/crate-vendor/td-net/vendor");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(root.join("net")).unwrap();
+        let lock = root.join("net/Cargo.lock");
+        std::fs::write(&lock, "[[package]]\nname = \"fixture\"\n").unwrap();
+        let digest = crate::sha256::sha256_file(&lock).unwrap();
+        let marker = cache.join(".warm-complete");
+        for (contents, should_resolve) in [
+            (None, true),
+            (Some("stale"), true),
+            (Some(digest.as_str()), false),
+        ] {
+            let _ = std::fs::remove_file(&marker);
+            if let Some(contents) = contents {
+                std::fs::write(&marker, format!("{contents}\n0\n")).unwrap();
+            }
+            let called = std::cell::Cell::new(false);
+            warm_td_crate_closure_resolving(&root, |_| {
+                called.set(true);
+                None
+            });
+            assert_eq!(called.get(), should_resolve);
+        }
+        // Exercise the actual production entry too: this empty checkout has
+        // no Cargo manifest, host tool cache or fetched registry packages.
+        warm_td_crate_closure(&root);
+        std::fs::write(&lock, "changed lock").unwrap();
+        let called = std::cell::Cell::new(false);
+        warm_td_crate_closure_resolving(&root, |_| {
+            called.set(true);
+            None
+        });
+        assert!(called.get());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

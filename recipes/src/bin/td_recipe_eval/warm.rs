@@ -259,7 +259,7 @@ fn survey(
         sources,
         ostree,
         headers,
-        vendors: cold_vendor_jobs(root, &graph),
+        vendors: cold_vendor_jobs(root, &graph)?,
     })
 }
 
@@ -285,9 +285,8 @@ fn header_seed_is_warm(sources_dir: &Path, arch: &str) -> Result<bool, String> {
 }
 
 /// The warm jobs for rust rungs in the closure whose vendored dep closure is
-/// missing. A rung whose warm command cannot be derived is reported and left out
-/// — the build's own vendor error is more precise than a guess would be.
-fn cold_vendor_jobs(root: &Path, graph: &[RecipeNode]) -> Vec<VendorJob> {
+/// missing. Refuse an unplannable declared vendor rather than a partial survey.
+fn cold_vendor_jobs(root: &Path, graph: &[RecipeNode]) -> Result<Vec<VendorJob>, String> {
     let mut jobs = Vec::new();
     for node in graph {
         // A rung with no committed lock declares no crate closure at all. Every
@@ -309,13 +308,15 @@ fn cold_vendor_jobs(root: &Path, graph: &[RecipeNode]) -> Vec<VendorJob> {
                     args,
                 });
             }
-            Err(e) => eprintln!(
-                "   [warm] no warm command for {}'s crate closure ({e}) — skipping it",
-                node.stem
-            ),
+            Err(e) => {
+                return Err(format!(
+                    "no vendor plan for {}'s declared crate closure: {e}",
+                    node.stem
+                ));
+            }
         }
     }
-    jobs
+    Ok(jobs)
 }
 
 /// Every `td-feed warm` argv that vendors a rust rung's locked dep closure in
@@ -351,12 +352,12 @@ fn vendor_warm_args_for(stem: &str) -> Result<Vec<String>, String> {
     if catalog::lookup(stem).is_none() {
         return Err(format!("unknown recipe stem '{stem}' (try `list`)"));
     }
-    Ok(vendor_warm_lines(&recipe_closure(&[stem])?))
+    vendor_warm_lines(&recipe_closure(&[stem])?)
 }
 
 /// The printable form, split out so a test can assert the derivation without
 /// capturing stdout.
-fn vendor_warm_lines(graph: &[RecipeNode]) -> Vec<String> {
+fn vendor_warm_lines(graph: &[RecipeNode]) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     for node in graph {
         if node.recipe.cargo_lock.is_none() {
@@ -371,13 +372,15 @@ fn vendor_warm_lines(graph: &[RecipeNode]) -> Vec<String> {
                 args.join("\t"),
                 lock.display()
             )),
-            Err(e) => eprintln!(
-                "   [warm] no warm command for {}'s crate closure ({e}) -- skipping it",
-                node.stem
-            ),
+            Err(e) => {
+                return Err(format!(
+                    "no vendor plan for {}'s declared crate closure: {e}",
+                    node.stem
+                ));
+            }
         }
     }
-    lines
+    Ok(lines)
 }
 
 /// td-feed's OWN completion predicate: the `.warm-complete` marker it renames
@@ -903,7 +906,7 @@ mod tests {
     fn vendor_jobs_cover_the_committed_lock_rungs() {
         let root = scratch("vendor-root");
         let graph = recipe_closure(&["system-x86-64"]).unwrap();
-        let jobs = cold_vendor_jobs(&root, &graph);
+        let jobs = cold_vendor_jobs(&root, &graph).unwrap();
         let uutils = jobs
             .iter()
             .find(|j| j.dest == "uutils")
@@ -937,7 +940,9 @@ mod tests {
             locked.contains(&"codex"),
             "codex declares a committed lock but is not in the default graph: {locked:?}"
         );
-        let lines = vendor_warm_lines(&graph);
+        let lines = vendor_warm_lines(&graph).unwrap();
+        assert!(lines.iter().any(|line| line == "warm\tcrate-local\tnet\ttd-net\tnet/Cargo.lock"),
+            "the builder's early td-net warm must match its recipe-owned plan");
         for stem in &locked {
             assert!(
                 lines.iter().any(|line| {
@@ -995,13 +1000,27 @@ mod tests {
         assert!(vendor_warm_args_cli(&two).is_err(), "arity is unchecked");
     }
 
+    #[test]
+    fn a_declared_vendor_without_a_plan_is_an_error_not_a_partial_roster() {
+        let mut graph = recipe_closure(&["td-net"]).unwrap();
+        let node = graph.iter_mut().find(|node| node.stem == "td-net").unwrap();
+        node.recipe.local_source = None;
+        node.recipe.source_input = None;
+        let error = vendor_warm_lines(&graph).unwrap_err();
+        assert!(error.contains("td-net"), "{error}");
+        let root = scratch("invalid-plan");
+        let error = cold_vendor_jobs(&root, &graph).err().unwrap();
+        assert!(error.contains("td-net"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// The line format the prelude parses: TAB-joined, `warm` first, then the
     /// recipe stem, then the lock td-feed pins that rung with. The lock is last
     /// so a reader that wants only the argv drops one field.
     #[test]
     fn a_derived_vendor_warm_line_is_tab_joined_with_the_stem_then_the_lock() {
         let graph = recipe_closure(&["system-x86-64"]).unwrap();
-        let lines = vendor_warm_lines(&graph);
+        let lines = vendor_warm_lines(&graph).unwrap();
         assert!(!lines.is_empty(), "the default graph derives no vendor warm");
         for line in &lines {
             let fields: Vec<&str> = line.split('\t').collect();

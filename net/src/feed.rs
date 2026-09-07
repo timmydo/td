@@ -21,6 +21,8 @@
 //                      2nd port, fetch the artifact back THROUGH the feed and verify it.
 //                      Also asserts both gates are load-bearing: a wrong pinned hash reds
 //                      warm, a corrupted store byte reds serve (sidecar mismatch).
+mod vendor;
+
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
@@ -1558,9 +1560,13 @@ fn copy_crates(from: &Path, to: &Path) -> usize {
 /// A marker written by the old scheme carries a count where the digest belongs,
 /// never matches, and so reads as cold exactly once, re-warms, and is replaced.
 /// That is the whole migration; there is no marker to convert.
+fn warm_complete_text(n: usize, lock_digest: &str) -> String {
+    format!("{lock_digest}\n{n}\n")
+}
+
 fn mark_warm_complete(vendor: &Path, n: usize, lock_digest: &str) {
     let tmp = vendor.join(".warm-complete.tmp");
-    if std::fs::write(&tmp, format!("{lock_digest}\n{n}\n")).is_ok()
+    if std::fs::write(&tmp, warm_complete_text(n, lock_digest)).is_ok()
         && std::fs::rename(&tmp, vendor.join(".warm-complete")).is_ok()
     {
         return;
@@ -1856,14 +1862,32 @@ fn transfer_locked_registry(
     store: &Path,
     consumer_base: Option<&str>,
 ) -> Result<(), String> {
-    let base = consumer_base.map(consumer_feed_base).transpose()?;
     let (sources, _) = read_locked_cargo_sources(lock)?;
-    let action = if base.is_some() { "consume" } else { "export" };
-    let completed = if base.is_some() {
-        "acquired"
-    } else {
-        "exported"
+    let transfer = match consumer_base {
+        Some(base) => RegistryTransfer::Consume(base),
+        None => RegistryTransfer::Export(store),
     };
+    transfer_registry_sources(&sources, archives, transfer)
+}
+
+#[derive(Clone, Copy)]
+enum RegistryTransfer<'a> {
+    Export(&'a Path),
+    Consume(&'a str),
+}
+
+fn transfer_registry_sources(
+    sources: &LockedCargoSources,
+    archives: &Path,
+    transfer: RegistryTransfer<'_>,
+) -> Result<(), String> {
+    let transfer = match transfer {
+        RegistryTransfer::Consume(base) => RegistryTransfer::Consume(consumer_feed_base(base)?),
+        RegistryTransfer::Export(store) => RegistryTransfer::Export(store),
+    };
+    let consume = matches!(transfer, RegistryTransfer::Consume(_));
+    let action = if consume { "consume" } else { "export" };
+    let completed = if consume { "acquired" } else { "exported" };
     let mut names = std::collections::BTreeSet::new();
     for package in &sources.registry {
         let name = registry_archive_name(package);
@@ -1878,17 +1902,20 @@ fn transfer_locked_registry(
         let name = registry_archive_name(package);
         let archive = archives.join(&name);
         let path = registry_feed_path(package);
-        let result = if let Some(base) = base {
-            let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
-            download_verified_policy(
-                &format!("{base}/{path}"),
-                &archive,
-                &package.checksum,
-                Some(&guard),
-                false,
-            )
-        } else {
-            export_verified_file(&archive, &store.join(path), &package.checksum)
+        let result = match transfer {
+            RegistryTransfer::Consume(base) => {
+                let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
+                download_verified_policy(
+                    &format!("{base}/{path}"),
+                    &archive,
+                    &package.checksum,
+                    Some(&guard),
+                    false,
+                )
+            }
+            RegistryTransfer::Export(store) => {
+                export_verified_file(&archive, &store.join(path), &package.checksum)
+            }
         };
         match result {
             Ok(()) => eprintln!(">> td-feed {action} cargo: {name} verified"),
@@ -1902,7 +1929,7 @@ fn transfer_locked_registry(
     if failures.is_empty() {
         Ok(())
     } else {
-        let remedy = if base.is_some() {
+        let remedy = if consume {
             "Fix local destination errors; for missing or mismatched host entries, warm the named bytes on the host and run td-feed export cargo LOCK ARCHIVES."
         } else {
             "Populate missing or repair corrupt files in the host ARCHIVES directory, fix any feed-store errors above, then retry export."
@@ -2043,6 +2070,13 @@ fn detach_from_workspace(manifest: &Path) -> Result<(), String> {
 ///   .td-build-cache/crate-vendor/<dest>/src/<crate>-<ver>/  the extracted source tree
 ///   .td-build-cache/crate-vendor/<dest>/vendor/*.crate      the locked dep closure
 fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
+    let _preparation_lock = match vendor::lock_job(root, dest) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("td-feed warm crate: {error}");
+            return;
+        }
+    };
     let cv = root.join(".td-build-cache/crate-vendor").join(dest);
     let srcparent = cv.join("src");
     let srcdir = srcparent.join(format!("{krate}-{ver}"));
@@ -2272,6 +2306,13 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
 }
 
 fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
+    let _preparation_lock = match vendor::lock_job(root, dest) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("td-feed warm {action}: {error}");
+            return;
+        }
+    };
     let vendor = root
         .join(".td-build-cache/crate-vendor")
         .join(dest)
@@ -2593,6 +2634,17 @@ fn export_source_pin(pin: &SourcePin, sources: &Path, store: &Path) -> Result<()
 }
 
 fn export_verified_file(source: &Path, dst: &Path, checksum: &str) -> Result<(), String> {
+    copy_verified_file(source, dst, checksum, || {
+        write_atomic(&sidecar_path(dst), format!("{checksum}\n").as_bytes())
+    })
+}
+
+fn copy_verified_file(
+    source: &Path,
+    dst: &Path,
+    checksum: &str,
+    finish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
     acquire_verified(
         dst,
@@ -2639,7 +2691,7 @@ fn export_verified_file(source: &Path, dst: &Path, checksum: &str) -> Result<(),
             }
             Ok(())
         },
-        || write_atomic(&sidecar_path(dst), format!("{checksum}\n").as_bytes()),
+        finish,
     )
 }
 
@@ -3565,6 +3617,15 @@ pub fn run(a: &[String]) {
                 die(format!("{action} cargo: {error}"));
             }
         }
+        Some(action @ ("export" | "consume"))
+            if matches!(a.len(), 3 | 4) && a.get(2).map(String::as_str) == Some("vendors") =>
+        {
+            if let Err(error) =
+                vendor::run(&repo_root(), a.get(3).map(String::as_str), action == "consume")
+            {
+                die(format!("{action} vendors: {error}"));
+            }
+        }
         // warm <action> — the structured host-PREP orchestration (consolidated warm-*.sh).
         // The low-level `warm INDEX STORE` primitive (feed-shared gate, feed-ensure serve)
         // stays: dispatch on a known action keyword, else treat it as the legacy 2-arg form.
@@ -3660,7 +3721,7 @@ pub fn run(a: &[String]) {
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed serve STORE ADDR\n  \
-                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);
@@ -4039,15 +4100,15 @@ mod tests {
         assert!(!dir.exists());
     }
 
-    struct ConsumerServer {
-        base: String,
+    pub(super) struct ConsumerServer {
+        pub(super) base: String,
         requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
     impl ConsumerServer {
-        fn start(store: PathBuf, response: Option<Vec<u8>>) -> Self {
+        pub(super) fn start(store: PathBuf, response: Option<Vec<u8>>) -> Self {
             use std::io::Write;
             use std::sync::{
                 atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -4090,7 +4151,7 @@ mod tests {
                 thread: Some(thread),
             }
         }
-        fn count(&self) -> usize {
+        pub(super) fn count(&self) -> usize {
             self.requests.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
