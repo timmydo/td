@@ -401,6 +401,96 @@ fn native_prompt_inspection_is_borrow_only_and_cannot_dispatch_or_poll() {
 }
 
 #[test]
+fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys() {
+    let source = include_str!("../src/wayland.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    let answer = production
+        .split("fn control_prompt_answer(")
+        .nth(1)
+        .unwrap();
+    let answer = answer.split("\n    fn ").next().unwrap();
+    let cleanup = answer.find("self.stop_pointer()").unwrap();
+    for guard in [
+        "self.closed",
+        "self.quitting",
+        "self.prompt.is_some()",
+        "self.closing.is_some()",
+        "self.conflict.is_some()",
+        "self.reloading.is_some()",
+        "self.menu.is_some()",
+        "self.activation_serial.is_some()",
+        "*generation == 0",
+        "self.frames.input_generation()?",
+        "actual != (*tab, *revision)",
+        "answer.validate_and_chord(*kind)?",
+        ".checked_add(8)",
+    ] {
+        assert!(answer.find(guard).unwrap() < cleanup, "{guard}");
+    }
+    assert_eq!(answer.matches(".target(self.ui.editor())?").count(), 4);
+    let entry = production.split("fn control_prompt_entry(").nth(1).unwrap();
+    let entry = entry.split("\n    fn ").next().unwrap();
+    for forbidden in [
+        "self.chord(",
+        "path_chord(",
+        "close_chord(",
+        "conflict_chord(",
+        "self.input.focused",
+        "self.configured",
+        "self.input.key(",
+    ] {
+        assert!(!answer.contains(forbidden), "{forbidden}");
+        assert!(!entry.contains(forbidden), "entry: {forbidden}");
+    }
+    for forbidden in [
+        ".dispatch(",
+        "self.connection",
+        "self.frames.",
+        "self.find(",
+    ] {
+        assert!(!entry.contains(forbidden), "entry: {forbidden}");
+    }
+    assert_eq!(entry.matches("prompt.type_chord(").count(), 4);
+    let command = include_str!("../src/command.rs");
+    let names = command
+        .split("const NAMES:")
+        .nth(1)
+        .unwrap()
+        .split("];\n")
+        .next()
+        .unwrap();
+    assert_eq!(names.matches("Item::").count(), 7);
+    for action in [
+        "AutoFill",
+        "Fill",
+        "GoToLine",
+        "Spell",
+        "NextMisspelling",
+        "PreviousMisspelling",
+        "FillColumn",
+    ] {
+        assert!(names.contains(&format!("Item::{action})")), "{action}");
+    }
+    for required in [
+        "self.search_chord(chord, false)",
+        "self.replace_chord(chord, false)",
+        "self.number_chord(chord, false)",
+        "self.command_chord(chord, false)",
+        "self.control_mutation_accepted()",
+        "self.control_input_error = Some(detail)",
+        "self.frames.invalidate(true)",
+    ] {
+        assert!(answer.contains(required), "{required}");
+    }
+    let dispatch = production.split("fn control_response(").nth(1).unwrap();
+    let dispatch = dispatch.split("\n    fn ").next().unwrap();
+    assert!(
+        dispatch.find("Operation::PromptAnswer").unwrap()
+            < dispatch.find("request.is_mutating()").unwrap()
+    );
+}
+
+#[test]
 fn remote_wheel_reuses_native_scroll_after_all_input_guards() {
     let native = include_str!("../src/pointer.rs");
     let control = include_str!("../src/control.rs");

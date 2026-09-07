@@ -126,8 +126,11 @@ change text/history or share physical wheel fractions. `prompt-state` reads
 full Find/Replace/numeric/command/path entries, target validity and feedback,
 including clipped or unfocused prompts. It returns the current input token
 and existing file-dialog IDs without typing, answering or changing state.
-These values can contain private document text and paths. Non-file entry
-still uses decoded keys with ordinary real-input readiness.
+These values can contain private document text and paths. `prompt-answer`
+echoes the input token, kind and validated tab/revision to replace the active
+non-file entry or use a typed ordinary prompt action, even without focus.
+Every accepted answer consumes the token; file/close/conflict answers keep
+their separate live-dialog policy. See CONTROL.md for exact actions/bounds.
 `check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback

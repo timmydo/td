@@ -4,7 +4,7 @@ use crate::menu::Item;
 use crate::model::{Editor, RevisionPoint, Selection, TabId};
 use crate::{Error, Result};
 
-const BYTES: usize = 64;
+pub(crate) const BYTES: usize = 64;
 const NAMES: &[(&str, Item)] = &[
     ("auto-fill-mode", Item::AutoFill),
     ("fill-paragraph", Item::Fill),

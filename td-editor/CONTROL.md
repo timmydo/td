@@ -10,7 +10,8 @@ numeric/command input under the stricter input contract below. Decoded pointer
 press/move/release share native hit testing, and normalized wheel deltas use
 the native scrolling path.
 `prompt-state` reads full text entries, target validity and native feedback
-without changing any input or dialog state.
+without changing any input or dialog state. `prompt-answer` supplies pinned
+non-file entry/actions without requiring focus.
 Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
@@ -69,6 +70,7 @@ In the examples below, field spaces denote literal Tab separators.
 | --- | --- |
 | `1 ID state` | Snapshot the current controller. |
 | `1 ID prompt-state` | Inspect native text-entry state and existing dialog IDs without mutation. |
+| `1 ID prompt-answer TAB REVISION INPUT_GENERATION KIND ANSWER [HEX_ENTRY]` | Answer one pinned non-file text prompt; details below. |
 | `1 ID new` | Create and activate an empty tab; return its stable ID. |
 | `1 ID open HEX_PATH` | Queue ordinary file Open and return a background-job ID. |
 | `1 ID save TAB REVISION` | Queue a revision-pinned save to the associated file. |
@@ -149,8 +151,8 @@ currently receiving input. Path entry takes precedence; otherwise a live
 close/conflict/Reload question outranks non-file entry for input. Consult
 `dialog` for this question authority; `key-ready=0` alone also covers loss
 of focus/readiness. Menus and questions with no retained entry report
-`none`. `state` supplies coarse modal flags. There are no new prompt IDs
-or answer operations in this increment.
+`none`. `state` supplies coarse modal flags. Inspection creates no new
+prompt IDs and grants no answer authority by itself.
 
 Each of `text`, `replacement`, `status` and `notice` is UTF-8 encoded as
 lowercase hex, with `-` for empty. Each is limited to 8,192 original bytes;
@@ -171,12 +173,82 @@ not stable machine enums, completion receipts, or claims about visible pixels.
 Readiness and all fields are captured in one UI-thread observation. Paths
 include their ordinary live dialog fields in that same snapshot; inspection
 does not bypass the explicit ID/tab/revision checks for an answer. Other
-text prompts still use decoded keys and their real-input readiness policy.
+text prompts can use the explicit pinned answers below. Decoded keys retain
+their real-input readiness policy.
 
 This explicitly opted-in private endpoint already grants document read/write
 access. Prompt entries and feedback may also contain user text and file paths;
 do not publish them as non-sensitive diagnostics. `Request` Debug contains
 only the query operation, never a response or prompt value.
+
+## Non-file prompt answers
+
+`prompt-answer` acts only on the currently open `find-forward`,
+`find-backward`, `replace`, `go-to-line`, `fill-column`, or `command`
+prompt. It cannot open a prompt. Use `prompt-state` to read its exact kind,
+valid tab/revision and current nonzero `input-generation`, then echo all
+four values. This input-context token is the live-instance fence: opening,
+closing, entry changes and every accepted answer advance it; caret-only
+blinks do not. Reopening the same kind on the same revision cannot accept
+an old answer. There is no additional non-file dialog ID counter.
+
+This is trusted semantic dialog control, available without keyboard/pointer
+readiness, focus or visible geometry. It does not synthesize a physical key,
+held state, repeat, serial or focus event. The file/close/conflict protocols
+are unchanged: these answers cannot reach their handlers or approve discard.
+Menus, close/quit, path/conflict/reload state, a closed window, fatal adapter
+state or an active native serial refuse `unavailable`.
+The menu/quit exclusions also defend the ordinary prompt-exclusivity
+invariant; Find opening clears any retained numeric entry.
+
+| Answer | Effect |
+| --- | --- |
+| `entry HEX_ENTRY` | Replace the entire active entry field, without submitting. Empty `-` clears it. |
+| `submit` | Ordinary Return: Find, numeric apply, exact named command, or Replace Find Next. |
+| `cancel` | Close this prompt only; completed Replace edits remain undoable. Unlike global Escape, it does not cancel an unrelated spelling scan. |
+| `complete` | Command only: ordinary bounded prefix completion. |
+| `next-field` | Replace only: toggle Find/With. |
+| `replace-one` | Replace only: replace the selected exact match. |
+| `replace-all` | Replace only: ordinary atomic whole-document replacement. |
+
+Non-entry answers take no extra argument. Unknown kinds/answers are
+`invalid-argument`; missing/extra fields are `protocol`. Entry wire decoding
+requires valid UTF-8 and at most 4,096 bytes before native admission.
+The native adapter also validates constructed requests: Find/Replace allow
+up to 4,096 UTF-8 bytes without control characters; numbers allow at most
+20 ASCII digits; command entry allows at most 64 ASCII lowercase letters or
+hyphens. Empty entries are allowed. Length excess is `limit`, invalid entry
+characters are `invalid-argument`. The entire entry is checked before any
+clearing/typing; there is no silent truncation or partial acceptance.
+Numeric range/line existence and exact command names are checked only when
+submitted, using the ordinary prompt's correction/refusal behavior.
+
+After global health checks, native admission checks excluded modal/serial
+state, nonzero/exact input token, matching live kind and the prompt's own
+target validity, exact requested tab/revision, answer-kind/entry validity,
+then controller generation headroom. Zero input token is `invalid-argument`.
+Native prompt target validation retains
+its own model refusal code. Token or requested tab/revision mismatch returns
+`stale-revision`; a missing/different kind or inapplicable answer returns
+`unavailable`. Existing selection/setting target checks apply even to
+Cancel and entry changes. A stale retained prompt is inspectable but cannot
+be answered by weakening its target checks; physical/ready decoded Cancel
+remains available. Every refusal before admission preserves entry, feedback,
+jobs, generations, drag/repeat/Paste and document state.
+
+Every admitted answer stops drag/repeat and cancels prior Paste, then uses
+only the pinned ordinary prompt handler. Entry replacement uses its existing
+clear-and-literal-character rules, without a generation per character.
+Observers run afterward and the input token advances even for an unchanged
+entry or refused numeric/command submission. Success is `1 ID ok` with an
+empty body: delivery, not proof of a model edit, match or job completion.
+Query `prompt-state`, document state/text and ordinary job fields afterward.
+Named commands still use the exact built-in action list, never evaluation;
+native jobs they initiate do not acquire a remote job receipt. A native
+handler error latches the existing fatal-input state and refuses later work.
+Numeric/command Cancel also skips global Escape's search-wrap cancellation;
+ordinary post-action observation still invalidates stale search state.
+Debug records kinds and entry byte lengths, never entry contents.
 
 ## Tab creation
 
@@ -677,11 +749,14 @@ discard or bypass an explicit dialog answer. A tab close mark starts the
 ordinary close coordinator, including for an inactive dirty tab.
 
 A menu press can enter Find/Replace/numeric/command entry, where pointer
-actions no longer work. Only decoded keys or physical input can dismiss
-those prompts today. Without keyboard readiness, a pointer-only client can
-therefore enter a prompt it cannot dismiss remotely until readiness returns.
-Prompt-entry answers remain later work; do not activate those menu items
-when the client cannot supply ordinary prompt input.
+actions no longer work. `prompt-state` plus pinned `prompt-answer` can
+complete or dismiss a valid prompt without keyboard readiness. Physical
+input and ready decoded keys retain their ordinary prompt behavior.
+If a pending file Open changes the active tab after a prompt opens, its
+target becomes stale. Strict remote Cancel also refuses it; a pointer-only
+client needs keyboard readiness restored to dismiss that retained entry.
+Do not enter these prompts during pending file work when no keyboard path
+is available. A fresh input token does not bypass the stale target fence.
 
 The nonzero exact `input-generation` fence and active tab/revision admission
 match decoded keys. The named active tab is the input context, not necessarily
@@ -1129,7 +1204,9 @@ frame callback or scanout. The native extension below adds its own redraw
 generations/snapshots, coarse flags, bounded spelling/file outcomes and close
 and conflict/path dialog identity/answers. Decoded key and pointer admission
 are connected, including normalized wheel frames. The separate `prompt-state`
-query exposes native entry values and feedback under its contract above.
+query exposes native entry values and feedback under its contract above;
+`prompt-answer` connects pinned non-file entry/actions independently of
+physical readiness.
 
 ## Experimental native adapter
 
@@ -1173,7 +1250,7 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-prompt-state` | Explicit implemented adapter identity. |
+| `adapter=native-prompt-answer` | Explicit implemented adapter identity. |
 | `key-ready=0\|1` | Native key availability, before target/generation/counter validation. |
 | `pointer-ready=0\|1` | Native pointer availability, before target/generation/counter validation. |
 | `wheel-ready=0\|1` | Native wheel availability; pointer readiness with no menu. |
@@ -1201,8 +1278,9 @@ bytes and `prompt-state` for entries/feedback. Controller generation does
 not cover native-only modal/job changes, and is not a submitted or
 callback-completed frame generation. Clients must not use it as a native
 snapshot version or presentation fence. Use
-`input-generation` for decoded keys, pointers and wheel frames, and the separate
-`window-generation` with `wait-frame` under the frame contract above.
+`input-generation` for decoded keys, pointers, wheel frames and non-file
+prompt answers, and the separate `window-generation` with `wait-frame`
+under the frame contract above.
 
 On ordinary window exit, stop and join the worker and explicitly attempt
 checked cleanup; a shutdown error contributes to nonzero exit status. Drop

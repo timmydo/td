@@ -40,7 +40,9 @@ press/move/release share native hit testing with separately tracked remote
 drags. Normalized wheel frames use the shared native scroll handler and input
 fence without physical axis accumulation. Read-only `prompt-state` exposes
 full entry values, target validity and stored feedback alongside existing
-live file-dialog IDs. It grants no new answer authority.
+live file-dialog IDs. Explicit non-file `prompt-answer` pins the input token,
+kind and valid tab/revision before replacing an entry or using an ordinary
+prompt action, without requiring focus. File-dialog authority is unchanged.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -2233,9 +2235,17 @@ entry values, selected Replace field, target validity, prior numeric/command
 refusals and stored feedback. It preserves input, jobs, text and generations,
 works without focus/visible geometry, and repeats existing live dialog IDs
 atomically with the input token. Each textual response field is bounded to
-8,192 UTF-8 bytes before hex encoding; no truncation, new prompt ID or answer
-operation is added. CONTROL.md defines field order, empty/stale target
-meaning, diagnostic-only status and the private endpoint's disclosure scope.
+8,192 UTF-8 bytes before hex encoding; no truncation or new prompt ID is
+added. Explicit non-file `prompt-answer` echoes the input token, kind and
+validated tab/revision, including the native selection/setting checks.
+It accepts whole literal active-field replacement and typed ordinary
+actions without focus/geometry readiness, never dispatching a global key
+or answering file/close/conflict state. Whole-entry bounds/alphabet checks
+precede cleanup. Every accepted answer advances the input token, including
+no-ops and ordinary numeric/command refusals; success is delivery only.
+CONTROL.md defines exact grammar, admission order, bounds and actions, plus
+snapshot field order, empty/stale target meaning, diagnostic-only status
+and the private endpoint's disclosure scope.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 
@@ -2281,9 +2291,9 @@ unknown commands/versions, bad hex, overflow and truncated frames before
 dispatch. A response echoes version/request ID, then `ok`, `error`, or
 `pending`; errors carry a stable code and hex-encoded diagnostic.
 
-Version 1 exposes `state`, `prompt-state`, `text`, `new`, `open`, `select-tab`,
-`select-range`, `insert`, `delete`, `undo`, `redo`, `find`, `go-to-line`,
-`replace`, `fill-paragraph`,
+Version 1 exposes `state`, `prompt-state`, `prompt-answer`, `text`, `new`,
+`open`, `select-tab`, `select-range`, `insert`, `delete`, `undo`, `redo`,
+`find`, `go-to-line`, `replace`, `fill-paragraph`,
 `set-auto-fill`, `set-fill-column`, `set-key-profile`, `check-spelling`,
 `spelling-results`, `save`, `save-as`, `close-tab`, `quit`, `dialog-answer`,
 `key`, `pointer`, `wheel`, and `wait-frame`. Text mutations and close requests

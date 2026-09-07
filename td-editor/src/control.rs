@@ -167,6 +167,13 @@ pub enum Operation {
         revision: u64,
         answer: DialogAnswer,
     },
+    PromptAnswer {
+        tab: TabId,
+        revision: u64,
+        generation: u64,
+        kind: PromptKind,
+        answer: PromptAnswer,
+    },
     Key {
         tab: TabId,
         revision: u64,
@@ -255,6 +262,20 @@ impl std::fmt::Debug for Operation {
                 .field("revision", revision)
                 .field("answer", answer)
                 .finish(),
+            Self::PromptAnswer {
+                tab,
+                revision,
+                generation,
+                kind,
+                answer,
+            } => f
+                .debug_struct("PromptAnswer")
+                .field("tab", tab)
+                .field("revision", revision)
+                .field("generation", generation)
+                .field("kind", kind)
+                .field("answer", answer)
+                .finish(),
             Self::Key {
                 tab,
                 revision,
@@ -341,6 +362,78 @@ impl std::fmt::Debug for Operation {
                 .field("revision", revision)
                 .field("edit", edit)
                 .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptKind {
+    FindForward,
+    FindBackward,
+    Replace,
+    GoToLine,
+    FillColumn,
+    Command,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum PromptAnswer {
+    Cancel,
+    Submit,
+    Complete,
+    NextField,
+    ReplaceOne,
+    ReplaceAll,
+    Entry(String),
+}
+
+impl std::fmt::Debug for PromptAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Entry(text) => f.debug_struct("Entry").field("bytes", &text.len()).finish(),
+            Self::Cancel => f.write_str("Cancel"),
+            Self::Submit => f.write_str("Submit"),
+            Self::Complete => f.write_str("Complete"),
+            Self::NextField => f.write_str("NextField"),
+            Self::ReplaceOne => f.write_str("ReplaceOne"),
+            Self::ReplaceAll => f.write_str("ReplaceAll"),
+        }
+    }
+}
+
+impl PromptAnswer {
+    pub(crate) fn validate_and_chord(&self, kind: PromptKind) -> Result<Option<&'static str>> {
+        match self {
+            Self::Cancel => Ok(Some("Escape")),
+            Self::Submit => Ok(Some("Return")),
+            Self::Complete if kind == PromptKind::Command => Ok(Some("Tab")),
+            Self::NextField if kind == PromptKind::Replace => Ok(Some("Tab")),
+            Self::ReplaceOne if kind == PromptKind::Replace => Ok(Some("M-r")),
+            Self::ReplaceAll if kind == PromptKind::Replace => Ok(Some("M-a")),
+            Self::Entry(text) => {
+                let limit = match kind {
+                    PromptKind::GoToLine | PromptKind::FillColumn => crate::number::DIGITS,
+                    PromptKind::Command => crate::command::BYTES,
+                    _ => SEARCH_BYTES,
+                };
+                if text.len() > limit {
+                    return Err(Error::Limit);
+                }
+                let valid = match kind {
+                    PromptKind::GoToLine | PromptKind::FillColumn => {
+                        text.bytes().all(|b| b.is_ascii_digit())
+                    }
+                    PromptKind::Command => {
+                        text.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                    }
+                    _ => !text.chars().any(char::is_control),
+                };
+                if !valid {
+                    return Err(Error::InvalidArgument);
+                }
+                Ok(None)
+            }
+            _ => Err(Error::Unavailable),
         }
     }
 }
@@ -518,6 +611,33 @@ impl Request {
                         _ => return Err(Error::InvalidArgument),
                     },
                 },
+                "prompt-answer" => Operation::PromptAnswer {
+                    tab: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    revision: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    generation: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    kind: match args.next().ok_or(Error::Protocol)? {
+                        "find-forward" => PromptKind::FindForward,
+                        "find-backward" => PromptKind::FindBackward,
+                        "replace" => PromptKind::Replace,
+                        "go-to-line" => PromptKind::GoToLine,
+                        "fill-column" => PromptKind::FillColumn,
+                        "command" => PromptKind::Command,
+                        _ => return Err(Error::InvalidArgument),
+                    },
+                    answer: match args.next().ok_or(Error::Protocol)? {
+                        "cancel" => PromptAnswer::Cancel,
+                        "submit" => PromptAnswer::Submit,
+                        "complete" => PromptAnswer::Complete,
+                        "next-field" => PromptAnswer::NextField,
+                        "replace-one" => PromptAnswer::ReplaceOne,
+                        "replace-all" => PromptAnswer::ReplaceAll,
+                        "entry" => PromptAnswer::Entry(bounded_text(
+                            args.next().ok_or(Error::Protocol)?,
+                            SEARCH_BYTES,
+                        )?),
+                        _ => return Err(Error::InvalidArgument),
+                    },
+                },
                 "key" => {
                     let tab = decimal(args.next().ok_or(Error::Protocol)?)?;
                     let revision = decimal(args.next().ok_or(Error::Protocol)?)?;
@@ -673,6 +793,7 @@ impl Request {
             | Operation::Quit
             | Operation::CloseTab { .. }
             | Operation::DialogAnswer { .. }
+            | Operation::PromptAnswer { .. }
             | Operation::Key { .. }
             | Operation::Pointer { .. }
             | Operation::Wheel { .. }
@@ -718,6 +839,7 @@ impl Request {
                     | Operation::CheckSpelling { .. }
                     | Operation::CloseTab { .. }
                     | Operation::DialogAnswer { .. }
+                    | Operation::PromptAnswer { .. }
                     | Operation::Key { .. }
                     | Operation::Pointer { .. }
                     | Operation::Wheel { .. }
@@ -1137,6 +1259,136 @@ mod tests {
         );
         assert_eq!(PromptState::empty().fields(1, "").unwrap(),
             "input-generation=1\tprompt=none\ttarget=-\ttarget-error=-\tfield=-\ttext=-\treplacement=-\trefused=-\tstatus=-\tnotice=-");
+    }
+
+    #[test]
+    fn prompt_answer_grammar_is_typed_native_only_and_redacts_entries() {
+        let request =
+            Request::parse(b"1\t7\tprompt-answer\t2\t3\t4\treplace\tentry\tcebb").unwrap();
+        assert_eq!(
+            request.operation,
+            Operation::PromptAnswer {
+                tab: 2,
+                revision: 3,
+                generation: 4,
+                kind: PromptKind::Replace,
+                answer: PromptAnswer::Entry("λ".into()),
+            }
+        );
+        assert!(request.is_mutating() && !request.is_edit());
+        assert!(!format!("{request:?}").contains('λ'));
+        let mut ui = Controller::default();
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        for kind in [
+            "find-forward",
+            "find-backward",
+            "replace",
+            "go-to-line",
+            "fill-column",
+            "command",
+        ] {
+            for action in [
+                "cancel",
+                "submit",
+                "complete",
+                "next-field",
+                "replace-one",
+                "replace-all",
+                "entry\t-",
+            ] {
+                assert!(Request::parse(
+                    format!("1\t7\tprompt-answer\t2\t3\t4\t{kind}\t{action}").as_bytes()
+                )
+                .is_ok());
+            }
+        }
+        for (tail, expected) in [
+            ("replace", Error::Protocol),
+            ("replace\tentry", Error::Protocol),
+            ("replace\tentry\tff", Error::InvalidText),
+            ("replace\tcancel\t-", Error::Protocol),
+            ("path-open\tcancel", Error::InvalidArgument),
+            ("replace\tdiscard", Error::InvalidArgument),
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t7\tprompt-answer\t2\t3\t4\t{tail}").as_bytes())
+                    .unwrap_err(),
+                Refusal {
+                    id: 7,
+                    error: expected
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_answer_validates_complete_entries_and_action_kind_before_mutation() {
+        for kind in [
+            PromptKind::FindForward,
+            PromptKind::FindBackward,
+            PromptKind::Replace,
+            PromptKind::GoToLine,
+            PromptKind::FillColumn,
+            PromptKind::Command,
+        ] {
+            assert_eq!(
+                PromptAnswer::Cancel.validate_and_chord(kind),
+                Ok(Some("Escape"))
+            );
+            assert_eq!(
+                PromptAnswer::Submit.validate_and_chord(kind),
+                Ok(Some("Return"))
+            );
+            assert_eq!(
+                PromptAnswer::Entry(String::new()).validate_and_chord(kind),
+                Ok(None)
+            );
+            for (action, allowed) in [
+                (PromptAnswer::Complete, PromptKind::Command),
+                (PromptAnswer::NextField, PromptKind::Replace),
+                (PromptAnswer::ReplaceOne, PromptKind::Replace),
+                (PromptAnswer::ReplaceAll, PromptKind::Replace),
+            ] {
+                assert_eq!(action.validate_and_chord(kind).is_ok(), kind == allowed);
+            }
+            let (letter, limit) = match kind {
+                PromptKind::GoToLine | PromptKind::FillColumn => ("9", crate::number::DIGITS),
+                PromptKind::Command => ("a", crate::command::BYTES),
+                _ => ("a", SEARCH_BYTES),
+            };
+            assert_eq!(
+                PromptAnswer::Entry(letter.repeat(limit)).validate_and_chord(kind),
+                Ok(None)
+            );
+            assert_eq!(
+                PromptAnswer::Entry(letter.repeat(limit + 1)).validate_and_chord(kind),
+                Err(Error::Limit)
+            );
+            for invalid in ["a\nb", "\t", "\0", "\u{7f}"] {
+                assert_eq!(
+                    PromptAnswer::Entry(invalid.into()).validate_and_chord(kind),
+                    Err(Error::InvalidArgument)
+                );
+            }
+        }
+        for invalid in ["-1", "+1", "1.0", "１", " 1"] {
+            assert_eq!(
+                PromptAnswer::Entry(invalid.into()).validate_and_chord(PromptKind::GoToLine),
+                Err(Error::InvalidArgument)
+            );
+        }
+        for invalid in ["A", "λ", "a b", "eval(1)"] {
+            assert_eq!(
+                PromptAnswer::Entry(invalid.into()).validate_and_chord(PromptKind::Command),
+                Err(Error::InvalidArgument)
+            );
+        }
+        assert_eq!(
+            PromptAnswer::Entry("λ".repeat(SEARCH_BYTES / 2))
+                .validate_and_chord(PromptKind::Replace),
+            Ok(None)
+        );
     }
 
     #[test]

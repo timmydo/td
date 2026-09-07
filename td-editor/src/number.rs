@@ -3,7 +3,7 @@
 use crate::model::{Command, Editor, RevisionPoint, Selection, TabId};
 use crate::{Error, Result};
 
-const DIGITS: usize = 20;
+pub(crate) const DIGITS: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Kind {
