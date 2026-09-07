@@ -121,7 +121,8 @@ enum FetchMode {
 }
 
 #[derive(Clone, Copy)]
-struct FetchPolicy {
+struct FetchPolicy<'a> {
+    feed: Option<&'a str>,
     mode: FetchMode,
     limits: GraphLimits,
     deadline: Option<Instant>,
@@ -214,13 +215,32 @@ fn object_path(root: &Path, key: ObjectKey) -> Result<PathBuf, String> {
     Ok(root.join(key.relative_path()?))
 }
 
-fn object_url(spec: &AcquireSpec, key: ObjectKey) -> Result<String, String> {
-    Ok(format!("{}/{}", spec.repository, key.relative_path()?))
+fn object_url(spec: &AcquireSpec, key: ObjectKey, feed: Option<&str>) -> Result<String, String> {
+    match feed {
+        Some(base) => Ok(format!("{base}/{}", feed_path(spec, key)?)),
+        None => Ok(format!("{}/{}", spec.repository, key.relative_path()?)),
+    }
+}
+
+fn feed_path(spec: &AcquireSpec, key: ObjectKey) -> Result<String, String> {
+    Ok(format!(
+        "ostree/{}/{}",
+        spec.commit.to_hex(),
+        key.relative_path()?
+    ))
 }
 
 fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
+    read_regular_with_metadata(path, max_bytes, &metadata)
+}
+
+fn read_regular_with_metadata(
+    path: &Path,
+    max_bytes: u64,
+    metadata: &fs::Metadata,
+) -> Result<Vec<u8>, String> {
     if !metadata.file_type().is_file() {
         return Err(format!(
             "OSTree object {} is not a regular file",
@@ -233,7 +253,18 @@ fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> 
             path.display()
         ));
     }
-    let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(crate::feed::OPEN_REGULAR_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    if !opened.is_file() || opened.len() != metadata.len() {
+        return Err(format!(
+            "OSTree object {} changed while opening",
+            path.display()
+        ));
+    }
     let capacity = usize::try_from(metadata.len())
         .map_err(|_| format!("OSTree object {} is too large for memory", path.display()))?;
     let mut bytes = Vec::with_capacity(capacity);
@@ -286,7 +317,7 @@ fn prepare_object(
     root: &Path,
     key: ObjectKey,
     transfer_budget: &AtomicU64,
-    policy: FetchPolicy,
+    policy: FetchPolicy<'_>,
 ) -> Result<u64, String> {
     let path = object_path(root, key)?;
     let parent = path
@@ -326,7 +357,7 @@ fn prepare_object(
                 .deadline
                 .ok_or_else(|| "OSTree network fetch has no absolute graph deadline".to_string())?;
             let downloaded = crate::http::get_to_file_accounted_no_redirects_before(
-                &object_url(spec, key)?,
+                &object_url(spec, key, policy.feed)?,
                 &path,
                 max_transfer,
                 transfer_budget,
@@ -445,7 +476,7 @@ fn fetch_object(
     root: &Path,
     key: ObjectKey,
     transfer_budget: &AtomicU64,
-    policy: FetchPolicy,
+    policy: FetchPolicy<'_>,
 ) -> Result<ObjectRecord, String> {
     let transfer_bytes = prepare_object(spec, root, key, transfer_budget, policy)?;
     finish_object(root, key, transfer_bytes, policy.mode)
@@ -464,7 +495,7 @@ fn fetch_objects(
     root: &Path,
     keys: &[ObjectKey],
     transfer_budget: &AtomicU64,
-    policy: FetchPolicy,
+    policy: FetchPolicy<'_>,
 ) -> Result<Vec<ObjectRecord>, String> {
     if keys.is_empty() {
         return Ok(Vec::new());
@@ -535,7 +566,7 @@ fn fetch_file_objects(
     references: &BTreeMap<Checksum, u64>,
     transfer_budget: &AtomicU64,
     decoded_bytes: &mut u64,
-    policy: FetchPolicy,
+    policy: FetchPolicy<'_>,
 ) -> Result<Vec<ObjectRecord>, String> {
     if keys.is_empty() {
         return Ok(Vec::new());
@@ -635,7 +666,7 @@ fn add_new_objects(
     wanted: impl IntoIterator<Item = ObjectKey>,
     objects: &mut BTreeMap<ObjectKey, ObjectRecord>,
     transfer_budget: &AtomicU64,
-    policy: FetchPolicy,
+    policy: FetchPolicy<'_>,
 ) -> Result<(), String> {
     let wanted: BTreeSet<ObjectKey> = wanted
         .into_iter()
@@ -666,7 +697,7 @@ fn add_file_objects(
     objects: &mut BTreeMap<ObjectKey, ObjectRecord>,
     transfer_budget: &AtomicU64,
     decoded_bytes: &mut u64,
-    policy: FetchPolicy,
+    policy: FetchPolicy<'_>,
 ) -> Result<(), String> {
     let keys: Vec<ObjectKey> = references
         .keys()
@@ -851,6 +882,16 @@ fn build_graph_with_limits(
     mode: FetchMode,
     limits: GraphLimits,
 ) -> Result<(GraphStats, String), String> {
+    build_graph_from(spec, root, mode, limits, None)
+}
+
+fn build_graph_from(
+    spec: &AcquireSpec,
+    root: &Path,
+    mode: FetchMode,
+    limits: GraphLimits,
+    feed: Option<&str>,
+) -> Result<(GraphStats, String), String> {
     let deadline = match mode {
         FetchMode::FetchMissing => Some(
             Instant::now()
@@ -860,6 +901,7 @@ fn build_graph_with_limits(
         FetchMode::CacheOnly => None,
     };
     let policy = FetchPolicy {
+        feed,
         mode,
         limits,
         deadline,
@@ -1640,14 +1682,14 @@ fn publish_work_after_owner_check(
     Ok(())
 }
 
-/// Acquire and transactionally publish an exact deploy graph.
-///
-/// Returns `(stats, fetched)`. A complete existing cache is re-authenticated
-/// and re-walked without network I/O before it is accepted as a hit.
-pub(crate) fn acquire(
-    spec: &AcquireSpec,
-    destination: &Path,
-) -> Result<(GraphStats, bool), String> {
+fn cache_lock(destination: &Path) -> Result<File, String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(120))
+        .ok_or("OSTree lock deadline overflow")?;
+    cache_lock_before(destination, Some(deadline))
+}
+
+fn cache_lock_before(destination: &Path, deadline: Option<Instant>) -> Result<File, String> {
     let parent = destination_parent(destination)?;
     fs::create_dir_all(parent).map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
     let identity = destination_identity(destination)?;
@@ -1657,16 +1699,122 @@ pub(crate) fn acquire(
         .write(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(crate::feed::OPEN_REGULAR_NOFOLLOW)
         .open(&lock_path)
         .map_err(|error| format!("open {}: {error}", lock_path.display()))?;
-    lock.lock()
-        .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+    if !lock
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", lock_path.display()))?
+        .is_file()
+    {
+        return Err(format!(
+            "OSTree cache lock {} is not a regular file",
+            lock_path.display()
+        ));
+    }
+    let Some(deadline) = deadline else {
+        lock.lock()
+            .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+        return Ok(lock);
+    };
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("OSTree cache {} is busy", destination.display()));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!("lock {}: {error}", lock_path.display()))
+            }
+        }
+    }
+    Ok(lock)
+}
+
+/// Publish only authenticated, already cached objects. No network acquisition.
+pub(crate) fn export_feed(
+    spec: &AcquireSpec,
+    destination: &Path,
+    store: &Path,
+    validate: impl Fn(GraphStats) -> Result<(), String>,
+) -> Result<GraphStats, String> {
+    let _lock = cache_lock(destination)?;
+    let parent = destination_parent(destination)?;
+    let identity = destination_identity(destination)?;
+    recover_transaction(spec, destination, &transaction_path(parent, &identity))?;
+    require_owned_destination(spec, destination)?;
+    let stats = existing_graph(spec, destination)?;
+    validate(stats)?;
+    let manifest_path = destination.join(MANIFEST_NAME);
+    let bytes = read_regular_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("decode {}: {error}", manifest_path.display()))?;
+    let (_, objects) = parse_manifest(spec, text)?;
+    for record in objects {
+        let source = object_path(destination, record.key)?;
+        let bytes = read_regular_bounded(&source, record.key.kind.max_transfer()?)?;
+        authenticate_object(record.key, &bytes)?;
+        // filez identity hashes decoded content; the sidecar seals transport bytes.
+        let checksum = crate::feed::hex_sha256(&bytes);
+        drop(bytes);
+        // Reopen through the shared locked publisher; its checksum gates source races.
+        crate::feed::export_verified_file(
+            &source,
+            &store.join(feed_path(spec, record.key)?),
+            &checksum,
+        )?;
+    }
+    Ok(stats)
+}
+
+/// Acquire and transactionally publish an exact deploy graph.
+///
+/// Returns `(stats, fetched)`. A complete existing cache is re-authenticated
+/// and re-walked without network I/O before it is accepted as a hit.
+pub(crate) fn acquire(
+    spec: &AcquireSpec,
+    destination: &Path,
+) -> Result<(GraphStats, bool), String> {
+    acquire_from(spec, destination, None, |_| Ok(()))
+}
+
+/// The endpoint selects transport only; graph ownership retains its upstream pin.
+pub(crate) fn acquire_from_feed(
+    spec: &AcquireSpec,
+    destination: &Path,
+    base: &str,
+    validate: impl Fn(GraphStats) -> Result<(), String>,
+) -> Result<(GraphStats, bool), String> {
+    let base = crate::feed::consumer_feed_base(base)?;
+    acquire_from(spec, destination, Some(base), validate)
+}
+
+fn acquire_from(
+    spec: &AcquireSpec,
+    destination: &Path,
+    feed: Option<&str>,
+    validate: impl Fn(GraphStats) -> Result<(), String>,
+) -> Result<(GraphStats, bool), String> {
+    let _lock = if feed.is_some() {
+        cache_lock(destination)?
+    } else {
+        // Ordinary host warming retains its existing wait for a cold producer.
+        cache_lock_before(destination, None)?
+    };
+    let parent = destination_parent(destination)?;
+    let identity = destination_identity(destination)?;
     let transaction = transaction_path(parent, &identity);
     recover_transaction(spec, destination, &transaction)?;
     let reserved = reserve_destination(spec, destination, &transaction)?;
     if !reserved {
         match existing_graph(spec, destination) {
-            Ok(stats) => return Ok((stats, false)),
+            Ok(stats) => {
+                validate(stats)?;
+                return Ok((stats, false));
+            }
             Err(error) => eprintln!(
                 "td-feed: cached OSTree graph {} was rejected: {error}; fetching an exact replacement",
                 destination.display()
@@ -1675,7 +1823,14 @@ pub(crate) fn acquire(
     }
 
     let work = create_work_directory(spec, &transaction)?;
-    let (stats, manifest) = build_graph(spec, work.path()?, FetchMode::FetchMissing)?;
+    let (stats, manifest) = build_graph_from(
+        spec,
+        work.path()?,
+        FetchMode::FetchMissing,
+        GRAPH_LIMITS,
+        feed,
+    )?;
+    validate(stats)?;
     sync_object_directories(work.path()?)?;
     let manifest_path = work.path()?.join(MANIFEST_NAME);
     let mut manifest_file = OpenOptions::new()
@@ -1696,7 +1851,231 @@ pub(crate) fn acquire(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feed::tests::ConsumerServer;
     use std::net::TcpListener;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FeedFixture {
+        root: PathBuf,
+        spec: AcquireSpec,
+        objects: BTreeMap<String, Vec<u8>>,
+        upstream: ConsumerServer,
+    }
+
+    impl FeedFixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "td-ostree-feed-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            let upstream = ConsumerServer::start(root.join("upstream"), None);
+            let (mut spec, objects) = synthetic_graph("app/org.example.Fixture/x86_64/stable");
+            spec.repository = upstream.base.clone();
+            let host = root.join("host");
+            fs::create_dir(&host).unwrap();
+            fs::write(host.join(OWNER_NAME), render_owner(&spec)).unwrap();
+            for (path, bytes) in &objects {
+                let path = host.join(path.trim_start_matches('/'));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, bytes).unwrap();
+            }
+            let (_, manifest) = build_graph(&spec, &host, FetchMode::CacheOnly).unwrap();
+            fs::write(host.join(MANIFEST_NAME), manifest).unwrap();
+            Self {
+                root,
+                spec,
+                objects,
+                upstream,
+            }
+        }
+
+        fn export(&self) {
+            export_feed(
+                &self.spec,
+                &self.root.join("host"),
+                &self.root.join("store"),
+                |_| Ok(()),
+            )
+            .unwrap();
+        }
+
+        fn consume(&self, guest: &str, base: &str) -> Result<(GraphStats, bool), String> {
+            acquire_from_feed(&self.spec, &self.root.join(guest), base, |_| Ok(()))
+        }
+    }
+
+    impl Drop for FeedFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn graph_transfers_share_a_bounded_regular_destination_lock() {
+        let fixture = FeedFixture::new("lock");
+        let destination = fixture.root.join("guest");
+        let lock = cache_lock(&destination).unwrap();
+        let error = cache_lock_before(&destination, Some(Instant::now())).unwrap_err();
+        assert!(error.contains("busy"));
+        drop(lock);
+        drop(cache_lock(&destination).unwrap());
+        let path = fixture.root.join(format!(
+            ".{}.td-ostree.lock",
+            destination_identity(&destination).unwrap()
+        ));
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("host"), &path).unwrap();
+        assert!(cache_lock(&destination).is_err());
+    }
+
+    #[test]
+    fn ordinary_graph_warming_can_wait_for_the_existing_producer() {
+        let fixture = FeedFixture::new("producer-wait");
+        let destination = fixture.root.join("host");
+        let lock = cache_lock(&destination).unwrap();
+        let spec = fixture.spec.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = acquire(&spec, &destination);
+            sender.send(result).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(lock);
+        let (_, fetched) = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(!fetched);
+        waiter.join().unwrap();
+        assert_eq!(fixture.upstream.count(), 0);
+    }
+
+    #[test]
+    fn typed_object_read_refuses_a_symlink_inserted_after_stat() {
+        let fixture = FeedFixture::new("typed-read");
+        let real = fixture.root.join("original");
+        let path = fixture.root.join("read-object");
+        fs::write(&path, b"same authenticated bytes").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            read_regular_with_metadata(&path, 64, &metadata).unwrap(),
+            b"same authenticated bytes"
+        );
+        fs::rename(&path, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        assert!(read_regular_with_metadata(&path, 64, &metadata).is_err());
+    }
+
+    #[test]
+    fn feed_graphs_authenticate_two_private_caches_and_reuse_with_host_down() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = FeedFixture::new("reuse");
+        fixture.export();
+        let feed = ConsumerServer::start(fixture.root.join("store"), None);
+        let count = fixture.objects.len();
+        for guest in ["one", "two"] {
+            let (stats, fetched) = fixture.consume(guest, &feed.base).unwrap();
+            assert!(fetched);
+            assert_eq!(stats.objects, count);
+            assert_eq!(
+                fs::read_to_string(fixture.root.join(guest).join(OWNER_NAME)).unwrap(),
+                render_owner(&fixture.spec)
+            );
+        }
+        assert_eq!(feed.count(), count * 2);
+        let object = fixture
+            .objects
+            .keys()
+            .next()
+            .unwrap()
+            .trim_start_matches('/');
+        let one = fixture.root.join("one").join(object);
+        let two = fixture.root.join("two").join(object);
+        assert_ne!(
+            fs::metadata(&one).unwrap().ino(),
+            fs::metadata(&two).unwrap().ino()
+        );
+        fs::set_permissions(&one, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&one, b"corrupt private object").unwrap();
+        assert!(fixture.consume("one", &feed.base).unwrap().1);
+        assert_eq!(fs::read(&one).unwrap(), fs::read(&two).unwrap());
+        drop(feed);
+        assert!(!fixture.consume("two", "http://127.0.0.1:1").unwrap().1);
+        assert_eq!(fixture.upstream.count(), 0);
+    }
+
+    #[test]
+    fn feed_graph_refusals_preserve_old_state_and_never_contact_upstream() {
+        let fixture = FeedFixture::new("refusal");
+        fixture.export();
+        let feed = ConsumerServer::start(fixture.root.join("store"), None);
+        fixture.consume("guest", &feed.base).unwrap();
+        let key = ObjectKey::new(ObjectKind::Commit, fixture.spec.commit);
+        let local = object_path(&fixture.root.join("guest"), key).unwrap();
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&local, b"old corrupt bytes").unwrap();
+        let published = fixture
+            .root
+            .join("store")
+            .join(feed_path(&fixture.spec, key).unwrap());
+        // Even a dishonest feed's matching transport sidecar cannot admit bad objects.
+        fs::write(&published, b"bad graph bytes").unwrap();
+        fs::write(
+            published.with_extension("commit.sha256"),
+            format!("{}\n", crate::feed::hex_sha256(b"bad graph bytes")),
+        )
+        .unwrap();
+        assert!(fixture.consume("guest", &feed.base).is_err());
+        assert_eq!(fs::read(&local).unwrap(), b"old corrupt bytes");
+        fs::remove_file(&published).unwrap();
+        assert!(fixture.consume("missing", &feed.base).is_err());
+        assert!(!fixture.root.join("missing").join(MANIFEST_NAME).exists());
+        drop(feed);
+        let redirect = ConsumerServer::start(fixture.root.join("unused"), Some(format!("HTTP/1.1 302 Found\r\nLocation: {}/objects\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", fixture.upstream.base).into_bytes()));
+        assert!(fixture.consume("redirected", &redirect.base).is_err());
+        drop(redirect);
+        assert_eq!(fixture.upstream.count(), 0);
+    }
+
+    #[test]
+    fn graph_feed_checks_accounting_before_publication_and_export() {
+        let fixture = FeedFixture::new("accounting");
+        let rejected = |_: GraphStats| Err("pin accounting mismatch".to_string());
+        assert!(export_feed(
+            &fixture.spec,
+            &fixture.root.join("host"),
+            &fixture.root.join("store"),
+            rejected
+        )
+        .is_err());
+        assert!(!fixture.root.join("store").exists());
+        fixture.export();
+        let feed = ConsumerServer::start(fixture.root.join("store"), None);
+        let destination = fixture.root.join("guest");
+        assert!(acquire_from_feed(&fixture.spec, &destination, &feed.base, rejected).is_err());
+        assert!(!destination.join(MANIFEST_NAME).exists());
+        fixture.consume("guest", &feed.base).unwrap();
+        let requests = feed.count();
+        assert!(acquire_from_feed(&fixture.spec, &destination, &feed.base, rejected).is_err());
+        assert_eq!(feed.count(), requests);
+        let key = ObjectKey::new(ObjectKind::Commit, fixture.spec.commit);
+        let source = object_path(&fixture.root.join("host"), key).unwrap();
+        fs::write(source, b"corrupt host cache").unwrap();
+        assert!(export_feed(
+            &fixture.spec,
+            &fixture.root.join("host"),
+            &fixture.root.join("another-store"),
+            |_| Ok(())
+        )
+        .is_err());
+        assert!(!fixture.root.join("another-store").exists());
+        assert_eq!(fixture.upstream.count(), 0);
+    }
 
     fn digest(bytes: &[u8]) -> Checksum {
         let mut hasher = td_engine::sha256::Sha256::new();
@@ -2366,6 +2745,7 @@ mod tests {
             &[key],
             &AtomicU64::new(0),
             FetchPolicy {
+                feed: None,
                 mode: FetchMode::CacheOnly,
                 limits: GRAPH_LIMITS,
                 deadline: None,

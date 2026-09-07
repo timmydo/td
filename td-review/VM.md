@@ -436,10 +436,34 @@ The vendor marker covers the registry subset; Git packages remain represented
 by separately reviewed recipe source archives. Run `consume sources` as well
 to acquire the source-pin table. Ordinary host `warm` commands retain their
 producer behavior and can fetch upstream, including with `TD_FEED_BASE` set.
-Other declared transfer objects, including reviewed OSTree application graphs,
-still need guest feed integration. These commands do not claim a complete
-development image, private build-store setup, or an upstream-disabled full
-system build.
+For the reviewed application/runtime graphs, use `td-feed export graphs` on
+the host and `td-feed consume graphs` in each guest. Both resolve the entire
+checkout's `td-recipe-eval ostree-pins` roster, currently Firefox and its
+Freedesktop runtime. The same builder/evaluator prerequisite applies. Each
+pin selects its existing private `~/.td/ostree/CACHE` directory. Export only
+publishes a complete authenticated host graph; warm missing host graphs
+through the ordinary recipe warm first. Neither transfer command fetches
+upstream or starts a daemon.
+
+Graph objects travel through the existing verified feed under a commit
+namespace. The consumer retains the upstream pin as cache identity and uses
+the host endpoint solely for transport. It authenticates every object against
+its tree-reachable checksum, including decoding filez content, then checks the
+pin's structural/decoded counts before publishing the complete private cache.
+It refuses redirects, missing objects and mismatches without upstream
+fallback. A verified existing private graph works with the feed stopped; a
+failed replacement preserves the previous cache. The graph's existing size,
+depth, worker and 12-hour acquisition limits apply, with a two-minute wait
+for the same per-cache lock used by warming. Ordinary host warming retains
+its blocking wait for another producer. The consumer refuses a memory-backed
+HOME cache before graph acquisition. An interrupted export can leave verified
+objects in the feed; retry completes it, and no partial guest graph is
+published. The later materializer still reauthenticates objects and owns foreign-payload admission.
+
+These commands do not claim a complete development image, private build-store
+setup, or an upstream-disabled full system build. The stock image still needs
+development toolchain and evaluator integration before checkout-based
+preparation is a complete guest workflow.
 
 Warm the selected repository revision's declared inputs on the host once.
 Guests have read access to the resulting artifacts, not a general cache upload

@@ -105,7 +105,7 @@ fn parse_jobs(text: &str) -> Result<Vec<Job>, String> {
     Ok(jobs)
 }
 
-fn command_text(command: Command, label: &str, limit: u64) -> Result<String, String> {
+pub(super) fn command_text(command: Command, label: &str, limit: u64) -> Result<String, String> {
     command_text_before(
         command,
         label,

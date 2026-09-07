@@ -21,6 +21,7 @@
 //                      2nd port, fetch the artifact back THROUGH the feed and verify it.
 //                      Also asserts both gates are load-bearing: a wrong pinned hash reds
 //                      warm, a corrupted store byte reds serve (sidecar mismatch).
+mod graphs;
 mod vendor;
 
 use sha2::{Digest, Sha256};
@@ -47,7 +48,7 @@ const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const FEED_NO_DAEMON_ENV: &str = "TD_FEED_NO_DAEMON";
 // Linux UAPI on td's x86/ARM targets: refuse final symlinks and avoid blocking
 // on a substituted FIFO before fstat can reject its file type.
-const OPEN_REGULAR_NOFOLLOW: i32 = 0x20000 | 0x800;
+pub(crate) const OPEN_REGULAR_NOFOLLOW: i32 = 0x20000 | 0x800;
 
 /// One mirror artifact: served at `path`, fetched from `url`, content sha256 `sha256`.
 struct Entry {
@@ -64,7 +65,7 @@ struct SourcePin {
     file: String,
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -210,13 +211,17 @@ fn mount_is_memory_backed(path: &Path, mountinfo: &str, depth: usize) -> io::Res
 }
 
 fn require_disk_backed(path: &Path) -> io::Result<()> {
+    require_disk_backed_for(path, "TD_FEED_DIR")
+}
+
+fn require_disk_backed_for(path: &Path, setting: &str) -> io::Result<()> {
     let canonical = std::fs::canonicalize(path)?;
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
     if mount_is_memory_backed(&canonical, &mountinfo, 0)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "feed scratch {} is memory-backed; choose a disk-backed TD_FEED_DIR",
+                "feed cache {} is memory-backed; choose a disk-backed {setting}",
                 canonical.display()
             ),
         ));
@@ -2633,7 +2638,11 @@ fn export_source_pin(pin: &SourcePin, sources: &Path, store: &Path) -> Result<()
     export_verified_file(&sources.join(&pin.file), &dst, &pin.sha256)
 }
 
-fn export_verified_file(source: &Path, dst: &Path, checksum: &str) -> Result<(), String> {
+pub(crate) fn export_verified_file(
+    source: &Path,
+    dst: &Path,
+    checksum: &str,
+) -> Result<(), String> {
     copy_verified_file(source, dst, checksum, || {
         write_atomic(&sidecar_path(dst), format!("{checksum}\n").as_bytes())
     })
@@ -2716,7 +2725,7 @@ fn export_source_pins(pins: &[SourcePin], sources: &Path, store: &Path) -> Resul
 }
 
 /// Validate the endpoint shared by every source-pin request.
-fn consumer_feed_base(base: &str) -> Result<&str, String> {
+pub(crate) fn consumer_feed_base(base: &str) -> Result<&str, String> {
     let base = base.trim_end_matches('/');
     let authority = base
         .strip_prefix("http://")
@@ -3626,6 +3635,13 @@ pub fn run(a: &[String]) {
                 die(format!("{action} vendors: {error}"));
             }
         }
+        Some(action @ ("export" | "consume"))
+            if a.len() == 3 && a.get(2).map(String::as_str) == Some("graphs") =>
+        {
+            if let Err(error) = graphs::run(&repo_root(), action == "consume") {
+                die(format!("{action} graphs: {error}"));
+            }
+        }
         // warm <action> — the structured host-PREP orchestration (consolidated warm-*.sh).
         // The low-level `warm INDEX STORE` primitive (feed-shared gate, feed-ensure serve)
         // stays: dispatch on a known action keyword, else treat it as the legacy 2-arg form.
@@ -3721,7 +3737,7 @@ pub fn run(a: &[String]) {
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed serve STORE ADDR\n  \
-                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed export vendors [TARGET]\n  td-feed consume vendors [TARGET]\n  td-feed export graphs\n  td-feed consume graphs\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);
@@ -3730,7 +3746,7 @@ pub fn run(a: &[String]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         cargo_route, detach_from_workspace, download_verified, ensure_serve_daemon,
         feed_daemon_policy, file_sha256_before, index_path, is_warm_complete, mark_warm_complete,
@@ -4100,15 +4116,15 @@ mod tests {
         assert!(!dir.exists());
     }
 
-    pub(super) struct ConsumerServer {
-        pub(super) base: String,
+    pub(crate) struct ConsumerServer {
+        pub(crate) base: String,
         requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
     impl ConsumerServer {
-        pub(super) fn start(store: PathBuf, response: Option<Vec<u8>>) -> Self {
+        pub(crate) fn start(store: PathBuf, response: Option<Vec<u8>>) -> Self {
             use std::io::Write;
             use std::sync::{
                 atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -4151,7 +4167,7 @@ mod tests {
                 thread: Some(thread),
             }
         }
-        pub(super) fn count(&self) -> usize {
+        pub(crate) fn count(&self) -> usize {
             self.requests.load(std::sync::atomic::Ordering::Relaxed)
         }
     }

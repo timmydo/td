@@ -1377,6 +1377,39 @@ Firefox and runtime graph counts above are permanent reviewed pin evidence and
 were reauthenticated offline during this landing, not downloaded test
 fixtures. The `net-test` affected-checks preflight runs the td-net suite for
 net and td-engine changes.
+
+For development-VM download reuse, `td-feed export graphs` publishes the
+checkout's reviewed `ostree-pins` roster from existing host caches into the
+ordinary local feed. Export takes the same destination lock as warming,
+recovers its owned transaction state, reauthenticates the complete graph and
+checks the pin's structural/decoded accounting before publishing any object.
+Each exported object is reauthenticated and copied with a transport SHA-256
+sidecar under `ostree/COMMIT/objects/FANOUT`. No graph discovery, upstream
+acquisition or executable admission occurs during export.
+
+`td-feed consume graphs` uses `TD_FEED_BASE` or the compositor's VM endpoint
+to acquire those objects into the caller's private graph cache. The endpoint
+is transport only: ownership and manifests retain the reviewed upstream
+repository, ref, commit and content checksum. The consumer refuses redirects
+and upstream fallback, including on a missing or corrupt feed object. Every
+object still passes semantic authentication; a filez transport sidecar is
+never a substitute for its decoded identity. The full graph must also match
+the pin's structural and decoded counts before publication. Observed transfer
+size remains informational because recompression can change it.
+
+These explicit transfer commands share the existing graph bounds and
+transactional cache publication. Export publishes each object atomically;
+a later failure can leave a verified subset in the feed, which retry reuses.
+Only guest publication requires a complete graph. Warm private caches are reauthenticated
+without contacting the feed; a damaged cache remains in place until a complete
+replacement is ready. Warm, export and consume use the same regular-file lock
+inode. Export and consume have a two-minute contention limit; ordinary host
+warming retains its blocking wait for another cold producer. The consumer
+requires a disk-backed cache below HOME, like ordinary warming. Neither the
+host graph cache nor the feed is writable by a guest through this interface.
+This extends development control-plane acquisition only; application admission, foreign marks,
+materialization and runtime confinement retain their existing boundaries.
+
 **The transactional deploy-tree materializer has now LANDED.**
 `td-builder ostree-materialize` takes the cache plus the reviewed exact ref,
 commit and content checksums. It ignores the cache manifest as authority,
