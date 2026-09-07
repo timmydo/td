@@ -85,6 +85,8 @@ pub enum Request {
     /// Evdev code and explicit Wayland milliseconds, never physical origin.
     Key { time: u32, code: u16, pressed: bool },
     ReleaseKeys(u32),
+    Pointer(crate::input::AutomationPointer),
+    ReleaseInput(u32),
 }
 
 /// The vocabulary, as one list, so the parser and the help text cannot drift:
@@ -115,6 +117,9 @@ pub const USAGE: &[(&str, &str)] = &[
     ("group", "group the focused window's container, or ungroup it"),
     ("key <time-ms> <1-247> <down|up>", "route a key on an enabled headless keyboard"),
     ("release-keys <time-ms>", "release all keys owned by that headless keyboard"),
+    ("pointer <time-ms> <x> <y> <buttons> <vertical> <horizontal>",
+        "route one complete absolute pointer report on an enabled headless seat"),
+    ("release-input <time-ms>", "release that headless seat's keys and pointer buttons"),
 ];
 
 impl Request {
@@ -136,6 +141,8 @@ impl Request {
             "group" => Request::Group,
             "key" => key_request(&mut words)?,
             "release-keys" => Request::ReleaseKeys(key_time(words.next())?),
+            "pointer" => pointer_request(&mut words)?,
+            "release-input" => Request::ReleaseInput(key_time(words.next())?),
             other => return Err(format!("no such request '{other}'; try 'help'")),
         };
         // Refused rather than ignored: a caller spelling an argument this verb
@@ -165,6 +172,11 @@ impl Request {
                 format!("key {time} {code} {}", if pressed { "down" } else { "up" })
             }
             Request::ReleaseKeys(time) => format!("release-keys {time}"),
+            Request::Pointer(report) => format!(
+                "pointer {} {} {} {} {} {}", report.time, report.x, report.y,
+                report.buttons, report.vertical, report.horizontal,
+            ),
+            Request::ReleaseInput(time) => format!("release-input {time}"),
             Request::FocusWindow(handle) => format!("focus {}", handle_word(handle)),
             Request::SendWindow(handle, number) => {
                 format!("send {} {number}", handle_word(handle))
@@ -192,7 +204,7 @@ fn handle_word(handle: u64) -> String {
 }
 
 fn key_time(word: Option<&str>) -> Result<u32, String> {
-    let word = word.ok_or("keyboard request needs time-ms")?;
+    let word = word.ok_or("input request needs time-ms")?;
     if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("time-ms must be an unsigned decimal u32".into());
     }
@@ -215,6 +227,44 @@ fn key_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Request,
         _ => return Err("key state must be 'down' or 'up'".into()),
     };
     Ok(Request::Key { time, code, pressed })
+}
+
+fn pointer_unsigned(word: Option<&str>, field: &str, max: u32) -> Result<u32, String> {
+    let word = word.ok_or_else(|| format!("pointer needs {field}"))?;
+    if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("pointer {field} must be unsigned decimal"));
+    }
+    let value = word.parse::<u32>().map_err(|_| format!("pointer {field} outside u32"))?;
+    if value > max {
+        return Err(format!("pointer {field} outside 0..={max}"));
+    }
+    Ok(value)
+}
+
+fn pointer_wheel(word: Option<&str>, field: &str) -> Result<i32, String> {
+    let word = word.ok_or_else(|| format!("pointer needs {field}"))?;
+    let digits = word.strip_prefix('-').unwrap_or(word);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("pointer {field} must be signed decimal without '+'"));
+    }
+    let value = word.parse::<i32>().map_err(|_| format!("pointer {field} outside i32"))?;
+    if !(-120..=120).contains(&value) {
+        return Err(format!("pointer {field} outside -120..=120 detents"));
+    }
+    Ok(value)
+}
+
+fn pointer_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Request, String> {
+    let time = key_time(words.next())?;
+    let x = pointer_unsigned(words.next(), "x", 16383)?;
+    let y = pointer_unsigned(words.next(), "y", 16383)?;
+    let buttons = u8::try_from(pointer_unsigned(words.next(), "buttons", 255)?)
+        .map_err(|_| "pointer buttons outside u8")?;
+    let vertical = pointer_wheel(words.next(), "vertical")?;
+    let horizontal = pointer_wheel(words.next(), "horizontal")?;
+    Ok(Request::Pointer(crate::input::AutomationPointer {
+        time, x, y, buttons, vertical, horizontal,
+    }))
 }
 
 /// Whether a word NAMES a window rather than describing one.
@@ -616,7 +666,8 @@ pub(crate) fn reportable(character: char) -> bool {
 pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> {
     let command = match request {
         Request::Layout => return Ok(Answer::Report(report(&runtime.control_snapshot()))),
-        Request::Key { .. } | Request::ReleaseKeys(_) => return Ok(Answer::InputDisabled),
+        Request::Key { .. } | Request::ReleaseKeys(_)
+        | Request::Pointer(_) | Request::ReleaseInput(_) => return Ok(Answer::InputDisabled),
         Request::Workspace(number) => Command::SwitchWorkspace(number),
         Request::Send(number) => Command::MoveToWorkspace(number),
         Request::Focus(direction) => Command::Focus(direction),
@@ -677,6 +728,7 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
 pub enum Answer {
     Ok,
     InputDisabled,
+    InputRefused(String),
     Report(String),
     NoSuchWindow(u64),
     /// Named a window that IS there and cannot be arranged: a portal dialog.
@@ -732,13 +784,13 @@ fn found(
 /// compositor's, and answering them as refusals told a script to go and check
 /// its spelling.
 pub fn answer(runtime: &Mutex<Runtime>, line: &str) -> String {
-    answer_with_keys(runtime, line, None)
+    answer_with_input(runtime, line, None)
 }
 
-fn answer_with_keys(
+fn answer_with_input(
     runtime: &Mutex<Runtime>,
     line: &str,
-    keys: Option<&mut crate::input::AutomationKeys>,
+    seat: Option<&mut crate::input::AutomationSeat>,
 ) -> String {
     let request = match Request::parse(line) {
         Ok(request) => request,
@@ -747,12 +799,24 @@ fn answer_with_keys(
     // A poisoned runtime is a compositor that has already lost; say so rather
     // than take this thread down after it.
     let outcome = match runtime.lock() {
-        Ok(mut runtime) => match (request, keys) {
-            (Request::Key { time, code, pressed }, Some(keys)) => {
-                keys.key(&mut runtime, time, code, pressed).map(|()| Answer::Ok)
+        Ok(mut runtime) => match (request, seat) {
+            (Request::Key { time, code, pressed }, Some(seat)) => {
+                seat.key(&mut runtime, time, code, pressed).map(|()| Answer::Ok)
             }
-            (Request::ReleaseKeys(time), Some(keys)) => {
-                keys.release(&mut runtime, time).map(|()| Answer::Ok)
+            (Request::ReleaseKeys(time), Some(seat)) => {
+                seat.release_keys(&mut runtime, time).map(|()| Answer::Ok)
+            }
+            (Request::Pointer(report), Some(seat)) => {
+                match seat.pointer(&mut runtime, report) {
+                    Ok(()) => Ok(Answer::Ok),
+                    Err(crate::input::AutomationFailure::Refused(error)) => {
+                        Ok(Answer::InputRefused(error))
+                    }
+                    Err(crate::input::AutomationFailure::Unavailable(error)) => Err(error),
+                }
+            }
+            (Request::ReleaseInput(time), Some(seat)) => {
+                seat.release_all(&mut runtime, time).map(|()| Answer::Ok)
             }
             _ => apply(&mut runtime, request),
         },
@@ -760,7 +824,8 @@ fn answer_with_keys(
     };
     match outcome {
         Ok(Answer::Ok) => "ok\n".to_string(),
-        Ok(Answer::InputDisabled) => "error keyboard automation is disabled\n".into(),
+        Ok(Answer::InputDisabled) => "error input automation is disabled\n".into(),
+        Ok(Answer::InputRefused(error)) => format!("error {error}\n"),
         Ok(Answer::Report(report)) => format!("ok\n{report}"),
         Ok(Answer::NoSuchWindow(handle)) => {
             format!("error no window {}\n", handle_word(handle))
@@ -824,9 +889,9 @@ pub(crate) fn serve_headless(
     thread::Builder::new()
         .name("td-control".into())
         .spawn(move || {
-            accept_with_keys(
+            accept_with_input(
                 listener.incoming(), &runtime, SocketPolicy::Private,
-                input_control.then(crate::input::AutomationKeys::default),
+                input_control.then(crate::input::AutomationSeat::default),
             );
             completion.report(Err("headless control listener retired".into()));
         })
@@ -842,14 +907,14 @@ fn accept(
     runtime: &Mutex<Runtime>,
     policy: SocketPolicy,
 ) {
-    accept_with_keys(connections, runtime, policy, None);
+    accept_with_input(connections, runtime, policy, None);
 }
 
-fn accept_with_keys(
+fn accept_with_input(
     connections: impl Iterator<Item = io::Result<UnixStream>>,
     runtime: &Mutex<Runtime>,
     policy: SocketPolicy,
-    mut keys: Option<crate::input::AutomationKeys>,
+    mut seat: Option<crate::input::AutomationSeat>,
 ) {
     let mut consecutive = 0;
     for connection in connections {
@@ -869,7 +934,7 @@ fn accept_with_keys(
         // answer, every wait it can do is bounded, and the alternative is a
         // thread per caller whose only purpose would be to let two callers
         // reorder each other's orders.
-        if let Err(error) = converse(stream, runtime, keys.as_mut()) {
+        if let Err(error) = converse(stream, runtime, seat.as_mut()) {
             eprintln!("td-compositor: control: {error}");
         }
     }
@@ -878,7 +943,7 @@ fn accept_with_keys(
 fn converse(
     mut stream: UnixStream,
     runtime: &Mutex<Runtime>,
-    keys: Option<&mut crate::input::AutomationKeys>,
+    seat: Option<&mut crate::input::AutomationSeat>,
 ) -> Result<(), String> {
     // One deadline for the whole exchange. The socket timeouts stay, because
     // they are what unblocks a single stalled syscall; the deadline is what
@@ -899,8 +964,8 @@ fn converse(
     // to get right — and the write below is bounded by the same deadline, so
     // answering a caller still mid-flood cannot park this thread.
     let reply = match read_request(&mut stream, deadline) {
-        Ok(line) => match keys {
-            Some(keys) => answer_with_keys(runtime, &line, Some(keys)),
+        Ok(line) => match seat {
+            Some(seat) => answer_with_input(runtime, &line, Some(seat)),
             None => answer(runtime, &line),
         },
         Err(error) => format!("error {error}\n"),
@@ -1216,6 +1281,10 @@ mod tests {
             Request::Key { time: 0, code: 1, pressed: true },
             Request::Key { time: u32::MAX, code: 247, pressed: false },
             Request::ReleaseKeys(u32::MAX),
+            Request::ReleaseInput(u32::MAX),
+            Request::Pointer(crate::input::AutomationPointer {
+                time: u32::MAX, x: 16383, y: 0, buttons: 255, vertical: -120, horizontal: 120,
+            }),
         ];
         for request in every {
             let line = request.render();
@@ -1240,6 +1309,7 @@ mod tests {
             "1-9" => "1".to_string(),
             "time-ms" => "0".to_string(),
             "1-247" => "30".to_string(),
+            "x" | "y" | "buttons" | "vertical" | "horizontal" => "0".to_string(),
             "@id" => "@12".to_string(),
             alternation => alternation
                 .split('|')
@@ -1267,12 +1337,40 @@ mod tests {
         let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
         runtime.lock().unwrap().enable_attention(true);
         let before = runtime.lock().unwrap().keyboard_snapshot();
-        let mut keys = crate::input::AutomationKeys::default();
-        for line in ["key 0 30 down", "release-keys 1"] {
-            assert_eq!(answer_with_keys(&runtime, line, Some(&mut keys)),
-                "unavailable keyboard automation refuses a trusted-attention runtime\n");
+        let mut keys = crate::input::AutomationSeat::default();
+        for line in [
+            "key 0 30 down", "release-keys 1", "pointer 2 0 0 0 0 0",
+            "pointer 2 16383 16383 1 0 0", "release-input 3",
+        ] {
+            assert_eq!(answer_with_input(&runtime, line, Some(&mut keys)),
+                "unavailable input automation refuses a trusted-attention runtime\n");
         }
         assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
+    }
+
+    #[test]
+    fn pointer_wire_fields_and_runtime_coordinates_are_bounded() {
+        for line in [
+            "pointer", "pointer 0 1 2 3 4", "pointer 0 -1 2 0 0 0",
+            "pointer 0 1 +2 0 0 0", "pointer 0 16384 0 0 0 0",
+            "pointer 0 0 0 256 0 0", "pointer 0 0 0 0 -121 0",
+            "pointer 0 0 0 0 0 121", "pointer 0 0 0 0 --1 0",
+            "pointer 0 0 0 0 +1 0", "pointer 0 0 0 0 0 0 extra",
+            "release-input", "release-input -1", "release-input 0 extra",
+        ] {
+            assert!(Request::parse(line).is_err(), "{line}");
+        }
+        let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
+        let width = runtime.lock().unwrap().width();
+        let before = runtime.lock().unwrap().pointer_snapshot();
+        let mut seat = crate::input::AutomationSeat::default();
+        let line = format!("pointer 0 {width} 0 1 0 0");
+        assert_eq!(answer_with_input(&runtime, &line, Some(&mut seat)),
+            "error pointer coordinates outside the output\n");
+        assert_eq!(runtime.lock().unwrap().pointer_snapshot(), before);
+        for line in ["pointer 0 0 0 1 0 0", "release-input 1"] {
+            assert_eq!(answer(&runtime, line), "error input automation is disabled\n");
+        }
     }
 
     #[test]

@@ -68,20 +68,22 @@ disabled by default. Existing layout commands work on `td-control`.
 Normal `run` startup, deployment authority and physical secure attention are
 unchanged. All production code remains std-only with no new syscall surface.
 
-## Opt-in keyboard control
+## Opt-in input control
 
 Append `--input-control enabled` to the headless command to grant its private
-`td-control` endpoint one synthetic keyboard. Ordinary `run` sessions and
-headless sessions without that exact option refuse keyboard requests. Public
-Wayland clients gain no control endpoint or input grant. No hardware device
-is acquired, and a trusted-attention-enabled runtime refuses synthetic input
-even if incorrectly wired to this adapter.
+`td-control` endpoint one synthetic seat with keyboard and pointer devices.
+Ordinary `run` sessions and headless sessions without that exact option refuse
+input requests. Public Wayland clients gain no control endpoint or input
+grant. No hardware device is acquired. A trusted-attention-enabled runtime
+refuses synthetic input even if incorrectly wired to this adapter.
 
 The `td-ctl` request vocabulary adds:
 
 ```text
 key <time-ms> <1-247> <down|up>
 release-keys <time-ms>
+pointer <time-ms> <x> <y> <buttons> <vertical> <horizontal>
+release-input <time-ms>
 ```
 
 `time-ms` is an explicit unsigned decimal u32 Wayland timestamp, including
@@ -95,34 +97,59 @@ compositor workspace chords and the help overlay. Launcher opening and
 process-launch chords report unavailable; they never start a process.
 Ctrl+Alt+Esc is ordinary untrusted input here, never secure attention.
 
-The keyboard belongs to the headless process generation, not an individual
-one-request control connection. Held keys persist across those connections.
+The seat belongs to the headless process generation, not an individual
+one-request control connection. Held keys and buttons persist across them.
 `release-keys` releases all its depressed keys using normal device-removal
 cleanup, including consumed shortcuts, but retains Caps/Num lock toggles and
-overlay visibility. Repeating it is harmless. The owner closes stdin to end
-the whole generation, which disconnects clients and discards all held state;
-there is no detached input controller that outlives its session. Callers
-sharing the endpoint share this keyboard and must serialize their scenarios.
+overlay visibility. It does not release pointer buttons. `release-input`
+releases both devices, including owed client button releases and compositor
+drag cleanup. Repeating either release command is harmless. The owner closes
+stdin to end the whole generation, disconnecting clients and discarding all
+held state. No detached input controller outlives its session. Callers
+sharing the endpoint share this seat and must serialize their scenarios.
+
+Every `pointer` request is one complete absolute report: position, entire held
+button mask and wheel deltas. Coordinates are unsigned decimal output pixels,
+including compositor chrome, from zero through width/height minus one. The
+wire ceiling is 16,383 per axis; coordinates outside the current output are
+refused before mutation, not clamped. Exact pixel/extent fractions feed the
+normal absolute-device placement path, with no intermediate quantization.
+The unsigned decimal button mask is 0..255: bits 0..7 correspond to evdev
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA, BTN_FORWARD, BTN_BACK
+and BTN_TASK (272..279). Changes follow ascending button-code order.
+An unchanged mask does not repeat a press; two separate reports express a
+click. Missing fields and overflow are refused, never supplied from another
+caller's partial report. The keyboard and pointer use separate device ids
+under the same binding state, so keyboard-only cleanup preserves pointer
+button ownership. Releasing Alt still cancels an Alt-held compositor drag
+through normal modifier handling.
+
+Wheel fields are signed decimal detents in -120..120, without a plus sign:
+vertical positive is away from the operator, horizontal positive is right.
+The shared evdev scroll conversion produces Wayland's signs/units. Unlike a
+held button mask, a nonzero wheel delta is a new action on every request.
+Overlay filtering, hit testing, client grabs, Alt drags, focus, and workspace
+gestures all follow the production pointer report path. Each control report
+flushes deferred cursor paint; a failed delivery retains device bookkeeping
+for cleanup and still attempts the pending paint. This is software output
+work, not evidence that a client processed its input or drew another frame.
 
 `ok` means input was routed or an idempotent no-op, not that the focused
 application processed it or presented another frame. Delivery failure can
 follow mutation; requests are not rollback transactions, and an unavailable
 or lost reply must not be blindly retried as exactly-once input. Use
-`release-keys` to recover depressed state or dispose of the session. The
+`release-input` to recover depressed state or dispose of the session. The
 existing request-size and whole-conversation deadline bounds remain in force.
-Pointer injection, pixel capture and application/output observation fences
-are still separate increments.
+Pixel capture and application/output observation fences remain separate
+increments.
 
 ## Planned control and observation increments
 
 These are the next implementation requirements, not available commands:
 
-1. Extend the opt-in keyboard with complete pointer/button/wheel reports
-   through normal shared seat and compositor-binding paths. Do not mutate
-   editor state or bypass compositor routing. Release automation-owned held
-   state when its controlling generation ends. Automation must never
-   manufacture a physical-origin witness, enter/confirm trusted attention,
-   or authorize secret release.
+1. Maintain the input boundary: do not mutate editor state or bypass
+   compositor routing. Automation must never manufacture a physical-origin
+   witness, enter/confirm trusted attention, or authorize secret release.
 2. Add a separately enabled capture capability on `td-ctl`, absent by default.
    A public Wayland socket grants neither synthetic input nor capture.
 3. Report monotonic session/action/commit/output identities with bounded

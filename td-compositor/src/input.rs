@@ -728,14 +728,53 @@ struct LiveInputTarget {
     launches: LaunchBackend,
 }
 
-/// One synthetic keyboard for the lifetime of an explicitly enabled headless
-/// session. It shares ordinary binding policy, but cannot obtain evdev origin.
+/// One synthetic seat for an explicitly enabled headless process generation.
+/// Keyboard and pointer use distinct device ids under the shared bindings.
 #[derive(Default)]
-pub(crate) struct AutomationKeys {
+pub(crate) struct AutomationSeat {
     bindings: KeyBindings,
 }
 
-impl AutomationKeys {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutomationPointer {
+    pub time: u32,
+    pub x: u32,
+    pub y: u32,
+    pub buttons: u8,
+    pub vertical: i32,
+    pub horizontal: i32,
+}
+
+#[derive(Debug)]
+pub(crate) enum AutomationFailure {
+    Refused(String),
+    Unavailable(String),
+}
+
+impl From<String> for AutomationFailure {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl AutomationPointer {
+    pub(crate) fn validate(self, width: usize, height: usize) -> Result<(), String> {
+        if usize::try_from(self.x).map_or(true, |x| x >= width)
+            || usize::try_from(self.y).map_or(true, |y| y >= height)
+        {
+            return Err("pointer coordinates outside the output".into());
+        }
+        if !(-120..=120).contains(&self.vertical) || !(-120..=120).contains(&self.horizontal) {
+            return Err("pointer wheel outside -120..=120 detents".into());
+        }
+        Ok(())
+    }
+}
+
+impl AutomationSeat {
+    const KEYBOARD: usize = 0;
+    const POINTER: usize = 1;
+
     pub(crate) fn key(
         &mut self,
         runtime: &mut Runtime,
@@ -748,7 +787,7 @@ impl AutomationKeys {
             return Err("automation key outside 1..=247".into());
         }
         let decision = self.bindings.feed_device(
-            0,
+            Self::KEYBOARD,
             Event {
                 timestamp: u128::from(time) * 1_000_000,
                 time,
@@ -760,22 +799,83 @@ impl AutomationKeys {
         deliver_key_decision(&mut AutomationTarget { runtime }, &mut self.bindings, decision)
     }
 
-    pub(crate) fn release(&mut self, runtime: &mut Runtime, time: u32) -> Result<(), String> {
+    pub(crate) fn release_keys(&mut self, runtime: &mut Runtime, time: u32) -> Result<(), String> {
         Self::admit(runtime)?;
         release_device_locked(
             &Mutex::new(AutomationTarget { runtime }),
-            0,
+            Self::KEYBOARD,
             &mut self.bindings,
             time,
         )
     }
 
+    pub(crate) fn pointer(
+        &mut self,
+        runtime: &mut Runtime,
+        report: AutomationPointer,
+    ) -> Result<(), AutomationFailure> {
+        Self::admit(runtime)?;
+        report.validate(runtime.width(), runtime.height()).map_err(AutomationFailure::Refused)?;
+        let width = u32::try_from(runtime.width())
+            .map_err(|_| "output width outside u32".to_string())?;
+        let height = u32::try_from(runtime.height())
+            .map_err(|_| "output height outside u32".to_string())?;
+        let mut pressed = BTreeSet::new();
+        let mut buttons = Vec::new();
+        for code in BTN_MOUSE..=BTN_TASK {
+            let bit = 1u8.checked_shl(u32::from(code - BTN_MOUSE))
+                .ok_or_else(|| "automation button code exceeds its mask".to_string())?;
+            let down = report.buttons & bit != 0;
+            if down {
+                pressed.insert(code);
+            }
+            if down != self.bindings.pointer_pressed.contains(&(Self::POINTER, code)) {
+                buttons.push(PointerButtonTransition { code, pressed: down });
+            }
+        }
+        let frame = PointerFrame {
+            time: report.time,
+            place: PointerPlace::At {
+                x: Fraction { numerator: report.x, denominator: width },
+                y: Fraction { numerator: report.y, denominator: height },
+            },
+            buttons,
+            scroll: PointerScroll { vertical: report.vertical, horizontal: report.horizontal },
+        };
+        let mut target = AutomationTarget { runtime };
+        let delivery = deliver_pointer_frame(
+            &mut target, &mut self.bindings, Self::POINTER, &frame, &pressed,
+        );
+        // A control request is a complete batch; settle cursor paint even if
+        // another part of delivery failed after changing the scene.
+        automation_outcome([delivery, target.flush()]).map_err(AutomationFailure::Unavailable)
+    }
+
+    pub(crate) fn release_all(&mut self, runtime: &mut Runtime, time: u32) -> Result<(), String> {
+        Self::admit(runtime)?;
+        let keyboard = self.release_keys(runtime, time);
+        let pointer = release_device_locked(
+            &Mutex::new(AutomationTarget { runtime }), Self::POINTER, &mut self.bindings, time,
+        );
+        automation_outcome([keyboard, pointer, runtime.flush_paint()])
+    }
+
     fn admit(runtime: &Runtime) -> Result<(), String> {
         if runtime.attention_enabled() {
-            return Err("keyboard automation refuses a trusted-attention runtime".into());
+            return Err("input automation refuses a trusted-attention runtime".into());
         }
         Ok(())
     }
+}
+
+fn automation_outcome<const N: usize>(outcomes: [Result<(), String>; N]) -> Result<(), String> {
+    let mut failure = None;
+    for outcome in outcomes {
+        if let Err(error) = outcome {
+            retain_failure(&mut failure, error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 struct AutomationTarget<'a> {
@@ -817,24 +917,24 @@ impl InputTarget for AutomationTarget<'_> {
 
     fn pointer_frame(
         &mut self,
-        _time: u32,
-        _dx: i32,
-        _dy: i32,
-        _buttons: &[PointerButtonInput],
-        _scroll: PointerScroll,
+        time: u32,
+        dx: i32,
+        dy: i32,
+        buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String> {
-        Err("keyboard automation has no pointer".into())
+        self.runtime.pointer_frame(time, dx, dy, buttons, scroll)
     }
 
     fn pointer_frame_at(
         &mut self,
-        _time: u32,
-        _x: Fraction,
-        _y: Fraction,
-        _buttons: &[PointerButtonInput],
-        _scroll: PointerScroll,
+        time: u32,
+        x: Fraction,
+        y: Fraction,
+        buttons: &[PointerButtonInput],
+        scroll: PointerScroll,
     ) -> Result<(), String> {
-        Err("keyboard automation has no pointer".into())
+        self.runtime.pointer_frame_at(time, x, y, buttons, scroll)
     }
 
     fn flush(&mut self) -> Result<(), String> {
@@ -1992,13 +2092,116 @@ mod tests {
         (cleanup, runtime)
     }
 
+    fn pointer_report(x: u32, y: u32, buttons: u8) -> AutomationPointer {
+        AutomationPointer { time: 10, x, y, buttons, vertical: 0, horizontal: 0 }
+    }
+
+    #[test]
+    fn automation_pointer_reports_share_grabs_wheels_and_explicit_cleanup() {
+        use crate::pointer::{PointerAxis, PointerEvent};
+        use crate::runtime::KeyboardDelivery;
+        let (_cleanup, mut runtime) = automation_runtime();
+        let active = || Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (events, _stop) = runtime.subscribe_input_with_activity(1, active(), active())
+            .unwrap().split();
+        let mut seat = AutomationSeat::default();
+        runtime.take_writes();
+        seat.pointer(&mut runtime, pointer_report(70, 90, 0)).unwrap();
+        assert!(!runtime.take_writes().is_empty(), "cursor paint was left pending");
+        let target = runtime.pointer_snapshot().focus.unwrap();
+        assert_eq!(target.surface, crate::scene::SurfaceKey { client: 1, object: 1 });
+        let mut report = pointer_report(75, 95, 1);
+        report.vertical = 2;
+        report.horizontal = -3;
+        seat.pointer(&mut runtime, report).unwrap();
+        let focused = runtime.pointer_snapshot().focus.unwrap();
+        assert_eq!((focused.x - target.x, focused.y - target.y), (5, 5));
+        let pointer_events = |events: &std::sync::mpsc::Receiver<KeyboardDelivery>| {
+            events.try_iter().filter_map(|delivery| match delivery {
+                KeyboardDelivery::Pointer(frame) => Some(frame.events),
+                _ => None,
+            }).flatten().collect::<Vec<_>>()
+        };
+        let delivered = pointer_events(&events);
+        assert_eq!(delivered.iter().filter(|event| matches!(event,
+            PointerEvent::Button { input, .. } if input.state == PointerButtonState::Pressed
+                && input.button == 272 && input.time == 10)).count(), 1);
+        for (axis, detents) in [(PointerAxis::Vertical, -2), (PointerAxis::Horizontal, -3)] {
+            assert!(delivered.iter().any(|event| matches!(event,
+                PointerEvent::Axis { step, time: 10, .. }
+                    if step.axis == axis && step.detents == detents)));
+        }
+        seat.pointer(&mut runtime, pointer_report(75, 95, 1)).unwrap();
+        assert!(pointer_events(&events).is_empty(), "unchanged held mask pressed twice");
+        // The client grab keeps motion and release even over compositor chrome.
+        seat.pointer(&mut runtime, pointer_report(3, 3, 1)).unwrap();
+        assert_eq!(runtime.pointer_snapshot().focus.unwrap().surface, target.surface);
+        seat.key(&mut runtime, 11, KEY_LEFTSHIFT, true).unwrap();
+        seat.release_keys(&mut runtime, 12).unwrap();
+        assert!(seat.bindings.pointer_forwarded.contains(&272));
+        assert!(!pointer_events(&events).iter().any(|event| matches!(event,
+            PointerEvent::Button { input, .. } if input.state == PointerButtonState::Released)));
+        seat.release_all(&mut runtime, 13).unwrap();
+        assert!(seat.bindings.pointer_pressed.is_empty());
+        assert!(seat.bindings.pointer_forwarded.is_empty());
+        let released = pointer_events(&events);
+        assert_eq!(released.iter().filter(|event| matches!(event,
+            PointerEvent::Button { input, .. } if input.state == PointerButtonState::Released
+                && input.button == 272 && input.time == 13)).count(), 1);
+        seat.release_all(&mut runtime, 14).unwrap();
+        assert!(pointer_events(&events).is_empty());
+    }
+
+    #[test]
+    fn automation_pointer_refuses_bounds_and_attention_without_mutation() {
+        let (_cleanup, mut runtime) = automation_runtime();
+        let mut seat = AutomationSeat::default();
+        seat.pointer(&mut runtime, pointer_report(70, 90, 1)).unwrap();
+        let before = runtime.pointer_snapshot();
+        let owned = seat.bindings.pointer_pressed.clone();
+        for report in [
+            pointer_report(320, 0, 0), pointer_report(0, 200, 0),
+            pointer_report(u32::MAX, 0, 0),
+            AutomationPointer { vertical: i32::MIN, ..pointer_report(70, 90, 0) },
+            AutomationPointer { horizontal: 121, ..pointer_report(70, 90, 0) },
+        ] {
+            assert!(seat.pointer(&mut runtime, report).is_err());
+            assert_eq!(runtime.pointer_snapshot(), before);
+            assert_eq!(seat.bindings.pointer_pressed, owned);
+        }
+        runtime.enable_attention(true);
+        assert!(seat.pointer(&mut runtime, pointer_report(3, 3, 0)).is_err());
+        assert!(seat.release_all(&mut runtime, 20).is_err());
+        assert_eq!(runtime.pointer_snapshot(), before);
+        assert_eq!(seat.bindings.pointer_pressed, owned);
+        runtime.enable_attention(false);
+        seat.release_all(&mut runtime, 21).unwrap();
+        for (x, y) in [(0, 0), (319, 0), (0, 199), (319, 199)] {
+            seat.pointer(&mut runtime, pointer_report(x, y, 0)).unwrap();
+        }
+    }
+
+    #[test]
+    fn automation_pointer_failure_retains_cleanup_and_all_eight_button_owners() {
+        let (_cleanup, mut runtime) = automation_runtime();
+        let mut seat = AutomationSeat::default();
+        runtime.fail_next_repaint();
+        assert!(seat.pointer(&mut runtime, pointer_report(70, 90, 255)).is_err());
+        assert_eq!(seat.bindings.pointer_pressed.len(), 8);
+        assert_eq!(seat.bindings.pointer_forwarded.len(), 8);
+        runtime.clear_repaint_failure();
+        seat.release_all(&mut runtime, 11).unwrap();
+        assert!(seat.bindings.pointer_pressed.is_empty());
+        assert!(seat.bindings.pointer_forwarded.is_empty());
+    }
+
     #[test]
     fn automation_delivers_normal_keys_once_and_releases_its_depressed_state() {
         use crate::keyboard::KeyboardEvent;
         use crate::runtime::KeyboardDelivery;
         let (_cleanup, mut runtime) = automation_runtime();
         let (events, _stop) = runtime.subscribe_keyboard(1).unwrap().split();
-        let mut keys = AutomationKeys::default();
+        let mut keys = AutomationSeat::default();
         keys.key(&mut runtime, 10, KEY_LEFTSHIFT, true).unwrap();
         keys.key(&mut runtime, 11, KEY_A, true).unwrap();
         keys.key(&mut runtime, 12, KEY_A, true).unwrap();
@@ -2015,7 +2218,7 @@ mod tests {
         assert_eq!(pressed, [(10, 42, KeyState::Pressed), (11, 30, KeyState::Pressed)]);
         assert!(delivered.iter().any(|event| matches!(event,
             KeyboardEvent::Modifiers { state, .. } if state.depressed == MOD_SHIFT)));
-        keys.release(&mut runtime, 13).unwrap();
+        keys.release_keys(&mut runtime, 13).unwrap();
         assert!(runtime.keyboard_snapshot().keys.is_empty());
         assert_eq!(runtime.keyboard_snapshot().modifiers.depressed, 0);
         let released: Vec<_> = events.try_iter().filter_map(|delivery| match delivery {
@@ -2027,11 +2230,11 @@ mod tests {
         }).collect();
         assert_eq!(released.len(), 2);
         assert!(released.iter().all(|input| input.time == 13 && input.state == KeyState::Released));
-        keys.release(&mut runtime, 14).unwrap();
+        keys.release_keys(&mut runtime, 14).unwrap();
         keys.key(&mut runtime, 15, KEY_A, false).unwrap();
         assert!(events.try_recv().is_err());
         keys.key(&mut runtime, 16, KEY_CAPSLOCK, true).unwrap();
-        keys.release(&mut runtime, 17).unwrap();
+        keys.release_keys(&mut runtime, 17).unwrap();
         assert_eq!(runtime.keyboard_snapshot().modifiers.locked, MOD_CAPS);
         assert!(runtime.keyboard_snapshot().keys.is_empty());
     }
@@ -2039,18 +2242,18 @@ mod tests {
     #[test]
     fn automation_cannot_mint_attention_and_refuses_trusted_runtime_before_mutation() {
         let (_cleanup, mut runtime) = automation_runtime();
-        let mut keys = AutomationKeys::default();
+        let mut keys = AutomationSeat::default();
         for code in [KEY_LEFTCTRL, KEY_LEFTALT, KEY_ESC] {
             keys.key(&mut runtime, 1, code, true).unwrap();
         }
         assert!(runtime.keyboard_snapshot().keys.contains(&u32::from(KEY_ESC)));
         assert!(runtime.keyboard_snapshot().focus.is_some());
         assert!(keys.bindings.attention == AttentionState::Closed);
-        keys.release(&mut runtime, 2).unwrap();
+        keys.release_keys(&mut runtime, 2).unwrap();
         runtime.enable_attention(true);
         let before = runtime.keyboard_snapshot();
         assert!(keys.key(&mut runtime, 3, KEY_A, true).is_err());
-        assert!(keys.release(&mut runtime, 3).is_err());
+        assert!(keys.release_keys(&mut runtime, 3).is_err());
         assert_eq!(runtime.keyboard_snapshot(), before);
         assert!(keys.bindings.pressed.is_empty());
         runtime.enable_attention(false);
@@ -2061,7 +2264,7 @@ mod tests {
         let mut target = AutomationTarget { runtime: &mut runtime };
         assert!(target.attention(true).is_err());
         assert!(target.drain_attention().is_err());
-        let source = include_str!("input.rs").split_once("impl AutomationKeys {").unwrap().1
+        let source = include_str!("input.rs").split_once("impl AutomationSeat {").unwrap().1
             .split_once("impl LiveInputTarget {").unwrap().0;
         for forbidden in ["EvdevOrigin", "sys::", "Command::new", "enable_attention(", ".attention("] {
             assert!(!source.contains(forbidden), "{forbidden}");
@@ -2071,25 +2274,25 @@ mod tests {
     #[test]
     fn automation_uses_compositor_bindings_and_disabled_control_cannot_route_it() {
         let (_cleanup, mut runtime) = automation_runtime();
-        let mut keys = AutomationKeys::default();
+        let mut keys = AutomationSeat::default();
         keys.key(&mut runtime, 1, KEY_LEFTMETA, true).unwrap();
         keys.key(&mut runtime, 2, KEY_2, true).unwrap();
         assert_eq!(runtime.control_snapshot().active_workspace, 2);
         assert!(!runtime.keyboard_snapshot().keys.contains(&u32::from(KEY_2)));
-        keys.release(&mut runtime, 3).unwrap();
+        keys.release_keys(&mut runtime, 3).unwrap();
         keys.key(&mut runtime, 4, KEY_1, true).unwrap();
         assert_eq!(runtime.control_snapshot().active_workspace, 2);
-        keys.release(&mut runtime, 5).unwrap();
+        keys.release_keys(&mut runtime, 5).unwrap();
         keys.key(&mut runtime, 6, KEY_LEFTMETA, true).unwrap();
         assert!(keys.key(&mut runtime, 7, KEY_T, true).is_err());
         assert!(keys.key(&mut runtime, 8, KEY_ENTER, true).is_err());
         assert!(!runtime.launcher_visible());
-        keys.release(&mut runtime, 9).unwrap();
+        keys.release_keys(&mut runtime, 9).unwrap();
         let before = runtime.keyboard_snapshot();
         let runtime = Mutex::new(runtime);
         for request in ["key 0 30 down", "release-keys 1"] {
             assert_eq!(crate::control::answer(&runtime, request),
-                "error keyboard automation is disabled\n");
+                "error input automation is disabled\n");
         }
         assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
     }
