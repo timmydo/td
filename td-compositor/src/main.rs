@@ -914,6 +914,9 @@ fn run_control(args: &[String]) -> Result<(), control::ControlFailure> {
     if request == control::Request::Capture {
         return say_bytes(&control::ask_capture(&socket)?);
     }
+    if request == control::Request::Observe {
+        return say(&control::ask_observe(&socket)?);
+    }
     let body = control::ask(&socket, request)?;
     say(&body)
 }

@@ -323,7 +323,9 @@ impl Framebuffer {
     /// Only completed bytes that match a public-scene render may be captured.
     /// In particular, neither a failed write nor private attention pixels can
     /// be relabeled as a public frame by the caller.
-    pub(crate) fn completed_public_ppm(&mut self, scene: &Scene) -> Result<Vec<u8>, String> {
+    pub(crate) fn completed_public_ppm(
+        &mut self, scene: &Scene, stamp: crate::headless::OutputStamp,
+    ) -> Result<Vec<u8>, String> {
         if self.resend_all || self.written.len() != self.frame.len() {
             return Err("output completion is not established".into());
         }
@@ -339,7 +341,8 @@ impl Framebuffer {
         }
         let pixels = self.width.checked_mul(self.height).and_then(|n| n.checked_mul(3))
             .ok_or("capture byte count overflow")?;
-        let header = format!("P6\n{} {}\n255\n", self.width, self.height);
+        let header = format!("P6\n# td-output-v1 {}\n{} {}\n255\n",
+            stamp.record(), self.width, self.height);
         let length = pixels.checked_add(header.len()).ok_or("capture size overflow")?;
         let mut ppm = Vec::new();
         ppm.try_reserve_exact(length).map_err(|_| "reserve public capture")?;
@@ -519,6 +522,8 @@ impl OutputBackend for Framebuffer {
 
 #[cfg(test)]
 mod tests {
+    const CAPTURE_STAMP: crate::headless::OutputStamp =
+        crate::headless::OutputStamp { session: 7, output: 1 };
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -582,10 +587,11 @@ mod tests {
         let cleanup = Cleanup(scratch("capture-stride"));
         let mut framebuffer = Framebuffer::test_file(&cleanup.0, 8, 4, 40).unwrap();
         let scene = Scene::new();
-        assert!(framebuffer.completed_public_ppm(&scene).is_err());
+        assert!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).is_err());
         framebuffer.paint(&scene, Damage::Unknown).unwrap();
-        let ppm = framebuffer.completed_public_ppm(&scene).unwrap();
-        let pixels = ppm.strip_prefix(b"P6\n8 4\n255\n").unwrap();
+        let ppm = framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).unwrap();
+        let header = format!("P6\n# td-output-v1 {}\n8 4\n255\n", CAPTURE_STAMP.record());
+        let pixels = ppm.strip_prefix(header.as_bytes()).unwrap();
         let backing = fs::read(&cleanup.0).unwrap();
         let expected: Vec<u8> = backing.as_chunks::<40>().0.iter().flat_map(|row| {
             row[..32].as_chunks::<4>().0.iter()
@@ -601,20 +607,20 @@ mod tests {
         let mut framebuffer = Framebuffer::test_file(&cleanup.0, 320, 200, 1280).unwrap();
         let mut scene = Scene::new();
         framebuffer.paint(&scene, Damage::Unknown).unwrap();
-        let public = framebuffer.completed_public_ppm(&scene).unwrap();
+        let public = framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).unwrap();
         scene.set_attention(true);
         framebuffer.paint(&scene, Damage::Unknown).unwrap();
-        assert!(framebuffer.completed_public_ppm(&scene).is_err());
+        assert!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).is_err());
         scene.set_attention(false);
         // Merely declaring the scene public does not relabel private output.
-        assert!(framebuffer.completed_public_ppm(&scene).is_err());
+        assert!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).is_err());
         framebuffer.paint(&scene, Damage::Unknown).unwrap();
-        assert_eq!(framebuffer.completed_public_ppm(&scene).unwrap(), public);
+        assert_eq!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).unwrap(), public);
         framebuffer.fail_next_write();
         assert!(framebuffer.paint(&scene, Damage::Whole).is_err());
-        assert!(framebuffer.completed_public_ppm(&scene).is_err());
+        assert!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).is_err());
         framebuffer.paint(&scene, Damage::Whole).unwrap();
-        assert_eq!(framebuffer.completed_public_ppm(&scene).unwrap(), public);
+        assert_eq!(framebuffer.completed_public_ppm(&scene, CAPTURE_STAMP).unwrap(), public);
     }
 
     #[test]

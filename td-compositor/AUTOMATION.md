@@ -29,12 +29,18 @@ keep that descriptor private. Stdout and stderr must be drained or redirected
 to caller-owned logs. The one stdout readiness record is:
 
 ```text
-TD-COMPOSITOR-HEADLESS-READY version=1 width=800 height=600 scale=1
+TD-COMPOSITOR-HEADLESS-READY version=2 session=0123456789abcdef0123456789abcdef width=800 height=600 scale=1
 ```
 
 It follows the initial successful output paint, both listener binds, keymap
 preparation, and successful listener/lifetime worker creation. It promises
 server startup, not that any application has mapped or completed an action.
+The session field is a fresh 128-bit nonce, encoded as exactly 32 lowercase
+hexadecimal digits. Startup reads 16 bytes from `/dev/urandom` before creating
+the directory and refuses on entropy-source failure; it has no clock/PID
+fallback. Reusing a pathname starts another identity. Nonces distinguish
+process lifetimes probabilistically, not by a persistent global sequence,
+and are identifiers rather than authorization secrets.
 Listener retirement fails the session, including an unexpected worker unwind
 in a development build: a completion guard reports abandonment even while
 other lifecycle senders remain live. An abort still ends the whole process.
@@ -140,8 +146,8 @@ follow mutation; requests are not rollback transactions, and an unavailable
 or lost reply must not be blindly retried as exactly-once input. Use
 `release-input` to recover depressed state or dispose of the session. The
 existing request-size and whole-conversation deadline bounds remain in force.
-Application/output observation identities and client-processing fences remain
-separate increments.
+Client-processing fences and action/commit identities remain separate
+increments; session and completed-output observation are specified below.
 
 ## Opt-in public capture
 
@@ -168,10 +174,14 @@ Wire success is `ok\n` followed by exactly:
 
 ```text
 P6\n
+# td-output-v1 session=SESSION output=OUTPUT\n
 WIDTH HEIGHT\n
 255\n
 ```
 
+The mandatory PPM comment names the ready record's session and this capture's
+completed-output number, using the grammar below. Unstamped legacy captures
+are refused by the CLI; this is an atomic development-protocol cutover.
 The header is followed by width × height × 3 RGB bytes, with no row padding,
 alpha, trailing bytes or newline. Header line endings are single LF bytes;
 the notation above spells them explicitly. Errors retain the ordinary
@@ -187,10 +197,57 @@ it is never a partial successful image.
 
 Capture deliberately causes a paint. It is not a passive query of a historical
 frame, and a fresh capture alone does not prove that a client processed an
-earlier input event or committed new content. Session/action/commit/output
-identities and bounded observation are the next increment. For now an owned
-headless process and its private endpoints define the test session lifetime;
-there is no cross-session capture token or client-processing fence.
+earlier input event or committed new content.
+
+## Session and completed-output observation
+
+The same startup capture grant enables `td-ctl --socket PATH observe`.
+Without that grant, or in ordinary `run`, both observation and capture
+refuse. Trusted-attention-enabled runtimes and visible private attention
+also refuse both paths. Observation takes a snapshot under the runtime lock
+without painting, dispatching input, flushing pending work or consuming a
+number. Wire success is `ok\n` followed by one fixed-order record; the CLI
+validates the full reply and prints only the record:
+
+```text
+td-output-v1 session=SESSION output=OUTPUT current=yes\n
+```
+
+SESSION has the readiness nonce's exact 32-lowercase-hex grammar. OUTPUT is
+an unsigned decimal u64 with no sign or leading zeros and at most 20
+digits; zero is spelled `0`. It increases
+once for each immediately completed production software paint in this
+headless runtime, including captures and paints whose pixels are unchanged.
+It starts at zero before any paint; startup's successful paint establishes
+one. Pending, failed and queued submissions do not advance it. A compound
+update advances it only when its final paint completes. Exhaustion refuses
+the next paint before touching the backend; it never wraps or aliases an
+earlier number. Other runtime profiles do not maintain this counter.
+
+`current=yes` means that the latest requested submission completed and no
+known paint or compound update is pending at the snapshot. Otherwise the
+record says `current=no`, retaining the historical completed number. Zero
+is valid only with `current=no`, and never in a capture. This flag does not
+run the capture's independent public-byte comparison. Failed writes retain
+the historical number without claiming those bytes remain current.
+
+Capture embeds the number assigned to its own fresh completed paint and
+constructs the validated pixel snapshot under that same lock. A harness
+must compare the returned session with the ready record before correlating
+numbers. Compare numbers only within one session; a new session restarts
+numbering. The protocol does not yet accept an expected-session guard on
+input or provide a historical-frame lookup or wait-for-number command.
+
+Observation replies are limited to 1,024 bytes including wire status, with
+the same five-second post-connect read/write deadline as capture. Malformed,
+oversized, truncated or expired replies publish no successful CLI output.
+The server checks its conversation deadline before each write; lock waits
+and synchronous painting are not preempted by that check. The client's
+deadline bounds waiting for a response, not the runtime's rendering work.
+Neither a number increase nor `current=yes` proves that an application
+processed input. Accepted-action identities and client commit fences remain
+the next increment; applications can lag while compositor-only paint
+continues.
 
 ## Planned control and observation increments
 
@@ -201,13 +258,14 @@ These are the next implementation requirements, not available commands:
    witness, enter/confirm trusted attention, or authorize secret release.
 2. Preserve separate input and capture grants. A public Wayland socket grants
    neither capability.
-3. Report monotonic session/action/commit/output identities with bounded
-   observation. Distinguish accepted input, a client's subsequent commit and
+3. Add monotonic per-session action/commit identities to the implemented
+   fresh session and completed-output identities. Distinguish accepted
+   input, a client's subsequent commit and
    completed output. A compositor sync cannot prove an application processed
    input. Queued output is not presented output.
-4. Correlate public captures with those completed-output identities while
-   preserving the public-scene comparison and fail-closed completion proof.
-   No raw private-screen backing file is exposed.
+4. Preserve capture correlation and the public-scene comparison and
+   fail-closed completion proof as observation grows. No raw private-screen
+   backing file is exposed.
 5. Run td-editor's native key-profile, selection, menu, wheel and inter-client
    clipboard scenarios in disposable td-compositor processes. Combine real
    routed input and output evidence with editor remote exact-state assertions.

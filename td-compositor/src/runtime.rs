@@ -394,6 +394,7 @@ pub struct Runtime {
     /// `Presented` proves a paint answered it, which a default would make
     /// unfalsifiable — fbdev has no other answer to give.
     last_submission: Option<Submission>,
+    headless_output: Option<crate::headless::OutputStamp>,
     layout: Arc<BTreeMap<SurfaceKey, ViewLayout>>,
     subscribers: BTreeMap<u64, SyncSender<()>>,
     /// Each connected client's popup registrations, by client.
@@ -547,6 +548,7 @@ impl Runtime {
             framebuffer,
             owed_damage: Damage::Unknown,
             last_submission: None,
+            headless_output: None,
             layout: Arc::new(BTreeMap::new()),
             subscribers: BTreeMap::new(),
             popup_registrations: BTreeMap::new(),
@@ -672,11 +674,39 @@ impl Runtime {
         self.framebuffer.output()
     }
 
+    pub(crate) fn headless(framebuffer: Framebuffer, session: u128) -> Self {
+        let mut runtime = Self::new(framebuffer);
+        runtime.headless_output = Some(crate::headless::OutputStamp { session, output: 0 });
+        runtime
+    }
+
+    /// A passive snapshot. Historical completion does not settle pending work.
+    pub(crate) fn observe_output(&self) -> Result<String, String> {
+        self.admit_public_observation()?;
+        let stamp = self.headless_output.ok_or("not a headless automation runtime")?;
+        let current = !self.pending_paint
+            && self.compound_settle.is_none()
+            && self.last_submission == Some(Submission::Presented);
+        Ok(format!(
+            "td-output-v1 {} current={}\n",
+            stamp.record(),
+            if current { "yes" } else { "no" },
+        ))
+    }
+
+    fn admit_public_observation(&self) -> Result<(), String> {
+        if self.attention_enabled || self.scene.attention_visible() {
+            return Err("public observation refuses a trusted-attention runtime".into());
+        }
+        if self.headless_output.is_none() {
+            return Err("not a headless automation runtime".into());
+        }
+        Ok(())
+    }
+
     /// Capture requests take a fresh public paint, not an unfenced preview.
     pub(crate) fn capture_public_ppm(&mut self) -> Result<Vec<u8>, String> {
-        if self.attention_enabled || self.scene.attention_visible() {
-            return Err("capture refuses a trusted-attention runtime".into());
-        }
+        self.admit_public_observation()?;
         if self.compound_settle.is_some() {
             return Err("capture cannot interrupt a compound scene update".into());
         }
@@ -684,7 +714,8 @@ impl Runtime {
         if self.pending_paint || self.last_submission != Some(Submission::Presented) {
             return Err("capture requires completed output, not queued submission".into());
         }
-        self.framebuffer.completed_public_ppm(&self.scene)
+        let stamp = self.headless_output.ok_or("not a headless automation runtime")?;
+        self.framebuffer.completed_public_ppm(&self.scene, stamp)
     }
 
     /// Pessimistic across the paint, as the framebuffer's shadow copy is across
@@ -701,10 +732,18 @@ impl Runtime {
             return Ok(());
         }
         self.pending_paint = true;
+        let next_output = self.headless_output.map(|stamp| {
+            stamp.output.checked_add(1).ok_or("headless output identity exhausted")
+        }).transpose()?;
         // The damage is cleared only on success, so a failed paint still owes
         // the whole output — which is what the backend's own shadow-copy
         // distrust did before this was the caller's to say.
         self.last_submission = Some(self.framebuffer.paint(&self.scene, self.owed_damage)?);
+        if self.last_submission == Some(Submission::Presented) {
+            if let (Some(stamp), Some(next)) = (self.headless_output.as_mut(), next_output) {
+                stamp.output = next;
+            }
+        }
         self.owed_damage = Damage::Unknown;
         self.pending_paint = false;
         Ok(())
@@ -4710,6 +4749,44 @@ mod tests {
             .unwrap();
         runtime.flush_paint().unwrap();
         assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+    }
+
+    #[test]
+    fn headless_output_identity_counts_only_completed_paints_and_never_wraps() {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-runtime-output-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+        )));
+        let mut runtime = Runtime::headless(
+            Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7,
+        );
+        let expected = |output, current| format!(
+            "td-output-v1 session=00000000000000000000000000000007 output={output} current={current}\n",
+        );
+        assert_eq!(runtime.observe_output().unwrap(), expected(0, "no"));
+        assert_eq!(runtime.observe_output().unwrap(), expected(0, "no"));
+        assert!(runtime.take_writes().is_empty());
+        runtime.repaint().unwrap();
+        assert_eq!(runtime.observe_output().unwrap(), expected(1, "yes"));
+        runtime.defer_repaint();
+        assert_eq!(runtime.observe_output().unwrap(), expected(1, "no"));
+        runtime.begin_compound_commit().unwrap();
+        runtime.repaint().unwrap();
+        assert_eq!(runtime.observe_output().unwrap(), expected(1, "no"));
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(runtime.observe_output().unwrap(), expected(2, "yes"));
+        runtime.fail_next_repaint();
+        assert!(runtime.repaint().is_err());
+        assert_eq!(runtime.observe_output().unwrap(), expected(2, "no"));
+        runtime.flush_paint().unwrap();
+        assert_eq!(runtime.observe_output().unwrap(), expected(3, "yes"));
+        runtime.capture_public_ppm().unwrap();
+        assert_eq!(runtime.observe_output().unwrap(), expected(4, "yes"));
+        runtime.headless_output.as_mut().unwrap().output = u64::MAX;
+        runtime.take_writes();
+        assert!(runtime.repaint().is_err());
+        assert!(runtime.take_writes().is_empty());
+        assert_eq!(runtime.observe_output().unwrap(), expected(u64::MAX, "no"));
+        assert!(runtime.capture_public_ppm().is_err());
     }
 
     #[test]

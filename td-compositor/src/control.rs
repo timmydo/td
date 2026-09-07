@@ -62,7 +62,7 @@ const MAX_CAPTURE_BYTES: usize = crate::MAX_UI_FRAME_BYTES / 4 * 3 + 128;
 /// requests additionally require the headless input grant at dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Request {
-    /// The only question. Everything else is an order.
+    /// Report the public window layout without changing it.
     Layout,
     Workspace(u8),
     Send(u8),
@@ -89,6 +89,7 @@ pub enum Request {
     Pointer(crate::input::AutomationPointer),
     ReleaseInput(u32),
     Capture,
+    Observe,
 }
 
 /// The vocabulary, as one list, so the parser and the help text cannot drift:
@@ -123,6 +124,7 @@ pub const USAGE: &[(&str, &str)] = &[
         "route one complete absolute pointer report on an enabled headless seat"),
     ("release-input <time-ms>", "release that headless seat's keys and pointer buttons"),
     ("capture", "write a completed public PPM frame on an enabled headless capture channel"),
+    ("observe", "report headless session and completed-output identity without painting"),
 ];
 
 impl Request {
@@ -147,6 +149,7 @@ impl Request {
             "pointer" => pointer_request(&mut words)?,
             "release-input" => Request::ReleaseInput(key_time(words.next())?),
             "capture" => Request::Capture,
+            "observe" => Request::Observe,
             other => return Err(format!("no such request '{other}'; try 'help'")),
         };
         // Refused rather than ignored: a caller spelling an argument this verb
@@ -182,6 +185,7 @@ impl Request {
             ),
             Request::ReleaseInput(time) => format!("release-input {time}"),
             Request::Capture => "capture".into(),
+            Request::Observe => "observe".into(),
             Request::FocusWindow(handle) => format!("focus {}", handle_word(handle)),
             Request::SendWindow(handle, number) => {
                 format!("send {} {number}", handle_word(handle))
@@ -671,7 +675,7 @@ pub(crate) fn reportable(character: char) -> bool {
 pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> {
     let command = match request {
         Request::Layout => return Ok(Answer::Report(report(&runtime.control_snapshot()))),
-        Request::Capture => return Ok(Answer::CaptureDisabled),
+        Request::Capture | Request::Observe => return Ok(Answer::CaptureDisabled),
         Request::Key { .. } | Request::ReleaseKeys(_)
         | Request::Pointer(_) | Request::ReleaseInput(_) => return Ok(Answer::InputDisabled),
         Request::Workspace(number) => Command::SwitchWorkspace(number),
@@ -983,13 +987,20 @@ fn converse(
             );
         }
     };
-    if capture && Request::parse(&line) == Ok(Request::Capture) {
+    let request = Request::parse(&line);
+    if capture && matches!(request, Ok(Request::Capture | Request::Observe)) {
         let outcome = runtime.lock().map_err(|_| "compositor runtime is poisoned".to_string())
-            .and_then(|mut runtime| runtime.capture_public_ppm());
+            .and_then(|mut runtime| {
+                if request == Ok(Request::Capture) {
+                    runtime.capture_public_ppm()
+                } else {
+                    runtime.observe_output().map(String::into_bytes)
+                }
+            });
         return match outcome {
-            Ok(ppm) => {
+            Ok(body) => {
                 write_answer(&mut stream, b"ok\n", deadline)?;
-                write_answer(&mut stream, &ppm, deadline)
+                write_answer(&mut stream, &body, deadline)
             }
             Err(error) => write_answer(
                 &mut stream, format!("unavailable {error}\n").as_bytes(), deadline,
@@ -1095,15 +1106,7 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
 
 /// Binary capture has its own bounded decoder, never the text-report reader.
 pub fn ask_capture(path: &Path) -> Result<Vec<u8>, ControlFailure> {
-    let mut stream = UnixStream::connect(path).map_err(|error| {
-        ControlFailure::Unreachable(format!("connect control socket {}: {error}", path.display()))
-    })?;
-    let deadline = Instant::now().checked_add(IO_TIMEOUT)
-        .ok_or_else(|| ControlFailure::Unreachable("capture deadline overflow".into()))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))
-        .and_then(|()| stream.write_all(b"capture\n"))
-        .map_err(|error| ControlFailure::Unreachable(format!("write capture request: {error}")))?;
-    let mut answer = read_capture(&mut stream, deadline)?;
+    let mut answer = ask_bounded(path, b"capture\n", MAX_CAPTURE_BYTES)?;
     let ppm_len = decode_capture(&answer)?.len();
     // The subtraction bounds the drain by len, without a second allocation.
     let prefix = answer.len().saturating_sub(ppm_len);
@@ -1111,28 +1114,89 @@ pub fn ask_capture(path: &Path) -> Result<Vec<u8>, ControlFailure> {
     Ok(answer)
 }
 
+pub fn ask_observe(path: &Path) -> Result<String, ControlFailure> {
+    let answer = ask_bounded(path, b"observe\n", REQUEST_LIMIT)?;
+    let text = std::str::from_utf8(&answer)
+        .map_err(|_| ControlFailure::Unreachable("observation reply is not UTF-8".into()))?;
+    let Some(body) = text.strip_prefix("ok\ntd-output-v1 ") else {
+        return split_answer(text, false).and_then(|_| {
+            Err(ControlFailure::Unreachable("observation reply has no identity".into()))
+        });
+    };
+    decode_observation(body)?;
+    Ok(format!("td-output-v1 {body}"))
+}
+
+fn decode_observation(body: &str) -> Result<(), ControlFailure> {
+    let bad = || ControlFailure::Unreachable("malformed observation reply".into());
+    let line = body.strip_suffix('\n').ok_or_else(bad)?;
+    let (stamp, current) = line.rsplit_once(" current=").ok_or_else(bad)?;
+    let stamp = decode_output_stamp(stamp)?;
+    if !matches!(current, "yes" | "no") || (current == "yes" && stamp.output == 0) {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+fn ask_bounded(
+    path: &Path,
+    request: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, ControlFailure> {
+    let mut stream = UnixStream::connect(path).map_err(|error| {
+        ControlFailure::Unreachable(format!("connect control socket {}: {error}", path.display()))
+    })?;
+    let deadline = Instant::now().checked_add(IO_TIMEOUT).ok_or_else(|| {
+        ControlFailure::Unreachable("control reply deadline overflow".into())
+    })?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .and_then(|()| stream.write_all(request))
+        .map_err(|error| {
+            ControlFailure::Unreachable(format!("write control request: {error}"))
+        })?;
+    read_bounded(&mut stream, deadline, limit)
+}
+
+#[cfg(test)]
 fn read_capture(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>, ControlFailure> {
+    read_bounded(stream, deadline, MAX_CAPTURE_BYTES)
+}
+
+fn read_bounded(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    limit: usize,
+) -> Result<Vec<u8>, ControlFailure> {
     let mut answer = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
-        let remaining = deadline.checked_duration_since(Instant::now())
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
             .filter(|time| !time.is_zero())
-            .ok_or_else(|| ControlFailure::Unreachable("capture deadline expired".into()))?;
-        stream.set_read_timeout(Some(remaining))
-            .map_err(|error| ControlFailure::Unreachable(format!("set capture timeout: {error}")))?;
+            .ok_or_else(|| {
+                ControlFailure::Unreachable("control reply deadline expired".into())
+            })?;
+        stream.set_read_timeout(Some(remaining)).map_err(|error| {
+            ControlFailure::Unreachable(format!("set control reply timeout: {error}"))
+        })?;
         let count = match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => count,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(ControlFailure::Unreachable(format!("read capture: {error}"))),
+            Err(error) => {
+                return Err(ControlFailure::Unreachable(format!("read control reply: {error}")));
+            }
         };
-        if answer.len().checked_add(count).is_none_or(|length| length > MAX_CAPTURE_BYTES) {
-            return Err(ControlFailure::Unreachable("capture exceeds byte limit".into()));
+        if answer.len().checked_add(count).is_none_or(|length| length > limit) {
+            return Err(ControlFailure::Unreachable("control reply exceeds byte limit".into()));
         }
         answer.try_reserve(count)
-            .map_err(|_| ControlFailure::Unreachable("reserve capture reply".into()))?;
-        answer.extend_from_slice(chunk.get(..count)
-            .ok_or_else(|| ControlFailure::Unreachable("invalid capture read count".into()))?);
+            .map_err(|_| ControlFailure::Unreachable("reserve control reply".into()))?;
+        let bytes = chunk.get(..count).ok_or_else(|| {
+            ControlFailure::Unreachable("invalid control reply read count".into())
+        })?;
+        answer.extend_from_slice(bytes);
     }
     Ok(answer)
 }
@@ -1152,8 +1216,14 @@ fn decode_capture(answer: &[u8]) -> Result<&[u8], ControlFailure> {
         }
         return Err(bad());
     };
-    let mut parts = ppm.splitn(4, |byte| *byte == b'\n');
+    let mut parts = ppm.splitn(5, |byte| *byte == b'\n');
     if parts.next() != Some(b"P6") {
+        return Err(bad());
+    }
+    let stamp = parts.next().and_then(|line| line.strip_prefix(b"# td-output-v1 "))
+        .filter(|line| line.len() <= 80).ok_or_else(bad)?;
+    let stamp = std::str::from_utf8(stamp).map_err(|_| bad())?;
+    if decode_output_stamp(stamp)?.output == 0 {
         return Err(bad());
     }
     let dimensions = parts.next().filter(|line| line.len() <= 64).ok_or_else(bad)?;
@@ -1180,6 +1250,28 @@ fn decode_capture(answer: &[u8]) -> Result<&[u8], ControlFailure> {
         return Err(bad());
     }
     Ok(ppm)
+}
+
+fn decode_output_stamp(record: &str) -> Result<crate::headless::OutputStamp, ControlFailure> {
+    let bad = || ControlFailure::Unreachable("malformed output identity".into());
+    let (session, output) = record.split_once(" output=").ok_or_else(bad)?;
+    let session = session.strip_prefix("session=").ok_or_else(bad)?;
+    if session.len() != 32
+        || !session.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(bad());
+    }
+    if output.is_empty()
+        || output.len() > 20
+        || (output.len() > 1 && output.starts_with('0'))
+        || !output.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    Ok(crate::headless::OutputStamp {
+        session: u128::from_str_radix(session, 16).map_err(|_| bad())?,
+        output: output.parse().map_err(|_| bad())?,
+    })
 }
 
 /// Read to the end, but KEEP what arrived before a failure.
@@ -1406,6 +1498,7 @@ mod tests {
             Request::ReleaseKeys(u32::MAX),
             Request::ReleaseInput(u32::MAX),
             Request::Capture,
+            Request::Observe,
             Request::Pointer(crate::input::AutomationPointer {
                 time: u32::MAX, x: 16383, y: 0, buttons: 255, vertical: -120, horizontal: 120,
             }),
@@ -1499,8 +1592,8 @@ mod tests {
 
     #[test]
     fn capture_decoder_requires_exact_bounded_binary_framing() {
-        let valid = b"ok\nP6\n1 1\n255\n\x00\xff\x0a";
-        assert_eq!(decode_capture(valid).unwrap(), b"P6\n1 1\n255\n\x00\xff\x0a");
+        let valid = b"ok\nP6\n# td-output-v1 session=00000000000000000000000000000001 output=1\n1 1\n255\n\x00\xff\x0a";
+        assert_eq!(decode_capture(valid).unwrap(), &valid[3..]);
         for end in 0..valid.len() {
             assert!(decode_capture(&valid[..end]).is_err(), "prefix {end}");
         }
@@ -1515,8 +1608,11 @@ mod tests {
             "ok\nP6\n1 1\r\n255\nabc", "ok\nP6\n1\t1\n255\nabc",
             "ok\nP6\n1  1\n255\nabc", "ok\nP6\n1 1 \n255\nabc",
         ] {
-            assert!(decode_capture(reply.as_bytes()).is_err(), "{reply}");
+            let stamped = reply.replacen("P6\n",
+                "P6\n# td-output-v1 session=00000000000000000000000000000001 output=1\n", 1);
+            assert!(decode_capture(stamped.as_bytes()).is_err(), "{reply}");
         }
+        assert!(decode_capture(b"ok\nP6\n1 1\n255\nabc").is_err());
         assert_eq!(decode_capture(b"error capture automation is disabled\n"),
             Err(ControlFailure::Refused("capture automation is disabled".into())));
         assert_eq!(decode_capture(b"unavailable output failed\n"),
@@ -1534,7 +1630,7 @@ mod tests {
             let _ = writer.write_all(&vec![0u8; MAX_CAPTURE_BYTES + 1]);
         });
         assert_eq!(read_capture(&mut reader, Instant::now() + Duration::from_secs(2)),
-            Err(ControlFailure::Unreachable("capture exceeds byte limit".into())));
+            Err(ControlFailure::Unreachable("control reply exceeds byte limit".into())));
         drop(reader);
         worker.join().unwrap();
     }
@@ -1550,6 +1646,27 @@ mod tests {
     }
 
     #[test]
+    fn observation_reader_keeps_its_smaller_limit_and_deadline() {
+        let (mut reader, _writer) = UnixStream::pair().unwrap();
+        assert!(read_bounded(&mut reader,
+            Instant::now() + Duration::from_millis(20), REQUEST_LIMIT).is_err());
+        for count in [REQUEST_LIMIT, REQUEST_LIMIT + 1] {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            writer.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+            writer.write_all(&vec![b'x'; count]).unwrap();
+            drop(writer);
+            let answer = read_bounded(&mut reader,
+                Instant::now() + Duration::from_secs(1), REQUEST_LIMIT);
+            if count == REQUEST_LIMIT {
+                assert_eq!(answer.unwrap().len(), count);
+            } else {
+                assert_eq!(answer, Err(ControlFailure::Unreachable(
+                    "control reply exceeds byte limit".into())));
+            }
+        }
+    }
+
+    #[test]
     fn control_blocking_write_uses_only_the_remaining_conversation_budget() {
         let budget = Duration::from_millis(20);
         let (_client, mut server) = UnixStream::pair().unwrap();
@@ -1561,7 +1678,10 @@ mod tests {
 
     #[test]
     fn capture_runtime_takes_a_fresh_paint_and_refuses_trusted_mode() {
-        let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
+        let frame = temporary("capture-fb");
+        let framebuffer = crate::framebuffer::Framebuffer::test_file(&frame.0, 240, 600, 960)
+            .unwrap();
+        let runtime = Mutex::new(Runtime::headless(framebuffer, 7));
         assert_eq!(answer(&runtime, "capture"), "error capture automation is disabled\n");
         let mut runtime = runtime.lock().unwrap();
         let ppm = runtime.capture_public_ppm().unwrap();
@@ -1569,9 +1689,37 @@ mod tests {
         runtime.defer_repaint();
         runtime.fail_next_repaint();
         assert!(runtime.capture_public_ppm().is_err(), "capture returned stale output");
-        assert_eq!(runtime.capture_public_ppm().unwrap(), ppm);
+        let later = runtime.capture_public_ppm().unwrap();
+        assert_ne!(later, ppm, "a later capture reused the output identity");
+        assert_eq!(later.splitn(5, |b| *b == b'\n').last().unwrap(),
+            ppm.splitn(5, |b| *b == b'\n').last().unwrap());
         runtime.enable_attention(true);
         assert!(runtime.capture_public_ppm().is_err());
+        assert!(runtime.observe_output().is_err());
+    }
+
+    #[test]
+    fn output_identities_and_observations_have_exact_bounded_grammar() {
+        let session = "0123456789abcdef0123456789abcdef";
+        let record = format!("session={session} output=18446744073709551615");
+        assert_eq!(decode_output_stamp(&record).unwrap().output, u64::MAX);
+        assert!(decode_observation(&format!("{record} current=yes\n")).is_ok());
+        assert!(decode_observation(&format!("session={session} output=0 current=no\n")).is_ok());
+        for value in ["", "+1", "-1", "01", "00", "1 ", "18446744073709551616"] {
+            assert!(decode_output_stamp(&format!("session={session} output={value}")).is_err());
+        }
+        for value in ["", "1", "0123456789abcdef0123456789abcdeF00", "g123456789abcdef0123456789abcdef"] {
+            assert!(decode_output_stamp(&format!("session={value} output=1")).is_err());
+        }
+        for ending in ["yes", "yes\r\n", "yes\n\n", "yes extra\n", "1\n"] {
+            assert!(decode_observation(&format!("{record} current={ending}")).is_err());
+        }
+        assert!(decode_observation(&format!("session={session} output=0 current=yes\n")).is_err());
+        for output in ["0", "+1", "18446744073709551616"] {
+            let reply = format!("ok\nP6\n# td-output-v1 session={session} output={output}\n1 1\n255\nabc");
+            assert!(decode_capture(reply.as_bytes()).is_err());
+        }
+        assert!(Request::parse("observe extra").is_err());
     }
 
     #[test]

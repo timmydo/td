@@ -130,12 +130,66 @@ fn request(path: &Path, line: &[u8]) -> String {
 }
 
 fn capture(path: &Path, root: &Path, name: &str) -> (ExitStatus, Vec<u8>) {
-    let output = root.join(format!("{name}.ppm"));
+    query_cli(path, root, name, "capture")
+}
+
+fn query_cli(path: &Path, root: &Path, name: &str, verb: &str) -> (ExitStatus, Vec<u8>) {
+    let extension = if verb == "capture" { "ppm" } else { "out" };
+    let output = root.join(format!("{name}.{extension}"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
-    command.arg0("td-ctl").arg("--socket").arg(path).arg("capture");
+    command.arg0("td-ctl").arg("--socket").arg(path).arg(verb);
     let mut client = Process::to_file(&mut command, &root.join(format!("{name}.log")), &output);
     let status = client.wait();
     (status, fs::read(output).unwrap())
+}
+
+fn ready_session(line: &str) -> &str {
+    let session = line.strip_prefix("TD-COMPOSITOR-HEADLESS-READY version=2 session=").unwrap()
+        .strip_suffix(" width=800 height=600 scale=1\n").unwrap();
+    assert_eq!(session.len(), 32);
+    assert!(session.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    session
+}
+
+fn captured_output(ppm: &[u8]) -> (&str, u64, &[u8]) {
+    let mut lines = ppm.splitn(5, |b| *b == b'\n');
+    assert_eq!(lines.next(), Some(b"P6".as_slice()));
+    let stamp = std::str::from_utf8(lines.next().unwrap()).unwrap()
+        .strip_prefix("# td-output-v1 session=").unwrap();
+    let (session, output) = stamp.split_once(" output=").unwrap();
+    assert_eq!(lines.next(), Some(b"800 600".as_slice()));
+    assert_eq!(lines.next(), Some(b"255".as_slice()));
+    let pixels = lines.next().unwrap();
+    assert_eq!(pixels.len(), 800 * 600 * 3);
+    (session, output.parse().unwrap(), pixels)
+}
+
+#[test]
+fn reusing_a_session_path_starts_a_new_capture_identity() {
+    let root = Root::new();
+    let session = root.0.join("session");
+    let mut previous = None;
+    for generation in 0..2 {
+        let mut command = headless(&session);
+        command.args(["--capture-control", "enabled"]);
+        let mut compositor = Process::start(
+            &mut command, &root.0.join(format!("compositor-{generation}.log")),
+            "TD-COMPOSITOR-HEADLESS-READY",
+        );
+        let ready = compositor.ready();
+        let identity = ready_session(&ready);
+        let (status, ppm) = capture(&session.join("td-control"), &root.0,
+            &format!("capture-{generation}"));
+        assert!(status.success());
+        let (captured_session, output, _) = captured_output(&ppm);
+        assert_eq!(captured_session, identity);
+        assert_eq!(output, 2, "a new runtime inherited old output numbering");
+        assert_ne!(previous.as_deref(), Some(identity), "a restarted session reused its nonce");
+        previous = Some(identity.to_string());
+        compositor.child.stdin.take();
+        assert!(compositor.wait().success());
+        assert!(!session.exists());
+    }
 }
 
 #[test]
@@ -155,8 +209,16 @@ fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
         let mut compositor = Process::start(
             &mut command, &case.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
         );
-        compositor.ready();
+        let ready = compositor.ready();
+        let identity = ready_session(&ready);
         let control = session.join("td-control");
+        if capture_enabled {
+            let expected = format!("ok\ntd-output-v1 session={identity} output=1 current=yes\n");
+            assert_eq!(request(&control, b"observe\n"), expected);
+            assert_eq!(request(&control, b"observe\n"), expected, "observe caused a paint");
+        } else {
+            assert_eq!(request(&control, b"observe\n"), "error capture automation is disabled\n");
+        }
         let (status, empty) = capture(&control, &case, "empty");
         let mut mapped_client = None;
         if !capture_enabled {
@@ -164,8 +226,14 @@ fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
             assert!(empty.is_empty());
         } else {
             assert!(status.success());
-            assert!(empty.starts_with(b"P6\n800 600\n255\n"));
-            assert_eq!(empty.len(), b"P6\n800 600\n255\n".len() + 800 * 600 * 3);
+            let (session_stamp, output_stamp, empty_pixels) = captured_output(&empty);
+            assert_eq!(session_stamp, identity);
+            assert_eq!(output_stamp, 2);
+            let (status, observed) = query_cli(&control, &case, "observe", "observe");
+            assert!(status.success());
+            assert_eq!(observed, format!(
+                "td-output-v1 session={identity} output=2 current=yes\n",
+            ).as_bytes());
             let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
             command.arg0("td-ui-demo").args(["run", "--socket"])
                 .arg(session.join("wayland-0")).arg("--ready-socket")
@@ -176,12 +244,17 @@ fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
             client.ready();
             let (status, mapped) = capture(&control, &case, "mapped");
             assert!(status.success());
-            assert_eq!(mapped.len(), empty.len());
-            assert_ne!(mapped, empty, "capture did not contain the real mapped client");
+            let (session_stamp, mapped_stamp, mapped_pixels) = captured_output(&mapped);
+            assert_eq!(session_stamp, identity);
+            assert!(mapped_stamp > output_stamp);
+            assert_ne!(mapped_pixels, empty_pixels, "capture did not contain the mapped client");
             assert_eq!(request(&control, b"workspace 2\n"), "ok\n");
             let (status, hidden) = capture(&control, &case, "hidden");
             assert!(status.success());
-            assert_ne!(hidden, mapped, "capture returned stale visible-client output");
+            let (session_stamp, hidden_stamp, hidden_pixels) = captured_output(&hidden);
+            assert_eq!(session_stamp, identity);
+            assert!(hidden_stamp > mapped_stamp);
+            assert_ne!(hidden_pixels, mapped_pixels, "capture returned stale visible-client output");
             assert!(request(&control, b"capture extra\n").starts_with("error "));
             if !input {
                 assert_eq!(request(&control, b"key 1 30 down\n"),
@@ -291,10 +364,7 @@ fn a_disposable_production_session_maps_a_real_client_and_dies_with_its_owner() 
         &log,
         "TD-COMPOSITOR-HEADLESS-READY",
     );
-    assert_eq!(
-        compositor.ready(),
-        "TD-COMPOSITOR-HEADLESS-READY version=1 width=800 height=600 scale=1\n"
-    );
+    ready_session(&compositor.ready());
     assert_eq!(
         fs::metadata(&session).unwrap().permissions().mode() & 0o777,
         0o700

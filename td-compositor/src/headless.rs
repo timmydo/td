@@ -12,6 +12,26 @@ const USAGE: &str = "headless requires --session-dir NEW_ABSOLUTE_PATH \
     --width N --height N [--input-control enabled] [--capture-control enabled]; \
     keep stdin open for the session lifetime";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OutputStamp {
+    pub session: u128,
+    pub output: u64,
+}
+
+impl OutputStamp {
+    pub(crate) fn record(self) -> String {
+        format!("session={:032x} output={}", self.session, self.output)
+    }
+}
+
+fn session_identity() -> Result<u128, String> {
+    let mut bytes = [0u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut bytes))
+        .map_err(|error| format!("read headless session identity: {error}"))?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
 #[derive(Debug)]
 struct Options {
     directory: PathBuf,
@@ -255,11 +275,12 @@ fn owner_closed(input: &mut impl Read) -> Result<(), String> {
 /// all blocking client/listener workers through the immediate process exit.
 pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Result<(), String> {
     let options = Options::parse(args)?;
+    let identity = session_identity()?;
     let mut directory = SessionDirectory::create(&options.directory)?;
     let result = (|| {
         let framebuffer =
             Framebuffer::headless(directory.output_file()?, options.width, options.height)?;
-        let mut runtime = Runtime::new(framebuffer);
+        let mut runtime = Runtime::headless(framebuffer, identity);
         runtime.repaint()?;
         let runtime = Arc::new(Mutex::new(runtime));
         let wayland = directory.bind("wayland-0")?;
@@ -284,8 +305,8 @@ pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Res
         let mut out = std::io::stdout().lock();
         writeln!(
             out,
-            "TD-COMPOSITOR-HEADLESS-READY version=1 width={} height={} scale=1",
-            options.width, options.height
+            "TD-COMPOSITOR-HEADLESS-READY version=2 session={identity:032x} width={} height={} scale=1",
+            options.width, options.height,
         )
         .and_then(|()| out.flush())
         .map_err(|error| format!("announce headless readiness: {error}"))?;
@@ -428,12 +449,14 @@ mod tests {
         }
         assert!(source.contains("server::serve_headless("));
         assert!(source.contains("control::serve_headless("));
+        assert!(source.contains("Runtime::headless(framebuffer, identity)"));
+        let identity = source.find("let identity = session_identity()?").unwrap();
         let paint = source.find("runtime.repaint()?").unwrap();
         let bind = source.find("directory.bind(\"wayland-0\")?").unwrap();
         let serve = source.find("server::serve_headless(").unwrap();
         let ready = source
-            .find("TD-COMPOSITOR-HEADLESS-READY version=1")
+            .find("TD-COMPOSITOR-HEADLESS-READY version=2")
             .unwrap();
-        assert!(paint < bind && bind < serve && serve < ready);
+        assert!(identity < paint && paint < bind && bind < serve && serve < ready);
     }
 }
