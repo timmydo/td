@@ -391,7 +391,12 @@ editors in one private compositor: native Cut, another source edit, then
 native Paste must transfer the original UTF-8 snapshot with exact saved
 bytes. Distinct client identities and captured ASCII prefixes are checked;
 Unicode glyph pixels and clipboard-owner exit/cancellation are not.
-Horizontal/high-resolution wheels remain subsequent work.
+Vertical and horizontal wheel cases also test page-bound clamping and
+inward movement after repeated outward reports. Horizontal scrolling is
+checked with Soft Wrap enabled, then disabled through the native menu;
+two-axis reports preserve row zero in the one-line document. Clamped
+no-ops do not require a redraw. High-resolution scrolling remains outside
+these native cases.
 This does not prove GPU or jail integration.
 
 An optional test runs against a separately launched Weston (not a dependency

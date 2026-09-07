@@ -499,7 +499,15 @@ fn native_vertical_wheel_scrolls_without_editing() {
     editor.rendered_at(800, 576);
     compositor.pointer(400, 80, 0);
     editor.wait_field("state", "pointer-ready", "1");
-    for (detents, row) in [(-1, 3), (-1, 6), (2, 0)] {
+    for (detents, row, repeat) in [
+        (-1, 3, false),
+        (-1, 6, false),
+        (2, 0, false),
+        (-120, 34, true),
+        (1, 31, false),
+        (120, 0, true),
+        (-1, 3, false),
+    ] {
         let before = compositor.observe(&window);
         compositor.pointer_frame(400, 80, 0, detents, 0);
         editor.wait_field("state", "view", &format!("1,{row},0,98,31,1,downstream,-"));
@@ -519,6 +527,74 @@ fn native_vertical_wheel_scrolls_without_editing() {
             &prefix,
             if row == 0 { 0 } else { prefix.len() },
         );
+        if repeat {
+            // A clamped no-op owes no redraw. The following inward report
+            // proves the resulting viewport without demanding a new frame here.
+            compositor.pointer_frame(400, 80, 0, detents, 0);
+        }
+    }
+    assert_eq!(std::fs::read(&file).unwrap(), text.as_bytes());
+    editor.quit();
+    compositor.stop();
+}
+
+#[test]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
+fn native_horizontal_wheel_respects_wrap_and_clamps_columns() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    let text = "abcdefghijklmnopqrstuvwxyz".repeat(5);
+    std::fs::write(&file, &text).unwrap();
+    std::fs::write(&dictionary, b"word\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.wait_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    compositor.pointer(400, 80, 0);
+    editor.wait_field("state", "pointer-ready", "1");
+    compositor.pointer_frame(400, 80, 0, 0, 120); // Soft Wrap suppresses this.
+    compositor.click(140, 32); // Format header.
+    editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+    // Menu admission follows the wheel frame on the same native pointer stream.
+    editor.wait_field("state", "view", "1,0,0,98,31,1,downstream,-");
+    compositor.click(140, 60); // Soft Wrap, first row.
+    editor.wait_field("state", "view", "1,0,0,98,31,0,downstream,-");
+    editor.wait_field("state", "modal", "0,0,0,0,0,0,0,0,0");
+    compositor.pointer(400, 80, 0);
+    for (columns, left, prefix, repeat) in [
+        (1, 3, "defgh", false),
+        (120, 33, "hijkl", true),
+        (-1, 30, "efghi", false),
+        (-120, 0, "abcde", true),
+        (1, 3, "defgh", false),
+    ] {
+        let before = compositor.observe(&window);
+        // Both axes in one report: the single logical row cannot scroll down.
+        compositor.pointer_frame(400, 80, 0, -1, columns);
+        editor.wait_field("state", "view", &format!("1,0,{left},98,31,0,downstream,-"));
+        editor.wait_field("state", "tab", "1,0,0,130,0,0,0,72,0,lf");
+        assert_eq!(
+            editor.ok("text\t1\t0\t0\t130"),
+            format!("130\t{}", td_editor::control::hex(text.as_bytes()))
+        );
+        compositor.rendered_text(
+            &mut editor,
+            &window,
+            0,
+            before,
+            prefix,
+            if left == 0 { 0 } else { prefix.len() },
+        );
+        if repeat {
+            // As above, the following inward report fences this clamped no-op.
+            compositor.pointer_frame(400, 80, 0, -1, columns);
+        }
     }
     assert_eq!(std::fs::read(&file).unwrap(), text.as_bytes());
     editor.quit();

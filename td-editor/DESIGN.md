@@ -2216,8 +2216,20 @@ reports with vertical detents -1, -1, then +2. Exact viewport rows 3, 6,
 then 0 pin the evdev sign conversion, three-rows-per-detent adapter policy
 and accumulation. Each step checks unchanged document revision, full text,
 selection and caret, a fresh callback/client-publication bracket and the
-captured first visible row. Disk bytes remain unchanged. It does not cover
-horizontal wheels, high-resolution scrolling or clamped no-op reports.
+captured first visible row. Large detents also clamp to first row 34 of the
+last page (65 rows including the final empty line, 31 visible) and back to
+zero. Repeated outward reports at each bound owe no redraw; the following
+inward reports must reach rows 31 and 3. Disk bytes remain unchanged.
+
+A horizontal-wheel case uses a 130-cell ASCII line. A horizontal report
+with Soft Wrap enabled keeps column zero; a subsequent native menu-open
+event fences that assertion before Format > Soft Wrap disables wrapping.
+Two-axis reports then clamp vertical motion at row zero and move horizontally
+through columns 3, 33, 30, 0 and 3. Column 33 is the last page, including
+the trailing caret cell. Repeated outward reports at the bounds are followed
+by inward reports, with no frame requirement for a clamped no-op itself.
+Exact state, unmodified text/revision/caret/selection/disk and captured
+alphabetic prefixes are checked. High-resolution scrolling is not covered.
 
 This proves native keyboard/pointer/menu/wheel/state/callback/pixel
 integration, not GPU, hardware input, jail or caller `$EDITOR` integration.
