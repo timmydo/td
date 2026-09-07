@@ -358,6 +358,7 @@ struct Window {
     searches: crate::search::History,
     spelling: crate::spelling::WindowState,
     control_jobs: crate::control_jobs::Jobs,
+    control_open_job: Option<u64>,
     control: Option<crate::control_worker::Worker>,
     frame_waiters: VecDeque<crate::control_worker::Job>,
     control_cleanup_error: Option<String>,
@@ -459,6 +460,7 @@ impl Window {
             searches: crate::search::History::default(),
             spelling: crate::spelling::WindowState::default(),
             control_jobs: crate::control_jobs::Jobs::default(),
+            control_open_job: None,
             control: None,
             frame_waiters: VecDeque::new(),
             control_cleanup_error: None,
@@ -1389,6 +1391,29 @@ impl Window {
             .as_mut()
             .and_then(|files| files.poll(&mut self.ui))
         {
+            let mut job_error = None;
+            if let Some(id) = self.control_open_job.take() {
+                // One file operation is in flight. Session publishes success only
+                // after Open selected or created its tab on this same UI thread.
+                let opened = if result.is_ok() {
+                    self.ui
+                        .editor()
+                        .active()
+                        .ok_or(crate::Error::MissingTab)
+                        .and_then(|tab| {
+                            Ok(Target {
+                                tab,
+                                revision: self.ui.editor().document(tab)?.revision(),
+                            })
+                        })
+                } else {
+                    Err(crate::Error::Unavailable)
+                };
+                if let Err(detail) = self.control_jobs.opened(id, opened) {
+                    job_error = Some(detail);
+                }
+                self.frames.invalidate(true);
+            }
             self.menu = None;
             if self.ui.editor().active() != active {
                 self.input.cancel_repeat();
@@ -1402,10 +1427,14 @@ impl Window {
                 self.spelling.install(dictionary);
                 self.frames.invalidate(true);
             }
-            self.notify(match result {
+            let mut notice = match result {
                 Ok(notice) => notice,
                 Err(detail) => format!("File operation failed: {detail}"),
-            });
+            };
+            if let Some(detail) = job_error {
+                notice.push_str(&format!("; Open job outcome unavailable: {detail}"));
+            }
+            self.notify(notice);
             if self.closing_save {
                 self.closing_save = false;
                 if succeeded {
@@ -1621,6 +1650,41 @@ impl Window {
                 .response(),
             };
         }
+        if let crate::control::Operation::Open(path) = &request.operation {
+            let result = (|| -> crate::Result<u64> {
+                if self.files.is_none()
+                    || self.files.as_ref().is_some_and(|files| files.busy())
+                    || self.control_open_job.is_some()
+                {
+                    return Err(crate::Error::Unavailable);
+                }
+                self.ui
+                    .generation()
+                    .checked_add(1)
+                    .ok_or(crate::Error::Exhausted)?;
+                let id = self.control_jobs.begin_open()?;
+                let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
+                match files.open(path.clone()) {
+                    Ok(()) => self.control_open_job = Some(id),
+                    Err(detail) => {
+                        self.control_jobs
+                            .opened(id, Err(crate::Error::Unavailable))?;
+                        self.notify(format!("Open failed: {detail}"));
+                    }
+                }
+                self.stop_pointer();
+                self.control_mutation_accepted();
+                Ok(id)
+            })();
+            return match result {
+                Ok(id) => format!("1\t{}\tpending\t{id}", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if matches!(request.operation, crate::control::Operation::New) {
             return match self.ui.dispatch(Event::New) {
                 Ok(Outcome::Created(tab)) => {
@@ -1800,7 +1864,7 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-close\tnative={},{},{},{}",
+                    "\tadapter=native-open\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.configured),
@@ -5412,7 +5476,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-close\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-open\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -5507,6 +5571,233 @@ mod tests {
     ) -> String {
         let mut client = control_client(path, payload.as_bytes());
         control_answer_pump(w, &mut client, peer, false) // Explicitly withhold background steps.
+    }
+
+    #[test]
+    fn remote_open_jobs_pin_completed_tabs_across_native_activity_and_file_failures() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let file = directory
+            .0
+            .join(std::ffi::OsString::from_vec(b"draft-\xff".to_vec()));
+        std::fs::write(&file, b"disk").unwrap();
+        let open = |path: &Path| {
+            format!(
+                "1\t1\topen\t{}",
+                crate::control::hex(path.as_os_str().as_bytes())
+            )
+        };
+        let (mut w, peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        let original = format!("{:?}", w.ui.editor().document(1).unwrap());
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, &open(&file)),
+            "1\t1\tpending\t1"
+        );
+        assert!(w.files.as_ref().unwrap().busy());
+        let before = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        assert!(before.contains("job=1,open,0,0,0,pending,-"));
+        for request in [
+            open(&file),
+            "1\t2\tclose-tab\t1\t1".into(),
+            "1\t3\tquit".into(),
+        ] {
+            assert!(
+                job_request(&mut w, &peer, &socket, &request).contains("\terror\tunavailable\t")
+            );
+            assert_eq!(job_request(&mut w, &peer, &socket, "1\t0\tstate"), before);
+        }
+        w.chord("C-n", false).unwrap();
+        assert_eq!(w.ui.editor().active(), Some(2));
+        finish_file(&mut w);
+        assert_eq!(w.ui.editor().active(), Some(3));
+        assert_eq!(w.ui.editor().document(3).unwrap().text(), "disk");
+        w.chord("C-n", false).unwrap();
+        assert_eq!(w.ui.editor().active(), Some(4));
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=1,open,3,0,0,complete,-"));
+        assert_eq!(
+            format!("{:?}", w.ui.editor().document(1).unwrap()),
+            original
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t5\tselect-tab\t3\t0"),
+            "1\t5\tok\t"
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t4\tinsert\t3\t0\t0\t0\t78"),
+            "1\t4\tok\t"
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t6\tselect-tab\t4\t0"),
+            "1\t6\tok\t"
+        );
+        // Duplicate Open selects the already-associated document, including its edits.
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, &open(&file)),
+            "1\t1\tpending\t2"
+        );
+        finish_file(&mut w);
+        assert_eq!(w.ui.editor().active(), Some(3));
+        assert_eq!(w.ui.editor().document(3).unwrap().text(), "xdisk");
+        assert!(w.ui.editor().document(3).unwrap().dirty());
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=2,open,3,1,0,complete,-"));
+        assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+        let missing = directory.path("new-file");
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, &open(&missing)),
+            "1\t1\tpending\t3"
+        );
+        finish_file(&mut w);
+        assert_eq!(w.ui.editor().active(), Some(5));
+        assert!(w.ui.editor().document(5).unwrap().dirty());
+        assert!(!missing.exists());
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=3,open,5,0,0,complete,-"));
+        let invalid = directory.path("invalid-text");
+        std::fs::write(&invalid, b"\xff").unwrap();
+        let documents = format!("{:?}", w.ui.editor());
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, &open(&invalid)),
+            "1\t1\tpending\t4"
+        );
+        finish_file(&mut w);
+        assert_eq!(format!("{:?}", w.ui.editor()), documents);
+        let state = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        assert!(state.contains("job=4,open,0,0,0,error,unavailable"));
+        assert!(state.contains("job=1,open,3,0,0,complete,-"));
+        assert!(!state.contains("draft") && !state.contains("invalid-text"));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_open_reports_disconnected_worker_submission_failures_as_terminal_jobs() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.files = Some(crate::session::Session::disconnected_for_test());
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        let documents = format!("{:?}", w.ui.editor());
+        for id in [1, 2] {
+            // First send meets a closed channel; poll then observes the dead worker.
+            if id == 2 {
+                w.tick(w.clock + 1, false).unwrap();
+            }
+            assert_eq!(
+                job_request(&mut w, &peer, &path, "1\t1\topen\t61"),
+                format!("1\t1\tpending\t{id}")
+            );
+            assert!(!w.files.as_ref().unwrap().busy());
+            assert!(w.control_open_job.is_none());
+            assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+                .contains(&format!("job={id},open,0,0,0,error,unavailable")));
+            assert_eq!(format!("{:?}", w.ui.editor()), documents);
+        }
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_open_and_spelling_jobs_interleave_without_cross_completion() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let file = directory.path("document");
+        std::fs::write(&file, b"disk").unwrap();
+        let (mut w, peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t1\tcheck-spelling\t1\t1"),
+            "1\t1\tpending\t1"
+        );
+        let request = format!(
+            "1\t2\topen\t{}",
+            crate::control::hex(file.as_os_str().as_encoded_bytes())
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &path, &request),
+            "1\t2\tpending\t2"
+        );
+        finish_file(&mut w);
+        let state = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        assert!(state.contains("job=1,spelling,1,1,1,pending,-"));
+        assert!(state.contains("job=2,open,2,0,0,complete,-"));
+        w.end_turn(w.clock, false).unwrap();
+        let state = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        assert!(state.contains("job=1,spelling,1,1,1,complete,-"));
+        assert!(state.contains("job=2,open,2,0,0,complete,-"));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_open_refusals_and_completion_capacity_failures_preserve_documents() {
+        let directory = DialogDirectory::new();
+        let file = directory.path("draft");
+        std::fs::write(&file, b"disk").unwrap();
+        let request = crate::control::Request {
+            id: 1,
+            operation: crate::control::Operation::Open(file.clone()),
+        };
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        for guard in ["scratch", "counter", "jobs", "closed"] {
+            let (mut w, _peer) = file_dialog_fixture();
+            match guard {
+                "scratch" => w.files = None,
+                "counter" => w.ui.generation_for_test(u64::MAX),
+                "jobs" => w.control_jobs.exhaust_for_test(),
+                "closed" => w.closed = true,
+                _ => panic!("unknown guard"),
+            }
+            let before = w.control_response(&state);
+            let notice = w.notice.clone();
+            assert!(w.control_response(&request).contains(
+                if matches!(guard, "counter" | "jobs") {
+                    "\terror\texhausted\t"
+                } else {
+                    "\terror\tunavailable\t"
+                }
+            ));
+            assert_eq!(w.control_response(&state), before);
+            assert_eq!(w.notice, notice);
+        }
+        let (mut w, _peer) = file_dialog_fixture();
+        for _ in 1..64 {
+            w.ui.dispatch(Event::New).unwrap();
+        }
+        let documents = format!("{:?}", w.ui.editor());
+        assert_eq!(w.control_response(&request), "1\t1\tpending\t1");
+        finish_file(&mut w);
+        assert_eq!(format!("{:?}", w.ui.editor()), documents);
+        assert!(w
+            .control_response(&state)
+            .contains("job=1,open,0,0,0,error,unavailable"));
+        assert_eq!(w.files.as_ref().unwrap().labels().count(), 0);
+        assert_eq!(std::fs::read(file).unwrap(), b"disk");
     }
 
     #[test]
@@ -6358,6 +6649,7 @@ mod tests {
             let before = w.control_response(&state);
             let notice = w.notice.clone();
             for command in [
+                "open\t61",
                 "new",
                 "close-tab\t1\t1",
                 "quit",
@@ -7113,7 +7405,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-close\t"));
+            assert!(response.contains("\tadapter=native-open\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

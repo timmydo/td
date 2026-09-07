@@ -16,9 +16,16 @@ enum Status {
     Failed(Error),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Kind {
+    Spelling,
+    Open,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Record {
     id: u64,
+    kind: Kind,
     tab: TabId,
     revision: u64,
     scan: Option<u64>,
@@ -42,6 +49,14 @@ impl Default for Jobs {
 impl Jobs {
     /// Reserve before invoking the shared action. Failure cannot evict history.
     pub(crate) fn begin(&mut self, tab: TabId, revision: u64) -> Result<u64> {
+        self.reserve(Kind::Spelling, tab, revision)
+    }
+
+    pub(crate) fn begin_open(&mut self) -> Result<u64> {
+        self.reserve(Kind::Open, 0, 0)
+    }
+
+    fn reserve(&mut self, kind: Kind, tab: TabId, revision: u64) -> Result<u64> {
         let id = self.last.checked_add(1).ok_or(Error::Exhausted)?;
         if self.records.len() == RECORDS {
             let terminal = self
@@ -53,6 +68,7 @@ impl Jobs {
         }
         self.records.push_back(Record {
             id,
+            kind,
             tab,
             revision,
             scan: None,
@@ -68,7 +84,10 @@ impl Jobs {
             .iter_mut()
             .find(|record| record.id == id)
             .ok_or(Error::InvalidArgument)?;
-        if record.status != Status::Pending || record.scan.is_some() {
+        if record.kind != Kind::Spelling
+            || record.status != Status::Pending
+            || record.scan.is_some()
+        {
             return Err(Error::InvalidArgument);
         }
         match result {
@@ -80,11 +99,32 @@ impl Jobs {
         Ok(())
     }
 
+    pub(crate) fn opened(&mut self, id: u64, result: Result<crate::dialog::Target>) -> Result<()> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(Error::InvalidArgument)?;
+        if record.kind != Kind::Open || record.status != Status::Pending {
+            return Err(Error::InvalidArgument);
+        }
+        match result {
+            Ok(target) if target.tab != 0 => {
+                record.tab = target.tab;
+                record.revision = target.revision;
+                record.status = Status::Complete;
+            }
+            Ok(_) => record.status = Status::Failed(Error::Protocol),
+            Err(error) => record.status = Status::Failed(error),
+        }
+        Ok(())
+    }
+
     /// Terminal outcomes are historical facts, not promises of current marks.
     pub(crate) fn observe(&mut self, editor: &Editor, spelling: &WindowState) -> bool {
         let mut changed = false;
         for record in &mut self.records {
-            if record.status != Status::Pending {
+            if record.kind != Kind::Spelling || record.status != Status::Pending {
                 continue;
             }
             let Some(scan) = record.scan else {
@@ -117,8 +157,12 @@ impl Jobs {
             };
             write!(
                 fields,
-                "\tjob={},spelling,{},{},{},{status},{error}",
+                "\tjob={},{},{},{},{},{status},{error}",
                 record.id,
+                match record.kind {
+                    Kind::Spelling => "spelling",
+                    Kind::Open => "open",
+                },
                 record.tab,
                 record.revision,
                 record.scan.unwrap_or(0)
@@ -140,6 +184,58 @@ mod tests {
     use crate::model::{Command, Selection};
     use crate::spelling::Dictionary;
     use crate::ui::{Controller, Event};
+
+    #[test]
+    fn open_outcomes_share_ids_but_cannot_be_finished_as_spelling() {
+        let mut jobs = Jobs::default();
+        let open = jobs.begin_open().unwrap();
+        assert_eq!(jobs.started(open, Ok(Some(1))), Err(Error::InvalidArgument));
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,open,0,0,0,pending,-"));
+        assert!(!jobs.observe(&Editor::default(), &WindowState::default()));
+        jobs.opened(
+            open,
+            Ok(crate::dialog::Target {
+                tab: 7,
+                revision: 8,
+            }),
+        )
+        .unwrap();
+        let before = jobs.fields().unwrap();
+        assert!(before.contains("job=1,open,7,8,0,complete,-"));
+        assert_eq!(
+            jobs.opened(open, Err(Error::Unavailable)),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(jobs.fields().unwrap(), before);
+        let spelling = jobs.begin(7, 8).unwrap();
+        assert_eq!(
+            jobs.opened(spelling, Err(Error::Unavailable)),
+            Err(Error::InvalidArgument)
+        );
+        jobs.started(spelling, Err(Error::Limit)).unwrap();
+        let failed = jobs.begin_open().unwrap();
+        jobs.opened(failed, Err(Error::Unavailable)).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=3,open,0,0,0,error,unavailable"));
+        let pending = jobs.begin_open().unwrap();
+        for _ in 0..65 {
+            let id = jobs.begin_open().unwrap();
+            jobs.opened(id, Err(Error::Unavailable)).unwrap();
+        }
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains(&format!("job={pending},open,0,0,0,pending,-")));
+        jobs.exhaust_for_test();
+        let before = jobs.fields().unwrap();
+        assert_eq!(jobs.begin_open(), Err(Error::Exhausted));
+        assert_eq!(jobs.fields().unwrap(), before);
+    }
 
     #[test]
     fn job_outcomes_distinguish_complete_cancelled_stale_and_start_failure() {

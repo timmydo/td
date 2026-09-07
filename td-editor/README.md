@@ -49,7 +49,7 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-Native query/edit control is available explicitly; remote file operations,
+Native query/edit/Open control is available explicitly; remote writes,
 GPU rendering and td-mail integration remain unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
@@ -81,8 +81,11 @@ key-profile setters and Go To Line also use revision-checked native control
 dispatch without changing text or history. `spelling-results` exposes status,
 whole-scan counts and bounded range pages pinned to both text revision and
 scan ID. Checking starts with ordinary F7 or remote `check-spelling`;
-pending scans expose no partial marks. File operations and dialog answers
-remain later work except for Close Tab, Quit and close-dialog Cancel/Discard.
+pending scans expose no partial marks. Remote `open` queues the ordinary file
+worker and records the selected/created tab ID and revision in shared bounded
+job history, including duplicate-file and missing-file behavior. Paths use
+literal OS bytes. Remote Close Tab, Quit and close-dialog Cancel/Discard
+are also connected; remote writes and other dialog answers remain later work.
 These answers pin the live dialog ID, tab and revision and work independently
 of physical focus/prompt visibility, without bypassing the close coordinator.
 `check-spelling` returns a job ID; native state retains

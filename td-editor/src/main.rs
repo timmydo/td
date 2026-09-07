@@ -8,6 +8,7 @@ const HELP: &str = concat!(
     "Window option: --dictionary PATH loads an explicit local English word list.\n",
     "Window option: --control-socket PATH enables private state/text and edits.\n",
     "Control edits check revision/selection; remote Save remains unavailable.\n",
+    "Control Open queues a file job; state reports its resulting tab and revision.\n",
     "Control can read/edit tabs and answer live Close/Quit with Cancel/Discard.\n",
     "Remote Discard also answers human-opened dialogs, without physical focus.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
@@ -39,7 +40,7 @@ const HELP: &str = concat!(
     "Format: Dictionary, Check Spelling, Next/Previous Misspelling (no wrapping).\n",
     "Spelling underlines appear at completion; edits clear them without rechecking.\n",
     "Word list: UTF-8, one ASCII word per line; 16 MiB / 250,000 unique words.\n",
-    "No bundled word list, GPU renderer, remote file I/O, recovery or td-mail link.\n",
+    "No bundled word list, GPU renderer, remote writes, recovery or td-mail link.\n",
     "Fixtures: --replay | --preview\n",
     "Scratch: --window-preview [--keys=windows|emacs]\n",
     "Scratch window has no file I/O.\n",
@@ -177,12 +178,14 @@ mod tests {
             "No bundled word list, GPU renderer",
             "private state/text and edits",
             "remote Save remains unavailable",
+            "Control Open queues a file job",
             "answer live Close/Quit with Cancel/Discard",
             "human-opened dialogs, without physical focus",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }
         assert!(!HELP.contains("No clipboard"));
+        assert!(!HELP.contains("remote file I/O"));
         assert!(HELP.ends_with('\n'));
         assert!(HELP.lines().all(|line| line.len() <= 80));
         assert!(HELP

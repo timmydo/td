@@ -4,6 +4,8 @@ use crate::model::{Command, Selection, TabId};
 use crate::ui::{Controller, Event};
 use crate::{Error, Result};
 use std::fmt::Write;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 
 pub const MAX_FRAME: usize = 1024 * 1024;
 pub const PAGE_BYTES: usize = 256 * 1024;
@@ -93,10 +95,11 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(framed)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum Operation {
     State,
     New,
+    Open(PathBuf),
     Quit,
     CloseTab {
         tab: TabId,
@@ -131,6 +134,79 @@ pub enum Operation {
         revision: u64,
         edit: Edit,
     },
+}
+
+impl std::fmt::Debug for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::State => f.write_str("State"),
+            Self::New => f.write_str("New"),
+            Self::Open(path) => f
+                .debug_struct("Open")
+                .field("path_bytes", &path.as_os_str().len())
+                .finish(),
+            Self::Quit => f.write_str("Quit"),
+            Self::CloseTab { tab, revision } => f
+                .debug_struct("CloseTab")
+                .field("tab", tab)
+                .field("revision", revision)
+                .finish(),
+            Self::DialogAnswer {
+                dialog,
+                tab,
+                revision,
+                answer,
+            } => f
+                .debug_struct("DialogAnswer")
+                .field("dialog", dialog)
+                .field("tab", tab)
+                .field("revision", revision)
+                .field("answer", answer)
+                .finish(),
+            Self::WaitFrame(generation) => f.debug_tuple("WaitFrame").field(generation).finish(),
+            Self::CheckSpelling { tab, revision } => f
+                .debug_struct("CheckSpelling")
+                .field("tab", tab)
+                .field("revision", revision)
+                .finish(),
+            Self::SpellingResults {
+                tab,
+                revision,
+                scan,
+                offset,
+                limit,
+            } => f
+                .debug_struct("SpellingResults")
+                .field("tab", tab)
+                .field("revision", revision)
+                .field("scan", scan)
+                .field("offset", offset)
+                .field("limit", limit)
+                .finish(),
+            Self::Text {
+                tab,
+                revision,
+                offset,
+                limit,
+            } => f
+                .debug_struct("Text")
+                .field("tab", tab)
+                .field("revision", revision)
+                .field("offset", offset)
+                .field("limit", limit)
+                .finish(),
+            Self::Edit {
+                tab,
+                revision,
+                edit,
+            } => f
+                .debug_struct("Edit")
+                .field("tab", tab)
+                .field("revision", revision)
+                .field("edit", edit)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +324,17 @@ impl Request {
             let operation = match name {
                 "state" => Operation::State,
                 "new" => Operation::New,
+                "open" => {
+                    let encoded = args.next().ok_or(Error::Protocol)?;
+                    if encoded.len() > 8192 {
+                        return Err(Error::Limit);
+                    }
+                    let path = unhex(encoded)?;
+                    if path.is_empty() || path.contains(&0) {
+                        return Err(Error::InvalidArgument);
+                    }
+                    Operation::Open(std::ffi::OsString::from_vec(path).into())
+                }
                 "quit" => Operation::Quit,
                 "close-tab" => Operation::CloseTab {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -378,6 +465,7 @@ impl Request {
             } => page(ui, *tab, *revision, *offset, *limit),
             Operation::Edit { .. }
             | Operation::New
+            | Operation::Open(_)
             | Operation::Quit
             | Operation::CloseTab { .. }
             | Operation::DialogAnswer { .. }
@@ -417,6 +505,7 @@ impl Request {
             || matches!(
                 self.operation,
                 Operation::New
+                    | Operation::Open(_)
                     | Operation::Quit
                     | Operation::CheckSpelling { .. }
                     | Operation::CloseTab { .. }
@@ -764,6 +853,47 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn open_accepts_only_bounded_nonempty_non_nul_os_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let secret = "private-draft-path";
+        let request =
+            Request::parse(format!("1\t8\topen\t{}", hex(secret.as_bytes())).as_bytes()).unwrap();
+        let debug = format!("{request:?}");
+        assert!(debug.contains("Open") && debug.contains("path_bytes: 18"));
+        assert!(!debug.contains(secret) && !debug.contains(&hex(secret.as_bytes())));
+        let request = Request::parse(b"1\t9\topen\t2fff").unwrap();
+        let Operation::Open(path) = &request.operation else {
+            panic!("not Open")
+        };
+        assert_eq!(path.as_os_str().as_bytes(), b"/\xff");
+        assert!(request.is_mutating());
+        let mut ui = Controller::default();
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        for (path, expected) in [
+            ("-".to_owned(), Error::InvalidArgument),
+            ("610062".to_owned(), Error::InvalidArgument),
+            ("2F".to_owned(), Error::Protocol),
+            ("6".to_owned(), Error::Protocol),
+            ("61".repeat(4097), Error::Limit),
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t9\topen\t{path}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                expected
+            );
+        }
+        assert!(Request::parse(format!("1\t9\topen\t{}", "61".repeat(4096)).as_bytes()).is_ok());
+        for payload in ["1\t9\topen", "1\t9\topen\t61\textra"] {
+            assert_eq!(
+                Request::parse(payload.as_bytes()).unwrap_err().error,
+                Error::Protocol
+            );
+        }
+    }
 
     #[test]
     fn close_requests_have_strict_native_only_grammar() {
@@ -1819,7 +1949,7 @@ mod tests {
             "redo\t1\t-1",
             "fill-paragraph\t1\t0",
             "new\t",
-            "open\t2f746d702f78",
+            "open\t2f746d702f78\textra",
             "close-tab\t1\t0\textra",
             "quit\textra",
             "save\t1\t0",

@@ -408,6 +408,39 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert_eq!(dispatch.matches("self.ui.dispatch(").count(), 1);
     assert_eq!(dispatch.matches("Event::").count(), 1);
     assert!(dispatch.contains("self.ui.dispatch(Event::New)"));
+    let open = dispatch
+        .split("if let crate::control::Operation::Open(path)")
+        .nth(1)
+        .unwrap();
+    let open = open
+        .split("if matches!(request.operation, crate::control::Operation::New)")
+        .next()
+        .unwrap();
+    assert!(
+        dispatch.find("request.is_mutating()").unwrap()
+            < dispatch.find("Operation::Open(path)").unwrap()
+    );
+    assert!(open.find("files.busy()").unwrap() < open.find("begin_open()").unwrap());
+    assert!(open.find(".checked_add(1)").unwrap() < open.find("begin_open()").unwrap());
+    assert!(open.find("begin_open()").unwrap() < open.find("files.open(path.clone())").unwrap());
+    assert!(open.contains("self.control_open_job = Some(id)"));
+    assert!(!open.contains("Event::Load") && !open.contains("std::fs::"));
+    let tick = production
+        .split("fn tick(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(
+        tick.find("files.poll(&mut self.ui)").unwrap()
+            < tick.find("self.control_jobs.opened(id, opened)").unwrap()
+    );
+    assert!(tick.contains("self.control_open_job.take()"));
+    assert_eq!(
+        production.matches("self.control_open_job.take()").count(),
+        1
+    );
     let answer = production
         .split("fn control_dialog_answer(")
         .nth(1)

@@ -499,6 +499,23 @@ fn file_error(error: crate::files::Failure) -> String {
 }
 
 #[cfg(test)]
+impl Session {
+    pub(crate) fn disconnected_for_test() -> Self {
+        let (sender, _jobs) = mpsc::sync_channel(1);
+        let (_results, receiver) = mpsc::sync_channel(1);
+        Self {
+            sender,
+            receiver,
+            pending: None,
+            associations: BTreeMap::new(),
+            failed: false,
+            conflict: None,
+            dictionary: None,
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;

@@ -26,8 +26,9 @@ state/text and scan-pinned spelling queries, plus revision/selection-checked
 edits. Native redraw/submitted/callback generations and bounded `wait-frame`
 acknowledgement are connected. Remote Check Spelling returns a job ID with
 bounded completion/error/cancellation history in native state. Remote New
-creates an ordinary empty tab and returns its stable ID. Remote file
-I/O and other dialog answers remain unimplemented. Remote Close Tab, Quit and
+creates an ordinary empty tab and returns its stable ID. Remote Open uses
+the ordinary file worker and bounded job history. Remote writes and other
+dialog answers remain unimplemented. Remote Close Tab, Quit and
 live close-dialog Cancel/Discard use the ordinary close coordinator.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
@@ -2124,8 +2125,13 @@ returns the created tab ID, and preserves existing text and file associations.
 It has no revision target or file authority; CONTROL.md pins its non-idempotent
 admission and refusal rules. Remote Close Tab, Quit and close-dialog
 Cancel/Discard are connected, with IDs shared by physical and remote close
-and deferred window-close approvals. File I/O and other dialog answers
-remain unimplemented.
+and deferred window-close approvals. Remote Open uses the ordinary file
+worker and shares the bounded job history with spelling. Completion captures
+the exact selected/created tab and revision before later UI actions.
+Duplicate Open retains edits and missing files remain unwritten.
+CONTROL.md defines OS-byte
+paths, admission guards, coarse file failure codes and historical outcomes.
+Remote writes and other dialog answers remain unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 

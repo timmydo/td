@@ -3,8 +3,8 @@
 The experimental `--window --control-socket PATH` endpoint implements the
 query and revision-checked editing subset below. It is off by default;
 scratch preview and replay do not accept the option. Remote Close Tab, Quit and
-close-dialog Cancel/Discard are connected; remote file I/O and other dialog
-answers remain unimplemented. Remote Check Spelling admission and
+close-dialog Cancel/Discard and file Open are connected; remote writes and
+other dialog answers remain unimplemented. Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
 [DESIGN.md](DESIGN.md#test-and-control-architecture).
@@ -61,6 +61,7 @@ In the examples below, field spaces denote literal Tab separators.
 | --- | --- |
 | `1 ID state` | Snapshot the current controller. |
 | `1 ID new` | Create and activate an empty tab; return its stable ID. |
+| `1 ID open HEX_PATH` | Queue ordinary file Open and return a background-job ID. |
 | `1 ID close-tab TAB REVISION` | Start ordinary active-tab close, without approving discard. |
 | `1 ID quit` | Start ordinary whole-window close, without approving discard. |
 | `1 ID dialog-answer DIALOG TAB REVISION ANSWER` | Answer the current close question with `cancel` or `discard`. |
@@ -69,14 +70,14 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
 | `1 ID check-spelling TAB REVISION` | Admit an on-demand whole-document spelling job for the active tab. |
 
-Tab creation and the editing subset are specified below. `load`, file I/O,
-physical-input simulation and other dialog answers remain refused; this parser is
-not a route into replay's broader command set.
+Tab creation, file Open and the editing subset are specified below. `load`,
+writes, physical-input simulation and other dialog answers remain refused;
+this parser is not a route into replay's broader command set.
 `Request::response` borrows `&Controller`, so it cannot dispatch an edit or
 change selection, views, history or generation. It returns `unavailable`
-for creation, closing, dialog, editing, spelling and frame requests.
+for creation, Open, closing, dialog, editing, spelling and frame requests.
 `Request::execute` admits edits; the native adapter dispatches creation,
-close/dialog actions and supplies its spelling/frame state.
+Open and close/dialog actions and supplies its job/spelling/frame state.
 
 An error response is `1 ID error CODE HEX_DIAGNOSTIC`. A recoverable request
 ID is echoed even if the command name is missing or later arguments are
@@ -119,6 +120,55 @@ invalidates the native frame. The reply is not presentation evidence;
 use state and `wait-frame` separately. The immutable controller-only
 response API returns `unavailable`; creation is a native action, while
 headless tests can dispatch `Event::New` directly or use replay `new`.
+
+## File Open jobs
+
+`1 ID open HEX_PATH` submits ordinary file Open through the existing single
+file worker. The path is 1..=4096 literal OS bytes, encoded in lowercase hex,
+with no NUL. It need not be UTF-8. Relative paths use the editor's working
+directory; no shell, tilde or environment expansion occurs. Oversize encoding
+is `limit`, malformed hex/arity is `protocol`, and empty/NUL paths are
+`invalid-argument`, before native admission. Request debug formatting exposes
+only the path byte count, not its contents. Ordinary native file notices
+retain their existing escaped-path diagnostics.
+
+Closed/quitting windows, every native modal and open menus refuse
+`unavailable`. A file session is required, and any pending file operation
+refuses another Open without consuming a job ID. Controller-counter and job
+capacity/exhaustion checks precede admission. These refusals preserve the
+native snapshot and notice. Admission cancels native repeat, drag and Paste
+through the shared cleanup paths, invalidates a frame and returns
+`1 ID pending JOB`. It does not wait for file I/O or select a tab yet.
+Here `pending` acknowledges a job ID, not a promise that its row is still
+pending: a synchronous submission failure may already be terminal.
+The file worker's ordinary publication, duplicate-association and text-codec
+rules are unchanged; Open grants no write, reload or overwrite authority.
+
+Open shares the checked job-ID sequence and 64-row history with spelling.
+Its row is `job=JOB,open,TAB,REVISION,0,STATUS,CODE`. A pending row has zero
+tab/revision. Successful completion records `complete,-` with the nonzero
+tab ID and revision selected or created by that exact Open, captured before
+any later native/control action. Opening an associated file selects its
+existing tab without replacing text, history or disk baseline. A missing
+file creates the ordinary dirty, empty new-file tab without writing a file.
+An invalid document, exhausted model capacity, worker failure or failed
+submission records `error,unavailable` with zero tab/revision; the native
+notice retains the more specific diagnostic. This subset does not yet expose
+typed file-error subcategories. No human diagnostic is parsed to classify
+success: the single in-flight worker result and synchronous controller
+admission determine it. Defensive impossible-target failures may report
+`missing-tab` or `protocol`; those are invariant errors, not file-error
+subcategories. Successful ordinary Open always selects a nonzero live tab.
+
+Open rows are historical, not a statement about the current active tab or
+revision. Later selection, edits, closure and spelling work cannot retarget
+them. A completed row is not presentation evidence; use `wait-frame`
+separately. No path, title or document bytes are retained in job rows. The
+same eviction and transport-lifetime rules as spelling apply. In particular,
+disconnect or a lost reply cannot cancel an admitted Open, and clients must
+not blindly retry it. Native Open/dictionary/Save operations do not create
+remote job rows. Remote Save/Save As and path/conflict answers remain later
+work.
 
 ## Close requests and dialog answers
 
@@ -455,11 +505,13 @@ accepted background job's lifetime. Disconnect after admission cannot undo
 or cancel the job; a lost reply is ambiguous and must not be blindly retried.
 
 Native state adds `job-last=N`, the largest admitted ID (zero initially),
-followed by zero or more `job=JOB,spelling,TAB,REVISION,SCAN,STATUS,CODE` fields
-in increasing job-ID order. Scan zero means startup produced no scan. Status
+followed by job fields in increasing job-ID order. Spelling rows are
+`job=JOB,spelling,TAB,REVISION,SCAN,STATUS,CODE`; Open rows are defined above.
+Scan zero means spelling startup produced no scan. Status
 is `pending`, `complete`, `cancelled`, or `error`; code is `-` except for a
-stable error code with `error`. Pending/complete rows name the real nonzero
-scan ID, which can be passed to `spelling-results` with that tab/revision.
+stable error code with `error`. Pending/complete spelling rows name the
+real nonzero scan ID, which can be passed to `spelling-results` with that
+tab/revision.
 A matching completed report completes the job. While pending, changed text
 is `error,stale-revision` and a closed tab is `error,missing-tab`; explicit
 scan cancellation, recheck or dictionary replacement is `cancelled`.
@@ -553,8 +605,8 @@ There are at most 64 tab/view pairs. No text bytes, file path, title, dictionary
 pending dialog/job or spelling range is serialized by this controller-only
 snapshot. Its generation means local UI state, **not** a submitted buffer,
 frame callback or scanout. The native extension below adds its own redraw
-generations/snapshots, coarse flags, bounded spelling-job outcomes and close
-dialog identity/answers. File job and other dialog identities remain
+generations/snapshots, coarse flags, bounded spelling/Open outcomes and close
+dialog identity/answers. Write jobs and other dialog identities remain
 later work before claiming complete remote control.
 
 ## Experimental native adapter
@@ -599,12 +651,12 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-close` | Explicit implemented adapter identity. |
+| `adapter=native-open` | Explicit implemented adapter identity. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |
 | `job-last=N` | Largest admitted remote background-job ID, or zero. |
-| `job=...` (repeated) | Up to 64 ordered spelling-job rows under the contract above. |
+| `job=...` (repeated) | Up to 64 ordered spelling/Open rows under the contracts above. |
 | `dialog-last=N` | Largest admitted close-coordinator ID, or zero. |
 | `dialog=...` | Live close scope/phase/target/allowed answers, or `-`. |
 | `window-generation=N` | Current native redraw-invalidation generation. |
@@ -614,8 +666,8 @@ this order. Error responses are unchanged:
 Boolean flags are `0|1`; the dictionary field is an entry count or `-`.
 The native/modal/spelling flags remain coarse presence information, not
 dialog IDs, allowed answers or spelling ranges. Separate dialog fields expose
-the close coordinator only; job rows expose spelling outcomes. File jobs and
-other dialog IDs remain absent. No path or entry text
+the close coordinator only; job rows expose spelling/Open outcomes. Write
+jobs and other dialog IDs remain absent. No path or entry text
 is disclosed by these added fields. Query `text` separately for document
 bytes. Controller generation does not cover native-only modal/job changes,
 and is not a submitted/callback-completed frame generation. Clients must not
