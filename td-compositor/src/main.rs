@@ -71,7 +71,8 @@ fn usage() -> String {
      --application-ready-socket PATH --application-app-id ID \
      --application-content-rgb-a RGB --application-content-rgb-b RGB) \
      (--terminal-client PATH | --terminal-authority stdin) | \
-     td-compositor headless --session-dir NEW_ABSOLUTE_PATH --width N --height N | \
+     td-compositor headless --session-dir NEW_ABSOLUTE_PATH --width N --height N \
+     [--input-control enabled] | \
      td-compositor probe-terminal-authority | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \

@@ -728,6 +728,120 @@ struct LiveInputTarget {
     launches: LaunchBackend,
 }
 
+/// One synthetic keyboard for the lifetime of an explicitly enabled headless
+/// session. It shares ordinary binding policy, but cannot obtain evdev origin.
+#[derive(Default)]
+pub(crate) struct AutomationKeys {
+    bindings: KeyBindings,
+}
+
+impl AutomationKeys {
+    pub(crate) fn key(
+        &mut self,
+        runtime: &mut Runtime,
+        time: u32,
+        code: u16,
+        pressed: bool,
+    ) -> Result<(), String> {
+        Self::admit(runtime)?;
+        if !(1..=MAX_XKB_EVDEV_KEY).contains(&code) {
+            return Err("automation key outside 1..=247".into());
+        }
+        let decision = self.bindings.feed_device(
+            0,
+            Event {
+                timestamp: u128::from(time) * 1_000_000,
+                time,
+                kind: EV_KEY,
+                code,
+                value: if pressed { KEY_PRESS } else { KEY_RELEASE },
+            },
+        );
+        deliver_key_decision(&mut AutomationTarget { runtime }, &mut self.bindings, decision)
+    }
+
+    pub(crate) fn release(&mut self, runtime: &mut Runtime, time: u32) -> Result<(), String> {
+        Self::admit(runtime)?;
+        release_device_locked(
+            &Mutex::new(AutomationTarget { runtime }),
+            0,
+            &mut self.bindings,
+            time,
+        )
+    }
+
+    fn admit(runtime: &Runtime) -> Result<(), String> {
+        if runtime.attention_enabled() {
+            return Err("keyboard automation refuses a trusted-attention runtime".into());
+        }
+        Ok(())
+    }
+}
+
+struct AutomationTarget<'a> {
+    runtime: &'a mut Runtime,
+}
+
+impl InputTarget for AutomationTarget<'_> {
+    fn attention(&mut self, _visible: bool) -> Result<u128, String> {
+        Err("automation has no physical input origin".into())
+    }
+
+    fn drain_attention(&mut self) -> Result<(), String> {
+        Err("automation has no physical input origin".into())
+    }
+
+    fn command(&mut self, command: Command) -> Result<(), String> {
+        self.runtime.command(command)
+    }
+
+    fn launcher(&mut self, _action: LauncherAction) -> Result<bool, String> {
+        Err("headless keyboard has no launcher".into())
+    }
+
+    fn help(&mut self, action: HelpAction) -> Result<bool, String> {
+        self.runtime.help(action)
+    }
+
+    fn launch(&mut self, _request: LaunchRequest) -> Result<(), String> {
+        Err("headless keyboard cannot launch processes".into())
+    }
+
+    fn key(&mut self, input: KeyInput) -> Result<(), String> {
+        self.runtime.key(input)
+    }
+
+    fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
+        self.runtime.modifiers(modifiers)
+    }
+
+    fn pointer_frame(
+        &mut self,
+        _time: u32,
+        _dx: i32,
+        _dy: i32,
+        _buttons: &[PointerButtonInput],
+        _scroll: PointerScroll,
+    ) -> Result<(), String> {
+        Err("keyboard automation has no pointer".into())
+    }
+
+    fn pointer_frame_at(
+        &mut self,
+        _time: u32,
+        _x: Fraction,
+        _y: Fraction,
+        _buttons: &[PointerButtonInput],
+        _scroll: PointerScroll,
+    ) -> Result<(), String> {
+        Err("keyboard automation has no pointer".into())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.runtime.flush_paint()
+    }
+}
+
 impl LiveInputTarget {
     /// A native process-launch failure is reported without retiring evdev.
     /// Application activation mutates the scene, so its paint/focus failures
@@ -1858,6 +1972,126 @@ mod tests {
             code,
             value,
         }
+    }
+
+    fn automation_runtime() -> (Cleanup, Runtime) {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-automation-input-{}-{}", std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed),
+        )));
+        let framebuffer = crate::framebuffer::Framebuffer::test_file(
+            &cleanup.0, 320, 200, 320 * 4,
+        ).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.commit(
+            crate::scene::SurfaceKey { client: 1, object: 1 },
+            crate::buffer::Surface::from_shm_pixels(
+                100, 100, [1, 2, 3, 0].repeat(10_000), crate::scene::SHM_XRGB8888,
+            ).unwrap(),
+        ).unwrap();
+        (cleanup, runtime)
+    }
+
+    #[test]
+    fn automation_delivers_normal_keys_once_and_releases_its_depressed_state() {
+        use crate::keyboard::KeyboardEvent;
+        use crate::runtime::KeyboardDelivery;
+        let (_cleanup, mut runtime) = automation_runtime();
+        let (events, _stop) = runtime.subscribe_keyboard(1).unwrap().split();
+        let mut keys = AutomationKeys::default();
+        keys.key(&mut runtime, 10, KEY_LEFTSHIFT, true).unwrap();
+        keys.key(&mut runtime, 11, KEY_A, true).unwrap();
+        keys.key(&mut runtime, 12, KEY_A, true).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().keys, [30, 42]);
+        assert_eq!(runtime.keyboard_snapshot().modifiers.depressed, MOD_SHIFT);
+        let delivered: Vec<_> = events.try_iter().filter_map(|delivery| match delivery {
+            KeyboardDelivery::Event(event) => Some(event.event),
+            _ => None,
+        }).collect();
+        let pressed: Vec<_> = delivered.iter().filter_map(|event| match event {
+            KeyboardEvent::Key { input, .. } => Some((input.time, input.key, input.state)),
+            _ => None,
+        }).collect();
+        assert_eq!(pressed, [(10, 42, KeyState::Pressed), (11, 30, KeyState::Pressed)]);
+        assert!(delivered.iter().any(|event| matches!(event,
+            KeyboardEvent::Modifiers { state, .. } if state.depressed == MOD_SHIFT)));
+        keys.release(&mut runtime, 13).unwrap();
+        assert!(runtime.keyboard_snapshot().keys.is_empty());
+        assert_eq!(runtime.keyboard_snapshot().modifiers.depressed, 0);
+        let released: Vec<_> = events.try_iter().filter_map(|delivery| match delivery {
+            KeyboardDelivery::Event(event) => match event.event {
+                KeyboardEvent::Key { input, .. } => Some(input),
+                _ => None,
+            },
+            _ => None,
+        }).collect();
+        assert_eq!(released.len(), 2);
+        assert!(released.iter().all(|input| input.time == 13 && input.state == KeyState::Released));
+        keys.release(&mut runtime, 14).unwrap();
+        keys.key(&mut runtime, 15, KEY_A, false).unwrap();
+        assert!(events.try_recv().is_err());
+        keys.key(&mut runtime, 16, KEY_CAPSLOCK, true).unwrap();
+        keys.release(&mut runtime, 17).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().modifiers.locked, MOD_CAPS);
+        assert!(runtime.keyboard_snapshot().keys.is_empty());
+    }
+
+    #[test]
+    fn automation_cannot_mint_attention_and_refuses_trusted_runtime_before_mutation() {
+        let (_cleanup, mut runtime) = automation_runtime();
+        let mut keys = AutomationKeys::default();
+        for code in [KEY_LEFTCTRL, KEY_LEFTALT, KEY_ESC] {
+            keys.key(&mut runtime, 1, code, true).unwrap();
+        }
+        assert!(runtime.keyboard_snapshot().keys.contains(&u32::from(KEY_ESC)));
+        assert!(runtime.keyboard_snapshot().focus.is_some());
+        assert!(keys.bindings.attention == AttentionState::Closed);
+        keys.release(&mut runtime, 2).unwrap();
+        runtime.enable_attention(true);
+        let before = runtime.keyboard_snapshot();
+        assert!(keys.key(&mut runtime, 3, KEY_A, true).is_err());
+        assert!(keys.release(&mut runtime, 3).is_err());
+        assert_eq!(runtime.keyboard_snapshot(), before);
+        assert!(keys.bindings.pressed.is_empty());
+        runtime.enable_attention(false);
+        for code in [0, 248, u16::MAX] {
+            assert!(keys.key(&mut runtime, 4, code, true).is_err());
+        }
+        assert_eq!(runtime.keyboard_snapshot(), before);
+        let mut target = AutomationTarget { runtime: &mut runtime };
+        assert!(target.attention(true).is_err());
+        assert!(target.drain_attention().is_err());
+        let source = include_str!("input.rs").split_once("impl AutomationKeys {").unwrap().1
+            .split_once("impl LiveInputTarget {").unwrap().0;
+        for forbidden in ["EvdevOrigin", "sys::", "Command::new", "enable_attention(", ".attention("] {
+            assert!(!source.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn automation_uses_compositor_bindings_and_disabled_control_cannot_route_it() {
+        let (_cleanup, mut runtime) = automation_runtime();
+        let mut keys = AutomationKeys::default();
+        keys.key(&mut runtime, 1, KEY_LEFTMETA, true).unwrap();
+        keys.key(&mut runtime, 2, KEY_2, true).unwrap();
+        assert_eq!(runtime.control_snapshot().active_workspace, 2);
+        assert!(!runtime.keyboard_snapshot().keys.contains(&u32::from(KEY_2)));
+        keys.release(&mut runtime, 3).unwrap();
+        keys.key(&mut runtime, 4, KEY_1, true).unwrap();
+        assert_eq!(runtime.control_snapshot().active_workspace, 2);
+        keys.release(&mut runtime, 5).unwrap();
+        keys.key(&mut runtime, 6, KEY_LEFTMETA, true).unwrap();
+        assert!(keys.key(&mut runtime, 7, KEY_T, true).is_err());
+        assert!(keys.key(&mut runtime, 8, KEY_ENTER, true).is_err());
+        assert!(!runtime.launcher_visible());
+        keys.release(&mut runtime, 9).unwrap();
+        let before = runtime.keyboard_snapshot();
+        let runtime = Mutex::new(runtime);
+        for request in ["key 0 30 down", "release-keys 1"] {
+            assert_eq!(crate::control::answer(&runtime, request),
+                "error keyboard automation is disabled\n");
+        }
+        assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
     }
 
     /// One axis of QEMU's `virtio-tablet-pci`, which reports 0..=32767 and is

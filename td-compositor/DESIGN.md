@@ -5670,6 +5670,11 @@ is how a PROGRAM does. `td-ctl` is a fourth name for the compositor artifact,
 selected by argv[0] beside `td-ui-demo` and `td-term`, and what it does is
 write one line to a Unix socket and print what comes back.
 
+The normal deployment channel remains layout-only. Disposable `headless`
+sessions also offer separately enabled keyboard routing, specified in
+[AUTOMATION.md](AUTOMATION.md#opt-in-keyboard-control); that grant cannot be
+enabled by a request or reach physical-origin trusted attention.
+
 ### Why a socket and not a protocol
 
 A caller here has no surface, no buffer and no registry. It is a one-shot that
@@ -6403,9 +6408,9 @@ not activated. The stock attention screen remains inert.
 ## Native headless automation
 
 [AUTOMATION.md](AUTOMATION.md) specifies disposable hardware-free sessions,
-their lifecycle and proof boundary, and the subsequent separately enabled
-input/capture work. This is the primary native client integration platform;
-it does not replace independent compositor interoperability checks.
+their lifecycle, opt-in normal keyboard routing and proof boundary, and the
+subsequent pointer/capture work. This is the primary native integration
+platform; it does not replace independent compositor interoperability checks.
 
 ## td-owned development VM bridge
 

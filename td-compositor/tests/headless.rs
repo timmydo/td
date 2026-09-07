@@ -122,6 +122,48 @@ fn request(path: &Path, line: &[u8]) -> String {
 }
 
 #[test]
+fn keyboard_grant_routes_workspace_chords_across_one_shot_connections() {
+    let root = Root::new();
+    for enabled in [false, true] {
+        let session = root.0.join(if enabled { "enabled" } else { "disabled" });
+        let log = root.0.join(if enabled { "enabled.log" } else { "disabled.log" });
+        let mut command = headless(&session);
+        if enabled {
+            command.args(["--input-control", "enabled"]);
+        }
+        let mut compositor = Process::start(&mut command, &log, "TD-COMPOSITOR-HEADLESS-READY");
+        compositor.ready();
+        let control = session.join("td-control");
+        let expected = if enabled { "ok\n" } else { "error keyboard automation is disabled\n" };
+        for line in ["key 1 125 down\n", "key 2 3 down\n", "release-keys 3\n"] {
+            assert_eq!(request(&control, line.as_bytes()), expected);
+        }
+        let layout = request(&control, b"layout\n");
+        assert!(layout.contains(if enabled { "workspace active=2 " } else { "workspace active=1 " }));
+        // Releasing Super must prevent a subsequent bare '1' from switching.
+        assert_eq!(request(&control, b"key 4 2 down\n"), expected);
+        assert_eq!(request(&control, b"release-keys 5\n"), expected);
+        assert_eq!(request(&control, b"layout\n"), layout);
+        assert!(request(&control, b"key 6 248 down\n").starts_with("error "));
+        if enabled {
+            assert_eq!(request(&control, b"key 7 125 down\n"), "ok\n");
+            assert!(request(&control, b"key 8 20 down\n").starts_with("unavailable "));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
+            command.arg0("td-ctl").arg("--socket").arg(&control)
+                .args(["release-keys", "9"]);
+            let mut ctl = Process::start(&mut command, &root.0.join("ctl.log"), "");
+            // Successful order replies have no CLI stdout body.
+            assert!(ctl.wait().success());
+        }
+        // EOF terminates the owning keyboard generation, even with held keys.
+        assert_eq!(request(&control, b"key 10 42 down\n"), expected);
+        compositor.child.stdin.take();
+        assert!(compositor.wait().success(), "{}", fs::read_to_string(log).unwrap());
+        assert!(!session.exists());
+    }
+}
+
+#[test]
 fn a_disposable_production_session_maps_a_real_client_and_dies_with_its_owner() {
     let root = Root::new();
     let session = root.0.join("session");

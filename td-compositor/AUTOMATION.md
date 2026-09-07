@@ -63,23 +63,68 @@ This proves software composition, not GPU execution or physical presentation.
 
 Headless startup opens no framebuffer/DRM/evdev device, starts no launcher,
 private portal listener, root authority channel, VM bridge, or status sampler.
-The status text stays empty; workspace chrome remains. No synthetic input is
-enabled in this increment. Existing layout commands work on `td-control`.
+The status text stays empty; workspace chrome remains. Synthetic input is
+disabled by default. Existing layout commands work on `td-control`.
 Normal `run` startup, deployment authority and physical secure attention are
 unchanged. All production code remains std-only with no new syscall surface.
+
+## Opt-in keyboard control
+
+Append `--input-control enabled` to the headless command to grant its private
+`td-control` endpoint one synthetic keyboard. Ordinary `run` sessions and
+headless sessions without that exact option refuse keyboard requests. Public
+Wayland clients gain no control endpoint or input grant. No hardware device
+is acquired, and a trusted-attention-enabled runtime refuses synthetic input
+even if incorrectly wired to this adapter.
+
+The `td-ctl` request vocabulary adds:
+
+```text
+key <time-ms> <1-247> <down|up>
+release-keys <time-ms>
+```
+
+`time-ms` is an explicit unsigned decimal u32 Wayland timestamp, including
+zero and wraparound; it is not a physical monotonic-clock witness. Codes are
+Linux evdev codes, not XKB's code-plus-eight or Unicode text. Both fields
+reject signs and overflow. The existing US keymap determines text. Duplicate
+downs and unmatched ups are idempotent; repeat is client-owned, with no
+synthetic repeat request. Keys pass through the same logical binding policy
+and normal Runtime keyboard/modifier delivery as evdev, including consumed
+compositor workspace chords and the help overlay. Launcher opening and
+process-launch chords report unavailable; they never start a process.
+Ctrl+Alt+Esc is ordinary untrusted input here, never secure attention.
+
+The keyboard belongs to the headless process generation, not an individual
+one-request control connection. Held keys persist across those connections.
+`release-keys` releases all its depressed keys using normal device-removal
+cleanup, including consumed shortcuts, but retains Caps/Num lock toggles and
+overlay visibility. Repeating it is harmless. The owner closes stdin to end
+the whole generation, which disconnects clients and discards all held state;
+there is no detached input controller that outlives its session. Callers
+sharing the endpoint share this keyboard and must serialize their scenarios.
+
+`ok` means input was routed or an idempotent no-op, not that the focused
+application processed it or presented another frame. Delivery failure can
+follow mutation; requests are not rollback transactions, and an unavailable
+or lost reply must not be blindly retried as exactly-once input. Use
+`release-keys` to recover depressed state or dispose of the session. The
+existing request-size and whole-conversation deadline bounds remain in force.
+Pointer injection, pixel capture and application/output observation fences
+are still separate increments.
 
 ## Planned control and observation increments
 
 These are the next implementation requirements, not available commands:
 
-1. Add separately enabled synthetic input and capture capabilities to the
-   existing `td-ctl` channel, absent by default. A public Wayland socket does
-   not grant either. Automation must never manufacture a physical-origin
-   witness, enter/confirm trusted attention, or authorize secret release.
-2. Route typed keys and complete pointer/button/wheel reports through the
-   normal shared logical-seat and compositor-binding paths. Do not mutate
-   editor state or call a shortcut that bypasses compositor routing. Release
-   automation-owned held state when its controlling generation ends.
+1. Extend the opt-in keyboard with complete pointer/button/wheel reports
+   through normal shared seat and compositor-binding paths. Do not mutate
+   editor state or bypass compositor routing. Release automation-owned held
+   state when its controlling generation ends. Automation must never
+   manufacture a physical-origin witness, enter/confirm trusted attention,
+   or authorize secret release.
+2. Add a separately enabled capture capability on `td-ctl`, absent by default.
+   A public Wayland socket grants neither synthetic input nor capture.
 3. Report monotonic session/action/commit/output identities with bounded
    observation. Distinguish accepted input, a client's subsequent commit and
    completed output. A compositor sync cannot prove an application processed

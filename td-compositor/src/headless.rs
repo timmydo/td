@@ -8,26 +8,29 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
-const USAGE: &str = "headless requires --session-dir NEW_ABSOLUTE_PATH --width N --height N; keep stdin open for the session lifetime";
+const USAGE: &str = "headless requires --session-dir NEW_ABSOLUTE_PATH --width N --height N [--input-control enabled]; keep stdin open for the session lifetime";
 
 #[derive(Debug)]
 struct Options {
     directory: PathBuf,
     width: usize,
     height: usize,
+    input_control: bool,
 }
 
 impl Options {
     fn parse(args: &[String]) -> Result<Self, String> {
-        if args.len() != 6 {
+        if args.len() != 6 && args.len() != 8 {
             return Err(USAGE.into());
         }
         let (mut directory, mut width, mut height) = (None, None, None);
+        let mut input_control = None;
         for [flag, value] in args.as_chunks::<2>().0 {
             let slot = match flag.as_str() {
                 "--session-dir" => &mut directory,
                 "--width" => &mut width,
                 "--height" => &mut height,
+                "--input-control" => &mut input_control,
                 _ => return Err(format!("unknown headless option {flag}; {USAGE}")),
             };
             if slot.replace(value.as_str()).is_some() {
@@ -48,6 +51,11 @@ impl Options {
         };
         let width = dimension(width)?;
         let height = dimension(height)?;
+        let input_control = match input_control {
+            None => false,
+            Some("enabled") => true,
+            Some(_) => return Err("--input-control accepts only 'enabled'".into()),
+        };
         if width
             .checked_mul(height)
             .and_then(|n| n.checked_mul(4))
@@ -59,6 +67,7 @@ impl Options {
             directory,
             width,
             height,
+            input_control,
         })
     }
 }
@@ -251,7 +260,7 @@ pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Res
             Arc::clone(&runtime),
             ended.clone(),
         )?;
-        control::serve_headless(control, runtime, ended.clone())?;
+        control::serve_headless(control, runtime, options.input_control, ended.clone())?;
         let completion = Completion::new(ended, "owner");
         std::thread::Builder::new()
             .name("headless-owner".into())
@@ -325,6 +334,19 @@ mod tests {
             }
             assert!(Options::parse(&values).is_err());
         }
+    }
+
+    #[test]
+    fn keyboard_control_requires_one_explicit_enable_pair() {
+        assert!(!Options::parse(&args("800", "600")).unwrap().input_control);
+        let mut values = args("800", "600");
+        values.extend(["--input-control".into(), "enabled".into()]);
+        assert!(Options::parse(&values).unwrap().input_control);
+        *values.last_mut().unwrap() = "true".into();
+        assert!(Options::parse(&values).is_err());
+        *values.last_mut().unwrap() = "enabled".into();
+        values.extend(["--input-control".into(), "enabled".into()]);
+        assert!(Options::parse(&values).is_err());
     }
 
     #[test]

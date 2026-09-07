@@ -57,10 +57,8 @@ const MAX_ACCEPT_FAILURES: u32 = 64;
 /// picks its own. Bounded so one cannot make a report no caller will read.
 const TITLE_LIMIT: usize = 200;
 
-/// What a caller can ask for. Every ordering variant is one `Command` the
-/// keyboard already sends, so this adds a way to say them rather than a second
-/// vocabulary of things to say — a control channel that could do what no key
-/// can would be a second implementation of the layout to keep in step.
+/// Layout orders share the keyboard's `Command` vocabulary. Synthetic key
+/// requests additionally require the headless input grant at dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Request {
     /// The only question. Everything else is an order.
@@ -84,6 +82,9 @@ pub enum Request {
     FocusWindow(u64),
     SendWindow(u64, u8),
     MoveWindow(u64, Direction),
+    /// Evdev code and explicit Wayland milliseconds, never physical origin.
+    Key { time: u32, code: u16, pressed: bool },
+    ReleaseKeys(u32),
 }
 
 /// The vocabulary, as one list, so the parser and the help text cannot drift:
@@ -112,6 +113,8 @@ pub const USAGE: &[(&str, &str)] = &[
     ("fullscreen", "toggle fullscreen for the focused window"),
     ("present <split|stacked|tabbed>", "how its container shows its windows"),
     ("group", "group the focused window's container, or ungroup it"),
+    ("key <time-ms> <1-247> <down|up>", "route a key on an enabled headless keyboard"),
+    ("release-keys <time-ms>", "release all keys owned by that headless keyboard"),
 ];
 
 impl Request {
@@ -131,6 +134,8 @@ impl Request {
             "fullscreen" => Request::Fullscreen,
             "present" => Request::Present(presentation(words.next())?),
             "group" => Request::Group,
+            "key" => key_request(&mut words)?,
+            "release-keys" => Request::ReleaseKeys(key_time(words.next())?),
             other => return Err(format!("no such request '{other}'; try 'help'")),
         };
         // Refused rather than ignored: a caller spelling an argument this verb
@@ -156,6 +161,10 @@ impl Request {
                 format!("present {}", presentation_word(presentation))
             }
             Request::Group => "group".to_string(),
+            Request::Key { time, code, pressed } => {
+                format!("key {time} {code} {}", if pressed { "down" } else { "up" })
+            }
+            Request::ReleaseKeys(time) => format!("release-keys {time}"),
             Request::FocusWindow(handle) => format!("focus {}", handle_word(handle)),
             Request::SendWindow(handle, number) => {
                 format!("send {} {number}", handle_word(handle))
@@ -180,6 +189,32 @@ impl Request {
 /// somewhere" to the person, with no way to tell which was meant.
 fn handle_word(handle: u64) -> String {
     format!("@{handle}")
+}
+
+fn key_time(word: Option<&str>) -> Result<u32, String> {
+    let word = word.ok_or("keyboard request needs time-ms")?;
+    if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("time-ms must be an unsigned decimal u32".into());
+    }
+    word.parse().map_err(|_| "time-ms outside u32".into())
+}
+
+fn key_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Request, String> {
+    let time = key_time(words.next())?;
+    let word = words.next().ok_or("key needs an evdev code")?;
+    if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("key code must be an unsigned decimal in 1..=247".into());
+    }
+    let code: u16 = word.parse().map_err(|_| "key code outside 1..=247")?;
+    if !(1..=247).contains(&code) {
+        return Err("key code outside 1..=247".into());
+    }
+    let pressed = match words.next() {
+        Some("down") => true,
+        Some("up") => false,
+        _ => return Err("key state must be 'down' or 'up'".into()),
+    };
+    Ok(Request::Key { time, code, pressed })
 }
 
 /// Whether a word NAMES a window rather than describing one.
@@ -581,6 +616,7 @@ pub(crate) fn reportable(character: char) -> bool {
 pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> {
     let command = match request {
         Request::Layout => return Ok(Answer::Report(report(&runtime.control_snapshot()))),
+        Request::Key { .. } | Request::ReleaseKeys(_) => return Ok(Answer::InputDisabled),
         Request::Workspace(number) => Command::SwitchWorkspace(number),
         Request::Send(number) => Command::MoveToWorkspace(number),
         Request::Focus(direction) => Command::Focus(direction),
@@ -640,6 +676,7 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
 #[derive(Debug)]
 pub enum Answer {
     Ok,
+    InputDisabled,
     Report(String),
     NoSuchWindow(u64),
     /// Named a window that IS there and cannot be arranged: a portal dialog.
@@ -695,6 +732,14 @@ fn found(
 /// compositor's, and answering them as refusals told a script to go and check
 /// its spelling.
 pub fn answer(runtime: &Mutex<Runtime>, line: &str) -> String {
+    answer_with_keys(runtime, line, None)
+}
+
+fn answer_with_keys(
+    runtime: &Mutex<Runtime>,
+    line: &str,
+    keys: Option<&mut crate::input::AutomationKeys>,
+) -> String {
     let request = match Request::parse(line) {
         Ok(request) => request,
         Err(error) => return format!("error {error}\n"),
@@ -702,11 +747,20 @@ pub fn answer(runtime: &Mutex<Runtime>, line: &str) -> String {
     // A poisoned runtime is a compositor that has already lost; say so rather
     // than take this thread down after it.
     let outcome = match runtime.lock() {
-        Ok(mut runtime) => apply(&mut runtime, request),
+        Ok(mut runtime) => match (request, keys) {
+            (Request::Key { time, code, pressed }, Some(keys)) => {
+                keys.key(&mut runtime, time, code, pressed).map(|()| Answer::Ok)
+            }
+            (Request::ReleaseKeys(time), Some(keys)) => {
+                keys.release(&mut runtime, time).map(|()| Answer::Ok)
+            }
+            _ => apply(&mut runtime, request),
+        },
         Err(_) => Err("compositor runtime is poisoned".to_string()),
     };
     match outcome {
         Ok(Answer::Ok) => "ok\n".to_string(),
+        Ok(Answer::InputDisabled) => "error keyboard automation is disabled\n".into(),
         Ok(Answer::Report(report)) => format!("ok\n{report}"),
         Ok(Answer::NoSuchWindow(handle)) => {
             format!("error no window {}\n", handle_word(handle))
@@ -763,13 +817,17 @@ pub fn serve(
 pub(crate) fn serve_headless(
     listener: UnixListener,
     runtime: Arc<Mutex<Runtime>>,
+    input_control: bool,
     ended: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     let completion = crate::headless::Completion::new(ended, "control");
     thread::Builder::new()
         .name("td-control".into())
         .spawn(move || {
-            accept(listener.incoming(), &runtime, SocketPolicy::Private);
+            accept_with_keys(
+                listener.incoming(), &runtime, SocketPolicy::Private,
+                input_control.then(crate::input::AutomationKeys::default),
+            );
             completion.report(Err("headless control listener retired".into()));
         })
         .map(|_| ())
@@ -783,6 +841,15 @@ fn accept(
     connections: impl Iterator<Item = io::Result<UnixStream>>,
     runtime: &Mutex<Runtime>,
     policy: SocketPolicy,
+) {
+    accept_with_keys(connections, runtime, policy, None);
+}
+
+fn accept_with_keys(
+    connections: impl Iterator<Item = io::Result<UnixStream>>,
+    runtime: &Mutex<Runtime>,
+    policy: SocketPolicy,
+    mut keys: Option<crate::input::AutomationKeys>,
 ) {
     let mut consecutive = 0;
     for connection in connections {
@@ -802,13 +869,17 @@ fn accept(
         // answer, every wait it can do is bounded, and the alternative is a
         // thread per caller whose only purpose would be to let two callers
         // reorder each other's orders.
-        if let Err(error) = converse(stream, runtime) {
+        if let Err(error) = converse(stream, runtime, keys.as_mut()) {
             eprintln!("td-compositor: control: {error}");
         }
     }
 }
 
-fn converse(mut stream: UnixStream, runtime: &Mutex<Runtime>) -> Result<(), String> {
+fn converse(
+    mut stream: UnixStream,
+    runtime: &Mutex<Runtime>,
+    keys: Option<&mut crate::input::AutomationKeys>,
+) -> Result<(), String> {
     // One deadline for the whole exchange. The socket timeouts stay, because
     // they are what unblocks a single stalled syscall; the deadline is what
     // bounds a caller whose every syscall returns promptly and slowly.
@@ -828,7 +899,10 @@ fn converse(mut stream: UnixStream, runtime: &Mutex<Runtime>) -> Result<(), Stri
     // to get right — and the write below is bounded by the same deadline, so
     // answering a caller still mid-flood cannot park this thread.
     let reply = match read_request(&mut stream, deadline) {
-        Ok(line) => answer(runtime, &line),
+        Ok(line) => match keys {
+            Some(keys) => answer_with_keys(runtime, &line, Some(keys)),
+            None => answer(runtime, &line),
+        },
         Err(error) => format!("error {error}\n"),
     };
     write_answer(&mut stream, reply.as_bytes(), deadline)
@@ -1139,6 +1213,9 @@ mod tests {
             Request::FocusWindow(12),
             Request::SendWindow(12, 7),
             Request::MoveWindow(40, Direction::Right),
+            Request::Key { time: 0, code: 1, pressed: true },
+            Request::Key { time: u32::MAX, code: 247, pressed: false },
+            Request::ReleaseKeys(u32::MAX),
         ];
         for request in every {
             let line = request.render();
@@ -1152,8 +1229,8 @@ mod tests {
 
     /// One word of a USAGE form as a caller would actually type it. A literal
     /// stands for itself; `<a|b>` takes its first alternative, since the
-    /// grammar has to accept all of them; and the two placeholders that are
-    /// not alternations name a range and an id, whose spelling is the thing
+    /// grammar has to accept all of them; other placeholders name a range,
+    /// timestamp or id, whose spelling is the thing
     /// this is checking.
     fn example(word: &str) -> String {
         let Some(inner) = word.strip_prefix('<').and_then(|w| w.strip_suffix('>')) else {
@@ -1161,6 +1238,8 @@ mod tests {
         };
         match inner {
             "1-9" => "1".to_string(),
+            "time-ms" => "0".to_string(),
+            "1-247" => "30".to_string(),
             "@id" => "@12".to_string(),
             alternation => alternation
                 .split('|')
@@ -1168,6 +1247,32 @@ mod tests {
                 .unwrap_or(alternation)
                 .to_string(),
         }
+    }
+
+    #[test]
+    fn keyboard_requests_refuse_malformed_or_out_of_range_fields() {
+        for line in [
+            "key", "key 0", "key 0 30", "key 0 0 down", "key 0 248 down",
+            "key 0 65536 down", "key -1 30 down", "key +1 30 down",
+            "key 4294967296 30 down", "key 0 +30 down", "key 0 -30 down",
+            "key 0 30 repeat", "key 0 30 down extra", "release-keys",
+            "release-keys -1", "release-keys 4294967296", "release-keys 0 extra",
+        ] {
+            assert!(Request::parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn trusted_runtime_miswiring_has_a_framed_unavailable_reply() {
+        let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
+        runtime.lock().unwrap().enable_attention(true);
+        let before = runtime.lock().unwrap().keyboard_snapshot();
+        let mut keys = crate::input::AutomationKeys::default();
+        for line in ["key 0 30 down", "release-keys 1"] {
+            assert_eq!(answer_with_keys(&runtime, line, Some(&mut keys)),
+                "unavailable keyboard automation refuses a trusted-attention runtime\n");
+        }
+        assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
     }
 
     #[test]
