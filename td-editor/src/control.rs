@@ -132,6 +132,13 @@ pub enum Operation {
         y: u32,
         extend: bool,
     },
+    Wheel {
+        tab: TabId,
+        revision: u64,
+        generation: u64,
+        rows: i32,
+        columns: i32,
+    },
     WaitFrame(u64),
     CheckSpelling {
         tab: TabId,
@@ -226,6 +233,20 @@ impl std::fmt::Debug for Operation {
                 .field("x", x)
                 .field("y", y)
                 .field("extend", extend)
+                .finish(),
+            Self::Wheel {
+                tab,
+                revision,
+                generation,
+                rows,
+                columns,
+            } => f
+                .debug_struct("Wheel")
+                .field("tab", tab)
+                .field("revision", revision)
+                .field("generation", generation)
+                .field("rows", rows)
+                .field("columns", columns)
                 .finish(),
             Self::WaitFrame(generation) => f.debug_tuple("WaitFrame").field(generation).finish(),
             Self::CheckSpelling { tab, revision } => f
@@ -458,6 +479,13 @@ impl Request {
                         chord,
                     }
                 }
+                "wheel" => Operation::Wheel {
+                    tab: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    revision: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    generation: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    rows: signed_wheel(args.next().ok_or(Error::Protocol)?)?,
+                    columns: signed_wheel(args.next().ok_or(Error::Protocol)?)?,
+                },
                 "pointer" => Operation::Pointer {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
                     revision: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -594,6 +622,7 @@ impl Request {
             | Operation::DialogAnswer { .. }
             | Operation::Key { .. }
             | Operation::Pointer { .. }
+            | Operation::Wheel { .. }
             | Operation::CheckSpelling { .. }
             | Operation::SpellingResults { .. }
             | Operation::WaitFrame(_) => Err(Error::Unavailable),
@@ -638,6 +667,7 @@ impl Request {
                     | Operation::DialogAnswer { .. }
                     | Operation::Key { .. }
                     | Operation::Pointer { .. }
+                    | Operation::Wheel { .. }
             )
     }
 
@@ -791,6 +821,26 @@ impl Request {
         })?;
         Ok(())
     }
+}
+
+fn signed_wheel(value: &str) -> Result<i32> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let magnitude = i32::try_from(decimal(digits)?).map_err(|_| Error::InvalidArgument)?;
+    let delta = if digits.len() != value.len() {
+        -magnitude
+    } else {
+        magnitude
+    };
+    // Reuse the admission bound; the wire operation retains an i32 delta.
+    wheel_delta(delta)?;
+    Ok(delta)
+}
+
+pub(crate) fn wheel_delta(value: i32) -> Result<isize> {
+    if !(-16_777_216..=16_777_216).contains(&value) {
+        return Err(Error::InvalidArgument);
+    }
+    isize::try_from(value).map_err(|_| Error::InvalidArgument)
 }
 
 fn pointer_pixel(value: &str) -> Result<u32> {
@@ -1015,6 +1065,46 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn decoded_wheel_grammar_bounds_signed_normalized_deltas() {
+        let request = Request::parse(b"1\t12\twheel\t2\t3\t4\t-6\t9").unwrap();
+        assert_eq!(
+            request.operation,
+            Operation::Wheel {
+                tab: 2,
+                revision: 3,
+                generation: 4,
+                rows: -6,
+                columns: 9,
+            }
+        );
+        assert!(request.is_mutating() && !request.is_edit());
+        let mut ui = Controller::default();
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        for tail in ["0\t-0", "-16777216\t16777216", "0001\t-0001"] {
+            assert!(Request::parse(format!("1\t12\twheel\t2\t3\t4\t{tail}").as_bytes()).is_ok());
+        }
+        for (tail, error) in [
+            ("0", Error::Protocol),
+            ("0\t0\textra", Error::Protocol),
+            ("+1\t0", Error::Protocol),
+            ("-\t0", Error::Protocol),
+            ("--1\t0", Error::Protocol),
+            ("1.0\t0", Error::Protocol),
+            ("0\t-16777217", Error::InvalidArgument),
+            ("2147483648\t0", Error::InvalidArgument),
+            ("18446744073709551616\t0", Error::Protocol),
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t12\twheel\t2\t3\t4\t{tail}").as_bytes()).unwrap_err(),
+                Refusal { id: 12, error }
+            );
+        }
+        assert_eq!(wheel_delta(i32::MIN), Err(Error::InvalidArgument));
+        assert_eq!(wheel_delta(i32::MAX), Err(Error::InvalidArgument));
+    }
 
     #[test]
     fn decoded_pointer_grammar_bounds_pixels_phases_and_native_authority() {

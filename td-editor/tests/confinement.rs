@@ -353,6 +353,58 @@ fn control_worker_keeps_bounded_nonblocking_transport_separate_from_editor_state
 }
 
 #[test]
+fn remote_wheel_reuses_native_scroll_after_all_input_guards() {
+    let native = include_str!("../src/pointer.rs");
+    let control = include_str!("../src/control.rs");
+    assert!(native.contains("delta.clamp(-16_777_216, 16_777_216) as isize"));
+    assert!(control.contains("!(-16_777_216..=16_777_216).contains(&value)"));
+    let source = include_str!("../src/wayland.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    let wheel = production.split("fn control_wheel(").nth(1).unwrap();
+    let wheel = wheel.split("\n    fn ").next().unwrap();
+    let cleanup = wheel.find("self.stop_pointer();").unwrap();
+    let mut prior = 0;
+    for guard in [
+        "control_wheel_available()",
+        "generation == 0",
+        "generation != self.frames.input_generation()?",
+        "revision_point(tab, revision)",
+        "self.ui.editor().active() != Some(tab)",
+        "wheel_delta(rows)?",
+        "wheel_delta(columns)?",
+        ".checked_add(8)",
+    ] {
+        let at = wheel.find(guard).unwrap();
+        assert!(prior <= at && at < cleanup, "{guard}");
+        prior = at;
+    }
+    assert!(
+        wheel.find("self.control_mutation_accepted()").unwrap()
+            < wheel
+                .find("self.decoded_scroll(tab, revision, rows, columns)")
+                .unwrap()
+    );
+    for forbidden in [
+        "Event::",
+        "self.pointer.x =",
+        "self.pointer.y =",
+        "activation_serial =",
+        "self.connection",
+        "wheel.update",
+    ] {
+        assert!(!wheel.contains(forbidden), "{forbidden}");
+    }
+    assert_eq!(
+        production
+            .matches("self.decoded_scroll(tab, revision, rows, columns)")
+            .count(),
+        2
+    );
+    assert_eq!(production.matches("Event::Scroll {").count(), 1);
+    assert!(production.contains("self.control_pointer_available() && self.menu.is_none()"));
+}
+
+#[test]
 fn only_native_caret_ticks_bypass_the_input_context_fence() {
     let ui = include_str!("../src/ui.rs");
     assert!(ui.contains(concat!(

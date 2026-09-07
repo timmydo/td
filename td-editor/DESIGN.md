@@ -37,7 +37,8 @@ Decoded key control drives editing, menus, Find, Replace, numeric and command
 entry with an exact native input-context fence. It requires real input
 readiness and cannot answer file/close/conflict flows. Decoded pointer
 press/move/release share native hit testing with separately tracked remote
-drags; wheel control remains deferred. Other UI prompts still expose only
+drags. Normalized wheel frames use the shared native scroll handler and input
+fence without physical axis accumulation. Other UI prompts still expose only
 coarse presence flags.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
@@ -2220,8 +2221,13 @@ separate owner-bound remote drag can continue only the controller gesture it
 started; physical input and ordinary input cancellation end it. Native modals
 refuse pointer actions, so dirty close still requires explicit token answers.
 CONTROL.md defines coordinate bounds, gesture lifetime, input/clipboard
-cleanup, delivery-only replies and fatal adapter errors. Wheel control and
-prompt-entry text queries remain later work.
+cleanup, delivery-only replies and fatal adapter errors. Normalized wheel
+frames also pin the input generation and active tab/revision, require pointer
+readiness with no menu/modal, and cancel existing input context even for a
+zero/clamped frame. Signed bounded row/column deltas use native scrolling
+without synthetic serials, cursor motion or shared physical fractions.
+CONTROL.md fixes units, grammar, guards, cleanup and delivery-only replies.
+Prompt-entry text queries remain later work.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 
@@ -2258,8 +2264,10 @@ starts with a four-byte big-endian payload length, followed by exactly that
 many bytes, within the one-MiB ceiling. The payload is an ASCII record with
 tab-separated fields and no terminating newline. Its first fields are
 protocol version `1`, caller-supplied decimal request ID, and command name.
-Integers are unsigned decimal with checked conversion. Text and OS path
-arguments are lowercase hex-encoded bytes; `-` denotes an empty byte string.
+Integers are unsigned decimal with checked conversion, except wheel row and
+column deltas, which permit one leading minus under CONTROL.md's bound.
+Text and OS path arguments are lowercase hex-encoded bytes; `-` denotes an
+empty byte string.
 Text arguments must decode to valid UTF-8. Reject missing/extra fields,
 unknown commands/versions, bad hex, overflow and truncated frames before
 dispatch. A response echoes version/request ID, then `ok`, `error`, or
@@ -2270,8 +2278,8 @@ Version 1 exposes `state`, `text`, `new`, `open`, `select-tab`, `select-range`,
 `fill-paragraph`,
 `set-auto-fill`, `set-fill-column`, `set-key-profile`, `check-spelling`,
 `spelling-results`, `save`, `save-as`, `close-tab`, `quit`, `dialog-answer`,
-`key`, `pointer`, and `wait-frame`. Text mutations and close requests name a
-stable tab ID and expected revision. Stale commands return `stale-revision`
+`key`, `pointer`, `wheel`, and `wait-frame`. Text mutations and close requests
+name a stable tab ID and expected revision. Stale commands return `stale-revision`
 without side effects. `state` reports the active tab, all tab IDs/revisions,
 dirty flags, cursors/selections, modes, current dialog, spelling job/status,
 and submitted/callback-completed frame generations. `text` takes tab ID,

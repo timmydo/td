@@ -1009,24 +1009,34 @@ impl Window {
                         && !self.pointer_modal()
                         && self.ui.editor().active() == Some(tab)
                     {
-                        let before = self.ui.generation();
-                        match self.ui.dispatch(Event::Scroll {
-                            tab,
-                            revision,
-                            rows,
-                            columns,
-                        }) {
-                            Ok(_) | Err(crate::Error::MissingTab | crate::Error::StaleRevision) => {
-                            }
-                            Err(e) => self.notify(format!("Scroll refused: {e}")),
-                        }
-                        self.frames.invalidate(before != self.ui.generation());
+                        self.decoded_scroll(tab, revision, rows, columns);
                     }
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn decoded_scroll(
+        &mut self,
+        tab: crate::model::TabId,
+        revision: u64,
+        rows: isize,
+        columns: isize,
+    ) {
+        let before = self.ui.generation();
+        match self.ui.dispatch(Event::Scroll {
+            tab,
+            revision,
+            rows,
+            columns,
+        }) {
+            Ok(_) | Err(crate::Error::MissingTab | crate::Error::StaleRevision) => {}
+            // Native input may exhaust the controller; remote admission reserves headroom.
+            Err(e) => self.notify(format!("Scroll refused: {e}")),
+        }
+        self.frames.invalidate(before != self.ui.generation());
     }
 
     fn menu_hover(&mut self, x: i32, y: i32) -> bool {
@@ -1674,6 +1684,16 @@ impl Window {
                 .response(),
             };
         }
+        if matches!(request.operation, crate::control::Operation::Wheel { .. }) {
+            return match self.control_wheel(&request.operation) {
+                Ok(()) => format!("1\t{}\tok\t", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if let crate::control::Operation::Key {
             tab,
             revision,
@@ -1931,6 +1951,51 @@ impl Window {
             && self.pointer.device.is_some()
             && self.pointer.enter.is_some()
             && self.activation_serial.is_none()
+    }
+
+    fn control_wheel_available(&self) -> bool {
+        self.control_pointer_available() && self.menu.is_none()
+    }
+
+    fn control_wheel(&mut self, operation: &crate::control::Operation) -> crate::Result<()> {
+        let crate::control::Operation::Wheel {
+            tab,
+            revision,
+            generation,
+            rows,
+            columns,
+        } = *operation
+        else {
+            return Err(crate::Error::InvalidArgument);
+        };
+        if !self.control_wheel_available() {
+            return Err(crate::Error::Unavailable);
+        }
+        if generation == 0 {
+            return Err(crate::Error::InvalidArgument);
+        }
+        if generation != self.frames.input_generation()? {
+            return Err(crate::Error::StaleRevision);
+        }
+        self.ui.editor().revision_point(tab, revision)?;
+        if self.ui.editor().active() != Some(tab) {
+            return Err(crate::Error::InvalidArgument);
+        }
+        let rows = crate::control::wheel_delta(rows)?;
+        let columns = crate::control::wheel_delta(columns)?;
+        self.ui
+            .generation()
+            .checked_add(8)
+            .ok_or(crate::Error::Exhausted)?;
+        self.stop_pointer();
+        self.control_mutation_accepted();
+        self.decoded_scroll(tab, revision, rows, columns);
+        self.searches.observe(self.ui.editor());
+        self.spelling.observe(self.ui.editor());
+        self.observe_control_jobs();
+        // Delivery burns a token even if native scroll invalidation was a no-op.
+        self.frames.invalidate(true);
+        Ok(())
     }
 
     fn control_pointer_event(
@@ -2472,11 +2537,12 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-input-context\tkey-ready={}\tpointer-ready={}\tpointer-drag={}\tnative={},{},{},{}",
+                    "\tadapter=native-wheel\tkey-ready={}\tpointer-ready={}\twheel-ready={}\tpointer-drag={}\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.control_key_available()),
                 flag(self.control_pointer_available()),
+                flag(self.control_wheel_available()),
                 self.control_pointer.as_ref().filter(|point| {
                     self.ui.pointer_drag() == Some(point.tab)
                         && self.ui.editor().active() == Some(point.tab)
@@ -6130,6 +6196,270 @@ mod tests {
         (w, peer)
     }
 
+    fn remote_wheel_request(w: &Window, rows: i32, columns: i32) -> crate::control::Request {
+        let tab = w.ui.editor().active().unwrap();
+        crate::control::Request {
+            id: 12,
+            operation: crate::control::Operation::Wheel {
+                tab,
+                revision: w.ui.editor().document(tab).unwrap().revision(),
+                generation: w.frames.input_generation().unwrap(),
+                rows,
+                columns,
+            },
+        }
+    }
+
+    #[test]
+    fn remote_wheel_matches_native_diagonal_scrolling_and_wrap_clamping() {
+        for wrap in [false, true] {
+            let (mut remote, _peer) = file_dialog_fixture();
+            let (mut native, _native_peer) = file_dialog_fixture();
+            for w in [&mut remote, &mut native] {
+                configure(w, 280, 160);
+                w.ui.dispatch(Event::Load(
+                    format!("{}\n", "abcd".repeat(25)).repeat(100).as_bytes(),
+                ))
+                .unwrap();
+                w.ui.dispatch(Event::Wrap {
+                    tab: 2,
+                    revision: 0,
+                    enabled: wrap,
+                })
+                .unwrap();
+                pointer_enter(w);
+                w.input.focused = false;
+            }
+            let selection = remote.ui.editor().document(2).unwrap().selection();
+            for (rows, columns) in [(1i32, 1i32), (-1, 0), (0, -1), (100, 100), (-100, -100)] {
+                let request = remote_wheel_request(&remote, rows * 3, columns * 3);
+                assert_eq!(remote.control_response(&request), "1\t12\tok\t");
+                let pointer = native.pointer.device.unwrap();
+                native
+                    .event(message(pointer, 8, &[0, rows as u32]))
+                    .unwrap();
+                native
+                    .event(message(pointer, 8, &[1, columns as u32]))
+                    .unwrap();
+                native.event(message(pointer, 5, &[])).unwrap();
+                if (rows, columns) == (1, 1) {
+                    let origin = remote.ui.tab_view(2).unwrap().viewport.origin();
+                    assert_eq!(origin.row, 3);
+                    assert_eq!(origin.column, if wrap { 0 } else { 3 });
+                }
+                assert_eq!(
+                    remote.ui.tab_view(2).unwrap(),
+                    native.ui.tab_view(2).unwrap()
+                );
+                assert_eq!(
+                    remote.ui.editor().document(2).unwrap().selection(),
+                    selection
+                );
+                assert_eq!(remote.ui.editor().document(2).unwrap().revision(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_wheel_fences_and_bounds_refuse_before_gesture_cleanup() -> crate::Result<()> {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 280, 160);
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        remote_pointer(&mut w, "press", area.x, area.y, false);
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        for guard in [
+            "generation",
+            "zero",
+            "revision",
+            "tab",
+            "rows",
+            "columns",
+            "counter",
+        ] {
+            let mut request = remote_wheel_request(&w, 3, 0);
+            let crate::control::Operation::Wheel {
+                tab,
+                revision,
+                generation,
+                rows,
+                columns,
+            } = &mut request.operation
+            else {
+                return Err(crate::Error::Protocol);
+            };
+            let code = match guard {
+                "generation" => {
+                    *generation += 1;
+                    "stale-revision"
+                }
+                "zero" => {
+                    *generation = 0;
+                    "invalid-argument"
+                }
+                "revision" => {
+                    *revision += 1;
+                    "stale-revision"
+                }
+                "tab" => {
+                    *tab = 99;
+                    "missing-tab"
+                }
+                "rows" => {
+                    *rows = i32::MIN;
+                    "invalid-argument"
+                }
+                "columns" => {
+                    *columns = i32::MAX;
+                    "invalid-argument"
+                }
+                _ => {
+                    w.ui.generation_for_test(u64::MAX - 7);
+                    "exhausted"
+                }
+            };
+            let before = w.control_response(&state);
+            assert!(w
+                .control_response(&request)
+                .contains(&format!("\terror\t{code}\t")));
+            assert_eq!(w.control_response(&state), before);
+            assert!(w.control_pointer.is_some() && w.ui.pointer_drag().is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remote_wheel_refuses_menus_and_missing_native_readiness_without_side_effects() {
+        for guard in [
+            "menu",
+            "search",
+            "configured",
+            "enter",
+            "device",
+            "closed",
+            "serial",
+        ] {
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            pointer_enter(&mut w);
+            match guard {
+                "menu" => w.open_menu(crate::menu::Group::File).unwrap(),
+                "search" => {
+                    w.chord("C-f", false).unwrap();
+                }
+                "configured" => w.configured = false,
+                "enter" => w.pointer.enter = None,
+                "device" => w.pointer.device = None,
+                "closed" => w.closed = true,
+                _ => w.activation_serial = Some(9),
+            }
+            let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+            let before = w.control_response(&state);
+            assert!(before.contains("\twheel-ready=0\t"), "{guard}: {before}");
+            let request = remote_wheel_request(&w, 3, 0);
+            assert!(w
+                .control_response(&request)
+                .contains("\terror\tunavailable\t"));
+            assert_eq!(w.control_response(&state), before);
+        }
+    }
+
+    #[test]
+    fn remote_wheel_even_zero_cancels_drag_repeat_and_fractional_physical_wheel() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 280, 160);
+        w.ui.dispatch(Event::Load("row\n".repeat(100).as_bytes()))
+            .unwrap();
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        remote_pointer(&mut w, "press", area.x, area.y, false);
+        let request = remote_wheel_request(&w, 0, 0);
+        let generation = w.frames.input_generation().unwrap();
+        assert_eq!(w.control_response(&request), "1\t12\tok\t");
+        assert!(w.frames.input_generation().unwrap() > generation);
+        assert!(w
+            .control_response(&request)
+            .contains("\terror\tstale-revision\t"));
+        assert!(w.control_pointer.is_none() && w.ui.pointer_drag().is_none());
+        pointer_move(&mut w, area.x, area.y);
+        pointer_button(&mut w, true);
+        let pointer = w.pointer.device.unwrap();
+        w.event(message(pointer, 4, &[0, 0, 15 * 256])).unwrap();
+        w.event(message(pointer, 5, &[])).unwrap();
+        w.input.key(106, true).unwrap();
+        w.input.arm(106, w.clock);
+        let request = remote_wheel_request(&w, 0, 0);
+        let before = w.ui.tab_view(2).unwrap().viewport;
+        let coordinates = (w.pointer.x, w.pointer.y);
+        assert_eq!(w.control_response(&request), "1\t12\tok\t");
+        assert!(!w.pointer.held && w.ui.pointer_drag().is_none());
+        assert!(w.input.repeat(w.clock + 1000).unwrap().is_none());
+        assert_eq!((w.pointer.x, w.pointer.y), coordinates);
+        assert!(w.pointer.enter.is_some() && w.activation_serial.is_none());
+        w.event(message(pointer, 4, &[0, 0, 256])).unwrap();
+        w.event(message(pointer, 5, &[])).unwrap();
+        assert_eq!(w.ui.tab_view(2).unwrap().viewport, before);
+    }
+
+    #[test]
+    fn remote_wheel_refusal_preserves_paste_but_accepted_zero_cancels_it() {
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        configure(&mut w, 800, 600);
+        pointer_enter(&mut w);
+        drain(&peer);
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        decoded_key(&mut w, "C-v");
+        let (_, _writers) = drain(&peer);
+        assert!(w.clipboard.incoming.is_some());
+        let old = remote_wheel_request(&w, 0, 0);
+        w.frames.invalidate(true);
+        assert!(w
+            .control_response(&old)
+            .contains("\terror\tstale-revision\t"));
+        assert!(w.clipboard.incoming.is_some());
+        let request = remote_wheel_request(&w, 0, 0);
+        assert_eq!(w.control_response(&request), "1\t12\tok\t");
+        assert!(w.clipboard.incoming.is_none() && w.clipboard.incoming_target.is_none());
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
+    }
+
+    #[test]
+    fn remote_wheel_socket_uses_input_context_without_changing_text_history() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        configure(&mut w, 280, 160);
+        let text = "row\n".repeat(100);
+        w.ui.dispatch(Event::Load(text.as_bytes())).unwrap();
+        w.ui.dispatch(Event::Focus(true)).unwrap();
+        pointer_enter(&mut w);
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        let state = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        assert!(state.contains("\twheel-ready=1\t"));
+        let input = state
+            .split('\t')
+            .find_map(|f| f.strip_prefix("input-generation="))
+            .unwrap();
+        let command = format!("1\t12\twheel\t2\t0\t{input}\t3\t0");
+        w.tick(500, false).unwrap();
+        assert_eq!(job_request(&mut w, &peer, &socket, &command), "1\t12\tok\t");
+        assert_eq!(w.ui.tab_view(2).unwrap().viewport.origin().row, 3);
+        assert!(job_request(&mut w, &peer, &socket, &command).contains("\terror\tstale-revision\t"));
+        assert_eq!(w.ui.tab_view(2).unwrap().viewport.origin().row, 3);
+        let doc = w.ui.editor().document(2).unwrap();
+        assert_eq!(doc.text(), text);
+        assert_eq!(doc.revision(), 0);
+        assert!(!doc.dirty());
+        w.stop_control();
+    }
+
     fn remote_pointer_request(
         w: &Window,
         phase: &str,
@@ -6911,7 +7241,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-input-context\tkey-ready=0\tpointer-ready=0\tpointer-drag=-\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\tinput-generation={input}\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-wheel\tkey-ready=0\tpointer-ready=0\twheel-ready=0\tpointer-drag=-\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\tinput-generation={input}\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -10011,7 +10341,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-input-context\t"));
+            assert!(response.contains("\tadapter=native-wheel\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

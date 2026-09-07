@@ -7,8 +7,8 @@ close-dialog Cancel/Discard/Save/path, conflict Cancel/Reload/Save As and file
 Open/Save/Save As are connected, including ordinary Open/Save As/Dictionary
 path answers. Decoded keys drive ordinary editing and menu/Find/Replace/
 numeric/command input under the stricter input contract below. Decoded pointer
-press/move/release also share native hit testing; wheel control remains later
-work.
+press/move/release share native hit testing, and normalized wheel deltas use
+the native scrolling path.
 Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
@@ -52,8 +52,9 @@ one-request-per-connection worker.
 
 Payloads are ASCII tab-separated records. Literal control bytes other than
 field-separating Tab, DEL and non-ASCII payload bytes are refused. Decimal
-fields contain one or more digits only: leading zeros are accepted; signs,
-spaces, exponents and overflow are refused. IDs/revisions fit `u64`; offsets
+fields contain one or more digits only, except signed wheel deltas below.
+Leading zeros are accepted; signs, spaces, exponents and overflow are
+refused. IDs/revisions fit `u64`; offsets
 and limits additionally fit the host's `usize`. Missing/extra fields, unknown
 versions and names are `protocol`. Parsing uses a bounded field iterator, not
 a vector proportional to the number of Tab bytes in an untrusted payload.
@@ -78,6 +79,7 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID dialog-answer DIALOG TAB REVISION save-as HEX_PATH` | Save the conflict target to a new literal destination. |
 | `1 ID key TAB REVISION GENERATION HEX_CHORD` | Deliver one decoded native chord with an exact input-context fence. |
 | `1 ID pointer TAB REVISION GENERATION PHASE X Y EXTEND` | Deliver a bounded pointer press/move/release with the same input-context fence. |
+| `1 ID wheel TAB REVISION GENERATION ROWS COLUMNS` | Deliver one bounded normalized wheel frame with an input-context fence. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
@@ -587,7 +589,8 @@ the coordinate range is `invalid-argument`. Existing decimal overflow is
 `protocol`. Bad phase is `invalid-argument`; bad flag/arity is `protocol`.
 Programmatically constructed requests get the same coordinate bound.
 No pointer-enter/leave, button identity, physical serial, axis frame or
-compositor cursor-warp request can be supplied. Wheel control is deferred.
+compositor cursor-warp request can be supplied. Normalized wheel frames use
+the separate operation below.
 
 Availability requires configuration, an actual pointer device and a current
 compositor enter for this surface, no closed/modal state and no dynamic
@@ -653,6 +656,53 @@ or presentation. Native adapter errors are fatal under the same contract;
 an error reply may be lost during shutdown. Native pointer-started file/scan
 actions create no remote job receipt. This is decoded editor input, not raw
 Wayland injection or control of another application.
+
+## Decoded wheel input
+
+`1 ID wheel TAB REVISION GENERATION ROWS COLUMNS` delivers one normalized
+scroll frame through the same handler as the physical wheel decoder. Rows
+are visual document rows; columns are monospaced layout cells. Positive
+values move down/right, negative values up/left. These are not wheel notches,
+pixels or Wayland fixed-point distances. Physical discrete notches decode
+to three units; physical smooth-distance accumulation remains native-only.
+Each remote request is already one complete frame, with no retained axis
+fractions, source metadata, stop events or partial frame state.
+
+`ROWS` and `COLUMNS` are the sole signed-decimal request fields: an optional
+single minus followed by one or more digits, with no plus, whitespace or
+fraction. Leading zeros and negative zero are accepted. Each magnitude must
+be at most 16,777,216, the native normalized clamp. A representable decimal
+magnitude beyond the bound is `invalid-argument`; malformed syntax or `u64`
+magnitude overflow is `protocol`. Constructed requests get the same bound.
+Both axes may be nonzero in one frame. Ordinary viewport bounds clamp the
+result; soft wrapping continues to suppress horizontal scrolling.
+
+Availability requires `pointer-ready=1` and no menu. All native modals,
+including menus, refuse wheel delivery with `unavailable`; no keyboard focus
+is required. State exposes `wheel-ready=0|1` before target/counter validation.
+The nonzero exact `input-generation`, current active tab/revision and eight
+possible controller dispatches are checked before any cleanup. Caret-only
+blinks do not invalidate the request; viewport, selection, layout and other
+input changes do. The active tab is the scroll target, not a tab under the
+physical cursor. There is no cursor warp or synthetic physical serial.
+
+Native admission checks readiness, nonzero/current generation, model
+revision, active tab, delta bounds and counter headroom in that order.
+An inactive tab with a stale revision returns `stale-revision`; with its
+current revision it returns `invalid-argument`, matching decoded keys and
+pointers. Wire bounds are checked at parsing first; a constructed request
+that is both stale and out of range gets the earlier native guard's error.
+
+Every admitted frame, even `(0,0)` or an edge-clamped no-op, is an input
+boundary: cancel remote/physical drags, repeat, pending Paste and accumulated
+physical wheel context before delivery. Preserve physical coordinates and
+compositor enter. Refusals preserve them all. No remote fraction can combine
+with later physical input. Scrolling changes view only, not document bytes,
+selection, revision, dirty state or undo history. Observe ordinary search,
+spelling and job state afterwards and invalidate the input token, including
+on a no-op. `1 ID ok` plus a trailing empty field acknowledges delivery, not
+an effective scroll or presentation; use the redraw frame contract for the
+latter. A lost reply is not safe to retry blindly. No background job is made.
 
 ## Revision-checked editing
 
@@ -1004,7 +1054,8 @@ snapshot. Its generation means local UI state, **not** a submitted buffer,
 frame callback or scanout. The native extension below adds its own redraw
 generations/snapshots, coarse flags, bounded spelling/file outcomes and close
 and conflict/path dialog identity/answers. Decoded key and pointer admission
-are connected; wheel control and prompt-entry text queries remain later work.
+are connected, including normalized wheel frames; prompt-entry text queries
+remain later work.
 
 ## Experimental native adapter
 
@@ -1048,9 +1099,10 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-input-context` | Explicit implemented adapter identity. |
+| `adapter=native-wheel` | Explicit implemented adapter identity. |
 | `key-ready=0\|1` | Native key availability, before target/generation/counter validation. |
 | `pointer-ready=0\|1` | Native pointer availability, before target/generation/counter validation. |
+| `wheel-ready=0\|1` | Native wheel availability; pointer readiness with no menu. |
 | `pointer-drag=TAB,REVISION` or `-` | Valid remote drag, never a physical gesture. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
@@ -1074,7 +1126,7 @@ is disclosed by these added fields. Query `text` separately for document
 bytes. Controller generation does not cover native-only modal/job changes,
 and is not a submitted/callback-completed frame generation. Clients must not
 use it as a native snapshot version or presentation fence. Use
-`input-generation` for decoded keys/pointers and the separate
+`input-generation` for decoded keys, pointers and wheel frames, and the separate
 `window-generation` with `wait-frame` under the frame contract above.
 
 On ordinary window exit, stop and join the worker and explicitly attempt

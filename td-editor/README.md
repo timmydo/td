@@ -118,8 +118,12 @@ offer. See CONTROL.md for exact fields, refusal and lost-reply semantics.
 Decoded pointer press/move/release shares native hit testing and menu/close
 routing. It requires real pointer presence and exact input generation, and
 keeps remote drags separate from physical input without moving the cursor.
-Close confirmation still requires explicit dialog answers. Wheel control and
-prompt-entry text queries are not connected yet.
+Close confirmation still requires explicit dialog answers. `wheel` supplies
+bounded signed visual-row/cell-column deltas with the same input token and
+real pointer readiness; menus/modals refuse it. Every admitted frame cancels
+prior drag/repeat/Paste context, including zero/clamped frames. It does not
+change text/history or share physical wheel fractions. Prompt-entry text
+queries are not connected yet.
 `check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback
