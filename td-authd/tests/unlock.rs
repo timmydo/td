@@ -8,6 +8,61 @@ use super::*;
 use std::os::fd::AsFd;
 use std::thread;
 
+fn write_request() -> Request {
+    Request::new([42; 32], 1000, Operation::Set {
+        application: "mail".into(), name: "main".into(), application_uid: 65537,
+        requester: 1000, role: Role::Recovery,
+    }).unwrap()
+}
+
+#[test]
+#[ignore = "exec-only write child driven by the supervisor socket fixture"]
+fn write_child() {
+    let mut stream = child_stream();
+    assert_eq!(read_frame(&mut stream), write_request().encode());
+    assert_eq!(read_frame(&mut stream), vec![0xa5; MAX_SECRET]);
+    for tag in [0x10, 0x12] {
+        let mut frame = vec![tag];
+        frame.extend_from_slice(&[tag; 32]);
+        frame.extend_from_slice(&write_request().encode());
+        send_frame(&mut stream, &frame);
+        frame[0] += 1;
+        assert_eq!(read_frame(&mut stream), frame);
+    }
+    send_frame(&mut stream, &[0x14]);
+}
+
+#[test]
+fn write_input_requires_both_receipts_and_cancellation_never_locks_prior_release() {
+    for stop in 0..3 {
+        let request = write_request();
+        assert_eq!(operation_verb(request.operation()).unwrap(), "write-operation");
+        let mut worker = Unlock::spawn(request.clone(), fixture("write_child")).unwrap();
+        worker.credential = Some(Credential(vec![0xa5; MAX_SECRET]));
+        worker.phase = Phase::CredentialInput;
+        assert_eq!(advance(&mut worker).unwrap(), Event::Present(request.clone()));
+        if stop > 0 {
+            worker.presented(&request).unwrap();
+            assert_eq!(advance(&mut worker).unwrap(), Event::Commit(request.clone()));
+        }
+        if stop == 2 { worker.commit(&request).unwrap(); }
+        else { worker.cancel("cancel write").unwrap(); }
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            match worker.poll_with(|_| panic!("write cancellation revoked prior runtime release")).unwrap() {
+                Event::Waiting => (),
+                Event::Complete if stop == 2 => break,
+                Event::Failed(reason) if stop < 2 => { assert_eq!(reason, "cancel write"); break; }
+                event => panic!("unexpected write event {event:?}"),
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(worker.child.is_none());
+        assert!(worker.credential.is_none());
+    }
+}
+
 fn request() -> Request {
     Request::new(
         [42; 32],

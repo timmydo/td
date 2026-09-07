@@ -2,6 +2,9 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("set_client", include_str!("../../../td-secret/src/set_client.rs")),
+    ("secret_sys", include_str!("../../../td-authd/src/secret_sys.rs")),
+    ("secret_request", include_str!("../../../td-authd/src/secret_request.rs")),
     ("write_operation", include_str!("../../../td-secret/src/write_operation.rs")),
     ("operation", include_str!("../../../td-secret/src/operation.rs")),
     ("enrollment_operation", include_str!("../../../td-secret/src/enrollment_operation.rs")),
@@ -43,6 +46,7 @@ pub fn recipe() -> Recipe {
         "{src}/td-firstboot/src",
         "{src}/td-busd/src",
         "{src}/td-authd/src",
+        "{src}/td-authd/tests",
         "{src}/engine/src",
     ] {
         steps.push(Step::MkDir {
@@ -60,6 +64,8 @@ pub fn recipe() -> Recipe {
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
             path: match *name {
+                "secret_sys" => "{src}/td-authd/src/secret_sys.rs".into(),
+                "secret_request" => "{src}/td-authd/src/secret_request.rs".into(),
                 "consent" => "{src}/td-authd/src/consent.rs".into(),
                 "crypto" => "{src}/td-secret/src/crypto.rs".into(),
                 "store" => "{src}/td-secret/src/store.rs".into(),
@@ -73,6 +79,7 @@ pub fn recipe() -> Recipe {
         });
     }
     for (path, source) in [
+        ("{src}/td-authd/tests/secret_sys.rs", include_str!("../../../td-authd/tests/secret_sys.rs")),
         ("{src}/td-firstboot/src/principals.rs", include_str!("../../../td-firstboot/src/principals.rs")),
         ("{src}/td-firstboot/src/principals_tests.rs", include_str!("../../../td-firstboot/src/principals_tests.rs")),
         ("{src}/engine/src/principals.rs", include_str!("../../../engine/src/principals.rs")),

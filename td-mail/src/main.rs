@@ -284,7 +284,7 @@ password_command = "pass show email/work.com"
 Rules:
 - At least one [account.NAME] section is required (or legacy [jmap] with the same three fields).
 - `well_known_url`, `username`, and exactly one of `password_command` or `secret` are required per account.
-- `secret = "portal"` asks td's credential portal for the secret stored as mail/NAME for [account.NAME] (mail/default for a legacy [jmap] section); it needs no shell and no file, and it works inside a td jail only, where the helper is packaged. Store the secret from the root console with `td-secret set --uid UID mail/NAME < file`, where UID is the human session UID. NAME is 1 to 64 bytes of [A-Za-z0-9_-].
+- `secret = "portal"` asks td's credential portal for the secret stored as mail/NAME for [account.NAME] (mail/default for a legacy [jmap] section); it needs no shell and no file, and it works inside a td jail only, where the helper is packaged. Submit the secret from the human session with `td-secret set mail/NAME < file`, then press Ctrl+Alt+Esc and W, verify the target and touch the enrolled token. NAME is 1 to 64 bytes of [A-Za-z0-9_-].
 - `password_command` is a shell command that prints the password to stdout.
 - Quoted strings support \", \\, \n, \t escapes.
 - `scrolloff` controls how many lines of context are kept above and below the cursor in list views.

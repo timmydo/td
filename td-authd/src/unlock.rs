@@ -1,6 +1,7 @@
 //! Nonblocking ownership of one private root token child.
 
 use crate::consent::{Enrollment, Operation, Platform, Recovery, Request, Role};
+use crate::secret_request::{Credential, MAX_SECRET};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
@@ -41,7 +42,11 @@ impl Wire {
     }
 
     fn queue(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if !self.output.is_empty() || bytes.is_empty() || bytes.len() > LIMIT {
+        self.queue_bounded(bytes, LIMIT)
+    }
+
+    fn queue_bounded(&mut self, bytes: &[u8], limit: usize) -> Result<(), String> {
+        if !self.output.is_empty() || bytes.is_empty() || bytes.len() > limit {
             return Err("invalid private unlock send".into());
         }
         self.output
@@ -100,6 +105,7 @@ impl Wire {
                     Err(error) => return Err(format!("write private unlock child: {error}")),
                 }
                 if self.sent == self.output.len() {
+                    self.output.fill(0);
                     self.output.clear();
                     self.sent = 0;
                     self.deadline = None;
@@ -136,6 +142,10 @@ impl Wire {
     }
 }
 
+impl Drop for Wire {
+    fn drop(&mut self) { self.output.fill(0); }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Event {
     Waiting,
@@ -147,6 +157,7 @@ pub(crate) enum Event {
 
 #[derive(PartialEq, Eq)]
 enum Phase {
+    CredentialInput,
     Presentation,
     Presented,
     Assertion,
@@ -160,6 +171,7 @@ enum Phase {
 
 pub(crate) struct Unlock {
     request: Request,
+    credential: Option<Credential>,
     child: Option<Child>,
     wire: Option<Wire>,
     phase: Phase,
@@ -189,6 +201,7 @@ fn command(verb: &str, owner: u32) -> Command {
 fn operation_verb(operation: &Operation) -> Result<&'static str, String> {
     match operation {
         Operation::Unlock { .. } => Ok("unlock-operation"),
+        Operation::Set { .. } => Ok("write-operation"),
         Operation::Enroll {
             step: Enrollment::CreatePrimary,
             ..
@@ -212,6 +225,16 @@ impl Unlock {
                 step: Enrollment::CreatePrimary,
             },
         )
+    }
+
+    pub fn start_write(owner: u32, operation: Operation, credential: Credential) -> Result<Self, String> {
+        if !matches!(operation, Operation::Set { .. }) || credential.0.is_empty() || credential.0.len() > MAX_SECRET {
+            return Err("invalid private credential write".into());
+        }
+        let mut worker = Self::start_operation(owner, operation)?;
+        worker.credential = Some(credential);
+        worker.phase = Phase::CredentialInput;
+        Ok(worker)
     }
 
     fn start_operation(owner: u32, operation: Operation) -> Result<Self, String> {
@@ -238,6 +261,7 @@ impl Unlock {
             .map_err(|e| format!("start private unlock child: {e}"))?;
         Ok(Self {
             request,
+            credential: None,
             child: Some(child),
             wire: Some(wire),
             phase: Phase::Presentation,
@@ -316,6 +340,7 @@ impl Unlock {
             return Ok(());
         }
         self.failure = Some(reason.into());
+        self.credential = None;
         self.wire = None;
         self.round.clear();
         if let Some(child) = &mut self.child {
@@ -360,6 +385,16 @@ impl Unlock {
     }
 
     fn poll_active(&mut self) -> Result<Event, String> {
+        if self.phase == Phase::CredentialInput {
+            let wire = self.wire.as_mut().ok_or("missing write endpoint")?;
+            if wire.poll()?.is_some() { return Err("write child answered before credential input".into()); }
+            if wire.output.is_empty() {
+                let credential = self.credential.take().ok_or("missing write input")?;
+                wire.queue_bounded(&credential.0, MAX_SECRET)?;
+                self.phase = Phase::Presentation;
+            }
+            return Ok(Event::Waiting);
+        }
         if self.phase == Phase::Presented {
             return Ok(Event::Present(self.request.clone()));
         }
@@ -446,6 +481,10 @@ impl Unlock {
             return Ok(Event::Waiting);
         };
         self.child = None;
+        if self.phase == Phase::Stopping && matches!(self.request.operation(), Operation::Set { .. }) {
+            let reason = self.failure.take().unwrap_or_else(|| "credential write cancelled".into());
+            return self.finish(Ok(Event::Failed(reason)));
+        }
         if self.phase == Phase::Stopping {
             let deadline = match deadline_after(CLEANUP_TIME) {
                 Ok(deadline) => deadline,

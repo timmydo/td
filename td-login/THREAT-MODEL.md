@@ -359,8 +359,9 @@ It selects enrollment with a second token or explicit unrecoverability,
 and primary or recovery unlock. Each immutable step must be presented
 before root token I/O; an assertion binds the exact request. Session
 startup clears old releases before graphical input begins, and generation
-teardown reaps any worker before clearing its release. Typed writes remain
-an explicit root-console interim pending one-operation elevation. No login, `su` or keyboard-consent
+teardown reaps any worker before clearing its release. Typed credential writes use a human-authenticated sealed descriptor and
+physical W selection of one queued request; one presented token assertion
+authorizes that operation. There is no root-console write bypass. No login, `su` or keyboard-consent
 behavior substitutes for that authorization.
 
 ## 4. Privilege can only be dropped, never gained

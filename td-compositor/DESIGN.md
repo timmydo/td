@@ -6325,12 +6325,17 @@ so it cannot attribute private screen pixels to an application. No pixel
 capture or synthetic-input portal is implemented by this increment.
 
 A fresh physical U selects primary unlock, R recovery unlock, E enrollment
-with a second recovery token, and X explicit unrecoverability. Only one
+with a second recovery token, X explicit unrecoverability, and W the ready
+credential write queued through `td-secret set`. Only one
 selection is allowed per successfully opened and closed attention lifetime.
 Held keys, repeats and a second device pressing an already-held logical key
 cannot select an operation. Ordinary control, Wayland and portal input APIs
 cannot construct that physical selection. The screen accepts no credential
-bytes. Typed one-operation writes remain a subsequent increment.
+bytes. For a write, root returns the complete canonical target and role,
+which must be a Set operation for the configured owner. The client presents
+that exact description and requires the same presentation and commit
+receipts as unlock. No ready write produces a notice, never a retry or an
+automatic enrollment/unlock. Success displays CREDENTIAL STORED.
 
 Enrollment first asks root for admitted read-only protector state. Only file
 or legacy TPM state permits enrollment; token state displays a fresh-unlock

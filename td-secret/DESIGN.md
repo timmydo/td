@@ -137,17 +137,13 @@ firstboot. These are failures of the shared trusted filesystem prerequisite,
 not a malformed entry supplied inside one user's old store. The broker
 requires successful firstboot and remains unavailable in that case.
 
-`td-secret set --uid UID APP/NAME` reads credential bytes from stdin at the
-root console. It uses the immutable identity parser and installed-account
-checks to resolve the logical user's portal owner; there is no implicit root
-store, caller-selected filesystem owner, or human-UID writer. Application and
-entry names are parsed separately and never interpreted as paths. This is the
-interim console operation authorized in §W.4, with no consent UI. The target
-replacement binds a secure-attention token touch to one typed request and one
-credential descriptor through td-authd. An enrolled store fails closed when
-its TPM or volatile release is absent; no error selects a file master.
-Console writes require root until increment (d); session release already
-requires a presented token operation.
+`td-secret set [--recovery] APP/NAME` submits one credential descriptor
+from the human session. The root console writer has been removed. Application
+and entry names remain typed fields, never paths. Physical secure attention
+selects the queued request and one fresh assertion authorizes its exact
+snapshot. Neither root's former console syntax nor an existing volatile
+release substitutes for that consent. Firstboot remains the initial writer
+of an unenrolled placeholder; see the named-write intake contract below.
 
 ## TPM protection and legacy migration
 
@@ -288,12 +284,11 @@ by the pinned emulator and existing TPM 2.0 devices. TPM library revision
 185 deprecates it in favor of newer digest/sequence verification commands
 ([TCG command specification](https://trustedcomputinggroup.org/wp-content/uploads/Trusted-Platform-Module-2.0-Library-Part-3_Commands-V185-RC4_12Dec2025.pdf)).
 An unsupported command fails closed; this prerequisite does not claim
-support for a device that omits it. The future consumer must separately
-validate CTAP CBOR, the enrolled credential identity, RP hash, presence
-flags and the signed challenge, and bind enrollment metadata to the
-sealed store. A successful signature check alone is no authorization.
+support for a device that omits it. The consumers below separately validate CTAP CBOR, the enrolled
+credential identity, RP hash, presence flags and the signed challenge,
+and bind enrollment metadata to the sealed store. A successful signature check alone is no authorization.
 Session release, recovery enrollment, trusted input and one-operation
-writes remain subsequent work.
+writes consume this transport under the contracts below.
 
 Tests cover report boundaries, literal wire encoding, sequence and channel
 substitution, keepalive state, initialization binding, malformed TPM Names
@@ -386,7 +381,7 @@ This serializes all td-owned workers across tokens and sessions. Root and
 the kernel remain trusted: the advisory lock cannot constrain a different
 root program that opens hidraw directly. Trusted root must not replace
 or overmount the runtime or lock while workers exist: that can split the
-lock inode just as unlinking it would. The future authority must still
+lock inode just as unlinking it would. The paired authority must
 serialize complete presented operations, including any gap between worker
 sessions, and bind a fresh assertion to each request. A transport lock is
 neither consent nor enrollment. Host fixtures prove cross-process exclusion,
@@ -509,7 +504,7 @@ Only a successful TPM-verified assertion under that returned key, with signed
 UP and device-bound backup flags, produces a Credential. Request buffers and
 credential ID/key buffers are cleared on drop on a best-effort basis.
 
-The future trusted caller must supply kernel randomness bound to the exact
+The trusted caller must supply kernel randomness bound to the exact
 secure-attention operation. Merely differing from the MakeCredential hash is
 not a freshness oracle. It must bind the complete public credential bytes,
 logical UID, RP and explicit second-token or unrecoverable policy into the TPM
@@ -705,7 +700,7 @@ key before parsing or selecting the token. Completing a request clears
 any old release before comparing the snapshot to the current stored
 protector, verifying signed presence, and unsealing. With a valid writable runtime, every refusal leaves
 it locked; publication follows successful verification and
-legacy cleanup. The store's stable lock covers each API call. The future
+legacy cleanup. The store's stable lock covers each API call. The paired
 authority must serialize the entire presented operation across separate
 calls and supply a fresh challenge bound to that operation.
 
@@ -717,14 +712,16 @@ application configuration or compositor startup. It neither reads nor
 creates a placeholder credential in an enrolled locked store. A legacy
 plaintext mail credential still present beside that application is
 refused and retained for explicit migration; it is never silently erased.
-The existing root `release` command refuses a token-protected store.
+The public console `release` command is removed; release requires the
+paired physical-attention flow.
 
-The persistent-format and boot prerequisite has a private root unlock
-worker below. No human CLI or compositor flow enrolls or releases tokens
-yet. The stock image continues with its explicitly unenrolled backend,
-and existing TPM-only stores retain their documented automatic release
-until the secure-input activation cutover. No new user authentication or
-one-operation elevation is claimed. Root and the TPM remain trusted;
+The paired authority invokes the private workers below after physical
+secure-attention selection and exact trusted presentation. Enrollment
+creates the token protector; session release requires an enrolled token;
+each queued credential write requires a separate token assertion. The stock
+image remains explicitly unenrolled. TPM-only stores receive no automatic
+release and require enrollment through the same trusted flow. Root and the
+TPM remain trusted;
 whole-store rollback, historical extents and best-effort memory clearing
 retain their existing limits. The token assertion is checked by td-owned
 software before TPM unseal, not by a TPM policy that understands FIDO.
@@ -833,8 +830,9 @@ parent creates and exclusively retains its endpoint; it must never
 delegate it, including as a child log descriptor. The child normalizes
 its endpoint to blocking mode. This child transport relies on that root
 launch invariant; it is distinct from the public/compositor channel
-authenticated with credentials and pidfds. There is no listener, human invocation or
-automatic session activation in this increment.
+authenticated with credentials and pidfds. This private worker exposes no
+listener or public human CLI; the admitted paired root authority is its
+sole caller after physical selection.
 
 Frames have a big-endian u16 length and 1..289 payload bytes, with one
 five-second deadline spanning header and payload and an overall 120-second
@@ -921,7 +919,8 @@ portal-owned runtime key and requires successful exit with the key absent.
 
 `enroll-operation --uid UID` uses the private unlock worker's root startup,
 unnamed socketpair, descriptor inventory, bounded framing and deadline
-checks. It is a private child entry, with no human CLI or automatic caller.
+checks. This private child has no public CLI. The admitted paired root
+authority invokes it after physical enrollment selection.
 The first canonical request must select Enroll, SHA-256 PCR 7, one explicit
 recovery policy, and CreatePrimary for the configured session owner. The root
 parent supplies the fresh unpredictable nonce. The paired compositor
@@ -982,10 +981,9 @@ including success. The parent must also observe successful child exit before
 reporting enrollment complete. Enrollment does not implicitly unlock a
 session, and no token response, credential ID, secret or master travels on
 this channel. Parent loss, cancellation and deadline require the same
-retained-child teardown duties as unlock. A future compositor step transition
-must invalidate the previous receipt and fully present the exact next request
-before acknowledging it; this worker does not widen the current renderer's
-one-prompt attention contract.
+retained-child teardown duties as unlock. Each compositor step transition
+invalidates the previous receipt and fully presents the exact next request
+before acknowledging it. A receipt never authorizes a different step.
 
 Socket oracles exercise both recovery policies and omit or alter every step
 and commit acknowledgement. They prove that no corresponding device call or
@@ -1075,8 +1073,8 @@ slice. Its caller must already have admitted the application and requester,
 pinned the exact credential snapshot to a fresh operation nonce, presented
 the immutable description, and won the one-operation commit decision. This
 backend does not admit an unprivileged caller or display consent itself.
-The public console writer remains the explicit interim until its paired
-one-operation consumer and descriptor intake replace it atomically.
+The paired consumer below supplies that admission and captures exactly one
+sealed credential descriptor before starting the worker.
 
 The store keeps its existing exclusive lock throughout the operation.
 The API checks that swap is disabled and the core-dump soft limit is zero
@@ -1134,10 +1132,9 @@ The parent must authenticate and admit the requester, pin the submitted
 credential descriptor and capture its immutable contents, assign a fresh
 unpredictable operation nonce, and pass only that snapshot to this worker.
 The root child independently admits the application assignment and keeps
-the exclusive store lock through completion. This hidden entry is an
-inactive controller prerequisite, not a public elevation listener. The
-interim console writer remains until the complete public intake and paired
-UI consumer replace it atomically.
+the exclusive store lock through completion. Only the paired root controller invokes this hidden entry. Its public
+intake and physical selection are specified below; there is no console
+write bypass.
 
 The worker requires the exact fresh `10`/`11` presentation round before
 one token assertion, using the selected enrolled role. It opens the TPM
@@ -1180,3 +1177,56 @@ must fail at application admission without credential intake or a reply,
 while preserving a seeded runtime key. Adding the canonical application
 account/group/service-shadow entries makes the same description admissible.
 The pre-fix source-built binary fails this oracle at the admission result.
+
+## Named-write intake and physical selection
+
+The public command is `td-secret set [--recovery] APPLICATION/NAME` in the
+human session. It reads exactly 1..4096 bytes from stdin, preserving newlines;
+stdin must be redirected or piped, so terminal echo cannot expose a typed
+credential. No credential value or digest enters argv, logs, the prompt or
+result messages. Swap must be disabled and the core-dump soft limit zero
+before input is read. The client creates a close-on-exec memfd, writes the
+bytes, and seals write, growth, shrinkage and further seal changes. The
+private raw implementation is shared from `td-authd/src/secret_sys.rs` and
+specified in UNSAFE.md §16. Owned buffers use best-effort clearing; a sealed
+memfd cannot be overwritten and disappears when its final owner closes it.
+
+The client connects only to `/run/td-authd/1000/set`, requires a root peer,
+and waits for the exact `TDSET01` newline greeting before transfer. It sends
+one u16 big-endian frame length, a version-1 typed target, and exactly one
+SCM_RIGHTS descriptor. The target contains a one-byte role (1 primary or
+2 recovery), then separately length-prefixed application and secret names,
+each at most 64 ASCII bytes. Its maximum body is 132 bytes. The root
+controller authenticates the actual human sender on every fragment, pins
+its live pidfd, and validates the active installed application assignment.
+It retains the exact sealed descriptor; there is no pathname reopen or
+shared-offset read. A root-owned parent prevents endpoint replacement by
+unprivileged clients. The public intake is separate from the private
+compositor channel, which still refuses received rights.
+
+Submission never opens a prompt. Pressing physical Ctrl+Alt+Esc and then a
+fresh W selects at most one complete pending write. The root controller
+checks protected memory again, captures the descriptor with a positional
+read from zero, assigns a fresh nonce, and starts the fixed private worker.
+The immutable prompt names the full application, credential, requester,
+external application UID and selected token role. A presentation receipt
+precedes the one token assertion; the final matching commit receipt
+permits exactly one atomic encrypted-record replacement. The token proof
+binds the fresh nonce and canonical target; only root knows the private
+nonce-to-snapshot association. No public password hash enables guessing.
+
+Admission has one five-second deadline and an admitted queue slot expires
+after sixty seconds. Selection starts the existing 120-second operation
+ceiling. There is one pending client and one secret-operation slot, with
+bounded nonblocking intake work on every authority heartbeat. Application
+UIDs cannot submit, including through a delegated human connection. A
+changed sender, extra traffic, missing or extra descriptors, mutable or
+oversized input, peer loss or expiry refuses the request. Cancellation
+kills and reaps the child while preserving any previous runtime release.
+Generation teardown reaps the child and then clears that release as usual.
+After a commit may have reached the worker, a lost or failed result is
+uncertain and must never trigger automatic retry.
+
+The app receives only its decrypted credential through `.Secret`. This
+local authority adds no remote store, synchronization service, account
+password, remembered consent, privileged shell or crypto dependency in apps.

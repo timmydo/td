@@ -36,6 +36,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "main.rs",
             "mount_sys.rs",
             "portal_files.rs",
+            "secret_intake.rs",
+            "secret_request.rs",
+            "secret_sys.rs",
             "session.rs",
             "sys.rs",
             "unlock.rs"
@@ -51,6 +54,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("launch.rs", 0),
         ("unlock.rs", 0),
         ("session.rs", 0),
+        ("secret_intake.rs", 0),
+        ("secret_request.rs", 0),
+        ("secret_sys.rs", 4),
         ("inspection.rs", 0),
         ("mount_sys.rs", 4),
         ("portal_files.rs", 0),
@@ -97,7 +103,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x278f8d6afeeb5087,
+        0xd201f6e066158e30,
         "private unlock supervisor changed"
     );
     assert_eq!(
@@ -107,7 +113,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x56cccb71a3945c10,
+        0x70b54b8756abcb88,
         "paired secret controller changed"
     );
     assert_eq!(
@@ -120,6 +126,26 @@ fn the_production_source_and_raw_boundary_are_closed() {
         0x13e77bb9effa0802,
         "read-only store controller changed"
     );
+    let intake_raw = include_str!("../src/secret_sys.rs").split("#[cfg(test)]").next().unwrap();
+    assert_eq!(intake_raw.matches("#[allow(unsafe_code)]").count(), 2);
+    assert_eq!(intake_raw.matches("core::arch::asm!").count(), 1);
+    assert_eq!(intake_raw.matches("OwnedFd::from_raw_fd").count(), 1);
+    assert_eq!(intake_raw.matches("const SYS_").count(), 7);
+    for constant in [
+        "const SYS_POLL: usize = 7;", "const SYS_SENDMSG: usize = 46;",
+        "const SYS_RECVMSG: usize = 47;", "const SYS_SETSOCKOPT: usize = 54;",
+        "const SYS_GETSOCKOPT: usize = 55;", "const SYS_FCNTL: usize = 72;",
+        "const SYS_MEMFD_CREATE: usize = 319;", "const F_ADD_SEALS: usize = 1033;",
+        "const F_GET_SEALS: usize = 1034;", "const REQUIRED_SEALS: usize = 15;",
+        "const MEMFD_FLAGS: usize = 3;", "const MSG_NOSIGNAL: usize = 0x4000;",
+        "const SO_PASSCRED: usize = 16;", "const SO_PASSPIDFD: usize = 76;",
+        "const SCM_RIGHTS: i32 = 1;", "const SCM_CREDENTIALS: i32 = 2;",
+        "const SCM_PIDFD: i32 = 4;", "const CONTROL: usize = 128;",
+        "const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;",
+    ] { assert!(intake_raw.contains(constant), "{constant}"); }
+    assert_eq!(fingerprint(intake_raw), INTAKE_RAW_FINGERPRINT);
+    assert_eq!(fingerprint(include_str!("../src/secret_intake.rs").split("#[cfg(test)]").next().unwrap()), INTAKE_FINGERPRINT);
+    assert_eq!(fingerprint(include_str!("../src/secret_request.rs").split("#[cfg(test)]").next().unwrap()), WRITE_REQUEST_FINGERPRINT);
     let application = include_str!("../src/application.rs")
         .split("#[cfg(test)]")
         .next()
@@ -286,7 +312,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x3be7a456ea994990,
+        0x504d62fd7b79c4c0,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -304,4 +330,8 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0xbbe187bccdba8518;
+const LAUNCH_FINGERPRINT: u64 = 0x67f04d92df199317;
+
+const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
+const INTAKE_FINGERPRINT: u64 = 0xb3fb222d7571e9fe;
+const WRITE_REQUEST_FINGERPRINT: u64 = 0x97c108f58f24869a;

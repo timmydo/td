@@ -213,8 +213,9 @@ shadow fields for `root` and `tester`, auto-logs in, and retains `su` as an
 administrative escape hatch. The paired compositor and `td-authd` provide
 physical secure attention, explicit token enrollment and token-gated
 secret release. File and TPM-only stores cannot serve application
-credentials. Typed one-operation writes remain the next increment. The
-stock VM remains unenrolled. Do not make a user-facing flow
+credentials. Typed credential writes require their own presented token
+operation; they cannot use an existing session release. The stock VM
+remains unenrolled. Do not make a user-facing flow
 depend on the current escape hatch; see `APPLICATIONS.md` §L.1 and
 `td-login/THREAT-MODEL.md`.
 

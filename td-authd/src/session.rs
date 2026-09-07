@@ -13,6 +13,7 @@ pub(crate) enum Request {
     Prepare,
     Poll,
     Inspect,
+    Write,
     Begin(Role),
     Enroll(Recovery),
     Presented(Description),
@@ -26,6 +27,7 @@ impl Request {
             [0x10] => Ok(Self::Prepare),
             [0x11] => Ok(Self::Poll),
             [0x17] => Ok(Self::Inspect),
+            [0x18] => Ok(Self::Write),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
             [0x16, 0] => Ok(Self::Enroll(Recovery::Unrecoverable)),
@@ -133,6 +135,8 @@ impl Drop for Cleanup {
 
 pub(crate) struct Session {
     owner: u32,
+    intake: Option<crate::secret_intake::Intake>,
+    writing: bool,
     activated: bool,
     prepared: bool,
     cleanup: Option<Cleanup>,
@@ -150,6 +154,8 @@ impl Session {
         }
         Ok(Self {
             owner,
+            intake: None,
+            writing: false,
             activated: false,
             prepared: false,
             cleanup: None,
@@ -161,6 +167,10 @@ impl Session {
     }
 
     pub fn answer(&mut self, request: Request) -> Result<Vec<u8>, String> {
+        if request == Request::Prepare {
+            if self.activated { return Err("secret session already prepared or preparing".into()); }
+            self.intake = Some(crate::secret_intake::Intake::bind(self.owner)?);
+        }
         self.answer_with(request, cleanup_command, Start::begin)
     }
 
@@ -185,6 +195,7 @@ impl Session {
                 self.reply()
             }
             Request::Inspect => self.inspect_with(Inspection::start),
+            Request::Write => self.begin_write(),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
             Request::Presented(description) => {
@@ -196,6 +207,14 @@ impl Session {
                 Ok(vec![0x93])
             }
             Request::Commit(description) => {
+                if self.writing {
+                    self.intake.as_mut().ok_or("missing credential intake")?.tick();
+                    if !self.intake.as_ref().is_some_and(|intake| intake.selected_alive()) {
+                        self.operation.as_mut().ok_or("no write operation")?.cancel("credential requester disappeared")?;
+                        self.event = Some(Event::Waiting);
+                        return Ok(vec![0x94]);
+                    }
+                }
                 self.operation
                     .as_mut()
                     .ok_or("no secret operation")?
@@ -219,6 +238,27 @@ impl Session {
                 }
             }
         }
+    }
+
+    fn begin_write(&mut self) -> Result<Vec<u8>, String> {
+        if !self.prepared || self.cleanup.is_some() || self.operation.is_some() || self.inspection.is_some() {
+            return Ok(vec![0x98, 0]);
+        }
+        let intake = self.intake.as_mut().ok_or("missing credential intake")?;
+        let (description, credential) = match intake.select() {
+            Ok(value) => value,
+            Err(_) => return Ok(vec![0x98, 0]),
+        };
+        let operation = match Unlock::start_write(self.owner, description, credential) {
+            Ok(operation) => operation,
+            Err(_) => { intake.finish(false); return Ok(vec![0x98, 0]); }
+        };
+        let mut answer = vec![0x92];
+        answer.extend_from_slice(&operation.request().encode());
+        self.operation = Some(operation);
+        self.writing = true;
+        self.event = Some(Event::Waiting);
+        Ok(answer)
     }
 
     fn inspect_with(
@@ -259,6 +299,10 @@ impl Session {
 
     /// Terminal traffic also advances watchdogs without consuming events.
     pub fn tick(&mut self) -> Result<(), String> {
+        if let Some(intake) = &mut self.intake { intake.tick(); }
+        if self.writing && !self.intake.as_ref().is_some_and(|intake| intake.selected_alive()) {
+            if let Some(operation) = &mut self.operation { operation.cancel("credential requester disappeared")?; }
+        }
         if let Some(cleanup) = &mut self.cleanup {
             if cleanup.poll()? {
                 self.cleanup = None;
@@ -314,6 +358,10 @@ impl Session {
         });
         answer.extend_from_slice(&operation.request().encode());
         if matches!(event, Event::Complete | Event::Failed(_)) {
+            if self.writing {
+                if let Some(intake) = &mut self.intake { intake.finish(matches!(event, Event::Complete)); }
+                self.writing = false;
+            }
             self.operation = None;
             self.event = None;
         }
@@ -334,6 +382,7 @@ impl Session {
             // proven child death, not replaying that result, permits relocking.
             operation.reap_for_teardown()?;
         }
+        self.intake = None;
         self.inspection = None;
         self.inspection_event = None;
         // Dropping pending generation cleanup also reaps before replacement.

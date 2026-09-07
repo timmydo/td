@@ -34,7 +34,7 @@ fn password_source(
 ) -> Result<PasswordSource, ConfigError> {
     if password_file {
         return Err(ConfigError::Parse(format!(
-            "password_file in {} is no longer a password source: store the password from the root console with `td-secret set --uid UID mail/{} < file` and set secret = \"{}\"",
+            "password_file in {} is no longer a password source: submit the password from the human session with `td-secret set mail/{} < file`, press Ctrl+Alt+Esc then W, verify the target and touch the token, and set secret = \"{}\"",
             section, name, PORTAL
         )));
     }
@@ -1086,7 +1086,7 @@ secret = "portal"
         .unwrap_err();
         match jmap {
             ConfigError::Parse(msg) => assert!(
-                msg.contains("password_file in [jmap] is no longer a password source: store the password from the root console with `td-secret set --uid UID mail/default < file`"),
+                msg.contains("password_file in [jmap] is no longer a password source: submit the password from the human session with `td-secret set mail/default < file`"),
                 "got: {}",
                 msg
             ),
@@ -1111,7 +1111,7 @@ secret = "portal"
             ),
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"/home/td/.config/td-mail/password\"\n",
-                "store the password from the root console with `td-secret set --uid UID mail/td < file` and set secret = \"portal\"",
+                "submit the password from the human session with `td-secret set mail/td < file`, press Ctrl+Alt+Esc then W, verify the target and touch the token, and set secret = \"portal\"",
             ),
         ] {
             let err = Config::parse(&format!("[account.td]\n{}", body)).unwrap_err();

@@ -202,6 +202,7 @@ impl KeyBindings {
         if self.attention != AttentionState::Closed {
             if self.attention == AttentionState::Open && !self.secret_selected && !logical_pressed && event.value == KEY_PRESS {
                 decision.secret = match event.code {
+                    KEY_W => Some(crate::secret_client::Selection::Write),
                     KEY_U => Some(crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Primary)),
                     KEY_R => Some(crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery)),
                     KEY_E => Some(crate::secret_client::Selection::Enroll(crate::authority::consent::Recovery::SecondToken)),
@@ -5623,7 +5624,7 @@ mod tests {
     fn physical_attention_requires_a_fresh_explicit_enrollment_choice() {
         use crate::authority::consent::Recovery;
         use crate::secret_client::Selection;
-        for (code, policy) in [(KEY_E, Recovery::SecondToken), (KEY_X, Recovery::Unrecoverable)] {
+        for (code, selection) in [(KEY_E, Selection::Enroll(Recovery::SecondToken)), (KEY_X, Selection::Enroll(Recovery::Unrecoverable)), (KEY_W, Selection::Write)] {
             let mut bindings = KeyBindings { attention_enabled: true, ..KeyBindings::default() };
             let mut target = RecordingTarget::default();
             assert!(bindings.feed(key(code, KEY_PRESS)).secret.is_none());
@@ -5639,7 +5640,7 @@ mod tests {
                 let decision = bindings.feed(event);
                 deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
             }
-            assert_eq!(target.secret_roles, [Selection::Enroll(policy)]);
+            assert_eq!(target.secret_roles, [selection]);
         }
     }
 

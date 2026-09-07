@@ -10,6 +10,13 @@
 )]
 
 mod client;
+mod set_client;
+#[path = "../../td-authd/src/secret_request.rs"]
+#[allow(dead_code, reason = "shared public credential request codec")]
+mod secret_request;
+#[path = "../../td-authd/src/secret_sys.rs"]
+#[allow(dead_code, reason = "shared public credential descriptor transport")]
+mod secret_sys;
 #[path = "../../td-authd/src/consent.rs"]
 #[allow(dead_code, reason = "shared immutable consent description")]
 mod consent;
@@ -51,7 +58,7 @@ mod tpm;
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod wire;
 
-use std::io::{self, Read};
+use std::io;
 
 fn run(args: &[String]) -> Result<(), String> {
     match args {
@@ -95,24 +102,11 @@ fn run(args: &[String]) -> Result<(), String> {
             secret.fill(0);
             result
         }
-        [command, uid_flag, uid, target] if command == "set" && uid_flag == "--uid" => {
-            store::require_root()?;
-            let uid = parse_uid(uid)?;
-            let (app, name) = store::target(target)?;
-            let store = owned_store(uid)?;
-            let mut secret = Vec::new();
-            io::stdin()
-                .take((store::MAX_SECRET + 1) as u64)
-                .read_to_end(&mut secret)
-                .map_err(|e| format!("read credential from stdin: {e}"))?;
-            let result = store.set(app, name, &secret);
-            secret.fill(0);
-            result?;
-            eprintln!("td-secret: credential stored (interim console authorization)");
-            Ok(())
-        }
+        [command, target] if command == "set" => set_client::set(target, consent::Role::Primary),
+        [command, flag, target] if command == "set" && flag == "--recovery" =>
+            set_client::set(target, consent::Role::Recovery),
         _ => Err(concat!(
-            "usage: td-secret set --uid UID APPLICATION/NAME < credential-file; ",
+            "usage: td-secret set [--recovery] APPLICATION/NAME < credential-input; ",
             "use physical secure attention to enroll or unlock the store"
         )
         .into()),
@@ -183,6 +177,9 @@ mod confinement {
         let sources = [
             ("main.rs", include_str!("main.rs")),
             ("client.rs", include_str!("client.rs")),
+            ("set_client.rs", include_str!("set_client.rs")),
+            ("secret_request.rs", include_str!("../../td-authd/src/secret_request.rs")),
+            ("secret_sys.rs", include_str!("../../td-authd/src/secret_sys.rs")),
             ("operation.rs", include_str!("operation.rs")),
             ("enrollment_operation.rs", include_str!("enrollment_operation.rs")),
             ("write_operation.rs", include_str!("write_operation.rs")),
@@ -202,12 +199,17 @@ mod confinement {
             let keyword = format!("un{}", "safe");
             let lint = format!("{keyword}_code");
             let raw = production.matches(&keyword).count() - production.matches(&lint).count();
-            assert_eq!(raw, 2 * usize::from(name == "sys.rs"), "{name}");
+            assert_eq!(raw, 2 * usize::from(matches!(name, "sys.rs" | "secret_sys.rs")), "{name}");
             assert_eq!(
                 production.matches(&format!("#[allow({lint})]")).count(),
-                2 * usize::from(name == "sys.rs")
+                2 * usize::from(matches!(name, "sys.rs" | "secret_sys.rs"))
             );
         }
+        let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
+            |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/secret_sys.rs").split("#[cfg(test)]").next().unwrap()), 0x320c8b6ddbfe29af, "intake raw source changed");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/secret_request.rs").split("#[cfg(test)]").next().unwrap()), 0x97c108f58f24869a, "intake request source changed");
+        assert_eq!(fingerprint(include_str!("set_client.rs").split("#[cfg(test)]").next().unwrap()), 0x544ec4d9d10e2ada, "credential client changed");
         let sys = include_str!("sys.rs");
         assert_eq!(sys.matches("core::arch::asm!").count(), 1);
         assert_eq!(sys.matches("const SYS_").count(), 3);
@@ -255,6 +257,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_metadata.rs",
                 "main.rs",
                 "operation.rs",
+                "set_client.rs",
                 "store.rs",
                 "sys.rs",
                 "tpm.rs",

@@ -10,6 +10,11 @@ mod channel;
 mod consent;
 mod launch;
 mod unlock;
+mod secret_intake;
+#[allow(dead_code, reason = "shared public credential transport and client codec")]
+mod secret_request;
+#[allow(dead_code, reason = "shared public credential transport and client codec")]
+mod secret_sys;
 mod session;
 mod inspection;
 mod mount_sys;

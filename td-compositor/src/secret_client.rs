@@ -16,6 +16,7 @@ const COMMITTED: u8 = 2;
 pub(crate) enum Selection {
     Unlock(Role),
     Enroll(Recovery),
+    Write,
 }
 impl From<Role> for Selection {
     fn from(role: Role) -> Self {
@@ -23,22 +24,24 @@ impl From<Role> for Selection {
     }
 }
 impl Selection {
-    fn operation(self) -> Operation {
-        match self {
+    fn operation(self) -> Option<Operation> {
+        Some(match self {
+            Self::Write => return None,
             Self::Unlock(role) => Operation::Unlock { role },
             Self::Enroll(recovery) => Operation::Enroll {
                 platform: Platform::TpmPcr7,
                 recovery,
                 step: Enrollment::CreatePrimary,
             },
-        }
+        })
     }
-    fn request(self) -> [u8; 2] {
+    fn request(self) -> Vec<u8> {
         match self {
-            Self::Unlock(Role::Primary) => [0x12, 1],
-            Self::Unlock(Role::Recovery) => [0x12, 2],
-            Self::Enroll(Recovery::Unrecoverable) => [0x16, 0],
-            Self::Enroll(Recovery::SecondToken) => [0x16, 1],
+            Self::Write => vec![0x18],
+            Self::Unlock(Role::Primary) => vec![0x12, 1],
+            Self::Unlock(Role::Recovery) => vec![0x12, 2],
+            Self::Enroll(Recovery::Unrecoverable) => vec![0x16, 0],
+            Self::Enroll(Recovery::SecondToken) => vec![0x16, 1],
         }
     }
 }
@@ -173,11 +176,18 @@ impl Client {
             return Ok(());
         }
         let response = wire.exchange(&attempt.selection.request())?;
+        if attempt.selection == Selection::Write && response == [0x98, 0] {
+            return attempt.notice(crate::attention::Notice::NoWrite);
+        }
         let Some((&0x92, bytes)) = response.split_first() else {
             return Err("invalid secret operation start response".into());
         };
         let request = Request::decode(bytes)?;
-        if request.owner() != 1000 || request.operation() != &attempt.selection.operation() {
+        let selected = match attempt.selection.operation() {
+            Some(operation) => request.operation() == &operation,
+            None => matches!(request.operation(), Operation::Set { requester: 1000, .. }),
+        };
+        if request.owner() != 1000 || !selected {
             return Err("root secret request changed the selected operation".into());
         }
         self.pending = Some(Pending {
@@ -253,6 +263,8 @@ impl Client {
                 pending.attempt.notice(
                     if matches!(pending.attempt.selection, Selection::Enroll(_)) {
                         crate::attention::Notice::Enrolled
+                    } else if pending.attempt.selection == Selection::Write {
+                        crate::attention::Notice::Stored
                     } else {
                         crate::attention::Notice::Unlocked
                     },
@@ -651,6 +663,47 @@ mod tests {
     }
     fn description(tag: &[u8], request: &Request) -> Vec<u8> {
         [tag, request.encode().as_slice()].concat()
+    }
+
+    #[test]
+    fn pending_write_displays_the_root_target_and_requires_one_exact_commit() {
+        for role in [Role::Primary, Role::Recovery] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Write;
+            let request = Request::new([43; 32], 1000, Operation::Set {
+                application: "mail".into(), name: "main".into(), application_uid: 65537,
+                requester: 1000, role,
+            }).unwrap();
+            let mut wire = wire(vec![
+                description(&[0x92], &request), description(&[0x91, 4], &request), vec![0x93],
+                description(&[0x91, 5], &request), vec![0x94], description(&[0x91, 6], &request),
+            ]);
+            let mut client = Client::default();
+            client.start(&mut wire, Arc::clone(&screen.attempt)).unwrap();
+            let before = std::fs::read(&screen.path).unwrap();
+            client.tick(&mut wire).unwrap();
+            assert_ne!(std::fs::read(&screen.path).unwrap(), before);
+            assert_eq!(client.pending.as_ref().unwrap().receipt, Some(request.clone()));
+            client.tick(&mut wire).unwrap();
+            client.tick(&mut wire).unwrap();
+            assert!(client.pending.is_none());
+            assert_eq!(wire.calls, [vec![0x18], vec![0x11], description(&[0x13], &request),
+                vec![0x11], description(&[0x14], &request), vec![0x11]]);
+        }
+    }
+
+    #[test]
+    fn empty_write_queue_is_a_notice_and_a_different_operation_is_refused() {
+        for response in [vec![0x98, 0], tagged(&[0x92])] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Write;
+            let mut client = Client::default();
+            let no_write = response == [0x98, 0];
+            let mut wire = wire(vec![response]);
+            assert_eq!(client.start(&mut wire, Arc::clone(&screen.attempt)).is_ok(), no_write);
+            assert!(client.pending.is_none());
+            assert_eq!(wire.calls, [vec![0x18]]);
+        }
     }
     fn enrollment_screen(recovery: Recovery) -> Screen {
         let mut screen = Screen::new();

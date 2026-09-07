@@ -78,8 +78,8 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies; one scoped received-descriptor adoption |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
-| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies |
-| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below |
+| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; plus the named credential intake module of §16 |
+| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake module below |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
 | 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
 
@@ -2305,6 +2305,52 @@ creates no child process. Original stdin remains exclusive in the compositor.
 Both crates pin the shared source, while compositor confinement pins the two
 shared include paths and the startup/worker caller roster. The target recipe
 stages those exact sources and runs their transport and client-policy tests.
+
+### Named credential intake boundary
+
+The named-write intake has a separate shared raw module,
+`td-authd/src/secret_sys.rs`, compiled by td-secret's console client as
+well as td-authd. It never changes the private compositor channel's
+ancillary policy. Its one function-scoped x86-64 instruction carries
+recvmsg(47), sendmsg(46), setsockopt(54), getsockopt(55), poll(7),
+fcntl(72), and memfd_create(319); one separate scoped adoption owns newly
+installed descriptors. Safe std owns listeners, connections, deadlines,
+metadata, positional reads, buffer writes and every close.
+
+The receiver enables exactly SOL_SOCKET(1)/SO_PASSCRED(16) and
+SO_PASSPIDFD(76), each with a four-byte value 1, before sending its greeting.
+The peer-UID query uses only SO_PEERCRED(17), with an exact twelve-byte
+ucred result. The console accepts only a root peer; root intake admits
+only its configured human owner. Each receive retains exactly one valid
+SCM_CREDENTIALS(2), one SCM_PIDFD(4), and at most one SCM_RIGHTS(1)
+descriptor. Every recognizable delivered descriptor is owned before any
+policy or truncation refusal. The control area is 128 aligned bytes and
+MSG_CMSG_CLOEXEC is mandatory. Each request frame must carry exactly one
+credential descriptor in total; continuations must retain the same live
+sender pidfd identity. The existing private channel still refuses rights.
+Poll checks one borrowed sender pidfd, POLLIN(1), with timeout zero; any
+event or error means the submitting process is no longer live.
+
+The console creates one memfd with a fixed NUL-terminated diagnostic name
+and exactly MFD_CLOEXEC(1)|MFD_ALLOW_SEALING(2). It writes the bounded
+credential, then applies F_ADD_SEALS(1033) with exactly
+F_SEAL_SEAL(1)|F_SEAL_SHRINK(2)|F_SEAL_GROW(4)|F_SEAL_WRITE(8).
+F_GET_SEALS(1034) checks those four bits before transfer and before root
+reads the descriptor. Additional seal bits do not weaken those required
+restrictions. The receiver requires a regular file of 1..4096 bytes and
+uses positional reads from offset zero while retaining the exact received
+file. There is no path reopen, shared-offset mutation, memory mapping,
+caller-selected fcntl command, or arbitrary descriptor forwarding.
+The sender carries one borrowed descriptor in exactly 24 ancillary bytes,
+SOL_SOCKET/SCM_RIGHTS, with MSG_NOSIGNAL; a short send continues only its
+ordinary bytes and never retransmits the descriptor.
+
+Confinement pins the complete shared raw source, syscall and option values,
+ABI layouts, the two scoped allowances and the caller roster. Kernel
+oracles cover sealed-descriptor immutability and transfer, sender identity,
+refused ancillary cleanup and descriptor-count limits. New commands,
+options, syscalls, descriptor consumers or allowances amend this section
+and both `td-authd/DESIGN.md` and `td-secret/DESIGN.md` in the same landing.
 
 ### Portal file-grant mount boundary
 

@@ -7,6 +7,8 @@ pub(crate) enum Notice {
     Menu,
     Pending,
     Unlocked,
+    Stored,
+    NoWrite,
     Enrolled,
     Unenrolled,
     Unavailable,
@@ -161,7 +163,7 @@ pub(crate) fn paint(
 ) {
     let bounds = (0, 0, width, height);
     ui::fill(frame, width, height, stride, bounds, [0x28, 0x20, 0x18, 0]);
-    let top = height.saturating_sub(176) / 2;
+    let top = height.saturating_sub(212) / 2;
     for (index, text) in [
         "TD SECURE ATTENTION",
         if draining {
@@ -170,6 +172,8 @@ pub(crate) fn paint(
             match notice {
                 Notice::Menu => "U: UNLOCK  R: RECOVERY TOKEN",
                 Notice::Pending => "PREPARING SECRET REQUEST",
+                Notice::Stored => "CREDENTIAL STORED",
+                Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
                 Notice::Unlocked => "SECRETS UNLOCKED",
                 Notice::Enrolled => "STORE ENROLLED - REOPEN AND PRESS U TO UNLOCK",
                 Notice::Unenrolled => "STORE NOT ENROLLED - REOPEN TO TRY AGAIN",
@@ -180,6 +184,7 @@ pub(crate) fn paint(
         },
         if notice == Notice::Menu && !draining { "E: ENROLL TWO TOKENS (HAVE BOTH READY)" } else { "" },
         if notice == Notice::Menu && !draining { "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL" } else { "" },
+        if notice == Notice::Menu && !draining { "W: REVIEW PENDING CREDENTIAL WRITE" } else { "" },
         if draining {
             "RELEASE KEYS AND BUTTONS"
         } else {

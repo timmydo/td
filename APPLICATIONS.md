@@ -8387,8 +8387,10 @@ Hidraw itself permits concurrent opens, and a different trusted root program
 can ignore that advisory lock. Complete presented-operation mediation remains
 required before enabling consent or a WebAuthn grant.
 
-**Neither consent mechanism is implemented.** The inert screen above
-provides no approval. The kernel now carries USB PCI xHCI, generic HID,
+**Current credential consent is specified in §W.4.** Physical selection,
+immutable presentation and a token assertion now mediate credential writes,
+enrollment and release. The broader operation vocabulary here remains a
+target; the proposed randomized-key mechanism is not implemented. The kernel now carries USB PCI xHCI, generic HID,
 USB HID and hidraw. The root-only worker implements the narrow CTAP HID
 transport described in `td-secret/DESIGN.md`; it does not grant consent.
 USB keyboard interfaces follow the compositor's seat-assigned startup
@@ -8417,11 +8419,10 @@ path; account-password recovery; and a policy language — the operation
 table is code, reviewed as code. Hardware PIN and recovery policy belong to
 `td-install/ENCRYPTION.md`; the application-secret policy remains in §W.4.
 
-**Cost, honestly.** A root authority and a new trust surface, with exclusive
-operation mediation still to connect to the USB HID/CTAP transport. The physical
-attention screen is inert; immutable request presentation, consent and
-one-operation execution remain unimplemented. This plan grants no current
-authority and supplies no account-password prompt.
+**Cost, honestly.** The credential operation adds a root authority, typed
+request intake and hardware transport to the trust surface. It grants only
+the credential operation specified in §W.4; broader elevation remains
+unimplemented and supplies no account-password prompt.
 
 ## M. Hardware rendering — not painting into the corner
 
@@ -9321,13 +9322,17 @@ refusal; source data is retained for operator resolution. Migration is
 restartable after any completed publication. There is no dual plaintext
 fallback in the shipped td-mail client.
 
-**Interim console writer.** `td-secret set --uid UID <application>/<name>`
-reads at most 4096 credential bytes from stdin and atomically replaces that
-entry. It requires root and resolves the portal owner through the immutable
-identity table and installed-account checks. The human-UID direct writer is
-removed with the ownership migration. This remains the explicit console
-provisioning interim, with no token consent, remembered authorization, shell
-or privileged helper invocation. It is not an elevation claim.
+**One-operation writer.** `td-secret set [--recovery] <application>/<name>`
+reads 1..4096 exact bytes from redirected stdin and sends one immutable
+sealed descriptor to the root authority. The listener admits only the human
+session UID and pins the actual sender on every fragment. It fixes the
+active application assignment. Physical Ctrl+Alt+Esc followed by W selects
+the queued request, then root captures its immutable bytes. The complete target
+and token role are presented before one fresh assertion; the matching commit
+permits one atomic encrypted-record replacement. An existing session release
+cannot authorize a write. Cancellation preserves that release; generation
+teardown still clears it. The former root-console `set --uid` bypass is
+removed. Firstboot remains the initial unenrolled-placeholder writer.
 
 **Hardware enrollment and session release.** Physical Ctrl+Alt+Esc opens
 the trusted screen. E selects enrollment with a second recovery token;
@@ -9403,12 +9408,12 @@ policy: a token left available to a walk-up attacker remains usable by
 that attacker. This is distinct from the hardware PIN disk/session policy
 in `td-install/ENCRYPTION.md`.
 
-**Remaining increment on the rolling workstream.** (d) Move the console
-writer behind `td-authd` as one named operation, with typed application/name
-and descriptor-pinned credential bytes, and one token touch bound to that
-operation. Remove each interim mechanism atomically when its replacement
-lands. No increment adds a server, synchronization service, or password
-fallback. `td-secret/DESIGN.md` specifies the current format and boundaries.
+The store, TPM protector, FIDO2 enrollment/release and typed one-operation
+writer are connected. The stock direct-kernel VM remains unenrolled;
+software and emulator checks do not certify a physical platform's PCR
+measurement chain or token timing. No path adds a remote server,
+synchronization service or password fallback. `td-secret/DESIGN.md`
+specifies the exact format, boundaries and verification limits.
 
 ### W.5 td-editor: a td-owned editor for mail and text
 

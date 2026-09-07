@@ -1,9 +1,9 @@
 # td-authd
 
 This supplies the private channel, fixed terminal launcher and root side of
-one-operation token release. The compositor does not yet invoke its secret
-session extension; no graphical authentication flow or public request
-listener is enabled. The image
+one-operation token release. The paired compositor invokes its secret session extension for physical
+enrollment, release, and a queued credential write. The public write intake
+admits only the configured human; it cannot select or acknowledge a prompt. The image
 starts it paired with the dedicated compositor and uses its terminal launcher.
 The eventual operation policy follows APPLICATIONS.md §L.1 and principle 7:
 one named operation, typed and descriptor-pinned arguments, one protected
@@ -430,7 +430,7 @@ assignment, or reconstruction from complete deployment history and retained
 state. Never reset it to the current table or prune retired rows. If the
 union exceeds its bounds, raise the format's reviewed bounds in a deployment
 update; overflow never silently drops reservations. Without a complete
-ledger, keep the future UID launcher disabled. Console recovery does not
+ledger, keep the application UID launcher disabled. Console recovery does not
 make an unverified deployment pass the boot oracle.
 
 ## Fixed terminal launch prerequisite
@@ -748,7 +748,7 @@ recovery choice; the nonce is retained but not shown. Enrollment binds the
 fixed TPM PCR 7 profile in its canonical encoding and refuses other tags.
 This means exactly SHA-256 PCR selection `7` (mask bit 7 alone); the
 store's other supported PCR selections are deliberately unencodable in
-this prompt profile. A future authority must refuse those selections, never
+this prompt profile. The authority must refuse those selections, never
 map a different mask onto this label. Spaces and dots are excluded from
 credential names: indented continuation text cannot imitate the fixed
 labels or token instructions. All consumers pin the codec source and its
@@ -758,9 +758,9 @@ These are structural checks, not caller admission or proof of
 randomness. The private root unlock and enrollment workers in
 `td-secret/DESIGN.md` consume this codec. The paired authority exposes its typed private
 session extension; the paired compositor supplies physical enrollment and
-unlock choices and their exact presentation receipts. There is no public
-operation listener.
-The future authority must pin the requester and credential input, admit
+unlock choices and their exact presentation receipts. The separate public
+credential intake below accepts one queued write without opening a prompt.
+The authority must pin the requester and credential input, admit
 the application from deployment policy, own an immutable operation under
 its fresh nonce, and bind its token challenge to the complete canonical
 description. The compositor's presentation receipt is necessary but
@@ -772,16 +772,19 @@ renderer and its private session client are specified in
 ## Private token child supervision
 
 `unlock.rs` owns one root-private `td-secret unlock-operation --uid
-1000` or `td-secret enroll-operation --uid 1000` child. The paired service calls this controller through the
+1000`, `td-secret enroll-operation --uid 1000`, or
+`td-secret write-operation --uid 1000` child. The paired service calls this controller through the
 private session extension below. The paired compositor enforces physical
 selection, exact immutable step presentation and cancellation before commit.
-There is no public listener, automatic release, or new keyboard
-authorization. The live caller must enforce root startup and
-paired-session admission before constructing the production controller.
+This private controller exposes no public listener and performs no automatic
+release. Its paired root caller enforces startup and session admission before
+constructing the production controller; queued writes arrive through the
+separate credential intake and require physical selection.
 The child independently requires root; this controller adds no
-credential switch. It generates a fresh kernel-random nonce for either
-a typed Unlock role or an Enroll request starting at CreatePrimary with
-one explicit recovery policy and the fixed SHA-256 PCR 7 profile. It
+credential switch. It generates a fresh kernel-random nonce for a typed
+Unlock role, an Enroll request starting at CreatePrimary with one explicit
+recovery policy and the fixed SHA-256 PCR 7 profile, or a Set request with
+the admitted target, requester and selected token role. It
 accepts no caller-selected nonce, executable, path, account or argument
 vector.
 
@@ -948,8 +951,8 @@ overall deadline, and withholds graphical input admission until generation
 preparation succeeds. Enrollment uses read-only inspection before beginning
 and after failure; a lost completion reply cannot authorize a retry. An
 already-enrolled store requires a separate fresh unlock. Typed credential
-writes remain a root-console interim until descriptor-pinned elevation is
-implemented.
+writes use the descriptor intake and their own fresh presented token
+operation; an existing release cannot authorize a write.
 The root verifies the authenticated peer and exact public description;
 it cannot independently observe the peer's framebuffer. A matching
 public byte string alone is not evidence of presentation or token touch.
@@ -992,11 +995,10 @@ poll records and requires it in acknowledgement requests. Responses
 contain only their acknowledgement tag. Cancellation retains the same nonce
 throughout every step. Enrollment and unlock share the single concurrent
 operation slot, generation preparation, terminal-result retention and
-teardown. Public credential-write requests remain unimplemented. The
-compositor still does not activate these records: before doing so it must
-fully present each exact next step and invalidate its earlier receipt,
-without allowing arbitrary prompt replacement or resetting physical
-attention after cancellation.
+teardown. The compositor fully presents each exact next step and invalidates
+its earlier receipt, without arbitrary prompt replacement or resetting
+physical attention after cancellation. Queued writes use the same operation
+slot and acknowledgement progression.
 
 Host child fixtures exercise both complete enrollment sequences through
 the supervisor and paired Session, with literal expected steps and a
@@ -1016,12 +1018,11 @@ to have both tokens ready before starting and show the remaining overall
 time. Physical timing validation remains an activation check; this API
 neither certifies that budget for hardware nor renews it after a step.
 
-The authenticated paired root API is callable now. Compositor abstinence
-is the current activation boundary, not an authd feature flag: a trusted
-compositor that violates its presentation duties could invoke it. The
+The authenticated paired root API trusts the dedicated compositor to
+enforce physical selection and complete presentation before acknowledging.
+A trusted compositor that violates those duties could invoke the root API. The
 root cannot observe its framebuffer and trusts that admitted peer to
-supply receipts honestly. These duties apply before a compositor consumer
-ships. Presentation acknowledgements carry descriptions in the request;
+supply receipts honestly. The compositor consumer enforces these duties. Presentation acknowledgements carry descriptions in the request;
 responses are the bare 93/94 tags, while poll results carry descriptions.
 
 ## Paired read-only store inspection
@@ -1068,3 +1069,49 @@ operation started before consuming the inspection result is a protocol
 error that ends the authority generation. It is not a soft busy response.
 The helper applies the same private root/stdin startup admission as the
 token workers and writes directly to the socket, with no buffered stdout.
+
+## Queued credential write
+
+Prepare creates the sole configured session's named intake at
+`/run/td-authd/1000/set`. The runtime and both parents must be root-owned
+directories without unprivileged writers or special mode bits. Root owns
+this paired generation's lifecycle; a replacement may remove its stale
+socket, and teardown removes only the inode this generation created. The
+socket belongs to human UID/GID 1000 with mode 0600. Incoming connections
+require that owner in SO_PEERCRED and every fragment's SCM_CREDENTIALS;
+the first live SCM_PIDFD is retained and each later sender must match its
+credentials and pidfs device/inode identity. Root or service UIDs do not
+acquire public submission authority. The named raw module is separate from
+`sys.rs` and never weakens the paired channel's refusal of rights.
+
+The versioned greeting, exact typed frame, single sealed descriptor and
+bounded deadlines follow `td-secret/DESIGN.md`. There is no unsolicited
+prompt and no public acknowledgement verb. One accept and at most four
+nonblocking I/O attempts run per terminal heartbeat. Extra connections are
+closed while one pending client exists. Only the private peer's exact `18`
+request selects a ready write. Busy, absent, expired or refused intake
+returns `98 00`; a started write returns `92 DESCRIPTION`, like unlock.
+Root resolves the installed application, captures its immutable bytes,
+generates the nonce and spawns only `/bin/td-secret write-operation --uid
+1000` with empty environment, `/` cwd, private stdin and null log fds.
+The worker independently repeats installed-account and store admission.
+
+The parent first sends the canonical description, then a separate bounded
+credential frame before accepting any child presentation invitation. Its
+private wire clears credential output before reuse or destruction. Public
+prompt frames remain bounded by the existing 289-byte limit. The child
+uses the unchanged fresh presentation and commit rounds, and the paired
+peer uses the existing exact-description acknowledgements. Peer loss or
+expiry is checked again before accepting a write commit. Completion is
+reported to the public client only after the child exits successfully;
+missing success is never authority to retry. Credential bytes do not pass
+through the compositor or its channel.
+
+A cancelled write kills and reaps its worker without invoking lock-session,
+so an unrelated prior release survives. Failed-generation teardown still
+reaps every worker before invoking lock-session. The named listener adds
+no process launch choice, path argument, remembered consent, shell, token
+fallback or automatic write retry. Root, the deployment identity table and
+the paired compositor remain trusted. The intake bounds resource use, but
+a malicious human process can occupy the single queue slot until expiry;
+this does not authorize its request or force a prompt.
