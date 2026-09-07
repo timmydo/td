@@ -727,6 +727,8 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     source.wait_field("state", "tab", &collapsed);
     source.wait_tab(source_revision, "b");
     assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    source.wait_field("clipboard-state", "device", "1");
+    source.wait_field("clipboard-state", "source-bytes", &text.len().to_string());
     // The destination must still receive the original offer, not empty text.
     // Reveal tiling before mapping the destination. The reply fences the
     // compositor layout change; no intermediate source frame is sampled.
@@ -746,6 +748,10 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     destination.wait_keyboard(profile);
     destination.wait_field("state", "focus", "1");
     source.wait_field("state", "focus", "0");
+    source.wait_field("clipboard-state", "focus", "0");
+    source.wait_field("clipboard-state", "source-bytes", &text.len().to_string());
+    destination.wait_field("clipboard-state", "selection", "utf8");
+    destination.wait_field("clipboard-state", "source-bytes", "-");
     let windows = compositor.windows();
     assert_eq!(windows.len(), 2);
     assert!(windows.contains(&source_window));
@@ -758,6 +764,8 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     assert_ne!(before_paste.client, before.client);
     compositor.chord(Some(KEY_LEFT_CTRL), paste_key);
     destination.wait_tab(1, text);
+    destination.wait_field("clipboard-state", "incoming", "0");
+    source.wait_field("clipboard-state", "outgoing", "0");
     // The ASCII prefix proves transported pixels; full UTF-8 is checked above.
     // The caret is on the final empty line; mask column 4 is outside the crop.
     compositor.rendered_text(
@@ -790,6 +798,7 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     }
     destination.wait_field("state", "focus", "1");
     select_clipboard_text(&mut compositor, profile);
+    destination.wait_field("clipboard-state", "selection", "none");
     let selected = format!("1,1,0,{0},0,{0},0,72,0,lf", text.len());
     destination.wait_field("state", "tab", &selected);
     let no_offer = td_editor::control::hex(b"Clipboard has no supported UTF-8 text offer.");

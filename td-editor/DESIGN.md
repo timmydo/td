@@ -22,7 +22,8 @@ explicit local dictionary through the file worker, scans on F7 in bounded
 chunks, and publishes underlines and counts together. Format supplies
 dictionary selection and next/previous marked-word navigation. GPU rendering
 is not implemented yet. The optional native control socket now exposes
-state/text and scan-pinned spelling queries, plus revision/selection-checked
+state/text, read-only clipboard metadata and scan-pinned spelling queries,
+plus revision/selection-checked
 edits. Native redraw/submitted/callback generations and bounded `wait-frame`
 acknowledgement are connected. Remote Check Spelling returns a job ID with
 bounded completion/error/cancellation history in native state. Remote New
@@ -1619,6 +1620,15 @@ pipes, non-endpoint refusal and restoration through shared descriptor aliases.
 
 ### Implemented experimental native clipboard
 
+The native `clipboard-state` control query reports device/focus flags,
+supported selection class, retained source byte count and incoming/outgoing
+owner presence, with the existing input-context token. It never reads
+payloads, advances or cancels transfers, issues Wayland requests, changes
+feedback or requests redraw. It works without focus/readiness and through
+modals. These are observations, not ownership acknowledgements, transfer
+receipts or action authority; no progress, target or terminal history is
+reported. CONTROL.md defines the exact bounded fields and refusal rules.
+
 At initial registry synchronization, a seat plus optional core
 wl_data_device_manager v3 enables one seat-bound data device. Higher versions
 are capped at 3; missing/older globals leave clipboard commands disabled.
@@ -2508,7 +2518,8 @@ unknown commands/versions, bad hex, overflow and truncated frames before
 dispatch. A response echoes version/request ID, then `ok`, `error`, or
 `pending`; errors carry a stable code and hex-encoded diagnostic.
 
-Version 1 exposes `state`, `prompt-state`, `prompt-answer`, `text`, `new`,
+Version 1 exposes `state`, `clipboard-state`, `prompt-state`,
+`prompt-answer`, `text`, `new`,
 `open`, `select-tab`, `select-range`, `insert`, `delete`, `undo`, `redo`,
 `find`, `go-to-line`, `replace`, `fill-paragraph`,
 `set-auto-fill`, `set-fill-column`, `set-key-profile`, `check-spelling`,

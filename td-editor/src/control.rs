@@ -149,6 +149,7 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
 pub enum Operation {
     State,
     PromptState,
+    ClipboardState,
     New,
     Open(PathBuf),
     Save {
@@ -226,6 +227,7 @@ impl std::fmt::Debug for Operation {
         match self {
             Self::State => f.write_str("State"),
             Self::PromptState => f.write_str("PromptState"),
+            Self::ClipboardState => f.write_str("ClipboardState"),
             Self::New => f.write_str("New"),
             Self::Open(path) => f
                 .debug_struct("Open")
@@ -578,6 +580,7 @@ impl Request {
             let operation = match name {
                 "state" => Operation::State,
                 "prompt-state" => Operation::PromptState,
+                "clipboard-state" => Operation::ClipboardState,
                 "new" => Operation::New,
                 "open" => Operation::Open(os_path(args.next().ok_or(Error::Protocol)?)?),
                 "save" | "save-as" => Operation::Save {
@@ -786,6 +789,7 @@ impl Request {
                 limit,
             } => page(ui, *tab, *revision, *offset, *limit),
             Operation::PromptState
+            | Operation::ClipboardState
             | Operation::Edit { .. }
             | Operation::New
             | Operation::Open(_)
@@ -1240,6 +1244,24 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn clipboard_state_is_a_read_only_native_query_with_exact_arity() {
+        let request = Request::parse(b"1\t33\tclipboard-state").unwrap();
+        assert_eq!(request.operation, Operation::ClipboardState);
+        assert!(!request.is_mutating() && !request.is_edit());
+        assert_eq!(format!("{:?}", request.operation), "ClipboardState");
+        let mut ui = Controller::default();
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        assert_eq!(
+            Request::parse(b"1\t33\tclipboard-state\textra").unwrap_err(),
+            Refusal {
+                id: 33,
+                error: Error::Protocol,
+            }
+        );
+    }
 
     #[test]
     fn prompt_state_is_a_read_only_native_query_with_exact_arity() {

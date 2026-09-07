@@ -68,6 +68,11 @@ td-editor/target/release/td-editor --help
 lossless file codec; `fill.rs` plans bounded reflow; `keys.rs` translates
 logical chords; `ui.rs` owns input/view state; and `replay.rs` feeds that same
 controller with framed commands.
+The native `clipboard-state` query reports device/focus, supported-offer
+type, retained source byte count and transfer-presence flags without
+reading text or advancing transfers. It is inspection, not a clipboard
+manager or Copy/Paste shortcut; see [CONTROL.md](CONTROL.md).
+
 The safe `control` library supplies one-frame decoding, controller state/text
 queries and revision-checked edits through the shared controller. See
 [CONTROL.md](CONTROL.md) for exact fields and bounds. The experimental

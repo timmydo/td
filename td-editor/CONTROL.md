@@ -69,6 +69,7 @@ In the examples below, field spaces denote literal Tab separators.
 | Payload fields | Meaning |
 | --- | --- |
 | `1 ID state` | Snapshot the current controller. |
+| `1 ID clipboard-state` | Inspect bounded native clipboard and transfer metadata without mutation. |
 | `1 ID prompt-state` | Inspect native text-entry state and existing dialog IDs without mutation. |
 | `1 ID prompt-answer TAB REVISION INPUT_GENERATION KIND ANSWER [HEX_ENTRY]` | Answer one pinned non-file text prompt; details below. |
 | `1 ID new` | Create and activate an empty tab; return its stable ID. |
@@ -109,6 +110,43 @@ lowercase hex. Empty byte strings use `-`; nonempty hex has two lowercase
 digits per byte. `hex`/`unhex` and the frame/page limits are shared with
 replay, whose old public helper names remain re-exports, not duplicate codecs.
 Replay also uses the bounded response-frame encoder.
+
+## Clipboard inspection
+
+`1 ID clipboard-state` is a native-only read-only query with no arguments.
+It is available without keyboard/pointer readiness, focus or non-modal UI.
+The controller-only adapter returns `unavailable`. Success is `1 ID ok`
+followed by these fields, in order:
+
+| Field | Meaning |
+| --- | --- |
+| `input-generation=N` | Existing input-context fence, not a clipboard revision or transfer receipt. |
+| `device=0\|1` | A native data-device object is retained. |
+| `focus=0\|1` | Current native keyboard focus. |
+| `selection=none\|unsupported\|utf8\|plain` | No selection ID, no usable supported offer, preferred UTF-8 MIME, or UTF-8 plain-text fallback. |
+| `source-bytes=N\|-` | Byte count of the locally retained immutable Copy/Cut snapshot, or no snapshot. |
+| `incoming=0\|1` | An incoming transfer owner is retained. |
+| `outgoing=0\|1` | An outgoing transfer owner is retained. |
+
+Selection classification uses the same current, non-retired offer and MIME
+preference as Paste, including accepted ASCII case variants. `unsupported`
+also covers a selection ID without a retained usable offer. Source retention
+does not acknowledge compositor ownership; a writer can remain after its
+source is retired. Transfer flags do not promise progress, successful EOF,
+a live peer or an unexpired deadline. There is no transfer identity, byte
+progress, target, terminal history, payload, native object ID or MIME string
+in this snapshot. Fields describe the adapter at query processing time and
+may change immediately afterward; the input token is not a clipboard-state
+version and does not reserve an offer or authorize an action.
+
+The query does not read clipboard bytes, issue protocol requests, poll or
+advance a transfer/file/spelling job, validate a target, clear feedback,
+cancel input/Paste, change a generation or request a frame. It uses the
+existing bounded control-worker query budget. Fatal adapter state and
+exhausted frame/input counters retain normal fail-stop behavior; shutdown
+ends socket service. Device, focus and supported-offer flags alone do not
+make Copy/Paste admissible: ordinary native serial, modal and target rules
+remain unchanged. The response is bounded metadata, not clipboard access.
 
 ## Prompt inspection
 

@@ -1689,6 +1689,16 @@ impl Window {
                 .response(),
             };
         }
+        if matches!(request.operation, crate::control::Operation::ClipboardState) {
+            return match self.control_clipboard_state() {
+                Ok(body) => format!("1\t{}\tok\t{body}", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if matches!(
             request.operation,
             crate::control::Operation::PromptAnswer { .. }
@@ -2695,6 +2705,34 @@ impl Window {
         self.spelling.observe(self.ui.editor());
         self.observe_control_jobs();
         self.frames.invalidate(true);
+    }
+
+    fn control_clipboard_state(&self) -> crate::Result<String> {
+        let selection = match self.clipboard.selection {
+            None => "none",
+            Some(id) => match self
+                .clipboard
+                .offers
+                .get(&id)
+                .and_then(crate::data::Offer::mime)
+            {
+                Some(mime) if mime.eq_ignore_ascii_case(crate::data::UTF8) => "utf8",
+                Some(mime) if mime.eq_ignore_ascii_case(crate::data::PLAIN) => "plain",
+                _ => "unsupported",
+            },
+        };
+        let source = self.clipboard.source.as_ref().map_or_else(
+            || "-".to_string(),
+            |(_, text)| text.len().to_string(),
+        );
+        Ok(format!(
+            "input-generation={}\tdevice={}\tfocus={}\tselection={selection}\tsource-bytes={source}\tincoming={}\toutgoing={}",
+            self.frames.input_generation()?,
+            u8::from(self.clipboard.device.is_some()),
+            u8::from(self.input.focused),
+            u8::from(self.clipboard.incoming.is_some()),
+            u8::from(self.clipboard.outgoing.is_some()),
+        ))
     }
 
     fn control_prompt_state(&self) -> crate::Result<String> {
@@ -6901,6 +6939,146 @@ mod tests {
         assert_eq!(w.frames.fields().unwrap(), frames);
         assert_eq!(w.notice, notice);
         answer
+    }
+
+    fn clipboard_snapshot(w: &mut Window) -> String {
+        let query = crate::control::Request::parse(b"1\t33\tclipboard-state").unwrap();
+        let before = crate::control::state(&w.ui).unwrap();
+        let frames = w.frames.fields().unwrap();
+        let notice = w.notice.clone();
+        let clock = w.clock;
+        let answer = w.control_response(&query);
+        assert!(answer.starts_with("1\t33\tok\t"), "{answer}");
+        assert_eq!(crate::control::state(&w.ui).unwrap(), before);
+        assert_eq!(w.frames.fields().unwrap(), frames);
+        assert_eq!(w.notice, notice);
+        assert_eq!(w.clock, clock);
+        answer
+    }
+
+    #[test]
+    fn clipboard_state_classifies_offers_and_retained_sources_without_input() {
+        let (mut w, _peer, _keyboard, device) = clipboard_fixture();
+        let generation = w.frames.input_generation().unwrap();
+        assert_eq!(clipboard_snapshot(&mut w), format!(
+            "1\t33\tok\tinput-generation={generation}\tdevice=1\tfocus=1\tselection=none\tsource-bytes=-\tincoming=0\toutgoing=0"
+        ));
+        for (index, (mime, expected)) in [
+            ("image/png", "unsupported"),
+            ("TeXt/PlAiN", "plain"),
+            ("TEXT/PLAIN;CHARSET=UTF-8", "utf8"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            selection_offer(&mut w, device, 0xff00_0010 + index as u32, &[mime]);
+            assert!(clipboard_snapshot(&mut w).contains(&format!("\tselection={expected}\t")));
+        }
+        selection_offer(
+            &mut w,
+            device,
+            0xff00_0013,
+            &[crate::data::PLAIN, crate::data::UTF8],
+        );
+        assert!(clipboard_snapshot(&mut w).contains("\tselection=utf8\t"));
+        w.clipboard.source = Some((99, std::sync::Arc::from("private λ")));
+        w.input.focused = false;
+        w.clipboard.device = None;
+        w.search_request("find", 1, 0).unwrap();
+        let snapshot = clipboard_snapshot(&mut w);
+        assert!(snapshot.contains("\tdevice=0\tfocus=0\t"));
+        assert!(snapshot.contains("\tsource-bytes=10\t"));
+        assert!(!snapshot.contains("private"));
+        assert!(w.search.is_some());
+        w.clipboard.offers.get_mut(&0xff00_0013).unwrap().retired = true;
+        assert!(clipboard_snapshot(&mut w).contains("\tselection=unsupported\t"));
+        w.clipboard.offers.clear();
+        assert!(clipboard_snapshot(&mut w).contains("\tselection=unsupported\t"));
+    }
+
+    #[test]
+    fn clipboard_state_does_not_step_pending_io_or_admit_eof() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        w.clipboard_request("paste", 1, 0).unwrap();
+        let (_, mut files) = drain(&peer);
+        let mut writer = files.pop().unwrap();
+        writer.write_all(b"complete").unwrap();
+        drop(writer);
+        let (mut reader, sender) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        w.clipboard.outgoing = Some(
+            crate::transfer::Outgoing::begin(
+                std::os::fd::OwnedFd::from(sender),
+                std::sync::Arc::from("secret"),
+                0,
+            )
+            .unwrap(),
+        );
+        let snapshot = clipboard_snapshot(&mut w);
+        assert!(snapshot.ends_with("\tincoming=1\toutgoing=1"));
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t33\tclipboard-state"),
+            snapshot
+        );
+        let mut byte = [0];
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(clipboard_snapshot(&mut w), snapshot);
+        w.tick(1, true).unwrap();
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "complete abc\n");
+        assert!(clipboard_snapshot(&mut w).ends_with("\tincoming=0\toutgoing=0"));
+        w.stop_control();
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn clipboard_state_preserves_repeat_and_expired_transfer_until_normal_tick() {
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        w.clipboard_request("paste", 1, 0).unwrap();
+        let (_, _writers) = drain(&peer);
+        w.input.key(106, true).unwrap();
+        w.input.arm(106, w.clock);
+        w.clock = 5000;
+        w.frames.clear_damage_for_test();
+        assert!(clipboard_snapshot(&mut w).ends_with("\tincoming=1\toutgoing=0"));
+        assert!(w.input.repeat(w.clock).unwrap().is_some());
+        assert!(!w.frames.is_dirty());
+        assert!(drain(&peer).0.is_empty());
+        w.tick(5000, false).unwrap();
+        assert!(w.clipboard.incoming.is_none());
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
+    }
+
+    #[test]
+    fn clipboard_state_retains_global_fatal_and_counter_refusals() {
+        for exhausted in [false, true] {
+            let (mut w, _peer) = file_dialog_fixture();
+            let query = crate::control::Request::parse(b"1\t33\tclipboard-state").unwrap();
+            if exhausted {
+                w.frames.exhaust_for_test();
+            } else {
+                w.control_input_error = Some("transport".into());
+            }
+            let before = crate::control::state(&w.ui).unwrap();
+            let response = w.control_response(&query);
+            let code = if exhausted { "exhausted" } else { "unavailable" };
+            assert!(response.contains(&format!("\terror\t{code}\t")), "{response}");
+            assert_eq!(crate::control::state(&w.ui).unwrap(), before);
+        }
     }
 
     #[test]
