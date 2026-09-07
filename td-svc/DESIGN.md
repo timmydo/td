@@ -131,6 +131,15 @@ The 1000:1000 ownership is authority shared by every unconfined process with
 that uid, not a same-uid security boundary. Confined applications cannot reach
 cgroupfs; other uid-1000 session components are trusted by this design.
 
+Activated application accounts use sibling `td-app-UID` delegations.
+Their provisioner is td-firstboot after durable account validation, with
+this root controller setup as a prerequisite. It requires empty domain
+subtrees and reads back controller and ownership changes before reporting
+enrollment success. The exact pre-session runtime contract lives in
+`td-authd/DESIGN.md`. td-svc's console and ordinary-start behavior remains
+as above; application admission must require firstboot success and verify
+placement after td-login. A reservation alone creates no cgroup.
+
 System services get leaves of their own, under `/sys/fs/cgroup/system`. That
 parent is a sibling of the delegated application root rather than a child of
 it — these are the system's services and uid 1000 owns no part of them — and,

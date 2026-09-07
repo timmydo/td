@@ -38,6 +38,17 @@ pub(crate) fn prepare_portal_runtimes(registry: &Registry) -> Result<(), String>
     Ok(())
 }
 
+/// Private client endpoints exist only for an installed application account.
+pub(crate) fn prepare_application_runtime(uid: u32) -> Result<(), String> {
+    if !(65536..=2147483647).contains(&uid) {
+        return Err("invalid application runtime identity".into());
+    }
+    let run = Directory::open(Path::new("/run"), 0, 0)?;
+    let users = runtime_child(&run, "user", (0, 0))?;
+    runtime_child_mode(&users, &uid.to_string(), (uid, uid), 0o700)?;
+    Ok(())
+}
+
 fn runtime_child(parent: &Directory, name: &str, owner: (u32, u32)) -> Result<Directory, String> {
     runtime_child_mode(parent, name, owner, 0o755)
 }

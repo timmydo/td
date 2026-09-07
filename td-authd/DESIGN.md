@@ -310,6 +310,50 @@ active applications: only the current immutable deployment declares those.
 Root and deployment configuration remain trusted; these checks catch
 accidental UID recycling, not a root attacker rewriting the ledger.
 
+### Application runtime preparation
+
+For each installed and validated application account, firstboot prepares
+`/sys/fs/cgroup/td-app-APP_UID` after private state conversion, before its
+state-ready and enrollment markers. It requires one writable cgroup2 mount
+at the unified hierarchy root, binds its major/minor device to the opened
+hierarchy's metadata, and requires the cpu, memory and pids controllers
+already enabled there by td-svc. It never changes the system root's policy.
+An unavailable controller, foreign owner, redirected path, live descendant
+or threaded cgroup fails firstboot before machine-id and host-key
+provisioning as well as withholding enrollment and dependent services.
+The supervisor's independent console-start guarantee remains in force.
+All operations use safe filesystem
+I/O through retained directory and control descriptors. Startup before any
+human/application process and a root-controlled mount hierarchy are trusted.
+This is not live cgroup repair or a credential-switch authority.
+
+The app delegation is an empty domain cgroup. Firstboot enables and reads
+back its three controllers, creates an empty domain `session` leaf without
+subtree controllers, and requires that leaf and its subtree-control/type files to remain
+root-owned. An existing app-owned leaf or subtree control refuses; it is
+never reclaimed as a repair. The app owns the
+leaf's cgroup.procs/cgroup.threads and the delegation's cgroup.procs,
+cgroup.threads and cgroup.subtree_control. Directory ownership is published
+last, after every control assignment reads back. The kernel hierarchy is
+volatile; repeated pre-session preparation accepts those same assignments
+but refuses populated subtrees. No limits are written here: td-jail applies
+its immutable per-instance policy in siblings of session.
+
+Firstboot then prepares root-owned mode-0755 `/run/user` and app-owned
+mode-0700 `/run/user/APP_UID` using the existing pinned runtime provisioner.
+An existing published runtime with wrong ownership or permissions refuses;
+only interrupted root-owned creation is completed. No socket is created.
+Only installed accounts consume reservations; stock application accounts
+remain absent. The final image cutover still owns root launch, socket
+admission, grants and per-app fetch services together.
+
+Before dropping credentials, td-login selects `td-user-1000/session` for
+the human and `td-app-APP_UID/session` for the reserved application UID
+range. The kernel enforces placement and td-login reads membership back.
+Its ordinary placement failure remains a diagnostic for console recovery;
+the application launcher must require the expected membership after the
+credential switch. UID selection creates no account, cgroup or privilege.
+
 ### Application state preparation
 
 An activated application account's home must be exactly

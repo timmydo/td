@@ -15,6 +15,7 @@
 //! program in the image that already has the required key implementation, so this crate
 //! stays dependency-free `std`; credential encryption shares td-secret's implementation.
 
+mod application_runtime;
 mod application_state;
 mod credentials;
 #[path = "../../td-secret/src/crypto.rs"]
@@ -269,6 +270,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
                 .ok_or_else(|| Failure::Failed("active application lacks its configured human migration home".into()))?;
             let home = application_state::prepare(former, &application.name, application.uid)
                 .map_err(Failure::Failed)?;
+            application_runtime::prepare(application.uid).map_err(Failure::Failed)?;
             emit(&format!("TD-APPLICATION-STATE-READY owner={} app={} uid={}\n",
                 application.owner, application.name, application.uid)).map_err(Failure::Failed)?;
             active_homes.insert(application.name, home);

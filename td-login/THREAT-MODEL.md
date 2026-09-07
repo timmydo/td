@@ -61,10 +61,17 @@ and a root-only matching private fixture before boot. Boot health reads those
 fixtures but never rewrites live administrator authorization state.
 
 The resource boundary is also an asset. The application identity must enter
-the delegated `td-user-1000/session` cgroup before it loses root, otherwise a
+its delegated session cgroup before it loses root, otherwise a
 later unprivileged td-jail cannot move its child into a sibling per-instance
 leaf: cgroup v2 requires write authority at the source/destination common
 ancestor.
+The human UID 1000 selects `td-user-1000/session`; application UIDs
+65536 through 2147483647 select `td-app-UID/session`. Every other non-root
+UID reports that no delegation is configured. Firstboot prepares only the
+installed, durably reserved application accounts' cgroups at sysinit, as
+specified in `td-authd/DESIGN.md`; this selector alone activates nothing.
+The root configured launcher must make a failed placement fatal before app
+code runs, as the existing terminal launcher does for the human session.
 
 ## 2. The core invariant: ordering, and then proof
 

@@ -8880,6 +8880,12 @@ deferring them. The shape:
   credentials. Stage 1 therefore starts in the session leaf; when it moves
   blocked stage 2 into a sibling per-instance leaf, the delegated root is the
   source/destination common ancestor and uid 1000 owns the required control files.
+  Activated app accounts select `td-app-APP_UID/session` instead. Firstboot
+  prepares the installed assignments' sibling delegations after td-svc's root
+  controller setup, then their private `/run/user/APP_UID` directories. The
+  pre-session, ownership and refusal rules are in `td-authd/DESIGN.md` under
+  Application runtime preparation. This support activates no stock account;
+  root launch and the grant/socket/fetch-service cutover must follow together.
 - `td-jail` creates one cgroup per instance, writes `memory.max`,
   `memory.high`, `pids.max`, and `cpu.max` from the resolved permission policy,
   then moves stage 2 into it *before* spawning the app, so every descendant is
