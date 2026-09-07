@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::host_bin::{arm_check_child, host_cargo_bin, wait_with_deadline};
+use crate::host_bin::{arm_check_child, host_cargo_bin, vendor_is_complete, wait_with_deadline};
 
 fn fatal(msg: &str) -> String {
     format!("td-builder check: FATAL: {msg}")
@@ -1308,43 +1308,6 @@ fn vendor_argv(job: &[String]) -> &[String] {
     job.split_last().map(|(_, rest)| rest).unwrap_or(&[])
 }
 
-/// td-feed's own completion predicate -- the marker it renames in only once the
-/// whole locked closure is published, AND the lock digest that marker carries.
-///
-/// Presence alone reads both an interrupted warm and a SUPERSEDED one as done.
-/// The second is the one that bites quietly: after a dependency bump the marker
-/// still sits there, this reader would report the vendor complete, the retry
-/// and the report are both suppressed, and the build then fails the vendor
-/// gate's set-equality check every run with nothing here saying why.
-fn vendor_is_complete(root: &Path, dest: &str, lock: Option<&str>) -> bool {
-    let marker = root
-        .join(".td-build-cache/crate-vendor")
-        .join(dest)
-        .join("vendor")
-        .join(".warm-complete");
-    // Bounded and regular-file only, as td-feed's own reader is: a marker
-    // replaced by a symlink to something huge must read as "not warm", not
-    // decide the question by exhausting memory.
-    let Ok(meta) = std::fs::metadata(&marker) else {
-        return false;
-    };
-    if !meta.is_file() || meta.len() > 4096 {
-        return false;
-    }
-    let Ok(marked) = std::fs::read_to_string(&marker) else {
-        return false;
-    };
-    // No lock named means nothing can vouch for the marker; treat it as cold
-    // rather than trust a bare file, which is the fail-open being closed here.
-    let Some(lock) = lock else {
-        return false;
-    };
-    let Ok(want) = crate::sha256::sha256_file(&root.join(lock)) else {
-        return false;
-    };
-    marked.lines().next().map(str::trim) == Some(want.as_str())
-}
-
 /// An already-built `td-recipe-eval`, WITHOUT building one: the operator
 /// override, else the workspace binary `provision_userland` built earlier in
 /// this same run, else the cargo-less host's sentinel.
@@ -1973,6 +1936,28 @@ mod scope_key_tests {
 
 #[cfg(test)]
 mod vendor_prelude_tests {
+    #[test]
+    fn vendor_marker_refuses_symlinks_and_oversized_contents() {
+        let root = std::env::temp_dir().join(format!("td-vendor-marker-{}", std::process::id()));
+        let cache = root.join(".td-build-cache/crate-vendor/td-net/vendor");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(root.join("net")).unwrap();
+        let lock = root.join("net/Cargo.lock");
+        std::fs::write(&lock, "lock fixture").unwrap();
+        let digest = crate::sha256::sha256_file(&lock).unwrap();
+        let marker = cache.join(".warm-complete");
+        let target = root.join("marker-target");
+        std::fs::write(&target, format!("{digest}\n0\n")).unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        assert!(!super::vendor_is_complete(&root, "td-net", Some("net/Cargo.lock")));
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::write(&marker, format!("{digest}\n{}", "x".repeat(4096))).unwrap();
+        assert!(!super::vendor_is_complete(&root, "td-net", Some("net/Cargo.lock")));
+        std::fs::write(&marker, format!("{digest}\n0\n")).unwrap();
+        assert!(super::vendor_is_complete(&root, "td-net", Some("net/Cargo.lock")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
 
     #[test]

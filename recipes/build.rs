@@ -205,8 +205,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 /// sha256 over the evaluator's own sources — everything under this crate's
 /// `src/`, its `build.rs` and manifest, the engine's `src/` and manifest, the
-/// workspace manifest and lock, and `tests/recipe-eval-tool.sh`, which builds
-/// the evaluator for the gate — as (path, file digest) pairs in path order.
+/// workspace manifest and lock, plus the builder preparation implementation
+/// and its script entry point — as (path, file digest) pairs in path order.
 /// The check verdict key holds it in place of reading those trees at run
 /// time: a key read from the tree names the tree at that moment, and a check
 /// whose assertions were compiled from older sources could record a pass
@@ -227,6 +227,7 @@ fn evaluator_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn E
         "Cargo.toml",
         "Cargo.lock",
         "tests/recipe-eval-tool.sh",
+        "builder/src/stage0.rs",
     ]
     .iter()
     .map(|rel| root.join(rel))

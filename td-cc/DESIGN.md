@@ -43,6 +43,7 @@ stages the launcher, Rust, GCC, binutils, and their declared runtime closure
 at their canonical store paths and provides ordinary /bin entry points.
 
 Shipping these tools alone does not make a guest ready for the repository's
-whole workflow. Target-native control-plane helper preparation,
-private writable build storage, and workspace provisioning are separate
-capabilities; the VM manager must not infer readiness from compiler presence.
+whole workflow. The native control-plane helper path uses the same compiler
+launcher for static GNU links. Private writable build storage and workspace
+provisioning remain separate capabilities; the VM manager must not infer
+readiness from compiler presence.

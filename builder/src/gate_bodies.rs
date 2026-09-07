@@ -2347,7 +2347,7 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     let rustc_s = path_str(&rustc_bin)?;
     let cc_s = path_str(&cc_bin)?;
     // The host build scripts / proc-macros link with the provisioned cc; the
-    // MUSL_TARGET binary links itself static via rust-lld (below).
+    // selected target links statically with its provisioned configuration.
     let host_triple = crate::stage0::rustc_host_triple(&rustc_bin)
         .map_err(|e| format!("FAIL: {e}"))?;
     let host_linker_var = crate::stage0::target_linker_var(&host_triple);
@@ -2365,31 +2365,12 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
 
     let old_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{old_path}");
-    // STATICALLY link the evaluator (and its cargo test binaries) for
-    // MUSL_TARGET: `+crt-static` pulls in musl's self-contained libc.a and the
-    // bundled `rust-lld` links it with NO external cc/glibc. A static binary has
-    // an EMPTY runtime closure — no DT_NEEDED, no DT_RUNPATH — so it can never
-    // load libgcc_s.so.1/libc.so.6 from the MUTABLE ~/.guix-home/profile/lib that
-    // a glibc gcc ld-wrapper would otherwise bake in as a runpath and that
-    // vanishes while guix-home reconfigures or GCs ("error while loading shared
-    // libraries: libgcc_s.so.1", exit 127), flaking this control-plane tool and
-    // reddening the check. Fixing it at the SOURCE (crt-static musl)
-    // supersedes pinning a runpath (re #469). The recipes crate is
-    // dependency-free (pure std, no proc-macros).
-    //
-    // Pass the flags via CARGO_ENCODED_RUSTFLAGS, not RUSTFLAGS: run_out_env
-    // OVERLAYS onto this gate's inherited environment, and cargo reads exactly
-    // ONE rustflags source (first-set wins, no merge). An ambient RUSTFLAGS or
-    // CARGO_ENCODED_RUSTFLAGS on the build host would otherwise outrank a
-    // tier-2 RUSTFLAGS and drop the static flags — assert_static would then fail
-    // the gate (fail-closed, but a spurious env-dependent red). With `--target
-    // MUSL_TARGET` set, this global CARGO_ENCODED_RUSTFLAGS applies to the
-    // MUSL_TARGET binary ONLY, leaving the host build script to link via
-    // CARGO_TARGET_<host>_LINKER = the provisioned cc. RUSTC pins the compiler;
-    // RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER are neutralized (empty = "no wrapper"
-    // to cargo) so no inherited rustc or sccache-style wrapper interposes.
-    let encoded_rustflags = crate::stage0::musl_static_encoded_rustflags();
-    let target = crate::stage0::MUSL_TARGET;
+    // Every control-plane helper uses this same static target configuration.
+    // Encoded flags outrank Cargo wrappers; explicit --target leaves host-kind
+    // build scripts dynamic. Clear inherited wrappers and pin their C linker.
+    let encoded_rustflags = crate::stage0::control_plane_flags(&penv, &cc_bin)
+        .map_err(|error| format!("FAIL: {error}"))?;
+    let target = crate::stage0::control_plane_target(&penv);
     let envs: [(&str, &str); 8] = [
         ("PATH", &new_path),
         ("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags),

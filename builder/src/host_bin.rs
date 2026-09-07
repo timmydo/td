@@ -28,54 +28,159 @@ fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
     })
 }
 
-/// Build a td network tool (`dir` = `net`, the merged td-net multicall — the only
-/// crate this is called for, via `check_loop::host_net_applet`) with the HOST cargo, STATICALLY
-/// linked (crt-static against a matched
-/// glibc), and return the binary. Best-effort: any missing piece (no toolchain,
-/// no static glibc, a non-static result) logs and returns `None` so the warm
-/// degrades to the td-built binary or is skipped — it never returns a
-/// DYNAMICALLY linked control-plane tool, which would drag a mutable
-/// host/guix-home runpath and flake with `libgcc_s.so.1` exit 127 (re #469).
+/// td-feed's own completion predicate -- the marker it renames in only once the
+/// whole locked closure is published, AND the lock digest that marker carries.
 ///
-/// Scope: td-feed/td-fetch run on the HOST (the warm's network prep), where NSS
-/// is present, so the static glibc's runtime `dlopen` of NSS modules during DNS
-/// resolves normally. `assert_static` proves an empty STARTUP closure (no
-/// PT_INTERP/DT_NEEDED/run-path — the flake fix), NOT that DNS needs zero runtime
-/// DSOs. td-subst's code compiles into td-net, but the td-subst APPLET is deliberately
-/// NOT resolved here (host_net_applet is called only for the fetch/feed applets): it is
-/// sourced ambiently (`TD_SUBST_BIN`/PATH) and runs inside
-/// the NEWNET-isolated loop sandbox, so its name-resolution/NSS posture is a separate
-/// question (PR #534 discussion) — statically linking that path is out of scope.
+/// Presence alone reads both an interrupted warm and a SUPERSEDED one as done.
+/// The second is the one that bites quietly: after a dependency bump the marker
+/// still sits there, this reader would report the vendor complete, the retry
+/// and the report are both suppressed, and the build then fails the vendor
+/// gate's set-equality check every run with nothing here saying why.
+pub(crate) fn vendor_is_complete(root: &Path, dest: &str, lock: Option<&str>) -> bool {
+    let marker = root
+        .join(".td-build-cache/crate-vendor")
+        .join(dest)
+        .join("vendor")
+        .join(".warm-complete");
+    // Require a regular marker entry and bound the actual read as well.
+    let Ok(meta) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > 4096 {
+        return false;
+    }
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(&marker) else {
+        return false;
+    };
+    let mut marked = String::new();
+    if file.take(4097).read_to_string(&mut marked).is_err() || marked.len() > 4096 {
+        return false;
+    }
+    // No lock named means nothing can vouch for the marker; treat it as cold
+    // rather than trust a bare file, which is the fail-open being closed here.
+    let Some(lock) = lock else {
+        return false;
+    };
+    let Ok(want) = crate::sha256::sha256_file(&root.join(lock)) else {
+        return false;
+    };
+    marked.lines().next().map(str::trim) == Some(want.as_str())
+}
+
+struct NativeVendor(PathBuf);
+
+impl Drop for NativeVendor {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl NativeVendor {
+    fn directory(&self) -> PathBuf {
+        self.0.join("sources")
+    }
+}
+
+fn prepare_native_vendor(root: &Path) -> Result<NativeVendor, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    if !vendor_is_complete(root, "td-net", Some("net/Cargo.lock")) {
+        return Err("native td-net vendor is incomplete or stale; prepare it with the installed td-feed first".into());
+    }
+    let scratch = root.join(".td-build-cache").join(format!(
+        "native-vendor-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&scratch)
+        .map_err(|e| format!("create native vendor {}: {e}", scratch.display()))?;
+    let prepared = NativeVendor(scratch);
+    let lock = std::fs::read_to_string(root.join("net/Cargo.lock"))
+        .map_err(|e| format!("read native td-net Cargo.lock: {e}"))?;
+    crate::build::validate_cargo_lock_sources(&lock, &[])?;
+    let archives = prepared.0.join("archives");
+    // td-feed publishes archives. Verify private copies before extraction.
+    crate::stage_verified_vendor(
+        &root.join(".td-build-cache/crate-vendor/td-net/vendor"),
+        &lock,
+        &archives,
+        false,
+    )?;
+    let sources = prepared.directory();
+    std::fs::create_dir(&sources).map_err(|e| format!("create native Cargo sources: {e}"))?;
+    for (index, (name, version, checksum)) in crate::cargo_lock::parse_lock_checksums(&lock)
+        .iter()
+        .enumerate()
+    {
+        let nv = format!("{name}-{version}");
+        let unpack = prepared.0.join(format!("unpack-{index}"));
+        std::fs::create_dir(&unpack).map_err(|e| format!("create crate unpack directory: {e}"))?;
+        crate::tar::extract_tar_gz(&archives.join(format!("{nv}.crate")), &unpack)?;
+        let package = unpack.join(&nv);
+        let entries = std::fs::read_dir(&unpack)
+            .map_err(|e| format!("inspect unpacked crate {nv}: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read unpacked crate {nv}: {e}"))?;
+        if entries.len() != 1
+            || !std::fs::symlink_metadata(&package)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+        {
+            return Err(format!(
+                "crate {nv} must unpack to exactly its own directory"
+            ));
+        }
+        let checksum_path = package.join(".cargo-checksum.json");
+        // Never follow an archive-provided checksum symlink.
+        match std::fs::remove_file(&checksum_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("replace crate {nv} checksum: {e}")),
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&checksum_path)
+            .map_err(|e| format!("create crate {nv} checksum: {e}"))?;
+        write!(file, "{{\"files\":{{}},\"package\":\"{checksum}\"}}")
+            .map_err(|e| format!("write crate {nv} checksum: {e}"))?;
+        std::fs::rename(&package, sources.join(&nv))
+            .map_err(|e| format!("publish private crate {nv}: {e}"))?;
+    }
+    Ok(prepared)
+}
+
+/// Build the network preparation helper with the provisioned toolchain.
+/// Only net/td-net is supported; both callers pin these arguments.
+/// td uses its native GNU target; other hosts use musl and its bundled linker.
+/// Both require an empty ELF startup closure before returning a helper. Static
+/// GNU linkage does not rule out libc loading NSS modules during name lookup;
+/// these helpers run on the build host, with its matching libc runtime.
 ///
-/// Unlike the pure-std tools, the network crates (ureq/rustls/ring) pull in
-/// PROC-MACROS that must compile for the host compiler, so `+crt-static` cannot
-/// go in a global RUSTFLAGS (it would try to statically link the proc-macro
-/// dylibs — "does not support these crate types"). Instead pass `--target
-/// x86_64-unknown-linux-musl` and set the static flags via CARGO_ENCODED_RUSTFLAGS
-/// (`stage0::musl_static_encoded_rustflags`): with `--target` set they apply to the
-/// MUSL_TARGET binary + its normal deps ONLY, leaving host-kind build scripts /
-/// proc-macros dynamic. The MUSL_TARGET link uses rustc's bundled `rust-lld` and
-/// musl's self-contained `libc.a` (no external glibc, no linker-glibc matching), so
-/// the result is fully static with an EMPTY runtime closure. CARGO_ENCODED_RUSTFLAGS
-/// is cargo's HIGHEST-precedence flag source — the one form a guix cargo wrapper
-/// (which re-injects `RUSTFLAGS="… -C linker=<gcc> -rpath …"` at runtime) cannot
-/// outrank; a per-target CARGO_TARGET_<musl>_RUSTFLAGS would lose to that global
-/// RUSTFLAGS, dropping `rust-lld` and baking a mutable guix-home DT_RUNPATH that
-/// fails assert_static. The compiler is pinned too: RUSTC to the provisioned rustc and
-/// RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER removed, so no ambient rustc or wrapper
-/// interposes on the control-plane build. ring's `cc-rs` build script compiles
-/// ring's C/asm FOR the musl target, so its CC/AR env forms (CC/HOST_CC/TARGET_CC
-/// and the per-target CC_<musl> spellings → the toolchain's `gcc`, AR alongside —
-/// every form cc-rs consults is pinned so an ambient one cannot outrank them). The
-/// HOST build scripts / proc-macros still link with the provisioned cc via
-/// CARGO_TARGET_<host-triple>_LINKER; `cc` may be absent by that name (a guix
-/// profile exposes only `gcc`), so it is pinned explicitly.
-pub(crate) fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) -> Option<PathBuf> {
+/// Explicit --target keeps static target flags off host build scripts and proc
+/// macros. Pin the compiler, C tools, wrappers, linker and highest-precedence
+/// encoded flags so ambient Cargo settings cannot replace the selected tools.
+/// Every cc-rs target spelling is pinned because target-specific settings take
+/// precedence over plain CC/AR. Failure is reported before the caller's existing
+/// fallback; a dynamically linked helper is never returned.
+pub(crate) fn host_cargo_bin(
+    root: &Path,
+    dir: &str,
+    bin: &str,
+    deadline: Option<Instant>,
+) -> Option<PathBuf> {
     let penv = crate::stage0::ProvisionEnv::from_env(root);
     let rustpath = match crate::stage0::provision_rust(&penv) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("td-builder check: static {bin}: no rust toolchain ({e}) — skipping host build");
+            eprintln!(
+                "td-builder check: static {bin}: no rust toolchain ({e}) — skipping host build"
+            );
             return None;
         }
     };
@@ -112,29 +217,39 @@ pub(crate) fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option
             return None;
         }
     };
-    let musl = crate::stage0::MUSL_TARGET;
-    // The MUSL_TARGET binary gets the static flags (via CARGO_ENCODED_RUSTFLAGS —
-    // see the doc comment); the host build-script link gets the provisioned cc as
-    // its per-target linker.
+    let target = crate::stage0::control_plane_target(&penv);
+    // Target artifacts get static flags; host build scripts use the C linker.
     let host_linker_var = crate::stage0::target_linker_var(&host_triple);
-    let encoded_rustflags = crate::stage0::musl_static_encoded_rustflags();
-    // cc-rs (ring's C build) resolves the compiler/archiver from the FIRST of
-    // several env forms, and the per-target-suffixed forms outrank the plain
-    // CC/HOST_CC/AR we set. ring's C compiles FOR the musl target, so pin every
-    // form cc-rs consults for that triple (both dash and underscore spellings) to
-    // the matched toolchain so an ambient CC_<triple>/AR_<triple>/HOST_AR cannot
-    // slip a different compiler into a control-plane binary (review PR #534).
-    let musl_us = musl.replace('-', "_");
-    let cc_target = format!("CC_{musl}");
-    let cc_target_us = format!("CC_{musl_us}");
-    let ar_target = format!("AR_{musl}");
-    let ar_target_us = format!("AR_{musl_us}");
+    let encoded_rustflags = match crate::stage0::control_plane_flags(&penv, &cc) {
+        Ok(flags) => flags,
+        Err(error) => {
+            eprintln!("td-builder check: static {bin}: {error} — skipping host build");
+            return None;
+        }
+    };
+    // Pin every cc-rs spelling, including target-specific overrides.
+    let target_us = target.replace('-', "_");
+    let cc_target = format!("CC_{target}");
+    let cc_target_us = format!("CC_{target_us}");
+    let ar_target = format!("AR_{target}");
+    let ar_target_us = format!("AR_{target_us}");
     let ambient_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{ambient_path}");
 
+    let native_vendor = if penv.native_td {
+        match prepare_native_vendor(root) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                eprintln!("td-builder check: static {bin}: {error}");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
     let mut command = Command::new(&cargo);
     command
-        .args(["build", "--release", "--quiet", "--target", musl])
+        .args(["build", "--release", "--quiet", "--target", target])
         .current_dir(root.join(dir))
         .env("PATH", &new_path)
         // Pin the compiler itself: an inherited RUSTC would build with a
@@ -159,12 +274,36 @@ pub(crate) fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option
         .env(&host_linker_var, &cc)
         .env("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags)
         .stdin(Stdio::null());
+    if let Some(prepared) = &native_vendor {
+        let path = match prepared.directory().canonicalize() {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("td-builder check: static {bin}: resolve native vendor: {e}");
+                return None;
+            }
+        };
+        let Some(path) = path.to_str() else {
+            eprintln!("td-builder check: static {bin}: native vendor path is not UTF-8");
+            return None;
+        };
+        let directory = td_engine::json::Json::Str(path.to_string()).to_json_string();
+        command.args([
+            "--offline",
+            "--frozen",
+            "--config",
+            "source.crates-io.replace-with=\"td-vendor\"",
+            "--config",
+            &format!("source.td-vendor.directory={directory}"),
+        ]);
+    }
     arm_check_child(&mut command);
     let child = command.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("td-builder check: static {bin}: cannot spawn cargo ({e}) — skipping host build");
+            eprintln!(
+                "td-builder check: static {bin}: cannot spawn cargo ({e}) — skipping host build"
+            );
             return None;
         }
     };
@@ -174,7 +313,7 @@ pub(crate) fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option
     let p = root
         .join(dir)
         .join("target")
-        .join(musl)
+        .join(target)
         .join("release")
         .join(bin);
     if !p.is_file() {
@@ -203,7 +342,10 @@ pub(crate) fn host_td_net(root: &Path) -> Option<PathBuf> {
 /// Wait for a warm child under an optional deadline: block when there is
 /// none; past it (or on a wait error), kill the child and report failure —
 /// a killed child is a failed warm step, never a failed check.
-pub(crate) fn wait_with_deadline(child: &mut std::process::Child, deadline: Option<Instant>) -> bool {
+pub(crate) fn wait_with_deadline(
+    child: &mut std::process::Child,
+    deadline: Option<Instant>,
+) -> bool {
     let Some(d) = deadline else {
         return child.wait().map(|st| st.success()).unwrap_or(false);
     };
@@ -236,4 +378,125 @@ pub(crate) fn arm_check_child(cmd: &mut Command) {
     // hosted runner dies. PR_SET_PDEATHSIG is reset across fork, so arming only
     // the runner in check_host is not enough for provisioning and warm tools.
     crate::sandbox::die_with_parent(cmd);
+}
+
+#[cfg(test)]
+mod native_vendor_tests {
+    use super::*;
+    use std::fs;
+
+    fn archive() -> Vec<u8> {
+        let mut tar = Vec::new();
+        for (name, data) in [
+            (
+                "tinydep-0.1.0/Cargo.toml",
+                "[package]\nname = \"tinydep\"\nversion = \"0.1.0\"\n",
+            ),
+            ("tinydep-0.1.0/src/lib.rs", "pub fn value() -> u8 { 7 }\n"),
+        ] {
+            let mut header = [0u8; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+            header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            tar.extend_from_slice(&header);
+            tar.extend_from_slice(data.as_bytes());
+            tar.resize(tar.len().div_ceil(512) * 512, 0);
+        }
+        tar.resize(tar.len() + 1024, 0);
+        let len = u16::try_from(tar.len()).unwrap();
+        let mut gzip = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1];
+        gzip.extend_from_slice(&len.to_le_bytes());
+        gzip.extend_from_slice(&(!len).to_le_bytes());
+        gzip.extend_from_slice(&tar);
+        gzip.extend_from_slice(&crate::crc32::crc32(&tar).to_le_bytes());
+        gzip.extend_from_slice(&(tar.len() as u32).to_le_bytes());
+        gzip
+    }
+
+    fn fixture(tag: &str) -> NativeVendor {
+        let root =
+            std::env::temp_dir().join(format!("td-native-vendor-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let fixture = NativeVendor(root);
+        let vendor = fixture.0.join(".td-build-cache/crate-vendor/td-net/vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::create_dir_all(fixture.0.join("net/src")).unwrap();
+        fs::write(vendor.join("tinydep-0.1.0.crate"), archive()).unwrap();
+        let checksum = crate::sha256::sha256_file(&vendor.join("tinydep-0.1.0.crate")).unwrap();
+        fs::write(fixture.0.join("net/Cargo.toml"), "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[dependencies]\ntinydep = \"=0.1.0\"\n[workspace]\n").unwrap();
+        fs::write(
+            fixture.0.join("net/src/lib.rs"),
+            "pub fn value() -> u8 { tinydep::value() }\n",
+        )
+        .unwrap();
+        let lock = format!("version = 4\n\n[[package]]\nname = \"consumer\"\nversion = \"0.1.0\"\ndependencies = [\"tinydep\"]\n\n[[package]]\nname = \"tinydep\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n");
+        fs::write(fixture.0.join("net/Cargo.lock"), lock).unwrap();
+        let lock_digest = crate::sha256::sha256_file(&fixture.0.join("net/Cargo.lock")).unwrap();
+        fs::write(vendor.join(".warm-complete"), format!("{lock_digest}\n1\n")).unwrap();
+        fixture
+    }
+
+    #[test]
+    fn prepared_archives_resolve_in_cargo_offline_and_cleanup() {
+        let fixture = fixture("resolve");
+        let prepared = prepare_native_vendor(&fixture.0).unwrap();
+        let path = prepared.directory();
+        assert!(path.join("tinydep-0.1.0/src/lib.rs").is_file());
+        let cargo_home = fixture.0.join("cargo-home");
+        fs::create_dir(&cargo_home).unwrap();
+        let directory = td_engine::json::Json::Str(path.to_str().unwrap().into()).to_json_string();
+        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args([
+                "metadata",
+                "--offline",
+                "--frozen",
+                "--format-version=1",
+                "--config",
+                "source.crates-io.replace-with=\"td-vendor\"",
+                "--config",
+                &format!("source.td-vendor.directory={directory}"),
+            ])
+            .current_dir(fixture.0.join("net"))
+            .env("CARGO_HOME", cargo_home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("tinydep"));
+        drop(prepared);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepared_archives_refuse_missing_extra_and_tampered_inputs() {
+        let fixture = fixture("refusals");
+        let vendor = fixture.0.join(".td-build-cache/crate-vendor/td-net/vendor");
+        let archive_path = vendor.join("tinydep-0.1.0.crate");
+        fs::write(&archive_path, b"tampered").unwrap();
+        assert!(prepare_native_vendor(&fixture.0)
+            .err()
+            .unwrap()
+            .contains("committed-lock"));
+        fs::remove_file(&archive_path).unwrap();
+        assert!(prepare_native_vendor(&fixture.0).is_err());
+        fs::write(&archive_path, archive()).unwrap();
+        fs::write(vendor.join("extra-0.1.0.crate"), archive()).unwrap();
+        assert!(prepare_native_vendor(&fixture.0).is_err());
+        assert!(fs::read_dir(fixture.0.join(".td-build-cache"))
+            .unwrap()
+            .all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("native-vendor-")));
+    }
 }

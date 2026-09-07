@@ -6,6 +6,13 @@
 //! td-builder itself, verbs `stage0-place` / `provision-rust` /
 //! `provision-cc`. Same contract, no `sh`:
 //!
+//! The standard td system (`ID=td` in `/etc/os-release`) uses its installed
+//! source-built GNU Rust/C toolchain instead. It never installs a musl target
+//! or replacement Rust toolchain. Both configurations produce statically linked
+//! helpers checked with `assert_static`; selecting the native configuration
+//! grants no target-artifact provenance. The musl details below describe other
+//! hosts. See td-review/VM.md for the native development contract.
+//!
 //! - `provision_rust` / `provision_cc` — resolve the SEED build's toolchain
 //!   guix-free and return a PATH fragment (colon-joined bin dirs). Resolution
 //!   order (first hit wins; DESIGN §Provenance head; human 2026-07-01 "we can
@@ -59,6 +66,8 @@ pub(crate) struct ProvisionEnv {
     pub(crate) rust_version: String,
     /// The PATH searched for rustc/cargo/rustup and the system cc.
     pub(crate) search_path: String,
+    /// The standard td system uses its source-built GNU toolchain.
+    pub(crate) native_td: bool,
 }
 
 impl ProvisionEnv {
@@ -71,8 +80,47 @@ impl ProvisionEnv {
             cc_home: nonempty("TD_CC_HOME"),
             rust_version: nonempty("TD_RUST_VERSION").unwrap_or_else(|| "1.96.0".to_string()),
             search_path: std::env::var("PATH").unwrap_or_default(),
+            native_td: std::fs::read_to_string("/etc/os-release")
+                .is_ok_and(|text| is_td_system(&text)),
         }
     }
+}
+
+// This selects a compiler configuration, never artifact provenance or authority.
+fn is_td_system(text: &str) -> bool {
+    let mut ids = text.lines().filter_map(|line| line.strip_prefix("ID="));
+    matches!(ids.next(), Some("td" | "\"td\"" | "'td'")) && ids.next().is_none()
+}
+
+fn native_std_in(toolchain: &Toolchain) -> Result<(), ProvisionErr> {
+    let rustc = Path::new(&toolchain.bin).join("rustc");
+    let host = rustc_host_triple(&rustc).map_err(ProvisionErr::Broken)?;
+    if host != GNU_TARGET {
+        return Err(ProvisionErr::Broken(format!(
+            "td's native control-plane build requires {GNU_TARGET}, found {host}"
+        )));
+    }
+    let lib = Path::new(&toolchain.sysroot)
+        .join("lib/rustlib")
+        .join(GNU_TARGET)
+        .join("lib");
+    let entries = std::fs::read_dir(&lib)
+        .map_err(|error| ProvisionErr::Broken(format!("read {}: {error}", lib.display())))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| ProvisionErr::Broken(error.to_string()))?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("libstd-") && name.ends_with(".rlib"))
+            && entry.path().is_file()
+        {
+            return Ok(());
+        }
+    }
+    Err(ProvisionErr::Broken(format!(
+        "no native Rust standard library in {}",
+        lib.display()
+    )))
 }
 
 fn is_exec(p: &Path) -> bool {
@@ -288,17 +336,6 @@ fn forward_to_stderr(out: &std::process::Output) {
     let _ = err.write_all(&out.stderr);
 }
 
-/// Tag a failed child's message as a provisioning gap only on gate-run's OWN
-/// two-part test: code 69 AND the sentinel `unprovisioned_exit` prints on its way
-/// out. The verb re-emits that sentinel downstream, so trusting the code alone
-/// would let any other 69 mint one and turn a regression into a tolerated skip.
-fn tag_child_failure(out: &std::process::Output, msg: String) -> String {
-    if td_engine::exit::child_reported_host_gap(out.status.code(), &out.stdout, &out.stderr) {
-        return format!("{}{msg}", td_engine::exit::UNPROVISIONED_TAG);
-    }
-    msg
-}
-
 /// Why [`provision_rust`]/[`provision_cc`] could not return a toolchain. The two
 /// cases map to DIFFERENT exit codes so an in-jail compile gate can tell "nothing
 /// to run here" from "a real failure", instead of silencing both as a skip:
@@ -340,13 +377,11 @@ impl std::fmt::Display for ProvisionErr {
     }
 }
 
-/// Resolve a guix-free Rust toolchain (rustc + cargo) for the td-builder SEED
-/// build and return a PATH fragment putting both on PATH. The toolchain is the
-/// host-supplied control-plane seed the trust model expects; it MUST ship the
-/// [`MUSL_TARGET`] static std (`ensure_musl_target`). See the module doc for the
-/// resolution order. NEVER invokes guix/guile. A resolved-but-unusable toolchain
-/// is [`ProvisionErr::Broken`] (RED); only a wholly absent one is
-/// [`ProvisionErr::Unavailable`] (a tolerated skip).
+/// Resolve the control-plane Rust toolchain and return its bin PATH fragment.
+/// Require the selected standard library: GNU on td, musl elsewhere. The
+/// module documentation specifies lookup order. Never invokes Guix/Guile.
+/// A resolved but unusable toolchain is `Broken` (RED); an absent toolchain
+/// is `Unavailable`, which callers can report as a provisioning gap.
 pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
     // 1. Explicitly provided toolchain.
     if let Some(home) = &env.rust_home {
@@ -358,7 +393,11 @@ pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr>
             )));
         }
         let tc = toolchain_at(&bp.join("rustc")).map_err(ProvisionErr::Broken)?;
-        musl_std_in(&tc.sysroot).map_err(|e| ProvisionErr::Broken(e.into_message()))?;
+        if env.native_td {
+            native_std_in(&tc)?;
+        } else {
+            musl_std_in(&tc.sysroot).map_err(|e| ProvisionErr::Broken(e.into_message()))?;
+        }
         return Ok(tc.bin);
     }
 
@@ -382,6 +421,10 @@ pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr>
             };
             // Only a MISSING std is worth a `rustup target add`; a sysroot that could
             // not be asked is a different fault and reds as it stands.
+            if env.native_td {
+                native_std_in(&tc)?;
+                return Ok(frag);
+            }
             match musl_std_in(&tc.sysroot) {
                 Ok(()) => {}
                 Err(MuslErr::Undiagnosed(m)) => return Err(ProvisionErr::Broken(m)),
@@ -408,6 +451,12 @@ pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr>
         }
     }
 
+    if env.native_td {
+        return Err(ProvisionErr::Unavailable(
+            "td native Rust/Cargo are missing; restore the standard system toolchain".into(),
+        ));
+    }
+
     // 3. rustup — fetch the pinned toolchain + the musl target (a host without
     //    rust on PATH).
     if let Some(rustup) = find_in_path(&env.search_path, "rustup") {
@@ -417,7 +466,14 @@ pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr>
         let ver = &env.rust_version;
         let broken = |m: String| ProvisionErr::Broken(m);
         let install = Command::new(&rustup)
-            .args(["toolchain", "install", ver, "--profile", "minimal", "--no-self-update"])
+            .args([
+                "toolchain",
+                "install",
+                ver,
+                "--profile",
+                "minimal",
+                "--no-self-update",
+            ])
             .stdin(Stdio::null())
             .output()
             .map_err(|e| broken(format!("spawn {}: {e}", rustup.display())))?;
@@ -472,11 +528,9 @@ fn has_cc(bin_dir: &Path) -> bool {
     is_exec(&bin_dir.join("gcc")) || is_exec(&bin_dir.join("cc"))
 }
 
-/// Resolve a C toolchain (gcc/cc) for the td-builder SEED build. Its role after
-/// the musl cutover is NARROW: it links the HOST build script (`build.rs`,
-/// compiled for the host triple, never placed) and compiles ring's C/asm in the
-/// network tools (`host_cargo_bin`). It is NOT the target link driver — the
-/// bundled `rust-lld` links the [`MUSL_TARGET`] binary directly. NEVER invokes guix.
+/// Resolve a C toolchain for host build scripts and network-helper C/assembly.
+/// On td this also links the static GNU target; other hosts use musl's bundled
+/// linker for the target. Never invokes Guix.
 pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
     // 1. Explicitly provided toolchain.
     if let Some(home) = &env.cc_home {
@@ -511,13 +565,40 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
     ))
 }
 
-/// The target triple every host-side control-plane binary is built for. Its
+/// The default target on hosts other than td. Its
 /// rust-std (`rust-std-x86_64-unknown-linux-musl`) ships the self-contained musl
 /// `libc.a` + crt objects, so a `+crt-static` build links a pure-`std` binary
 /// with an EMPTY runtime closure — no host glibc, no gcc-driven crt, and no guix
 /// `/gnu/store` glibc:static pin (the retired seed). This is the source of the
 /// static libc that replaced `provision_glibc_static` (re #469).
 pub(crate) const MUSL_TARGET: &str = "x86_64-unknown-linux-musl";
+pub(crate) const GNU_TARGET: &str = "x86_64-unknown-linux-gnu";
+
+pub(crate) fn control_plane_target(env: &ProvisionEnv) -> &'static str {
+    if env.native_td {
+        GNU_TARGET
+    } else {
+        MUSL_TARGET
+    }
+}
+
+pub(crate) fn control_plane_flags(env: &ProvisionEnv, cc: &Path) -> Result<String, String> {
+    if !env.native_td {
+        return Ok(musl_static_encoded_rustflags());
+    }
+    let linker = cc
+        .to_str()
+        .filter(|path| !path.contains('\u{1f}'))
+        .ok_or_else(|| "native linker path cannot be encoded as Rust flags".to_string())?;
+    Ok([
+        "-Ctarget-feature=+crt-static".to_string(),
+        "-Crelocation-model=static".to_string(),
+        format!("-Clinker={linker}"),
+        "-Cforce-frame-pointers=yes".to_string(),
+        "-Cdebuginfo=line-tables-only".to_string(),
+    ]
+    .join("\u{1f}"))
+}
 
 /// The rustc flags that fully-static-link a control-plane binary for
 /// [`MUSL_TARGET`], as an ordered arg list: `+crt-static` pulls in musl's
@@ -545,8 +626,8 @@ fn musl_static_flags() -> [&'static str; 6] {
 /// `CARGO_TARGET_<triple>_RUSTFLAGS` is OUTRANKED by that global `RUSTFLAGS` and
 /// silently loses `rust-lld`, relinking with the gcc driver and baking in a
 /// mutable guix-home DT_RUNPATH that fails `assert_static`). Every host-side
-/// control-plane build site (`bootstrap_stage0`, `host_cargo_bin`, the recipe-eval
-/// gate, `tests/recipe-eval-tool.sh`) sets exactly this so each links IDENTICALLY.
+/// control-plane build site selects these flags through `control_plane_flags`
+/// when using musl; the native GNU configuration pins its C linker instead.
 pub(crate) fn musl_static_encoded_rustflags() -> String {
     musl_static_flags().join("\u{1f}")
 }
@@ -610,13 +691,9 @@ pub(crate) fn target_linker_var(triple: &str) -> String {
 /// rustc/cargo (+ a host cc to link the build script); it runs under a CLEARED
 /// environment with only the provisioned toolchain on PATH (the old `env -i`).
 ///
-/// The build targets [`MUSL_TARGET`] with [`musl_static_encoded_rustflags`]: a
-/// fully static binary with an EMPTY runtime closure, so staging it into a build
-/// sandbox pulls in NO host `lib/` — the sole way to keep host libraries (and
-/// stray +x libtool archives beside them) out of the sandbox entirely (re #469).
-/// The MUSL_TARGET link uses the bundled `rust-lld` (no external cc); the host
-/// `build.rs` (compiled for the host triple, never placed) links with the
-/// provisioned cc. The result is asserted static before it is used.
+/// Both target configurations require a static binary with no startup runtime
+/// closure. Musl uses its bundled linker; native td uses the declared C linker.
+/// The host build script links with the provisioned cc and is never placed.
 pub(crate) fn bootstrap_stage0(
     root: &Path,
     penv: &ProvisionEnv,
@@ -630,10 +707,8 @@ pub(crate) fn bootstrap_stage0(
     // FAILURE → the (blocking) bootstrap gate REDs, never a silent skip.
     let rustpath = provision_rust(penv).map_err(|e| e.tagged())?;
     let ccpath = provision_cc(penv).map_err(|e| e.tagged())?;
-    // The host toolchain may legitimately live under a guix profile (the
-    // host-supplied control-plane seed the trust model expects); its provenance
-    // is NOT what "guix-free" gates. The guix-free guarantee is the STATIC musl
-    // OUTPUT (asserted below), which embeds no runtime guix dependency.
+    // A host toolchain may live under a Guix profile. The placed helper's
+    // static startup closure, checked below, keeps host runtime DSOs out.
     let bootpath = format!("{rustpath}:{ccpath}");
 
     let work = scratch_dir("stage0-boot")?;
@@ -650,23 +725,23 @@ pub(crate) fn bootstrap_stage0(
         .or_else(|| find_in_path(&bootpath, "gcc"))
         .ok_or_else(|| format!("no cc/gcc on the provisioned toolchain PATH ({bootpath})"))?;
     let host_triple = rustc_host_triple(&rustc)?;
+    let target = control_plane_target(penv);
+    let flags = control_plane_flags(penv, &cc)?;
     let build = Command::new(&cargo)
         .env_clear()
         .env("PATH", &bootpath)
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
         .env("HOME", &work)
         .env("CARGO_HOME", work.join("cargo"))
         .env(
             "CARGO_BUILD_JOBS",
             crate::check_memory::build_jobs().to_string(),
         )
-        // CARGO_ENCODED_RUSTFLAGS (highest precedence) — NOT a per-target
-        // CARGO_TARGET_<musl>_RUSTFLAGS: a guix cargo is a wrapper that re-injects
-        // `RUSTFLAGS="… -C linker=<gcc> -rpath …"` at RUNTIME (after our env_clear),
-        // and that global RUSTFLAGS OUTRANKS the per-target var, silently dropping
-        // `rust-lld` and baking a mutable guix-home DT_RUNPATH that fails
-        // assert_static. With `--target MUSL_TARGET`, these flags hit the MUSL_TARGET
-        // binary ONLY; the host build script/proc-macros link with the provisioned cc.
-        .env("CARGO_ENCODED_RUSTFLAGS", musl_static_encoded_rustflags())
+        // Encoded flags outrank host Cargo wrappers. Explicit --target keeps
+        // static flags off host-kind build scripts and proc macros.
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
         .env(target_linker_var(&host_triple), &cc)
         .args([
             "build",
@@ -674,7 +749,7 @@ pub(crate) fn bootstrap_stage0(
             "--offline",
             "--frozen",
             "--target",
-            MUSL_TARGET,
+            target,
             "--manifest-path",
         ])
         .arg(root.join("builder/Cargo.toml"))
@@ -689,10 +764,7 @@ pub(crate) fn bootstrap_stage0(
         return Err("the stage0 cargo build failed (see stderr)".to_string());
     }
 
-    let built = work
-        .join("target")
-        .join(MUSL_TARGET)
-        .join("release/td-builder");
+    let built = work.join("target").join(target).join("release/td-builder");
     let bin_dir = out_dir.join("bin");
     std::fs::create_dir_all(&bin_dir).map_err(|e| format!("mkdir {}: {e}", bin_dir.display()))?;
     let dest = bin_dir.join("td-builder");
@@ -714,7 +786,7 @@ pub(crate) fn bootstrap_stage0(
         forward_to_stderr(&smoke);
         return Err(format!(
             "the placed static stage0 builder {} does not run (exit {:?}) — the provisioned \
-             rust toolchain's {MUSL_TARGET} std may be broken or incompatible (re #469)",
+             rust toolchain's {target} std may be broken or incompatible (re #469)",
             dest.display(),
             smoke.status.code()
         ));
@@ -891,7 +963,7 @@ fn embedded_include_paths(files: &[PathBuf]) -> Result<Vec<String>, String> {
 
 /// The evaluator's compile inputs — the mirror of the stage0 roots below, with
 /// `recipes/` in place of `builder/`, PLUS everything the crate embeds (above)
-/// and the tool script itself, whose static-linking contract a memo hit skips.
+/// and the helper implementation/entry script a memo hit skips.
 /// The seed-digest table is `include_str!`d into td-recipe-eval too, so a new
 /// seed pin must not leave a stale compiled table in force.
 fn recipe_eval_fp_roots(root: &Path) -> Result<Vec<String>, String> {
@@ -905,6 +977,7 @@ fn recipe_eval_fp_roots(root: &Path) -> Result<Vec<String>, String> {
         "Cargo.lock",
         "seed/seed-digests.txt",
         "tests/recipe-eval-tool.sh",
+        "builder/src/stage0.rs",
     ]
     .iter()
     .map(|p| root.join(p).to_string_lossy().into_owned())
@@ -1007,47 +1080,110 @@ pub(crate) fn recipe_eval_place(root: &Path, base: &Path) -> Result<String, Stri
         base.display()
     );
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("tests/recipe-eval-tool.sh")
-        .arg(base)
-        .current_dir(root)
-        .stdin(Stdio::null());
-    // The tool resolves its toolchain through `$TD_BUILDER_SELF provision-{rust,cc}`.
-    // We ARE a td-builder: name ourselves rather than rely on the gate-run export,
-    // so a dev invocation works too.
-    if let Ok(self_exe) = std::env::current_exe() {
-        cmd.env("TD_BUILDER_SELF", self_exe);
-    }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("spawn sh tests/recipe-eval-tool.sh: {e}"))?;
-    if !out.status.success() {
-        forward_to_stderr(&out);
-        let msg = "recipe-eval-tool.sh could not build td-recipe-eval (see stderr)".to_string();
-        return Err(tag_child_failure(&out, msg));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let bin = stdout
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .ok_or_else(|| "recipe-eval-tool.sh printed no td-recipe-eval path".to_string())?;
-    if !is_exec(Path::new(bin)) {
-        return Err(format!(
-            "recipe-eval-tool.sh printed `{bin}', which is not executable"
-        ));
-    }
-    let digest = crate::sha256::sha256_file(Path::new(bin))
-        .map_err(|e| format!("sha256 {bin}: {e}"))?;
+    let built = build_recipe_eval(root, base, &ProvisionEnv::from_env(root))?;
+    let bin = built.to_str().ok_or("evaluator path is not UTF-8")?;
+    let digest =
+        crate::sha256::sha256_file(Path::new(bin)).map_err(|e| format!("sha256 {bin}: {e}"))?;
     std::fs::write(&meta, format!("{fp}\n{bin}\n{digest}\n"))
         .map_err(|e| format!("write {}: {e}", meta.display()))?;
     ensure_recipe_eval_sentinel(base, bin)?;
     Ok(bin.to_string())
 }
 
+/// Build the evaluator directly; the legacy script is only a CLI entry shim.
+fn build_recipe_eval(root: &Path, base: &Path, penv: &ProvisionEnv) -> Result<PathBuf, String> {
+    let rustpath = provision_rust(penv).map_err(|error| error.tagged())?;
+    let ccpath = provision_cc(penv).map_err(|error| error.tagged())?;
+    let cargo = find_in_path(&rustpath, "cargo").ok_or("no provisioned cargo")?;
+    let rustc = find_in_path(&rustpath, "rustc").ok_or("no provisioned rustc")?;
+    let cc = find_in_path(&ccpath, "cc")
+        .or_else(|| find_in_path(&ccpath, "gcc"))
+        .ok_or("no provisioned C compiler")?;
+    let host = rustc_host_triple(&rustc)?;
+    let target = control_plane_target(penv);
+    let flags = control_plane_flags(penv, &cc)?;
+    let base = std::fs::canonicalize(base)
+        .map_err(|error| format!("resolve {}: {error}", base.display()))?;
+    let home = base.join("home");
+    std::fs::create_dir_all(&home)
+        .map_err(|error| format!("create evaluator home {}: {error}", home.display()))?;
+    let log_path = base.join("build.log");
+    let log = std::fs::File::create(&log_path)
+        .map_err(|error| format!("create evaluator log {}: {error}", log_path.display()))?;
+    let stderr = log.try_clone()
+        .map_err(|error| format!("clone evaluator log {}: {error}", log_path.display()))?;
+    let status = Command::new(cargo)
+        .args([
+            "build",
+            "--release",
+            "--offline",
+            "--frozen",
+            "--target",
+            target,
+            "--manifest-path",
+        ])
+        .arg(root.join("recipes/Cargo.toml"))
+        .arg("--target-dir")
+        .arg(base.join("target"))
+        .current_dir(root)
+        .env(
+            "PATH",
+            format!(
+                "{rustpath}:{ccpath}:{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("RUSTC", rustc)
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .env(target_linker_var(&host), cc)
+        .env("CARGO_HOME", home)
+        .env(
+            "CARGO_BUILD_JOBS",
+            crate::check_memory::build_jobs().to_string(),
+        )
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(stderr)
+        .status()
+        .map_err(|error| format!("spawn evaluator Cargo build: {error}"))?;
+    if !status.success() {
+        report_evaluator_log_tail(&base.join("build.log"));
+        return Err(format!(
+            "evaluator Cargo build failed ({status}); see {}",
+            base.join("build.log").display()
+        ));
+    }
+    let binary = base
+        .join("target")
+        .join(target)
+        .join("release/td-recipe-eval");
+    if !is_exec(&binary) {
+        return Err(format!("evaluator is not executable: {}", binary.display()));
+    }
+    crate::elf::assert_static(&binary)?;
+    Ok(binary)
+}
+
+fn report_evaluator_log_tail(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    let result = (|| -> std::io::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(16 * 1024)))?;
+        let mut tail = Vec::with_capacity(16 * 1024);
+        file.take(16 * 1024).read_to_end(&mut tail)?;
+        Ok(tail)
+    })();
+    match result {
+        Ok(tail) => eprintln!("evaluator build log tail:\n{}", String::from_utf8_lossy(&tail)),
+        Err(error) => eprintln!("could not read evaluator build log {}: {error}", path.display()),
+    }
+}
+
 /// Keep `recipe-eval-path` naming the binary the memo just served. The tool
-/// script writes it on a BUILD, but a memo hit skips the script — and cache-lib's
+/// build and memo-hit paths both maintain it because cache-lib's
 /// `load_recipe_eval` and `resolve_recipe_eval` both read the sentinel, not the
 /// memo, so a hit that left it absent or stale would send them elsewhere.
 fn ensure_recipe_eval_sentinel(base: &Path, bin: &str) -> Result<(), String> {
@@ -1152,7 +1288,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     }
 
     // 2. stage0 places ITSELF into the td store (its OWN store-add-builder;
-    //    refs are scanned vs the seed-scan dir's entries — a readdir). The musl
+    //    refs are scanned vs the seed-scan dir's entries — a readdir). The
     //    static builder embeds NO external store paths in its runtime closure, so
     //    the scan is vacuous: pass an EMPTY dir so no candidate matches (in
     //    particular the guix rust-sysroot strings in std panic metadata are NOT
@@ -1166,7 +1302,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
         .arg(&s0_dir)
         .arg(&store)
         .arg(&db)
-        .arg(&seedscan) // SEED-scan dir: empty — a musl static builder has no external store refs
+        .arg(&seedscan) // Empty: a checked static builder has no startup runtime dependencies.
         .current_dir(root)
         .stdin(Stdio::null())
         .output()
@@ -1349,7 +1485,101 @@ mod tests {
             cc_home: None,
             rust_version: "1.96.0".to_string(),
             search_path: String::new(),
+            native_td: false,
         }
+    }
+
+    #[test]
+    fn native_td_selection_requires_one_exact_system_id() {
+        assert!(is_td_system("NAME=td\nID=td\n"));
+        assert!(is_td_system("ID=\"td\"\n"));
+        assert!(is_td_system("ID='td'\n"));
+        for other in ["ID_LIKE=td\n", "ID=other\n", "ID=td\nID=other\n", "ID=td-extra\n"] {
+            assert!(!is_td_system(other));
+        }
+    }
+
+    fn native_fixture(tag: &str) -> (PathBuf, ProvisionEnv) {
+        let root = scratch(tag);
+        let bin = root.join("toolchain/bin");
+        let sysroot = root.join("toolchain");
+        write_exec(&bin.join("rustc"), &format!(
+            "case \"$1\" in --print) echo '{}' ;; -vV) echo 'host: {GNU_TARGET}' ;; esac\n",
+            sysroot.display()
+        ));
+        exec_file(&bin.join("cargo"));
+        exec_file(&bin.join("cc"));
+        let lib = sysroot.join("lib/rustlib").join(GNU_TARGET).join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("libstd-fixture.rlib"), b"!<arch>\n").unwrap();
+        let mut env = base_env();
+        env.native_td = true;
+        env.search_path = bin.to_string_lossy().into_owned();
+        (root, env)
+    }
+
+    #[test]
+    fn td_uses_installed_gnu_std_without_adding_a_musl_target() {
+        let (root, mut env) = native_fixture("native-td-resolve");
+        assert_eq!(provision_rust(&env).unwrap(), env.search_path);
+        assert!(!musl_libc_path(&root.join("toolchain")).exists());
+        env.rust_home = Some(root.join("toolchain").to_string_lossy().into_owned());
+        assert_eq!(provision_rust(&env).unwrap(), env.search_path);
+        std::fs::remove_file(root.join("toolchain/lib/rustlib").join(GNU_TARGET).join("lib/libstd-fixture.rlib")).unwrap();
+        assert!(matches!(provision_rust(&env), Err(ProvisionErr::Broken(_))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn td_refuses_a_compiler_for_another_host_target() {
+        let (root, env) = native_fixture("native-td-wrong-target");
+        write_exec(&root.join("toolchain/bin/rustc"), &format!(
+            "case \"$1\" in --print) echo '{}' ;; -vV) echo 'host: aarch64-unknown-linux-gnu' ;; esac\n",
+            root.join("toolchain").display()
+        ));
+        assert!(matches!(provision_rust(&env), Err(ProvisionErr::Broken(_))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn td_does_not_download_a_replacement_toolchain_when_missing() {
+        let root = scratch("native-no-rust");
+        let marker = root.join("called");
+        write_exec(&root.join("rustup"), &format!(
+            "case \"$1\" in --td-fixture-probe) ;; *) echo called > '{}' ;; esac\n", marker.display()
+        ));
+        let mut env = base_env();
+        env.native_td = true;
+        env.search_path = root.to_string_lossy().into_owned();
+        assert!(matches!(provision_rust(&env), Err(ProvisionErr::Unavailable(_))));
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_flags_pin_the_linker_without_splitting_spaces() {
+        let mut env = base_env();
+        env.native_td = true;
+        let flags = control_plane_flags(&env, Path::new("/declared path/bin/cc")).unwrap();
+        assert_eq!(control_plane_target(&env), GNU_TARGET);
+        assert!(flags.split('\u{1f}').any(|arg| arg == "-Clinker=/declared path/bin/cc"));
+        assert!(control_plane_flags(&env, Path::new("/bad\u{1f}path")).is_err());
+        assert!(!flags.contains("rust-lld"));
+    }
+
+    #[test]
+    fn evaluator_cargo_failure_cannot_become_a_provisioning_skip() {
+        let (root, env) = native_fixture("native-td-cargo-failure");
+        write_exec(&root.join("toolchain/bin/cargo"), &format!(
+            "case \"$1\" in build) echo '{}'; exit 69 ;; esac\n",
+            td_engine::exit::UNPROVISIONED_SENTINEL
+        ));
+        let error = build_recipe_eval(&root, &root, &env).unwrap_err();
+        assert!(error.contains("Cargo build failed"), "{error}");
+        assert!(!error.starts_with(td_engine::exit::UNPROVISIONED_TAG));
+        let missing = build_recipe_eval(&root, &root, &base_env()).unwrap_err();
+        assert!(missing.starts_with(td_engine::exit::UNPROVISIONED_TAG));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // Pin the exact `\x1f`-field layout of the encoded musl rustflags (review PR
@@ -1671,11 +1901,7 @@ mod tests {
         // rustup names the SAME rustc through a symlinked parent.
         std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
         let rustup = d.join("rustup");
-        write_fake_rustup(
-            &rustup,
-            &d.join("link/toolchain/bin/rustc"),
-            &toolchain,
-        );
+        write_fake_rustup(&rustup, &d.join("link/toolchain/bin/rustc"), &toolchain);
         let mut env = base_env();
         env.search_path = format!("{}:{}", rbin.display(), rustup.display());
         assert_eq!(provision_rust(&env).unwrap(), rbin.to_string_lossy());
@@ -1809,40 +2035,6 @@ mod tests {
         }
     }
 
-    /// A tolerated skip must stay EVIDENCE, not inference. `recipe-eval-place`
-    /// re-emits the sentinel for whatever it tags, so tagging on the exit code
-    /// alone would let any other 69 in the tool script mint a skip and hide a
-    /// regression behind it — the exact failure the two-part test exists to stop.
-    #[test]
-    fn only_a_69_that_carries_the_sentinel_is_tagged_unprovisioned() {
-        use std::os::unix::process::ExitStatusExt;
-        let sentinel = td_engine::exit::UNPROVISIONED_SENTINEL;
-        let tag = td_engine::exit::UNPROVISIONED_TAG;
-        // ExitStatus::from_raw takes a wait(2) status word: code << 8.
-        let out = |code: i32, stdout: &str, stderr: &str| std::process::Output {
-            status: std::process::ExitStatus::from_raw(code << 8),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        };
-        let m = || "boom".to_string();
-
-        let tagged = tag_child_failure(&out(69, "", &format!("nope\n{sentinel}\n")), m());
-        assert_eq!(tagged, format!("{tag}boom"), "69 + sentinel on stderr is the skip");
-        let tagged = tag_child_failure(&out(69, sentinel, ""), m());
-        assert_eq!(tagged, format!("{tag}boom"), "the sentinel counts on stdout too");
-
-        assert_eq!(
-            tag_child_failure(&out(69, "", "cargo: error: linker not found\n"), m()),
-            "boom",
-            "a 69 with no sentinel is SOME OTHER failure and must red, not skip"
-        );
-        assert_eq!(
-            tag_child_failure(&out(1, "", &format!("{sentinel}\n")), m()),
-            "boom",
-            "the sentinel alone does not make a skip; the code must agree"
-        );
-    }
-
     /// The evaluator memo is the reason a warm tree needs no toolchain, so it
     /// must reuse ONLY an intact placement of the CURRENT recipes source — and
     /// name the reason when it will not, for the same reason stage0 does.
@@ -1863,7 +2055,14 @@ mod tests {
         write_exec(&bin, "different bytes");
         let swapped = recipe_eval_memo_hit(&meta, "fp1").unwrap_err();
         assert!(swapped.contains("not the one memoized"), "{swapped}");
-        std::fs::write(&meta, format!("fp1\n{bin_s}\n{}\n", crate::sha256::sha256_file(&bin).unwrap())).unwrap();
+        std::fs::write(
+            &meta,
+            format!(
+                "fp1\n{bin_s}\n{}\n",
+                crate::sha256::sha256_file(&bin).unwrap()
+            ),
+        )
+        .unwrap();
         // An edited recipes tree must rebuild rather than evaluate with the old
         // binary — a stale evaluator would emit yesterday's recipes.
         let moved = recipe_eval_memo_hit(&meta, "fp2").unwrap_err();

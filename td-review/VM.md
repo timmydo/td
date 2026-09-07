@@ -265,7 +265,41 @@ Private development-store placement and VM data-capacity management remain
 required before reporting the complete repository workflow ready. The standard
 Rust toolchain also builds cargo-clippy and clippy-driver from its pinned
 source release, with an offline clean/denied-lint/repaired recipe probe.
-The target-native control-plane helper path is still outstanding.
+On a standard td system, the control-plane helper resolver selects the
+installed `x86_64-unknown-linux-gnu` Rust standard library and native C linker.
+It recognizes the exact `ID=td` system identity in `/etc/os-release`; this
+selects build configuration and grants no artifact provenance or authority.
+Missing or broken native tools fail provisioning instead of downloading a
+musl target or replacement toolchain. Other hosts retain their musl helper
+configuration.
+
+The builder, evaluator, recipe test binaries, and network preparation helper
+use the same selected target and static-link policy. Each placed helper still
+must have no ELF interpreter, dynamic dependencies, or runtime search path;
+GNU static linkage is not a claim that libc name resolution can never load
+runtime modules. The standard td image provides that libc runtime. Compiler,
+linker, wrapper settings, and Cargo flags are pinned at helper build sites.
+The native network helper builds offline and frozen from the verified
+`td-net` vendor directory prepared through td-feed. Both the prelude and
+native compiler path require its completion record to match the current lock.
+A missing, incomplete, or stale vendor is a preparation gap; use the installed
+td-feed/VM artifact preparation path first. Cargo never fetches registry
+packages to repair this gap. The completion record is a local preparation
+record, not authentication or protection from another writer with the same
+filesystem authority. Preparation copies the complete locked archive set into
+private scratch, verifies each copy against Cargo.lock, and extracts the
+packages into a separate Cargo directory source. Cargo receives that extracted
+tree with package checksums, never td-feed's directory of `.crate` files.
+The scratch remains private to the invocation and is removed after the build.
+Evaluator preparation is Rust-owned; the existing script entry point delegates
+to its memoized builder operation. Its source fingerprint covers that Rust
+implementation as well as the script entry point. The helpers remain control
+plane programs: compiling one inside td does not admit it as a target recipe
+tool or replace the source-bootstrap artifact graph.
+
+These helpers alone do not establish the complete repository workflow. Private
+writable store placement, capacity, workspace provisioning, and a two-guest
+full-check/Git round trip remain separate acceptance requirements.
 
 ## Copy/paste before account linking
 
