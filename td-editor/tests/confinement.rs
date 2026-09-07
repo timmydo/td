@@ -475,6 +475,40 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         .split("\n    fn ")
         .next()
         .unwrap();
+    let pointer = production
+        .split("fn control_pointer_event(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    let cleanup = pointer.find("self.control_mutation_accepted()").unwrap();
+    let mut prior = 0;
+    for guard in [
+        "control_pointer_available()",
+        "generation != self.frames.generation()?",
+        "revision_point(tab, revision)",
+        "self.ui.editor().active() != Some(tab)",
+        "check_revision(gesture)",
+        ".checked_add(8)",
+    ] {
+        let at = pointer.find(guard).unwrap();
+        assert!(prior <= at && at < cleanup, "{guard}");
+        prior = at;
+    }
+    assert!(pointer.contains("self.control_input_error = Some(detail)"));
+    assert!(pointer.contains("self.decoded_pointer_action(phase, fixed_x, fixed_y, extend)"));
+    assert!(!pointer.contains("Event::") && !pointer.contains("activation_serial ="));
+    assert!(!pointer.contains("self.pointer.x =") && !pointer.contains("self.pointer.y ="));
+    let physical = production
+        .split("fn pointer_action(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(physical
+        .contains("self.decoded_pointer_action(phase, self.pointer.x, self.pointer.y, extend)"));
     assert!(
         dispatch.find("request.is_mutating()").unwrap()
             < dispatch.find("Operation::Open(path)").unwrap()

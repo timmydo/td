@@ -35,8 +35,10 @@ Reload outcomes. Ordinary Open/Save As/Dictionary path prompts also have
 revision-bound remote answers; Dictionary jobs report bounded outcomes.
 Decoded key control drives editing, menus, Find, Replace, numeric and command
 entry with an exact native redraw-generation fence. It requires real input
-readiness and cannot answer file/close/conflict flows. Pointer control remains
-unimplemented; other UI prompts still expose only coarse presence flags.
+readiness and cannot answer file/close/conflict flows. Decoded pointer
+press/move/release share native hit testing with separately tracked remote
+drags; wheel control remains deferred. Other UI prompts still expose only
+coarse presence flags.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -2206,8 +2208,16 @@ fatal state and stop further control/drawing before nonzero shutdown, just as
 physical input does; a partially written Wayland message cannot be resumed.
 The redraw fence may starve slow clients across caret blinks; it promises no
 bounded admission progress. A separate input-context fence is deferred.
-Pointer control remains the
-next admission increment; prompt entries still have no text query.
+Decoded pointer press/move/
+release also pin the native generation and active tab/revision, require a
+real pointer enter, and use the shared native hover/hit-testing path. They do
+not move the physical cursor or manufacture its coordinates/serials. A
+separate owner-bound remote drag can continue only the controller gesture it
+started; physical input and ordinary input cancellation end it. Native modals
+refuse pointer actions, so dirty close still requires explicit token answers.
+CONTROL.md defines coordinate bounds, gesture lifetime, input/clipboard
+cleanup, delivery-only replies and fatal adapter errors. Wheel control and
+prompt-entry text queries remain later work.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 

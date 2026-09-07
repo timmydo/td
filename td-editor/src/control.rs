@@ -123,6 +123,15 @@ pub enum Operation {
         generation: u64,
         chord: String,
     },
+    Pointer {
+        tab: TabId,
+        revision: u64,
+        generation: u64,
+        phase: crate::ui::PointerPhase,
+        x: u32,
+        y: u32,
+        extend: bool,
+    },
     WaitFrame(u64),
     CheckSpelling {
         tab: TabId,
@@ -199,6 +208,24 @@ impl std::fmt::Debug for Operation {
                 .field("revision", revision)
                 .field("generation", generation)
                 .field("chord_bytes", &chord.len())
+                .finish(),
+            Self::Pointer {
+                tab,
+                revision,
+                generation,
+                phase,
+                x,
+                y,
+                extend,
+            } => f
+                .debug_struct("Pointer")
+                .field("tab", tab)
+                .field("revision", revision)
+                .field("generation", generation)
+                .field("phase", phase)
+                .field("x", x)
+                .field("y", y)
+                .field("extend", extend)
                 .finish(),
             Self::WaitFrame(generation) => f.debug_tuple("WaitFrame").field(generation).finish(),
             Self::CheckSpelling { tab, revision } => f
@@ -431,6 +458,20 @@ impl Request {
                         chord,
                     }
                 }
+                "pointer" => Operation::Pointer {
+                    tab: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    revision: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    generation: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    phase: match args.next().ok_or(Error::Protocol)? {
+                        "press" => crate::ui::PointerPhase::Press,
+                        "move" => crate::ui::PointerPhase::Move,
+                        "release" => crate::ui::PointerPhase::Release,
+                        _ => return Err(Error::InvalidArgument),
+                    },
+                    x: pointer_pixel(args.next().ok_or(Error::Protocol)?)?,
+                    y: pointer_pixel(args.next().ok_or(Error::Protocol)?)?,
+                    extend: boolean(args.next().ok_or(Error::Protocol)?)?,
+                },
                 "wait-frame" => Operation::WaitFrame(decimal(args.next().ok_or(Error::Protocol)?)?),
                 "check-spelling" => Operation::CheckSpelling {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -552,6 +593,7 @@ impl Request {
             | Operation::CloseTab { .. }
             | Operation::DialogAnswer { .. }
             | Operation::Key { .. }
+            | Operation::Pointer { .. }
             | Operation::CheckSpelling { .. }
             | Operation::SpellingResults { .. }
             | Operation::WaitFrame(_) => Err(Error::Unavailable),
@@ -595,6 +637,7 @@ impl Request {
                     | Operation::CloseTab { .. }
                     | Operation::DialogAnswer { .. }
                     | Operation::Key { .. }
+                    | Operation::Pointer { .. }
             )
     }
 
@@ -748,6 +791,19 @@ impl Request {
         })?;
         Ok(())
     }
+}
+
+fn pointer_pixel(value: &str) -> Result<u32> {
+    let pixel = u32::try_from(decimal(value)?).map_err(|_| Error::InvalidArgument)?;
+    pointer_fixed(pixel)?;
+    Ok(pixel)
+}
+
+pub(crate) fn pointer_fixed(pixel: u32) -> Result<i32> {
+    i32::try_from(pixel)
+        .ok()
+        .and_then(|pixel| pixel.checked_mul(256))
+        .ok_or(Error::InvalidArgument)
 }
 
 pub(crate) fn validate_chord(chord: &str) -> Result<()> {
@@ -959,6 +1015,44 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn decoded_pointer_grammar_bounds_pixels_phases_and_native_authority() {
+        let request = Request::parse(b"1\t8\tpointer\t2\t3\t4\tpress\t12\t34\t1").unwrap();
+        assert_eq!(
+            request.operation,
+            Operation::Pointer {
+                tab: 2,
+                revision: 3,
+                generation: 4,
+                phase: crate::ui::PointerPhase::Press,
+                x: 12,
+                y: 34,
+                extend: true,
+            }
+        );
+        assert!(request.is_mutating() && !request.is_edit());
+        let mut ui = Controller::default();
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        for (tail, error) in [
+            ("press\t0\t0", Error::Protocol),
+            ("press\t0\t0\t0\textra", Error::Protocol),
+            ("press\t-1\t0\t0", Error::Protocol),
+            ("press\t0\t0\t2", Error::Protocol),
+            ("enter\t0\t0\t0", Error::InvalidArgument),
+            ("press\t8388608\t0\t0", Error::InvalidArgument),
+            ("release\t0\t4294967296\t0", Error::InvalidArgument),
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t8\tpointer\t2\t3\t4\t{tail}").as_bytes()).unwrap_err(),
+                Refusal { id: 8, error }
+            );
+        }
+        assert_eq!(pointer_fixed(8_388_607), Ok(2_147_483_392));
+        assert_eq!(pointer_fixed(8_388_608), Err(Error::InvalidArgument));
+        assert!(Request::parse(b"1\t8\tpointer\t2\t3\t4\tmove\t8388607\t0\t0").is_ok());
+    }
 
     #[test]
     fn decoded_key_grammar_is_bounded_private_and_native_only() {

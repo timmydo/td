@@ -7,7 +7,8 @@ close-dialog Cancel/Discard/Save/path, conflict Cancel/Reload/Save As and file
 Open/Save/Save As are connected, including ordinary Open/Save As/Dictionary
 path answers. Decoded keys drive ordinary editing and menu/Find/Replace/
 numeric/command input under the stricter input contract below. Decoded pointer
-control remains unimplemented.
+press/move/release also share native hit testing; wheel control remains later
+work.
 Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
@@ -76,6 +77,7 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID dialog-answer DIALOG TAB REVISION discard-reload` | Confirm the conflict's second question before replacing unsaved text. |
 | `1 ID dialog-answer DIALOG TAB REVISION save-as HEX_PATH` | Save the conflict target to a new literal destination. |
 | `1 ID key TAB REVISION GENERATION HEX_CHORD` | Deliver one decoded native chord with an exact redraw-generation fence. |
+| `1 ID pointer TAB REVISION GENERATION PHASE X Y EXTEND` | Deliver a bounded pointer press/move/release with the same generation fence. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
@@ -563,6 +565,85 @@ or clipboard offers the compositor did not supply. No new clipboard RPC is
 added. Replay keeps its separate, controller-only `key TAB REV HEX_CHORD`
 grammar; its keys do not perform native file or clipboard I/O.
 
+## Decoded pointer input
+
+`1 ID pointer TAB REVISION GENERATION PHASE X Y EXTEND` supplies one native
+pointer action. The phase is exactly `press`, `move` or `release`; `EXTEND`
+is exactly `0|1` and affects only a text press, like Shift-click. Coordinates
+are unsigned integer surface pixels, not buffer pixels, text offsets or
+24.8 wire integers. Each is 0..=8,388,607, admitting an exact checked 24.8
+conversion. Negative syntax is `protocol`; a representable decimal outside
+the coordinate range is `invalid-argument`. Existing decimal overflow is
+`protocol`. Bad phase is `invalid-argument`; bad flag/arity is `protocol`.
+Programmatically constructed requests get the same coordinate bound.
+No pointer-enter/leave, button identity, physical serial, axis frame or
+compositor cursor-warp request can be supplied. Wheel control is deferred.
+
+Availability requires configuration, an actual pointer device and a current
+compositor enter for this surface, no closed/modal state and no dynamic
+physical activation serial. Unlike keys, keyboard focus/map readiness is
+unnecessary: ordinary pointer selection already works without them. State's
+`pointer-ready=0|1` exposes availability, not counter/target admission.
+Menus accept hover/activation; all other native modals refuse `unavailable`,
+including file/close/conflict flows. Pointer coordinates never approve a
+discard or bypass an explicit dialog answer. A tab close mark starts the
+ordinary close coordinator, including for an inactive dirty tab.
+
+A menu press can enter Find/Replace/numeric/command entry, where pointer
+actions no longer work. Only decoded keys or physical input can dismiss
+those prompts today. Without keyboard readiness, a pointer-only client can
+therefore enter a prompt it cannot dismiss remotely until readiness returns.
+Prompt-entry answers remain later work; do not activate those menu items
+when the client cannot supply ordinary prompt input.
+
+The nonzero exact native-generation fence and active tab/revision admission
+match decoded keys. The named active tab is the input context, not necessarily
+the tab hit by a tab-strip click. Hit testing resolves that tab under the
+same fence. Counter admission conservatively reserves eight possible dispatches
+before input cleanup. Refused requests preserve selection, modal state, Paste,
+repeat and any live gesture. Oversized surfaces/coordinates never bypass the
+ordinary geometry and document bounds; out-of-text drag motion clamps through
+the shared controller. Fractional physical coordinates retain their existing
+strict midpoint rules in the common native path.
+
+A text press captures a separate editor-bound remote drag point only when
+the controller actually starts a drag. A tab/menu/chrome press does not create
+one. State exposes `pointer-drag=TAB,REVISION` for a still-valid active point
+or `-`; this never reports a physical gesture. Move/Release can continue only
+that remote point, revalidating its owner/revision and controller drag target.
+A changed point refuses with its model error, and a lost controller gesture
+is `unavailable`; a fresh Press can replace it. Release ends the remote drag.
+Without an owned remote gesture, Move may hover a menu and Release is ignored;
+neither may continue an existing physical drag. Each request still needs fresh
+native-generation admission; the gesture is not a generation bypass.
+
+Remote input cancels prior physical drag/wheel/repeat/Paste context, including
+the adapter's remembered held flag. It never changes the physical pointer's
+remembered coordinates or enter serial, claims a physical button press, or
+moves the compositor's visible cursor. Every later real
+pointer event or decoded native key cancels a remote gesture. Semantic edits
+and modal transitions use their existing input cancellation. A lost socket
+reply/disconnect does not synthesize Release or Undo; an admitted gesture is
+window state, not connection-owned state. A later remote Press, key, semantic
+edit or physical input can end it. No timer, worker or new gesture allocation
+loop is introduced.
+
+Every admitted phase, even an ignored Move/Release, cancels a Paste that was
+already pending. It is an explicit remote input boundary, not a physical
+button-release acknowledgement. Activate a menu item with a single Press;
+omit redundant Move/Release phases after the menu consumes its click.
+Pointer and native input share menu hover, hit testing, selection/drag and
+close routing. Copy/Cut through a menu still requires an actual physical
+serial. Paste can use only an existing compositor offer under the ordinary
+focused data-device policy and remains live after the action that starts it.
+Post-action search/spelling/job observation does not cancel that new
+transfer. As with decoded keys, `1 ID ok` with a
+trailing empty field means delivery, not an effective click, file completion
+or presentation. Native adapter errors are fatal under the same contract;
+an error reply may be lost during shutdown. Native pointer-started file/scan
+actions create no remote job receipt. This is decoded editor input, not raw
+Wayland injection or control of another application.
+
 ## Revision-checked editing
 
 All requests below name a stable tab ID and its expected text revision.
@@ -909,8 +990,8 @@ pending dialog/job or spelling range is serialized by this controller-only
 snapshot. Its generation means local UI state, **not** a submitted buffer,
 frame callback or scanout. The native extension below adds its own redraw
 generations/snapshots, coarse flags, bounded spelling/file outcomes and close
-and conflict/path dialog identity/answers. Decoded key admission is connected;
-pointer admission remains later work before claiming complete remote control.
+and conflict/path dialog identity/answers. Decoded key and pointer admission
+are connected; wheel control and prompt-entry text queries remain later work.
 
 ## Experimental native adapter
 
@@ -954,8 +1035,10 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-key` | Explicit implemented adapter identity. |
+| `adapter=native-pointer` | Explicit implemented adapter identity. |
 | `key-ready=0\|1` | Native key availability, before target/generation/counter validation. |
+| `pointer-ready=0\|1` | Native pointer availability, before target/generation/counter validation. |
+| `pointer-drag=TAB,REVISION` or `-` | Valid remote drag, never a physical gesture. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |

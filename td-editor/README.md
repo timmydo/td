@@ -49,8 +49,8 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-Native query/edit/file/dialog and decoded-key control are available explicitly.
-Remote pointer input, GPU rendering and td-mail integration remain
+Native query/edit/file/dialog and decoded key/pointer control are explicit.
+Remote wheel input, GPU rendering and td-mail integration remain
 unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
@@ -114,6 +114,11 @@ Native adapter errors stop the window; conservative generation changes can
 starve slow key clients. Prefer semantic commands when available.
 Copy/Cut still require a physical press; Paste uses an existing compositor
 offer. See CONTROL.md for exact fields, refusal and lost-reply semantics.
+Decoded pointer press/move/release shares native hit testing and menu/close
+routing. It requires real pointer presence and exact native generation, and
+keeps remote drags separate from physical input without moving the cursor.
+Close confirmation still requires explicit dialog answers. Wheel control and
+prompt-entry text queries are not connected yet.
 `check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback

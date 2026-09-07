@@ -330,6 +330,7 @@ struct Window {
     xrgb: bool,
     argb: bool,
     pointer: Pointer,
+    control_pointer: Option<crate::model::RevisionPoint>,
     cursor_image: Option<CursorImage>,
     frames: crate::control_frame::Frames,
     callback: Option<u32>,
@@ -451,6 +452,7 @@ impl Window {
             xrgb: false,
             argb: false,
             pointer: Pointer::default(),
+            control_pointer: None,
             cursor_image: None,
             frames: crate::control_frame::Frames::default(),
             callback: None,
@@ -897,6 +899,7 @@ impl Window {
             self.set_kind(device, Kind::RetiredPointer)?;
         }
         self.pointer = Pointer::default();
+        self.control_pointer = None;
         self.ui.dispatch(Event::CancelPointer).map_err(error)?;
         Ok(())
     }
@@ -914,6 +917,7 @@ impl Window {
     }
 
     fn clear_pointer_gesture(&mut self) {
+        self.control_pointer = None;
         self.pointer.held = false;
         self.pointer.wheel = crate::pointer::Wheel::default();
         self.pointer.wheel_target = None;
@@ -932,6 +936,9 @@ impl Window {
         let event = crate::pointer::decode(&message)?;
         if self.pointer.device != Some(message.object) {
             return Ok(());
+        }
+        if self.control_pointer.is_some() {
+            self.stop_pointer();
         }
         if let P::Enter { surface, .. } | P::Leave(surface) = event {
             if surface != SURFACE {
@@ -957,23 +964,7 @@ impl Window {
             P::Motion(x, y) => {
                 self.pointer.x = x;
                 self.pointer.y = y;
-                if let Some(menu) = &mut self.menu {
-                    if let Some(index) = menu.hit(
-                        self.ui.geometry(),
-                        i64::from(x).div_euclid(256),
-                        i64::from(y).div_euclid(256),
-                    ) {
-                        if menu
-                            .group
-                            .items()
-                            .get(index)
-                            .is_some_and(|item| menu.enabled(*item))
-                        {
-                            self.frames.invalidate(menu.selected != index);
-                            menu.selected = index;
-                        }
-                    }
-                } else if self.pointer.held {
+                if !self.menu_hover(x, y) && self.pointer.held {
                     self.pointer_action(crate::ui::PointerPhase::Move)?;
                 }
             }
@@ -1038,9 +1029,48 @@ impl Window {
         Ok(())
     }
 
+    fn menu_hover(&mut self, x: i32, y: i32) -> bool {
+        let Some(menu) = &mut self.menu else {
+            return false;
+        };
+        if let Some(index) = menu.hit(
+            self.ui.geometry(),
+            i64::from(x).div_euclid(256),
+            i64::from(y).div_euclid(256),
+        ) {
+            if menu
+                .group
+                .items()
+                .get(index)
+                .is_some_and(|item| menu.enabled(*item))
+            {
+                self.frames.invalidate(menu.selected != index);
+                menu.selected = index;
+            }
+        }
+        true
+    }
+
     fn pointer_action(&mut self, phase: crate::ui::PointerPhase) -> Result<()> {
-        let raw_x = i64::from(self.pointer.x).div_euclid(256);
-        let raw_y = i64::from(self.pointer.y).div_euclid(256);
+        let extend = self.input.focused
+            && self.input.synchronized
+            && self
+                .input
+                .map
+                .as_ref()
+                .is_some_and(|map| map.pointer_extend(self.input.modifiers));
+        self.decoded_pointer_action(phase, self.pointer.x, self.pointer.y, extend)
+    }
+
+    fn decoded_pointer_action(
+        &mut self,
+        phase: crate::ui::PointerPhase,
+        fixed_x: i32,
+        fixed_y: i32,
+        extend: bool,
+    ) -> Result<()> {
+        let raw_x = i64::from(fixed_x).div_euclid(256);
+        let raw_y = i64::from(fixed_y).div_euclid(256);
         if phase == crate::ui::PointerPhase::Press && self.menu_pointer(raw_x, raw_y)? {
             self.pointer.held = false;
             return Ok(());
@@ -1053,8 +1083,8 @@ impl Window {
         };
         let revision = self.ui.editor().document(tab).map_err(error)?.revision();
         let geometry = self.ui.geometry();
-        let x = i64::from(self.pointer.x).div_euclid(256);
-        let y = i64::from(self.pointer.y).div_euclid(256);
+        let x = raw_x;
+        let y = raw_y;
         let area = geometry.document();
         // Keep chrome hit boxes on integer pixels; inside text preserve strict
         // midpoint ties even for signed 24.8 subpixel coordinates.
@@ -1063,7 +1093,7 @@ impl Window {
             && y >= area.y
             && y < area.y + i64::from(area.height);
         let x = if text || phase != crate::ui::PointerPhase::Press {
-            let ceil = x + i64::from(self.pointer.x.rem_euclid(256) != 0);
+            let ceil = x + i64::from(fixed_x.rem_euclid(256) != 0);
             if text {
                 ceil.min(area.x + i64::from(area.width) - 1)
             } else {
@@ -1072,13 +1102,6 @@ impl Window {
         } else {
             x
         };
-        let extend = self.input.focused
-            && self.input.synchronized
-            && self
-                .input
-                .map
-                .as_ref()
-                .is_some_and(|map| map.pointer_extend(self.input.modifiers));
         let before = self.ui.generation();
         let outcome = match self.ui.dispatch(Event::Pointer {
             tab,
@@ -1237,6 +1260,9 @@ impl Window {
     }
 
     fn chord(&mut self, chord: &str, repeated: bool) -> Result<bool> {
+        if self.control_pointer.is_some() {
+            self.stop_pointer();
+        }
         if matches!(chord, "Escape" | "C-g") && !repeated {
             self.clipboard.incoming = None;
             self.searches.cancel_wrap();
@@ -1636,6 +1662,16 @@ impl Window {
             }
             .response();
         }
+        if matches!(request.operation, crate::control::Operation::Pointer { .. }) {
+            return match self.control_pointer_event(&request.operation) {
+                Ok(()) => format!("1\t{}\tok\t", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if let crate::control::Operation::Key {
             tab,
             revision,
@@ -1883,6 +1919,91 @@ impl Window {
             Some(detail) => Err(detail.clone()),
             None => Ok(()),
         }
+    }
+
+    fn control_pointer_available(&self) -> bool {
+        !self.closed
+            && self.control_input_error.is_none()
+            && !self.pointer_modal()
+            && self.configured
+            && self.pointer.device.is_some()
+            && self.pointer.enter.is_some()
+            && self.activation_serial.is_none()
+    }
+
+    fn control_pointer_event(
+        &mut self,
+        operation: &crate::control::Operation,
+    ) -> crate::Result<()> {
+        use crate::ui::PointerPhase;
+        let crate::control::Operation::Pointer {
+            tab,
+            revision,
+            generation,
+            phase,
+            x,
+            y,
+            extend,
+        } = *operation
+        else {
+            return Err(crate::Error::InvalidArgument);
+        };
+        if !self.control_pointer_available() {
+            return Err(crate::Error::Unavailable);
+        }
+        if generation == 0 {
+            return Err(crate::Error::InvalidArgument);
+        }
+        if generation != self.frames.generation()? {
+            return Err(crate::Error::StaleRevision);
+        }
+        let point = self.ui.editor().revision_point(tab, revision)?;
+        if self.ui.editor().active() != Some(tab) {
+            return Err(crate::Error::InvalidArgument);
+        }
+        let fixed_x = crate::control::pointer_fixed(x)?;
+        let fixed_y = crate::control::pointer_fixed(y)?;
+        let continuing = phase != PointerPhase::Press && self.control_pointer.is_some();
+        if continuing {
+            let gesture = self
+                .control_pointer
+                .as_ref()
+                .ok_or(crate::Error::Unavailable)?;
+            self.ui.editor().check_revision(gesture)?;
+            if gesture.tab != tab || self.ui.pointer_drag() != Some(tab) {
+                return Err(crate::Error::Unavailable);
+            }
+        }
+        self.ui
+            .generation()
+            .checked_add(8)
+            .ok_or(crate::Error::Exhausted)?;
+        if !continuing {
+            self.stop_pointer();
+        }
+        self.control_mutation_accepted();
+        let result = if phase == PointerPhase::Move && self.menu_hover(fixed_x, fixed_y) {
+            Ok(())
+        } else if phase == PointerPhase::Press || continuing {
+            self.decoded_pointer_action(phase, fixed_x, fixed_y, extend)
+        } else {
+            Ok(()) // Never continue an unowned physical gesture.
+        };
+        if result.is_ok()
+            && self.ui.pointer_drag() == Some(tab)
+            && self.ui.editor().active() == Some(tab)
+        {
+            self.control_pointer = Some(point);
+        }
+        self.searches.observe(self.ui.editor());
+        self.spelling.observe(self.ui.editor());
+        self.observe_control_jobs();
+        self.frames.invalidate(true);
+        if let Err(detail) = result {
+            self.control_input_error = Some(detail);
+            return Err(crate::Error::Unavailable);
+        }
+        Ok(())
     }
 
     fn control_key_available(&self) -> bool {
@@ -2349,10 +2470,16 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-key\tkey-ready={}\tnative={},{},{},{}",
+                    "\tadapter=native-pointer\tkey-ready={}\tpointer-ready={}\tpointer-drag={}\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.control_key_available()),
+                flag(self.control_pointer_available()),
+                self.control_pointer.as_ref().filter(|point| {
+                    self.ui.pointer_drag() == Some(point.tab)
+                        && self.ui.editor().active() == Some(point.tab)
+                        && self.ui.editor().check_revision(point).is_ok()
+                }).map_or_else(|| "-".into(), |point| format!("{},{}", point.tab, point.revision)),
                 flag(self.configured),
                 flag(self.files.is_some()),
                 flag(self.files.as_ref().is_some_and(|files| files.busy())),
@@ -6001,6 +6128,353 @@ mod tests {
         (w, peer)
     }
 
+    fn remote_pointer_request(
+        w: &Window,
+        phase: &str,
+        x: i64,
+        y: i64,
+        extend: bool,
+    ) -> crate::control::Request {
+        let tab = w.ui.editor().active().unwrap();
+        let revision = w.ui.editor().document(tab).unwrap().revision();
+        crate::control::Request::parse(
+            format!(
+                "1\t8\tpointer\t{tab}\t{revision}\t{}\t{phase}\t{x}\t{y}\t{}",
+                w.frames.generation().unwrap(),
+                u8::from(extend)
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn remote_pointer(w: &mut Window, phase: &str, x: i64, y: i64, extend: bool) {
+        let request = remote_pointer_request(w, phase, x, y, extend);
+        assert_eq!(w.control_response(&request), "1\t8\tok\t");
+    }
+
+    #[test]
+    fn remote_pointer_drags_share_native_hit_testing_without_moving_physical_coordinates() {
+        let (mut remote, _peer) = file_dialog_fixture();
+        let (mut native, _native_peer) = file_dialog_fixture();
+        for w in [&mut remote, &mut native] {
+            configure(w, 800, 600);
+            w.ui.dispatch(Event::Load("abé中z\nnext".as_bytes()))
+                .unwrap();
+            let device = w.device.unwrap();
+            w.event(message(device, 2, &[99, SURFACE])).unwrap();
+            pointer_enter(w);
+        }
+        let tab = remote.ui.editor().active().unwrap();
+        let area = remote.ui.geometry().document();
+        for (phase, x, y) in [
+            ("press", area.x + 4, area.y),
+            ("move", area.x + 25, area.y),
+            ("release", area.x + 8, area.y + 16),
+        ] {
+            remote_pointer(&mut remote, phase, x, y, false);
+            pointer_move(&mut native, x, y);
+            if phase != "move" {
+                pointer_button(&mut native, phase == "press");
+            }
+            assert_eq!(
+                remote.ui.editor().document(tab).unwrap().selection(),
+                native.ui.editor().document(tab).unwrap().selection()
+            );
+            assert_eq!((remote.pointer.x, remote.pointer.y), (0, 0));
+            assert!(!remote.pointer.held && remote.activation_serial.is_none());
+        }
+        assert!(remote.control_pointer.is_none());
+        assert!(remote.ui.pointer_drag().is_none());
+        assert_eq!(remote.ui.editor().document(tab).unwrap().revision(), 0);
+        let anchor = remote.ui.editor().document(tab).unwrap().selection().anchor;
+        remote_pointer(&mut remote, "press", area.x + 16, area.y, true);
+        assert_eq!(
+            remote.ui.editor().document(tab).unwrap().selection().anchor,
+            anchor
+        );
+        remote_pointer(&mut remote, "release", 8_388_607, 8_388_607, false);
+        assert!(remote.control_pointer.is_none());
+    }
+
+    #[test]
+    fn remote_pointer_owns_only_its_drag_and_real_input_cancels_it() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.chord("a", false).unwrap();
+        w.chord("b", false).unwrap();
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        pointer_move(&mut w, area.x, area.y);
+        pointer_button(&mut w, true);
+        remote_pointer(&mut w, "move", area.x + 16, area.y, false);
+        assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..0);
+        assert!(!w.pointer.held && w.ui.pointer_drag().is_none());
+        for physical in ["pointer", "key", "semantic"] {
+            remote_pointer(&mut w, "press", area.x, area.y, false);
+            assert!(w.control_pointer.is_some());
+            match physical {
+                "pointer" => pointer_move(&mut w, area.x + 16, area.y),
+                "key" => {
+                    w.chord("Right", false).unwrap();
+                }
+                _ => {
+                    let request =
+                        crate::control::Request::parse(b"1\t0\tselect-range\t1\t2\t1\t1").unwrap();
+                    assert_eq!(w.control_response(&request), "1\t0\tok\t");
+                }
+            }
+            assert!(w.control_pointer.is_none());
+            let selection = w.ui.editor().document(1).unwrap().selection();
+            remote_pointer(&mut w, "move", area.x + 16, area.y, false);
+            assert_eq!(w.ui.editor().document(1).unwrap().selection(), selection);
+            assert!(w.ui.pointer_drag().is_none());
+        }
+    }
+
+    #[test]
+    fn remote_pointer_fences_and_counter_refusals_preserve_live_gestures() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        remote_pointer(&mut w, "press", area.x, area.y, false);
+        let old = remote_pointer_request(&w, "move", area.x + 16, area.y, false);
+        w.frames.invalidate(true);
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let before = w.control_response(&state);
+        assert!(w
+            .control_response(&old)
+            .contains("\terror\tstale-revision\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert!(w.control_pointer.is_some());
+        w.ui.generation_for_test(u64::MAX);
+        let request = remote_pointer_request(&w, "release", area.x, area.y, false);
+        let before = w.control_response(&state);
+        assert!(w
+            .control_response(&request)
+            .contains("\terror\texhausted\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert!(w.control_pointer.is_some() && w.ui.pointer_drag().is_some());
+    }
+
+    #[test]
+    fn remote_pointer_socket_selects_tabs_and_requires_token_answers_for_dirty_close() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.chord("a", false).unwrap();
+        w.ui.dispatch(Event::New).unwrap();
+        pointer_enter(&mut w);
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        let tab = w.ui.geometry().tab(0, 1, 2).unwrap();
+        let command = format!(
+            "1\t1\tpointer\t2\t0\t{}\tpress\t{}\t{}\t0",
+            w.frames.generation().unwrap(),
+            tab.x + 4,
+            tab.y + 4
+        );
+        assert_eq!(job_request(&mut w, &peer, &socket, &command), "1\t1\tok\t");
+        assert_eq!(w.ui.editor().active(), Some(1));
+        assert!(w.control_pointer.is_none());
+        let close = w.ui.geometry().tab_close(0, 0, 2).unwrap();
+        let command = format!(
+            "1\t2\tpointer\t1\t1\t{}\tpress\t{}\t{}\t0",
+            w.frames.generation().unwrap(),
+            close.x,
+            close.y
+        );
+        assert_eq!(job_request(&mut w, &peer, &socket, &command), "1\t2\tok\t");
+        let state = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        assert!(state.contains("\tpointer-ready=0\t"));
+        assert!(state.contains("dialog=1,close-tab,question,1,1,cancel+discard+save"));
+        let command = format!(
+            "1\t3\tpointer\t1\t1\t{}\tpress\t{}\t{}\t0",
+            w.frames.generation().unwrap(),
+            close.x,
+            close.y
+        );
+        assert!(job_request(&mut w, &peer, &socket, &command).contains("\terror\tunavailable\t"));
+        assert_eq!(job_request(&mut w, &peer, &socket, "1\t0\tstate"), state);
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &socket,
+                "1\t4\tdialog-answer\t1\t1\t1\tcancel"
+            ),
+            "1\t4\tok\t"
+        );
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "a");
+        let tab = w.ui.geometry().tab(1, 0, 2).unwrap();
+        remote_pointer(&mut w, "press", tab.x + 4, tab.y + 4, false);
+        assert_eq!(w.ui.editor().active(), Some(2));
+        let close = w.ui.geometry().tab_close(0, 1, 2).unwrap();
+        let command = format!(
+            "1\t5\tpointer\t2\t0\t{}\tpress\t{}\t{}\t0",
+            w.frames.generation().unwrap(),
+            close.x,
+            close.y
+        );
+        assert_eq!(job_request(&mut w, &peer, &socket, &command), "1\t5\tok\t");
+        assert_eq!(w.ui.editor().active(), Some(2));
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("dialog=2,close-tab,question,1,1,cancel+discard+save"));
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &socket,
+                "1\t6\tdialog-answer\t2\t1\t1\tcancel"
+            ),
+            "1\t6\tok\t"
+        );
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "a");
+        w.stop_control();
+    }
+
+    #[test]
+    fn pointer_capability_loss_drops_remote_gesture_ownership() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        remote_pointer(&mut w, "press", area.x, area.y, false);
+        assert!(w.control_pointer.is_some() && w.ui.pointer_drag().is_some());
+        let seat = w.seat.unwrap();
+        w.event(message(seat, 0, &[2])).unwrap();
+        assert!(w.pointer.device.is_none());
+        assert!(w.control_pointer.is_none() && w.ui.pointer_drag().is_none());
+    }
+
+    #[test]
+    fn remote_pointer_menus_keep_copy_cut_physical_and_preserve_new_paste() {
+        use crate::menu::Group;
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        configure(&mut w, 800, 600);
+        pointer_enter(&mut w);
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        drain(&peer);
+        for index in [2, 3, 4] {
+            let header = w.ui.geometry().menu(Group::Edit.index()).unwrap();
+            remote_pointer(&mut w, "press", header.x, header.y, false);
+            let panel = w.menu.as_ref().unwrap().panel(w.ui.geometry()).unwrap();
+            let (x, y) = (panel.x + 4, panel.y + index * 24 + 4);
+            remote_pointer(&mut w, "move", x, y, false);
+            assert_eq!(w.menu.as_ref().unwrap().selected, index as usize);
+            remote_pointer(&mut w, "press", x, y, false);
+            assert!(w.menu.is_none());
+            assert!(w.clipboard.source.is_none() && w.activation_serial.is_none());
+            assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
+            if index == 4 {
+                assert!(w.clipboard.incoming.is_some());
+                let (_, mut files) = drain(&peer);
+                let mut writer = files.pop().unwrap();
+                writer.write_all(b"menu paste").unwrap();
+                drop(writer);
+                w.tick(w.clock, true).unwrap();
+                assert_eq!(
+                    w.ui.editor().document(1).unwrap().text(),
+                    "menu paste abc\n"
+                );
+            } else {
+                assert!(w.notice.as_ref().unwrap().contains("physical"));
+                assert!(drain(&peer).0.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn remote_pointer_refuses_unavailable_input_and_invalidated_drag_targets() {
+        for guard in ["configure", "device", "enter", "serial", "closed", "modal"] {
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            pointer_enter(&mut w);
+            match guard {
+                "configure" => w.configured = false,
+                "device" => w.pointer.device = None,
+                "enter" => w.pointer.enter = None,
+                "serial" => w.activation_serial = Some(11),
+                "closed" => w.closed = true,
+                _ => {
+                    w.chord("C-f", false).unwrap();
+                }
+            }
+            let request = remote_pointer_request(&w, "press", 100, 100, false);
+            let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+            let before = w.control_response(&state);
+            assert!(w
+                .control_response(&request)
+                .contains("\terror\tunavailable\t"));
+            assert_eq!(w.control_response(&state), before);
+        }
+        for guard in ["revision", "editor"] {
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            pointer_enter(&mut w);
+            let area = w.ui.geometry().document();
+            remote_pointer(&mut w, "press", area.x, area.y, false);
+            if guard == "revision" {
+                w.ui.dispatch(Event::Edit {
+                    tab: 1,
+                    revision: 0,
+                    command: crate::model::Command::Insert("x".into()),
+                })
+                .unwrap();
+            } else {
+                w.ui = Controller::default();
+                w.ui.dispatch(Event::New).unwrap();
+            }
+            let request = remote_pointer_request(&w, "move", area.x + 16, area.y, false);
+            let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+            let before = w.control_response(&state);
+            assert!(before.contains("\tpointer-drag=-\t"));
+            let code = if guard == "revision" {
+                "stale-revision"
+            } else {
+                "invalid-argument"
+            };
+            assert!(w
+                .control_response(&request)
+                .contains(&format!("\terror\t{code}\t")));
+            assert_eq!(w.control_response(&state), before);
+        }
+    }
+
+    #[test]
+    fn remote_pointer_menu_transport_failure_latches_the_shared_fatal_boundary() {
+        use crate::menu::Group;
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        configure(&mut w, 800, 600);
+        pointer_enter(&mut w);
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        let header = w.ui.geometry().menu(Group::Edit.index()).unwrap();
+        remote_pointer(&mut w, "press", header.x, header.y, false);
+        let panel = w.menu.as_ref().unwrap().panel(w.ui.geometry()).unwrap();
+        drain(&peer);
+        drop(peer);
+        let request = remote_pointer_request(&w, "press", panel.x + 4, panel.y + 4 * 24 + 4, false);
+        assert!(w
+            .control_response(&request)
+            .contains("\terror\tunavailable\t"));
+        assert!(w.end_turn(w.clock, false).is_err());
+        let before = crate::control::state(&w.ui).unwrap();
+        let later = remote_pointer_request(&w, "press", 100, 100, false);
+        assert!(w
+            .control_response(&later)
+            .contains("\terror\tunavailable\t"));
+        assert_eq!(crate::control::state(&w.ui).unwrap(), before);
+        assert!(w.draw().is_err());
+    }
+
     fn decoded_key_request(w: &Window, chord: &str) -> crate::control::Request {
         let tab = w.ui.editor().active().unwrap();
         let revision = w.ui.editor().document(tab).unwrap().revision();
@@ -6345,7 +6819,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-key\tkey-ready=0\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-pointer\tkey-ready=0\tpointer-ready=0\tpointer-drag=-\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -9445,7 +9919,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-key\t"));
+            assert!(response.contains("\tadapter=native-pointer\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

@@ -208,6 +208,10 @@ impl Controller {
         Ok(Outcome::Changed)
     }
 
+    pub(crate) fn pointer_drag(&self) -> Option<TabId> {
+        self.drag.map(|(tab, _)| tab)
+    }
+
     fn reset_input(&mut self) {
         self.keys.reset();
         self.mark = None;

@@ -16,6 +16,8 @@ const HELP: &str = concat!(
     "Control also answers live Open/Save As/Dictionary paths by ID and revision.\n",
     "Control keys require real input readiness and exact native generation.\n",
     "Key replies acknowledge delivery; file/close/conflict answers require tokens.\n",
+    "Control pointer press/move/release uses native hit testing, not cursor warps.\n",
+    "Remote drags are separate; real pointer input and keys cancel them.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -191,6 +193,8 @@ mod tests {
             "answers live Open/Save As/Dictionary paths by ID and revision",
             "Control keys require real input readiness and exact native generation",
             "Key replies acknowledge delivery; file/close/conflict answers require tokens",
+            "Control pointer press/move/release uses native hit testing",
+            "Remote drags are separate",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }
