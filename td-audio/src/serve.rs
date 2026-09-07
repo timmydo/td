@@ -33,8 +33,8 @@ pub const SOCKET_PATH: &str = "/run/td-audio/native";
 /// mode. A 0600 socket would exclude the jailed app this exists to serve.
 pub const SOCKET_MODE: u32 = 0o666;
 
-/// The seat user. §K.5: "accept uid 1000 and the audio uid, refuse everything
-/// else".
+/// The human seat user; deployment policy separately admits the audio service
+/// and the immutable assigned Firefox UID (APPLICATIONS.md §K.5).
 pub const SEAT_UID: u32 = 1000;
 
 /// The most clients this daemon will hold at once.
@@ -87,7 +87,7 @@ const READ_CHUNK: usize = 64 * 1024;
 /// Who may connect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
-    /// Every uid allowed through. §K.5 names two.
+    /// Dedicated audio, the human seat and the assigned Firefox principal.
     pub allowed_uids: Vec<u32>,
 }
 
@@ -104,6 +104,33 @@ impl Policy {
             allowed_uids.push(SEAT_UID);
         }
         Self { allowed_uids }
+    }
+
+    pub fn for_deployment(own: u32) -> io::Result<Self> {
+        Self::deployment_policy(own, std::fs::symlink_metadata(crate::app_policy::PATH).map(|_| ()), || {
+            crate::app_policy::load().map_err(io::Error::other)
+        })
+    }
+
+    fn deployment_policy(
+        own: u32,
+        exists: io::Result<()>,
+        load: impl FnOnce() -> io::Result<crate::app_policy::Policy>,
+    ) -> io::Result<Self> {
+        let mut policy = Self::for_uid(own);
+        match exists {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                eprintln!("td-audio: no deployment policy; application peers are not admitted");
+                return Ok(policy);
+            }
+            Err(error) => return Err(error),
+            Ok(()) => {}
+        }
+        let applications = load()?;
+        if let Some(firefox) = applications.for_name("firefox") {
+            policy.allowed_uids.push(firefox.uid);
+        }
+        Ok(policy)
     }
 
     pub fn admits(&self, peer: &sys::Peer) -> bool {
@@ -2047,6 +2074,30 @@ mod tests {
             "a client that never reads stalled the daemon"
         );
         server.shutdown();
+    }
+
+    #[test]
+    fn deployment_audio_admits_only_the_assigned_browser_and_fails_closed() {
+        let installed = || crate::app_policy::Policy::parse(
+            "td-bus-applications-v1\t1000\n65539\tclaude\t\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
+        ).map_err(io::Error::other);
+        let policy = Policy::deployment_policy(994, Ok(()), installed).unwrap();
+        for uid in [994, 1000, 65536] {
+            assert!(policy.admits(&sys::Peer { pid: 1, uid, gid: uid }));
+        }
+        for uid in [0, 991, 993, 1001, 65537, 65538, 65539] {
+            assert!(!policy.admits(&sys::Peer { pid: 1, uid, gid: uid }));
+        }
+        let fallback = Policy::deployment_policy(994, Err(io::ErrorKind::NotFound.into()), || {
+            panic!("missing deployment must not call loader")
+        }).unwrap();
+        assert_eq!(fallback.allowed_uids, [994, 1000]);
+        assert!(Policy::deployment_policy(994, Err(io::ErrorKind::PermissionDenied.into()), installed).is_err());
+        assert!(Policy::deployment_policy(994, Ok(()), || Err(io::Error::other("invalid policy"))).is_err());
+        let no_browser = Policy::deployment_policy(994, Ok(()), || {
+            crate::app_policy::Policy::parse("td-bus-applications-v1\t1000\n65537\tmail\t\n").map_err(io::Error::other)
+        }).unwrap();
+        assert_eq!(no_browser.allowed_uids, [994, 1000]);
     }
 
     /// The policy accepts the daemon's own uid and the seat user, and nothing

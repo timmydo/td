@@ -317,8 +317,8 @@ pub fn may_signal(caller: &Identity) -> bool {
 /// Whether `caller` may use `td.Jail1` at all.
 ///
 /// A deployed application UID may register only its immutable identity and
-/// grants. The human UID retains that ability for installed applications
-/// during the launcher cutover. Jailed peers cannot rewrite their lineage.
+/// grants. The registration handler refuses the human UID for installed
+/// applications. Jailed peers cannot rewrite their lineage.
 pub fn may_register(caller: &Identity) -> bool {
     matches!(caller, Identity::Unconfined | Identity::Launcher)
 }

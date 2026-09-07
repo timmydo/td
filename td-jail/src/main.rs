@@ -5,6 +5,10 @@
 //! development-host launch when no product configuration is installed.
 #![deny(unsafe_code)]
 
+#[allow(dead_code, reason = "shared immutable application policy")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-busd/src/app_policy.rs")]
+mod app_policy;
+
 mod authority;
 mod bus;
 mod cgroup;

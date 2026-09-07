@@ -20,6 +20,7 @@ const COMPOSITOR_FONT_DATA_RS: &str = include_str!("../../../td-compositor/src/f
 const COMPOSITOR_KEYBOARD_RS: &str = include_str!("../../../td-compositor/src/keyboard.rs");
 const DEFAULT_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
 const SHARED_DBUS: &[(&str, &str)] = &[
+    ("{src}/td-busd/src/app_policy.rs", include_str!("../../../td-busd/src/app_policy.rs")),
     (
         "{src}/td-busd/src/message.rs",
         include_str!("../../../td-busd/src/message.rs"),

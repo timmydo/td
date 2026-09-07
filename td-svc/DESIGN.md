@@ -364,19 +364,29 @@ leaf. Firstboot reserves its UID and prepares its protected runtime;
 readiness probe runs as the human UID and checks the live cross-UID
 listener.
 
-The first desktop portal follows the same distinction. `portal requires=busd`
-because activation and name ownership are meaningless without the broker, and
-its separate one-shot live client has `portal-evidence requires=portal`.
-Firefox is only `after=portal`: a missing Settings service or Request lifecycle
-is application-evidence failure, not permission for mutable user-service state
-to prevent base deployment acknowledgement. Neither portal unit is in
-`bootsuccess`'s strict chain. The root portal supervisor is intentionally the
-daemon td-svc tracks: it retains td-busd's one-shot activation authority and
-waits for one literal uid-1000 direct child. That child remains in the
-supervisor's process group, so ordinary stop/restart containment covers both
-without a new td-svc primitive. The one-shot evidence client emits separate
-exact lines only after its synchronous Settings reply and its pre-subscribed
-Background method-reply/directed-`Request.Response` denial both complete.
+The portal follows the same distinction. It requires the broker, runs at
+UID 991 beneath its root supervisor, and is ordered after root preparation
+of its read-only Downloads view. Its live evidence client remains human
+UID 1000. Portal failure is application evidence failure, outside the
+bootsuccess strict chain. The portal child remains in its supervisor's
+process group, so normal stop/restart containment covers both without a
+new supervision primitive. Firefox uses after=portal rather than a strict
+requirement: a restartable portal in backoff must not permanently strand
+the application. The portal-evidence unit requires the exact synchronous
+Settings reply and its pre-subscribed Background denial; ordinary startup
+ordering alone does not establish either result.
+
+Application units require successful firstboot and invoke the root typed
+launcher, with `cgroup=session` because the leader moves into its own
+`td-app-UID/session` leaf. Firefox also requires `firefox-files`;
+Claude's fixed root evidence unit requires `claude-files`. Mail requires
+`mail-files`, and mail and news require their separate application-UID
+fetch services. The root grant oneshots finish before their applications
+start. Mail's preparation follows Firefox's settled preparation so the
+shared Downloads source has one initializer at a time. It does not
+require Firefox preparation to succeed. Shutdown releases all three
+views after services stop and before releasing the portal view and
+`/var`.
 
 Application audio uses both edges deliberately. `audio requires=seat`
 because its private identity and runtime directory do not exist before seat

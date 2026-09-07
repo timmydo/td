@@ -216,8 +216,9 @@ A launch request names only an installed application. The authority selects
 its immutable package and account from compiled deployment configuration; no
 caller may select an executable, Unix identity, state directory, or cgroup.
 Terminal arguments remain literal unprivileged application arguments. The
-image cutover must migrate state ownership and all credential/socket checks
-atomically; merely adding this parser enables no launch or consent path.
+image activates these identities together with private state ownership and
+credential/socket admission. The typed launcher consumes that reservation;
+this identity parser grants no token consent.
 
 The live reader pins the root-owned `/etc` directory and opens only the four
 fixed children `td-principals.tsv`, `passwd`, `group`, and `shadow`. Each
@@ -266,19 +267,18 @@ parser. A registry row alone does not activate a service. The image
 consumes the compositor assignment through its paired root authority;
 the broker consumes UID 992 through its service-only login path and
 protected runtime. The portal account `tdp1000` consumes UID/GID 991 and
-its private `/run/td-portal/1000` runtime. Firstboot transfers credential
-files and volatile release ownership to it; application accounts remain
-reserved. Each
-atomic identity cutover consumes these assignments. The paired
-compositor may enter its inert credential and channel startup at its
-reserved UID before ledger admission; the authority verifies the ledger
-before allowing device access, worker creation, or human terminal
-launch. A failed firstboot unit settles ordinary service ordering; the
-broker requires its success explicitly. Ordering alone is not
-authorization. The boot oracle requires the exact
-`TD-PRINCIPALS-ENROLLED` line on every successful boot. Retired human
-accounts may disappear while their service and application reservations
-remain.
+its private `/run/td-portal/1000` runtime. Firstboot transfers
+credential files and volatile release ownership to it. Stock
+applications consume their assigned service accounts, private state and
+runtime in one cutover. The paired compositor may enter its inert
+credential and channel startup at its reserved UID before ledger
+admission; the authority verifies the ledger before allowing device
+access, worker creation, or human terminal launch. A failed firstboot
+unit settles ordinary service ordering; the broker requires its success
+explicitly. Ordering alone is not authorization. The boot oracle
+requires the exact `TD-PRINCIPALS-ENROLLED` line on every successful
+boot. Retired human accounts may disappear while their service and
+application reservations remain.
 
 The canonical table parser and reservation union live in
 `engine/src/principals.rs`. td-firstboot includes that dependency-free source
@@ -343,9 +343,9 @@ Firstboot then prepares root-owned mode-0755 `/run/user` and app-owned
 mode-0700 `/run/user/APP_UID` using the existing pinned runtime provisioner.
 An existing published runtime with wrong ownership or permissions refuses;
 only interrupted root-owned creation is completed. No socket is created.
-Only installed accounts consume reservations; stock application accounts
-remain absent. The final image cutover still owns root launch, socket
-admission, grants and per-app fetch services together.
+Only installed accounts consume reservations. The stock image installs
+all four application accounts and couples their root launch, socket
+admission, grants and private per-app fetch services.
 
 Before dropping credentials, td-login selects `td-user-1000/session` for
 the human and `td-app-APP_UID/session` for the reserved application UID
@@ -360,8 +360,8 @@ An activated application account's home must be exactly
 `/var/lib/td/applications/APP_UID`. The shared account validator checks this
 for retained as well as current application reservations. An absent account
 remains a reservation; its row alone creates no application state or runtime.
-The stock image still reserves these accounts. Their image activation must
-also switch the root launcher, cgroups, socket admission and fetch services.
+The stock image activates these accounts together with the root launcher,
+cgroups, socket admission and per-application fetch services.
 
 When a deployed application account is present, firstboot prepares its home
 after checking the durable registry and before reporting enrollment success.
@@ -607,8 +607,8 @@ ARG...` consumes an installed application assignment. OWNER is currently
 name grammar. The presentation and at most 128 literal arguments (32 KiB
 including terminators) come from root-owned unit configuration. There is no
 request listener, caller-selected executable, credential change in td-authd,
-or human elevation. Stock application accounts remain reserved until the
-atomic image, socket, grant and per-app fetch-service cutover.
+or human elevation. Stock application units use this operation after
+firstboot and, where needed, mapped-grant preparation succeed.
 
 Startup requires the same root credentials, single thread, absent controlling
 terminal and exclusive standard descriptors as the terminal authority.
@@ -656,3 +656,69 @@ It passes literal application arguments without a shell and sets no
 compositor control endpoint. The bounding capability set is not a held
 privilege and is not required empty. No new syscall or unsafe surface is
 introduced; confinement pins the complete application controller and startup.
+
+## Application filesystem grants
+
+Root startup prepares three writable idmapped views: Firefox and mail
+share human Downloads, and Claude receives human src, each below the assigned
+application's private home. `prepare-application-files APP` and the matching
+shutdown operation accept only those three installed names. Active-account and
+durable-ledger admission select the UID; no caller supplies a path or map.
+The existing root namespace helper maps filesystem human UID/GID 1000 to
+that application identity. Mount attributes require nosuid, nodev and noexec;
+a cloned read-only source remains read-only and refuses writable admission.
+The portal's separate read-only Downloads view is unchanged.
+
+Every directory is opened through a retained parent without following links.
+The human source must be directly owned by UID/GID 1000, and the private
+application home must have exact app ownership and mode 0700. Preparation
+runs before application processes start; it is not live repair of an
+app-writable home or protection against a root mount-table editor. A present
+view must match the source device/inode, selected mapped owner and all four
+required options. Wrong or stacked mounts are refused. Shutdown resolves the
+same enrolled assignment and invokes only the fixed view's umount helper;
+failed ledger admission or a remaining mount is reported, not silently
+ignored. The image must stop services before releasing these mounts and
+release them before unmounting /var.
+
+Application activation uses the same immutable application policy reader in
+the broker, jail, portal, compositor and audio daemon. Broker registration
+requires the assigned external UID; human UID registration is removed.
+The portal validates broker-reported UID plus app name against its loaded
+policy for both credential retrieval and FileChooser. Public Wayland admits
+the human and assigned application UIDs; audio admits the human, its own
+service and the assigned Firefox UID. Compositor control and
+readiness remain human-only, and the private portal channel remains UID 991.
+
+Mail and news fetch daemons use their own service accounts and mode-0700
+runtime directories. Credential-bearing fetch requests therefore remain
+inside the application's UID domain. The human fetch service is separate.
+The fixed root Claude boot oracle uses its service account directly to
+capture the no-terminal refusal and real PTY child-exit proof; production
+application units use the typed root launcher with null application stdio.
+Bus evidence connects as the human observer and independently checks the
+subject application UID against the immutable policy. An unjailed service
+UID retains launcher filtering and is not an unrestricted bus observer.
+
+The grant preparer may create the two declared missing human directories,
+initially root-owned mode 0700 and then transferred to the human UID/GID.
+A pinned empty root-owned directory with only owner permissions is the
+restartable creation intermediate; nonempty or nonprivate remnants refuse.
+Existing sources must already have human UID/GID and mode 0700, checked
+before publication; private parent modes must also be valid;
+no recursive chown, fallback copy, or broad human-home grant is performed.
+The writable mapped owner can change the shared source's permissions and
+contents. Firefox and mail therefore share availability of Downloads, as
+well as its data: either grantee or the human can invalidate its private
+mode. The next preparation refuses and identifies the application and
+source in its diagnostic. The human owner must restore mode 0700 on the
+named source before retrying the service. Root does not silently undo an
+owner's permission change or start an application without its required
+grant. This shared directory is outside the private per-application state
+boundary; arbitrary deletion or renaming by its owner can also deny it.
+
+Jail admission permits only the declared projection's source identities,
+including its root, through the otherwise reserved home boundary. The
+maintenance backing-volume ancestor remains read-only and grants no
+sibling state. Nested mounts pointing outside the declared human source
+and protected mounts at or below it are refused.

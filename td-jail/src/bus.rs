@@ -574,20 +574,13 @@ impl Connection {
 ///
 /// # A serial is not an authenticator
 ///
-/// Unprivileged peers share uid 1000 on the session bus. Directed
-/// routing means any of them may send a `METHOD_RETURN` to this connection's
-/// unique name, and serials here are 1 then 2 on a fresh connection — so a
-/// peer that wants to answer for the broker can, and a first draft of this
-/// function let it: it matched on `REPLY_SERIAL` alone.
-///
-/// What that bought an attacker was not a forged token, which is useless on
-/// its own, but a forged `Complete` SUCCESS. Stage 1 would then write the
-/// proof, release a jail whose real registration is still pending, and let it
-/// expire — and the application, which is genuinely confined, resolves
-/// `Unconfined` and gets everything the portal has. §D concedes that a rogue
-/// uid-1000 process can register a false instance FOR ITSELF; this was the
-/// other direction, degrading somebody else's real jail, and nothing in §D
-/// conceded it.
+/// A directed reply's serial does not identify its sender. Fresh connections
+/// use serials 1 then 2, so a peer admitted by the broker's routing policy can
+/// guess this call's serial. A first draft accepted any matching reply serial.
+/// A forged Complete success could release a jail before its real registration
+/// completed and leave it with expired lineage. The stock application UID
+/// binding independently refuses human-UID registration; it does not make a
+/// serial an authenticator.
 ///
 /// So the sender is checked. td-busd rebuilds `SENDER` rather than relaying
 /// it — a peer's own value is discarded and replaced with that connection's
@@ -1539,17 +1532,10 @@ mod tests {
 
     /// A reply from a peer that is not the broker is not this call's reply.
     ///
-    /// The attack this closes: unprivileged session peers share uid 1000,
-    /// routing to a unique name is directed, and a fresh connection's serials
-    /// are 1 then 2. So a hostile peer can address a `METHOD_RETURN` to this
-    /// connection carrying serial 2 and have the broker deliver it.
-    ///
-    /// The prize is not a forged token — a token nobody issued fails at the
-    /// next step. It is a forged `Complete` SUCCESS: stage 1 writes the proof,
-    /// releases a jail whose real registration is still pending, that pending
-    /// registration expires, and a genuinely confined application resolves
-    /// `Unconfined`. §D concedes a rogue process can register a false instance
-    /// for ITSELF and concedes nothing about degrading somebody else's jail.
+    /// A peer's directed METHOD_RETURN can guess serial 2 on this fresh
+    /// connection. A forged Complete success must never release the jail
+    /// before the broker has completed its real registration. Application UID
+    /// admission is a separate policy, not evidence for a reply's sender.
     ///
     /// Here the forgery arrives FIRST and the broker's own reply behind it,
     /// which is the ordering an attacker would arrange. The genuine reply must

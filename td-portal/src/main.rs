@@ -17,6 +17,9 @@
 //! exec-service-as`, and stays alive while that child owns
 //! `org.freedesktop.portal.Desktop`.
 
+#[path = "../../td-busd/src/app_policy.rs"]
+#[allow(dead_code)]
+mod app_policy;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
 mod file_chooser;
@@ -1135,11 +1138,11 @@ fn run(paths: &Paths) -> Result<(), String> {
     connection
         .finish_setup()
         .map_err(|error| format!("cannot enter portal service mode: {error}"))?;
-    serve(&mut connection, &settings)
+    serve(&mut connection, &settings, app_policy::load()?)
         .map_err(|error| format!("the portal service connection ended: {error}"))
 }
 
-fn serve(connection: &mut Connection, settings: &Settings) -> io::Result<()> {
+fn serve(connection: &mut Connection, settings: &Settings, application_policy: app_policy::Policy) -> io::Result<()> {
     let reader = connection.service_reader()?;
     let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_SERVICE_EVENTS);
     let bus_sender = sender.clone();
@@ -1166,7 +1169,10 @@ fn serve(connection: &mut Connection, settings: &Settings) -> io::Result<()> {
             }
         })
         .map_err(|error| io::Error::other(format!("start portal owner audit: {error}")))?;
-    let mut state = ServiceState::default();
+    let mut state = ServiceState {
+        application_policy: Some(application_policy),
+        ..ServiceState::default()
+    };
     loop {
         let event = receiver
             .recv()
@@ -1224,6 +1230,7 @@ struct ActiveDialog {
 
 #[derive(Default)]
 struct ServiceState {
+    application_policy: Option<app_policy::Policy>,
     secrets: BTreeMap<u32, secret::Pending>,
     secret_receipts: BTreeMap<String, secret::Receipt>,
     handles: Handles,
@@ -1494,7 +1501,7 @@ fn consume_active_audit_reply(
         .remove(&reply_serial)
         .ok_or_else(|| io::Error::other("an active FileChooser audit disappeared"))?;
     let live_firefox = reply.kind == MessageType::MethodReturn
-        && credentials_app_id(reply)
+        && credentials_app_id(reply, state.application_policy.as_ref())
             .map(|app_id| app_id.as_deref() == Some("firefox"))
             .unwrap_or(false);
     if live_firefox {
@@ -1548,7 +1555,7 @@ fn consume_identity_reply(
         )
         .map(|()| true);
     }
-    let app_id = match credentials_app_id(reply) {
+    let app_id = match credentials_app_id(reply, state.application_policy.as_ref()) {
         Ok(app_id) => app_id,
         Err(error) => {
             eprintln!("td-portal: refused malformed FileChooser identity: {error}");
@@ -2705,7 +2712,7 @@ fn background_token<'a>(call: &'a Message<'a>) -> Result<Option<&'a str>, &'stat
     Ok(token)
 }
 
-fn credentials_app_id(reply: &Message<'_>) -> io::Result<Option<String>> {
+fn credentials_app_id(reply: &Message<'_>, policy: Option<&app_policy::Policy>) -> io::Result<Option<String>> {
     if reply.kind != MessageType::MethodReturn || reply.fields.signature != Some("a{sv}") {
         return Err(io::Error::other(
             "GetConnectionCredentials returned the wrong message shape",
@@ -2759,12 +2766,12 @@ fn credentials_app_id(reply: &Message<'_>) -> io::Result<Option<String>> {
             _ => {}
         }
     }
-    if uid != Some(UI_UID) {
-        return Err(io::Error::other(format!(
-            "GetConnectionCredentials returned uid {uid:?}, expected {UI_UID}"
-        )));
+    let Some(app) = app_id else { return Ok(None); };
+    let expected = policy.and_then(|policy| uid.and_then(|uid| policy.for_uid(uid)));
+    if !expected.is_some_and(|rule| rule.application == app) {
+        return Err(io::Error::other("broker UID and application do not match the immutable assignment"));
     }
-    Ok(app_id)
+    Ok(Some(app))
 }
 
 fn download_grant_ready(path: &Path, owner: u32) -> bool {
@@ -3590,6 +3597,7 @@ mod confinement {
         ("sys.rs", include_str!("../../td-secret/src/sys.rs")),
         ("wayland_channel.rs", include_str!("wayland_channel.rs")),
         ("wayland_dialog.rs", include_str!("wayland_dialog.rs")),
+        ("app_policy.rs", include_str!("../../td-busd/src/app_policy.rs")),
     ];
     const SYS: &str = include_str!("../../td-secret/src/sys.rs");
     const DIALOG: &str = include_str!("wayland_dialog.rs");
@@ -3677,7 +3685,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
         actual.sort();
         let mut expected = SOURCES
             .iter()
-            .filter(|(name, _)| *name != "sys.rs")
+            .filter(|(name, _)| !["sys.rs", "app_policy.rs"].contains(name))
             .map(|(name, _)| (*name).to_string())
             .collect::<Vec<_>>();
         expected.sort();
@@ -3690,6 +3698,27 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    pub(super) fn service_state() -> ServiceState {
+        ServiceState {
+            application_policy: Some(app_policy::Policy::parse(
+                "td-bus-applications-v1\t1000\n65539\tclaude\t\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n65538\tnews\t\n"
+            ).unwrap()),
+            ..ServiceState::default()
+        }
+    }
+
+    #[test]
+    fn credential_identity_requires_the_assigned_external_uid_and_broker_app() {
+        let state = service_state();
+        for (uid, name, allowed) in [(65536, "firefox", true), (65537, "mail", true), (1000, "mail", false), (65536, "mail", false), (65537, "firefox", false), (0, "firefox", false), (65540, "unknown", false)] {
+            let bytes = credentials_reply(41, uid, Some(name));
+            let (reply, _) = message::decode(&bytes, 0).unwrap();
+            assert_eq!(credentials_app_id(&reply, state.application_policy.as_ref()).is_ok(), allowed);
+            assert!(credentials_app_id(&reply, None).is_err());
+        }
+    }
+
 
     #[test]
     fn download_grant_requires_an_owned_directory_without_following_links() {
@@ -4254,7 +4283,7 @@ mod tests {
             unique: Some(":1.10".into()),
             until: None,
         };
-        let mut state = ServiceState::default();
+        let mut state = service_state();
         begin_open_file(&mut connection, &mut state, &call).unwrap();
         let IncomingFrame::Message(query) = read_frame(&mut broker_stream).unwrap() else {
             panic!("identity query was not a complete frame");
@@ -4293,7 +4322,7 @@ mod tests {
                 unique: Some(":1.10".into()),
                 until: None,
             };
-            let mut state = ServiceState::default();
+            let mut state = service_state();
             let count = if global {
                 MAX_PENDING_OPENS
             } else {
@@ -4338,7 +4367,7 @@ mod tests {
                 unique: Some(":1.10".into()),
                 until: None,
             };
-            let mut state = ServiceState::default();
+            let mut state = service_state();
             let path = "/org/freedesktop/portal/desktop/request/1_8/audit";
             let audit_owner = if global { ":1.8" } else { ":1.9" };
             state.active.insert(
@@ -4394,7 +4423,7 @@ mod tests {
                 unique: Some(":1.10".into()),
                 until: None,
             };
-            let mut state = ServiceState::default();
+            let mut state = service_state();
             let path = "/org/freedesktop/portal/desktop/request/1_9/audit";
             state.active.insert(
                 path.into(),
@@ -4440,7 +4469,7 @@ mod tests {
                     <= MAX_PENDING_IDENTITIES_PER_OWNER
             );
 
-            let live = credentials_reply(41, UI_UID, Some("firefox"));
+            let live = credentials_reply(41, 65536, Some("firefox"));
             let (live, _) = message::decode(&live, 0).unwrap();
             assert!(consume_active_audit_reply(&mut connection, &mut state, &live).unwrap());
             assert!(state.pending_audits.is_empty());
@@ -4477,6 +4506,8 @@ mod tests {
             (UI_UID, None, false),
             (UI_UID, Some("not-firefox"), false),
             (0, Some("firefox"), false),
+            (UI_UID, Some("firefox"), false),
+            (65537, Some("firefox"), false),
             (UI_UID, Some("firefox"), true),
         ] {
             let (service_stream, mut caller_stream) = UnixStream::pair().unwrap();
@@ -4489,7 +4520,7 @@ mod tests {
                 unique: Some(":1.10".into()),
                 until: None,
             };
-            let mut state = ServiceState::default();
+            let mut state = service_state();
             state.pending.insert(41, pending_open(":1.9", "denied"));
             let reply = if malformed {
                 malformed_credentials_reply(41)
@@ -4525,7 +4556,7 @@ mod tests {
             unique: Some(":1.10".into()),
             until: None,
         };
-        let mut state = ServiceState::default();
+        let mut state = service_state();
         state.pending.insert(41, pending_open(":1.9", "second"));
         let first = "/org/freedesktop/portal/desktop/request/1_8/first";
         state.active.insert(
@@ -4541,7 +4572,7 @@ mod tests {
         );
         cancel_dialog(&mut state, first).unwrap();
         assert!(state.active.get(first).unwrap().cancelled);
-        let reply = credentials_reply(41, UI_UID, Some("firefox"));
+        let reply = credentials_reply(41, 65536, Some("firefox"));
         let (reply, _) = message::decode(&reply, 0).unwrap();
         let (events, _) = mpsc::sync_channel(MAX_QUEUED_SERVICE_EVENTS);
         assert!(consume_identity_reply(&mut connection, &mut state, &events, &reply).unwrap());
@@ -4565,7 +4596,7 @@ mod tests {
         worker_stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let mut state = ServiceState::default();
+        let mut state = service_state();
         state.active.insert(
             path.into(),
             ActiveDialog {
@@ -4596,7 +4627,7 @@ mod tests {
             unique: Some(":1.10".into()),
             until: None,
         };
-        let mut state = ServiceState::default();
+        let mut state = service_state();
         let path = state
             .handles
             .reserve(HandleKind::Request, ":1.9", "audited")
@@ -5352,7 +5383,7 @@ mod tests {
                     unique: Some(":1.10".into()),
                     until: None,
                 };
-                serve(&mut connection, &settings)
+                serve(&mut connection, &settings, service_state().application_policy.unwrap())
             });
             client_stream.write_all(&oversized).unwrap();
             client_stream.write_all(&ping).unwrap();

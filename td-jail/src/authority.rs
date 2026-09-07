@@ -363,8 +363,9 @@ where
     I: Iterator<Item = OsString>,
 {
     let identity = effective_identity()?;
-    let config = target_config()?;
-    resolve_with_config(name, arguments, identity, identity, config)
+    let mut config = target_config()?;
+    config.real_home = Some(PathBuf::from(format!("/var/lib/td/applications/{}", identity.0)));
+    resolve_with_config(name, arguments, identity, (APPLICATION_UID, APPLICATION_GID), config)
 }
 
 pub(crate) fn is_host_argument(argument: &OsStr) -> bool {
@@ -473,7 +474,7 @@ where
     let (wayland_socket, bus_socket, runtime_root) = if config.host_mode {
         host_session_sockets(outside_identity, config.runtime_root.as_deref())?
     } else {
-        let (display, compositor_uid, runtime_root) = stock_session(outside_identity.0)?;
+        let (display, compositor_uid, runtime_root) = stock_session(outside_identity.0, name)?;
         (
             resolved_socket(display, compositor_uid, "Wayland authority")?,
             resolved_socket(
@@ -702,17 +703,21 @@ where
     })
 }
 
-/// The stock display is compositor-owned; its client runtime stays human-owned.
-fn stock_session(owner: u32) -> io::Result<(&'static Path, u32, PathBuf)> {
-    if owner != 1000 {
-        return Err(invalid(
-            "the stock graphical session requires human uid 1000",
-        ));
+/// Display ownership is separate from the assigned application's runtime.
+fn stock_session(owner: u32, name: &str) -> io::Result<(&'static Path, u32, PathBuf)> {
+    let policy = crate::app_policy::load().map_err(invalid)?;
+    application_session(owner, name, &policy)
+}
+
+fn application_session(owner: u32, name: &str, policy: &crate::app_policy::Policy)
+    -> io::Result<(&'static Path, u32, PathBuf)> {
+    if policy.owner() != 1000 || !policy.for_uid(owner).is_some_and(|rule| rule.application == name) {
+        return Err(invalid("kernel UID does not own the installed application"));
     }
     Ok((
         Path::new(crate::permissions::TD_WAYLAND_SOCKET_PATH),
         crate::permissions::TD_COMPOSITOR_UID,
-        PathBuf::from("/run/user/1000"),
+        PathBuf::from(format!("/run/user/{owner}")),
     ))
 }
 
@@ -1745,6 +1750,78 @@ struct GrantBoundary {
     allowed_home_mount: MountIdentity,
     allowed_home_mounts: BTreeSet<MountIdentity>,
     other_home_mounts: BTreeSet<MountIdentity>,
+    human_projection: Option<(PathBuf, MountIdentity)>,
+}
+
+fn private_application_home(home: &Path) -> bool {
+    let Some(uid) = home.strip_prefix("/var/lib/td/applications").ok()
+        .and_then(|suffix| suffix.to_str())
+        .and_then(|text| text.parse::<u32>().ok()) else { return false; };
+    (65536..=2147483647).contains(&uid)
+        && home.as_os_str() == std::ffi::OsStr::new(&format!("/var/lib/td/applications/{uid}"))
+}
+
+// Only the root-prepared, identity-mapped view of one declared human
+// directory may cross the separate-home reservation.
+fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf, MountIdentity)>> {
+    if !private_application_home(home) {
+        return Ok(None);
+    }
+    let uid = home.file_name().and_then(|name| name.to_str())
+        .and_then(|name| name.parse::<u32>().ok())
+        .ok_or_else(|| invalid("invalid private application home"))?;
+    let policy = crate::app_policy::load().map_err(invalid)?;
+    let component = match policy.for_uid(uid).map(|rule| rule.application.as_str()) {
+        Some("firefox" | "mail") => "Downloads",
+        Some("claude") => "src",
+        _ => return Ok(None),
+    };
+    let view = home.join(component);
+    let mut found = false;
+    for line in mountinfo.lines() {
+        let left = line.split_once(" - ").ok_or_else(|| invalid("invalid mount table"))?.0;
+        let fields = left.split_whitespace().collect::<Vec<_>>();
+        let path = decode_mountinfo_path(fields.get(4).ok_or_else(|| invalid("missing mountpoint"))?)?;
+        if path != view { continue; }
+        let options = fields.get(5).ok_or_else(|| invalid("missing mount options"))?;
+        if found || !["rw", "nosuid", "nodev", "noexec"].iter()
+            .all(|required| options.split(',').any(|option| option == *required)) {
+            return Err(invalid("declared human projection is stacked or lacks mount restrictions"));
+        }
+        found = true;
+    }
+    if !found {
+        return Err(invalid("declared human projection has not been prepared"));
+    }
+    require_owned_directory(&view, (uid, uid), true)?;
+    let identity = mount_identity_for_path(mountinfo, &view)?;
+    let human = mount_identity_for_path(mountinfo, &Path::new("/var/home/tester").join(component))?;
+    if identity != human {
+        return Err(invalid("application projection does not name its declared human directory"));
+    }
+    Ok(Some((view, identity)))
+}
+
+fn require_projection_mounts(
+    source: &BTreeSet<MountIdentity>,
+    projection: &MountIdentity,
+    reserved: &BTreeSet<MountIdentity>,
+) -> io::Result<()> {
+    for identity in source {
+        if identity.device != projection.device
+            || !path_is_same_or_child(&identity.root, &projection.root) {
+            return Err(invalid("human projection contains an undeclared mount"));
+        }
+        for protected in reserved {
+            if mount_identities_overlap(identity, protected)
+                && !(protected.device == projection.device
+                    && protected.root != projection.root
+                    && path_is_same_or_child(&projection.root, &protected.root)) {
+                return Err(invalid("human projection aliases a reserved mount"));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl GrantBoundary {
@@ -1778,7 +1855,9 @@ impl GrantBoundary {
         ];
         let mut home_roots = Vec::new();
         for path in RESERVED_FILESYSTEM_TREES {
-            if matches!(*path, "/home" | "/var/home") {
+            if matches!(*path, "/home" | "/var/home")
+                || (*path == "/var/lib/td" && private_application_home(&state.real_home))
+            {
                 match fs::canonicalize(path) {
                     Ok(path) => {
                         if !home_roots.contains(&path) {
@@ -1803,6 +1882,7 @@ impl GrantBoundary {
         let other_home_mounts =
             mount_identities_outside_allowed_home(mountinfo, &home_roots, &state.real_home)?;
         Ok(Self {
+            human_projection: human_projection(mountinfo, &state.real_home)?,
             reserved,
             home_roots,
             allowed_home: state.real_home.clone(),
@@ -1847,6 +1927,7 @@ impl GrantBoundary {
             allowed_home: state.real_home.clone(),
             home_mounts: BTreeSet::new(),
             other_home_mounts: BTreeSet::new(),
+            human_projection: None,
         })
     }
 
@@ -1874,6 +1955,11 @@ impl GrantBoundary {
                 source.display(),
                 path.display()
             )));
+        }
+        if let Some((view, identity)) = &self.human_projection {
+            if path_is_same_or_child(source, view) {
+                return require_projection_mounts(source_mounts, identity, &self.reserved_mounts);
+            }
         }
         require_grant_mount_identities(
             source,
@@ -3506,14 +3592,40 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn stock_display_belongs_to_the_compositor_and_runtime_to_the_human() {
-        let (display, uid, runtime) = stock_session(1000).unwrap();
+    fn human_projection_cannot_smuggle_sibling_or_reserved_mounts() {
+        let identity = |device: &str, path: &str| MountIdentity {
+            device: device.into(), root: path.into(),
+        };
+        let projection = identity("0:9", "/@var/home/tester/Downloads");
+        let backing = BTreeSet::from([identity("0:9", "/")]);
+        assert!(require_projection_mounts(&BTreeSet::from([projection.clone()]), &projection, &backing).is_ok());
+        let child = identity("0:9", "/@var/home/tester/Downloads/nested");
+        assert!(require_projection_mounts(&BTreeSet::from([child.clone()]), &projection, &backing).is_ok());
+        for wrong in [identity("0:9", "/@var/lib/td/secrets"), identity("0:9", "/@var/home/tester/src"), identity("0:8", "/@var/home/tester/Downloads"), identity("0:9", "/@var/home/tester")] {
+            assert!(require_projection_mounts(&BTreeSet::from([projection.clone(), wrong]), &projection, &backing).is_err());
+        }
+        for protected in [projection.clone(), child] {
+            assert!(require_projection_mounts(&BTreeSet::from([projection.clone()]), &projection, &BTreeSet::from([protected])).is_err());
+        }
+        assert!(private_application_home(Path::new("/var/lib/td/applications/65536")));
+        for path in ["/var/lib/td/applications/065536", "/var/lib/td/applications/1000", "/var/lib/td/applications/65536/child", "/var/lib/td/applications/65536/", "/tmp/65536"] {
+            assert!(!private_application_home(Path::new(path)));
+        }
+    }
+
+    #[test]
+    fn stock_display_belongs_to_compositor_and_runtime_to_the_assigned_app() {
+        let policy = crate::app_policy::Policy::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n"
+        ).unwrap();
+        let (display, uid, runtime) = application_session(65536, "firefox", &policy).unwrap();
         assert_eq!(display, Path::new("/run/td-compositor/1000/wayland-0"));
         assert_eq!(uid, 993);
-        assert_eq!(runtime, Path::new("/run/user/1000"));
-        for owner in [0, 993, 1001, 65536, u32::MAX] {
-            assert!(stock_session(owner).is_err());
+        assert_eq!(runtime, Path::new("/run/user/65536"));
+        for owner in [0, 993, 1000, 1001, 65537, u32::MAX] {
+            assert!(application_session(owner, "firefox", &policy).is_err());
         }
+        assert!(application_session(65536, "mail", &policy).is_err());
     }
 
     #[test]

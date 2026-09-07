@@ -353,11 +353,11 @@ fn parse_hex_field(line: &str, name: &str) -> io::Result<u32> {
     })
 }
 
-pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32) -> io::Result<usize> {
-    if firefox_pid == 0 {
+pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32, firefox_uid: u32) -> io::Result<usize> {
+    if firefox_pid == 0 || firefox_uid == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Firefox seccomp audit expected PID must be nonzero",
+            "Firefox seccomp audit expected PID and UID must be nonzero",
         ));
     }
     let mut observed = FIREFOX_REQUIRED_AUDIT_SYSCALLS.map(|_| 0_usize);
@@ -426,10 +426,24 @@ pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32) -> io::Result<us
         let compat = parse_decimal_field(line, "compat")?;
         let signal = parse_decimal_field(line, "sig")?;
         let code = parse_hex_field(line, "code")?;
-        if uid != 1000 || pid == 0 || arch != AUDIT_ARCH_X86_64 || compat != 0 {
+        // The independent boot-health probe runs concurrently under the human
+        // UID. Its fixed root-owned executable's x32 kill is not Firefox data.
+        if uid == 1000
+            && pid != 0
+            && pid != firefox_pid
+            && arch == AUDIT_ARCH_X86_64
+            && compat == 0
+            && syscall == X32_SYSCALL_BIT | 1
+            && signal == 31
+            && code == SECCOMP_RET_KILL_PROCESS
+            && audit_field(line, "exe")? == "\"/run/td-jail-seccomp-probe/probe\""
+        {
+            continue;
+        }
+        if uid != firefox_uid || pid == 0 || arch != AUDIT_ARCH_X86_64 || compat != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "seccomp audit record is not an x86-64 uid-1000 Firefox-jail denial",
+                format!("seccomp audit record is not an x86-64 assigned-UID Firefox-jail denial: uid={uid} expected={firefox_uid} pid={pid} arch={arch:#x} compat={compat}"),
             ));
         }
         let action = expected_audit_action(syscall).ok_or_else(|| {
@@ -613,7 +627,7 @@ mod tests {
     const X32_CHILD_PID: u32 = 8;
 
     fn verify_firefox_audit(log: &str) -> io::Result<usize> {
-        super::verify_firefox_audit(log, FIREFOX_PID)
+        super::verify_firefox_audit(log, FIREFOX_PID, 65536)
     }
 
     #[derive(Clone, Copy)]
@@ -878,7 +892,7 @@ mod tests {
             (310, SECCOMP_RET_ERRNO, 0),
             (X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31),
         ] {
-            log.push_str(&audit_line(1000, syscall, code, signal, FIREFOX_PROBE_PATH));
+            log.push_str(&audit_line(65536, syscall, code, signal, FIREFOX_PROBE_PATH));
         }
         log.push_str(&barrier(AuditBarrier::End));
         log
@@ -904,7 +918,7 @@ mod tests {
             )
         );
         let log = before_end(complete_audit(), &audit_line(
-            1000,
+            65536,
             SYS_CLONE3,
             SECCOMP_RET_ERRNO,
             0,
@@ -913,11 +927,32 @@ mod tests {
         assert_eq!(verify_firefox_audit(&log).unwrap(), 18);
 
         let missing = complete_audit().replacen(
-            &audit_line(1000, 310, SECCOMP_RET_ERRNO, 0, FIREFOX_PROBE_PATH),
+            &audit_line(65536, 310, SECCOMP_RET_ERRNO, 0, FIREFOX_PROBE_PATH),
             "",
             1,
         );
         assert!(verify_firefox_audit(&missing).is_err());
+    }
+
+    #[test]
+    fn firefox_audit_does_not_count_the_parallel_standalone_probe() {
+        let standalone = audit_line_for_pid(1000, FIREFOX_PID + 200,
+            X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31,
+            "/run/td-jail-seccomp-probe/probe");
+        assert_eq!(verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(), 18);
+        let missing = complete_audit().replace(
+            &audit_line(65536, X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31, FIREFOX_PROBE_PATH), "");
+        assert!(verify_firefox_audit(&before_end(missing, &standalone)).is_err());
+        for bad in [
+            standalone.replace("uid=1000", "uid=65537"),
+            standalone.replace("uid=1000", "uid=0"),
+            standalone.replace("/run/td-jail-seccomp-probe/probe", "/run/untrusted/probe"),
+            standalone.replace("sig=31", "sig=0"),
+            standalone.replace("1073741825", "1073741826"),
+            standalone.replace("0x80000000", "0x50000"),
+        ] {
+            assert!(verify_firefox_audit(&before_end(complete_audit(), &bad)).is_err());
+        }
     }
 
     #[test]
@@ -964,7 +999,7 @@ mod tests {
         assert!(verify_firefox_audit(&before_end(
             good.clone(),
             &audit_line(
-                1000,
+                65536,
                 400,
                 SECCOMP_RET_ERRNO,
                 0,
@@ -972,17 +1007,20 @@ mod tests {
             ),
         ))
         .is_err());
-        assert!(verify_firefox_audit(&good.replacen("uid=1000", "uid=0", 1)).is_err());
+        for uid in [0, 1000, 65537, 65538, 65539] {
+            assert!(verify_firefox_audit(&good.replacen("uid=65536", &format!("uid={uid}"), 1)).is_err());
+        }
+        assert!(super::verify_firefox_audit(&good, FIREFOX_PID, 0).is_err());
         assert!(verify_firefox_audit(&good.replacen(
             &audit_line(
-                1000,
+                65536,
                 SYS_PERSONALITY,
                 SECCOMP_RET_ERRNO,
                 0,
                 FIREFOX_PROBE_PATH,
             ),
             &audit_line_for_pid(
-                1000,
+                65536,
                 9,
                 SYS_PERSONALITY,
                 SECCOMP_RET_ERRNO,
@@ -994,14 +1032,14 @@ mod tests {
         .is_err());
         assert!(verify_firefox_audit(&good.replacen(
             &audit_line(
-                1000,
+                65536,
                 X32_SYSCALL_BIT | 1,
                 SECCOMP_RET_KILL_PROCESS,
                 31,
                 FIREFOX_PROBE_PATH,
             ),
             &audit_line_for_pid(
-                1000,
+                65536,
                 FIREFOX_PID,
                 X32_SYSCALL_BIT | 1,
                 SECCOMP_RET_KILL_PROCESS,
@@ -1026,7 +1064,7 @@ mod tests {
         assert!(verify_firefox_audit(&before_end(good.clone(), &format!("{padding}x\n"))).is_err());
 
         let runtime = audit_line(
-            1000,
+            65536,
             SYS_CLONE3,
             SECCOMP_RET_ERRNO,
             0,

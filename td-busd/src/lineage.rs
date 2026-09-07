@@ -394,8 +394,8 @@ pub struct Instance {
 /// precisely that survived a whole suite before this became a struct.
 ///
 /// Every field arrives over the wire. The stock registry binds the app and
-/// grants to immutable policy plus the kernel UID. Human launchers retain
-/// installed-name impersonation; generic brokers retain supplied claims.
+/// grants to immutable policy plus the assigned kernel UID. Human-UID
+/// registration is refused; generic brokers retain supplied claims.
 #[derive(Debug, Clone)]
 pub struct Registration {
     pub instance: String,
@@ -450,7 +450,7 @@ struct Pending {
     owned: Vec<String>,
     /// The uid that opened phase one. Phase two must come from the same uid.
     /// The stock policy binds an application UID to its installed identity;
-    /// the human UID remains an interim launcher for installed applications.
+    /// the human UID cannot register an installed application.
     uid: u32,
     /// When phase one ran, for `PENDING_LIFETIME`.
     opened: Instant,

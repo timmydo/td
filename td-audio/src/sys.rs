@@ -561,11 +561,9 @@ fn classify(revents: i16) -> Ready {
 
 /// Who is on the other end of a connected Unix socket.
 ///
-/// §K.5 makes this the authorization decision: "the **directory is traversable
-/// (0755, owned by `audio`) and the socket is 0666**, with authorization done
-/// by the daemon on `SO_PEERCRED` — accept uid 1000 and the audio uid, refuse
-/// everything else — rather than by mode bits. That puts the decision in code
-/// that can say why it refused."
+/// APPLICATIONS.md §K.5 gates the traversable socket with SO_PEERCRED.
+/// Deployment policy admits the human, audio service and assigned Firefox
+/// UIDs. This record supplies kernel identity; it does not grant admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Peer {
     pub pid: i32,

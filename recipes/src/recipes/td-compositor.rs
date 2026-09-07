@@ -10,6 +10,7 @@ use crate::types::{Recipe, Step};
 // of td-compositor's is on it.
 const MAIN_RS: &str = include_str!("../../../td-compositor/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("app_policy", include_str!("../../../td-busd/src/app_policy.rs")),
     (
         "attention",
         include_str!("../../../td-compositor/src/attention.rs"),

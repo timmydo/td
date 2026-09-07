@@ -592,8 +592,8 @@ every path as an explicit argument, and adding a variable is a
 unit-level key rather than a flag on `exec-as`.
 
 **No setuid helper and no new root daemon of its own.** One dependency is
-not this design's: `td-authd` (§L.1), for elevation and, in v2, for the
-identity transition per-app uids need. Root on this image is ordinary
+not this design's: `td-authd` (§L.1), for elevation and the
+identity transition per-app UIDs use. Root on this image is ordinary
 rather than exceptional — `build_td_svc_conf` already runs seven root
 oneshots and two root daemons — so the claim worth making is the narrow
 one: **nothing here is more privileged than its caller**, no setuid
@@ -1980,8 +1980,8 @@ Firstboot moves existing state behind a root-owned home, converts ownership,
 then publishes that home to the app; it preserves credential-store ownership
 and the logical human identity. The restart, refusal and startup assumptions
 are specified in `td-authd/DESIGN.md` under Application state preparation.
-The stock image still reserves application accounts; their activation must
-switch launch, cgroups, grants and socket authorization together (§L).
+The stock image activates application accounts together with launch,
+cgroups, grants and socket authorization (§L).
 
 
 ### B.5 Activation and state — there is no install
@@ -3653,13 +3653,12 @@ agree with its kernel UID's name and grants; disagreement fails closed. `Unknown
 lineage stays denied. UID mapping for EXTERNAL claims never selects this
 role. Generic host/test brokers retain their caller-supplied registry.
 
-The application UID and state cutover remains pending. Human-UID
-launchers can still register any installed name with its exact grants,
-so installed-name impersonation by another human-UID process remains
-possible. Root's trusted portal connection cannot register an app in the
-stock profile. This policy table is rebuilt for the selected deployment;
-the persistent UID reservation ledger also retains removed assignments
-and does not grant them access to a deployment where they are absent.
+Application UIDs and private state are active. Human-UID processes
+cannot register an application; the stock registry requires its assigned
+external UID. Root's trusted portal connection cannot register an app
+either. This policy table is rebuilt for the selected deployment; the
+persistent UID reservation ledger also retains removed assignments and
+does not grant them access to a deployment where they are absent.
 
 `td-busd` also **absorbs `xdg-dbus-proxy`**. Upstream starts a filtering
 proxy per sandbox and bind-mounts the proxied socket; td bind-mounts the
@@ -4009,16 +4008,12 @@ That token is also what makes §A.0's completeness invariant checkable:
 **stage 1 refuses to proceed without it**, so entering the jail without
 having registered is a refusal rather than an unregistered instance.
 
-**The remaining app-id exposure is the human-UID launcher.** The stock
-broker constrains registration to installed names and exact grants. Its
-application-UID policy also binds each dedicated UID to one name, but
-those application accounts and their state cutover are still pending.
-Current launchers share UID 1000, so another human-UID process can still
-register an installed app such as `firefox` and have that name reported
-in a future elevation prompt. It may also mislabel its own child as a
-jail. Lineage proves which instance owns a connection; it cannot prove
-which installed application a human-UID registrant intended to launch.
-Per-app UID activation is required before the prompt can trust the name.
+**Application identity follows the assigned external UID.** The stock
+broker constrains registration to the installed name and exact grants
+assigned to the external application UID. Human UID 1000 cannot register
+applications. A compromised application launcher can label its own child
+as an instance of its assigned application, which is the authority it
+already holds; it cannot select another installed application identity.
 
 A connection arriving between the two phases is refused rather than
 queued — the ambiguous case fails closed, as above — and the token is
@@ -4491,8 +4486,8 @@ there. It is not a secret — the difference from a name is that a peer
 which may not use an interface is better told so than left calling a
 method that appears not to exist — and it is the interface that CREATES
 confinement records. A jailed peer may not rewrite its own instance.
-Unconfined human launchers retain installed-name impersonation; a
-dedicated application UID is bound to its immutable name and grants.
+Human-UID registration is refused; a dedicated application UID is bound
+to its immutable name and grants.
 
 What the filter depended on had already landed, which is what made this
 increment reviewable on its own: the registration protocol and the
@@ -4558,9 +4553,8 @@ that opened it closes would discard every legitimate registration at
 exactly the moment §A sweeps descriptors.
 
 The parentage proof alone does not authenticate an app name. The stock
-application-UID policy supplies that binding; human-UID launchers can
-still mislabel their own child as another installed app. Generic brokers
-retain the caller-supplied name.
+application-UID policy supplies that binding and refuses human-UID
+registration. Generic development brokers retain the caller-supplied name.
 
 **The app id is graded as a td identity, not as a bus name.** A draft
 used the bus-name grammar, which is wrong in both directions: §B's
@@ -4821,9 +4815,9 @@ at boot does it.** Every jailed application is a registered instance and
 reports `td.AppId`. A deployment application UID outside a jail is a
 registration-only `Launcher`; ordinary human-UID processes with proved
 unconfined lineage remain `Unconfined`. The stock policy fixes installed
-names and grants, while current human-UID launchers retain the
-installed-name impersonation exposure described in §D. Application UID
-and state activation is the remaining prerequisite for trusted names.
+names and grants for each assigned external UID. Human-UID launchers
+cannot register an installed application; an application launcher can
+register only its own assigned identity.
 
 **What the launcher sends is fixed by its own grammar, not by anything
 the application controls.** The **app id is the application's td name** —
@@ -5856,7 +5850,7 @@ not for a persistent Session lifecycle.
 | — | `.Background` | — | `RequestBackground` returns denied; persistent background execution needs a td-svc user-service design. |
 | — | `.Documents` | FUSE | **absent** (§0: no `CONFIG_FUSE_FS`). See below. |
 | — | `.Print`, `.Camera`, `.ScreenCast`, `.RemoteDesktop` | spooler / PipeWire | **not exported.** A fake PipeWire descriptor would make successful setup indistinguishable from a broken stream. |
-| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); unenrolled stores retain the file-master offline gap, and both backends retain human-UID application impersonation until the app identity cutover. |
+| — | `.Secret` | a keyring | Upstream keyring-key protocol remains unexported. td-owned terminal applications use `td.Secret1` credential delivery (§W.4); unenrolled stores retain the file-master offline gap, and both backends still lack token-gated session release. |
 
 **The Documents consequence, stated honestly rather than buried.**
 Without it, a file chooser can only grant what the sandbox can already
@@ -6045,7 +6039,8 @@ an identity that could not be resolved. A grant-bearing interface therefore
 cannot treat absence as authority.
 
 The landed FileChooser rule is deliberately narrower than a general portal
-identity design: it requires exact uid 1000 and exact `td.AppId="firefox"`.
+identity design: it requires the assigned Firefox external UID and exact
+`td.AppId="firefox"`, checked against the immutable application table.
 Missing, duplicate, mistyped, or any other app identity is `NotAllowed` before
 a Request is exported or the `/var/td-portal-files/1000/Downloads` root is
 opened. The host and guest roots are compiled as that one application's
@@ -6054,8 +6049,7 @@ ambiguity and prevents another jailed app from receiving Firefox's paths.
 
 The human can read the original Downloads directory but cannot enter the
 portal's private compositor protocol or credential-store runtime. Human-UID
-application registration remains an interim: another human-UID launcher can
-still impersonate installed Firefox with its exact grants. Absence of broker
+application registration is refused. Absence of broker
 lineage evidence never increases FileChooser authority.
 
 ### The private portal ↔ compositor protocol
@@ -6066,7 +6060,7 @@ on, and that is false: a Wayland server accepts each client on its own
 `AF_UNIX` socket, so it can read `SO_PEERCRED` per connection exactly as
 `td-busd` does, and it may advertise a different registry to each one —
 per-connection globals are ordinary Wayland practice, not a stretch.
-After per-app uids (§L) the peers would differ by uid as well.
+The peers also differ by their external UID (§L).
 
 So the reason is a **policy choice, and a better one**, rather than a protocol
 necessity. Keying on `SO_PEERCRED` would mean the privileged global exists on
@@ -6160,8 +6154,9 @@ A filesystem escape does not authorize this private protocol: UID 1000 is
 refused before a slot or dialog is created. The portal is a separate trusted
 service at UID 991. Its compromise can still create modal UI and read the
 credential store, while root and the compositor remain outside this boundary.
-Application UID isolation is still required to prevent human-account escape
-and broker registration impersonation. This private dialog protocol is not
+The separate application UIDs prevent human-account access to private
+application state and human-UID broker registration impersonation. This
+private dialog protocol is not
 the secure-attention screen and grants no token consent or elevation.
 
 ```
@@ -7127,7 +7122,12 @@ and image commits — showing:
     `TD-FIREFOX-SECCOMP-OK probes=17` result described there. This proves the
     probes are blocked in the real outer application process and that every
     audited non-allow decision during the workload belongs to the compiled
-    roster. An earlier wording asked for "zero EPERMs for syscalls outside the
+    roster. The concurrent standalone boot-health probe's one x32 kill is
+    recognized only by its human UID 1000, distinct positive PID, fixed
+    root-owned `/run/td-jail-seccomp-probe/probe` executable, x86-64 ABI and
+    exact syscall/action/signal. It contributes no Firefox probe evidence;
+    every other record still requires the assigned external Firefox UID.
+    Missing Firefox probes cannot be replaced by this standalone record. An earlier wording asked for "zero EPERMs for syscalls outside the
     roster", which is vacuous: a deny list permits those calls. A false hit is
     instead a call wrongly placed *inside* the roster; audit cannot distinguish
     that policy mistake from an intended denial. Firefox completing the real
@@ -7307,8 +7307,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
 | 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the empty runtime, `/bin/mail` and `/bin/news` launchers, and two td-svc units that run each as td-term's `--command` in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
 | 32 | **a second bus-holding application's peer attribution — LANDED** in the broker, in two halves. A jailed or unproved caller is told no host pid, about itself or the broker: `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` and `GetConnectionCredentials` carries the uid without `ProcessID`, and only a caller the lineage walk proved unconfined gets one. Queued descriptors are charged to the admission key HOLDING them beside the bus's ceiling, in two counts per key with a quarter of it each: the sender's freight count until every recipient is charged, each recipient's queued count once a frame is queued to it, apart so a stall on one of a key's connections does not refuse its siblings. A recipient key at its queued share costs the sender a `LimitsExceeded` reply and nobody a connection; a sender key at its freight share is refused; only the ceiling, which one key's two counts cannot reach, relieves a holder. Both halves have tests that drive them through the broker. The roster tripwire stays at one bus-holding application until the entry that lifts it brings the first two-application boot oracle | a second bus-holding application shares the broker without reading a host pid through it, and without starving the first of descriptors |
-| 33 | **Claude Code ships — LANDED** as the fourth shipped application and the first foreign-payload terminal program: a marked payload on Firefox's runtime, run behind the same jail as the source-built mail and news, with the `devices=tty` grant in its policy and its own boot oracle unit, `claude-evidence`. Once every Firefox oracle has published, so no second window shares a frame those measure, the unit launches it twice as the UI user: with no terminal of its own, which the grant refuses before anything runs, and inside a pseudo-terminal from `td-term --command`, where `claude --version` runs to exit status 0 through td-jail's registration on the live broker beside Firefox's instance; td-term's own line for its child's status, matched whole wherever the capture holds it, is the proof, so a failed acquisition, registration, jail or payload is a failed launch; Firefox's process token and bus identity are read before and after and must match, so the instance it ran beside is the live one; a failed launch's captured output goes to a file, never the console. The oracle found the jail keying the `/usr` aliases on Firefox's reviewed package library path rather than on the runtime, so a dynamic application with no package libraries had no interpreter; the aliases now follow the runtime, and stage 1 tells stage 2 so in a word of its own. The payload then died with SIGILL: the oracle's default `qemu64` CPU has no SSE4.2 or POPCNT, the x86-64-v2 baseline the payload assumes and Firefox's conservative build does not, so the boot now emulates `Nehalem`, the lowest stock model that supplies it. It then ran `--version` to exit 0, but the jail's post-exit read of the cgroup leaf's diagnostics found it already reaped, since the application is short-lived, and reported that as a failure; that read is observability the launch discards on success, so a leaf already gone is now `None`, not a failed launch, matching the rest of the module. The host oracle latches `TD-CLAUDE-TERMINAL-OK` and fails without it, and the roster tripwire now requires an evidence unit per shipped application. Not yet: a launcher card that opens it, and the executable state subtree its updater needs; the caller's working directory is rung 34 | a foreign-payload terminal application is proved to run in a terminal of its own, beside the browser, on one live bus |
-| 34 | **the caller's working directory — LANDED** in the jail, so a jailed program starts where the operator started it. Stage 1 reads its own directory while it still stands in it, before the unshare and the mount plan make the answer unreadable, and maps it through the directory grant that contains it — at most one can, since admitted grants never overlap in source or target, and the deepest match is taken so the rule stays right for a set built rather than resolved. Stage 1 holds itself to the wire format, so a name it cannot carry is no directory rather than a launch stage 2 would refuse. The result travels to stage 2 as one word and its path, directly after the terminal grant, and is refused there unless it is a bounded, canonical, absolute path that is not root. Stage 2 then starts the entry in it and, if that fails for any reason, starts it once more from stage 2's own `/`: a readback could not promise more, since `stat` succeeds without the search bit `chdir` needs, and a spawn reports before the entry execs, so the fallback costs one fork and never runs the entry twice. The directory is therefore a request and not a promise — a caller outside every grant, one the mount plan did not place, or one the entry cannot enter keeps `/` rather than failing the launch. It travels as a NAME and never as an inherited descriptor, which is the escape §A step 0 exists to close, so it widens nothing — it can only ever name a path the mount plan itself placed. Claude Code is the case that wanted it, and `claude` run from `~/src/td` now starts there under its own `~/src` grant; the rule is the jail's rather than one application's, so Firefox, mail and news get it wherever their grants already reach. Unit tests pin the mapping — the tail kept, the grant's own root, the deepest of nested grants, a sibling that merely shares a name prefix, a single-file grant, and no grant at all — that every mapped path is byte-for-byte what stage 2 accepts, that a non-UTF-8 name yields no directory, that a directory which cannot be entered is answered by one attempt without it, and the argv round trip with its refusals | a jailed program starts where the operator started it, and only ever inside what the policy already granted |
+| 33 | **Claude Code ships — LANDED** as the fourth shipped application and the first foreign-payload terminal program: a marked payload on Firefox's runtime, run behind the same jail as the source-built mail and news, with the `devices=tty` grant in its policy and its own boot oracle unit, `claude-evidence`. Once every Firefox oracle has published, so no second window shares a frame those measure, the unit launches it twice as its application user: with no terminal of its own, which the grant refuses before anything runs, and inside a pseudo-terminal from `td-term --command`, where `claude --version` runs to exit status 0 through td-jail's registration on the live broker beside Firefox's instance; td-term's own line for its child's status, matched whole wherever the capture holds it, is the proof, so a failed acquisition, registration, jail or payload is a failed launch; Firefox's process token and bus identity are read before and after and must match, so the instance it ran beside is the live one; a failed launch's captured output goes to a file, never the console. The oracle found the jail keying the `/usr` aliases on Firefox's reviewed package library path rather than on the runtime, so a dynamic application with no package libraries had no interpreter; the aliases now follow the runtime, and stage 1 tells stage 2 so in a word of its own. The payload then died with SIGILL: the oracle's default `qemu64` CPU has no SSE4.2 or POPCNT, the x86-64-v2 baseline the payload assumes and Firefox's conservative build does not, so the boot now emulates `Nehalem`, the lowest stock model that supplies it. It then ran `--version` to exit 0, but the jail's post-exit read of the cgroup leaf's diagnostics found it already reaped, since the application is short-lived, and reported that as a failure; that read is observability the launch discards on success, so a leaf already gone is now `None`, not a failed launch, matching the rest of the module. The host oracle latches `TD-CLAUDE-TERMINAL-OK` and fails without it, and the roster tripwire now requires an evidence unit per shipped application. Not yet: a launcher card that opens it, and the executable state subtree its updater needs; the caller's working directory is rung 34 | a foreign-payload terminal application is proved to run in a terminal of its own, beside the browser, on one live bus |
+| 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused. A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
@@ -7903,7 +7903,8 @@ for a single-user machine is *nearly* fine and is exactly the kind of
 "nearly" this document refuses elsewhere. The specification: the
 **directory is traversable (0755, owned by `audio`) and the socket is
 0666**, with authorization done by the daemon on `SO_PEERCRED` — accept
-uid 1000 and the audio uid, refuse everything else — rather than by mode
+the human UID, the audio UID and the immutable assigned Firefox UID,
+refuse everything else — rather than by mode
 bits. That puts the decision in code that can say why it refused, which
 is the same reason `td-busd` authenticates rather than relying on a 0700
 directory. And `td-seatd` **creates the directory only**; it cannot
@@ -8054,57 +8055,43 @@ remains accessible; its immutability prevents modification. The portal owns
 the credential store and has a read-only mapped Downloads grant, with no
 access to the remaining private human home.
 
-**The app runs as uid 1000 in v1, and the consequence is stated rather
-than buried.** `SO_PEERCRED` distinguishes a confined client only while
-it stays confined; after an escape the process has the session's uid and
-can connect to every uid-accessible socket. Same-uid is not a post-escape
-boundary.
+Applications run under distinct external service UIDs: Firefox 65536,
+mail 65537, news 65538 and Claude 65539. The immutable identity registry
+and retained ledger bind those assignments to the human session; retired
+UIDs are never reassigned. Root-configured units invoke `td-authd
+application-start`, which selects the enrolled account, uses td-login's
+checked credential drop, and verifies the application cgroup before exec.
+No caller may choose an executable or UID through that operation. The
+fixed root boot oracle also invokes service accounts directly to capture
+its terminal and refusal evidence. There is no public launch listener.
 
-A distinct external uid per application converts an escape from ownership
-of the human account into ownership of that application's state. The
-identity registry reserves those UIDs explicitly and persists retired
-assignments, as specified in `td-authd/DESIGN.md`.
+The jail maps each external UID to 1000 inside its private namespace.
+The broker checks AUTH EXTERNAL against that kernel mapping and permits
+registration only for the immutable name and exact grants assigned to the
+external UID. Human-UID registration is refused. A service UID outside a
+registered jail has registration authority, without a portal app identity.
+Lineage still fixes the instance; escaping an application does not acquire
+the human account or another application's assigned identity.
 
-The trusted root launcher will select the assigned service account and
-start td-jail through td-login's checked credential drop. The jail already
-supports distinct inside and outside identities: starting at the assigned
-external uid lets it install its own single-entry map to uid 1000 inside.
-No second daemon writes another process's identity maps. Root still belongs
-on every supported launch path, selecting only the immutable application
-and its account; it must accept no caller-selected executable or uid.
+Firstboot migrates legacy application state into mode-0700
+`/var/lib/td/applications/APP_UID`, creates the corresponding service
+runtime and cgroup, and removes the old application directory. The root
+filesystem helper publishes only Firefox and mail Downloads and Claude's src
+views of the human's corresponding directories. These writable idmapped
+mounts preserve mode-0600 files and map new writes back to human ownership.
+They are nosuid,nodev,noexec; they grant no other human directory. Jail
+resolution verifies their exact source mount identity and rejects nested
+mounts outside that declared source or aliases to protected state. The
+portal retains its separate read-only mapped Downloads view.
 
-Credential checks must consume the admitted external UID or an explicit
-set of service/application UIDs, and filesystem grants must preserve
-private modes across the external identity mapping. The retained AUTH
-EXTERNAL rules below account for uid 1000 inside differing from the
-external kernel identity.
-
-The compositor identity, devices, sockets and terminal launcher cut over
-atomically to UID 993. The broker consumes UID 992 and the portal UID 991.
-The portal cutover transfers credential-store ownership and isolates its
-runtime and private compositor admission, while preserving FileChooser
-through a fixed read-only idmapped Downloads view. Application assignments
-remain reservations. Their activation requires an atomic migration of state,
-cgroups, socket permissions and peer checks. Human-UID application
-registration still prevents a secure consent claim.
-
-**Two consequences must be designed for now even though the work is
-v2**, because both are silent breakages rather than missing features:
-
-- **`AUTH EXTERNAL` stops being uid equality.** A sandboxed app inside a
-  user namespace believes it is uid 1000 and sends `AUTH EXTERNAL` with
-  1000 hex-encoded, while `SO_PEERCRED` — read by a broker *outside* that
-  namespace — reports the mapped host uid. The claimed identity and the
-  peer credential disagree by construction, so a broker that compares
-  them for equality drops every sandboxed connection the moment per-app
-  uids land. The rule must be that the claimed uid is checked against
-  what the peer's credential *maps to*. The live transport now implements
-  that prerequisite through the kernel UID-map read specified in §D.
-- **`~/.td/app/<name>` is owned by the wrong uid.** State directories are
-  created before the identity exists in v1, so the v2 landing needs a
-  chown pass or idmapped mounts, and `td-authd` (§L.1) is where that
-  belongs — as an enumerated operation authorised at enrollment, not a
-  prompt per launch.
+Compositor public Wayland and audio admission consume the same immutable
+application table; audio admits only its Firefox assignment. Human
+control/readiness sockets and the private portal
+Wayland listener keep their separate admission rules. Mail and news each
+have a fetch daemon at their application UID and private runtime path, so
+human-UID network helpers do not handle their credential-bearing requests.
+The detailed account, migration, mount and launch contract is in
+`td-authd/DESIGN.md`. FIDO release and consent remain separate prerequisites.
 
 **The claim.** Absent a kernel, namespace, seccomp, jail or
 session-daemon vulnerability, a compromised flatpak app cannot read or
@@ -8116,7 +8103,7 @@ through setuid or capabilities (`NO_NEW_PRIVS` plus empty caps, both read
 back); cannot speak to non-portal bus names; and cannot record audio. td
 does **not** claim that same-uid *unjailed* processes are isolated from
 each other; that a kernel bug in the allowed syscall surface cannot void
-the jail — in v1 an escape owns the user account; that network traffic or
+the jail; that network traffic or
 network-namespace metadata is mediated when `shared=network` is granted;
 that a malicious publisher is contained beyond the jail; or anything about
 side channels, resource exhaustion, or the profile-data persistence in §B.
@@ -8180,15 +8167,15 @@ than a compromise.
 
 #### The prerequisite, without which none of it works
 
-The compositor now runs at dedicated UID 993, while portal and
-applications retain UID 1000 and the broker runs at UID 992. The root
-authority pins the compositor's kernel sender over its private channel.
-Unprivileged human-UID processes cannot ptrace that service or read its
-input/display devices. Per-application identity and trusted input remain
-prerequisites for consent.
+The compositor runs at dedicated UID 993, the portal at UID 991, the
+broker at UID 992 and applications at distinct assigned external UIDs.
+The root authority pins the compositor's kernel sender over its private
+channel. Unprivileged human-UID processes cannot ptrace that service or
+read its input/display devices. Presented request binding and
+token-mediated consent remain prerequisites for elevation.
 
 > **`td-compositor` must NOT share a uid with anything an application can
-> become.** That means per-app uids (§L, v2) *and* the compositor at its
+> become.** That means per-app UIDs (§L) *and* the compositor at its
 > own uid. A hard prerequisite, not a refinement: elevation must not ship
 > before it.
 
@@ -8291,12 +8278,10 @@ requester ──request──▶ td-authd (root)
 2. **Identity comes from the kernel** — `SO_PEERCRED` plus §D's lineage
    walk, `Unknown` denied. A rogue application cannot present itself as
    another *process*, because the pid is the kernel's answer rather than
-   its own. **It can still present itself under another NAME while v1
-   runs application launchers at uid 1000**, since §D's registration authenticates
-   by uid and the app id is supplied by the registrant — so the prompt's
-   "firefox is asking to publish a deployment" is only as good as
-   per-app uids, which is the prerequisite this section already refuses
-   to ship without.
+   its own. The stock broker also binds the application name to the
+   external UID and immutable grants, so another application cannot
+   supply a different name for the prompt. A compromised launcher retains
+   its own application's identity; it gains no different assignment.
 3. **Consent is bound to the request, and binding is not just hashing.**
    One operation, one requester, one argument set, once. No remembered
    answers, no "don't ask again", no grace window. Hashing an argument
@@ -8421,7 +8406,7 @@ FIDO assertion.
 | **Input-focus theft** | Exclusive input for the prompt's lifetime; no client receives those events at all |
 | **Elevate-a-shell** | Structurally impossible — no operation returns a process, and the table is enumerated |
 | **Replay of a captured approval** | The assertion covers requester, operation, pinned arguments and a nonce, **length-prefixed rather than concatenated** (or `("a","bc")` and `("ab","c")` collide), and the nonce is consumed before the operation starts |
-| **The requester lies about what it is** | It never says which PROCESS it is — that is `SO_PEERCRED` plus lineage. It does say which APPLICATION, since §D's registration is authenticated by uid and v1 runs application launchers at uid 1000, so the name in the prompt is only as good as per-app uids. A draft wrote this row the other way round, claiming an escaped app is "promoted to `Unconfined`" where the prompt can only say "a process"; under §E's own definition that is wrong, because an escapee is still a descendant of a live registered stage-2 pid and resolves `Jailed` — the filter denies `unshare`, `setns` and `clone(CLONE_NEWUSER)`, and killing PID 1 of a pid namespace kills the namespace. The exposure is the id, not the lineage |
+| **The requester lies about what it is** | It never says which PROCESS it is — that is `SO_PEERCRED` plus lineage. It does say which APPLICATION, and §D binds that name to the assigned external UID and immutable grants. A draft wrote this row the other way round, claiming an escaped app is "promoted to `Unconfined`" where the prompt can only say "a process"; under §E's own definition that is wrong, because an escapee is still a descendant of a live registered stage-2 pid and resolves `Jailed` — the filter denies `unshare`, `setns` and `clone(CLONE_NEWUSER)`, and killing PID 1 of a pid namespace kills the namespace. The exposure is the id, not the lineage |
 | **Walk-up attacker at an unlocked session** | **Out of scope by decision.** A password model would resist it and this one does not; that is the accepted trade. A screen lock is where to address it, and it belongs to the session rather than to elevation |
 | **Prompt spam from an unidentifiable requester** | **Partly unanswerable as specified.** Rate-limiting assumes a stable requester identity, and `Unconfined` code can fork a fresh process per request. Rate-limit the jailed case per app id; for `Unconfined` the limit can only be global, which degrades into denying elevation to everyone while an attacker spams |
 
@@ -8884,8 +8869,8 @@ deferring them. The shape:
   prepares the installed assignments' sibling delegations after td-svc's root
   controller setup, then their private `/run/user/APP_UID` directories. The
   pre-session, ownership and refusal rules are in `td-authd/DESIGN.md` under
-  Application runtime preparation. This support activates no stock account;
-  root launch and the grant/socket/fetch-service cutover must follow together.
+  Application runtime preparation. Stock application accounts consume this
+  preparation together with root launch, grants and private fetch services.
 - `td-jail` creates one cgroup per instance, writes `memory.max`,
   `memory.high`, `pids.max`, and `cpu.max` from the resolved permission policy,
   then moves stage 2 into it *before* spawning the app, so every descendant is
@@ -8931,30 +8916,31 @@ deferring them. The shape:
   back for diagnostics: an app killed for memory or throttled for CPU should
   say so rather than looking like an unexplained failure or slowdown.
 
-The landed hierarchy leaves PID 1 and system services at the hierarchy root,
-which cgroup v2 explicitly exempts from the no-internal-process rule, beside
-the empty delegated `td-user-1000` root. Application sessions and per-instance
-leaves are the only descendants placed under the delegated subtree.
-The jail also supports the reserved application identity range through
-separate direct children `/sys/fs/cgroup/td-app-UID`, selected only from
-the externally verified launch UID. These are siblings of the human
-delegation, never descendants of a human-owned cgroup. Creation and live
-probes require the selected delegation and its control files to have the
-actual external UID/GID and the same controller policy as above. Cleanup
-parses a canonical membership and refuses a different external UID before
-filesystem access. The inner namespace's UID 1000 does not select this root.
-The reserved application UID range is owned by `td-authd/DESIGN.md`'s
-Principal registry prerequisite. Its Fixed terminal launch prerequisite
-already limits the current human launcher to UID 1000; the broader human
-registry range does not provision additional session cgroups. Accordingly,
-the sole human delegation remains `td-user-1000`; other human/service IDs
-have no application delegation. Applications assigned to another human
-session still select their own reserved external UID, not that human UID. This support creates no accounts or
-cgroups and enables no new launch path. Root provisioning, app state and
-socket ownership must activate each reserved identity atomically before
-its application can run there; the current image still uses the human
-subtree. The membership parser proves shape and matching ownership, not
-that an application principal was enrolled.
+The landed hierarchy leaves PID 1 and system services at the hierarchy
+root, which cgroup v2 explicitly exempts from the no-internal-process
+rule, beside the empty delegated `td-user-1000` root. Application
+sessions and per-instance leaves are the only descendants placed under
+the delegated subtree. The jail also supports the reserved application
+identity range through separate direct children
+`/sys/fs/cgroup/td-app-UID`, selected only from the externally verified
+launch UID. These are siblings of the human delegation, never
+descendants of a human-owned cgroup. Creation and live probes require
+the selected delegation and its control files to have the actual
+external UID/GID and the same controller policy as above. Cleanup parses
+a canonical membership and refuses a different external UID before
+filesystem access. The inner namespace's UID 1000 does not select this
+root. The reserved application UID range is owned by
+`td-authd/DESIGN.md`'s Principal registry prerequisite. Its Fixed
+terminal launch prerequisite already limits the current human launcher
+to UID 1000; the broader human registry range does not provision
+additional session cgroups. Accordingly, the sole human delegation
+remains `td-user-1000`; other human/service IDs have no application
+delegation. Applications assigned to another human session still select
+their own assigned external UID, not that human UID. Stock applications
+use those dedicated subtrees after root provisioning; the human subtree
+contains the human session and its terminal processes. The membership
+parser proves shape and matching ownership, not that an application
+principal was enrolled.
 
 Per-app values live in the same per-package permission file as the filesystem
 and device grants (decision 9). Omission means 1 GiB high, 1.25 GiB max, 1024
@@ -9298,9 +9284,9 @@ existing stores before human sessions, with a restartable root-owned
 intermediate leaf; logical UID and credential bytes remain unchanged.
 The file-backed master remains an interim backend: an offline disk
 reader can recover it. This backend provides no TPM protection,
-authenticated session lock or token recovery. Human-UID launchers can
-still impersonate installed applications through registration until
-their cutover.
+authenticated session lock or token recovery. Application registration
+requires each application's own external UID; the human UID cannot
+impersonate an installed application.
 
 **Applications receive credentials, not encryption keys.** td owns the
 `td.Secret1` interface on the activated `org.freedesktop.portal.Desktop`
@@ -9352,25 +9338,25 @@ components the platform measures. The stock direct-kernel QEMU path has no
 measured-deployment policy and remains unenrolled. The kernel carries ACPI
 TPM discovery and the TIS/FIFO and CRB drivers.
 
-Firstboot automatically releases existing enrolled stores for every deployed
-session into checked `/run` tmpfs after identity enrollment and before
-application-home provisioning. Invalid homes cannot leave an old store
-human-owned after a successful migration. A refused migration quarantines
-an admitted store leaf as root-only and skips its release, while unrelated
-services continue. Failure before quarantine is diagnosed as unconfirmed
-isolation, with existing filesystem access potentially remaining. After a
-successful cutover, failed TPM release leaves credentials unavailable and
-can be retried with `td-secret release --uid UID` at the root console.
-Volatile keys belong to the portal identity, with their logical
-human UID retained in the path and TPM envelope. Release has no token consent,
-and application registration impersonation remains until the app UID cutover.
-There is no recovery or policy migration yet; the enrollment
-command explicitly requires acceptance of unrecoverability. Old snapshots
-may retain the former file master and credentials. `td-secret/DESIGN.md`
-specifies the PCR, memory, physical-bus, rollback and update boundaries, plus
-the pinned host-emulator oracle. That oracle covers TPM restart, changed
-measurements, a different TPM and actual store migration; it is separate from
-the desktop boot check.
+Firstboot automatically releases existing enrolled stores for every
+deployed session into checked `/run` tmpfs after identity enrollment and
+before application-home provisioning. Invalid homes cannot leave an old
+store human-owned after a successful migration. A refused migration
+quarantines an admitted store leaf as root-only and skips its release,
+while unrelated services continue. Failure before quarantine is
+diagnosed as unconfirmed isolation, with existing filesystem access
+potentially remaining. After a successful cutover, failed TPM release
+leaves credentials unavailable and can be retried with `td-secret
+release --uid UID` at the root console. Volatile keys belong to the
+portal identity, with their logical human UID retained in the path and
+TPM envelope. Release still has no token consent. There is no recovery
+or policy migration yet; the enrollment command explicitly requires
+acceptance of unrecoverability. Old snapshots may retain the former file
+master and credentials. `td-secret/DESIGN.md` specifies the PCR, memory,
+physical-bus, rollback and update boundaries, plus the pinned
+host-emulator oracle. That oracle covers TPM restart, changed
+measurements, a different TPM and actual store migration; it is separate
+from the desktop boot check.
 
 The secure-attention prerequisites reserve distinct compositor, broker,
 portal, and application identities in immutable
@@ -9379,15 +9365,16 @@ all account databases and persists their union in
 `/var/lib/td/principals.tsv`, retaining retired assignments so updates
 cannot reuse their UIDs. The image consumes the compositor assignment at
 UID/GID 993, broker assignment at UID/GID 992, and portal assignment at
-UID/GID 991. Application activation must migrate state and socket
-authorization together. `td-authd/DESIGN.md` specifies
-the canonical table, account classes, and durable ledger.
-The root-configured `td-authd application-start` prerequisite can consume
-an activated application account through td-login and requires its assigned
-cgroup before executing the fixed application command. It has no public
-request endpoint. Stock application accounts remain reservations until the
-image, broker/jail identity, socket admission, grants and per-app fetch
-services switch together; this helper alone does not activate them.
+UID/GID 991. The application accounts, private state, cgroups, socket
+authorization and fetch services consume their assignments atomically.
+`td-authd/DESIGN.md` specifies the canonical table, account classes, and
+durable ledger. The root-configured `td-authd application-start`
+prerequisite can consume an activated application account through
+td-login and requires its assigned cgroup before executing the fixed
+application command. It has no public request endpoint. Stock
+application units now consume those accounts and require successful
+firstboot; grant-bearing units also require successful root filesystem
+preparation.
 
 The paired compositor's physical attention screen is implemented but
 accepts no request or approval. Secret operations require a complete,
@@ -9578,15 +9565,17 @@ webpki-roots, and no decoder. So:
    recipe through the Cargo runner from the checkout's `net/`, `engine/`
    and `td-boot/` trees and the committed lock's vendor closure: the
    first target-built control-plane program, and the one target network
-   client. It listens on `/run/user/1000/td-fetch/socket` as the UI
-   user under a `[fetchd]` unit after `seat` and `netup`,
+   client. The human `[fetchd]` remains at `/run/user/1000/td-fetch/socket`.
+   Mail and news use separate `[mail-fetch]` and `[news-fetch]` units
+   after firstboot and netup, at `/run/user/APP_UID/td-fetch/socket`,
    `restart=always`, in a directory of its own that it makes, mode
    0700, so that the jail binds the directory rather than the socket
    inode and a restart's fresh socket is the one a running jail
    connects to; the socket is mode 0600, and that is the whole of the
    authentication: the tier forbids `unsafe`, so peer credentials are
-   not read, and only the UI user's processes, the jails among them,
-   can connect.
+   not read. Each application runtime is mode 0700 and only that
+   application UID can reach its service. The human and sibling
+   applications cannot access its socket or daemon memory.
 2. The grant is `sockets=fetch`, beside `sockets=wayland`. §C's mount
    plan step 12 binds the `td-fetch` directory into the jail's runtime
    directory when it is granted, read-only like the bus and as a

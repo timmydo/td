@@ -7,6 +7,13 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+
+static APPLICATION_POLICY: OnceLock<Result<crate::app_policy::Policy, String>> = OnceLock::new();
+
+pub(crate) fn application_policy() -> Result<&'static crate::app_policy::Policy, String> {
+    APPLICATION_POLICY.get_or_init(crate::app_policy::load).as_ref().map_err(Clone::clone)
+}
 
 pub(crate) const HUMAN_UID: u32 = 1000;
 
@@ -14,6 +21,7 @@ pub(crate) const HUMAN_UID: u32 = 1000;
 pub(crate) enum SocketPolicy {
     Private,
     HumanSession,
+    ApplicationSession,
 }
 
 impl SocketPolicy {
@@ -28,7 +36,7 @@ impl SocketPolicy {
     pub(crate) fn mode(self) -> u32 {
         match self {
             Self::Private => 0o600,
-            Self::HumanSession => 0o666,
+            Self::HumanSession | Self::ApplicationSession => 0o666,
         }
     }
 
@@ -36,7 +44,19 @@ impl SocketPolicy {
         if self == Self::Private {
             return Ok(());
         }
-        require_human(sys::peer_uid(stream)?)
+        let uid = sys::peer_uid(stream)?;
+        if self == Self::ApplicationSession && uid != HUMAN_UID {
+            return require_application(uid, application_policy()?);
+        }
+        require_human(uid)
+    }
+}
+
+fn require_application(uid: u32, policy: &crate::app_policy::Policy) -> Result<(), String> {
+    if policy.owner() == HUMAN_UID && policy.for_uid(uid).is_some() {
+        Ok(())
+    } else {
+        Err(format!("compositor application socket refuses peer uid {uid}"))
     }
 }
 
@@ -279,6 +299,21 @@ fn authority_sockets_owned(runtime: &Path, owner: u32) -> Result<Vec<PathBuf>, S
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn application_display_admission_does_not_grant_human_control() {
+        let policy = crate::app_policy::Policy::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n"
+        ).unwrap();
+        for uid in [65536, 65537] {
+            assert!(require_application(uid, &policy).is_ok());
+            assert!(require_human(uid).is_err());
+        }
+        for uid in [0, 991, 992, 993, 994, 1000, 1001, 65538, u32::MAX] {
+            assert!(require_application(uid, &policy).is_err());
+        }
+        assert_eq!(SocketPolicy::ApplicationSession.mode(), 0o666);
+    }
 
     #[test]
     fn readiness_waits_for_publication_permissions() {

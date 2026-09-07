@@ -51,7 +51,9 @@ The activated desktop portal serves `td.Secret1` version 1:
 
 - `Retrieve(s name) -> (h credential, s receipt)` performs a broker
   `GetConnectionCredentials` lookup for the original unique sender. Only an
-  authenticated application at uid 1000 is currently admitted. No caller
+  authenticated application whose external UID matches its immutable
+  assignment is admitted. The portal checks the broker-reported UID and
+  AppId together. The human UID cannot register as an application. No caller
   supplies its application name; `FLATPAK_ID` is not consulted by the portal.
 - The credential descriptor names an already-unlinked regular file in the
   runtime filesystem. It is reopened read-only before transfer. The master
@@ -214,10 +216,10 @@ Updates rewrite the encrypted bundle atomically and never persist a
 plaintext key. There is no additional daemon or external service.
 
 This release is **automatic at boot and has no human authentication**.
-The portal service can read the released key and credentials. Human-UID
-launchers can still register any installed application with its fixed
-grants, so application impersonation through the broker remains until
-the app UID and state cutover. TPM possession is not user identity. PCR
+The portal service can read the released key and credentials. Each
+application registers only from its assigned external UID and reads its
+private state; human-UID launchers cannot impersonate it through the
+broker. TPM possession is not user identity. PCR
 changes after release do not revoke already released bytes. Memory
 zeroing remains best effort. The kernel, root, DMA and physical TPM-bus
 interception are outside this increment's boundary; its TPM sessions are
@@ -694,8 +696,9 @@ clients use the public socket.
 The FileChooser reads only `/var/td-portal-files/1000/Downloads`, a
 root-created read-only idmapped view of the existing human Downloads
 directory. The fixed root helper and its syscall contract are specified
-in td-authd/DESIGN.md and UNSAFE.md §16. No writable human-home grant,
-ACL fallback, or file ownership rewrite is provided. The portal starts
+in td-authd/DESIGN.md and UNSAFE.md §16. The portal receives no writable
+human-home grant, ACL fallback, or file ownership rewrite. Application
+views are separately specified in td-authd/DESIGN.md. The portal starts
 after grant preparation settles, even if preparation fails. FileChooser
 then refuses requests before exporting a Request unless the fixed grant
 root is a real directory owned by the portal; a root-owned empty

@@ -5,8 +5,8 @@ use crate::types::{Recipe, Step};
 // third-party crates. It is static for the same reason td-profiler is: a daemon
 // that owns the only path to the hardware must not depend on a dynamic loader
 // that the thing it is diagnosing may have broken. The crate is the one source
-// of truth; this recipe embeds every sibling module beside main.rs for direct
-// rustc module resolution.
+// of truth; this recipe preserves the source layout, including the shared
+// broker policy, for direct rustc module resolution.
 //
 // This is APPLICATIONS.md §I rungs 25 and 26 — the ALSA PCM back end and its
 // mixer, driven by a tone fixture, plus the PulseAudio protocol and the socket
@@ -14,6 +14,7 @@ use crate::types::{Recipe, Step};
 // account before its unit selects and starts this output.
 const MAIN_RS: &str = include_str!("../../../td-audio/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("app_policy", include_str!("../../../td-busd/src/app_policy.rs")),
     ("alsa", include_str!("../../../td-audio/src/alsa.rs")),
     ("device", include_str!("../../../td-audio/src/device.rs")),
     ("mixer", include_str!("../../../td-audio/src/mixer.rs")),
@@ -99,14 +100,18 @@ pub fn recipe() -> Recipe {
             path: "{out}/bin".into(),
         },
         Step::WriteFile {
-            path: "{src}/main.rs".into(),
+            path: "{src}/td-audio/src/main.rs".into(),
             content: MAIN_RS.into(),
             exec: false,
         },
     ];
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: format!("{{src}}/{name}.rs"),
+            path: if *name == "app_policy" {
+                "{src}/td-busd/src/app_policy.rs".into()
+            } else {
+                format!("{{src}}/td-audio/src/{name}.rs")
+            },
             content: (*source).into(),
             exec: false,
         });
@@ -144,7 +149,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-audio",
-                "{src}/main.rs",
+                "{src}/td-audio/src/main.rs",
             ],
         )
         .env("PATH", &path)
@@ -185,11 +190,15 @@ mod tests {
         declared.sort_unstable();
         written.sort_unstable();
         assert_eq!(written, declared);
-        assert_eq!(written.len(), 13);
+        assert_eq!(written.len(), 14);
 
         let mut staged: Vec<String> = staged_files().into_iter().map(|(name, _)| name).collect();
-        let mut expected: Vec<String> = std::iter::once("main.rs".to_string())
-            .chain(MODULES.iter().map(|(name, _)| format!("{name}.rs")))
+        let mut expected: Vec<String> = std::iter::once("td-audio/src/main.rs".to_string())
+            .chain(MODULES.iter().map(|(name, _)| if *name == "app_policy" {
+                "td-busd/src/app_policy.rs".to_string()
+            } else {
+                format!("td-audio/src/{name}.rs")
+            }))
             .collect();
         staged.sort_unstable();
         expected.sort_unstable();
@@ -280,7 +289,7 @@ mod tests {
         // here passed, because nothing tied what is scanned to what is staged.
         let files = staged_files();
         assert!(
-            files.iter().any(|(name, _)| name == "main.rs"),
+            files.iter().any(|(name, _)| name == "td-audio/src/main.rs"),
             "the crate root is staged"
         );
         let staged: String = files.iter().map(|(_, text)| text.as_str()).collect();
@@ -338,8 +347,8 @@ mod tests {
         for (name, text) in &files {
             let uses = text.matches(keyword).count();
             let expected = match name.as_str() {
-                "main.rs" => KEYWORD_USES_IN_MAIN,
-                "sys.rs" => KEYWORD_USES_IN_SYS,
+                "td-audio/src/main.rs" => KEYWORD_USES_IN_MAIN,
+                "td-audio/src/sys.rs" => KEYWORD_USES_IN_SYS,
                 _ => 0,
             };
             assert_eq!(
@@ -358,10 +367,10 @@ mod tests {
         // No module is declared anywhere but the root. One declared in `sys`
         // would resolve to `sys/extra.rs`, which this recipe stages nowhere and
         // no scan here reads — a confirmation pass put a back door there and
-        // every assertion passed. The staged tree is flat, so the build would
+        // every assertion passed. Each staged module has no submodules, so the build would
         // fail on the missing file; failing in the scan says why.
         for (name, text) in &files {
-            if name == "main.rs" {
+            if name == "td-audio/src/main.rs" {
                 continue;
             }
             assert!(

@@ -8,6 +8,10 @@
 //! change is needed (the consumer cutover is a follow-up).
 
 pub mod application;
+#[cfg(test)]
+#[path = "../../td-busd/src/app_policy.rs"]
+#[allow(dead_code)]
+mod app_policy;
 pub mod catalog;
 // The build script's source scans, here for their tests only.
 #[cfg(test)]

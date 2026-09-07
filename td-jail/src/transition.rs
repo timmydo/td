@@ -4921,7 +4921,11 @@ pub fn probe_firefox_seccomp_audit(firefox_pid: u32) -> io::Result<()> {
             "Firefox seccomp audit is not UTF-8",
         )
     })?;
-    seccomp::verify_firefox_audit(&log, firefox_pid)?;
+    let policy = crate::app_policy::load().map_err(io::Error::other)?;
+    let firefox = policy.for_name("firefox").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::PermissionDenied, "Firefox has no application assignment")
+    })?;
+    seccomp::verify_firefox_audit(&log, firefox_pid, firefox.uid)?;
     writeln!(io::stdout(), "{}", seccomp::FIREFOX_AUDIT_MARKER)
 }
 

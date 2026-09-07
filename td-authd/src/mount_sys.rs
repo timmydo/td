@@ -1,4 +1,4 @@
-//! Fixed Linux x86-64 operations for the portal's read-only file grant.
+//! Fixed Linux x86-64 operations for portal and application file grants.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -11,6 +11,7 @@ const CLONE_NEWUSER: usize = 0x1000_0000;
 const AT_EMPTY_PATH: usize = 0x1000;
 const OPEN_TREE_FLAGS: usize = 1 | 0x80000 | AT_EMPTY_PATH;
 const PORTAL_ATTRIBUTES: u64 = 0x100000 | 1 | 2 | 4 | 8;
+const APPLICATION_ATTRIBUTES: u64 = 0x100000 | 2 | 4 | 8;
 const MOVE_FLAGS: usize = 4 | 0x40;
 
 #[repr(C)]
@@ -86,8 +87,19 @@ pub(crate) fn portal_attributes(
     mount: BorrowedFd<'_>,
     namespace: BorrowedFd<'_>,
 ) -> io::Result<()> {
+    set_attributes(mount, namespace, PORTAL_ATTRIBUTES)
+}
+
+pub(crate) fn application_attributes(
+    mount: BorrowedFd<'_>,
+    namespace: BorrowedFd<'_>,
+) -> io::Result<()> {
+    set_attributes(mount, namespace, APPLICATION_ATTRIBUTES)
+}
+
+fn set_attributes(mount: BorrowedFd<'_>, namespace: BorrowedFd<'_>, set: u64) -> io::Result<()> {
     let attributes = MountAttr {
-        set: PORTAL_ATTRIBUTES,
+        set,
         clear: 0,
         propagation: 0,
         namespace: namespace.as_raw_fd() as u64,

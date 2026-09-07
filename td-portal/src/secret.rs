@@ -119,7 +119,7 @@ pub(super) fn identity_reply(
         .secrets
         .remove(&serial)
         .ok_or_else(|| io::Error::other("credential request disappeared"))?;
-    let app = credentials_app_id(reply)
+    let app = credentials_app_id(reply, state.application_policy.as_ref())
         .ok()
         .flatten()
         .filter(|app| secret_store::valid_name(app));
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn identities_are_broker_only_and_unconfined_is_refused() {
         let (mut connection, mut peer) = connection();
-        let mut state = ServiceState::default();
+        let mut state = super::super::tests::service_state();
         let bytes = retrieve();
         let (call, _) = message::decode(&bytes, 0).unwrap();
         begin(&mut connection, &mut state, &call).unwrap();
@@ -441,7 +441,7 @@ mod tests {
     fn receipts_are_owner_bound_expiring_and_one_use() {
         let (mut connection, mut peer) = connection();
         let token = "01234567890123456789012345678901";
-        let mut state = ServiceState::default();
+        let mut state = super::super::tests::service_state();
         state.secret_receipts.insert(
             token.into(),
             Receipt {

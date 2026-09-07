@@ -21,12 +21,12 @@ fn pinned(parent: &File, name: &str) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), name))
 }
 
-fn directory(path: &Path, owner: u32, trusted: bool) -> Result<File, String> {
+pub(crate) fn directory(path: &Path, owner: u32, trusted: bool) -> Result<File, String> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(DIRECTORY_FLAGS)
         .open(path)
-        .map_err(|e| format!("open portal file-grant directory: {e}"))?;
+        .map_err(|e| format!("open file-grant directory: {e}"))?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_dir()
         || metadata.uid() != owner
@@ -34,7 +34,7 @@ fn directory(path: &Path, owner: u32, trusted: bool) -> Result<File, String> {
         || (trusted && metadata.mode() & 0o022 != 0)
     {
         return Err(format!(
-            "portal file-grant directory {} has uid/gid {}/{} mode {:04o}; expected {owner}/{owner}{}",
+            "file-grant directory {} has uid/gid {}/{} mode {:04o}; expected {owner}/{owner}{}",
             path.display(), metadata.uid(), metadata.gid(), metadata.mode() & 0o7777,
             if trusted { " without other writers" } else { "" },
         ));
@@ -42,18 +42,18 @@ fn directory(path: &Path, owner: u32, trusted: bool) -> Result<File, String> {
     Ok(file)
 }
 
-fn child(parent: &File, name: &str, owner: u32, trusted: bool) -> Result<File, String> {
+pub(crate) fn child(parent: &File, name: &str, owner: u32, trusted: bool) -> Result<File, String> {
     directory(&pinned(parent, name), owner, trusted)
 }
 
-fn ensure_root_child(parent: &File, name: &str) -> Result<File, String> {
+pub(crate) fn ensure_root_child(parent: &File, name: &str) -> Result<File, String> {
     let created = match fs::DirBuilder::new()
         .mode(0o755)
         .create(pinned(parent, name))
     {
         Ok(()) => true,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
-        Err(e) => return Err(format!("create portal file-grant directory: {e}")),
+        Err(e) => return Err(format!("create file-grant directory: {e}")),
     };
     let directory = child(parent, name, 0, true)?;
     if created {
@@ -62,12 +62,16 @@ fn ensure_root_child(parent: &File, name: &str) -> Result<File, String> {
             .map_err(|e| e.to_string())?;
     }
     if directory.metadata().map_err(|e| e.to_string())?.mode() & 0o7777 != 0o755 {
-        return Err("portal file-grant parent must have mode 0755".into());
+        return Err("file-grant directory must have mode 0755".into());
     }
     Ok(directory)
 }
 
 fn mount_options() -> Result<Option<String>, String> {
+    mount_options_at(VIEW)
+}
+
+pub(crate) fn mount_options_at(view: &str) -> Result<Option<String>, String> {
     let mut text = String::new();
     File::open("/proc/self/mountinfo")
         .map_err(|e| e.to_string())?
@@ -75,21 +79,26 @@ fn mount_options() -> Result<Option<String>, String> {
         .read_to_string(&mut text)
         .map_err(|e| e.to_string())?;
     if text.len() as u64 > MAX_MOUNTINFO {
-        return Err("mount table exceeds portal file-grant bound".into());
+        return Err("mount table exceeds file-grant bound".into());
     }
-    mount_options_from(&text)
+    mount_options_for(&text, view)
 }
 
+#[cfg(test)]
 fn mount_options_from(text: &str) -> Result<Option<String>, String> {
+    mount_options_for(text, VIEW)
+}
+
+fn mount_options_for(text: &str, view: &str) -> Result<Option<String>, String> {
     let mut result = None;
     for line in text.lines() {
         let Some((left, _)) = line.split_once(" - ") else {
-            return Err("malformed portal file-grant mount table".into());
+            return Err("malformed file-grant mount table".into());
         };
         let mut fields = left.split_ascii_whitespace();
-        if fields.nth(4) == Some(VIEW) {
+        if fields.nth(4) == Some(view) {
             if result.is_some() {
-                return Err("portal file-grant has stacked mounts".into());
+                return Err("file-grant has stacked mounts".into());
             }
             result = Some(fields.next().ok_or("missing mount options")?.to_string());
         }
@@ -100,14 +109,14 @@ fn mount_options_from(text: &str) -> Result<Option<String>, String> {
 fn require_view(source: &File, parent: &File, options: &str) -> Result<(), String> {
     for required in ["ro", "nosuid", "nodev", "noexec"] {
         if !options.split(',').any(|option| option == required) {
-            return Err(format!("portal file-grant mount lacks {required}"));
+            return Err(format!("file-grant mount lacks {required}"));
         }
     }
     let source = source.metadata().map_err(|e| e.to_string())?;
     let view = child(parent, "Downloads", PORTAL, false)?;
     let view = view.metadata().map_err(|e| e.to_string())?;
     if source.dev() != view.dev() || source.ino() != view.ino() {
-        return Err("portal file-grant no longer names the configured Downloads directory".into());
+        return Err("file-grant no longer names the configured Downloads directory".into());
     }
     Ok(())
 }
@@ -122,6 +131,10 @@ impl Drop for NamespaceChild {
 }
 
 fn namespace() -> Result<File, String> {
+    namespace_for(PORTAL)
+}
+
+pub(crate) fn namespace_for(uid: u32) -> Result<File, String> {
     let (mut parent, child) = UnixStream::pair().map_err(|e| e.to_string())?;
     parent
         .set_read_timeout(Some(DEADLINE))
@@ -150,7 +163,7 @@ fn namespace() -> Result<File, String> {
     // The unreaped direct child cannot have its PID reassigned. It waits on
     // this private endpoint and never delegates it or executes another image.
     let process = PathBuf::from(format!("/proc/{}", child.0.id()));
-    let mapping = format!("{HUMAN} {PORTAL} 1\n");
+    let mapping = format!("{HUMAN} {uid} 1\n");
     fs::write(process.join("uid_map"), &mapping).map_err(|e| e.to_string())?;
     fs::write(process.join("setgroups"), "deny\n").map_err(|e| e.to_string())?;
     fs::write(process.join("gid_map"), &mapping).map_err(|e| e.to_string())?;
@@ -205,7 +218,7 @@ pub(crate) fn prepare() -> Result<(), String> {
     let mount = mount_sys::clone_directory(source.as_fd()).map_err(|e| e.to_string())?;
     mount_sys::portal_attributes(mount.as_fd(), namespace.as_fd()).map_err(|e| e.to_string())?;
     mount_sys::publish(mount.as_fd(), target.as_fd()).map_err(|e| e.to_string())?;
-    let options = mount_options()?.ok_or("published portal file-grant mount is missing")?;
+    let options = mount_options()?.ok_or("published file-grant mount is missing")?;
     require_view(&source, &session, &options)
 }
 
@@ -228,7 +241,7 @@ pub(crate) fn release() -> Result<(), String> {
         return Err(format!("fixed portal unmount failed: {status}"));
     }
     if mount_options()?.is_some() {
-        return Err("portal file-grant mount remains after unmount".into());
+        return Err("file-grant mount remains after unmount".into());
     }
     Ok(())
 }
@@ -236,3 +249,16 @@ pub(crate) fn release() -> Result<(), String> {
 #[cfg(test)]
 #[path = "../tests/portal_files.rs"]
 mod tests;
+
+
+#[cfg(test)]
+#[test]
+#[allow(clippy::unwrap_used)]
+fn application_mount_lookup_uses_its_exact_view_and_refuses_stacks() {
+    let view = "/var/lib/td/applications/65537/Downloads";
+    let row = format!("7 1 0:1 / {view} rw,nosuid,nodev,noexec - btrfs none rw\n");
+    assert_eq!(mount_options_for(&row, view).unwrap().as_deref(),
+        Some("rw,nosuid,nodev,noexec"));
+    assert!(mount_options_for(&row, "/var/lib/td/applications/65536/Downloads").unwrap().is_none());
+    assert!(mount_options_for(&format!("{row}{row}"), view).is_err());
+}

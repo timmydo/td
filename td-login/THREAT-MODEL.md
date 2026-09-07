@@ -255,7 +255,8 @@ Consequences worth stating plainly:
   account passwordless to satisfy ordinary `exec-as` would therefore red both
   the image contract and the credential policy.
 
-  The shipped image has six locked service identities. OpenSSH's `sshd`
+  The shipped image has six infrastructure service identities plus four
+  locked application identities. OpenSSH's `sshd`
   privilege-separation account and `td-profiler`'s `profiler` account are not
   td-svc `exec-as` targets; each daemon performs its own fixed-purpose drop.
   The `sshd` account has a `/bin/false` shell and an empty root-owned
@@ -332,29 +333,29 @@ prepares the broker and portal runtimes after durable enrollment, whose
 success td-svc requires before startup. The portal consumes UID/GID 991;
 firstboot transfers credential-store ownership to it before human
 sessions and releases enrolled stores independently of application-home
-validation. Application assignments remain reserved. The broker loads an
-immutable deployment table binding each reserved application UID to one
-installed name and exact bus grants. An application UID outside a jail
-receives registration authority only; its name is not exposed as a
-jailed portal identity until lineage is proven. Human-UID launchers
-remain an explicit interim and can still register any installed
-application, with its fixed grants. This does not activate application
-accounts or isolate their state yet. Activation consumes the same
-service-only class defined here. `td-authd/DESIGN.md` specifies that
-reservation contract. The image's paired td-authd terminal launcher uses
-ordinary `exec-as` after a read-only reservation check and
-private-channel authentication. It fixes the human account in root-owned
-service configuration and replaces every standard descriptor before
-spawning this helper. Its unprivileged terminal-exec wrapper refuses a
-failed session-cgroup placement before terminal code runs, and a new
-process group keeps the user terminal independent of the authority
-generation. This adds no credential-switch mechanism or human
-authentication policy here. The paired compositor now reserves physical
-Ctrl+Alt+Esc for an inert trusted screen with exclusive input; it
-accepts no authorization. FIDO2 release still requires token
-enrollment/recovery, protected ownership and a presented prompt bound to
-its assertion. No login, `su` or keyboard-consent behavior substitutes
-for that authorization.
+validation. Stock application assignments are active service accounts.
+The broker loads an immutable deployment table binding each reserved
+application UID to one installed name and exact bus grants. An
+application UID outside a jail receives registration authority only; its
+name is not exposed as a jailed portal identity until lineage is proven.
+Human-UID launchers cannot register applications. Each application owns
+a private home under `/var/lib/td/applications/APP_UID`, its runtime and
+cgroup. The root application launcher consumes the service-only class
+defined here and requires exact post-switch credentials and cgroup
+placement. `td-authd/DESIGN.md` specifies that reservation contract. The
+image's paired td-authd terminal launcher uses ordinary `exec-as` after
+a read-only reservation check and private-channel authentication. It
+fixes the human account in root-owned service configuration and replaces
+every standard descriptor before spawning this helper. Its unprivileged
+terminal-exec wrapper refuses a failed session-cgroup placement before
+terminal code runs, and a new process group keeps the user terminal
+independent of the authority generation. This adds no credential-switch
+mechanism or human authentication policy here. The paired compositor now
+reserves physical Ctrl+Alt+Esc for an inert trusted screen with
+exclusive input; it accepts no authorization. FIDO2 release still
+requires token enrollment/recovery, protected ownership and a presented
+prompt bound to its assertion. No login, `su` or keyboard-consent
+behavior substitutes for that authorization.
 
 ## 4. Privilege can only be dropped, never gained
 

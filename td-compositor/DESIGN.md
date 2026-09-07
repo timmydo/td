@@ -36,9 +36,10 @@ require a separately reviewed descriptor-based syscall surface.
 and evdev nodes, renders software pixels, and reads Linux input events. Its
 Wayland, private portal, optional control and application-readiness sockets
 live beneath the compositor-owned runtime directory. Stock sockets permit
-cross-UID connection and require kernel peer UID 1000 before protocol access.
-Root is deliberately refused too; diagnostics use the checked human identity.
-The image's socket clients already run through td-login as that identity.
+cross-UID connection. Public Wayland admits the human and application UIDs
+from the immutable deployment table; control/readiness admit only human
+UID 1000 and the private portal listener only UID 991. Root is refused;
+diagnostics use the appropriate checked identity.
 Mode 0666 avoids giving shared supplementary groups authority over service
 state or devices; unrelated local UIDs can reach only accept-and-refuse.
 These accepts run serially on each listener: a local connection flood can
@@ -6197,19 +6198,24 @@ root-owned parent. Human runtime `/run/user/1000` remains mode 0700.
 A human-identity boot probe requires permission denial opening every input
 node and the framebuffer. No existing descriptor survives deployment reboot.
 
-Authority-mode Wayland, control and application readiness sockets admit
-only kernel peer UID 1000 before any protocol access. Socket mode 0666
-permits cross-UID connection, while the peer check supplies session
-admission. The private portal listener instead admits only the dedicated
-portal UID 991; it does not apply human-session admission first. The
-portal keeps its dialog buffers in its own 0700 runtime and transfers
-descriptors directly. The physical attention screen below supplies no
-token consent. Host-development direct mode retains its private socket
-permissions.
+Authority-mode public Wayland admits kernel peer UID 1000 and the exact
+application UIDs in the root-owned immutable deployment policy, loaded
+once at startup before accepting clients. Control and
+application-readiness sockets admit only kernel peer UID 1000. Socket
+mode 0666 permits cross-UID connection, while the peer check supplies
+session admission. The private portal listener instead admits only the
+dedicated portal UID 991; it does not apply human-session admission
+first. The portal keeps its dialog buffers in its own 0700 runtime and
+transfers descriptors directly. The physical attention screen below
+supplies no token consent. Host-development direct mode retains its
+private socket permissions.
 
-The session policy is the only additional caller of the existing peer-UID
-wrapper. Control, readiness and public Wayland paths share that policy;
-none accepts a caller-supplied identity. No new raw syscall is introduced.
+The session policy is the only additional caller of the existing
+peer-UID wrapper. Public Wayland uses application-session admission;
+control and readiness use human-session admission. Neither accepts a
+caller-supplied identity, and missing, unreadable or malformed
+deployment policy refuses compositor startup. No new raw syscall is
+introduced.
 
 The physical-input boot also runs `probe-terminal-authority` as the human
 after initial application placement. It arms only with the exact

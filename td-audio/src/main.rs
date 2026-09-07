@@ -15,6 +15,10 @@
 //! is worse than one that is absent.
 #![deny(unsafe_code)]
 
+#[allow(dead_code, reason = "shared immutable application policy")]
+#[path = "../../td-busd/src/app_policy.rs"]
+mod app_policy;
+
 mod alsa;
 mod device;
 mod mixer;
@@ -128,7 +132,7 @@ fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
     let playback = device::select(&found, wanted)?;
     let sink = AlsaSink::open(playback, Request::default())?;
     let spec = sink.spec();
-    let policy = serve::Policy::for_uid(current_uid()?);
+    let policy = serve::Policy::for_deployment(current_uid()?)?;
     let mut server = serve::Server::bind(&options.socket, sink, policy)?;
     let mut stdout = io::stdout();
     writeln!(
@@ -676,6 +680,7 @@ mod tests {
     fn sources() -> Vec<(&'static str, &'static str)> {
         vec![
             ("main.rs", include_str!("main.rs")),
+            ("app_policy.rs", include_str!("../../td-busd/src/app_policy.rs")),
             ("alsa.rs", include_str!("alsa.rs")),
             ("device.rs", include_str!("device.rs")),
             ("mixer.rs", include_str!("mixer.rs")),
@@ -799,9 +804,10 @@ mod tests {
                 "{file} declares a submodule, which no scan here reads"
             );
         }
-        // No path-attribute redirection anywhere: it would point a module at a
-        // file this scan never reads.
-        assert!(!squeezed().contains(concat!("#[pa", "th")));
+        // One shared source is inventoried above and staged by the recipe.
+        let shared = concat!("#[pa", "th=\"../../td-busd/src/app_policy.rs\"]");
+        assert_eq!(squeezed().matches(shared).count(), 1);
+        assert!(!squeezed().replacen(shared, "", 1).contains(concat!("#[pa", "th")));
     }
 
     /// The list this module scans is every `.rs` file on disk, and there are
@@ -836,6 +842,7 @@ mod tests {
         }
         let mut scanned: Vec<String> = sources()
             .into_iter()
+            .filter(|(file, _)| *file != "app_policy.rs")
             .map(|(file, _)| file.to_string())
             .collect();
         on_disk.sort();

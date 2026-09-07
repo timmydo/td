@@ -1649,9 +1649,9 @@ impl<'a> Connection<'a> {
             && on(JAIL_INTERFACE);
         if jail_method {
             // A jailed peer cannot rewrite its own confinement record.
-            // Unconfined human launchers and fixed application principals
-            // reach the registry, which applies deployment grants and UID
-            // binding before creating a pending instance.
+            // Unconfined peers reach the registry. The stock registry refuses
+            // human-UID registration and binds application principals to their
+            // deployment grants before creating a pending instance.
             if !policy::may_register(&self.identity) {
                 return self.refuse_if_wanted(
                     message,
@@ -1928,7 +1928,7 @@ impl<'a> Connection<'a> {
     ///
     /// Called before entering a jail. Stock registration is constrained by
     /// the immutable deployment table and the external kernel UID. Human-UID
-    /// launchers retain installed-name impersonation until their UID cutover.
+    /// callers cannot register an installed application.
     fn jail_register(
         &mut self,
         message: &message::Message<'_>,
@@ -4161,7 +4161,7 @@ fn probe_application_connection(
     }
     if credentials.uid != uid {
         return Err(format!(
-            "application connection {name} belongs to uid {}, not probe uid {uid}",
+            "application connection {name} belongs to uid {}, not assigned uid {uid}",
             credentials.uid
         ));
     }
@@ -4176,12 +4176,27 @@ fn probe_application_connection(
 /// GUID closes broker restart, while unique names and kernel pids close
 /// replacement of any connection present at the first snapshot.
 pub fn probe_application(path: &Path, uid: u32, app_id: &str) -> Result<String, String> {
-    probe_application_within(path, uid, app_id, PROBE_TIMEOUT)
+    let policy = crate::app_policy::load()?;
+    let application_uid = application_probe_subject(&policy, uid, app_id)?;
+    probe_application_within(path, uid, application_uid, app_id, PROBE_TIMEOUT)
+}
+
+fn application_probe_subject(
+    policy: &crate::app_policy::Policy,
+    observer: u32,
+    app_id: &str,
+) -> Result<u32, String> {
+    if observer != policy.owner() {
+        return Err("application evidence requires the human session observer".into());
+    }
+    policy.for_name(app_id).map(|rule| rule.uid)
+        .ok_or_else(|| "application evidence requires an installed application".into())
 }
 
 fn probe_application_within(
     path: &Path,
     uid: u32,
+    application_uid: u32,
     app_id: &str,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
@@ -4262,7 +4277,7 @@ fn probe_application_within(
             continue;
         };
         if let Some(connection) =
-            probe_application_connection(name, &credentials, uid, app_id)?
+            probe_application_connection(name, &credentials, application_uid, app_id)?
         {
             connections.push(connection);
         }
@@ -11733,7 +11748,7 @@ mod tests {
 
             let (mut stream, _) = listener.accept().expect("accept");
             let authentication = line(&mut stream);
-            assert!(authentication.starts_with(b"\0AUTH EXTERNAL "));
+            assert_eq!(authentication, format!("\0AUTH EXTERNAL {}\r\n", uid_hex()).as_bytes());
             stream
                 .write_all(format!("OK {GUID}\r\n").as_bytes())
                 .expect("answer authentication");
@@ -11877,7 +11892,7 @@ mod tests {
                             entries.dict_entry(|entry| {
                                 entry.string("UnixUserID")?;
                                 entry.variant("u", |value| {
-                                    value.uint32(this_uid());
+                                    value.uint32(if app_id == Some("firefox") { 65536 } else { this_uid() });
                                     Ok(())
                                 })
                             })?;
@@ -11911,6 +11926,7 @@ mod tests {
             probe_application_within(
                 &path,
                 this_uid(),
+                65536,
                 "firefox",
                 std::time::Duration::from_secs(5),
             )
@@ -11924,10 +11940,29 @@ mod tests {
     }
 
     #[test]
+    fn the_application_probe_separates_human_observer_from_assigned_subject() {
+        let policy = crate::app_policy::Policy::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n65537\tmail\t\n",
+        ).unwrap();
+        assert_eq!(application_probe_subject(&policy, 1000, "firefox").unwrap(), 65536);
+        for observer in [0, 991, 1001, 65536, 65537] {
+            assert!(application_probe_subject(&policy, observer, "firefox").is_err());
+        }
+        assert!(application_probe_subject(&policy, 1000, "missing").is_err());
+        for uid in [0, 1000, 65537] {
+            let credentials = ProbeCredentials { uid, pid: Some(42), app_id: Some("firefox".into()) };
+            assert!(probe_application_connection(":1.42", &credentials, 65536, "firefox").is_err());
+        }
+        let credentials = ProbeCredentials { uid: 65536, pid: Some(42), app_id: Some("firefox".into()) };
+        assert_eq!(probe_application_connection(":1.42", &credentials, 65536, "firefox").unwrap(), Some((":1.42".into(), 42)));
+    }
+
+    #[test]
     fn the_application_probe_refuses_ids_outside_the_td_grammar() {
         let error = probe_application_within(
             Path::new("/not/contacted"),
             this_uid(),
+            65536,
             "-not-an-app",
             std::time::Duration::from_millis(1),
         )

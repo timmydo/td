@@ -5,6 +5,7 @@ const MAIN_RS: &str = include_str!("../../../td-jail/src/main.rs");
 #[cfg(test)]
 const BUILDER_APPLICATION_RS: &str = include_str!("../../../builder/src/application.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("app_policy", include_str!("../../../td-busd/src/app_policy.rs")),
     (
         "authority",
         include_str!("../../../td-jail/src/authority.rs"),

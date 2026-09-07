@@ -2322,11 +2322,23 @@ propagation; flags are exactly AT_EMPTY_PATH. move_mount(429) publishes
 through borrowed source and destination descriptors, two empty paths, and
 exactly MOVE_MOUNT_F_EMPTY_PATH(4)|MOVE_MOUNT_T_EMPTY_PATH(0x40).
 
+The application-grant wrapper additionally admits exactly
+MOUNT_ATTR_IDMAP|NOSUID|NODEV|NOEXEC (0x10000e), with the same zero clear
+and propagation fields. It does not clear an inherited read-only attribute;
+a resulting read-only view fails the required writable-view check. The two
+public wrappers select these fixed values; no caller supplies a flags word.
+The shared namespace helper may map human UID/GID 1000 to the immutable,
+actively enrolled Firefox, mail or Claude application UID for its fixed Downloads
+or workspace grant. Application mapping startup and shutdown are root-only.
+The same instruction and adoption sites serve both mount profiles.
+
 The wrappers accept neither paths nor flags. Safe std owns all descriptors
 and closes the detached mount on failure. No descriptor from this boundary
 is received over D-Bus or the attention channel. The production consumer
 selects the fixed human Downloads source and read-only portal destination;
-it does not provide a general mount or application-launch operation.
+the application consumer selects only Firefox/mail Downloads or Claude src
+beneath that assigned application's private home. Neither consumer provides
+a general mount operation or accepts a path from an application.
 
 ## 17. `td-mail` — the terminal surface of a screen application
 

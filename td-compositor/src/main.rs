@@ -1,5 +1,9 @@
 #![deny(unsafe_code)]
 
+#[allow(dead_code, reason = "shared immutable application policy")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-busd/src/app_policy.rs")]
+mod app_policy;
+
 mod attention;
 mod authority;
 mod bar;
@@ -415,6 +419,12 @@ fn resolve_socket_endpoint(path: &Path, label: &str) -> Result<PathBuf, String> 
 
 fn run_compositor(options: RunOptions) -> Result<(), String> {
     let socket_policy = session::SocketPolicy::for_authority(options.terminal_authority);
+    let display_policy = if options.terminal_authority {
+        session::application_policy()?;
+        session::SocketPolicy::ApplicationSession
+    } else {
+        session::SocketPolicy::Private
+    };
     // Pin the root sender before framebuffer, listener, or input workers exist.
     let launches = if options.terminal_authority {
         launcher::LaunchBackend::Authority(authority::Launcher::connect()?)
@@ -513,7 +523,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         &options.socket,
         &options.portal_socket,
         runtime,
-        socket_policy,
+        display_policy,
     )
 }
 
@@ -1205,6 +1215,7 @@ mod confinement {
     const AUTH_SYS: &str = include_str!("../../td-authd/src/sys.rs");
 
     const OTHER: &[(&str, &str)] = &[
+        ("app_policy.rs", include_str!("../../td-busd/src/app_policy.rs")),
         ("attention.rs", include_str!("attention.rs")),
         ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
@@ -1634,6 +1645,7 @@ fn syscall6(
             OTHER
                 .iter()
                 .chain(TEST_ONLY)
+                .filter(|(name, _)| *name != "app_policy.rs")
                 .map(|(name, _)| (*name).to_string()),
         );
         inventoried.sort();

@@ -4407,7 +4407,7 @@ mod tests {
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled.
-        assert_eq!(readers_of("td-busd"), ["td-jail", "td-login", "td-portal", "td-secret"]);
+        assert_eq!(readers_of("td-busd"), ["td-audio", "td-compositor", "td-jail", "td-login", "td-portal", "td-secret"]);
         assert_eq!(readers_of("td-boot"), ["td-install"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
         assert!(readers_of("td-sh").is_empty(), "{readers:?}");
@@ -6511,11 +6511,17 @@ mod tests {
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
             [
+                "td-audio",
+                "td-authd",
                 "td-busd",
+                "td-compositor",
+                "td-editor",
                 "td-firstboot",
                 "td-jail",
                 "td-login",
                 "td-portal",
+                "td-review",
+                "td-seatd",
                 "td-secret"
             ]
         );
