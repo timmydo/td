@@ -39,6 +39,7 @@ const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
 const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(30 * 60);
+const SOURCE_CONSUMER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const FEED_NO_DAEMON_ENV: &str = "TD_FEED_NO_DAEMON";
@@ -457,6 +458,19 @@ fn download_verified_before(
     want: &str,
     guard: Option<&ResponseGuard<'_>>,
 ) -> Result<(), String> {
+    download_verified_policy(url, dst, want, guard, true)
+}
+
+fn download_verified_policy(
+    url: &str,
+    dst: &Path,
+    want: &str,
+    guard: Option<&ResponseGuard<'_>>,
+    allow_redirects: bool,
+) -> Result<(), String> {
+    if !allow_redirects && guard.is_none() {
+        return Err("redirect refusal requires a transfer deadline".into());
+    }
     static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(0);
     let parent = dst
         .parent()
@@ -532,12 +546,16 @@ fn download_verified_before(
     (|| {
         if let Some(guard) = guard {
             guard.check().map_err(|e| e.to_string())?;
-            crate::http::get_to_file_before(
-                url,
-                &tmp.path,
-                MAX_ARTIFACT_BYTES,
-                guard.deadline,
-            )?;
+            if allow_redirects {
+                crate::http::get_to_file_before(
+                    url, &tmp.path, MAX_ARTIFACT_BYTES, guard.deadline,
+                )?;
+            } else {
+                crate::http::get_to_file_accounted_no_redirects_before(
+                    url, &tmp.path, MAX_ARTIFACT_BYTES,
+                    &AtomicU64::new(0), MAX_ARTIFACT_BYTES, guard.deadline,
+                )?;
+            }
             guard.check().map_err(|e| e.to_string())?;
         } else {
             crate::http::get_to_file(url, &tmp.path, MAX_ARTIFACT_BYTES)?;
@@ -606,7 +624,6 @@ impl<'a> ResponseGuard<'a> {
         }
     }
 
-    #[cfg(test)]
     fn without_client(deadline: Instant) -> Self {
         Self {
             deadline,
@@ -2239,7 +2256,22 @@ fn recipe_eval_tool(root: &Path) -> Result<PathBuf, String> {
             root.display()
         ));
     }
+    let builder = match std::env::var_os("TD_BUILDER_SELF").filter(|value| !value.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let local = root.join("target/release/td-builder");
+            if is_executable_file(&local) {
+                local
+            } else {
+                std::env::var_os("PATH").and_then(|paths| {
+                    std::env::split_paths(&paths).map(|dir| dir.join("td-builder"))
+                        .find(|path| is_executable_file(path))
+                }).ok_or("source pin resolution requires td-builder; build it with cargo build --release --manifest-path builder/Cargo.toml or install it on PATH")?
+            }
+        }
+    };
     let out = Command::new("sh")
+        .env("TD_BUILDER_SELF", builder)
         .arg(&script)
         .arg(root.join(".td-build-cache/recipe-eval"))
         .current_dir(root)
@@ -2370,6 +2402,67 @@ fn shared_feed() -> Option<(String, PathBuf)> {
             None
         }
     }
+}
+
+/// Explicit consumers never populate a producer store or fall back upstream.
+fn consume_source_pins(pins: &[SourcePin], dest: &Path, base: &str) -> Result<(), String> {
+    let base = base.trim_end_matches('/');
+    let authority = base.strip_prefix("http://")
+        .or_else(|| base.strip_prefix("https://"))
+        .ok_or("TD_FEED_BASE must be an http:// or https:// endpoint")?;
+    if authority.is_empty() || authority.bytes().any(|b| {
+        b.is_ascii_whitespace() || b.is_ascii_control() || matches!(b, b'/' | b'?' | b'#' | b'@' | b'\\')
+    }) {
+        return Err("TD_FEED_BASE must name one server without a path, query or credentials".into());
+    }
+    if pins.is_empty() {
+        return Err("no recipe source pins to consume".into());
+    }
+    let mut failures = Vec::new();
+    for pin in pins {
+        if pin.file.is_empty() || pin.file == "." || pin.file == ".."
+            || pin.file.contains('/') || pin.file.contains('\\')
+            || pin.file == ".td-feed-download.lock"
+            || pin.file.starts_with(".td-feed-download-")
+        {
+            return Err(format!("unsafe source destination for {}", pin.key));
+        }
+        let path = pin.url.strip_prefix("https://")
+            .or_else(|| pin.url.strip_prefix("http://"))
+            .ok_or_else(|| format!("source {} is not an HTTP artifact", pin.key))?;
+        if store_path(Path::new("."), path).is_none() {
+            return Err(format!("source {} has no safe feed path", pin.key));
+        }
+        let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
+        let result = download_verified_policy(
+            &format!("{base}/{path}"), &dest.join(&pin.file), &pin.sha256,
+            Some(&guard), false,
+        );
+        match result {
+            Ok(()) => eprintln!(">> td-feed consume sources: {} verified", pin.file),
+            Err(error) => {
+                let failure = format!(
+                    "source {} ({}): {error}; resolve any local cache error above; if the host entry is missing or mismatched, warm this declared pin on the host ({} SHA-256 {}); upstream fallback is disabled",
+                    pin.key, pin.file, pin.url, pin.sha256,
+                );
+                eprintln!(">> td-feed consume sources: {failure}");
+                failures.push(failure);
+            }
+        }
+    }
+    if failures.is_empty() { Ok(()) } else {
+        Err(format!("{} source archive(s) were not acquired:\n{}", failures.len(), failures.join("\n")))
+    }
+}
+
+fn consume_sources(root: &Path) -> Result<(), String> {
+    let base = std::env::var("TD_FEED_BASE")
+        .map_err(|_| "requires TD_FEED_BASE".to_string())?;
+    let pins = recipe_source_pins_result(root)?;
+    consume_source_pins(&pins, &sources_dir(), &base)?;
+    warm_kernel_headers_from_pins("i386", &pins);
+    warm_kernel_headers_from_pins("x86_64", &pins);
+    Ok(())
 }
 
 /// warm sources — fetch the recipe-owned pinned source-bootstrap tarballs into the shared
@@ -3135,6 +3228,11 @@ fn ensure_serve_daemon(feed_dir: &Path) -> Result<String, String> {
 
 pub fn run(a: &[String]) {
     match a.get(1).map(String::as_str) {
+        Some("consume") if a.len() == 3 && a.get(2).map(String::as_str) == Some("sources") => {
+            if let Err(error) = consume_sources(&repo_root()) {
+                die(format!("consume sources: {error}"));
+            }
+        }
         // warm <action> — the structured host-PREP orchestration (consolidated warm-*.sh).
         // The low-level `warm INDEX STORE` primitive (feed-shared gate, feed-ensure serve)
         // stays: dispatch on a known action keyword, else treat it as the legacy 2-arg form.
@@ -3230,7 +3328,7 @@ pub fn run(a: &[String]) {
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed serve STORE ADDR\n  \
-                 td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed consume sources  (requires TD_FEED_BASE; no upstream fallback)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);
@@ -3551,6 +3649,158 @@ mod tests {
 
         assert_eq!(std::fs::read(&out).unwrap(), b"published bytes");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn consumer_rejects_coordination_names_and_incomplete_download_policy() {
+        let dir = unique_tmp_dir("consumer-reserved");
+        for name in [".td-feed-download.lock", ".td-feed-download-12-3.tmp"] {
+            let pin = super::SourcePin {
+                key: "fixture".into(), url: "https://example.invalid/source".into(),
+                sha256: super::hex_sha256(b"bytes"), file: name.into(),
+            };
+            let error = super::consume_source_pins(&[pin], &dir, "http://127.0.0.1:0").unwrap_err();
+            assert!(error.contains("unsafe source destination"), "{error}");
+        }
+        let error = super::download_verified_policy("http://127.0.0.1:0", &dir.join("source"), "", None, false).unwrap_err();
+        assert!(error.contains("requires a transfer deadline"));
+        assert!(!dir.exists());
+    }
+
+    struct ConsumerServer {
+        base: String,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ConsumerServer {
+        fn start(store: PathBuf, response: Option<Vec<u8>>) -> Self {
+            use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+            use std::io::Write;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let stopped = stop.clone();
+            let seen = requests.clone();
+            let thread = std::thread::spawn(move || {
+                while !stopped.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            seen.fetch_add(1, Ordering::Relaxed);
+                            if let Some(bytes) = &response {
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                                let mut scratch = [0; 4096];
+                                let _ = stream.read(&mut scratch);
+                                let _ = stream.write_all(bytes);
+                            } else {
+                                let _ = super::handle_conn(stream, &store);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("listener: {error}"),
+                    }
+                }
+            });
+            Self { base, requests, stop, thread: Some(thread) }
+        }
+        fn count(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for ConsumerServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        }
+    }
+
+    #[test]
+    fn two_consumers_use_verified_host_bytes_without_contacting_origin() {
+        let dir = unique_tmp_dir("consumers");
+        let store = dir.join("host");
+        let origin = ConsumerServer::start(dir.join("upstream"), None);
+        let bytes = b"one pinned source, two private caches";
+        let pin = super::SourcePin {
+            key: "fixture".into(), url: format!("{}/source.tar", origin.base),
+            sha256: super::hex_sha256(bytes), file: "source.tar".into(),
+        };
+        let host_file = store.join(super::strip_scheme(&pin.url));
+        std::fs::create_dir_all(host_file.parent().unwrap()).unwrap();
+        std::fs::write(&host_file, bytes).unwrap();
+        std::fs::write(super::sidecar_path(&host_file), format!("{}\n", pin.sha256)).unwrap();
+        let feed = ConsumerServer::start(store, None);
+        for guest in ["first", "second"] {
+            super::consume_source_pins(std::slice::from_ref(&pin), &dir.join(guest), &feed.base).unwrap();
+            assert_eq!(std::fs::read(dir.join(guest).join(&pin.file)).unwrap(), bytes);
+        }
+        assert_eq!(feed.count(), 2);
+        assert_eq!(origin.count(), 0);
+        std::fs::write(&host_file, b"corrupt host object").unwrap();
+        let error = super::consume_source_pins(std::slice::from_ref(&pin), &dir.join("third"), &feed.base).unwrap_err();
+        assert!(error.contains("500"), "{error}");
+        assert!(!dir.join("third").join(&pin.file).exists());
+        std::fs::write(&host_file, bytes).unwrap();
+        // A warm private cache remains usable after the host feed is unavailable.
+        super::consume_source_pins(std::slice::from_ref(&pin), &dir.join("first"), "http://127.0.0.1:0").unwrap();
+        std::fs::write(dir.join("first").join(&pin.file), b"private mutation").unwrap();
+        assert_eq!(std::fs::read(&host_file).unwrap(), bytes);
+        assert_eq!(std::fs::read(dir.join("second").join(&pin.file)).unwrap(), bytes);
+        drop(feed);
+        let restarted = ConsumerServer::start(dir.join("host"), None);
+        super::consume_source_pins(std::slice::from_ref(&pin), &dir.join("third"), &restarted.base).unwrap();
+        assert_eq!(origin.count(), 0);
+        drop(restarted);
+        drop(origin);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn consumer_reports_all_missing_pins_in_one_pass() {
+        let dir = unique_tmp_dir("consumer-all-misses");
+        let feed = ConsumerServer::start(dir.join("empty"), None);
+        let pins: Vec<_> = ["first", "second"].into_iter().map(|key| super::SourcePin {
+            key: key.into(), url: format!("https://example.invalid/{key}"),
+            sha256: super::hex_sha256(b"bytes"), file: key.into(),
+        }).collect();
+        let error = super::consume_source_pins(&pins, &dir.join("guest"), &feed.base).unwrap_err();
+        assert!(error.contains("2 source archive(s)"), "{error}");
+        assert!(error.contains("source first") && error.contains("source second"));
+        assert_eq!(feed.count(), 2);
+        drop(feed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn consumer_misses_corruption_and_redirects_never_fall_back_upstream() {
+        let dir = unique_tmp_dir("consumer-refusal");
+        let origin = ConsumerServer::start(dir.join("upstream"), None);
+        let pin = super::SourcePin {
+            key: "fixture".into(), url: format!("{}/source.tar", origin.base),
+            sha256: super::hex_sha256(b"expected"), file: "source.tar".into(),
+        };
+        for (index, response) in [
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt".to_vec(),
+            format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", pin.url).into_bytes(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nex".to_vec(),
+        ].into_iter().enumerate() {
+            let feed = ConsumerServer::start(dir.join("unused"), Some(response));
+            let dest = dir.join(index.to_string());
+            let error = super::consume_source_pins(std::slice::from_ref(&pin), &dest, &feed.base).unwrap_err();
+            assert!(error.contains("warm this declared pin on the host"), "{error}");
+            assert!(!dest.join(&pin.file).exists());
+            assert_eq!(feed.count(), if index == 3 { 3 } else { 1 });
+            assert_eq!(origin.count(), 0);
+            assert!(std::fs::read_dir(&dest).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        }
+        drop(origin);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

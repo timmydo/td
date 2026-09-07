@@ -273,12 +273,26 @@ to the development host; no maintainer-operated cache or public server is
 required. Feed endpoint discovery/restart is host profile state, not a baked-in
 port in each image.
 
-Setting `TD_FEED_BASE` alone is not yet proof of reuse. In particular, current
-`td-feed warm sources` attempts local `warm_one` before reading the explicit
-feed, which can fetch upstream again in a new guest. The artifact increment
-must distinguish a guest consuming a remote feed from its host producer,
-consume warm entries first, and cover every selected fixed-output acquisition
-path. This includes recipe source archives, locked Cargo registry sources,
+The source archive consumer is `TD_FEED_BASE=http://HOST:PORT td-feed consume
+sources`. It resolves the checkout's recipe source pins, reads verified host
+bytes into the caller's private `~/.td/sources`, and refuses upstream fallback
+and HTTP redirects. The endpoint requires an explicit HTTP(S) scheme and
+one server authority, with no path, query, fragment, or credentials. Each
+source transfer has a two-minute absolute deadline. Missing or mismatched
+bytes fail with all affected pins and conditional host warming instructions;
+local cache failures retain their own diagnostics. It does not populate a local producer store or start a
+feed daemon. Valid private cached bytes remain usable while the host is down.
+Source pin resolution needs the checkout's built `target/release/td-builder`
+or an installed `td-builder` on PATH; `TD_BUILDER_SELF` may explicitly select
+one. The command supplies that selection to the existing evaluator helper.
+Like `warm sources`, it attempts local kernel-header preparation after the
+archives are present; that best-effort preparation is not a readiness claim.
+
+`warm sources` remains the host producer operation and may fetch upstream,
+including when `TD_FEED_BASE` is set. The consumer command currently covers
+recipe source archives only; VM endpoint provisioning and the remaining
+fixed-output acquisition paths still need integration. These include locked
+Cargo registry sources,
 reviewed Git-source archives, and other declared transfer objects that the
 existing warm paths need. Unsupported paths remain visible coverage gaps.
 
