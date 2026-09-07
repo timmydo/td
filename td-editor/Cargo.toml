@@ -10,6 +10,7 @@ license = "GPL-3.0-or-later"
 [package.metadata.td-gate]
 clippy-all-targets = true
 trusted-test-root = true
+native-compositor-tests = true
 
 [lints.clippy]
 unwrap_used = "deny"

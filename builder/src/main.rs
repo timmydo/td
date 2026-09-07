@@ -17,6 +17,7 @@
 //!     `td-builder check` rung.
 
 mod affected;
+mod native_tests;
 mod application;
 mod bootstrap;
 mod build;

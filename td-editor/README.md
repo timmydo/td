@@ -355,13 +355,20 @@ The latter is borrowed and duplicated; give this process exclusive use of it.
 Temporary SHM files are private, immediately unlinked, and bounded to three
 buffers; busy buffers are never overwritten before compositor release.
 
-The first native td-compositor editor tests need no existing display or
-hardware. From the repository root, build the explicit test tool and run:
+The native td-compositor editor tests need no existing display or hardware.
+`ready` builds their compositor tool and runs both key profiles automatically
+when the editor is selected. To run just this tier from the repository root:
+
+```text
+target/release/td-builder gate-crates native-compositor --manifest-path td-editor/Cargo.toml
+```
+
+Or build the explicit tool and run the cases through Cargo directly:
 
 ```text
 cargo build --frozen --manifest-path td-compositor/Cargo.toml --target-dir td-compositor/target
 TD_TEST_TRUSTED_ROOT=1 \
-TD_EDITOR_TEST_COMPOSITOR="$PWD/td-compositor/target/debug/td-compositor" \
+TD_TEST_COMPOSITOR="$PWD/td-compositor/target/debug/td-compositor" \
   cargo test --frozen --manifest-path td-editor/Cargo.toml \
   --test control_process native_compositor:: -- --include-ignored
 ```
@@ -371,9 +378,9 @@ Real routed Shift/Control input, exact remote text/revision assertions,
 frame callbacks, correlated public captures and saved bytes are checked.
 The capture must contain the expected Unifont text at the document origin
 after every edit, excluding only the one-pixel blinking caret column.
-These process tests are currently explicit opt-in; their decoder tests run
-by default. Automatic gate-tool builds and native pointer/wheel/clipboard
-coverage are subsequent work. This does not prove GPU or jail integration.
+Bare Cargo leaves these process cases ignored; their decoder tests run by
+default. Native pointer/wheel/clipboard coverage is subsequent work.
+This does not prove GPU or jail integration.
 
 An optional test runs against a separately launched Weston (not a dependency
 of the editor). Set the socket to your isolated test instance:

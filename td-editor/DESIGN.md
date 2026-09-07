@@ -2166,11 +2166,13 @@ the mapped-buffer oracle. This process proof neither substitutes for a real
 compositor nor proves GPU, jail or caller `$EDITOR` integration.
 
 The native `tests/support/native_compositor.rs` fixture runs both key
-profiles in disposable td-compositor processes. For this first editor
-increment the two process cases are explicit opt-in with an absolute
-`TD_EDITOR_TEST_COMPOSITOR` path; their bounded observation/capture decoders
-run in the ordinary suite. Promotion into the declared gate-tool workflow
-is the next integration step, not an existing default-gate claim.
+profiles in disposable td-compositor processes. Its manifest declares
+`native-compositor-tests = true`: ready's host preflight and gate 325 build
+the explicit compositor tool and run the ignored native cases. Bare Cargo
+tests still require an absolute `TD_TEST_COMPOSITOR` path and explicit
+ignored-test selection; bounded observation/capture decoders run in the
+ordinary suite. DEVELOPMENT.md defines tool preparation, narrowing,
+non-vacuous result checks, ownership and cancellation boundaries.
 The owned compositor starts with an empty inherited environment, an owner
 stdin lifetime and separate input/capture grants. Session readiness, numbered
 input receipts, applied client-publication snapshots and completed PPM output

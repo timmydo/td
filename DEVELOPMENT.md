@@ -316,6 +316,43 @@ map: host-root-owned directories otherwise appear as an unmapped overflow
 UID. Such an owner remains untrusted by production code. A real container
 must supply an identifiable trusted path or the optional endpoint refuses.
 
+## Native compositor test platform
+
+A roster crate declaring `native-compositor-tests = true` in its gate
+metadata adds a native process-test command to both the host preflight and
+gate 325. It requires the discovered `td-compositor` crate. The command is
+attributed to the consumer for affected-check narrowing: an editor-only
+change builds its compositor test tool without selecting the compositor's
+own suites or expanding the recipe-check scope. Compositor changes select
+declared native-test consumers as readers even without shared source files.
+
+`td-builder gate-crates native-compositor --manifest-path CRATE/Cargo.toml`
+checks that declaration, builds the repository's compositor offline into a
+fresh owned directory under `target/`, then runs the consumer's ignored
+`control_process` cases filtered by `native_compositor::`, with two test
+threads. Ordinary tests and optional Weston cases keep their own commands.
+The tool's absolute UTF-8 path is forced through Cargo configuration as
+`TD_TEST_COMPOSITOR`; ambient values cannot substitute another executable.
+`trusted-test-root` is retained for this test command. The tool build's
+explicit target directory is independent of `CARGO_TARGET_DIR`; the tests
+still honor the gate's target directory. Ambient cross-target configuration
+that does not produce the expected host binary fails, never reuses an old
+binary. This is host test preparation, not a target artifact input.
+
+The wrapper requires successful Cargo exit and a final, exact, nonzero
+passing libtest summary from this invocation. Embedded diagnostic markers
+do not count; a later zero or malformed summary retires earlier evidence.
+This parses the test harness's output, not adversarial executable output.
+Its streamed stdout is bounded to four MiB and 64 KiB per line; stderr is
+inherited. Gate-run supplies its existing wall-clock deadline inside gate
+325. Direct and host-preflight invocations have no total elapsed-time
+limit. Hosted runs retain check-host memory/client-loss cancellation and
+descendant containment; the direct command is not automatically hosted.
+On normal completion or error the wrapper reaps its Cargo child and removes
+only its owned tool directory. The process fixture owns editor/compositor
+cleanup. A hard-killed wrapper can leave its uniquely named scratch
+directory behind.
+
 # Code review: three per commit
 
 Every increment is read by three independent reviewers before it lands. They

@@ -1610,6 +1610,12 @@ fn render_cargo_test(cmds: &[String]) -> String {
                     o.push_str(" -- ");
                     o.push_str(args);
                 }
+                if cmds.iter().any(|cmd| {
+                    cmd.contains(" gate-crates native-compositor ")
+                        && cmd_manifest_crate(cmd) == Some(krate)
+                }) {
+                    o.push_str(" [native compositor tool + tests]");
+                }
             }
         }
     }
@@ -2800,10 +2806,36 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             Ok(_) => fail("the derived roster is empty — it cannot be"),
             Err(e) => fail(&e),
         },
+        [op, flag, manifest] if op == "native-compositor" && flag == "--manifest-path" => {
+            let roster = match discover_gate_crates(&root) {
+                Ok(roster) => roster,
+                Err(e) => return fail(&e),
+            };
+            let Some(krate) = roster
+                .iter()
+                .find(|k| *manifest == format!("{}/Cargo.toml", k.name))
+            else {
+                return fail("manifest is not a known roster crate");
+            };
+            if !krate.native_compositor_tests {
+                return fail("manifest does not declare native-compositor-tests");
+            }
+            if !roster.iter().any(|k| k.name == "td-compositor") {
+                return fail("native tests require the td-compositor roster crate");
+            }
+            match crate::native_tests::run(&root, manifest, krate.trusted_test_root) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
         _ => {
             eprintln!("usage: td-builder gate-crates locks");
             eprintln!("       td-builder gate-crates cargo-cmds");
             eprintln!("       td-builder gate-crates names");
+            eprintln!(concat!(
+                "       td-builder gate-crates native-compositor ",
+                "--manifest-path CRATE/Cargo.toml"
+            ));
             // 2 for "typed wrong", as `text_cli` does — a failed CHECK is 1,
             // and the gate script must be able to tell them apart.
             ExitCode::from(2)
@@ -3074,6 +3106,7 @@ fn dependency_free(lock: &str, text: &str, expected: usize) -> Result<(), String
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GateCrate {
     trusted_test_root: bool,
+    native_compositor_tests: bool,
     /// The directory name, which is also the crate name and the manifest path
     /// the commands are spelled with: `td-sh`.
     name: String,
@@ -3237,6 +3270,7 @@ fn resembles_gate_section(header: &str) -> bool {
 fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
     let mut out = GateCrate {
         trusted_test_root: false,
+        native_compositor_tests: false,
         name: name.to_string(),
         clippy_all_targets: false,
         test_args: None,
@@ -3302,6 +3336,10 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
             return Err(format!("{name}: `{line}` is not `key = value`"));
         };
         match key.trim() {
+            "native-compositor-tests" => {
+                out.native_compositor_tests =
+                    gate_bool(name, "native-compositor-tests", value.trim())?;
+            }
             "trusted-test-root" => {
                 out.trusted_test_root = gate_bool(name, "trusted-test-root", value.trim())?;
             }
@@ -3614,7 +3652,10 @@ fn crate_readers(root: &Path, roster: &[GateCrate]) -> Result<Vec<(String, Vec<S
             if read.name == reader.name {
                 continue;
             }
-            if names_crate_dir(&text, &read.name) || manifest_names(&manifest, &read.name) {
+            if names_crate_dir(&text, &read.name)
+                || manifest_names(&manifest, &read.name)
+                || (reader.native_compositor_tests && read.name == "td-compositor")
+            {
                 if let Some((_, readers)) = out.iter_mut().find(|(n, _)| *n == read.name) {
                     push_unique(readers, &reader.name);
                 }
@@ -3748,7 +3789,8 @@ fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Ve
 /// The crate a `--manifest-path <crate>/Cargo.toml` command names; None for the
 /// `--workspace` ones, which belong to no single crate.
 fn cmd_manifest_crate(cmd: &str) -> Option<&str> {
-    Some(cmd.split_once("--manifest-path ")?.1.split_once('/')?.0)
+    // The quoted gate executable path may itself contain this flag's text.
+    Some(cmd.rsplit_once("--manifest-path ")?.1.split_once('/')?.0)
 }
 
 /// What the `cargo-test` preflight runs, in order: every `cargo test` before
@@ -3768,6 +3810,9 @@ fn cargo_test_cmds_all(root: &Path) -> Result<Vec<String>, String> {
             cmd.push_str(args);
         }
         out.push(cmd);
+        if k.native_compositor_tests {
+            out.push(native_compositor_command(k)?);
+        }
     }
     out.push("cargo clippy --frozen --workspace".to_string());
     for k in &crates {
@@ -3805,6 +3850,9 @@ pub(crate) fn gate_cargo_cmds(root: &Path) -> Result<Vec<String>, String> {
             cmd.push_str(args);
         }
         out.push(cmd);
+        if k.native_compositor_tests {
+            out.push(native_compositor_command(k)?);
+        }
     }
     Ok(out)
 }
@@ -3815,6 +3863,16 @@ fn crate_test_command(krate: &GateCrate) -> String {
         cmd.push_str(" --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'");
     }
     cmd
+}
+
+fn native_compositor_command(krate: &GateCrate) -> Result<String, String> {
+    let binary = std::env::current_exe().map_err(|e| format!("gate executable: {e}"))?;
+    let quoted = shell_quote(&binary).ok_or("gate executable path cannot be shell-quoted")?;
+    // Attribute the tool preparation to its consumer, preserving narrowed gates.
+    Ok(format!(
+        "{quoted} gate-crates native-compositor --manifest-path {}/Cargo.toml",
+        krate.name
+    ))
 }
 
 /// The crate names gate 325 reports, in roster order.
@@ -4494,6 +4552,7 @@ mod tests {
         }
         let krate = |name: &str| GateCrate {
             trusted_test_root: false,
+            native_compositor_tests: false,
             name: name.to_string(),
             clippy_all_targets: false,
             test_args: None,
@@ -6511,7 +6570,7 @@ mod tests {
                 "td-secret"
             ]
         );
-        assert_eq!(comp.len(), 20, "{comp:?}");
+        assert_eq!(comp.len(), 21, "{comp:?}");
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
             [
@@ -6606,7 +6665,7 @@ mod tests {
         let mut paths: Vec<String> = editor_paths.iter().map(|p| (*p).to_string()).collect();
         assert!(compute_selection(&root, &paths).targets.is_empty());
         let commands = cargo_test_cmds(&root, &paths).unwrap();
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 5, "{commands:?}");
         assert!(commands.iter().all(|c| {
             c.contains("--workspace") || c.contains("--manifest-path td-editor/Cargo.toml")
         }));
@@ -6786,8 +6845,13 @@ mod tests {
         }
         assert_eq!(
             cmds.len(),
-            2 * (names.len() + 1),
-            "one clippy and one test command per crate, plus the workspace pair"
+            2 * (names.len() + 1)
+                + discover_gate_crates(&root)
+                    .unwrap()
+                    .iter()
+                    .filter(|k| k.native_compositor_tests)
+                    .count(),
+            "clippy/test per crate and workspace, plus declared native tests"
         );
         // The declared FLAGS, not just the command's presence. Without this,
         // deleting the `--all-targets` branch leaves every test green while
@@ -6913,6 +6977,104 @@ mod tests {
                 &format!("[package.metadata.td-gate]\ntrusted-test-root = {invalid}\n"),
             ).is_err());
         }
+    }
+
+    #[test]
+    fn native_compositor_tests_follow_metadata_in_both_legs_without_widening_consumers() {
+        assert_eq!(
+            cmd_manifest_crate(concat!(
+                "'/repo/--manifest-path td-decoy/tool' gate-crates native-compositor ",
+                "--manifest-path td-editor/Cargo.toml"
+            )),
+            Some("td-editor")
+        );
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        let native = |commands: Vec<String>| -> Vec<String> {
+            commands
+                .into_iter()
+                .filter(|c| c.contains(" gate-crates native-compositor "))
+                .collect()
+        };
+        let host = native(cargo_test_cmds_all(&root).unwrap());
+        let gate = native(gate_cargo_cmds(&root).unwrap());
+        assert_eq!(host, gate);
+        let declared: Vec<_> = roster
+            .iter()
+            .filter(|k| k.native_compositor_tests)
+            .map(|k| k.name.as_str())
+            .collect();
+        assert_eq!(
+            host.iter().filter_map(|c| cmd_manifest_crate(c)).collect::<Vec<_>>(),
+            declared
+        );
+        assert!(declared.contains(&"td-editor"));
+        let editor = cargo_test_cmds(&root, &["td-editor/src/model.rs".into()]).unwrap();
+        assert_eq!(
+            native(editor.clone()),
+            host.iter()
+                .filter(|c| cmd_manifest_crate(c) == Some("td-editor"))
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert!(!editor.iter().any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
+        assert!(render_cargo_test(&editor).contains("[native compositor tool + tests]"));
+        let compositor = cargo_test_cmds(&root, &["td-compositor/src/main.rs".into()]).unwrap();
+        assert_eq!(native(compositor), host);
+        assert!(native(cargo_test_cmds(&root, &["td-review/src/main.rs".into()]).unwrap()).is_empty());
+        for invalid in ["1", "yes", "\"true\"", ""] {
+            assert!(parse_gate_crate(
+                "td-x",
+                &format!("[package.metadata.td-gate]\nnative-compositor-tests = {invalid}\n")
+            ).is_err());
+        }
+        assert!(!parse_gate_crate("td-x", "[package]\n").unwrap().native_compositor_tests);
+    }
+
+    #[test]
+    fn native_tool_declaration_is_a_reader_edge_without_shared_sources() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = (0..100)
+            .find_map(|attempt| {
+                let path = std::env::temp_dir().join(format!(
+                    "td-native-reader-{}-{attempt}", std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => Some(Ok(path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .expect("unused fixture name")
+            .unwrap();
+        let _cleanup = Cleanup(root.clone());
+        for (name, native) in [("td-compositor", false), ("td-consumer", true)] {
+            let base = root.join(name);
+            std::fs::create_dir_all(base.join("src")).unwrap();
+            std::fs::write(base.join("src/main.rs"), "fn main() {}\n").unwrap();
+            std::fs::write(
+                base.join("Cargo.toml"),
+                format!("[package]\n[package.metadata.td-gate]\nnative-compositor-tests = {native}\n"),
+            ).unwrap();
+        }
+        let roster = discover_gate_crates(&root).unwrap();
+        let readers = crate_readers(&root, &roster).unwrap();
+        assert!(readers.contains(&("td-compositor".into(), vec!["td-consumer".into()])));
+        assert!(readers.contains(&("td-consumer".into(), vec![])));
+        let mut selected = vec!["td-compositor".into()];
+        close_over_readers(&mut selected, &readers);
+        assert!(selected.contains(&"td-consumer".into()));
+        let commands = cargo_test_cmds(&root, &["td-consumer/src/main.rs".into()]).unwrap();
+        assert!(commands.iter().any(|c| c.contains(" gate-crates native-compositor ")));
+        assert!(!commands.iter().any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
     }
 
     /// The declaration parser, over manifest TEXT so its cases are literals

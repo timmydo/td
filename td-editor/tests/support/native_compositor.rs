@@ -100,8 +100,8 @@ fn ppm<'a>(reply: &'a [u8], session: &str) -> Result<(u64, &'a [u8])> {
 
 impl Compositor {
     fn start(directory: &Directory) -> Self {
-        let binary = PathBuf::from(std::env::var_os("TD_EDITOR_TEST_COMPOSITOR").expect(
-            "set TD_EDITOR_TEST_COMPOSITOR to an explicitly built td-compositor; see README",
+        let binary = PathBuf::from(std::env::var_os("TD_TEST_COMPOSITOR").expect(
+            "set TD_TEST_COMPOSITOR to an explicitly built td-compositor; see README",
         ));
         assert!(
             binary.is_absolute(),
@@ -384,13 +384,13 @@ fn keyboard_profile(profile: &str) {
 }
 
 #[test]
-#[ignore = "requires explicit built TD_EDITOR_TEST_COMPOSITOR; see README"]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
 fn native_windows_keyboard() {
     keyboard_profile("windows");
 }
 
 #[test]
-#[ignore = "requires explicit built TD_EDITOR_TEST_COMPOSITOR; see README"]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
 fn native_emacs_keyboard() {
     keyboard_profile("emacs");
 }
