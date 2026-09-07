@@ -5,8 +5,9 @@ query and revision-checked editing subset below. It is off by default;
 scratch preview and replay do not accept the option. Remote Close Tab, Quit and
 close-dialog Cancel/Discard/Save/path, conflict Cancel/Reload/Save As and file
 Open/Save/Save As are connected, including ordinary Open/Save As/Dictionary
-path answers. Decoded key/pointer control and other keyboard-prompt answers
-(menu/Find/Replace/numeric/command input) remain unimplemented.
+path answers. Decoded keys drive ordinary editing and menu/Find/Replace/
+numeric/command input under the stricter input contract below. Decoded pointer
+control remains unimplemented.
 Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
@@ -74,13 +75,14 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID dialog-answer DIALOG TAB REVISION reload` | Request Reload from a live conflict; dirty text requires a second answer. |
 | `1 ID dialog-answer DIALOG TAB REVISION discard-reload` | Confirm the conflict's second question before replacing unsaved text. |
 | `1 ID dialog-answer DIALOG TAB REVISION save-as HEX_PATH` | Save the conflict target to a new literal destination. |
+| `1 ID key TAB REVISION GENERATION HEX_CHORD` | Deliver one decoded native chord with an exact redraw-generation fence. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
 | `1 ID check-spelling TAB REVISION` | Admit an on-demand whole-document spelling job for the active tab. |
 
 Tab creation, file jobs and the editing subset are specified below. `load`,
-direct Reload, physical-input simulation and other dialog answers remain
+direct Reload, raw physical-input simulation and other dialog answers remain
 refused; this parser is not a route into replay's broader command set.
 `Request::response` borrows `&Controller`, so it cannot dispatch an edit or
 change selection, views, history or generation. It returns `unavailable`
@@ -484,7 +486,82 @@ completion. No cancellation RPC or download/bundled dictionary is added.
 Terminal rows are historical; later replacements do not rewrite them.
 Native keyboard Return still submits through its ordinary path without a
 remote job row. This endpoint now answers all file/close/conflict dialogs;
-other UI modals retain their coarse flags until decoded input is connected.
+other UI modals retain coarse flags and accept decoded keys as specified next.
+
+## Decoded keys
+
+`1 ID key TAB REVISION GENERATION HEX_CHORD` delivers one logical chord to
+the same native handler as a translated key press. `GENERATION` must be the
+exact current `window-generation` from state, not controller generation or
+a frame callback. It fences native prompt/menu/selection context as well as
+the named active tab/revision. Zero is `invalid-argument`; any different
+generation is `stale-revision`. Redraw invalidations are conservative: caret
+blink, resize, notice changes or other input can make a queued key stale even
+when document bytes did not change. Query again after an explicit refusal;
+never blindly retry a lost reply. An old Return cannot select a newly opened
+menu or answer a later prompt merely because its text revision is unchanged.
+Every admitted key invalidates this generation, even when ignored, so obtain
+fresh state before the next key. There is no bounded retry/progress guarantee:
+slow clients or busy turns can repeatedly cross the 500-ms caret-blink boundary
+and starve key admission. Prefer semantic commands where available. A separate
+input-context generation is deferred; this increment keeps the conservative
+fence rather than weakening changed-context rejection.
+
+The chord is 1..=32 UTF-8 bytes in lowercase hex, with no control characters.
+Use names such as `Return`, `Tab`, `Space`, `C-x`, `C-S-s`, or a single
+printable Unicode scalar, following the existing logical key vocabulary.
+Empty/control text is `invalid-argument`, oversize is `limit`, invalid UTF-8
+is `invalid-text`, and malformed hex/arity/numbers are `protocol`. Debug
+reports only the byte count. The same bounds apply to constructed requests.
+No evdev code, XKB mask, physical serial, held-key state or repeat timer is
+supplied or invented. Each request is a fresh non-repeat delivery; Emacs
+prefixes remain live across admitted keys under their ordinary rules.
+
+Unlike trusted semantic edits/dialog answers, decoded keys require a
+configured window, actual keyboard device and validated map, focus and
+synchronized modifiers. They cannot enter during a physical serial's dynamic
+scope. Native state exposes `key-ready=0|1` for this availability guard; it is
+not a reservation or a guarantee of target/counter admission. Closed/quitting
+windows and every file path, close, conflict or pending-Reload flow refuse
+`unavailable`, even for Escape. Use explicit `dialog-answer` with its live
+ID/tab/revision instead. Synthetic Save or Close may open those flows, but
+another key cannot approve them. Menus, Find, Replace, numeric and command
+prompts do accept keys; their ordinary target and visibility checks remain.
+The endpoint cannot create focus, synchronize a seat or enlarge a window.
+
+Availability runs first, then the generation fence, missing/stale tab checks,
+active-tab check (`invalid-argument`), chord validation and a conservative
+eight-dispatch controller-counter reservation. Admission refusals preserve
+UI, prompt entry, pending Paste, repeat and history. After admission, cancel
+the prior pointer gesture/repeat/Paste through shared cleanup, then call the
+native chord handler. Observe search/spelling/job invalidation afterward;
+do not cancel a new Paste started by that chord. Native typing invokes Auto
+Fill and ordinary undo grouping; it is not semantic Insert. A new scan or
+file operation started by a key follows native behavior and creates no
+remote job row. Use semantic file/spelling commands for job receipts.
+
+Success is `1 ID ok` with an empty trailing field: the chord was delivered,
+not necessarily bound, effective, saved or presented. Ordinary ignored keys,
+unknown bindings and native command refusals retain their existing visible
+feedback; they do not turn this reply into an operation-completion receipt.
+A native adapter error may queue `unavailable` after delivery, then terminates
+the window with the same nonzero-error shutdown as physical input. The error
+is latched before any further control admission or drawing: a partially sent
+Wayland message must not be followed by more output on a damaged stream.
+Shutdown may drop that error reply; its delivery is not guaranteed. Prior
+cleanup or effects are not rolled back. For ordinary delivery, query state/text,
+dialog/job fields and `wait-frame` separately. Closing the final clean tab
+can end the window before reply delivery, under the existing EOF ambiguity.
+
+Copy/Cut cannot obtain clipboard ownership from a decoded key: their shared
+native path still requires a current physical press serial. Menu activation
+does not fabricate one either. Paste can request only an already advertised,
+supported compositor selection under the existing focused data-device policy;
+it revalidates its captured document/selection at completion. The private
+endpoint has the editor's existing authority, not a route to other windows
+or clipboard offers the compositor did not supply. No new clipboard RPC is
+added. Replay keeps its separate, controller-only `key TAB REV HEX_CHORD`
+grammar; its keys do not perform native file or clipboard I/O.
 
 ## Revision-checked editing
 
@@ -832,8 +909,8 @@ pending dialog/job or spelling range is serialized by this controller-only
 snapshot. Its generation means local UI state, **not** a submitted buffer,
 frame callback or scanout. The native extension below adds its own redraw
 generations/snapshots, coarse flags, bounded spelling/file outcomes and close
-and conflict/path dialog identity/answers. Decoded key/pointer admission
-remains later work before claiming complete remote control.
+and conflict/path dialog identity/answers. Decoded key admission is connected;
+pointer admission remains later work before claiming complete remote control.
 
 ## Experimental native adapter
 
@@ -877,7 +954,8 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-paths` | Explicit implemented adapter identity. |
+| `adapter=native-key` | Explicit implemented adapter identity. |
+| `key-ready=0\|1` | Native key availability, before target/generation/counter validation. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |

@@ -14,6 +14,8 @@ const HELP: &str = concat!(
     "Control conflict Reload needs a second discard answer for unsaved text.\n",
     "Control conflict Save As takes a new path; Reload jobs report cancellation.\n",
     "Control also answers live Open/Save As/Dictionary paths by ID and revision.\n",
+    "Control keys require real input readiness and exact native generation.\n",
+    "Key replies acknowledge delivery; file/close/conflict answers require tokens.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -187,6 +189,8 @@ mod tests {
             "Reload needs a second discard answer",
             "Reload jobs report cancellation",
             "answers live Open/Save As/Dictionary paths by ID and revision",
+            "Control keys require real input readiness and exact native generation",
+            "Key replies acknowledge delivery; file/close/conflict answers require tokens",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }

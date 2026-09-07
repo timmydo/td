@@ -12,6 +12,7 @@ pub const PAGE_BYTES: usize = 256 * 1024;
 pub const INSERT_BYTES: usize = 256 * 1024;
 pub const SEARCH_BYTES: usize = crate::search::QUERY_BYTES;
 pub const SPELLING_RANGES: usize = 256;
+pub const KEY_BYTES: usize = 32;
 
 /// One length-prefixed frame. Any refusal poisons it and drops partial text.
 #[derive(Default)]
@@ -116,6 +117,12 @@ pub enum Operation {
         revision: u64,
         answer: DialogAnswer,
     },
+    Key {
+        tab: TabId,
+        revision: u64,
+        generation: u64,
+        chord: String,
+    },
     WaitFrame(u64),
     CheckSpelling {
         tab: TabId,
@@ -180,6 +187,18 @@ impl std::fmt::Debug for Operation {
                 .field("tab", tab)
                 .field("revision", revision)
                 .field("answer", answer)
+                .finish(),
+            Self::Key {
+                tab,
+                revision,
+                generation,
+                chord,
+            } => f
+                .debug_struct("Key")
+                .field("tab", tab)
+                .field("revision", revision)
+                .field("generation", generation)
+                .field("chord_bytes", &chord.len())
                 .finish(),
             Self::WaitFrame(generation) => f.debug_tuple("WaitFrame").field(generation).finish(),
             Self::CheckSpelling { tab, revision } => f
@@ -399,6 +418,19 @@ impl Request {
                         _ => return Err(Error::InvalidArgument),
                     },
                 },
+                "key" => {
+                    let tab = decimal(args.next().ok_or(Error::Protocol)?)?;
+                    let revision = decimal(args.next().ok_or(Error::Protocol)?)?;
+                    let generation = decimal(args.next().ok_or(Error::Protocol)?)?;
+                    let chord = bounded_text(args.next().ok_or(Error::Protocol)?, KEY_BYTES)?;
+                    validate_chord(&chord)?;
+                    Operation::Key {
+                        tab,
+                        revision,
+                        generation,
+                        chord,
+                    }
+                }
                 "wait-frame" => Operation::WaitFrame(decimal(args.next().ok_or(Error::Protocol)?)?),
                 "check-spelling" => Operation::CheckSpelling {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -519,6 +551,7 @@ impl Request {
             | Operation::Quit
             | Operation::CloseTab { .. }
             | Operation::DialogAnswer { .. }
+            | Operation::Key { .. }
             | Operation::CheckSpelling { .. }
             | Operation::SpellingResults { .. }
             | Operation::WaitFrame(_) => Err(Error::Unavailable),
@@ -561,6 +594,7 @@ impl Request {
                     | Operation::CheckSpelling { .. }
                     | Operation::CloseTab { .. }
                     | Operation::DialogAnswer { .. }
+                    | Operation::Key { .. }
             )
     }
 
@@ -714,6 +748,16 @@ impl Request {
         })?;
         Ok(())
     }
+}
+
+pub(crate) fn validate_chord(chord: &str) -> Result<()> {
+    if chord.len() > KEY_BYTES {
+        return Err(Error::Limit);
+    }
+    if chord.is_empty() || chord.chars().any(char::is_control) {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
 }
 
 fn bounded_text(encoded: &str, limit: usize) -> Result<String> {
@@ -915,6 +959,43 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn decoded_key_grammar_is_bounded_private_and_native_only() {
+        let request = Request::parse(b"1\t9\tkey\t2\t3\t4\t70726976617465").unwrap();
+        assert_eq!(
+            request.operation,
+            Operation::Key {
+                tab: 2,
+                revision: 3,
+                generation: 4,
+                chord: "private".into(),
+            }
+        );
+        assert!(request.is_mutating() && !request.is_edit());
+        assert!(!format!("{request:?}").contains("private"));
+        assert!(format!("{request:?}").contains("chord_bytes: 7"));
+        let mut ui = Controller::default();
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        for (arguments, error) in [
+            ("2\t3\t4".to_owned(), Error::Protocol),
+            ("2\t3\t4\t61\textra".to_owned(), Error::Protocol),
+            ("2\t3\t-1\t61".to_owned(), Error::Protocol),
+            ("2\t3\t4\t6A".to_owned(), Error::Protocol),
+            ("2\t3\t4\tff".to_owned(), Error::InvalidText),
+            ("2\t3\t4\t-".to_owned(), Error::InvalidArgument),
+            ("2\t3\t4\t0a".to_owned(), Error::InvalidArgument),
+            ("2\t3\t4\tc285".to_owned(), Error::InvalidArgument),
+            (format!("2\t3\t4\t{}", "61".repeat(33)), Error::Limit),
+        ] {
+            let refusal = Request::parse(format!("1\t9\tkey\t{arguments}").as_bytes()).unwrap_err();
+            assert_eq!(refusal, Refusal { id: 9, error });
+        }
+        assert!(Request::parse(b"1\t0\tkey\t1\t0\t1\tf09f9880").is_ok());
+        assert!(validate_chord(&"a".repeat(32)).is_ok());
+        assert_eq!(validate_chord(&"a".repeat(33)), Err(Error::Limit));
+    }
 
     #[test]
     fn save_grammar_pins_revision_and_explicit_save_as_path_without_replay_authority() {

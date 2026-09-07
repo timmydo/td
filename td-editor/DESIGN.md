@@ -33,8 +33,10 @@ answers use the ordinary close coordinator. Conflict Cancel/Reload/Save As
 and explicit second-stage discard-before-Reload are connected, with bounded
 Reload outcomes. Ordinary Open/Save As/Dictionary path prompts also have
 revision-bound remote answers; Dictionary jobs report bounded outcomes.
-Other keyboard-prompt answers remain unimplemented; menus, Find, Replace,
-numeric and command entry have only coarse presence flags.
+Decoded key control drives editing, menus, Find, Replace, numeric and command
+entry with an exact native redraw-generation fence. It requires real input
+readiness and cannot answer file/close/conflict flows. Pointer control remains
+unimplemented; other UI prompts still expose only coarse presence flags.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -2189,9 +2191,23 @@ the same Open/Save As jobs or a global Dictionary job; dictionary replacement
 clears marks without editing documents. Close-driven paths retain the close
 ID, and conflict-driven Save As gets a fresh independent path ID. CONTROL.md
 defines scope, lifetime, counter exhaustion, reply ambiguity and failure
-semantics. Decoded key/pointer control remains the next admission increment.
-Other keyboard-prompt answers remain unimplemented, including
-menu/Find/Replace/numeric/command input.
+semantics. Decoded key control now invokes the same native chord handler,
+including menu/Find/Replace/numeric/command input. It requires configured,
+focused and synchronized real keyboard state plus an exact native redraw
+generation and active tab/revision. This prevents a delayed key from silently
+acting on changed native input context. File/close/conflict flows refuse all
+decoded keys and require their explicit live dialog answers. No synthetic
+serial, held key or repeat is created, so Copy/Cut retains its physical-press
+requirement; Paste uses only an existing compositor offer. Delivery is not an
+operation-completion receipt, and native key-started work has no remote job
+row. CONTROL.md pins grammar, generation/availability guards, conservative
+counter admission, cleanup and reply ambiguity. Native adapter errors latch a
+fatal state and stop further control/drawing before nonzero shutdown, just as
+physical input does; a partially written Wayland message cannot be resumed.
+The redraw fence may starve slow clients across caret blinks; it promises no
+bounded admission progress. A separate input-context fence is deferred.
+Pointer control remains the
+next admission increment; prompt entries still have no text query.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 

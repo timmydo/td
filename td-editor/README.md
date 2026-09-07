@@ -49,9 +49,9 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-Native query/edit/file/dialog control is available explicitly. Decoded remote
-key/pointer input, other keyboard-prompt answers, GPU rendering and td-mail
-integration remain unimplemented. Do not set
+Native query/edit/file/dialog and decoded-key control are available explicitly.
+Remote pointer input, GPU rendering and td-mail integration remain
+unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
@@ -105,8 +105,15 @@ explicit new destination and leaves the external file untouched. Ordinary
 Open/Save As/Dictionary prompts also accept a literal Path or Cancel answer
 bound to their live ID and revision, including while unfocused. Dictionary
 jobs report installation or failure without changing document text/history.
-Other keyboard-prompt answers (menu/Find/Replace/numeric/command) are not
-remotely connected yet.
+Decoded `key` drives editing and menu/Find/Replace/numeric/command prompts
+through the native handler. It requires real keyboard readiness and pins the
+current native redraw generation as well as the active tab/revision. File,
+close and conflict dialogs require explicit token-bound answers, never keys.
+A key reply acknowledges delivery, not command success or file completion.
+Native adapter errors stop the window; conservative generation changes can
+starve slow key clients. Prefer semantic commands when available.
+Copy/Cut still require a physical press; Paste uses an existing compositor
+offer. See CONTROL.md for exact fields, refusal and lost-reply semantics.
 `check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback

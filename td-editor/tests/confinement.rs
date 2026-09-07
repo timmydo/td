@@ -409,6 +409,65 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert_eq!(dispatch.matches("Event::").count(), 1);
     assert!(dispatch.contains("self.ui.dispatch(Event::New)"));
     assert!(dispatch.contains("self.control_open_job(path.clone())"));
+    let key = production
+        .split("fn control_key(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    let mut prior = 0;
+    for guard in [
+        "control_key_available()",
+        "generation != self.frames.generation()?",
+        "revision_point(target.tab, target.revision)",
+        "self.ui.editor().active() != Some(target.tab)",
+        "validate_chord(chord)?",
+        ".checked_add(8)",
+    ] {
+        let position = key.find(guard).unwrap();
+        assert!(prior < position);
+        prior = position;
+        assert!(key.find(guard).unwrap() < key.find("self.chord(chord, false)").unwrap());
+    }
+    assert!(key.contains("self.control_input_error = Some(detail)"));
+    assert!(
+        end_turn.find("self.control_tick();").unwrap()
+            < end_turn.rfind("self.control_input_health()?").unwrap()
+    );
+    assert!(
+        draw.find("self.control_input_health()?").unwrap()
+            < draw.find("self.frames.capture").unwrap()
+    );
+    assert!(
+        dispatch.find("self.control_input_error.is_some()").unwrap()
+            < dispatch.find("Operation::Key").unwrap()
+    );
+    assert!(
+        key.find("self.control_mutation_accepted()").unwrap()
+            < key.find("self.chord(chord, false)").unwrap()
+    );
+    assert!(!key.contains("Event::") && !key.contains("activation_serial ="));
+    assert!(!key.contains("self.input.arm(") && !key.contains("self.clipboard_request("));
+    let ready = production
+        .split("fn control_key_available(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    for guard in [
+        "self.prompt.is_none()",
+        "self.closing.is_none()",
+        "self.conflict.is_none()",
+        "self.reloading.is_none()",
+        "self.input.focused",
+        "self.input.synchronized",
+        "self.input.map.is_some()",
+        "self.activation_serial.is_none()",
+    ] {
+        assert!(ready.contains(guard));
+    }
     let open = production
         .split("fn control_open_job(")
         .nth(1)

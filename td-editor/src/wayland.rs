@@ -360,6 +360,7 @@ struct Window {
     spelling: crate::spelling::WindowState,
     control_jobs: crate::control_jobs::Jobs,
     control_file_job: Option<ControlFile>,
+    control_input_error: Option<String>,
     control: Option<crate::control_worker::Worker>,
     frame_waiters: VecDeque<crate::control_worker::Job>,
     control_cleanup_error: Option<String>,
@@ -480,6 +481,7 @@ impl Window {
             spelling: crate::spelling::WindowState::default(),
             control_jobs: crate::control_jobs::Jobs::default(),
             control_file_job: None,
+            control_input_error: None,
             control: None,
             frame_waiters: VecDeque::new(),
             control_cleanup_error: None,
@@ -1529,6 +1531,7 @@ impl Window {
     }
 
     fn end_turn(&mut self, now: u64, repeat: bool) -> Result<()> {
+        self.control_input_health()?;
         self.tick(now, repeat)?;
         match self.spelling.step(self.ui.editor()) {
             Ok(changed) => self.frames.invalidate(changed),
@@ -1539,12 +1542,13 @@ impl Window {
         }
         self.observe_control_jobs();
         self.control_tick();
+        self.control_input_health()?;
         self.frames.generation().map_err(error)?;
         Ok(())
     }
 
     fn control_tick(&mut self) {
-        if self.closed {
+        if self.closed || self.control_input_error.is_some() {
             return;
         }
         if self.control.is_some() {
@@ -1577,7 +1581,7 @@ impl Window {
         }
         // One outer turn, not every decoded Wayland event, budgets UI work.
         for _ in 0..CONTROL_JOBS_PER_TURN {
-            if budget == 0 {
+            if budget == 0 || self.control_input_error.is_some() {
                 break;
             }
             let Some(worker) = self.control.as_ref() else {
@@ -1618,12 +1622,42 @@ impl Window {
     }
 
     fn control_response(&mut self, request: &crate::control::Request) -> String {
+        if self.control_input_error.is_some() {
+            return crate::control::Refusal {
+                id: request.id,
+                error: crate::Error::Unavailable,
+            }
+            .response();
+        }
         if let Err(error) = self.frames.generation() {
             return crate::control::Refusal {
                 id: request.id,
                 error,
             }
             .response();
+        }
+        if let crate::control::Operation::Key {
+            tab,
+            revision,
+            generation,
+            chord,
+        } = &request.operation
+        {
+            return match self.control_key(
+                Target {
+                    tab: *tab,
+                    revision: *revision,
+                },
+                *generation,
+                chord,
+            ) {
+                Ok(()) => format!("1\t{}\tok\t", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
         }
         if let crate::control::Operation::DialogAnswer {
             dialog,
@@ -1842,6 +1876,67 @@ impl Window {
         } else {
             response
         }
+    }
+
+    fn control_input_health(&self) -> Result<()> {
+        match &self.control_input_error {
+            Some(detail) => Err(detail.clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn control_key_available(&self) -> bool {
+        !self.closed
+            && self.control_input_error.is_none()
+            && !self.quitting
+            && self.prompt.is_none()
+            && self.closing.is_none()
+            && self.conflict.is_none()
+            && self.reloading.is_none()
+            && self.configured
+            && self.device.is_some()
+            && self.input.map.is_some()
+            && self.input.focused
+            && self.input.synchronized
+            && self.activation_serial.is_none()
+    }
+
+    fn control_key(&mut self, target: Target, generation: u64, chord: &str) -> crate::Result<()> {
+        // File/close answers require their live dialog token, never a key.
+        if !self.control_key_available() {
+            return Err(crate::Error::Unavailable);
+        }
+        if generation == 0 {
+            return Err(crate::Error::InvalidArgument);
+        }
+        if generation != self.frames.generation()? {
+            return Err(crate::Error::StaleRevision);
+        }
+        self.ui
+            .editor()
+            .revision_point(target.tab, target.revision)?;
+        if self.ui.editor().active() != Some(target.tab) {
+            return Err(crate::Error::InvalidArgument);
+        }
+        crate::control::validate_chord(chord)?;
+        // Conservatively cover cleanup plus nested native prompt/close dispatch.
+        self.ui
+            .generation()
+            .checked_add(8)
+            .ok_or(crate::Error::Exhausted)?;
+        self.stop_pointer();
+        self.control_mutation_accepted();
+        let result = self.chord(chord, false);
+        self.searches.observe(self.ui.editor());
+        self.spelling.observe(self.ui.editor());
+        self.observe_control_jobs();
+        self.frames.invalidate(true);
+        if let Err(detail) = result {
+            // A partially sent Wayland message requires fail-stop dispatch.
+            self.control_input_error = Some(detail);
+            return Err(crate::Error::Unavailable);
+        }
+        Ok(())
     }
 
     fn control_open_job(&mut self, path: PathBuf) -> crate::Result<u64> {
@@ -2254,9 +2349,10 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-paths\tnative={},{},{},{}",
+                    "\tadapter=native-key\tkey-ready={}\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
+                flag(self.control_key_available()),
                 flag(self.configured),
                 flag(self.files.is_some()),
                 flag(self.files.as_ref().is_some_and(|files| files.busy())),
@@ -2315,6 +2411,7 @@ impl Window {
     }
 
     fn draw(&mut self) -> Result<()> {
+        self.control_input_health()?;
         self.frames.generation().map_err(error)?;
         if self.closed
             || !self.frames.is_dirty()
@@ -5904,6 +6001,337 @@ mod tests {
         (w, peer)
     }
 
+    fn decoded_key_request(w: &Window, chord: &str) -> crate::control::Request {
+        let tab = w.ui.editor().active().unwrap();
+        let revision = w.ui.editor().document(tab).unwrap().revision();
+        crate::control::Request::parse(
+            format!(
+                "1\t9\tkey\t{tab}\t{revision}\t{}\t{}",
+                w.frames.generation().unwrap(),
+                crate::control::hex(chord.as_bytes())
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn decoded_key(w: &mut Window, chord: &str) {
+        let request = decoded_key_request(w, chord);
+        assert_eq!(w.control_response(&request), "1\t9\tok\t", "{chord}");
+    }
+
+    #[test]
+    fn remote_keys_share_native_typing_prefixes_history_and_auto_fill() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut remote, _peer) = file_dialog_fixture();
+            let (mut native, _native_peer) = file_dialog_fixture();
+            for w in [&mut remote, &mut native] {
+                configure(w, 800, 600);
+                w.ui.dispatch(Event::Profile(profile)).unwrap();
+                for command in [
+                    crate::model::Command::FillColumn(20),
+                    crate::model::Command::AutoFill(true),
+                ] {
+                    w.ui.dispatch(Event::Edit {
+                        tab: 1,
+                        revision: 0,
+                        command,
+                    })
+                    .unwrap();
+                }
+            }
+            for c in "one two three four five six é".chars() {
+                let chord = c.to_string();
+                decoded_key(&mut remote, &chord);
+                native.chord(&chord, false).unwrap();
+            }
+            assert!(remote
+                .ui
+                .editor()
+                .document(1)
+                .unwrap()
+                .text()
+                .contains('\n'));
+            let undo = if profile == Profile::Windows {
+                "C-z"
+            } else {
+                "C-/"
+            };
+            decoded_key(&mut remote, undo);
+            native.chord(undo, false).unwrap();
+            for chord in ["Home", "S-Right", "Backspace"] {
+                decoded_key(&mut remote, chord);
+                native.chord(chord, false).unwrap();
+            }
+            let a = remote.ui.editor().document(1).unwrap();
+            let b = native.ui.editor().document(1).unwrap();
+            assert_eq!(a.text(), b.text());
+            assert_eq!(a.selection(), b.selection());
+            assert_eq!(a.history_depth(), b.history_depth());
+            assert_eq!(a.revision(), b.revision());
+            if profile == Profile::Emacs {
+                decoded_key(&mut remote, "C-x");
+                assert!(remote.ui.keys().pending());
+                decoded_key(&mut remote, "C-f");
+            } else {
+                decoded_key(&mut remote, "C-o");
+            }
+            assert!(remote.prompt.is_some());
+            assert!(remote.control_dialog_fields().contains("path-open,path,1,"));
+        }
+    }
+
+    #[test]
+    fn remote_keys_pin_native_generation_and_preserve_refused_input() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        decoded_key(&mut w, "a");
+        let old = decoded_key_request(&w, "x");
+        w.chord("Left", false).unwrap(); // Selection changed without a text revision.
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let before = w.control_response(&state);
+        assert!(w
+            .control_response(&old)
+            .contains("\terror\tstale-revision\t"));
+        assert_eq!(w.control_response(&state), before);
+        let old_return = decoded_key_request(&w, "Return");
+        decoded_key(&mut w, "F10");
+        let before = w.control_response(&state);
+        assert!(w
+            .control_response(&old_return)
+            .contains("\terror\tstale-revision\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert_eq!(w.ui.editor().tabs().count(), 1);
+        decoded_key(&mut w, "Escape");
+        for (tab, revision, generation, expected) in [
+            (1, 1, 0, "invalid-argument"),
+            (9, 1, w.frames.generation().unwrap(), "missing-tab"),
+            (1, 0, w.frames.generation().unwrap(), "stale-revision"),
+        ] {
+            let request = crate::control::Request::parse(
+                format!("1\t9\tkey\t{tab}\t{revision}\t{generation}\t61").as_bytes(),
+            )
+            .unwrap();
+            let before = w.control_response(&state);
+            assert!(w
+                .control_response(&request)
+                .contains(&format!("\terror\t{expected}\t")));
+            assert_eq!(w.control_response(&state), before);
+        }
+        let mut oversized = decoded_key_request(&w, "x");
+        if let crate::control::Operation::Key { chord, .. } = &mut oversized.operation {
+            *chord = "a".repeat(33);
+        }
+        let before = w.control_response(&state);
+        assert!(w.control_response(&oversized).contains("\terror\tlimit\t"));
+        assert_eq!(w.control_response(&state), before);
+        w.ui.generation_for_test(u64::MAX);
+        let request = decoded_key_request(&w, "x");
+        let before = w.control_response(&state);
+        assert!(w
+            .control_response(&request)
+            .contains("\terror\texhausted\t"));
+        assert_eq!(w.control_response(&state), before);
+    }
+
+    #[test]
+    fn remote_keys_drive_ui_prompts_but_cannot_answer_file_or_discard_dialogs() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        for chord in ["a", "Return", "b", "C-Home", "C-f", "b", "Return", "Escape"] {
+            decoded_key(&mut w, chord);
+        }
+        assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 2..3);
+        for chord in ["F6", "1", "Return"] {
+            decoded_key(&mut w, chord);
+        }
+        assert_eq!(w.ui.editor().document(1).unwrap().selection().caret, 0);
+        for chord in ["C-h", "C-u", "a", "Tab", "x", "M-a", "Escape"] {
+            decoded_key(&mut w, chord);
+        }
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "x\nb");
+        w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        for chord in [
+            "M-x", "g", "o", "t", "o", "-", "l", "i", "n", "e", "Return", "2", "Return",
+        ] {
+            decoded_key(&mut w, chord);
+        }
+        assert_eq!(w.ui.editor().document(1).unwrap().selection().caret, 2);
+        w.ui.dispatch(Event::Profile(Profile::Windows)).unwrap();
+        for starter in ["C-s", "C-w"] {
+            decoded_key(&mut w, starter);
+            let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+            let before = w.control_response(&state);
+            for chord in ["Return", "C-d", "C-s", "Escape"] {
+                let request = decoded_key_request(&w, chord);
+                assert!(w
+                    .control_response(&request)
+                    .contains("\terror\tunavailable\t"));
+                assert_eq!(w.control_response(&state), before);
+            }
+            let answer = crate::control::Request::parse(
+                format!("1\t1\tdialog-answer\t{}\t1\t4\tcancel", w.last_dialog_id).as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(w.control_response(&answer), "1\t1\tok\t");
+        }
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "x\nb");
+    }
+
+    #[test]
+    fn remote_keys_require_real_input_readiness_and_never_borrow_a_press_serial() {
+        for guard in [
+            "configure",
+            "device",
+            "map",
+            "focus",
+            "synchronized",
+            "serial",
+            "closed",
+        ] {
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            match guard {
+                "configure" => w.configured = false,
+                "device" => w.device = None,
+                "map" => w.input.map = None,
+                "focus" => w.input.focused = false,
+                "synchronized" => w.input.synchronized = false,
+                "serial" => w.activation_serial = Some(12),
+                "closed" => w.closed = true,
+                _ => panic!("unknown guard"),
+            }
+            let request = decoded_key_request(&w, "a");
+            let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+            let before = w.control_response(&state);
+            assert!(w
+                .control_response(&request)
+                .contains("\terror\tunavailable\t"));
+            assert_eq!(w.control_response(&state), before);
+            assert_eq!(
+                w.activation_serial,
+                if guard == "serial" { Some(12) } else { None }
+            );
+        }
+    }
+
+    #[test]
+    fn remote_key_socket_admission_connects_to_token_bound_save_without_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let destination = directory.path("saved");
+        let (mut w, peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        let state = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        assert!(state.contains("\tkey-ready=1\t"));
+        let generation = state
+            .split('\t')
+            .find_map(|field| field.strip_prefix("window-generation="))
+            .unwrap();
+        let command = format!("1\t1\tkey\t1\t0\t{generation}\t78");
+        assert_eq!(job_request(&mut w, &peer, &socket, &command), "1\t1\tok\t");
+        assert!(job_request(&mut w, &peer, &socket, &command).contains("\terror\tstale-revision\t"));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "x");
+        let generation = w.frames.generation().unwrap();
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &socket,
+                &format!("1\t2\tkey\t1\t1\t{generation}\t432d73")
+            ),
+            "1\t2\tok\t"
+        );
+        let state = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        assert!(state.contains("\tkey-ready=0\t"));
+        assert!(state.contains("dialog=1,path-save-as,path,1,1,cancel+path"));
+        let answer = format!(
+            "1\t3\tdialog-answer\t1\t1\t1\tpath\t{}",
+            crate::control::hex(destination.as_os_str().as_encoded_bytes())
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, &answer),
+            "1\t3\tpending\t1"
+        );
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"x");
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=1,save-as,1,1,0,complete,-"));
+        decoded_key(&mut w, "y");
+        decoded_key(&mut w, "C-s"); // Native Save, no remote job ID.
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(destination).unwrap(), b"xy");
+        assert!(w.control_jobs.fields().unwrap().starts_with("job-last=1\t"));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_keys_cancel_prior_input_but_preserve_new_paste_and_physical_clipboard_authority() {
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        configure(&mut w, 800, 600);
+        drain(&peer);
+        for chord in ["C-c", "C-x"] {
+            decoded_key(&mut w, chord);
+            assert!(w.clipboard.source.is_none());
+            assert!(w.activation_serial.is_none());
+            assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
+            assert!(w.notice.as_ref().unwrap().contains("physical"));
+            assert!(drain(&peer).0.is_empty());
+        }
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        decoded_key(&mut w, "C-v");
+        let (_, mut files) = drain(&peer);
+        let mut writer = files.pop().unwrap();
+        assert!(w.clipboard.incoming.is_some());
+        writer.write_all(b"pasted").unwrap();
+        drop(writer);
+        w.tick(w.clock, true).unwrap();
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "pasted abc\n");
+        decoded_key(&mut w, "C-v");
+        let (_, _writer) = drain(&peer);
+        w.input.key(106, true).unwrap();
+        w.input.arm(106, w.clock);
+        let old = decoded_key_request(&w, "x");
+        w.frames.invalidate(true);
+        assert!(w
+            .control_response(&old)
+            .contains("\terror\tstale-revision\t"));
+        assert!(w.clipboard.incoming.is_some());
+        decoded_key(&mut w, "Left");
+        assert!(w.clipboard.incoming.is_none());
+        assert!(w.input.repeat(w.clock + 1000).unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_key_transport_failure_stops_native_dispatch_and_drawing() {
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        configure(&mut w, 800, 600);
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        drain(&peer);
+        drop(peer);
+        let request = decoded_key_request(&w, "C-v");
+        assert!(w
+            .control_response(&request)
+            .contains("\terror\tunavailable\t"));
+        assert!(w.end_turn(w.clock, false).is_err());
+        let before = crate::control::state(&w.ui).unwrap();
+        let later = decoded_key_request(&w, "x");
+        assert!(w
+            .control_response(&later)
+            .contains("\terror\tunavailable\t"));
+        assert_eq!(crate::control::state(&w.ui).unwrap(), before);
+        assert!(w.draw().is_err());
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
+    }
+
     #[test]
     fn native_read_only_state_names_modal_state_without_mutating_it() {
         let (mut w, _peer) = file_dialog_fixture();
@@ -5917,7 +6345,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-paths\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-key\tkey-ready=0\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -9017,7 +9445,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-paths\t"));
+            assert!(response.contains("\tadapter=native-key\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");
