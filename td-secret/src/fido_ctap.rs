@@ -6,12 +6,23 @@ use super::{crypto, fido_hid, tpm};
 pub const RP_ID: &str = "td.invalid";
 pub const MAX_CREDENTIAL_ID: usize = 1024;
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct Es256PublicKey {
     x: [u8; 32],
     y: [u8; 32],
 }
 
 impl Es256PublicKey {
+    /// The fixed public EC2/ES256/P-256 map, without unconsumed COSE metadata.
+    pub fn canonical_cose(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(77);
+        bytes.extend_from_slice(&[0xa5, 1, 2, 3, 0x26, 0x20, 1, 0x21, 0x58, 0x20]);
+        bytes.extend_from_slice(&self.x);
+        bytes.extend_from_slice(&[0x22, 0x58, 0x20]);
+        bytes.extend_from_slice(&self.y);
+        bytes
+    }
+
     /// Shape validation only; the TPM verifies curve membership during use.
     pub fn from_cose(bytes: &[u8]) -> Result<Self, String> {
         let value = cbor::decode(bytes)?;

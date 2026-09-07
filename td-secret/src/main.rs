@@ -12,6 +12,8 @@
 mod client;
 #[allow(dead_code, reason = "FIDO2 transport prerequisite; no release consumer yet")]
 mod fido_hid;
+#[allow(dead_code, reason = "enrollment metadata prerequisite; no release consumer yet")]
+mod fido_metadata;
 #[allow(dead_code, reason = "CTAP codec prerequisite; no release consumer yet")]
 mod fido_cbor;
 #[allow(dead_code, reason = "CTAP codec prerequisite; no release consumer yet")]
@@ -155,6 +157,7 @@ mod confinement {
             ("fido_ctap.rs", include_str!("fido_ctap.rs")),
             ("fido_enroll.rs", include_str!("fido_enroll.rs")),
             ("fido_hid.rs", include_str!("fido_hid.rs")),
+            ("fido_metadata.rs", include_str!("fido_metadata.rs")),
             ("store.rs", include_str!("store.rs")),
             ("sys.rs", include_str!("sys.rs")),
             ("tpm.rs", include_str!("tpm.rs")),
@@ -212,6 +215,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_ctap.rs",
                 "fido_enroll.rs",
                 "fido_hid.rs",
+                "fido_metadata.rs",
                 "main.rs",
                 "store.rs",
                 "sys.rs",

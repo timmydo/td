@@ -479,6 +479,61 @@ template bytes for bound/zero/unbound inputs, and refusal when the TPM returns
 the same primary Name for bound and unbound input. The emulator also proves
 that a key sealed with a zero digest cannot use the unbound parent.
 
+## Canonical enrollment metadata and release prerequisite
+
+`fido_metadata.rs` encodes one logical UID, the fixed RP, one primary
+credential and an explicit recovery choice. Construction requires verified
+Credential values; recovery requires a distinct credential ID and public
+key. This detects duplicate enrollment records, not distinct physical
+hardware. The trusted enrollment flow must still require a second token or
+explicit unrecoverability.
+
+The format is `TDENROL1`, a big-endian u32 UID, a one-byte RP length and
+`td.invalid`, a policy byte (0 unrecoverable, 1 second token), then the
+primary and, for policy 1, recovery record. Each record is a big-endian
+u16 nonempty credential-ID length, at most 1024 ID bytes, and the fixed
+77-byte canonical public EC2/ES256/P-256 COSE map. No optional COSE hints
+survive normalization; the complete signing key does. Decoding refuses
+oversized input, other versions/RPs/policies, a UID different from the
+independently admitted session, duplicate IDs/keys, malformed key shapes,
+truncation and trailing data. The maximum record is 2230 bytes.
+
+SHA-256 of `td-secret-enrollment-v1` plus a zero byte and the exact
+canonical record supplies the TPM parent binding. Decode proves structure,
+not disk integrity: an attacker may edit public metadata, but cannot load
+the existing child under the resulting changed parent. Atomic publication
+of metadata and its sealed envelope remains the store consumer's obligation.
+A full old record can still be rolled back; there is no anti-rollback claim.
+
+A release request owns the chosen enrolled key, ID, UID, full metadata
+binding and challenge. Neither a replacement key nor a caller-selected
+binding can be passed to its unseal method. It verifies the complete signed
+assertion through the TPM, requires signed presence and device-bound backup
+flags, and only then unseals the child bound to that metadata and UID.
+Selecting recovery on an explicitly unrecoverable record refuses before
+request encoding. The later trusted caller must supply fresh kernel
+randomness bound to one presented secure-attention operation; this API
+cannot establish freshness or consent from arbitrary caller bytes.
+
+These safe APIs introduce no device access, persistent file, root command
+or automatic release consumer. The current TPM-only backend stays active
+until the complete FIDO store migration lands. Root and the trusted TPM
+remain in the trust boundary; this is a td-owned software ordering check,
+not a TPM policy that itself evaluates FIDO presence. This store profile
+requires presence only: it does not request PIN/UV or enforce a signature
+counter. Possession of an enrolled token and a touch can authorize release
+on the bound platform when the trusted operation is presented. Owned credential-ID
+and request buffers are cleared on drop on a best-effort basis.
+
+Ordinary tests pin independent literal encoding and a Python hashlib
+binding vector, all truncations and record bounds, and malformed or
+ambiguous recovery records. The pinned-emulator oracle enrolls two
+independently OpenSSL-signed public fixtures, releases through either role,
+and refuses changed challenges/signatures, the wrong role's key, removed
+recovery, substituted metadata plus envelope digest, and another UID.
+Only public fixture bytes are committed; no signing key or OpenSSL runtime
+dependency is added. These are protocol tests, not physical-token evidence.
+
 ## TPM validation
 
 The optional host oracle uses upstream swtpm 0.10.1 and libtpms 0.10.2,
