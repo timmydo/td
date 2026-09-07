@@ -42,8 +42,28 @@ Open defaults to GTK and automatic KVM/TCG selection. CLI options select
 failure falls through within QEMU's accelerator selection; unrelated errors
 are not retried. A successful QMP query records the actual accelerator.
 Existing windows are identified by their `td-vm: NAME` title; select one through
-the host desktop when Open reports it already running. Window focusing is not
-implemented yet.
+the host desktop when Open finds an existing QEMU process. Window focusing is
+not implemented yet.
+
+The table's `live` state means a QEMU process exists, including a guest paused
+on a host disk I/O fault. `td-vm status NAME` or `h` in the TUI explicitly
+queries QEMU execution and disk I/O status. Opening an existing instance also
+shows that snapshot. Table refresh remains a local process/disk inspection;
+it does not contact every monitor or claim that a live process is executing.
+Status is read-only and does not create manager state. Monitor errors remain
+unavailable status, never permission to start another QEMU or delete its disk.
+
+`td-vm resume NAME` or `R` resumes `paused`, `io-error`, or `prelaunch` states.
+Resolve the reported fault first: `nospace` means a host backing-disk allocation
+failed, which is separate from free space inside the guest. Resume is explicit,
+serialized with other instance operations, and checks QEMU execution again
+after `cont`. An already running guest is unchanged; other execution states
+are refused. A successful snapshot does not prove a disk fault cannot recur.
+A paused VM retains its lifetime and disk locks throughout recovery. These
+backend controls use QMP; guest clipboard, artifact and power integration keep
+the td-owned protocol described below. See QEMU's
+[run-state schema](https://github.com/qemu/qemu/blob/master/qapi/run-state.json)
+and [block I/O schema](https://github.com/qemu/qemu/blob/master/qapi/block-core.json).
 
 A separate supervisor waits for each QEMU independently of TUI exit. The TUI
 reaps its completed supervisors through waiting threads. A slow template

@@ -37,6 +37,8 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm remove-template TEMPLATE
   td-vm create NAME TEMPLATE [CPUS MEMORY_MIB]
   td-vm list
+  td-vm status NAME                  inspect QEMU execution and disk I/O state
+  td-vm resume NAME                  resume an explicitly paused guest
   td-vm open NAME [--accel auto|kvm|tcg] [--display gtk|sdl]
   td-vm stop NAME --force             cut power (guest work may be lost)
   td-vm delete NAME --yes             delete a stopped instance and its work
@@ -79,7 +81,7 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     };
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    let read_only = matches!(words.first(), Some(&"list" | &"templates" | &"logs"));
+    let read_only = matches!(words.first(), Some(&"list" | &"templates" | &"logs" | &"status"));
     let manager = if read_only {
         if !home.exists() && matches!(words.as_slice(), ["list"] | ["templates"]) {
             println!("No managed instances or templates yet.");
@@ -98,6 +100,14 @@ fn run(args: Vec<String>) -> Result<()> {
         ["create", name, template] => manager.create(name, template, "4", "8192"),
         ["create", name, template, cpus, memory] => manager.create(name, template, cpus, memory),
         ["list"] => manager.list(),
+        ["status", name] => {
+            println!("{}", term::scrub_lines(&manager.status(name)?));
+            Ok(())
+        }
+        ["resume", name] => {
+            println!("{}", term::scrub_lines(&manager.resume(name)?));
+            Ok(())
+        }
         ["open" | "start", name, options @ ..] => manager.start(name, Launch::parse(options)?),
         ["_supervise", name, accel, display] => manager.supervise(
             name,
@@ -578,7 +588,7 @@ impl Manager {
                     let config = Config::read(&dir)?;
                     let blocks = io(fs::metadata(dir.join("disk.qcow2")), "inspect disk")?.blocks();
                     let state = if running(&dir)? {
-                        "running"
+                        "live"
                     } else if self.active(&value)? {
                         "starting"
                     } else {
@@ -706,7 +716,8 @@ impl Manager {
         let _lock = self.lock(&format!("instance-{value}"))?;
         let dir = self.instance(value)?;
         if running(&dir)? {
-            println!("{value} is already running; select its td-vm window in the desktop");
+            println!("{}", term::scrub_lines(&self.status(value).unwrap_or_else(|e| e)));
+            println!("{value} already has a QEMU process; select its existing td-vm window");
             return Ok(());
         }
         // A supervisor may still be starting or reaping a guest without QMP.
@@ -831,6 +842,34 @@ impl Manager {
         } else {
             Err(format!("QEMU exited {status}; inspect boot diagnostics"))
         }
+    }
+
+    fn status(&self, value: &str) -> Result<String> {
+        let dir = self.instance(value)?;
+        if !running(&dir)? {
+            return Ok(format!("{value}: {}", if self.active(value)? {
+                "starting or finishing shutdown"
+            } else {
+                "stopped"
+            }));
+        }
+        let mut qmp = Qmp::connect(&dir.join("qmp"))
+            .map_err(|e| format!("{value}: process live; QEMU status unavailable: {e}"))?;
+        Health::query(&mut qmp).map(|health| health.describe(value))
+            .map_err(|e| format!("{value}: process live; QEMU status unavailable: {e}"))
+    }
+
+    fn resume(&self, value: &str) -> Result<String> {
+        name(value)?;
+        let _lock = self.lock(&format!("instance-{value}"))?;
+        let dir = self.instance(value)?;
+        if !running(&dir)? {
+            return Err("instance has no live QEMU to resume; use open to boot it".into());
+        }
+        let mut qmp = Qmp::connect(&dir.join("qmp"))
+            .map_err(|e| format!("{value}: process live; resume monitor unavailable: {e}"))?;
+        resume_qmp(&mut qmp).map(|health| health.describe(value))
+            .map_err(|e| format!("{value}: resume failed: {e}"))
     }
 
     fn stop(&self, value: &str) -> Result<()> {
@@ -1215,6 +1254,89 @@ impl Qmp {
     }
 }
 
+#[derive(Debug)]
+struct Health {
+    state: String,
+    disk_errors: Vec<(String, String)>,
+}
+
+impl Health {
+    fn query(qmp: &mut Qmp) -> Result<Self> {
+        let status = qmp.execute("query-status")?;
+        let blocks = qmp.execute("query-block")?;
+        Self::parse(&status, &blocks)
+    }
+
+    fn parse(status: &json::Json, blocks: &json::Json) -> Result<Self> {
+        let state = status.get("status").and_then(json::Json::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 64
+                && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
+            .ok_or("QEMU status lacks a valid execution state")?;
+        let runnable = match status.get("running") {
+            Some(json::Json::Bool(value)) => *value,
+            _ => return Err("QEMU status lacks a boolean running field".into()),
+        };
+        if runnable != (state == "running") {
+            return Err("QEMU status has inconsistent execution fields".into());
+        }
+        let blocks = blocks.as_arr().filter(|v| v.len() <= 256)
+            .ok_or("QEMU disk status is not a bounded device list")?;
+        let mut disk_errors = Vec::new();
+        for block in blocks {
+            let Some(io_status) = block.get("io-status") else { continue; };
+            let io_status = io_status.as_str().filter(|s| !s.is_empty() && s.len() <= 64)
+                .ok_or("QEMU disk I/O status is malformed")?;
+            if io_status == "ok" { continue; }
+            let device = [
+                block.get("device"),
+                block.get("qdev"),
+                block.get("inserted").and_then(|v| v.get("node-name")),
+            ].into_iter().flatten().filter_map(json::Json::as_str)
+                .find(|s| !s.is_empty() && s.len() <= 256)
+                .ok_or("QEMU disk identity is malformed")?;
+            disk_errors.push((device.to_string(), io_status.to_string()));
+        }
+        Ok(Self { state: state.to_string(), disk_errors })
+    }
+
+    fn runnable(&self) -> bool {
+        self.state == "running"
+    }
+
+    fn resumable(&self) -> bool {
+        matches!(self.state.as_str(), "paused" | "io-error" | "prelaunch")
+    }
+
+    fn describe(&self, name: &str) -> String {
+        let mut report = format!("{name}: QEMU {}; guest CPUs {}", self.state,
+            if self.runnable() { "running" } else { "not running" });
+        for (device, status) in &self.disk_errors {
+            report.push_str(&format!("\ndisk {device}: {status}"));
+        }
+        if self.disk_errors.iter().any(|(_, state)| state == "nospace") {
+            report.push_str("\nThe host backing disk could not allocate space. Restore host capacity first.");
+        }
+        if self.resumable() {
+            report.push_str(&format!("\nAfter correcting any fault, use td-vm resume {name} (R in the TUI)."));
+        }
+        report
+    }
+}
+
+fn resume_qmp(qmp: &mut Qmp) -> Result<Health> {
+    let health = Health::query(qmp)?;
+    if health.runnable() { return Ok(health); }
+    if !health.resumable() {
+        return Err(format!("refusing resume from QEMU {}; inspect status and logs", health.state));
+    }
+    qmp.execute("cont")?;
+    let health = Health::query(qmp)?;
+    if !health.runnable() {
+        return Err(format!("QEMU remains {}; inspect status and correct the fault before retrying", health.state));
+    }
+    Ok(health)
+}
+
 fn prompt(terminal: &mut term::Terminal, title: &str) -> Result<Option<String>> {
     terminal.drain_input().map_err(|e| e.to_string())?;
     let mut value = String::new();
@@ -1254,7 +1376,7 @@ fn tui(manager: &Manager) -> Result<()> {
         let (height, width) = terminal.size();
         let mut frame = term::Frame::new(height, width);
         frame.push_text("td-vm  Enter open · n new · i import · t templates · D delete · X cut power", term::Style::bar(term::CYAN));
-        frame.push_text("l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
+        frame.push_text("h status · R resume · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text("NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB DISK MiB", term::Style::bold());
         let page = height.saturating_sub(7).max(1);
         let offset = selected.saturating_sub(page - 1);
@@ -1269,7 +1391,7 @@ fn tui(manager: &Manager) -> Result<()> {
         if rows.is_empty() {
             frame.push_text("No instances yet.", term::Style::dim());
         }
-        frame.push_text("Paste: v sends text, then Ctrl+Shift+V in td-term. Copy: c requests host copy.", term::Style::dim());
+        frame.push_text("Live means a QEMU process exists. h inspects guest execution and disk faults.", term::Style::dim());
         frame.push_text(&status, term::Style::fg(term::YELLOW));
         terminal.draw(frame.finish()).map_err(|e| e.to_string())?;
         let keys = terminal.read_keys().map_err(|e| e.to_string())?;
@@ -1416,12 +1538,26 @@ fn tui(manager: &Manager) -> Result<()> {
                         .suspend(|| manager.sharing(name, &mode))
                         .map_err(|e| e.to_string())?
                 }
-                term::Key::Char('l') if current.is_some() => {
+                term::Key::Char('R') if current.is_some() => {
                     let name = current.ok_or("no instance selected")?;
-                    let logs = manager.logs(name)?;
+                    status = manager.resume(name).unwrap_or_else(|e| e);
+                    break;
+                }
+                term::Key::Char('l' | 'h') if current.is_some() => {
+                    let name = current.ok_or("no instance selected")?;
+                    let logs = if key == term::Key::Char('h') {
+                        manager.status(name).unwrap_or_else(|e| e)
+                    } else {
+                        manager.logs(name)?
+                    };
                     let (height, width) = terminal.size();
                     let mut frame = term::Frame::new(height, width);
-                    frame.push_text("Log tail — any key returns", term::Style::bar(term::CYAN));
+                    let title = if key == term::Key::Char('h') {
+                        "QEMU status snapshot — any key returns"
+                    } else {
+                        "Log tail — any key returns"
+                    };
+                    frame.push_text(title, term::Style::bar(term::CYAN));
                     let lines: Vec<_> = logs.lines().collect();
                     for line in lines
                         .iter()
@@ -1618,6 +1754,88 @@ mod tests {
         let mut qmp = Qmp::connect(&path).unwrap();
         assert!(qmp.execute("quit").unwrap_err().contains("denied"));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn health_refuses_malformed_status_and_reports_disk_exhaustion() {
+        let blocks = json::parse(r#"[{"device":"disk0","io-status":"nospace"}]"#).unwrap();
+        let status = json::parse(r#"{"status":"io-error","running":false}"#).unwrap();
+        let health = Health::parse(&status, &blocks).unwrap();
+        assert!(!health.runnable());
+        assert!(health.resumable());
+        let report = health.describe("worker");
+        assert!(report.contains("disk disk0: nospace"));
+        assert!(report.contains("Restore host capacity"));
+        assert!(report.contains("td-vm resume worker"));
+        for (blocks, label) in [
+            (r#"[{"device":"","qdev":"/machine/disk","io-status":"nospace"}]"#, "/machine/disk"),
+            (r#"[{"device":"","inserted":{"node-name":"data"},"io-status":"failed"}]"#, "data"),
+        ] {
+            let health = Health::parse(&status, &json::parse(blocks).unwrap()).unwrap();
+            assert!(health.describe("worker").contains(&format!("disk {label}:")));
+        }
+        for bad in [
+            r#"{"status":"paused","running":true}"#,
+            r#"{"status":"running","running":false}"#,
+            r#"{"status":"paused"}"#,
+            r#"{"status":"paused","running":"false"}"#,
+            r#"{"status":"paused\u001b","running":false}"#,
+        ] {
+            assert!(Health::parse(&json::parse(bad).unwrap(), &blocks).is_err());
+        }
+        assert!(Health::parse(&status, &json::Json::Null).is_err());
+        assert!(Health::parse(&status, &json::parse(r#"[{"io-status":false}]"#).unwrap()).is_err());
+        let future = json::parse(r#"{"status":"future-state","running":false}"#).unwrap();
+        assert!(!Health::parse(&future, &blocks).unwrap().resumable());
+    }
+
+    fn scripted_qmp(script: Vec<(&'static str, &'static str)>) -> (Qmp, thread::JoinHandle<()>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let worker = thread::spawn(move || {
+            let mut server = BufReader::new(server);
+            for (verb, response) in script {
+                let mut request = String::new();
+                server.read_line(&mut request).unwrap();
+                let request = json::parse(&request).unwrap();
+                assert_eq!(request.get("execute").and_then(json::Json::as_str), Some(verb));
+                writeln!(server.get_mut(), "{{\"return\":{response},\"id\":\"td-vm\"}}").unwrap();
+            }
+            let mut request = String::new();
+            assert_eq!(server.read_line(&mut request).unwrap(), 0, "unexpected mutation: {request}");
+        });
+        (Qmp { stream: BufReader::new(client) }, worker)
+    }
+
+    #[test]
+    fn resume_checks_the_state_and_verifies_execution_after_cont() {
+        let paused = r#"{"status":"io-error","running":false}"#;
+        let active = r#"{"status":"running","running":true}"#;
+        let blocks = r#"[{"device":"disk0","io-status":"nospace"}]"#;
+        let (mut qmp, worker) = scripted_qmp(vec![
+            ("query-status", paused), ("query-block", blocks), ("cont", "{}"),
+            ("query-status", active), ("query-block", "[]"),
+        ]);
+        assert!(resume_qmp(&mut qmp).unwrap().runnable());
+        drop(qmp); worker.join().unwrap();
+        let (mut qmp, worker) = scripted_qmp(vec![
+            ("query-status", paused), ("query-block", blocks), ("cont", "{}"),
+            ("query-status", paused), ("query-block", blocks),
+        ]);
+        assert!(resume_qmp(&mut qmp).unwrap_err().contains("remains io-error"));
+        drop(qmp); worker.join().unwrap();
+        let (mut qmp, worker) = scripted_qmp(vec![
+            ("query-status", r#"{"status":"internal-error","running":false}"#),
+            ("query-block", "[]"),
+        ]);
+        assert!(resume_qmp(&mut qmp).unwrap_err().contains("refusing resume"));
+        drop(qmp); worker.join().unwrap();
+        let (mut qmp, worker) = scripted_qmp(vec![
+            ("query-status", active), ("query-block", "[]"),
+        ]);
+        assert!(resume_qmp(&mut qmp).unwrap().runnable());
+        drop(qmp); worker.join().unwrap();
     }
 
     #[test]
@@ -1968,6 +2186,18 @@ mod tests {
         let supervisor =
             thread::spawn(move || Manager::existing(&root).unwrap().run_qemu("one", cmd));
         wait_running(&one);
+        assert!(manager.status("one").unwrap().contains("prelaunch"));
+        manager.resume("one").unwrap();
+        Qmp::connect(&one.join("qmp")).unwrap().execute("stop").unwrap();
+        assert!(manager.status("one").unwrap().contains("paused"));
+        assert!(manager.rows().unwrap().iter().any(|(name, row)| name == "one" && row.contains("live")));
+        assert!(manager.delete("one").is_err(), "a paused guest still owns its disk");
+        manager.resume("one").unwrap();
+        assert!(manager.status("one").unwrap().contains("guest CPUs running"));
+        let held = Qmp::connect(&one.join("qmp")).unwrap();
+        assert!(manager.start("one", Launch::parse(&[]).unwrap()).is_ok(),
+            "an occupied monitor does not turn an existing open into a failed launch");
+        drop(held);
         assert!(
             manager.start("one", Launch::parse(&[]).unwrap()).is_ok(),
             "duplicate open discovers existing QEMU"
