@@ -129,6 +129,15 @@ fn request(path: &Path, line: &[u8]) -> String {
     answer
 }
 
+fn input_request(path: &Path, session: &str, line: &str) -> String {
+    let (verb, rest) = line.split_once(' ').unwrap();
+    request(path, format!("{verb} {session} {rest}").as_bytes())
+}
+
+fn input_receipt(session: &str, action: u64) -> String {
+    format!("ok\ntd-action-v1 session={session} action={action}\n")
+}
+
 fn capture(path: &Path, root: &Path, name: &str) -> (ExitStatus, Vec<u8>) {
     query_cli(path, root, name, "capture")
 }
@@ -171,7 +180,7 @@ fn reusing_a_session_path_starts_a_new_capture_identity() {
     let mut previous = None;
     for generation in 0..2 {
         let mut command = headless(&session);
-        command.args(["--capture-control", "enabled"]);
+        command.args(["--capture-control", "enabled", "--input-control", "enabled"]);
         let mut compositor = Process::start(
             &mut command, &root.0.join(format!("compositor-{generation}.log")),
             "TD-COMPOSITOR-HEADLESS-READY",
@@ -185,6 +194,19 @@ fn reusing_a_session_path_starts_a_new_capture_identity() {
         assert_eq!(captured_session, identity);
         assert_eq!(output, 2, "a new runtime inherited old output numbering");
         assert_ne!(previous.as_deref(), Some(identity), "a restarted session reused its nonce");
+        if let Some(old_session) = previous.as_deref() {
+            let control = session.join("td-control");
+            let before = request(&control, b"layout\n");
+            for line in ["key 1 125 down\n", "key 2 3 down\n", "pointer 3 1 1 1 0 0\n",
+                "release-keys 4\n", "release-input 5\n"]
+            {
+                assert_eq!(input_request(&control, old_session, line),
+                    "error input session identity does not match\n");
+            }
+            assert_eq!(request(&control, b"layout\n"), before);
+        }
+        assert_eq!(input_request(&session.join("td-control"), identity, "release-input 6\n"),
+            input_receipt(identity, 1));
         previous = Some(identity.to_string());
         compositor.child.stdin.take();
         assert!(compositor.wait().success());
@@ -257,7 +279,7 @@ fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
             assert_ne!(hidden_pixels, mapped_pixels, "capture returned stale visible-client output");
             assert!(request(&control, b"capture extra\n").starts_with("error "));
             if !input {
-                assert_eq!(request(&control, b"key 1 30 down\n"),
+                assert_eq!(input_request(&control, identity, "key 1 30 down\n"),
                     "error input automation is disabled\n");
             }
             mapped_client = Some(client);
@@ -282,31 +304,37 @@ fn keyboard_grant_routes_workspace_chords_across_one_shot_connections() {
             command.args(["--input-control", "enabled"]);
         }
         let mut compositor = Process::start(&mut command, &log, "TD-COMPOSITOR-HEADLESS-READY");
-        compositor.ready();
+        let ready = compositor.ready();
+        let identity = ready_session(&ready);
         let control = session.join("td-control");
-        let expected = if enabled { "ok\n" } else { "error input automation is disabled\n" };
-        for line in ["key 1 125 down\n", "key 2 3 down\n", "release-keys 3\n"] {
-            assert_eq!(request(&control, line.as_bytes()), expected);
+        let expected = |action| if enabled { input_receipt(identity, action) }
+            else { "error input automation is disabled\n".into() };
+        for (index, line) in ["key 1 125 down\n", "key 2 3 down\n", "release-keys 3\n"]
+            .into_iter().enumerate()
+        {
+            assert_eq!(input_request(&control, identity, line), expected(index as u64 + 1));
         }
         let layout = request(&control, b"layout\n");
         assert!(layout.contains(if enabled { "workspace active=2 " } else { "workspace active=1 " }));
         // Releasing Super must prevent a subsequent bare '1' from switching.
-        assert_eq!(request(&control, b"key 4 2 down\n"), expected);
-        assert_eq!(request(&control, b"release-keys 5\n"), expected);
+        assert_eq!(input_request(&control, identity, "key 4 2 down\n"), expected(4));
+        assert_eq!(input_request(&control, identity, "release-keys 5\n"), expected(5));
         assert_eq!(request(&control, b"layout\n"), layout);
-        assert!(request(&control, b"key 6 248 down\n").starts_with("error "));
+        assert!(input_request(&control, identity, "key 6 248 down\n").starts_with("error "));
         if enabled {
-            assert_eq!(request(&control, b"key 7 125 down\n"), "ok\n");
-            assert!(request(&control, b"key 8 20 down\n").starts_with("unavailable "));
+            assert_eq!(input_request(&control, identity, "key 7 125 down\n"), expected(6));
+            assert!(input_request(&control, identity, "key 8 20 down\n").starts_with("unavailable "));
             let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
             command.arg0("td-ctl").arg("--socket").arg(&control)
-                .args(["release-keys", "9"]);
-            let mut ctl = Process::start(&mut command, &root.0.join("ctl.log"), "");
-            // Successful order replies have no CLI stdout body.
+                .args(["release-keys", identity, "9"]);
+            let output = root.0.join("ctl.out");
+            let mut ctl = Process::to_file(&mut command, &root.0.join("ctl.log"), &output);
             assert!(ctl.wait().success());
+            assert_eq!(fs::read_to_string(output).unwrap(),
+                expected(7).strip_prefix("ok\n").unwrap());
         }
         // EOF terminates the owning keyboard generation, even with held keys.
-        assert_eq!(request(&control, b"key 10 42 down\n"), expected);
+        assert_eq!(input_request(&control, identity, "key 10 42 down\n"), expected(8));
         compositor.child.stdin.take();
         assert!(compositor.wait().success(), "{}", fs::read_to_string(log).unwrap());
         assert!(!session.exists());
@@ -322,7 +350,8 @@ fn pointer_control_hits_real_workspace_chrome_with_a_mapped_native_client() {
     let mut compositor = Process::start(
         &mut command, &root.0.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
     );
-    compositor.ready();
+    let ready = compositor.ready();
+    let identity = ready_session(&ready);
     let control = session.join("td-control");
     let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
     command.arg0("td-ui-demo").args(["run", "--socket"])
@@ -333,20 +362,20 @@ fn pointer_control_hits_real_workspace_chrome_with_a_mapped_native_client() {
     assert_eq!(request(&control, b"workspace 2\n"), "ok\n");
     assert!(request(&control, b"layout\n").contains("visible=false focused=false"));
     // Workspace 1 holds the client and occupies the first top-bar cell.
-    assert_eq!(request(&control, b"pointer 1 1 1 1 0 0\n"), "ok\n");
-    assert_eq!(request(&control, b"release-input 2\n"), "ok\n");
+    assert_eq!(input_request(&control, identity, "pointer 1 1 1 1 0 0\n"), input_receipt(identity, 1));
+    assert_eq!(input_request(&control, identity, "release-input 2\n"), input_receipt(identity, 2));
     let layout = request(&control, b"layout\n");
     assert!(layout.contains("workspace active=1 "), "{layout}");
     assert!(layout.contains("visible=true focused=true"), "{layout}");
     for line in ["pointer 3 800 0 1 0 0\n", "pointer 3 0 600 1 0 0\n"] {
-        assert_eq!(request(&control, line.as_bytes()), "error pointer coordinates outside the output\n");
+        assert_eq!(input_request(&control, identity, line), "error pointer coordinates outside the output\n");
     }
     assert_eq!(request(&control, b"layout\n"), layout);
-    for line in [
+    for (index, line) in [
         "pointer 4 300 300 1 0 0\n", "key 4 42 down\n",
         "release-keys 5\n", "pointer 6 310 310 1 1 -1\n", "release-input 7\n",
-    ] {
-        assert_eq!(request(&control, line.as_bytes()), "ok\n");
+    ].into_iter().enumerate() {
+        assert_eq!(input_request(&control, identity, line), input_receipt(identity, index as u64 + 3));
     }
     compositor.child.stdin.take();
     assert!(compositor.wait().success());

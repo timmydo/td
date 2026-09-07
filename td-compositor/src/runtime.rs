@@ -395,6 +395,7 @@ pub struct Runtime {
     /// unfalsifiable — fbdev has no other answer to give.
     last_submission: Option<Submission>,
     headless_output: Option<crate::headless::OutputStamp>,
+    headless_action: u64,
     layout: Arc<BTreeMap<SurfaceKey, ViewLayout>>,
     subscribers: BTreeMap<u64, SyncSender<()>>,
     /// Each connected client's popup registrations, by client.
@@ -549,6 +550,7 @@ impl Runtime {
             owed_damage: Damage::Unknown,
             last_submission: None,
             headless_output: None,
+            headless_action: 0,
             layout: Arc::new(BTreeMap::new()),
             subscribers: BTreeMap::new(),
             popup_registrations: BTreeMap::new(),
@@ -678,6 +680,41 @@ impl Runtime {
         let mut runtime = Self::new(framebuffer);
         runtime.headless_output = Some(crate::headless::OutputStamp { session, output: 0 });
         runtime
+    }
+
+    pub(crate) fn prepare_input_action(
+        &self,
+        expected_session: u128,
+    ) -> Result<u64, crate::input::AutomationFailure> {
+        use crate::input::AutomationFailure::{Refused, Unavailable};
+        if self.attention_enabled || self.scene.attention_visible() {
+            return Err(Unavailable(
+                "input automation refuses a trusted-attention runtime".into(),
+            ));
+        }
+        let stamp = self
+            .headless_output
+            .ok_or_else(|| Refused("input automation requires a headless runtime".into()))?;
+        if stamp.session != expected_session {
+            return Err(Refused("input session identity does not match".into()));
+        }
+        self.headless_action
+            .checked_add(1)
+            .ok_or_else(|| Unavailable("headless input identity exhausted".into()))
+    }
+
+    pub(crate) fn finish_input_action(&mut self, action: u64) -> Result<String, String> {
+        let stamp = self
+            .headless_output
+            .ok_or("input automation requires a headless runtime")?;
+        if self.headless_action.checked_add(1) != Some(action) {
+            return Err("input action completion is out of sequence".into());
+        }
+        self.headless_action = action;
+        Ok(format!(
+            "td-action-v1 session={:032x} action={action}\n",
+            stamp.session
+        ))
     }
 
     /// A passive snapshot. Historical completion does not settle pending work.
@@ -4787,6 +4824,31 @@ mod tests {
         assert!(runtime.take_writes().is_empty());
         assert_eq!(runtime.observe_output().unwrap(), expected(u64::MAX, "no"));
         assert!(runtime.capture_public_ppm().is_err());
+    }
+
+    #[test]
+    fn input_receipt_counter_refuses_exhaustion_and_out_of_sequence_completion() {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-runtime-action-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+        )));
+        let mut runtime = Runtime::headless(
+            Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7,
+        );
+        assert!(runtime.prepare_input_action(8).is_err());
+        assert_eq!(runtime.prepare_input_action(7).unwrap(), 1);
+        assert!(runtime.finish_input_action(2).is_err());
+        assert_eq!(runtime.headless_action, 0);
+        assert_eq!(runtime.finish_input_action(1).unwrap(),
+            "td-action-v1 session=00000000000000000000000000000007 action=1\n");
+        assert!(runtime.finish_input_action(1).is_err());
+        assert_eq!(runtime.prepare_input_action(7).unwrap(), 2);
+        runtime.headless_action = u64::MAX;
+        assert!(runtime.prepare_input_action(7).is_err());
+        assert!(runtime.finish_input_action(0).is_err());
+        assert_eq!(runtime.headless_action, u64::MAX);
+        assert!(runtime.take_writes().is_empty());
+        runtime.headless_output = None;
+        assert!(runtime.prepare_input_action(7).is_err());
     }
 
     #[test]

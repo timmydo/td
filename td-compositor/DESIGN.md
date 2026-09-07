@@ -6462,9 +6462,9 @@ boot release are removed when this consumer is activated.
 ## Native headless automation
 
 [AUTOMATION.md](AUTOMATION.md) specifies disposable hardware-free sessions,
-their lifecycle, opt-in normal seat routing, session identities, passive
-completed-output observation and stamped public capture. Client action/commit
-fences remain subsequent work. This is the primary native integration
+their lifecycle, opt-in normal seat routing, session-guarded input receipts,
+passive completed-output observation and stamped public capture. Client
+commit fences remain subsequent work. This is the primary native integration
 platform; it does not replace independent compositor interoperability checks.
 
 ## td-owned development VM bridge

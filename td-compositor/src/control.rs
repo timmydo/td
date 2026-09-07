@@ -84,10 +84,10 @@ pub enum Request {
     SendWindow(u64, u8),
     MoveWindow(u64, Direction),
     /// Evdev code and explicit Wayland milliseconds, never physical origin.
-    Key { time: u32, code: u16, pressed: bool },
-    ReleaseKeys(u32),
-    Pointer(crate::input::AutomationPointer),
-    ReleaseInput(u32),
+    Key { session: u128, time: u32, code: u16, pressed: bool },
+    ReleaseKeys { session: u128, time: u32 },
+    Pointer { session: u128, report: crate::input::AutomationPointer },
+    ReleaseInput { session: u128, time: u32 },
     Capture,
     Observe,
 }
@@ -118,16 +118,26 @@ pub const USAGE: &[(&str, &str)] = &[
     ("fullscreen", "toggle fullscreen for the focused window"),
     ("present <split|stacked|tabbed>", "how its container shows its windows"),
     ("group", "group the focused window's container, or ungroup it"),
-    ("key <time-ms> <1-247> <down|up>", "route a key on an enabled headless keyboard"),
-    ("release-keys <time-ms>", "release all keys owned by that headless keyboard"),
-    ("pointer <time-ms> <x> <y> <buttons> <vertical> <horizontal>",
+    ("key <session> <time-ms> <1-247> <down|up>", "route a key on the named headless session"),
+    ("release-keys <session> <time-ms>", "release all keys owned by that headless keyboard"),
+    ("pointer <session> <time-ms> <x> <y> <buttons> <vertical> <horizontal>",
         "route one complete absolute pointer report on an enabled headless seat"),
-    ("release-input <time-ms>", "release that headless seat's keys and pointer buttons"),
+    ("release-input <session> <time-ms>", "release that headless seat's keys and pointer buttons"),
     ("capture", "write a completed public PPM frame on an enabled headless capture channel"),
     ("observe", "report headless session and completed-output identity without painting"),
 ];
 
 impl Request {
+    pub fn input_session(&self) -> Option<u128> {
+        match self {
+            Self::Key { session, .. }
+            | Self::ReleaseKeys { session, .. }
+            | Self::Pointer { session, .. }
+            | Self::ReleaseInput { session, .. } => Some(*session),
+            _ => None,
+        }
+    }
+
     /// Parse one request line. Errors are the caller's to read, so they name
     /// what was wrong rather than restating the whole grammar.
     pub fn parse(line: &str) -> Result<Request, String> {
@@ -145,9 +155,13 @@ impl Request {
             "present" => Request::Present(presentation(words.next())?),
             "group" => Request::Group,
             "key" => key_request(&mut words)?,
-            "release-keys" => Request::ReleaseKeys(key_time(words.next())?),
+            "release-keys" => Request::ReleaseKeys {
+                session: input_session(words.next())?, time: key_time(words.next())?,
+            },
             "pointer" => pointer_request(&mut words)?,
-            "release-input" => Request::ReleaseInput(key_time(words.next())?),
+            "release-input" => Request::ReleaseInput {
+                session: input_session(words.next())?, time: key_time(words.next())?,
+            },
             "capture" => Request::Capture,
             "observe" => Request::Observe,
             other => return Err(format!("no such request '{other}'; try 'help'")),
@@ -175,15 +189,15 @@ impl Request {
                 format!("present {}", presentation_word(presentation))
             }
             Request::Group => "group".to_string(),
-            Request::Key { time, code, pressed } => {
-                format!("key {time} {code} {}", if pressed { "down" } else { "up" })
+            Request::Key { session, time, code, pressed } => {
+                format!("key {session:032x} {time} {code} {}", if pressed { "down" } else { "up" })
             }
-            Request::ReleaseKeys(time) => format!("release-keys {time}"),
-            Request::Pointer(report) => format!(
-                "pointer {} {} {} {} {} {}", report.time, report.x, report.y,
+            Request::ReleaseKeys { session, time } => format!("release-keys {session:032x} {time}"),
+            Request::Pointer { session, report } => format!(
+                "pointer {session:032x} {} {} {} {} {} {}", report.time, report.x, report.y,
                 report.buttons, report.vertical, report.horizontal,
             ),
-            Request::ReleaseInput(time) => format!("release-input {time}"),
+            Request::ReleaseInput { session, time } => format!("release-input {session:032x} {time}"),
             Request::Capture => "capture".into(),
             Request::Observe => "observe".into(),
             Request::FocusWindow(handle) => format!("focus {}", handle_word(handle)),
@@ -220,7 +234,22 @@ fn key_time(word: Option<&str>) -> Result<u32, String> {
     word.parse().map_err(|_| "time-ms outside u32".into())
 }
 
+fn parse_session(word: &str) -> Option<u128> {
+    if word.len() != 32
+        || !word.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    u128::from_str_radix(word, 16).ok()
+}
+
+fn input_session(word: Option<&str>) -> Result<u128, String> {
+    word.and_then(parse_session)
+        .ok_or_else(|| "input request needs the 32-lowercase-hex session identity".into())
+}
+
 fn key_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Request, String> {
+    let session = input_session(words.next())?;
     let time = key_time(words.next())?;
     let word = words.next().ok_or("key needs an evdev code")?;
     if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -235,7 +264,7 @@ fn key_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Request,
         Some("up") => false,
         _ => return Err("key state must be 'down' or 'up'".into()),
     };
-    Ok(Request::Key { time, code, pressed })
+    Ok(Request::Key { session, time, code, pressed })
 }
 
 fn pointer_unsigned(word: Option<&str>, field: &str, max: u32) -> Result<u32, String> {
@@ -264,6 +293,7 @@ fn pointer_wheel(word: Option<&str>, field: &str) -> Result<i32, String> {
 }
 
 fn pointer_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Request, String> {
+    let session = input_session(words.next())?;
     let time = key_time(words.next())?;
     let x = pointer_unsigned(words.next(), "x", 16383)?;
     let y = pointer_unsigned(words.next(), "y", 16383)?;
@@ -271,9 +301,9 @@ fn pointer_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Requ
         .map_err(|_| "pointer buttons outside u8")?;
     let vertical = pointer_wheel(words.next(), "vertical")?;
     let horizontal = pointer_wheel(words.next(), "horizontal")?;
-    Ok(Request::Pointer(crate::input::AutomationPointer {
+    Ok(Request::Pointer { session, report: crate::input::AutomationPointer {
         time, x, y, buttons, vertical, horizontal,
-    }))
+    } })
 }
 
 /// Whether a word NAMES a window rather than describing one.
@@ -676,8 +706,10 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
     let command = match request {
         Request::Layout => return Ok(Answer::Report(report(&runtime.control_snapshot()))),
         Request::Capture | Request::Observe => return Ok(Answer::CaptureDisabled),
-        Request::Key { .. } | Request::ReleaseKeys(_)
-        | Request::Pointer(_) | Request::ReleaseInput(_) => return Ok(Answer::InputDisabled),
+        Request::Key { .. }
+        | Request::ReleaseKeys { .. }
+        | Request::Pointer { .. }
+        | Request::ReleaseInput { .. } => return Ok(Answer::InputDisabled),
         Request::Workspace(number) => Command::SwitchWorkspace(number),
         Request::Send(number) => Command::MoveToWorkspace(number),
         Request::Focus(direction) => Command::Focus(direction),
@@ -786,7 +818,7 @@ fn found(
     Ok(Answer::NoSuchWindow(handle))
 }
 
-/// The answer to one request: a status line, then a body only a question has.
+/// The answer to one request: a status line, then any report or input receipt.
 ///
 /// THREE statuses, not two. `error` is the request's fault and `unavailable`
 /// is the compositor's, and a caller wants them apart for the same reason the
@@ -796,6 +828,33 @@ fn found(
 /// its spelling.
 pub fn answer(runtime: &Mutex<Runtime>, line: &str) -> String {
     answer_with_input(runtime, line, None)
+}
+
+fn apply_input(
+    runtime: &mut Runtime, request: Request, seat: &mut crate::input::AutomationSeat,
+) -> Result<Answer, String> {
+    let session = request.input_session().ok_or("not an input request")?;
+    let action = match runtime.prepare_input_action(session) {
+        Ok(action) => action,
+        Err(crate::input::AutomationFailure::Refused(error)) => {
+            return Ok(Answer::InputRefused(error));
+        }
+        Err(crate::input::AutomationFailure::Unavailable(error)) => return Err(error),
+    };
+    match request {
+        Request::Key { time, code, pressed, .. } => seat.key(runtime, time, code, pressed)?,
+        Request::ReleaseKeys { time, .. } => seat.release_keys(runtime, time)?,
+        Request::Pointer { report, .. } => match seat.pointer(runtime, report) {
+            Ok(()) => {}
+            Err(crate::input::AutomationFailure::Refused(error)) => {
+                return Ok(Answer::InputRefused(error));
+            }
+            Err(crate::input::AutomationFailure::Unavailable(error)) => return Err(error),
+        },
+        Request::ReleaseInput { time, .. } => seat.release_all(runtime, time)?,
+        _ => return Err("not an input request".into()),
+    }
+    runtime.finish_input_action(action).map(Answer::Report)
 }
 
 fn answer_with_input(
@@ -810,24 +869,9 @@ fn answer_with_input(
     // A poisoned runtime is a compositor that has already lost; say so rather
     // than take this thread down after it.
     let outcome = match runtime.lock() {
-        Ok(mut runtime) => match (request, seat) {
-            (Request::Key { time, code, pressed }, Some(seat)) => {
-                seat.key(&mut runtime, time, code, pressed).map(|()| Answer::Ok)
-            }
-            (Request::ReleaseKeys(time), Some(seat)) => {
-                seat.release_keys(&mut runtime, time).map(|()| Answer::Ok)
-            }
-            (Request::Pointer(report), Some(seat)) => {
-                match seat.pointer(&mut runtime, report) {
-                    Ok(()) => Ok(Answer::Ok),
-                    Err(crate::input::AutomationFailure::Refused(error)) => {
-                        Ok(Answer::InputRefused(error))
-                    }
-                    Err(crate::input::AutomationFailure::Unavailable(error)) => Err(error),
-                }
-            }
-            (Request::ReleaseInput(time), Some(seat)) => {
-                seat.release_all(&mut runtime, time).map(|()| Answer::Ok)
+        Ok(mut runtime) => match seat {
+            Some(seat) if request.input_session().is_some() => {
+                apply_input(&mut runtime, request, seat)
             }
             _ => apply(&mut runtime, request),
         },
@@ -1082,6 +1126,9 @@ fn write_answer(stream: &mut UnixStream, answer: &[u8], deadline: Instant) -> Re
 /// without reading the text — which is the whole reason the status is a line
 /// of its own rather than a word in front of the report.
 pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
+    if request.input_session().is_some() {
+        return ask_input(path, request);
+    }
     let mut stream = UnixStream::connect(path).map_err(|error| {
         ControlFailure::Unreachable(format!(
             "connect control socket {}: {error}",
@@ -1102,6 +1149,41 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
         ControlFailure::Unreachable("control answer is not UTF-8".to_string())
     })?;
     split_answer(&answer, matches!(request, Request::Layout))
+}
+
+fn ask_input(path: &Path, request: Request) -> Result<String, ControlFailure> {
+    let session = request
+        .input_session()
+        .ok_or_else(|| ControlFailure::Refused("not an input request".into()))?;
+    let line = format!("{}\n", request.render());
+    let answer = ask_bounded(path, line.as_bytes(), REQUEST_LIMIT)?;
+    decode_input_receipt(&answer, session).map(str::to_string)
+}
+
+fn decode_input_receipt(answer: &[u8], expected_session: u128) -> Result<&str, ControlFailure> {
+    let bad = || ControlFailure::Unreachable("malformed input receipt".into());
+    if answer.len() > REQUEST_LIMIT {
+        return Err(bad());
+    }
+    let text = std::str::from_utf8(answer).map_err(|_| bad())?;
+    let Some(body) = text.strip_prefix("ok\n") else {
+        return split_answer(text, false).and_then(|_| Err(bad()));
+    };
+    let line = body.strip_suffix('\n').ok_or_else(bad)?;
+    let (session, action) = line
+        .strip_prefix("td-action-v1 session=")
+        .and_then(|line| line.split_once(" action="))
+        .ok_or_else(bad)?;
+    let session = parse_session(session).ok_or_else(bad)?;
+    if session != expected_session {
+        return Err(ControlFailure::Unreachable(
+            "input receipt belongs to another session".into(),
+        ));
+    }
+    if parse_counter(action).is_none_or(|action| action == 0) {
+        return Err(bad());
+    }
+    Ok(body)
 }
 
 /// Binary capture has its own bounded decoder, never the text-report reader.
@@ -1252,25 +1334,24 @@ fn decode_capture(answer: &[u8]) -> Result<&[u8], ControlFailure> {
     Ok(ppm)
 }
 
+fn parse_counter(word: &str) -> Option<u64> {
+    if word.is_empty()
+        || word.len() > 20
+        || (word.len() > 1 && word.starts_with('0'))
+        || !word.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    word.parse().ok()
+}
+
 fn decode_output_stamp(record: &str) -> Result<crate::headless::OutputStamp, ControlFailure> {
     let bad = || ControlFailure::Unreachable("malformed output identity".into());
     let (session, output) = record.split_once(" output=").ok_or_else(bad)?;
     let session = session.strip_prefix("session=").ok_or_else(bad)?;
-    if session.len() != 32
-        || !session.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(bad());
-    }
-    if output.is_empty()
-        || output.len() > 20
-        || (output.len() > 1 && output.starts_with('0'))
-        || !output.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(bad());
-    }
     Ok(crate::headless::OutputStamp {
-        session: u128::from_str_radix(session, 16).map_err(|_| bad())?,
-        output: output.parse().map_err(|_| bad())?,
+        session: parse_session(session).ok_or_else(bad)?,
+        output: parse_counter(output).ok_or_else(bad)?,
     })
 }
 
@@ -1346,7 +1427,7 @@ fn declared_windows(body: &str) -> Option<usize> {
         .and_then(|count| count.parse().ok())
 }
 
-/// Split a status line from its body.
+/// Decode legacy layout/ordinary-order replies and shared error statuses.
 ///
 /// The terminator is REQUIRED. `splitn` would hand back the whole answer as a
 /// status when there is no newline in it, so a truncated `ok` — a compositor
@@ -1356,8 +1437,9 @@ fn declared_windows(body: &str) -> Option<usize> {
 /// half-answer into the failure it is.
 ///
 /// `reported` is whether the REQUEST was one that owes a body, which only the
-/// caller knows: an order's answer is `ok` and nothing else, and a question's
-/// is a report. Judged without it, the emptiest truncation of all — a `layout`
+/// caller knows: an ordinary order's answer is `ok` and nothing else, and a
+/// layout question's is a report. Input receipts use their own decoder.
+/// Judged without it, the emptiest truncation of all — a `layout`
 /// answer cut to its status line — was indistinguishable from a `fullscreen`
 /// that worked, so the one case the count exists to catch slipped through the
 /// gap left for orders.
@@ -1378,7 +1460,7 @@ fn split_answer(answer: &str, reported: bool) -> Result<String, ControlFailure> 
             ));
         }
         if !reported {
-            // An order's answer is the status line and nothing else, so a body
+            // A legacy order's answer is the status line alone, so a body
             // here is an answer this client does not understand — and reading
             // one as success is how a caller comes to trust a compositor that
             // is saying something else entirely.
@@ -1469,6 +1551,65 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    fn input_line(line: &str, session: u128) -> String {
+        let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
+        format!("{verb} {session:032x} {rest}")
+    }
+
+    #[test]
+    fn input_receipts_bind_the_session_and_exact_positive_counter() {
+        let reply = b"ok\ntd-action-v1 session=00000000000000000000000000000007 action=1\n";
+        assert_eq!(decode_input_receipt(reply, 7).unwrap(),
+            std::str::from_utf8(&reply[3..]).unwrap());
+        for end in 0..reply.len() {
+            assert!(decode_input_receipt(&reply[..end], 7).is_err());
+        }
+        assert_eq!(decode_input_receipt(reply, 8), Err(ControlFailure::Unreachable(
+            "input receipt belongs to another session".into())));
+        for action in ["0", "00", "01", "+1", "-1", "18446744073709551616", "1\n", "1 extra"] {
+            let reply = format!("ok\ntd-action-v1 session={:032x} action={action}\n", 7);
+            assert!(decode_input_receipt(reply.as_bytes(), 7).is_err(), "{action}");
+        }
+        let maximum = format!("ok\ntd-action-v1 session={:032x} action={}\n", 7, u64::MAX);
+        assert!(decode_input_receipt(maximum.as_bytes(), 7).is_ok());
+        assert!(decode_input_receipt(b"ok\n", 7).is_err());
+        assert!(decode_input_receipt(&[b'x'; REQUEST_LIMIT + 1], 7).is_err());
+        assert_eq!(decode_input_receipt(b"error input session identity does not match\n", 7),
+            Err(ControlFailure::Refused("input session identity does not match".into())));
+        assert_eq!(decode_input_receipt(b"unavailable input delivery failed\n", 7),
+            Err(ControlFailure::Unreachable("input delivery failed".into())));
+        for session in ["", "7", "0000000000000000000000000000000F", "0000000000000000000000000000000g"] {
+            assert!(Request::parse(&format!("key {session} 0 30 down")).is_err());
+            let reply = format!("ok\ntd-action-v1 session={session} action=1\n");
+            assert_eq!(decode_input_receipt(reply.as_bytes(), 7),
+                Err(ControlFailure::Unreachable("malformed input receipt".into())));
+        }
+    }
+
+    #[test]
+    fn stale_input_sessions_preserve_depressed_state_and_receipt_numbering() {
+        let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
+        let mut seat = crate::input::AutomationSeat::default();
+        let receipt = |action| format!("ok\ntd-action-v1 session={:032x} action={action}\n", 7);
+        assert_eq!(answer_with_input(&runtime, &input_line("key 0 42 down", 7), Some(&mut seat)),
+            receipt(1));
+        let before = runtime.lock().unwrap().keyboard_snapshot();
+        let pointer = runtime.lock().unwrap().pointer_snapshot();
+        for line in ["key 1 42 up", "release-keys 2", "pointer 3 0 0 1 0 0", "release-input 4"] {
+            assert_eq!(answer_with_input(&runtime, &input_line(line, 8), Some(&mut seat)),
+                "error input session identity does not match\n");
+        }
+        assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
+        assert_eq!(runtime.lock().unwrap().pointer_snapshot(), pointer);
+        // An accepted duplicate is still a completed request, not deduplication.
+        assert_eq!(answer_with_input(&runtime, &input_line("key 5 42 down", 7), Some(&mut seat)),
+            receipt(2));
+        assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
+        assert_eq!(answer_with_input(&runtime, &input_line("release-input 6", 7), Some(&mut seat)),
+            receipt(3));
+        assert!(runtime.lock().unwrap().keyboard_snapshot().keys.is_empty());
+    }
+
     #[test]
     fn every_request_survives_the_round_trip_its_own_spelling_makes() {
         // `render` is what the client writes and `parse` is what the server
@@ -1493,15 +1634,15 @@ mod tests {
             Request::FocusWindow(12),
             Request::SendWindow(12, 7),
             Request::MoveWindow(40, Direction::Right),
-            Request::Key { time: 0, code: 1, pressed: true },
-            Request::Key { time: u32::MAX, code: 247, pressed: false },
-            Request::ReleaseKeys(u32::MAX),
-            Request::ReleaseInput(u32::MAX),
+            Request::Key { session: 0, time: 0, code: 1, pressed: true },
+            Request::Key { session: u128::MAX, time: u32::MAX, code: 247, pressed: false },
+            Request::ReleaseKeys { session: 7, time: u32::MAX },
+            Request::ReleaseInput { session: 7, time: u32::MAX },
             Request::Capture,
             Request::Observe,
-            Request::Pointer(crate::input::AutomationPointer {
+            Request::Pointer { session: 7, report: crate::input::AutomationPointer {
                 time: u32::MAX, x: 16383, y: 0, buttons: 255, vertical: -120, horizontal: 120,
-            }),
+            } },
         ];
         for request in every {
             let line = request.render();
@@ -1523,6 +1664,7 @@ mod tests {
             return word.to_string();
         };
         match inner {
+            "session" => format!("{:032x}", 7),
             "1-9" => "1".to_string(),
             "time-ms" => "0".to_string(),
             "1-247" => "30".to_string(),
@@ -1545,7 +1687,8 @@ mod tests {
             "key 0 30 repeat", "key 0 30 down extra", "release-keys",
             "release-keys -1", "release-keys 4294967296", "release-keys 0 extra",
         ] {
-            assert!(Request::parse(line).is_err(), "{line}");
+            assert!(Request::parse(line).is_err(), "legacy input: {line}");
+            assert!(Request::parse(&input_line(line, 7)).is_err(), "{line}");
         }
     }
 
@@ -1559,7 +1702,7 @@ mod tests {
             "key 0 30 down", "release-keys 1", "pointer 2 0 0 0 0 0",
             "pointer 2 16383 16383 1 0 0", "release-input 3",
         ] {
-            assert_eq!(answer_with_input(&runtime, line, Some(&mut keys)),
+            assert_eq!(answer_with_input(&runtime, &input_line(line, 7), Some(&mut keys)),
                 "unavailable input automation refuses a trusted-attention runtime\n");
         }
         assert_eq!(runtime.lock().unwrap().keyboard_snapshot(), before);
@@ -1575,18 +1718,20 @@ mod tests {
             "pointer 0 0 0 0 +1 0", "pointer 0 0 0 0 0 0 extra",
             "release-input", "release-input -1", "release-input 0 extra",
         ] {
-            assert!(Request::parse(line).is_err(), "{line}");
+            assert!(Request::parse(line).is_err(), "legacy input: {line}");
+            assert!(Request::parse(&input_line(line, 7)).is_err(), "{line}");
         }
         let (runtime, _frame) = session(SurfaceKey { client: 7, object: 7 });
         let width = runtime.lock().unwrap().width();
         let before = runtime.lock().unwrap().pointer_snapshot();
         let mut seat = crate::input::AutomationSeat::default();
-        let line = format!("pointer 0 {width} 0 1 0 0");
+        let line = input_line(&format!("pointer 0 {width} 0 1 0 0"), 7);
         assert_eq!(answer_with_input(&runtime, &line, Some(&mut seat)),
             "error pointer coordinates outside the output\n");
         assert_eq!(runtime.lock().unwrap().pointer_snapshot(), before);
         for line in ["pointer 0 0 0 1 0 0", "release-input 1"] {
-            assert_eq!(answer(&runtime, line), "error input automation is disabled\n");
+            assert_eq!(answer(&runtime, &input_line(line, 7)),
+                "error input automation is disabled\n");
         }
     }
 
@@ -1966,7 +2111,7 @@ mod tests {
         let frame = temporary("control-fb");
         let framebuffer = crate::framebuffer::Framebuffer::test_file(&frame.0, 240, 600, 240 * 4)
             .expect("test framebuffer");
-        let mut runtime = Runtime::new(framebuffer);
+        let mut runtime = Runtime::headless(framebuffer, 7);
         runtime
             .commit(
                 window,

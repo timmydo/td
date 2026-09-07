@@ -86,11 +86,20 @@ refuses synthetic input even if incorrectly wired to this adapter.
 The `td-ctl` request vocabulary adds:
 
 ```text
-key <time-ms> <1-247> <down|up>
-release-keys <time-ms>
-pointer <time-ms> <x> <y> <buttons> <vertical> <horizontal>
-release-input <time-ms>
+key <session> <time-ms> <1-247> <down|up>
+release-keys <session> <time-ms>
+pointer <session> <time-ms> <x> <y> <buttons> <vertical> <horizontal>
+release-input <session> <time-ms>
 ```
+
+`session` is the exact 32-lowercase-hex nonce from readiness. Every synthetic
+input request requires it. The runtime checks the expected identity before
+touching the seat, so a controller holding the previous generation's nonce
+cannot send input after the owner reuses a socket path. Non-headless runtimes
+refuse even if an input adapter is incorrectly supplied. This is a generation
+guard, not additional authority; the nonce is public to the session owner.
+Legacy nonce-less input requests are refused, not inferred from the endpoint.
+Ordinary layout commands retain their existing unguarded vocabulary.
 
 `time-ms` is an explicit unsigned decimal u32 Wayland timestamp, including
 zero and wraparound; it is not a physical monotonic-clock witness. Codes are
@@ -140,14 +149,39 @@ flushes deferred cursor paint; a failed delivery retains device bookkeeping
 for cleanup and still attempts the pending paint. This is software output
 work, not evidence that a client processed its input or drew another frame.
 
-`ok` means input was routed or an idempotent no-op, not that the focused
+Successful input now replies with `ok\n` followed by one receipt:
+
+```text
+td-action-v1 session=SESSION action=ACTION\n
+```
+
+The CLI validates and prints the receipt, including a match against the
+request's expected session. ACTION is a positive canonical decimal u64,
+with no sign or leading zeros and at most 20 digits. Its per-session counter
+starts at zero internally. The first successful seat request gets one;
+every later successful request gets the next number, including an accepted
+idempotent no-op or release of already-released input. Number capacity is
+checked before routing, and exhaustion refuses without touching the seat.
+Publication follows complete successful routing under the same runtime lock.
+Rejected or failed requests neither publish a receipt nor advance this
+counter. Other control orders and output paints do not advance it.
+
+The input CLI uses a 1,024-byte reply ceiling and one five-second post-connect
+read/write deadline, as observation does. Missing, truncated, oversized,
+malformed and wrong-session receipts publish no successful CLI stdout.
+Error/refusal exit codes remain unchanged. There is no compatibility success
+for an old server's bare `ok`, which provides no session-bound receipt.
+
+A receipt means input was routed or an idempotent no-op, not that the focused
 application processed it or presented another frame. Delivery failure can
 follow mutation; requests are not rollback transactions, and an unavailable
 or lost reply must not be blindly retried as exactly-once input. Use
 `release-input` to recover depressed state or dispose of the session. The
 existing request-size and whole-conversation deadline bounds remain in force.
-Client-processing fences and action/commit identities remain separate
-increments; session and completed-output observation are specified below.
+Receipts identify successful routing, not every partial state change and not
+an idempotency key that the server remembers for a retry. Callers still
+serialize their scenarios. Client-commit observations and processing fences
+remain separate increments; completed-output observation is specified below.
 
 ## Opt-in public capture
 
@@ -235,8 +269,9 @@ Capture embeds the number assigned to its own fresh completed paint and
 constructs the validated pixel snapshot under that same lock. A harness
 must compare the returned session with the ready record before correlating
 numbers. Compare numbers only within one session; a new session restarts
-numbering. The protocol does not yet accept an expected-session guard on
-input or provide a historical-frame lookup or wait-for-number command.
+numbering. Synthetic input takes its own expected-session guard and returns
+numbered receipts, but this output query does not contain action state or
+provide a historical-frame lookup or wait-for-number command.
 
 Observation replies are limited to 1,024 bytes including wire status, with
 the same five-second post-connect read/write deadline as capture. Malformed,
@@ -245,9 +280,9 @@ The server checks its conversation deadline before each write; lock waits
 and synchronous painting are not preempted by that check. The client's
 deadline bounds waiting for a response, not the runtime's rendering work.
 Neither a number increase nor `current=yes` proves that an application
-processed input. Accepted-action identities and client commit fences remain
-the next increment; applications can lag while compositor-only paint
-continues.
+processed input. Accepted-input receipts are separate from output numbers.
+Client commit fences remain the next increment. Applications can lag while
+compositor-only paint continues.
 
 ## Planned control and observation increments
 
@@ -258,8 +293,8 @@ These are the next implementation requirements, not available commands:
    witness, enter/confirm trusted attention, or authorize secret release.
 2. Preserve separate input and capture grants. A public Wayland socket grants
    neither capability.
-3. Add monotonic per-session action/commit identities to the implemented
-   fresh session and completed-output identities. Distinguish accepted
+3. Add per-client commit identities to the implemented session identities,
+   input receipts and completed-output identities. Distinguish accepted
    input, a client's subsequent commit and
    completed output. A compositor sync cannot prove an application processed
    input. Queued output is not presented output.

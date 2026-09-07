@@ -2340,7 +2340,10 @@ mod tests {
         keys.release_keys(&mut runtime, 9).unwrap();
         let before = runtime.keyboard_snapshot();
         let runtime = Mutex::new(runtime);
-        for request in ["key 0 30 down", "release-keys 1"] {
+        for request in [
+            "key 00000000000000000000000000000007 0 30 down",
+            "release-keys 00000000000000000000000000000007 1",
+        ] {
             assert_eq!(crate::control::answer(&runtime, request),
                 "error input automation is disabled\n");
         }
