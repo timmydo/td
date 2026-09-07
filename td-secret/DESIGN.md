@@ -232,6 +232,71 @@ credential value recovered from them. Operators must replace real upstream
 credentials after enrollment if historical copies may have escaped. The
 atomic cutover removes the active legacy mechanism, not storage history.
 
+## FIDO2 protocol prerequisites
+
+`fido_hid.rs` implements the 64-byte CTAP HID report profile from
+[CTAP 2.3 section 11.2](https://fidoalliance.org/specs/fido-v2.3-ps-20260226/fido-client-to-authenticator-protocol-v2.3-ps-20260226.html).
+It contains no device enumeration, device I/O, authorization or release
+consumer. The later hidraw transport must validate that the selected
+device's input and output reports match this profile, own device access,
+and impose one absolute transaction deadline. Keepalives and other-channel
+reports never grant presence or extend that deadline.
+
+Messages are bounded to 7609 bytes: 57 in the initial report and at most
+128 sequential continuation reports of 59 bytes each. Request encoding
+supports INIT, CBOR and CANCEL; CANCEL has no response. Decoding pins the
+channel and expected command, refuses reordered, duplicated, restarted,
+empty or oversized responses, and closes the transaction on any error or
+completion. The typed initialization transaction owns the same nonce for
+request encoding and reply matching. A complete INIT response for another
+nonce is ignored while waiting for this request, without resending or
+extending the deadline. Resynchronizing an already allocated channel
+requires the reply to return that same channel. Reports from other channels are ignored without changing the
+current assembly. Keepalives are accepted only before a CBOR response
+starts. Initialization checks the caller's fresh eight-byte nonce, CTAP
+HID version 2, CBOR capability and a nonzero, nonbroadcast allocated
+channel. Future fields after the 17-byte INIT response prefix are accepted
+within the same bound. Padding beyond the advertised length is ignored.
+An error report received during assembly closes the transaction and retains
+the device's error code in the diagnostic. Owned request reports and response
+messages clear their buffers on drop; malformed-response buffers are cleared
+immediately. This is best effort, not guaranteed erasure of compiler or
+caller copies. The later transport must similarly clear its raw I/O buffers.
+
+`Client::verify_es256` uses TPM2_LoadExternal and TPM2_VerifySignature
+to verify a SHA-256 digest with a public-only P-256 key and fixed-width
+ECDSA components. No private signing key or new cryptographic dependency
+enters td. The loaded public area has the fixed ECC/SHA-256/ECDSA/P-256
+template and null hierarchy; its returned Name must match the submitted
+public bytes. Success requires the exact null-hierarchy verification
+ticket with an empty digest. Loaded objects are flushed on success and
+rejection; failed cleanup refuses success and retains the handle for the
+client's final cleanup attempt.
+If verification and cleanup both fail, the returned diagnostic includes
+both failures.
+
+The command profile supports TPM2_VerifySignature (0x177), as implemented
+by the pinned emulator and existing TPM 2.0 devices. TPM library revision
+185 deprecates it in favor of newer digest/sequence verification commands
+([TCG command specification](https://trustedcomputinggroup.org/wp-content/uploads/Trusted-Platform-Module-2.0-Library-Part-3_Commands-V185-RC4_12Dec2025.pdf)).
+An unsupported command fails closed; this prerequisite does not claim
+support for a device that omits it. The future consumer must separately
+validate CTAP CBOR, the enrolled credential identity, RP hash, presence
+flags and the signed challenge, and bind enrollment metadata to the
+sealed store. A successful signature check alone is no authorization.
+Session release, recovery enrollment, trusted input and one-operation
+writes remain subsequent work.
+
+Tests cover report boundaries, literal wire encoding, sequence and channel
+substitution, keepalive state, initialization binding, malformed TPM Names
+and tickets, and cleanup failures. The target recipe compiles and runs the
+ordinary crate tests with its source-built toolchain. The explicit
+`emulator_es256` oracle uses an independently generated OpenSSL P-256
+signature fixture, rejects changed public coordinates, digest and signature
+components, and repeats verification beyond the TPM transient-slot count.
+The fixture requires no OpenSSL at test time. Neither these tests nor
+their software authenticator framing inputs prove a physical token touch.
+
 ## TPM validation
 
 The optional host oracle uses upstream swtpm 0.10.1 and libtpms 0.10.2,

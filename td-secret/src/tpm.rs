@@ -1,4 +1,4 @@
-//! TPM 2.0: one fixed storage parent, one PCR policy, one sealed 32-byte key.
+//! TPM 2.0 sealing and public-only ES256 verification.
 
 use crate::crypto;
 use std::fs::{File, OpenOptions};
@@ -24,6 +24,8 @@ const PCR_READ: u32 = 0x17e;
 const START_AUTH_SESSION: u32 = 0x176;
 const FLUSH_CONTEXT: u32 = 0x165;
 const POLICY_GET_DIGEST: u32 = 0x189;
+const LOAD_EXTERNAL: u32 = 0x167;
+const VERIFY_SIGNATURE: u32 = 0x177;
 const SEALED_ATTRIBUTES: u32 = 0x492;
 pub const MAX_PACKET: usize = 4096;
 
@@ -200,6 +202,63 @@ impl<T: Transport> Client<T> {
         Self {
             transport,
             handles: Vec::new(),
+        }
+    }
+
+    /// Verify a digest with a public-only P-256 key. This grants no store access.
+    pub fn verify_es256(
+        &mut self,
+        x: &[u8; 32],
+        y: &[u8; 32],
+        digest: &[u8; 32],
+        r: &[u8; 32],
+        s: &[u8; 32],
+    ) -> Result<(), String> {
+        let mut public = Vec::with_capacity(88);
+        put16(&mut public, 0x23); // ECC
+        put16(&mut public, SHA256);
+        put32(&mut public, 0x40040); // unrestricted signing, userWithAuth
+        put_blob(&mut public, &[])?;
+        for value in [ALG_NULL, 0x18, SHA256, 3, ALG_NULL] {
+            put16(&mut public, value);
+        }
+        put_blob(&mut public, x)?;
+        put_blob(&mut public, y)?;
+        let mut parameters = Vec::new();
+        put_blob(&mut parameters, &[])?; // public only
+        put_blob(&mut parameters, &public)?;
+        put32(&mut parameters, NULL);
+        let (handle, out) = self.call(LOAD_EXTERNAL, &[], None, &parameters, true)?;
+        let handle = handle.ok_or("missing TPM verification handle")?;
+        let verified = (|| {
+            let mut reader = Reader(&out);
+            check_name(&public, reader.blob()?)?;
+            reader.end()?;
+            let mut signature = Vec::new();
+            put_blob(&mut signature, digest)?;
+            put16(&mut signature, 0x18); // ECDSA
+            put16(&mut signature, SHA256);
+            put_blob(&mut signature, r)?;
+            put_blob(&mut signature, s)?;
+            let (_, out) = self.call(VERIFY_SIGNATURE, &[handle], None, &signature, false)?;
+            let mut ticket = Reader(&out);
+            if ticket.u16()? != 0x8022 || ticket.u32()? != NULL || !ticket.blob()?.is_empty() {
+                return Err("invalid public-only TPM verification ticket".into());
+            }
+            ticket.end()
+        })();
+        // Repeated assertions must not exhaust the TPM's transient object slots.
+        let flushed = self.call(FLUSH_CONTEXT, &[handle], None, &[], false)
+            .and_then(|(_, out)| Reader(&out).end());
+        if flushed.is_ok() {
+            self.handles.retain(|value| *value != handle);
+        }
+        match (verified, flushed) {
+            (Err(primary), Err(cleanup)) => Err(format!(
+                "{primary}; verification object cleanup failed: {cleanup}"
+            )),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
         }
     }
 
@@ -766,6 +825,107 @@ pub(crate) mod tests {
         let mut changed_pcr = key;
         changed_pcr.pcr_digest[0] ^= 1;
         assert!(SealedKey::decode(&changed_pcr.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn es256_rejects_malformed_names_tickets_and_failed_cleanup() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct DeviceReply { fault: u8, flushes: Rc<Cell<usize>> }
+        impl Transport for DeviceReply {
+            fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
+                let code = u32::from_be_bytes(command[6..10].try_into().unwrap());
+                let mut out = Vec::new();
+                let mut rc = 0;
+                match code {
+                    LOAD_EXTERNAL => {
+                        let mut request = Reader(&command[10..]);
+                        assert!(request.blob().unwrap().is_empty());
+                        let public = request.blob().unwrap();
+                        assert_eq!(request.u32().unwrap(), NULL);
+                        request.end().unwrap();
+                        let mut name = SHA256.to_be_bytes().to_vec();
+                        name.extend_from_slice(&crypto::digest(public));
+                        if self.fault == 1 { name[2] ^= 1; }
+                        put32(&mut out, if self.fault == 12 { 0x8100_0000 } else { 0x8000_0000 });
+                        put_blob(&mut out, &name).unwrap();
+                        if self.fault == 2 { out.push(0); }
+                        if self.fault == 11 { rc = 0x101; out.clear(); }
+                    }
+                    VERIFY_SIGNATURE => {
+                        put16(&mut out, if self.fault == 3 { 0x8021 } else { 0x8022 });
+                        put32(&mut out, if self.fault == 4 { OWNER } else { NULL });
+                        put_blob(&mut out, if self.fault == 5 { &[1] } else { &[] }).unwrap();
+                        if self.fault == 6 { out.push(0); }
+                        if matches!(self.fault, 8 | 10) { rc = 0x2db; out.clear(); }
+                        if self.fault == 9 { out.pop(); }
+                    }
+                    FLUSH_CONTEXT => {
+                        self.flushes.set(self.flushes.get() + 1);
+                        if matches!(self.fault, 7 | 10) && self.flushes.get() == 1 { rc = 0x101; }
+                    }
+                    _ => panic!("unexpected verification command {code:#x}"),
+                }
+                let mut response = NO_SESSIONS.to_be_bytes().to_vec();
+                put32(&mut response, 10 + out.len() as u32);
+                put32(&mut response, rc);
+                response.extend_from_slice(&out);
+                Ok(response)
+            }
+        }
+        let [x, y, digest, r, s] = es256_fixture();
+        for fault in 0..=12 {
+            let flushes = Rc::new(Cell::new(0));
+            let mut client = Client::new(DeviceReply { fault, flushes: flushes.clone() });
+            let result = client.verify_es256(&x, &y, &digest, &r, &s);
+            assert_eq!(result.is_ok(), fault == 0, "fault {fault}");
+            if fault == 10 {
+                let error = result.unwrap_err();
+                assert!(error.contains("0x177") && error.contains("0x165"));
+            }
+            let loaded = usize::from(fault < 11);
+            assert_eq!(flushes.get(), loaded, "only admitted transient objects are retired");
+            assert_eq!(client.handles.len(), usize::from(matches!(fault, 7 | 10)));
+            drop(client);
+            assert_eq!(flushes.get(), if matches!(fault, 7 | 10) { 2 } else { loaded });
+        }
+    }
+
+    fn es256_fixture() -> [[u8; 32]; 5] {
+        // Independently generated OpenSSL 3.5.7 P-256/SHA-256 signature.
+        [
+            "024b51d901d395bc26de4f967225248bc9a7df360209a932856be223d5e1559d",
+            "22cc0e2fa5c56fcbbfc143e1ecd4009d1ff9ac33b9e047bb935ea5e563996c55",
+            "4994c7bb96286fd9ef8d505d8ab3dea532624cf615bc59f44df535ada05dd5f9",
+            "49298c57698034a7fb139bb67afd8019356759df90fc1d118f0ecfa66f0c463b",
+            "8683952a24bd4b70eb95c04b1e0f560ffd94cfb31688836a20cfd7381b76983d",
+        ].map(|value| std::array::from_fn(|i| {
+            u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).unwrap()
+        }))
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    fn emulator_es256_verifies_mutations_and_retires_handles() {
+        let root = std::env::temp_dir().join(format!("td-es256-oracle-{}", std::process::id()));
+        assert!(!root.exists());
+        let emulator = Emulator::start(&root);
+        let mut client = emulator.client();
+        let [x, y, digest, r, s] = es256_fixture();
+        for _ in 0..16 {
+            client.verify_es256(&x, &y, &digest, &r, &s).unwrap();
+            assert!(client.handles.is_empty());
+        }
+        for field in 0..5 {
+            let mut values = [x, y, digest, r, s];
+            values[field][0] ^= 1;
+            let [x, y, digest, r, s] = values;
+            assert!(client.verify_es256(&x, &y, &digest, &r, &s).is_err(), "field {field}");
+            assert!(client.handles.is_empty());
+        }
+        drop(client);
+        drop(emulator);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

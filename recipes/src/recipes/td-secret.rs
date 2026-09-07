@@ -4,6 +4,7 @@ const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     ("client", include_str!("../../../td-secret/src/client.rs")),
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
+    ("fido_hid", include_str!("../../../td-secret/src/fido_hid.rs")),
     ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),
     ("sys", include_str!("../../../td-secret/src/sys.rs")),
@@ -116,6 +117,24 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     steps.push(Step::run("{root}", &["{out}/bin/td-secret", "selftest"]));
+    steps.push(
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition", "2021", "--test", "--crate-name", "td_secret_tests",
+                "--target", "x86_64-unknown-linux-gnu",
+                "-C", "target-feature=+crt-static", "-C", "relocation-model=static",
+                &linker, "-L", glib, &lib_b, &bin_b,
+                "-Clink-arg=-L{root}/eh", "-Clink-arg=-static-libgcc",
+                "-o", "{root}/secret-tests", "{src}/td-secret/src/main.rs",
+            ],
+        )
+        .env("PATH", &path)
+        .env("CARGO_MANIFEST_DIR", "{src}/td-secret")
+        .env("SOURCE_DATE_EPOCH", "1"),
+    );
+    steps.push(Step::run("{root}", &["{root}/secret-tests"]));
     steps.push(split_target_debug("{out}"));
     steps.push(Step::assert_static(&["{out}/bin/td-secret"]));
 
