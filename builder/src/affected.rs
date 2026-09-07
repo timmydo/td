@@ -4401,9 +4401,9 @@ mod tests {
         // The conservative textual edge widens checks even without a read.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-portal", "td-review", "td-seatd"]
+            ["td-authd", "td-editor", "td-jail", "td-portal", "td-review", "td-seatd", "td-secret"]
         );
-        assert_eq!(readers_of("td-authd"), ["td-compositor"]);
+        assert_eq!(readers_of("td-authd"), ["td-compositor", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled.
@@ -4440,10 +4440,12 @@ mod tests {
                 "td-authd",
                 "td-compositor",
                 "td-editor",
+                "td-firstboot",
                 "td-jail",
                 "td-portal",
                 "td-review",
-                "td-seatd"
+                "td-seatd",
+                "td-secret"
             ]))
         );
         assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check), Some(paths(&["td-sh"])));
@@ -6501,13 +6503,15 @@ mod tests {
                 "td-authd",
                 "td-compositor",
                 "td-editor",
+                "td-firstboot",
                 "td-jail",
                 "td-portal",
                 "td-review",
-                "td-seatd"
+                "td-seatd",
+                "td-secret"
             ]
         );
-        assert_eq!(comp.len(), 16, "{comp:?}");
+        assert_eq!(comp.len(), 20, "{comp:?}");
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
             [

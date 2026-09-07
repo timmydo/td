@@ -6395,9 +6395,10 @@ This receipt records a completed paint, not live authorization. The later
 channel consumer must bind it to its outstanding nonce, serialize the whole
 operation, invalidate it on cancellation/channel loss and start token I/O
 only after accepting that exact receipt. A receipt already handed out does
-not revoke itself when attention closes. No production caller uses this API
-or the request codec yet; the stock attention screen remains inert and no
-token release or write is enabled by this prerequisite.
+not revoke itself when attention closes. No production caller uses this
+receipt API yet. The private root unlock worker consumes the request codec
+as specified in `td-secret/DESIGN.md`, but its paired-authority caller is
+not activated. The stock attention screen remains inert.
 
 ## td-owned development VM bridge
 

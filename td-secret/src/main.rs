@@ -10,17 +10,21 @@
 )]
 
 mod client;
-#[allow(dead_code, reason = "physical token transport; trusted consumer follows")]
+#[path = "../../td-authd/src/consent.rs"]
+#[allow(dead_code, reason = "shared immutable consent description")]
+mod consent;
+mod operation;
+#[allow(dead_code, reason = "shared physical token transport")]
 mod fido_device;
-#[allow(dead_code, reason = "FIDO2 transport prerequisite; no release consumer yet")]
+#[allow(dead_code, reason = "shared FIDO2 framing and cancellation codec")]
 mod fido_hid;
-#[allow(dead_code, reason = "enrollment metadata prerequisite; no release consumer yet")]
+#[allow(dead_code, reason = "shared enrollment and recovery metadata")]
 mod fido_metadata;
-#[allow(dead_code, reason = "CTAP codec prerequisite; no release consumer yet")]
+#[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
 mod fido_cbor;
-#[allow(dead_code, reason = "CTAP codec prerequisite; no release consumer yet")]
+#[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
 mod fido_ctap;
-#[allow(dead_code, reason = "enrollment prerequisite; no release consumer yet")]
+#[allow(dead_code, reason = "enrollment construction and verified assertion support")]
 mod fido_enroll;
 #[path = "../../td-firstboot/src/principals.rs"]
 #[allow(dead_code, reason = "shared immutable session identity loader")]
@@ -50,6 +54,9 @@ use std::io::{self, Read};
 fn run(args: &[String]) -> Result<(), String> {
     match args {
         [command] if command == "selftest" => crypto::selftest(),
+        [command, flag, uid] if command == "unlock-operation" && flag == "--uid" => {
+            operation::run(parse_uid(uid)?)
+        }
         [command, index, inode, rdev] if command == "hid-worker" => fido_device::worker(index, inode, rdev),
         [command, uid_flag, uid, pcr_flag, pcrs, recovery]
             if command == "seal"
@@ -140,6 +147,14 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod confinement {
     #[test]
+    fn private_unlock_controller_and_shared_description_are_pinned() {
+        let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
+            |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
+        assert_eq!(fingerprint(include_str!("operation.rs")), 0x53060fda67b3ebc7);
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xf1d3b878619f19f4, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+    }
+
+    #[test]
     fn console_targets_require_one_canonical_human_identity() {
         for value in ["0", "991", "01000", "+1000", "65534", "4294967296", "1000 "] {
             assert!(super::parse_uid(value).is_err(), "{value}");
@@ -155,6 +170,7 @@ mod confinement {
         let sources = [
             ("main.rs", include_str!("main.rs")),
             ("client.rs", include_str!("client.rs")),
+            ("operation.rs", include_str!("operation.rs")),
             ("crypto.rs", include_str!("crypto.rs")),
             ("fido_cbor.rs", include_str!("fido_cbor.rs")),
             ("fido_ctap.rs", include_str!("fido_ctap.rs")),
@@ -222,6 +238,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_hid.rs",
                 "fido_metadata.rs",
                 "main.rs",
+                "operation.rs",
                 "store.rs",
                 "sys.rs",
                 "tpm.rs"

@@ -79,7 +79,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
         0xf1d3b878619f19f4,
-        "shared consent changed: reconcile compositor confinement and this pin"
+        "shared consent changed: reconcile td-secret/src/main.rs, compositor confinement and this pin"
     );
     let application = include_str!("../src/application.rs")
         .split("#[cfg(test)]")

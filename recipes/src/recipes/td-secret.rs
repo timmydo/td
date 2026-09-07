@@ -2,6 +2,8 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("operation", include_str!("../../../td-secret/src/operation.rs")),
+    ("consent", include_str!("../../../td-authd/src/consent.rs")),
     ("client", include_str!("../../../td-secret/src/client.rs")),
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
     ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
@@ -38,6 +40,7 @@ pub fn recipe() -> Recipe {
         "{src}/td-secret/src",
         "{src}/td-firstboot/src",
         "{src}/td-busd/src",
+        "{src}/td-authd/src",
         "{src}/engine/src",
     ] {
         steps.push(Step::MkDir {
@@ -55,6 +58,7 @@ pub fn recipe() -> Recipe {
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
             path: match *name {
+                "consent" => "{src}/td-authd/src/consent.rs".into(),
                 "crypto" => "{src}/td-secret/src/crypto.rs".into(),
                 "store" => "{src}/td-secret/src/store.rs".into(),
                 "name" => "{src}/td-busd/src/name.rs".into(),

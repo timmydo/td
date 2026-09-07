@@ -694,15 +694,15 @@ plaintext mail credential still present beside that application is
 refused and retained for explicit migration; it is never silently erased.
 The existing root `release` command refuses a token-protected store.
 
-This is a persistent-format and boot prerequisite. No CLI or compositor
-flow enrolls tokens or calls the token-release API yet. The stock image
-continues with its explicitly unenrolled backend, and existing TPM-only
-stores retain their documented automatic release until the secure-input
-activation cutover. No new user authentication or one-operation elevation
-is claimed. Root and the TPM remain trusted; whole-store rollback,
-historical extents and best-effort memory clearing retain their existing
-limits. The token assertion is checked by td-owned software before TPM
-unseal, not by a TPM policy that understands FIDO.
+The persistent-format and boot prerequisite has a private root unlock
+worker below. No human CLI or compositor flow enrolls or releases tokens
+yet. The stock image continues with its explicitly unenrolled backend,
+and existing TPM-only stores retain their documented automatic release
+until the secure-input activation cutover. No new user authentication or
+one-operation elevation is claimed. Root and the TPM remain trusted;
+whole-store rollback, historical extents and best-effort memory clearing
+retain their existing limits. The token assertion is checked by td-owned
+software before TPM unseal, not by a TPM policy that understands FIDO.
 
 Ordinary fixtures cover atomic rotation, failed roundtrip preservation,
 complete format bounds and wrong-UID/version refusal. The pinned TPM
@@ -795,3 +795,86 @@ unknown files, links, foreign ownership and contention. It checks that the
 old human and an application UID cannot read the master or records, the
 service can read them, and the encrypted and plaintext credential bytes
 survive unchanged. It never runs by default on the development host.
+
+## Private unlock worker
+
+`unlock-operation --uid UID` is a root-only child controller for the
+future paired authority. It requires single-threaded startup, only
+standard inherited descriptors, and an unnamed root-owned socketpair on
+stdin; neither log descriptor may duplicate the child endpoint inode.
+The descriptor-directory iterator observes itself as fd 3, after
+standard-fd presence is checked and before stdin is cloned. The trusted
+parent creates and exclusively retains its endpoint; it must never
+delegate it, including as a child log descriptor. The child normalizes
+its endpoint to blocking mode. This child transport relies on that root
+launch invariant; it is distinct from the public/compositor channel
+authenticated with credentials and pidfds. There is no listener, human invocation or
+automatic session activation in this increment.
+
+Frames have a big-endian u16 length and 1..289 payload bytes, with one
+five-second deadline spanning header and payload and an overall 120-second
+operation deadline derived from the HID session lifetime. These are
+cooperative checks; the parent must also enforce the child lifetime if
+TPM I/O blocks. The first frame is the canonical TDCONS01 description
+of an Unlock operation for the configured UID. Other operations refuse.
+After startup and endpoint admission, before receiving the first frame,
+the child clears any previous volatile key. Malformed input and an initial
+disconnect cannot retain a release. A startup refusal requires the parent
+to clear the prior generation; it cannot claim child cleanup. The child
+then verifies the installed session's store ownership and requires a
+token protector. It sends `10`, a fresh 32-byte kernel-random round value, and the complete
+description, then requires `11` followed by exactly that round value and
+description as the parent's presentation acknowledgement. The round value
+is private protocol data and is not part of the displayed description.
+The parent may paint after receiving this invitation, but completed
+presentation and its acknowledgement must both fit within five seconds.
+If painting cannot meet that bound, the operation fails before token I/O.
+Only then does it discover and initialize exactly one connected token.
+No token operation is retried after an uncertain response.
+
+The CTAP challenge is SHA-256 of `td-secret/presented-unlock/v1` plus a
+zero byte and the complete canonical description. The parent must supply a
+fresh unpredictable nonce, admit that request, and acknowledge only the
+exact completed trusted presentation. Primary and recovery requests select
+the corresponding enrolled key. The child retains the bound protector and
+assertion response, sends `12` plus a second fresh 32-byte round value and
+the description, and waits for exactly `13` plus that round value and
+description before TPM verification, unseal and publication. An earlier
+round cannot be prequeued or replayed as the later acknowledgement.
+The commit invitation also requires its answer within five seconds, after
+the token assertion; a delayed decision fails and spends that touch.
+Neither deadline permits retrying an uncertain token operation.
+The existing bound release API compares the current protector snapshot.
+The child returns `14` on success; the parent must also require successful
+child exit, because expiry after writing that frame can still fail and
+clear the key. Protocol bytes are hexadecimal here.
+No credential, assertion or key is returned on this channel.
+
+The parent must serialize cancellation and commit acknowledgement: the
+commit record is the execution point, not a revocable approval. Before
+sending it, cancellation, peer loss, deadline or a stale presentation must
+close the endpoint and kill/reap this child. The parent must also supervise
+its lifetime and clear session keys on generation loss. Token work happens
+in the separate child so that the parent's terminal heartbeat can continue.
+Those parent duties are not activated by this child entry point. After any
+reported failure, including loss of the final success response, the child
+attempts to clear the volatile key. A process killed after publication
+requires the parent's generation cleanup; this child alone cannot promise
+cleanup after SIGKILL. Existing HID worker ownership bounds device I/O.
+
+Socket tests run the actual framed controller and prove that missing or
+mismatched presentation acknowledgement cannot call token acquisition,
+and missing or mismatched commit acknowledgement cannot call publication.
+They cover complete-request challenge changes, frame bounds, expiration and
+unsupported operations. Hardware release continues to use the existing
+TPM/assertion oracles; these protocol tests do not claim a physical touch.
+
+The ignored root fixture
+`operation::tests::initial_failures_remove_a_seeded_runtime_key_in_the_root_vm`
+requires `td.operation-fixture=1` on the kernel command line, no persistent
+store, tmpfs `/run`, and the production binary at `/bin/td-secret`. It
+executes that binary on real root-owned socketpairs and proves that initial
+EOF, truncation, malformed descriptors, a wrong owner and an unknown
+operation all remove a seeded portal-owned runtime key. It also exercises
+the production descriptor inventory and unnamed-socket admission. Ordinary
+host tests never run this fixture.

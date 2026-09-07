@@ -750,16 +750,18 @@ store's other supported PCR selections are deliberately unencodable in
 this prompt profile. A future authority must refuse those selections, never
 map a different mask onto this label. Spaces and dots are excluded from
 credential names: indented continuation text cannot imitate the fixed
-labels or token instructions. Both consumers pin the codec source and its
+labels or token instructions. All consumers pin the codec source and its
 tests assert the complete public argument display.
 
-These are structural checks, not caller admission or proof of randomness.
-No channel opcode, root operation, public listener or token access consumes
-this codec yet. The future authority must pin the requester and credential
-input, admit the application from deployment policy, own an immutable
-operation under its fresh nonce, and bind its token challenge to the complete
-canonical description. The compositor's presentation receipt is necessary
-but insufficient: cancellation, peer loss, deadline or request replacement
+These are structural checks, not caller admission or proof of
+randomness. The private root unlock worker in `td-secret/DESIGN.md`
+consumes this codec. Its paired-authority caller and compositor receipt
+integration are not activated; there is no public operation listener.
+The future authority must pin the requester and credential input, admit
+the application from deployment policy, own an immutable operation under
+its fresh nonce, and bind its token challenge to the complete canonical
+description. The compositor's presentation receipt is necessary but
+insufficient: cancellation, peer loss, deadline or request replacement
 must invalidate authority before committing any write or release. The
 renderer and its current unconsumed receipt API are specified in
 `td-compositor/DESIGN.md`.
