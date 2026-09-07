@@ -598,3 +598,61 @@ The terminal helper sets `TD_CONTROL_SOCKET` to the fixed compositor runtime
 path before exec. The terminal passes its actual Wayland socket path to its
 PTY child, preserving the connection endpoint across the compositor UID
 cutover. No root authority operation accepts either path from a requester.
+
+## Fixed application launch prerequisite
+
+The root startup operation `application-start OWNER APP direct|terminal --
+ARG...` consumes an installed application assignment. OWNER is currently
+1000, the image's single graphical session; APP has the canonical registry
+name grammar. The presentation and at most 128 literal arguments (32 KiB
+including terminators) come from root-owned unit configuration. There is no
+request listener, caller-selected executable, credential change in td-authd,
+or human elevation. Stock application accounts remain reserved until the
+atomic image, socket, grant and per-app fetch-service cutover.
+
+Startup requires the same root credentials, single thread, absent controlling
+terminal and exclusive standard descriptors as the terminal authority.
+The conservative shared audit also requires neither log to alias stdin;
+a unit with all three descriptors pointing to /dev/null is refused. A
+child runs only `/bin/td-firstboot check-launch-application OWNER APP` with
+an empty environment, `/` working directory, null stdin/stderr and a private
+stdout socketpair. The read-only check verifies immutable account files and
+that the deployment is already durably enrolled. It selects only an active
+current application account, never a retired reservation or caller UID.
+Its exact bounded reply carries the canonical UID. One two-second deadline
+covers reply reads and observed child completion; failure kills and reaps
+the validator. Trusted root must not change the account database, deployment
+or mount hierarchy during launch. The check creates no state and does not
+substitute for successful firstboot dependency ordering.
+
+After validation the authority execs the fixed td-login `exec-service-as`
+helper for `tdaUID`, followed by its own `application-exec` wrapper. All
+standard descriptors become null, the environment is cleared and cwd is `/`.
+The supervisor PID is retained across execs. No inherited root endpoint or
+log reaches application code. Root startup refusals are diagnosed; after the
+handoff, failures appear as the supervised process's exit status. The fixed
+firstboot check can be run directly for detailed admission diagnostics.
+
+The unprivileged wrapper requires all four UID/GID columns to equal the
+selected application UID, exactly its primary supplementary group, empty
+inheritable/permitted/effective/ambient capabilities, and exact membership
+in `td-app-UID/session`. A diagnostic-only td-login placement failure thus
+cannot execute application code. This wrapper gains no privilege and is not
+an alternative application-identity authority: an app UID invoking it directly
+still has only that UID. Broker and jail activation must independently bind
+that identity to its installed application.
+
+The wrapper constructs only `/bin/APP` or `/bin/td-term run` with that fixed
+application command. Terminal presentation selects the human session's public
+Wayland socket and an app-private readiness socket. It supplies the canonical
+private HOME and runtime, service USER/LOGNAME, `/bin/false` SHELL and `/bin`
+PATH to its immediate child. td-term separately constructs the command's
+environment from its service account: its existing PTY contract uses that
+account's HOME as cwd, `/bin/sh` as SHELL, and its selected WAYLAND_DISPLAY.
+This does not execute a shell for an explicit application command or change
+its service-only account class. Direct presentation uses the immutable
+`/bin/APP` td-jail link, whose product resolver fixes the display endpoint.
+It passes literal application arguments without a shell and sets no
+compositor control endpoint. The bounding capability set is not a held
+privilege and is not required empty. No new syscall or unsafe surface is
+introduced; confinement pins the complete application controller and startup.

@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod application;
 mod channel;
 mod launch;
 mod mount_sys;
@@ -12,7 +13,9 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd terminal-serve --user USER --uid UID --peer-uid UID | \
     td-authd terminal-exec UID GENERATION HANDLE | td-authd prepare-portal-files | \
-    td-authd release-portal-files";
+    td-authd release-portal-files | \
+    td-authd application-start OWNER APP direct|terminal -- ARG... | \
+     td-authd application-exec UID OWNER APP direct|terminal -- ARG...";
 
 fn run(arguments: &[String]) -> Result<(), String> {
     if arguments == ["prepare-portal-files"] {
@@ -25,6 +28,12 @@ fn run(arguments: &[String]) -> Result<(), String> {
         return portal_files::namespace_helper();
     }
     if let Some((verb, rest)) = arguments.split_first() {
+        if verb == "application-start" {
+            return application::start(rest);
+        }
+        if verb == "application-exec" {
+            return application::exec(rest);
+        }
         if verb == "terminal-exec" {
             return launch::terminal_exec(rest);
         }

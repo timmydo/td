@@ -206,7 +206,8 @@ fn usage() -> String {
          {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with the application pair, a first \
          configuration under DIR/{APPLICATION_STATE_ROOT} or its validated private app home\n  \
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
-         td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n"
+         td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
+         td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n"
     )
 }
 
@@ -221,6 +222,12 @@ fn run(args: &[String]) -> Result<(), Failure> {
             principal_store::check_launch_session(&user, owner, compositor)
                 .map_err(Failure::Failed)?;
             return emit("TD-LAUNCH-SESSION-CHECK-OK\n").map_err(Failure::Failed);
+        }
+        Invocation::CheckLaunchApplication(owner, name) => {
+            let uid =
+                principal_store::check_launch_application(owner, &name).map_err(Failure::Failed)?;
+            return emit(&format!("TD-LAUNCH-APPLICATION-CHECK-OK\t{uid}\n"))
+                .map_err(Failure::Failed);
         }
         Invocation::Provision(config) => config,
     };
@@ -334,10 +341,36 @@ enum Invocation {
     Help,
     CheckPrincipals(PathBuf),
     CheckLaunchSession(String, u32, u32),
+    CheckLaunchApplication(u32, String),
     Provision(Config),
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
+    if args
+        .first()
+        .is_some_and(|verb| verb == "check-launch-application")
+    {
+        let [_, owner, name] = args else {
+            return Err(Failure::Usage(
+                "check-launch-application requires OWNER APP".into(),
+            ));
+        };
+        let uid = owner
+            .parse::<u32>()
+            .map_err(|_| Failure::Usage("invalid application owner".into()))?;
+        if !(1000..=65533).contains(&uid)
+            || uid.to_string() != *owner
+            || name.len() > 64
+            || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+        {
+            return Err(Failure::Usage("invalid application launch identity".into()));
+        }
+        return Ok(Invocation::CheckLaunchApplication(uid, name.clone()));
+    }
+
     if args
         .first()
         .is_some_and(|verb| verb == "check-launch-session")
@@ -1228,9 +1261,27 @@ mod tests {
             Invocation::Provision(config) => Ok(config),
             Invocation::Help
             | Invocation::CheckPrincipals(_)
+            | Invocation::CheckLaunchApplication(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
                 "asked for a non-provisioning operation".to_string(),
             )),
+        }
+    }
+
+    #[test]
+    fn application_launch_checks_require_a_canonical_owner_and_one_name() {
+        let arguments = ["check-launch-application", "1000", "mail"].map(String::from);
+        assert!(
+            matches!(parse(&arguments), Ok(Invocation::CheckLaunchApplication(1000, name)) if name == "mail")
+        );
+        for arguments in [
+            vec!["check-launch-application"],
+            vec!["check-launch-application", "01000", "mail"],
+            vec!["check-launch-application", "0", "mail"],
+            vec!["check-launch-application", "1000", "../mail"],
+            vec!["check-launch-application", "1000", "mail", "extra"],
+        ] {
+            assert!(parse(&arguments.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
         }
     }
 

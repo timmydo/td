@@ -27,6 +27,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(
         files,
         [
+            "application.rs",
             "channel.rs",
             "launch.rs",
             "main.rs",
@@ -36,6 +37,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ]
     );
     for (name, count) in [
+        ("application.rs", 0),
         ("main.rs", 1),
         ("channel.rs", 0),
         ("sys.rs", 4),
@@ -61,7 +63,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "println!",
             "eprintln!",
         ] {
-            let child_api = name == "launch.rs"
+            let child_api = matches!(name, "launch.rs" | "application.rs")
                 && ["::Command", "::thread", ".spawn(", ".exec("].contains(&forbidden);
             let mapping_child_api =
                 name == "portal_files.rs" && ["::Command", ".spawn("].contains(&forbidden);
@@ -70,6 +72,34 @@ fn the_production_source_and_raw_boundary_are_closed() {
             }
         }
     }
+    let application = include_str!("../src/application.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        fingerprint(application),
+        0xf5f8d44565a906c7,
+        "application launch controller changed"
+    );
+    for forbidden in [
+        "thread::spawn",
+        "thread::Builder",
+        "thread::scope",
+        "pre_exec",
+        ".uid(",
+        ".gid(",
+        ".groups(",
+    ] {
+        assert!(
+            !application.contains(forbidden),
+            "application.rs: {forbidden}"
+        );
+    }
+    assert_eq!(application.matches(".spawn(").count(), 1);
+    assert_eq!(application.matches(".exec()").count(), 2);
+    assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
+    assert_eq!(application.matches(".stderr(Stdio::null())").count(), 2);
+    assert_eq!(application.matches(".stdout(Stdio::null())").count(), 1);
     let launch = include_str!("../src/launch.rs");
     for forbidden in [
         "thread::spawn",
@@ -121,7 +151,11 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(raw.matches("syscall5(").count(), 5);
     assert_eq!(raw.matches("adopt(").count(), 2);
     let mounts = include_str!("../src/mount_sys.rs");
-    assert_eq!(fingerprint(mounts), 0xa245d04766973f8c, "fixed mount boundary changed");
+    assert_eq!(
+        fingerprint(mounts),
+        0xa245d04766973f8c,
+        "fixed mount boundary changed"
+    );
     for constant in [
         "const SYS_UNSHARE: usize = 272;",
         "const SYS_OPEN_TREE: usize = 428;",
@@ -142,7 +176,11 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(mounts.matches("syscall5(").count(), 5);
     assert_eq!(mounts.matches("adopt(").count(), 2);
     let files = include_str!("../src/portal_files.rs");
-    assert_eq!(fingerprint(files), 0x4b003b1d31aba476, "root portal grant controller changed");
+    assert_eq!(
+        fingerprint(files),
+        0x4b003b1d31aba476,
+        "root portal grant controller changed"
+    );
     assert_eq!(files.matches("Command::new(\"/bin/td-authd\")").count(), 1);
     assert_eq!(files.matches("Command::new(\"/bin/umount\")").count(), 1);
     assert!(files.contains(".arg(VIEW)"));
@@ -172,7 +210,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0xd75fc116519ed531,
+        0x2e551b33ba80a7e9,
         "main.rs: production startup changed"
     );
     assert_eq!(

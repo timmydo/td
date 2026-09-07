@@ -70,8 +70,10 @@ The human UID 1000 selects `td-user-1000/session`; application UIDs
 UID reports that no delegation is configured. Firstboot prepares only the
 installed, durably reserved application accounts' cgroups at sysinit, as
 specified in `td-authd/DESIGN.md`; this selector alone activates nothing.
-The root configured launcher must make a failed placement fatal before app
-code runs, as the existing terminal launcher does for the human session.
+The root-configured td-authd application launcher makes a failed placement
+fatal before app code runs, as the terminal launcher does for the human
+session. Its active-account admission and post-switch checks are specified
+in `td-authd/DESIGN.md`; it uses this existing service-only credential path.
 
 ## 2. The core invariant: ordering, and then proof
 
@@ -101,8 +103,10 @@ Before Layer 1, `session::enter` performs one non-credential root operation:
 for uid 1000 it writes its own pid to the fixed
 `/sys/fs/cgroup/td-user-1000/session/cgroup.procs` and requires
 `/proc/self/cgroup` to read back exactly `0::/td-user-1000/session`. Root
-sessions do nothing; any other nonroot uid has no configured delegation. No
-argv or account-database field selects the path. This uses safe filesystem I/O
+sessions do nothing; application UIDs select their canonical
+`td-app-UID/session` path. Other nonroot UIDs have no configured delegation.
+No argv or account-database path field selects the path. This uses safe
+filesystem I/O
 and does not widen the unsafe surface. It must precede `creds::apply`; after the
 uid drop, a process still outside the delegated subtree cannot acquire the
 common-ancestor permission needed to enter it.

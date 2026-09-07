@@ -348,6 +348,20 @@ pub(crate) fn check_launch_session(user: &str, owner: u32, compositor: u32) -> R
     desired.verify_launch_session(user, owner, compositor)
 }
 
+/// Read-only selection for the root application launcher. The caller cannot
+/// choose an account or reuse a retired application's reserved identity.
+pub(crate) fn check_launch_application(owner: u32, name: &str) -> Result<u32, String> {
+    let desired = Registry::load()?;
+    let prior = state_directory()?.verify_enrolled(&desired)?;
+    prior.verify_installed_accounts(&desired)?;
+    desired
+        .active_applications()?
+        .into_iter()
+        .find(|application| application.owner == owner && application.name == name)
+        .map(|application| application.uid)
+        .ok_or_else(|| "application has no active account in the enrolled deployment".into())
+}
+
 #[cfg(test)]
 #[path = "principal_store_tests.rs"]
 mod tests;

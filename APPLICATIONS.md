@@ -9382,6 +9382,12 @@ UID/GID 993, broker assignment at UID/GID 992, and portal assignment at
 UID/GID 991. Application activation must migrate state and socket
 authorization together. `td-authd/DESIGN.md` specifies
 the canonical table, account classes, and durable ledger.
+The root-configured `td-authd application-start` prerequisite can consume
+an activated application account through td-login and requires its assigned
+cgroup before executing the fixed application command. It has no public
+request endpoint. Stock application accounts remain reservations until the
+image, broker/jail identity, socket admission, grants and per-app fetch
+services switch together; this helper alone does not activate them.
 
 The paired compositor's physical attention screen is implemented but
 accepts no request or approval. Secret operations require a complete,
