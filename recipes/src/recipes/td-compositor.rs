@@ -100,6 +100,8 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/terminfo.rs"),
     ),
     ("ui", include_str!("../../../td-compositor/src/ui.rs")),
+    ("vm_bridge", include_str!("../../../td-compositor/src/vm_bridge.rs")),
+    ("vm_wire", include_str!("../../../td-compositor/src/vm_wire.rs")),
     ("wire", include_str!("../../../td-compositor/src/wire.rs")),
 ];
 

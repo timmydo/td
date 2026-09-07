@@ -403,6 +403,9 @@ pub struct Runtime {
     /// is transferring an offer between the focused client and its source.
     selection: Option<SelectionSource>,
     selection_revision: u64,
+    vm_revision: u64,
+    vm_text: Option<(DataSourceIdentity, Arc<Vec<u8>>)>,
+    vm_writer: Option<SyncSender<crate::vm_bridge::ClipboardWrite>>,
     /// xdg-foreign handles are compositor-wide bearer capabilities. The
     /// object maps stay on their owning client threads; this registry carries
     /// only the cross-client identity and relationship needed to resolve one.
@@ -539,6 +542,9 @@ impl Runtime {
             keyboard_subscribers: BTreeMap::new(),
             selection: None,
             selection_revision: 0,
+            vm_revision: 1,
+            vm_text: None,
+            vm_writer: None,
             foreign_exports: BTreeMap::new(),
             foreign_imports: BTreeMap::new(),
             toplevel_parents: BTreeMap::new(),
@@ -3327,6 +3333,7 @@ impl Runtime {
     }
 
     fn next_selection_revision(&mut self) -> Result<u64, String> {
+        self.bump_vm_revision()?;
         self.selection_revision = self
             .selection_revision
             .checked_add(1)
@@ -3394,6 +3401,7 @@ impl Runtime {
             return Ok(None);
         }
         let prior = std::mem::replace(&mut self.selection, source);
+        self.vm_text = None;
         let mut local_cancel = None;
         if let Some(prior) = prior {
             if prior.identity.client == client {
@@ -3415,6 +3423,111 @@ impl Runtime {
         }))
     }
 
+    fn bump_vm_revision(&mut self) -> Result<(), String> {
+        self.vm_revision = self
+            .vm_revision
+            .checked_add(1)
+            .ok_or("VM clipboard revision exhausted")?;
+        Ok(())
+    }
+
+    pub(crate) fn vm_writer(&mut self, writer: Option<SyncSender<crate::vm_bridge::ClipboardWrite>>) {
+        self.vm_writer = writer;
+    }
+
+    pub(crate) fn vm_snapshot(&self) -> Result<u64, String> {
+        if self.scene.attention_visible() || self.keyboard.snapshot().focus.is_none() {
+            return Err("guest has no ordinary keyboard focus".into());
+        }
+        Ok(self.vm_revision)
+    }
+
+    pub(crate) fn vm_check(&self, revision: u64) -> Result<(), String> {
+        if self.vm_snapshot()? != revision {
+            return Err(
+                "guest focus, keyboard or selection changed; retry the explicit action".into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn vm_put(&mut self, revision: u64, bytes: Vec<u8>) -> Result<(), String> {
+        self.vm_check(revision)?;
+        crate::vm_wire::text(&bytes)?;
+        if bytes.is_empty() {
+            return Err("clipboard import needs nonempty text".into());
+        }
+        let focused = self
+            .keyboard
+            .snapshot()
+            .focus
+            .ok_or("no guest focus")?
+            .client;
+        if let Some(prior) = self.selection.take() {
+            self.queue_data_delivery(
+                prior.identity.client,
+                KeyboardDelivery::DataSourceCancelled(prior.identity),
+            )?;
+        }
+        let generation = self.next_selection_revision()?;
+        // Client IDs start at one. Zero names only this compositor-owned source.
+        let identity = DataSourceIdentity {
+            client: 0,
+            object: 0,
+            generation,
+        };
+        self.vm_text = Some((identity, Arc::new(bytes)));
+        self.selection = Some(SelectionSource {
+            identity,
+            mime_types: Arc::new(vec![
+                "text/plain;charset=utf-8".into(),
+                "text/plain".into(),
+                "UTF8_STRING".into(),
+            ]),
+        });
+        self.queue_selection_update(
+            focused,
+            SelectionUpdate {
+                revision: generation,
+                source: self.selection.clone(),
+            },
+        )
+    }
+
+    pub(crate) fn vm_get(
+        &mut self,
+        revision: u64,
+        file: TransferEndpoint,
+    ) -> Result<Option<Arc<Vec<u8>>>, String> {
+        self.vm_check(revision)?;
+        let source = self.selection.clone().ok_or("guest clipboard is empty")?;
+        if let Some((identity, bytes)) = &self.vm_text {
+            if *identity == source.identity {
+                return Ok(Some(Arc::clone(bytes)));
+            }
+        }
+        let mime = [
+            "text/plain;charset=utf-8",
+            "text/plain;charset=UTF-8",
+            "text/plain",
+            "UTF8_STRING",
+        ]
+        .into_iter()
+        .find(|mime| source.mime_types.iter().any(|value| value == mime))
+        .ok_or("guest selection has no supported text MIME")?;
+        if !self.queue_transfer_delivery(
+            source.identity.client,
+            KeyboardDelivery::DataSourceSend {
+                source: source.identity,
+                mime_type: mime.into(),
+                file,
+            },
+        )? {
+            return Err("guest clipboard source unavailable or busy".into());
+        }
+        Ok(None)
+    }
+
     /// Clear a selection whose source object is going away. No cancellation
     /// is sent: destroying wl_data_source is the client giving that object up.
     pub fn clear_selection(
@@ -3426,6 +3539,7 @@ impl Runtime {
             return Ok(None);
         }
         self.selection = None;
+        self.vm_text = None;
         let focused = self.keyboard.snapshot().focus.map(|surface| surface.client);
         if let Some(client) = focused {
             let update = SelectionUpdate {
@@ -3466,6 +3580,15 @@ impl Runtime {
         }
         if self.keyboard.snapshot().focus.map(|surface| surface.client) != Some(receiver) {
             return Ok(false);
+        }
+        if let Some((identity, bytes)) = &self.vm_text {
+            if *identity == source {
+                return Ok(self.vm_writer.as_ref().is_some_and(|writer| {
+                    writer.try_send(crate::vm_bridge::ClipboardWrite {
+                        file: file.into_file(), bytes: Arc::clone(bytes),
+                    }).is_ok()
+                }));
+            }
         }
         self.queue_transfer_delivery(
             source.client,
@@ -3733,6 +3856,7 @@ impl Runtime {
     }
 
     fn publish_keyboard(&mut self, events: Vec<RoutedKeyboardEvent>) -> Result<(), String> {
+        if !events.is_empty() { self.bump_vm_revision()?; }
         let leaving = events.iter().find_map(|event| match event.event {
             crate::keyboard::KeyboardEvent::Leave { surface } => Some(surface.client),
             _ => None,

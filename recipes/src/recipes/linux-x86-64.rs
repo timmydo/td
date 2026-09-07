@@ -511,6 +511,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_VIRTIO[ =]/d; \
                   /^#? *CONFIG_VIRTIO_MENU[ =]/d; \
                   /^#? *CONFIG_VIRTIO_PCI[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_CONSOLE[ =]/d; \
                   /^#? *CONFIG_VIRTIO_BLK[ =]/d; \
                   /^#? *CONFIG_MISC_FILESYSTEMS[ =]/d; \
                   /^#? *CONFIG_EROFS_FS[ =]/d; \
@@ -614,6 +615,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_VIRTIO=y' \
                    'CONFIG_VIRTIO_MENU=y' \
                    'CONFIG_VIRTIO_PCI=y' \
+                   'CONFIG_VIRTIO_CONSOLE=y' \
                    'CONFIG_VIRTIO_BLK=y' \
                    'CONFIG_MISC_FILESYSTEMS=y' \
                    'CONFIG_EROFS_FS=y' \
@@ -719,6 +721,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_BLOCK=y' .config || { echo 'BLOCK off - no block layer for the virtio-blk erofs disk' >&2; exit 1; }; \
                  grep -q '^CONFIG_PCI=y' .config || { echo 'PCI off - virtio-blk-pci (the -M pc transport) needs the PCI bus' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_PCI=y' .config || { echo 'VIRTIO_PCI off - no virtio transport on the -M pc PCI bus' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VIRTIO_CONSOLE=y' .config || { echo 'VIRTIO_CONSOLE off - no td VM bridge' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_BLK=y' .config || { echo 'VIRTIO_BLK off - the erofs disk (/dev/vda) would not appear' >&2; exit 1; }; \
                  grep -q '^CONFIG_EROFS_FS=y' .config || { echo 'EROFS_FS off - the read-only erofs root could not be mounted' >&2; exit 1; }; \
                  if grep -q '^CONFIG_OVERLAY_FS=y' .config; then echo 'OVERLAY_FS on - /etc is immutable and writable state uses direct mounts; no overlay user remains' >&2; exit 1; fi; \

@@ -4401,7 +4401,7 @@ mod tests {
         // The conservative textual edge widens checks even without a read.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd"]
+            ["td-authd", "td-editor", "td-jail", "td-portal", "td-review", "td-seatd"]
         );
         assert_eq!(readers_of("td-authd"), ["td-compositor"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
@@ -4442,6 +4442,7 @@ mod tests {
                 "td-editor",
                 "td-jail",
                 "td-portal",
+                "td-review",
                 "td-seatd"
             ]))
         );
@@ -6502,10 +6503,11 @@ mod tests {
                 "td-editor",
                 "td-jail",
                 "td-portal",
+                "td-review",
                 "td-seatd"
             ]
         );
-        assert_eq!(comp.len(), 14, "{comp:?}");
+        assert_eq!(comp.len(), 16, "{comp:?}");
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
             [

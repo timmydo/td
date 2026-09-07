@@ -60,9 +60,9 @@ listing does not create manager state or take catalog locks.
 
 This increment boots the stock desktop and reports workspace integration as
 pending. Guest provisioning/unique guest identities, orderly host power
-operations, a guest bridge, private writable development stores, automatic
-Git setup, copy/paste across the VM boundary, shared download configuration,
-and account linking are not implemented. Stop from the guest; host
+operations, private writable development stores, automatic
+Git setup, and account linking are not implemented. The td-owned clipboard
+and feed bridge described below requires a matching updated system image. Stop from the guest; host
 `stop NAME --force` explicitly cuts power. Disk deletion requires `--yes` or
 typing the instance name in the TUI and reports unsubmitted work as unknown.
 The table currently reports allocated overlay space; virtual capacity,
@@ -231,8 +231,7 @@ Make ordinary text copy/paste work in both directions between the host desktop
 and td-term in the selected QEMU window. Treat this as a first-class development
 capability. The compositor has a focus-scoped Wayland clipboard; td-term
 supports selection copy and bounded UTF-8 paste using Control+Shift+C/V,
-including application-requested bracketed paste. The host/guest transport
-remains to be implemented.
+including application-requested bracketed paste. The td-owned host/guest transport uses the private VM bridge below.
 
 Use the existing compositor clipboard and terminal PTY input paths. Preserve
 UTF-8, multiline text, selection ownership, and bracketed paste when the child
@@ -241,16 +240,52 @@ Do not simulate characters with QMP keycodes or turn terminal escape sequences
 into an implicit host clipboard-write interface. Initial support is text;
 file drag/drop is a separate capability.
 
-The transport increment must select and test a concrete QEMU/guest clipboard
-interface with the supported display backend. QEMU has a clipboard subsystem,
-but a graphical window alone does not connect td's clipboard to it; see
-[QEMU UI interfaces](https://www.qemu.org/docs/master/devel/ui.html).
-Keep the clipboard channel separate from credential delivery. A background VM
-must not receive every host clipboard update or overwrite the host selection:
-pin selection/focus authority, explicit copy/paste actions, bounded payloads,
-transfer deadlines, cancellation, and loop suppression in the compositor
-contract when implementing the bridge. An ordinary background Wayland client
-cannot bypass the existing focus policy to perform this integration.
+The compositor owns the guest protocol; QEMU only carries bytes on the standard
+virtio-serial device. No QEMU guest agent, SPICE/vdagent protocol, QEMU clipboard
+extension, or QEMU patch participates. Explicit actions in the host manager
+select one instance. QEMU-window focus and clipboard shortcuts are not exposed
+by this transport and are not claimed by this increment.
+
+In the TUI, `v` opens a bracketed-paste prompt in the host terminal. Paste with
+the host terminal's ordinary Paste action, then confirm the byte count and
+instance. This replaces the guest selection; focus td-term and press
+Control+Shift+V to insert it. No Enter is added. `c` fetches the selected guest's
+text selection and makes one explicit OSC 52 write request to the host terminal.
+That terminal must support and allow OSC 52 writes; the manager reports a
+request, not confirmed host clipboard ownership. There is no OSC clipboard
+query, watch, background synchronization, or terminal escape path originating
+in a guest application. Unsupported terminals can use the byte-oriented CLI:
+
+```text
+td-vm clipboard put worker-a < text.txt
+td-vm clipboard get worker-a > text.txt
+td-vm sharing worker-a off
+td-vm sharing worker-a on
+```
+
+The paste prompt has a two-minute deadline. Within that deadline, an oversized
+or invalid framed paste is consumed through its end marker before returning to
+the menu. Ctrl+C cancels while waiting for a frame; inside a frame it is invalid
+text, so it cannot expose the remaining framed paste as menu keystrokes.
+These framing guarantees require bracketed-paste support; unsupported
+terminals use the stdin/stdout CLI.
+
+An empty import is refused and preserves the guest selection. The source text
+is UTF-8, at most 64 KiB, and permits only TAB, CR and LF among
+control characters. Export refuses an empty result: an abandoned source endpoint
+must not silently clear the host clipboard. Neither diagnostics nor metadata records retain clipboard
+contents. Explicit sharing defaults on; `off` refuses later transfers and does
+not erase selections already delivered. Lifecycle and user bridge operations
+share the per-instance operation lock. No clipboard transfer retries itself
+after failure: a lost acknowledgement can mean a completed action.
+
+The guest binds a transfer to a single-use five-second snapshot of its current
+ordinary keyboard focus, keyboard state and selection. A change invalidates the
+snapshot, even if focus moves away and back. Secure attention and an unfocused
+seat refuse clipboard snapshots. Applications still use the existing focused
+Wayland data-device route; the host bridge is not an ordinary Wayland client
+and adds no public client protocol. There are no unsolicited guest clipboard
+messages or cross-instance relays, so there is no synchronization loop.
 
 Test host-to-guest and guest-to-host text in the real desktop, including Unicode,
 multiline paste, application-requested bracketed paste, switching between two
@@ -273,6 +308,19 @@ not copy a host `127.0.0.1` URL unchanged into a guest. Keep the listener local
 to the development host; no maintainer-operated cache or public server is
 required. Feed endpoint discovery/restart is host profile state, not a baked-in
 port in each image.
+
+Run `td-feed ensure-serve` on the host to obtain its loopback port, then
+`td-vm feed NAME PORT` (or `f` in the TUI). The manager records only
+`http://10.0.2.2:PORT` and replays this idempotent configuration when the bridge
+becomes available, including after a reboot in the same QEMU process. If the
+guest does not acknowledge, the command reports the reason and returns failure;
+the desired configuration remains saved for a later supervisor retry.
+`td-vm feed NAME off` clears it. The compositor publishes the endpoint as
+ordinary non-secret data in its volatile `/run/td-compositor/1000/vm-feed`.
+`td-feed consume sources` uses that compositor-owned regular file when
+`TD_FEED_BASE` is unset. An explicit environment value wins. This avoids
+changing login environments or requiring a new terminal after configuration.
+Other acquisition paths do not implicitly adopt this endpoint yet.
 
 The source archive consumer is `TD_FEED_BASE=http://HOST:PORT td-feed consume
 sources`. It resolves the checkout's recipe source pins, reads verified host
@@ -303,8 +351,8 @@ case where a warm private host cache had never populated its HTTP feed.
 
 `warm sources` remains the host producer operation and may fetch upstream,
 including when `TD_FEED_BASE` is set. The consumer command currently covers
-recipe source archives only; VM endpoint provisioning and the remaining
-fixed-output acquisition paths still need integration. These include locked
+recipe source archives only; the remaining fixed-output acquisition paths
+still need integration. These include locked
 Cargo registry sources,
 reviewed Git-source archives, and other declared transfer objects that the
 existing warm paths need. Unsupported paths remain visible coverage gaps.
@@ -413,20 +461,70 @@ still be necessary for a managed credential; no per-image repetition is planned.
 
 ## The host/guest bridge
 
-Use a dedicated virtio-serial port per VM connected to its supervisor through
-a private Unix socket. QMP is a separate host-only control socket. The bridge
-handles provisioning, agent credentials, status, and power operations. Git uses
-ordinary outbound SSH to the host; neither an SSH daemon in the guest nor a
-host-to-guest port-forward is required. Interactive sessions use the QEMU
-window, with no shared writable filesystem or tmux.
+The initial bridge uses one named virtio-serial port, `org.td.vm.1`. QEMU
+connects it to a private Unix socket inside the instance directory. A separate
+supervisor control socket accepts local manager actions and serializes access
+to that carrier. The carrier and QMP are separate sockets. Only the supervisor
+speaks to the guest; restarting the TUI reconnects to the supervisor.
+
+The standard image kernel builds `CONFIG_VIRTIO_CONSOLE=y`. At boot td-seatd
+finds the exact port name through kernel sysfs, refuses duplicate names, and
+assigns only that character device to compositor UID/GID with mode 0600. Its
+private `vm-port` record tells the compositor which device it assigned. The
+compositor opens that device using safe std nonblocking file I/O and starts a
+bounded worker. Missing or invalid bridge devices do not prevent compositor
+startup. Seat assignment removes a stale record when the named port is absent;
+a changed assignment is refused before ownership of a replacement is granted.
+Stock boots without this named device have no bridge. Hot
+unplug does not authorize opening another device. A new bridge-capable bundle
+comes from the existing `build-qcow` producer and can be imported once and
+reused for every new instance; an older template still boots its desktop but
+cannot acquire the new capabilities without an image update.
+
+The implemented vocabulary is `snapshot`, `put`, `get`, `feed`, `ok`, `error`.
+Each newline-terminated frame contains exactly six space-delimited fields:
+`TDVM1 ID VERB REVISION LENGTH HEX_PAYLOAD`. Numbers are canonical unsigned decimal
+u64, IDs are nonzero random host request identifiers, and payload hex is
+lowercase with exactly LENGTH decoded bytes. Decoded payloads are at most 65,536 bytes; whole frames are at most
+131,200 bytes. Empty payloads retain their final separating space. Unknown
+versions, verbs, invalid numbers, odd/non-hex payloads, overflow and truncation
+are refused. An expired or oversized partial frame is discarded through its
+next newline. New carrier connections start with an empty delimiter to separate abandoned
+bytes from new frames. Declared lengths reject truncated payloads. A complete
+request whose final delimiter or acknowledgement was lost can still have
+taken effect; the host never reports a timeout as proof of non-execution.
+
+The host has one outstanding conversation per instance and an absolute
+seven-second I/O deadline, covering the guest's five-second source deadline
+plus relay time; a manager allows two more seconds for local queueing. Replies
+echo the request ID. Clipboard operations first take a
+snapshot and then consume it with the same ID and returned revision; the guest
+checks it before mutation or source access and after a source read. A source
+read retains at most 64 KiB and never holds the runtime lock during I/O. A
+compositor-owned selection uses one writer with two queued endpoints and the
+existing five-second clipboard write bound. Client selection replacements use
+the ordinary cancellation and focused-offer paths. Transport errors are not
+permission to replay clipboard actions; configuration retries are idempotent.
+Idle loops back off to 100 ms. Saved feed configuration is replayed every two
+seconds with a 500 ms budget, including an explicit `off`, so it survives a
+guest reboot inside the same QEMU process. An unchanged guest file is not
+rewritten. The initial protocol has no asynchronous guest-reboot notification.
+The host does not accept unsolicited guest requests, paths, commands or URLs.
+
+The bridge currently handles clipboard and feed configuration directly in the
+compositor. Future provisioning, credentials, status and power operations need
+separate fixed-purpose guest endpoints and their own reviewed authority; the
+current worker does not implement them. Git uses ordinary outbound SSH to the
+host; neither an SSH daemon in the guest nor a host-to-guest port-forward is
+required. Interactive sessions use the QEMU window, with no shared writable
+filesystem or tmux.
 
 The host binds identity to the socket/QEMU pair it launched, not to an instance
 name supplied by the guest. A versioned, bounded protocol carries fixed requests
 for provisioning/status, selected settings generations, selected provider
 credentials, Git public-key enrollment/branch reservations, and power operations.
-Git objects and pack-protocol streams never travel over this bridge. The
-protocol increment must specify framing, lengths, deadlines, backpressure,
-generation checks, and reconnect behavior before exposing a parser.
+Git objects and pack-protocol streams never travel over this bridge. Extensions must specify their own framing, lengths, deadlines, backpressure,
+generation checks, and reconnect behavior before exposing new requests.
 
 On the guest, a fixed-purpose td-owned service provisions files and publishes
 user/application-scoped endpoints. Credentials reach the intended CLI through

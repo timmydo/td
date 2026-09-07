@@ -2548,8 +2548,8 @@ fn export_source_pins(pins: &[SourcePin], sources: &Path, store: &Path) -> Resul
     }
 }
 
-/// Explicit consumers never populate a producer store or fall back upstream.
-fn consume_source_pins(pins: &[SourcePin], dest: &Path, base: &str) -> Result<(), String> {
+/// Validate the endpoint shared by every source-pin request.
+fn consumer_feed_base(base: &str) -> Result<&str, String> {
     let base = base.trim_end_matches('/');
     let authority = base
         .strip_prefix("http://")
@@ -2566,6 +2566,12 @@ fn consume_source_pins(pins: &[SourcePin], dest: &Path, base: &str) -> Result<()
             "TD_FEED_BASE must name one server without a path, query or credentials".into(),
         );
     }
+    Ok(base)
+}
+
+/// Explicit consumers never populate a producer store or fall back upstream.
+fn consume_source_pins(pins: &[SourcePin], dest: &Path, base: &str) -> Result<(), String> {
+    let base = consumer_feed_base(base)?;
     if pins.is_empty() {
         return Err("no recipe source pins to consume".into());
     }
@@ -2604,8 +2610,45 @@ fn consume_source_pins(pins: &[SourcePin], dest: &Path, base: &str) -> Result<()
     }
 }
 
+fn vm_feed_base(path: &Path, owner: u32) -> Result<String, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // Refuse a final symlink and avoid blocking on a substituted special file.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000 | 0x800)
+        .open(path)
+        .map_err(|e| format!("requires TD_FEED_BASE or a provisioned VM feed endpoint: {e}"))?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
+        return Err("VM feed endpoint is not a compositor-owned regular file".into());
+    }
+    let mut base = String::new();
+    file.take(129)
+        .read_to_string(&mut base)
+        .map_err(|e| e.to_string())?;
+    if base.len() > 128 {
+        return Err("VM feed endpoint exceeds limit".into());
+    }
+    let port = base
+        .strip_prefix("http://10.0.2.2:")
+        .and_then(|text| {
+            text.parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0 && port.to_string() == text)
+        })
+        .ok_or("VM feed endpoint must be canonical http://10.0.2.2:PORT")?;
+    Ok(format!("http://10.0.2.2:{port}"))
+}
+
 fn consume_sources(root: &Path) -> Result<(), String> {
-    let base = std::env::var("TD_FEED_BASE").map_err(|_| "requires TD_FEED_BASE".to_string())?;
+    let base = match std::env::var("TD_FEED_BASE") {
+        Ok(base) => base,
+        Err(std::env::VarError::NotPresent) => vm_feed_base(
+            &Path::new(td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH).join("vm-feed"),
+            td_engine::permissions::TD_COMPOSITOR_UID,
+        )?,
+        Err(_) => return Err("TD_FEED_BASE is not UTF-8".into()),
+    };
     let pins = recipe_source_pins_result(root)?;
     consume_source_pins(&pins, &sources_dir(), &base)?;
     warm_kernel_headers_from_pins("i386", &pins);
@@ -3480,7 +3523,7 @@ pub fn run(a: &[String]) {
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed serve STORE ADDR\n  \
-                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (requires TD_FEED_BASE; no upstream fallback)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);
@@ -3794,6 +3837,46 @@ mod tests {
 
         assert_eq!(std::fs::read(&out).unwrap(), b"published bytes");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn vm_feed_file_checks_the_opened_object_owner_mode_and_bound() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = unique_tmp_dir("vm-feed-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feed");
+        let uid = std::fs::metadata(&dir).unwrap().uid();
+        assert!(super::vm_feed_base(&path, uid).is_err());
+        std::fs::write(&path, b"http://10.0.2.2:1234").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            super::vm_feed_base(&path, uid).unwrap(),
+            "http://10.0.2.2:1234"
+        );
+        assert!(super::vm_feed_base(&path, uid.wrapping_add(1)).is_err());
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(super::vm_feed_base(&link, uid).is_err());
+        assert!(super::vm_feed_base(&dir, uid).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(super::vm_feed_base(&path, uid).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for data in [vec![b'a'; 129], b"not a URL".to_vec(), vec![0xff]] {
+            std::fs::write(&path, data).unwrap();
+            assert!(super::vm_feed_base(&path, uid).is_err());
+        }
+        for base in [
+            "http://other:1234",
+            "https://10.0.2.2:1234",
+            "http://10.0.2.2:0",
+            "http://10.0.2.2:0123",
+            "http://10.0.2.2:65536",
+            "http://10.0.2.2:1234/",
+        ] {
+            std::fs::write(&path, base).unwrap();
+            assert!(super::vm_feed_base(&path, uid).is_err(), "{base}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

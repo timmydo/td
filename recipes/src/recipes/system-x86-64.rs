@@ -4298,6 +4298,11 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-net}/bin/td-net".into(),
         link: "{root}/real-root/bin/td-fetchd".into(),
     });
+    // The explicit source-cache consumer shares the already shipped multicall.
+    steps.push(Step::Symlink {
+        target: "{in:td-net}/bin/td-net".into(),
+        link: "{root}/real-root/bin/td-feed".into(),
+    });
     steps.push(Step::Symlink {
         target: "{in:td-portal}/bin/td-portal".into(),
         link: "{root}/real-root/bin/td-portal".into(),
@@ -4604,6 +4609,7 @@ fn shape_check() -> String {
      [ \"$(readlink \"$root/bin/td-busd\" 2>/dev/null)\" = \"{in:td-busd}/bin/td-busd\" ] || { echo 'root tree: /bin/td-busd is not a symlink to the staged session bus broker - the busd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
      tdbusd=\"{root}/real-root{in:td-busd}/bin/td-busd\"; { [ -f \"$tdbusd\" ] && [ -x \"$tdbusd\" ]; } || { echo 'root tree: td-busd is not packed/executable at real-root{in:td-busd}/bin/td-busd - the /bin/td-busd symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-fetchd\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-fetchd is not a symlink to the staged td-net multicall - the fetchd unit names it in full, so this is the only thing standing between that unit and exec-ing nothing' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-feed\" 2>/dev/null)\" = \"{in:td-net}/bin/td-net\" ] || { echo 'root tree: /bin/td-feed must select the shipped source consumer' >&2; exit 1; }; \
      tdfetchd=\"{root}/real-root{in:td-net}/bin/td-net\"; { [ -f \"$tdfetchd\" ] && [ -x \"$tdfetchd\" ]; } || { echo 'root tree: td-net is not packed/executable at real-root{in:td-net}/bin/td-net - the /bin/td-fetchd symlink would dangle and the fetchd unit would exec nothing' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
      tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
@@ -6595,6 +6601,10 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         assert!(session.contains(&format!("pub(crate) const HUMAN_UID: u32 = {UI_UID};")));
         let server = include_str!("../../../td-compositor/src/server.rs");
         assert!(server.contains(&format!("const PORTAL_UID: u32 = {UI_UID};")));
+        assert!(include_str!("../../../td-compositor/src/vm_wire.rs")
+            .contains(&format!("\"/run/td-compositor/{UI_UID}/vm-feed\"")));
+        assert!(include_str!("../../../td-compositor/src/vm_bridge.rs")
+            .contains(&format!("\"/run/td-compositor/{UI_UID}/vm-port\"")));
         let seat = include_str!("../../../td-seatd/src/main.rs");
         assert!(seat.contains(r#"const COMPOSITOR_RUNTIME_NAME: &str = "td-compositor";"#));
         assert!(seat.contains("Ok(run.join(COMPOSITOR_RUNTIME_NAME).join(owner))"));
@@ -12644,6 +12654,11 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     #[test]
     fn td_net_is_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
+        assert!(steps.iter().any(|step| matches!(step,
+            Step::Symlink { target, link }
+                if target == "{in:td-net}/bin/td-net"
+                    && link == "{root}/real-root/bin/td-feed"
+        )), "the VM source consumer must be available as /bin/td-feed");
         assert!(
             steps.iter().any(|s| matches!(
                 s,

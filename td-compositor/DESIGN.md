@@ -1262,8 +1262,9 @@ errors the core protocol assigns them. Core assigns no used-state error to
 `offer`, so a bounded late offer is accepted and ignored rather than retained
 where no already-announced target could learn it.
 
-The runtime holds one selection for the logical seat. Only the client that
-currently owns keyboard focus may replace or clear it. The request's serial is
+The runtime holds one selection for the logical seat. Only the Wayland client that
+currently owns keyboard focus may replace or clear it through the public
+data-device interface. The explicit VM bridge authority below is separate. The request's serial is
 read but is not checked against an input-event ledger, because td does not keep
 one; current keyboard ownership is the narrower authority it can enforce. A
 background request is ignored after consuming the source, as a compositor may
@@ -3921,9 +3922,11 @@ The source-pinned consumers are the server SHM pool, client keymap and shipped
 descriptor selftest paths. Each removes the number from its raw disposal queue
 before adoption; all file reads are positional so their shared offset stays
 unchanged.
-Server clipboard endpoints remain in the opaque `TransferEndpoint` raw owner;
-its drop reaches the rostered close wrapper. The client clipboard source has
-its separately pinned adoption/conversion path. PTY slave acquisition retains
+Server clipboard endpoints use the opaque `TransferEndpoint` File owner.
+The server consumes its received descriptor through the existing exact
+`ReceivedFd::into_file` conversion; a VM export may instead supply a native
+owned Unix socket endpoint. Ordinary forwarding preserves the exact open-file
+description. The client clipboard source retains its own pinned conversion. PTY slave acquisition retains
 its existing reopen-and-close helper and does not receive cross-UID files.
 
 Confinement tests pin each wrapper family to its callers across every module:
@@ -6310,3 +6313,53 @@ applications. Unplugging the device drains its bookkeeping. The current
 fixed device roster requires compositor restart to add a replacement.
 Direct-profile readers retain their per-device partial-report fast path;
 they never claim secure attention or use the trusted timestamp cutoff.
+
+
+## td-owned development VM bridge
+
+[td-vm's host/guest bridge](../td-review/VM.md#the-hostguest-bridge) owns the
+wire vocabulary, framing and bounds. QEMU supplies only a standard virtio-serial
+byte carrier. Seat startup retries discovery for at most two seconds because
+the kernel publishes the port name asynchronously. td-seatd delegates the exact `org.td.vm.1` device, discovered in
+kernel-owned sysfs, to the compositor account and records its `/dev/vportNpM`
+path in a private compositor runtime file. The human and confined applications
+cannot open it. The existing device-access proof includes this device when
+present. The compositor opens the record and device without following final symlinks
+or blocking, then validates each opened object's type, ownership and mode; no public Wayland object or
+control-socket command acquires this authority. Ordinary boots without an
+assignment do not start a bridge worker. An invalid or unavailable optional
+bridge is reported without preventing desktop startup. Seat discovery and
+assignment failures clear the optional record before admitting the desktop;
+failure to clear that authority remains fatal. The human access probe reports
+optional discovery failures separately and still checks every discovered,
+present device for denied access. Seat assignment clears the record when the named port is absent and refuses a changed assignment
+before granting ownership of a replacement device.
+
+A host action first obtains a five-second, single-use snapshot. Every keyboard
+event publication or selection revision advances the VM revision, so changing
+focus away and back cannot revive an old action. Clipboard snapshots require
+ordinary keyboard focus and refuse the secure-attention screen. Import refuses empty text and checks
+that revision before replacing the seat selection and notifying the focused
+client. Client ID zero is reserved for this compositor-owned source; ordinary
+clients start at one. Normal source cancellation and client replacement release
+retained host text. No clipboard payload is logged.
+
+Export asks the current selection source through the existing bounded
+`wl_data_source.send` queue and an owned Unix socket endpoint. A single bridge
+worker reads at most 64 KiB with the snapshot deadline and checks the revision
+while waiting and immediately before returning text. Empty exports are refused
+because source closure without data cannot prove a deliberate empty selection.
+No runtime lock spans
+endpoint I/O. Import sources share one writer thread, two queued transfers and
+the existing five-second `conn::write_clipboard` bound. Queue exhaustion closes
+the refused destination. This uses existing File ownership and syscall
+surfaces, with no new unsafe code. UTF-8 and control-character checks match the
+host boundary; the native terminal retains its normal bracketed-paste behavior.
+
+The same worker publishes a validated, non-secret host-feed URL into the
+compositor-owned volatile `vm-feed` file for `td-feed consume sources`.
+Configuration does not alter login environments or grant host-command access.
+The initial vocabulary has no credential or provisioning operation. A guest
+cannot write the host clipboard without an explicit manager Copy action.
+Host QEMU-window focus is outside this protocol; the initial UI uses explicit
+host-terminal actions rather than automatic desktop clipboard synchronization.

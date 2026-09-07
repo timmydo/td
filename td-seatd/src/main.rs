@@ -7,6 +7,7 @@ use std::os::unix::fs::{self as unix_fs, FileTypeExt, MetadataExt, PermissionsEx
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+use std::time::{Duration, Instant};
 
 const FRAMEBUFFER: &str = "/dev/fb0";
 const INPUT_DIR: &str = "/dev/input";
@@ -183,6 +184,132 @@ fn input_paths(input_dir: &Path) -> Result<Vec<PathBuf>, String> {
         ));
     }
     Ok(paths)
+}
+
+/// Only the named td channel is delegated; other virtio ports stay private
+/// to their original owner. Sysfs is kernel-owned, /dev is root-owned.
+fn vm_port(sys: &Path, dev: &Path) -> Result<Option<PathBuf>, String> {
+    let entries = match fs::read_dir(sys) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("inspect VM ports: {e}")),
+    };
+    let mut found = None;
+    for (index, entry) in entries.enumerate() {
+        if index >= 64 {
+            return Err("too many virtio ports".into());
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name
+            .strip_prefix("vport")
+            .and_then(|s| s.split_once('p'))
+            .is_some_and(|(a, b)| decimal_component(a) && decimal_component(b))
+        {
+            continue;
+        }
+        let mut value = String::new();
+        let file = match File::open(entry.path().join("name")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("read virtio port name: {e}")),
+        };
+        file.take(129)
+            .read_to_string(&mut value)
+            .map_err(|e| e.to_string())?;
+        if value == "org.td.vm.1\n" {
+            if found.is_some() {
+                return Err("duplicate td VM bridge ports".into());
+            }
+            found = Some(dev.join(name));
+        }
+    }
+    Ok(found)
+}
+
+fn wait_vm_port(sys: &Path, dev: &Path, timeout: Duration) -> Result<Option<PathBuf>, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let found = vm_port(sys, dev)?;
+        if found.is_some() || Instant::now() >= deadline {
+            return Ok(found);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assign_vm_port(runtime: &Path, account: Account) -> Result<(), String> {
+    // The kernel receives a port's name after probing its device.
+    let result = wait_vm_port(
+        Path::new("/sys/class/virtio-ports"),
+        Path::new("/dev"),
+        Duration::from_secs(2),
+    )
+    .and_then(|path| assign_vm_port_path(runtime, account, path.as_deref(), true));
+    optional_vm_assignment(runtime, account, result)
+}
+
+fn optional_vm_assignment(
+    runtime: &Path,
+    account: Account,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    if let Err(error) = result {
+        // Disable the optional channel before admitting the ordinary desktop.
+        assign_vm_port_path(runtime, account, None, true)?;
+        eprintln!("td-seatd: optional VM bridge unavailable: {error}");
+    }
+    Ok(())
+}
+
+fn assign_vm_port_path(
+    runtime: &Path,
+    account: Account,
+    path: Option<&Path>,
+    require_char: bool,
+) -> Result<(), String> {
+    let record = runtime.join("vm-port");
+    let Some(path) = path else {
+        return match fs::remove_file(&record) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("clear VM port assignment: {e}")),
+        };
+    };
+    let existing = match fs::symlink_metadata(&record) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("inspect VM port assignment: {e}")),
+    };
+    if existing {
+        checked_metadata(&record, false)?;
+        verify_owner_mode(&record, account, 0o600)?;
+        let mut current = Vec::new();
+        File::open(&record)
+            .map_err(|e| e.to_string())?
+            .take(129)
+            .read_to_end(&mut current)
+            .map_err(|e| e.to_string())?;
+        if current == path.as_os_str().as_encoded_bytes() {
+            return assign_path(path, account, require_char);
+        }
+        return Err("VM port assignment changed; restart the deployment".into());
+    }
+    assign_path(path, account, require_char)?;
+    let mut options = fs::OpenOptions::new();
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = options
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&record)
+        .map_err(|e| format!("publish VM port assignment: {e}"))?;
+    file.write_all(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| e.to_string())?;
+    assign_path(&record, account, false)
 }
 
 fn decimal_component(value: &str) -> bool {
@@ -513,6 +640,14 @@ fn probe_access(assignment: Assignment) -> Result<(), String> {
     for path in input_paths(Path::new(INPUT_DIR))? {
         denied_device_read(&path)?;
     }
+    match vm_port(Path::new("/sys/class/virtio-ports"), Path::new("/dev")) {
+        Ok(Some(path)) => match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            _ => denied_device_read(&path)?,
+        },
+        Ok(None) => (),
+        Err(error) => eprintln!("td-seatd: optional VM bridge privacy probe unavailable: {error}"),
+    }
     writeln!(std::io::stdout().lock(), "\n{PRIVATE_DEVICES_MARKER}").map_err(|e| e.to_string())
 }
 
@@ -604,6 +739,9 @@ fn run(args: &[String]) -> Result<(), String> {
         )?,
         _ => return Err(usage()),
     };
+    if command == "assign" {
+        assign_vm_port(&compositor_runtime(&runtime)?, assignment.compositor)?;
+    }
     println!(
         "{READY_MARKER} uid={} gid={} framebuffer={} inputs={} runtime={} \
          compositor-uid={} compositor-gid={} compositor-runtime={} \
@@ -893,6 +1031,100 @@ mod tests {
             invalid.push(program.into());
             assert!(parse_audio_exec(&invalid).is_err(), "{program}");
         }
+    }
+
+    #[test]
+    fn vm_port_scan_selects_only_the_td_name_and_refuses_duplicates() {
+        let scratch = Scratch::new();
+        let sys = scratch.path.join("ports");
+        assert!(vm_port(&sys, Path::new("/dev")).unwrap().is_none());
+        fs::create_dir_all(sys.join("vport0p1")).unwrap();
+        fs::create_dir_all(sys.join("vport0p2")).unwrap();
+        fs::write(sys.join("vport0p1/name"), b"com.other.port\n").unwrap();
+        fs::write(sys.join("vport0p2/name"), b"org.td.vm.1\n").unwrap();
+        assert_eq!(
+            vm_port(&sys, Path::new("/dev")).unwrap(),
+            Some(PathBuf::from("/dev/vport0p2"))
+        );
+        fs::write(sys.join("vport0p1/name"), b"org.td.vm.1\n").unwrap();
+        assert!(vm_port(&sys, Path::new("/dev"))
+            .unwrap_err()
+            .contains("duplicate"));
+        assert!(include_str!("../../td-compositor/src/vm_wire.rs").contains("\"org.td.vm.1\""));
+    }
+
+    #[test]
+    fn vm_port_wait_observes_a_late_name_and_bounds_absence() {
+        let scratch = Scratch::new();
+        let sys = scratch.path.join("sys");
+        fs::create_dir_all(sys.join("vport0p1")).unwrap();
+        let name = sys.join("vport0p1/name");
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            fs::write(name, b"org.td.vm.1\n").unwrap();
+        });
+        assert_eq!(
+            wait_vm_port(&sys, Path::new("/dev"), Duration::from_secs(2)).unwrap(),
+            Some(PathBuf::from("/dev/vport0p1"))
+        );
+        publisher.join().unwrap();
+        fs::remove_file(sys.join("vport0p1/name")).unwrap();
+        assert_eq!(
+            wait_vm_port(&sys, Path::new("/dev"), Duration::ZERO).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn vm_port_assignment_clears_absence_and_refuses_renumber_before_mutation() {
+        let scratch = Scratch::new();
+        let meta = fs::metadata(&scratch.path).unwrap();
+        let account = Account { uid: meta.uid(), gid: meta.gid() };
+        let old = scratch.path.join("vport0p1");
+        let new = scratch.path.join("vport0p2");
+        fs::write(&old, b"").unwrap();
+        fs::write(&new, b"").unwrap();
+        fs::set_permissions(&new, Permissions::from_mode(0o644)).unwrap();
+        assign_vm_port_path(&scratch.path, account, Some(&old), false).unwrap();
+        assign_vm_port_path(&scratch.path, account, Some(&old), false).unwrap();
+        assert_eq!(fs::metadata(&old).unwrap().mode() & 0o777, 0o600);
+        assert!(assign_vm_port_path(&scratch.path, account, Some(&new), false)
+            .unwrap_err().contains("assignment changed"));
+        assert_eq!(fs::metadata(&new).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(fs::read(scratch.path.join("vm-port")).unwrap(),
+            old.as_os_str().as_encoded_bytes());
+        fs::remove_file(&old).unwrap();
+        assign_vm_port_path(&scratch.path, account, None, false).unwrap();
+        assert!(!scratch.path.join("vm-port").exists());
+        assign_vm_port_path(&scratch.path, account, None, false).unwrap();
+        assign_vm_port_path(&scratch.path, account, Some(&new), false).unwrap();
+    }
+
+    #[test]
+    fn optional_vm_failure_clears_authority_but_cleanup_failure_refuses() {
+        let scratch = Scratch::new();
+        let meta = fs::metadata(&scratch.path).unwrap();
+        let account = Account { uid: meta.uid(), gid: meta.gid() };
+        let record = scratch.path.join("vm-port");
+        fs::write(&record, b"stale").unwrap();
+        optional_vm_assignment(&scratch.path, account, Err("duplicate ports".into())).unwrap();
+        assert!(!record.exists());
+        fs::create_dir(&record).unwrap();
+        assert!(optional_vm_assignment(&scratch.path, account, Err("scan failed".into())).is_err());
+    }
+
+    #[test]
+    fn vm_port_lookup_errors_refuse_before_delegation() {
+        let scratch = Scratch::new();
+        let meta = fs::metadata(&scratch.path).unwrap();
+        let account = Account { uid: meta.uid(), gid: meta.gid() };
+        let runtime = scratch.path.join("not-a-directory");
+        let device = scratch.path.join("vport0p1");
+        fs::write(&runtime, b"").unwrap();
+        fs::write(&device, b"").unwrap();
+        fs::set_permissions(&device, Permissions::from_mode(0o644)).unwrap();
+        assert!(assign_vm_port_path(&runtime, account, Some(&device), false).is_err());
+        assert_eq!(fs::metadata(&device).unwrap().mode() & 0o777, 0o644);
     }
 
     #[test]

@@ -1521,11 +1521,14 @@ fn data_source_is_live(data: &DataObjects, source: DataSourceIdentity) -> bool {
 /// An exact, owned selection endpoint whose raw descriptor stays confined to
 /// the protocol server. The runtime may route this opaque capability between
 /// clients, but only this module can attach it to a Wayland event.
-pub(crate) struct TransferEndpoint(sys::ReceivedFd);
+pub(crate) struct TransferEndpoint(std::fs::File);
 
 impl TransferEndpoint {
+    pub(crate) fn from_file(file: std::fs::File) -> Self { Self(file) }
+    pub(crate) fn into_file(self) -> std::fs::File { self.0 }
+
     fn adopt(fd: RawFd) -> Result<TransferEndpoint, String> {
-        sys::ReceivedFd::adopt(fd).map(TransferEndpoint)
+        sys::ReceivedFd::adopt(fd).map(|fd| TransferEndpoint(sys::ReceivedFd::into_file(fd)))
     }
 }
 

@@ -21,6 +21,13 @@ mod term;
 #[path = "../../../engine/src/json.rs"]
 mod json;
 
+#[path = "../vm_bridge.rs"]
+mod vm_bridge;
+#[path = "../vm_clipboard.rs"]
+mod vm_clipboard;
+#[path = "../../../td-compositor/src/vm_wire.rs"]
+mod vm_wire;
+
 type Result<T> = std::result::Result<T, String>;
 const HELP: &str = "td-vm: manage persistent graphical td instances
 
@@ -35,11 +42,16 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm delete NAME --yes             delete a stopped instance and its work
   td-vm logs NAME
   td-vm prune                        remove interrupted import/create staging
+  td-vm clipboard put NAME            stdin text to guest selection
+  td-vm clipboard get NAME            guest selection to stdout
+  td-vm sharing NAME on|off           enable/disable explicit transfers
+  td-vm feed NAME PORT|off            provision host feed endpoint
+  td-vm bridge NAME                   query guest clipboard capability
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
-The existing desktop boots; workspace provisioning, clipboard, cache sharing,
-and login integration are subsequent milestones. Shut down from inside td;
+Clipboard and feed actions require a bridge-capable system image. Workspace
+provisioning and login integration remain pending. Shut down from inside td;
 only explicit force-stop is available until the guest power bridge lands.";
 
 fn main() -> ExitCode {
@@ -92,6 +104,32 @@ fn run(args: Vec<String>) -> Result<()> {
             Launch::parse(&["--accel", accel, "--display", display])?,
         ),
         ["stop", name, "--force"] => manager.stop(name),
+        ["clipboard", "put", name] => {
+            let mut bytes = Vec::new();
+            io(
+                std::io::stdin()
+                    .take((vm_wire::MAX_TEXT + 1) as u64)
+                    .read_to_end(&mut bytes),
+                "read clipboard input",
+            )?;
+            vm_wire::text(&bytes)?;
+            manager.bridge(name, vm_wire::PUT, bytes).map(|_| ())
+        }
+        ["clipboard", "get", name] => {
+            let bytes = manager.bridge(name, vm_wire::GET, Vec::new())?;
+            vm_wire::text(&bytes)?;
+            io(
+                std::io::stdout().write_all(&bytes),
+                "write clipboard output",
+            )
+        }
+        ["sharing", name, mode @ ("on" | "off")] => manager.sharing(name, mode),
+        ["feed", name, port] => manager.feed(name, port),
+        ["bridge", name] => {
+            let result = manager.bridge(name, vm_wire::SNAPSHOT, Vec::new())?;
+            println!("{}", term::scrub_lines(&String::from_utf8_lossy(&result)));
+            Ok(())
+        }
         ["delete", name, "--yes"] => manager.delete(name),
         ["logs", name] => {
             println!("{}", term::scrub_lines(&manager.logs(name)?));
@@ -361,7 +399,7 @@ impl Manager {
         let root = io(root.canonicalize(), "resolve VM state directory")?;
         path_text(&root)?;
         // Linux sockaddr_un has room for 107 pathname bytes plus its NUL.
-        if root.as_os_str().len() + "/instances/".len() + 32 + "/qmp".len() > 107 {
+        if root.as_os_str().len() + "/instances/".len() + 32 + "/bridge".len() > 107 {
             return Err("TD_VM_HOME is too long for QEMU Unix sockets; use a shorter path".into());
         }
         for part in ["templates", "instances", "locks"] {
@@ -396,6 +434,24 @@ impl Manager {
         let dir = self.root.join("instances").join(name(value)?);
         check_private_dir(&dir)?;
         Ok(dir)
+    }
+
+    fn bridge(&self, value: &str, verb: &str, data: Vec<u8>) -> Result<Vec<u8>> {
+        name(value)?;
+        let _lock = self.lock(&format!("instance-{value}"))?;
+        vm_bridge::ask(&self.instance(value)?, verb, data)
+    }
+
+    fn sharing(&self, value: &str, mode: &str) -> Result<()> {
+        name(value)?;
+        let _lock = self.lock(&format!("instance-{value}"))?;
+        vm_bridge::sharing(&self.instance(value)?, mode)
+    }
+
+    fn feed(&self, value: &str, port: &str) -> Result<()> {
+        name(value)?;
+        let _lock = self.lock(&format!("instance-{value}"))?;
+        vm_bridge::configure_feed(&self.instance(value)?, port)
     }
 
     fn template(&self, value: &str) -> Result<PathBuf> {
@@ -726,6 +782,7 @@ impl Manager {
         verify_template(&self.template(&config.template)?)?;
         disk_available(&dir)?;
         cleanup_runtime(&dir)?;
+        let _bridge = vm_bridge::Supervisor::start(&dir)?;
         // QEMU never reads stdin (serial goes to a file). Keeping the same
         // locked open-file description on fd 0 preserves exclusion even if
         // the supervisor dies before QEMU publishes its monitor or pidfile.
@@ -882,7 +939,7 @@ impl Config {
 }
 
 fn cleanup_runtime(dir: &Path) -> Result<()> {
-    for file in ["qmp", "pid", "accel"] {
+    for file in ["qmp", "pid", "accel", "guest", "bridge"] {
         match fs::remove_file(dir.join(file)) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -973,6 +1030,19 @@ fn qemu_command(dir: &Path, base: &Path, config: &Config, launch: Launch) -> Res
         .arg(dir.join("pid"))
         .arg("-qmp")
         .arg(format!("unix:{}/qmp,server=on,wait=off", path_text(dir)?))
+        .args(["-device", "virtio-serial-pci,id=tdbridge"])
+        .arg("-chardev")
+        .arg(format!(
+            "socket,id=tdbridge,path={}/guest,server=on,wait=off",
+            path_text(dir)?
+        ))
+        .args([
+            "-device",
+            &format!(
+                "virtserialport,bus=tdbridge.0,chardev=tdbridge,name={}",
+                vm_wire::PORT
+            ),
+        ])
         .arg("-serial")
         .arg(format!("file:{}/serial.log", path_text(dir)?))
         .arg("-kernel")
@@ -1183,9 +1253,10 @@ fn tui(manager: &Manager) -> Result<()> {
         selected = selected.min(rows.len().saturating_sub(1));
         let (height, width) = terminal.size();
         let mut frame = term::Frame::new(height, width);
-        frame.push_text("td-vm  Enter open · n new · i import · t templates · D delete · X cut power · l logs · r refresh · q quit", term::Style::bar(term::CYAN));
+        frame.push_text("td-vm  Enter open · n new · i import · t templates · D delete · X cut power", term::Style::bar(term::CYAN));
+        frame.push_text("l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text("NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB DISK MiB", term::Style::bold());
-        let page = height.saturating_sub(6).max(1);
+        let page = height.saturating_sub(7).max(1);
         let offset = selected.saturating_sub(page - 1);
         for (index, (_, row)) in rows.iter().enumerate().skip(offset).take(page) {
             let style = if index == selected {
@@ -1198,7 +1269,7 @@ fn tui(manager: &Manager) -> Result<()> {
         if rows.is_empty() {
             frame.push_text("No instances yet.", term::Style::dim());
         }
-        frame.push_text("Desktop lifecycle only. Workspace, clipboard, downloads and login integration pending.", term::Style::dim());
+        frame.push_text("Paste: v sends text, then Ctrl+Shift+V in td-term. Copy: c requests host copy.", term::Style::dim());
         frame.push_text(&status, term::Style::fg(term::YELLOW));
         terminal.draw(frame.finish()).map_err(|e| e.to_string())?;
         let keys = terminal.read_keys().map_err(|e| e.to_string())?;
@@ -1293,6 +1364,58 @@ fn tui(manager: &Manager) -> Result<()> {
                         })
                         .map_err(|e| e.to_string())?
                 }
+                term::Key::Char('v') if current.is_some() => {
+                    let name = current.ok_or("no instance selected")?;
+                    match vm_clipboard::capture(&mut terminal, name) {
+                        Ok(bytes) => {
+                            let Some(answer) = prompt(
+                                &mut terminal,
+                                &format!(
+                                    "Send {} bytes to {name}'s clipboard? Type yes",
+                                    bytes.len()
+                                ),
+                            )?
+                            else {
+                                break;
+                            };
+                            if answer != "yes" {
+                                status = "Cancelled".into();
+                                break;
+                            }
+                            manager.bridge(name, vm_wire::PUT, bytes).map(|_| ())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                term::Key::Char('c') if current.is_some() => {
+                    let name = current.ok_or("no instance selected")?;
+                    manager.bridge(name, vm_wire::GET, Vec::new())
+                        .and_then(|bytes| vm_clipboard::copy(&mut terminal, &bytes))
+                }
+                term::Key::Char('f') if current.is_some() => {
+                    let name = current.ok_or("no instance selected")?;
+                    let Some(port) = prompt(
+                        &mut terminal,
+                        "Host td-feed port (run td-feed ensure-serve on host); off disables",
+                    )?
+                    else {
+                        break;
+                    };
+                    terminal
+                        .suspend(|| manager.feed(name, &port))
+                        .map_err(|e| e.to_string())?
+                }
+                term::Key::Char('s') if current.is_some() => {
+                    let name = current.ok_or("no instance selected")?;
+                    let Some(mode) =
+                        prompt(&mut terminal, "Explicit clipboard transfers: on or off")?
+                    else {
+                        break;
+                    };
+                    terminal
+                        .suspend(|| manager.sharing(name, &mode))
+                        .map_err(|e| e.to_string())?
+                }
                 term::Key::Char('l') if current.is_some() => {
                     let name = current.ok_or("no instance selected")?;
                     let logs = manager.logs(name)?;
@@ -1314,6 +1437,8 @@ fn tui(manager: &Manager) -> Result<()> {
                 _ => continue,
             };
             status = match operation {
+                Ok(()) if key == term::Key::Char('c') =>
+                    "Copy requested through the host terminal (requires OSC 52 support).".into(),
                 Ok(()) => "Done".into(),
                 Err(e) => e,
             };
@@ -1597,8 +1722,11 @@ mod tests {
             let value = iter.next().unwrap();
             match flag.as_str() {
                 "-accel" | "-display" | "-smp" | "-name" | "-pidfile" | "-qmp" | "-serial"
-                | "-kernel" | "-initrd" | "-append" | "-drive" => {}
-                "-device" if value == "virtio-blk-pci,drive=disk0" => {}
+                | "-kernel" | "-initrd" | "-append" | "-drive" | "-chardev" => {}
+                "-device"
+                    if value == "virtio-blk-pci,drive=disk0"
+                        || value == "virtio-serial-pci,id=tdbridge"
+                        || value.starts_with("virtserialport,bus=tdbridge.0,") => {}
                 _ => {
                     result.push(flag.clone());
                     result.push(value.clone());
@@ -1665,6 +1793,17 @@ mod tests {
                 || v.contains("snapshot")
                 || v.contains("daemonize")));
             assert_eq!(managed_platform(&values), canonical_platform(&config()));
+            assert!(pair(
+                "-chardev",
+                "socket,id=tdbridge,path=/tmp/instance/guest,server=on,wait=off"
+            ));
+            assert!(pair(
+                "-device",
+                "virtserialport,bus=tdbridge.0,chardev=tdbridge,name=org.td.vm.1"
+            ));
+            assert!(!values
+                .iter()
+                .any(|value| value.contains("vdagent") || value.contains("spice")));
             let profile =
                 include_str!("../../../recipes/src/bin/td_recipe_eval/checks/vm_profile.rs");
             for (key, expected) in [

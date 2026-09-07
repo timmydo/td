@@ -549,9 +549,15 @@ compositor. The source-pinned consumers are `conn.rs` for keymaps,
 `server.rs` for SHM pools, and `client.rs` for the shipped descriptor selftest.
 Each removes the number from its raw disposal queue before adoption and uses
 positional reads, preserving shared offsets.
-Server-routed clipboard endpoints remain in their opaque `TransferEndpoint`
-owner, while the separately pinned client source consumes its endpoint through
-the same `into_file` conversion. No registry lock spans its eventual write.
+Server-routed clipboard endpoints retain an opaque `TransferEndpoint` File
+owner, consuming their received descriptor through the same pinned
+`ReceivedFd::into_file` conversion in `server.rs`. A VM export can supply a
+native owned Unix socket endpoint without raw adoption; an imported selection
+consumes its destination File in the existing bounded clipboard writer. The
+client source retains its separately pinned conversion. No registry or runtime
+lock spans endpoint I/O. The VM worker may call exactly the bounded
+`conn::write_clipboard` helper; its source pin refuses every other reach into
+that Wayland transport module. This changes no syscall or unsafe allowance.
 Deliberately
 NOT in that surface:
 framebuffer and evdev

@@ -36,6 +36,8 @@ mod term;
 mod term_client;
 mod terminfo;
 mod ui;
+mod vm_bridge;
+mod vm_wire;
 mod wire;
 
 use framebuffer::Framebuffer;
@@ -487,6 +489,9 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     // incumbent said.
     if let Some(path) = options.control_socket.as_deref() {
         control::serve(path, Arc::clone(&runtime), socket_policy)?;
+    }
+    if let Err(error) = vm_bridge::start(Arc::clone(&runtime)) {
+        eprintln!("td-compositor: VM bridge unavailable: {error}");
     }
     // Reported, never fatal: a compositor without a clock is worth more
     // than no compositor.
@@ -1235,6 +1240,8 @@ mod confinement {
         ("term_client.rs", include_str!("term_client.rs")),
         ("terminfo.rs", include_str!("terminfo.rs")),
         ("ui.rs", include_str!("ui.rs")),
+        ("vm_bridge.rs", include_str!("vm_bridge.rs")),
+        ("vm_wire.rs", include_str!("vm_wire.rs")),
         ("wire.rs", include_str!("wire.rs")),
     ];
     const TEST_ONLY: &[(&str, &str)] = &[
@@ -2352,9 +2359,15 @@ pub struct MappedRegion {
             if TRANSPORT_USERS.contains(&name) {
                 continue;
             }
+            let mut source = squeezed(source);
+            if name == "vm_bridge.rs" {
+                assert_eq!(source.matches("conn::write_clipboard(").count(), 1,
+                    "VM clipboard writes must have one bounded transport entry");
+                source = source.replace("conn::write_clipboard(", "");
+            }
             for form in [concat!("conn", "::"), concat!("conn", "as")] {
                 assert_eq!(
-                    squeezed(source).matches(form).count(),
+                    source.matches(form).count(),
                     0,
                     "{name} reached the Wayland transport ('{form}')"
                 );
@@ -2379,6 +2392,23 @@ pub struct MappedRegion {
             1,
             "private listener peer authentication must have one kernel query"
         );
+        assert!(production(server).contains("static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1)"));
+        for (name, source) in std::iter::once(("main.rs", production_main))
+            .chain(OTHER.iter().copied())
+        {
+            // This roster includes generated modules without test sections.
+            let source = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+            assert_eq!(
+                occurrences(source, "TransferEndpoint::from_file("),
+                usize::from(name == "vm_bridge.rs"),
+                "endpoint construction escaped {name}"
+            );
+            assert_eq!(
+                occurrences(source, ".into_file("),
+                usize::from(name == "runtime.rs"),
+                "endpoint extraction escaped {name}"
+            );
+        }
         let accept = production(server)
             .split("fn accept_clients(")
             .nth(1)
@@ -2404,13 +2434,10 @@ pub struct MappedRegion {
             1,
             "client selection endpoints must have one exact conversion site"
         );
-        for source in [production(client), production(server)] {
-            assert_eq!(
-                occurrences(source, "sys::ReceivedFd::into_file("),
-                0,
-                "exact endpoint conversion escaped conn.rs"
-            );
-        }
+        assert_eq!(occurrences(production(client), "sys::ReceivedFd::into_file("), 0,
+            "exact endpoint conversion escaped the client transport module");
+        assert_eq!(occurrences(production(server), "sys::ReceivedFd::into_file("), 1,
+            "server clipboard endpoints must have one exact conversion site");
         assert_eq!(
             occurrences(
                 production(conn),
