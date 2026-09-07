@@ -143,10 +143,15 @@ fn capture(path: &Path, root: &Path, name: &str) -> (ExitStatus, Vec<u8>) {
 }
 
 fn query_cli(path: &Path, root: &Path, name: &str, verb: &str) -> (ExitStatus, Vec<u8>) {
-    let extension = if verb == "capture" { "ppm" } else { "out" };
+    query_cli_args(path, root, name, &[verb])
+}
+
+fn query_cli_args(path: &Path, root: &Path, name: &str, args: &[&str]) -> (ExitStatus, Vec<u8>) {
+    let verb = args.first().unwrap();
+    let extension = if *verb == "capture" { "ppm" } else { "out" };
     let output = root.join(format!("{name}.{extension}"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
-    command.arg0("td-ctl").arg("--socket").arg(path).arg(verb);
+    command.arg0("td-ctl").arg("--socket").arg(path).args(args);
     let mut client = Process::to_file(&mut command, &root.join(format!("{name}.log")), &output);
     let status = client.wait();
     (status, fs::read(output).unwrap())
@@ -171,6 +176,148 @@ fn captured_output(ppm: &[u8]) -> (&str, u64, &[u8]) {
     let pixels = lines.next().unwrap();
     assert_eq!(pixels.len(), 800 * 600 * 3);
     (session, output.parse().unwrap(), pixels)
+}
+
+#[test]
+fn native_client_publications_correlate_routed_input_with_captured_output() {
+    let root = Root::new();
+    let session = root.0.join("session");
+    let mut command = headless(&session);
+    command.args(["--input-control", "enabled", "--capture-control", "enabled"]);
+    let mut compositor = Process::start(
+        &mut command, &root.0.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
+    );
+    let ready = compositor.ready();
+    let identity = ready_session(&ready);
+    let control = session.join("td-control");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
+    command.arg0("td-ui-demo").args(["run", "--socket"])
+        .arg(session.join("wayland-0")).arg("--ready-socket")
+        .arg(root.0.join("client.ready"));
+    let mut client = Process::start(
+        &mut command, &root.0.join("client.log"), "TD-UI-CLIENT-READY",
+    );
+    client.ready();
+    let layout = request(&control, b"layout\n");
+    let window = layout.lines().find_map(|line| line.strip_prefix("window id="))
+        .unwrap().split_whitespace().next().unwrap();
+    let decode = |reply: &str| {
+        let prefix = format!("td-client-v1 session={identity} window={window} client=");
+        let body = reply.strip_prefix(&prefix).unwrap();
+        let (client, body) = body.split_once(" commit=").unwrap();
+        let (commit, body) = body.split_once(" output=").unwrap();
+        let output = body.strip_suffix(" current=yes\n").unwrap();
+        (client.parse::<u64>().unwrap(), commit.parse::<u64>().unwrap(),
+            output.parse::<u64>().unwrap())
+    };
+    let observe = || {
+        let reply = request(&control, format!("observe-client {identity} {window}\n").as_bytes());
+        decode(reply.strip_prefix("ok\n").unwrap())
+    };
+    let (client_id, first_commit, first_output) = observe();
+    assert!(client_id > 0 && first_commit >= 2 && first_output > 0);
+    let (status, cli) = query_cli_args(&control, &root.0, "client-observe",
+        &["observe-client", identity, window]);
+    assert!(status.success());
+    let (cli_client, cli_commit, cli_output) = decode(std::str::from_utf8(&cli).unwrap());
+    assert_eq!(cli_client, client_id);
+    assert!(cli_commit >= first_commit && cli_output >= first_output);
+    // Readiness does not order the independent seat worker's focus events.
+    let deadline = Instant::now() + TIMEOUT;
+    let initial_commit = loop {
+        assert!(Instant::now() < deadline, "initial client publication did not settle");
+        let (observed_client, commit, output) = observe();
+        assert_eq!(observed_client, client_id);
+        let (status, before) = capture(&control, &root.0, "before");
+        assert!(status.success());
+        let (final_client, final_commit, final_output) = observe();
+        assert_eq!(final_client, client_id);
+        if commit != final_commit {
+            continue;
+        }
+        let (captured_session, captured, pixels) = captured_output(&before);
+        assert_eq!(captured_session, identity);
+        assert!(captured > output && captured <= final_output);
+        assert!(!demo_a_up_visible(pixels));
+        break commit;
+    };
+    assert_eq!(input_request(&control, identity, "key 1 30 down\n"), input_receipt(identity, 1));
+    assert_eq!(input_request(&control, identity, "key 2 30 up\n"), input_receipt(identity, 2));
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        assert!(Instant::now() < deadline, "native input did not produce correlated client output");
+        let (observed_client, commit, output) = observe();
+        assert_eq!(observed_client, client_id);
+        if commit <= initial_commit {
+            continue;
+        }
+        let (status, after) = capture(&control, &root.0, "after");
+        assert!(status.success());
+        let (final_client, final_commit, final_output) = observe();
+        assert_eq!(final_client, client_id);
+        if commit != final_commit {
+            continue;
+        }
+        let (captured_session, captured, pixels) = captured_output(&after);
+        assert_eq!(captured_session, identity);
+        assert!(captured > output && captured <= final_output);
+        if !demo_a_up_visible(pixels) {
+            continue;
+        }
+        break;
+    }
+    let stale = if identity == "00000000000000000000000000000000" {
+        "00000000000000000000000000000001"
+    } else {
+        "00000000000000000000000000000000"
+    };
+    let (status, body) = query_cli_args(&control, &root.0, "stale-observe",
+        &["observe-client", stale, window]);
+    assert_eq!(status.code(), Some(1));
+    assert!(body.is_empty());
+    client.child.kill().unwrap();
+    assert!(!client.wait().success());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let reply = request(&control, format!("observe-client {identity} {window}\n").as_bytes());
+        if reply == "unavailable client observation window is gone\n" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "disconnected client observation remained live");
+    }
+    compositor.child.stdin.take();
+    assert!(compositor.wait().success());
+}
+
+fn demo_a_up_visible(pixels: &[u8]) -> bool {
+    // Independent golden 5x7 glyphs for the demo's "A UP" suffix at scale 2.
+    // Focus/geometry repaint alone must not satisfy input completion.
+    let glyphs = [
+        [14u8, 17, 17, 31, 17, 17, 17],
+        [0; 7],
+        [17, 17, 17, 17, 17, 17, 14],
+        [30, 17, 17, 30, 16, 16, 16],
+    ];
+    let yellow = |x: usize, y: usize| {
+        pixels.get((y * 800 + x) * 3..(y * 800 + x) * 3 + 3) == Some(&[0xff, 0xe8, 0xc0])
+    };
+    for y in 0..=600 - 14 {
+        for x in 0..=800 - 48 {
+            if !yellow(x + 2, y) {
+                continue;
+            }
+            let matches = (0..14).all(|dy| (0..48).all(|dx| {
+                let column = (dx / 2) % 6;
+                let row = glyphs.get(dx / 12).and_then(|glyph| glyph.get(dy / 2)).unwrap();
+                let ink = column < 5 && row & (1 << (4 - column)) != 0;
+                yellow(x + dx, y + dy) == ink
+            }));
+            if matches {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[test]
@@ -240,6 +387,8 @@ fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
             assert_eq!(request(&control, b"observe\n"), expected, "observe caused a paint");
         } else {
             assert_eq!(request(&control, b"observe\n"), "error capture automation is disabled\n");
+            assert_eq!(request(&control, format!("observe-client {identity} @1\n").as_bytes()),
+                "error capture automation is disabled\n");
         }
         let (status, empty) = capture(&control, &case, "empty");
         let mut mapped_client = None;

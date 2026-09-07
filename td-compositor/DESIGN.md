@@ -6463,8 +6463,8 @@ boot release are removed when this consumer is activated.
 
 [AUTOMATION.md](AUTOMATION.md) specifies disposable hardware-free sessions,
 their lifecycle, opt-in normal seat routing, session-guarded input receipts,
-passive completed-output observation and stamped public capture. Client
-commit fences remain subsequent work. This is the primary native integration
+passive client-publication/completed-output observation and stamped public
+capture. This is the primary native integration
 platform; it does not replace independent compositor interoperability checks.
 
 ## td-owned development VM bridge

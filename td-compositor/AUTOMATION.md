@@ -281,8 +281,76 @@ and synchronous painting are not preempted by that check. The client's
 deadline bounds waiting for a response, not the runtime's rendering work.
 Neither a number increase nor `current=yes` proves that an application
 processed input. Accepted-input receipts are separate from output numbers.
-Client commit fences remain the next increment. Applications can lag while
-compositor-only paint continues.
+Applications can lag while compositor-only paint continues.
+
+### Applied client commits
+
+With the capture grant enabled, `observe-client <session> <@id>` takes a
+passive snapshot for the live client owning that public `layout` window
+handle. The session argument has the same exact nonce syntax as input; a
+stale session, missing window or retired connection returns `unavailable`
+and no record. Malformed requests and absent capture grant return `error`.
+The ordinary deployment channel and trusted-attention runtimes refuse it.
+The CLI validates the expected session and window, exact field order,
+canonical unsigned decimal counters and final newline before printing the
+body. The wire response includes the status line shown here:
+
+```text
+ok
+td-client-v1 session=0123456789abcdef0123456789abcdef window=@12 client=5 commit=8 output=19 current=yes
+```
+
+`client` is a nonzero connection identity, never reused within the process.
+Allocation refuses before wrapping; the session nonce separates processes.
+Connection-ID exhaustion retires the accept worker and, through the owned
+worker lifecycle, ends the disposable session. It cannot recover by retrying
+another connection, so the listener does not advertise reusable capacity.
+`commit` starts at zero and advances once per successful applied surface
+transaction by that client, including empty/no-op commits and the initial
+empty commit that solicits configure. It is a client-wide publication
+counter, not a document revision or an exact count of `wl_surface.commit`
+requests. Synchronized
+subsurface commits only cache pending state and do not advance it. A parent
+commit that applies several cached children advances once; a transition out
+of effective synchronization applies its cached subtree and advances once,
+even if that transaction is empty. Destruction, capture, ordinary control
+and other clients' transactions do not advance this client's counter.
+
+Capacity is checked before admission or scene mutation. An exhausted-counter
+refusal preserves the previous valid observation until normal disconnect
+cleanup; it did not begin applying a new scene transaction.
+Transaction application and
+compound settlement must both succeed before publishing the next number
+under the runtime lock. An admitted attempt's failure leaves the historical
+number and an invalid observation, even if scene state was partially changed
+or a later capture successfully paints it. Normal protocol handling
+disconnects failed clients.
+An outbound notification failure after publication does not revoke a scene
+update: publication precedes flushing deferred Wayland events, so this is
+not evidence that the client received a callback or buffer release.
+Only one small record per live registered headless client is retained;
+unregistration removes it. No event history or disconnected-client journal
+is accumulated. Ordinary runtimes do not allocate observation records.
+
+`output` is the latest completed output number in the same locked snapshot,
+not a claim that the client caused that output. `current=yes` requires a
+successful client publication and the same settled/presented condition as
+`observe`; a zero commit or output can only be `current=no`. Pending, failed
+or queued paints and compound transactions cannot claim current output.
+Neither observation query causes a paint, input event or client transaction.
+The reply is bounded to 1,024 bytes and the same five-second post-connect
+CLI conversation budget as other small automation observations.
+
+For correlated evidence, observe a client, capture, then observe it again.
+Require the expected session/window/client, a positive unchanged commit,
+`current=yes` at both observations, and the output-number relation
+`first_output < capture_output <= second_output`. Otherwise retry within a
+test deadline or fail.
+This binds pixels to an applied-publication interval; it does not establish
+which input caused it, nor cover all state changes outside surface commits.
+Native editor tests must also assert the expected editor remote state and
+inspect the captured pixels. Input receipts, client publication, completed
+output and editor semantic state remain distinct pieces of evidence.
 
 ## Planned control and observation increments
 
@@ -293,9 +361,9 @@ These are the next implementation requirements, not available commands:
    witness, enter/confirm trusted attention, or authorize secret release.
 2. Preserve separate input and capture grants. A public Wayland socket grants
    neither capability.
-3. Add per-client commit identities to the implemented session identities,
-   input receipts and completed-output identities. Distinguish accepted
-   input, a client's subsequent commit and
+3. Preserve the implemented session, input, client-publication and
+   completed-output identities. Distinguish accepted input, an applied
+   client transaction and
    completed output. A compositor sync cannot prove an application processed
    input. Queued output is not presented output.
 4. Preserve capture correlation and the public-scene comparison and

@@ -396,6 +396,8 @@ pub struct Runtime {
     last_submission: Option<Submission>,
     headless_output: Option<crate::headless::OutputStamp>,
     headless_action: u64,
+    /// Only live headless clients, with no retained event journal.
+    headless_commits: BTreeMap<u64, ClientCommit>,
     layout: Arc<BTreeMap<SurfaceKey, ViewLayout>>,
     subscribers: BTreeMap<u64, SyncSender<()>>,
     /// Each connected client's popup registrations, by client.
@@ -456,6 +458,12 @@ pub struct Runtime {
     /// Nothing in the pointer model carries it: neither press a drag begins
     /// with is delivered, so no client is told any of this.
     dragging: Option<Drag>,
+}
+
+#[derive(Default)]
+struct ClientCommit {
+    number: u64,
+    valid: bool,
 }
 
 #[derive(Default)]
@@ -551,6 +559,7 @@ impl Runtime {
             last_submission: None,
             headless_output: None,
             headless_action: 0,
+            headless_commits: BTreeMap::new(),
             layout: Arc::new(BTreeMap::new()),
             subscribers: BTreeMap::new(),
             popup_registrations: BTreeMap::new(),
@@ -644,11 +653,15 @@ impl Runtime {
             ));
         }
         self.client_resources.insert(client, resources);
+        if self.headless_output.is_some() {
+            self.headless_commits.insert(client, ClientCommit::default());
+        }
         Ok(())
     }
 
     pub(crate) fn unregister_client_resources(&mut self, client: u64) {
         self.client_resources.remove(&client);
+        self.headless_commits.remove(&client);
     }
 
     pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
@@ -727,6 +740,77 @@ impl Runtime {
         Ok(format!(
             "td-output-v1 {} current={}\n",
             stamp.record(),
+            if current { "yes" } else { "no" },
+        ))
+    }
+
+    /// Admission precedes scene mutation; a failed transaction stays invalid.
+    pub(crate) fn begin_client_commit(&mut self, client: u64) -> Result<Option<u64>, String> {
+        if self.headless_output.is_none() {
+            return Ok(None);
+        }
+        let state = self
+            .headless_commits
+            .get_mut(&client)
+            .ok_or("unregistered headless client")?;
+        let next = state
+            .number
+            .checked_add(1)
+            .ok_or("client commit identity exhausted")?;
+        state.valid = false;
+        Ok(Some(next))
+    }
+
+    /// Called under the scene transaction lock, before outbound notification.
+    pub(crate) fn finish_client_commit(
+        &mut self,
+        client: u64,
+        number: Option<u64>,
+    ) -> Result<(), String> {
+        let Some(number) = number else {
+            return Ok(());
+        };
+        let state = self
+            .headless_commits
+            .get_mut(&client)
+            .ok_or("unregistered headless client")?;
+        if state.valid || state.number.checked_add(1) != Some(number) {
+            return Err("client commit completion is out of sequence".into());
+        }
+        state.number = number;
+        state.valid = true;
+        Ok(())
+    }
+
+    pub(crate) fn observe_client(
+        &self,
+        session: u128,
+        window: u64,
+    ) -> Result<String, String> {
+        self.admit_public_observation()?;
+        let stamp = self
+            .headless_output
+            .ok_or("not a headless automation runtime")?;
+        if stamp.session != session {
+            return Err("client observation session identity does not match".into());
+        }
+        let key = self
+            .window_for_handle(window)
+            .ok_or("client observation window is gone")?;
+        let state = self
+            .headless_commits
+            .get(&key.client)
+            .ok_or("client observation connection is gone")?;
+        let current = state.valid
+            && !self.pending_paint
+            && self.compound_settle.is_none()
+            && self.last_submission == Some(Submission::Presented);
+        Ok(format!(
+            "td-client-v1 session={session:032x} window=@{window} client={} \
+             commit={} output={} current={}\n",
+            key.client,
+            state.number,
+            stamp.output,
             if current { "yes" } else { "no" },
         ))
     }
@@ -4824,6 +4908,67 @@ mod tests {
         assert!(runtime.take_writes().is_empty());
         assert_eq!(runtime.observe_output().unwrap(), expected(u64::MAX, "no"));
         assert!(runtime.capture_public_ppm().is_err());
+    }
+
+    #[test]
+    fn client_observations_refuse_stale_failed_pending_and_retired_state() {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-runtime-client-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+        )));
+        let mut runtime = Runtime::headless(
+            Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7,
+        );
+        let key = SurfaceKey { client: 3, object: 5 };
+        runtime.register_client_resources(3, Arc::new(ClientResourceHighWater::default())).unwrap();
+        assert!(runtime.register_client_resources(3,
+            Arc::new(ClientResourceHighWater::default())).is_err());
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let handle = runtime.scene.handle(key).unwrap();
+        assert!(runtime.observe_client(7, handle).unwrap().contains("commit=0 output=1 current=no"));
+        assert!(runtime.observe_client(8, handle).is_err());
+        assert!(runtime.observe_client(7, handle + 1).is_err());
+        let number = runtime.begin_client_commit(3).unwrap();
+        assert!(runtime.finish_client_commit(3, Some(2)).is_err());
+        runtime.finish_client_commit(3, number).unwrap();
+        assert!(runtime.finish_client_commit(3, number).is_err());
+        let current = runtime.observe_client(7, handle).unwrap();
+        assert!(current.contains("commit=1 output=1 current=yes"));
+        runtime.register_client_resources(4, Arc::new(ClientResourceHighWater::default())).unwrap();
+        let other = runtime.begin_client_commit(4).unwrap();
+        runtime.finish_client_commit(4, other).unwrap();
+        assert_eq!(runtime.observe_client(7, handle).unwrap(), current);
+        runtime.unregister_client_resources(4);
+        runtime.begin_compound_commit().unwrap();
+        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=no\n"));
+        runtime.finish_compound_commit().unwrap();
+        runtime.defer_repaint();
+        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=no\n"));
+        runtime.fail_next_repaint();
+        assert!(runtime.repaint().is_err());
+        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=no\n"));
+        runtime.repaint().unwrap();
+        runtime.begin_client_commit(3).unwrap();
+        // Even a successful fresh paint cannot repair a failed transaction.
+        runtime.capture_public_ppm().unwrap();
+        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=no\n"));
+        runtime.finish_client_commit(3, Some(2)).unwrap();
+        assert!(runtime.observe_client(7, handle).unwrap().ends_with("current=yes\n"));
+        runtime.headless_commits.get_mut(&3).unwrap().number = u64::MAX;
+        let exhausted = runtime.observe_client(7, handle).unwrap();
+        assert!(runtime.begin_client_commit(3).is_err());
+        assert_eq!(runtime.headless_commits.get(&3).unwrap().number, u64::MAX);
+        assert_eq!(runtime.observe_client(7, handle).unwrap(), exhausted);
+        runtime.enable_attention(true);
+        assert!(runtime.observe_client(7, handle).is_err());
+        runtime.enable_attention(false);
+        runtime.unregister_client_resources(3);
+        assert!(runtime.headless_commits.is_empty());
+        assert!(runtime.observe_client(7, handle).is_err());
+        assert!(runtime.begin_client_commit(3).is_err());
+        runtime.headless_output = None;
+        assert_eq!(runtime.begin_client_commit(3).unwrap(), None);
+        runtime.finish_client_commit(3, None).unwrap();
+        assert!(runtime.observe_client(7, handle).is_err());
     }
 
     #[test]

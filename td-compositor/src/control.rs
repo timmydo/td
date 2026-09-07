@@ -90,6 +90,7 @@ pub enum Request {
     ReleaseInput { session: u128, time: u32 },
     Capture,
     Observe,
+    ObserveClient { session: u128, window: u64 },
 }
 
 /// The vocabulary, as one list, so the parser and the help text cannot drift:
@@ -125,6 +126,10 @@ pub const USAGE: &[(&str, &str)] = &[
     ("release-input <session> <time-ms>", "release that headless seat's keys and pointer buttons"),
     ("capture", "write a completed public PPM frame on an enabled headless capture channel"),
     ("observe", "report headless session and completed-output identity without painting"),
+    (
+        "observe-client <session> <@id>",
+        "report that live client's applied commit and output identities",
+    ),
 ];
 
 impl Request {
@@ -164,6 +169,10 @@ impl Request {
             },
             "capture" => Request::Capture,
             "observe" => Request::Observe,
+            "observe-client" => Request::ObserveClient {
+                session: input_session(words.next())?,
+                window: window(words.next(), verb)?,
+            },
             other => return Err(format!("no such request '{other}'; try 'help'")),
         };
         // Refused rather than ignored: a caller spelling an argument this verb
@@ -200,6 +209,9 @@ impl Request {
             Request::ReleaseInput { session, time } => format!("release-input {session:032x} {time}"),
             Request::Capture => "capture".into(),
             Request::Observe => "observe".into(),
+            Request::ObserveClient { session, window } => {
+                format!("observe-client {session:032x} {}", handle_word(window))
+            }
             Request::FocusWindow(handle) => format!("focus {}", handle_word(handle)),
             Request::SendWindow(handle, number) => {
                 format!("send {} {number}", handle_word(handle))
@@ -245,7 +257,7 @@ fn parse_session(word: &str) -> Option<u128> {
 
 fn input_session(word: Option<&str>) -> Result<u128, String> {
     word.and_then(parse_session)
-        .ok_or_else(|| "input request needs the 32-lowercase-hex session identity".into())
+        .ok_or_else(|| "request needs the 32-lowercase-hex session identity".into())
 }
 
 fn key_request<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<Request, String> {
@@ -705,7 +717,9 @@ pub(crate) fn reportable(character: char) -> bool {
 pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> {
     let command = match request {
         Request::Layout => return Ok(Answer::Report(report(&runtime.control_snapshot()))),
-        Request::Capture | Request::Observe => return Ok(Answer::CaptureDisabled),
+        Request::Capture | Request::Observe | Request::ObserveClient { .. } => {
+            return Ok(Answer::CaptureDisabled);
+        }
         Request::Key { .. }
         | Request::ReleaseKeys { .. }
         | Request::Pointer { .. }
@@ -1032,11 +1046,18 @@ fn converse(
         }
     };
     let request = Request::parse(&line);
-    if capture && matches!(request, Ok(Request::Capture | Request::Observe)) {
+    if capture
+        && matches!(
+            request,
+            Ok(Request::Capture | Request::Observe | Request::ObserveClient { .. })
+        )
+    {
         let outcome = runtime.lock().map_err(|_| "compositor runtime is poisoned".to_string())
             .and_then(|mut runtime| {
                 if request == Ok(Request::Capture) {
                     runtime.capture_public_ppm()
+                } else if let Ok(Request::ObserveClient { session, window }) = request {
+                    runtime.observe_client(session, window).map(String::into_bytes)
                 } else {
                     runtime.observe_output().map(String::into_bytes)
                 }
@@ -1126,6 +1147,11 @@ fn write_answer(stream: &mut UnixStream, answer: &[u8], deadline: Instant) -> Re
 /// without reading the text — which is the whole reason the status is a line
 /// of its own rather than a word in front of the report.
 pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
+    if let Request::ObserveClient { session, window } = request {
+        let line = format!("{}\n", request.render());
+        let answer = ask_bounded(path, line.as_bytes(), REQUEST_LIMIT)?;
+        return decode_client_observation(&answer, session, window).map(str::to_string);
+    }
     if request.input_session().is_some() {
         return ask_input(path, request);
     }
@@ -1218,6 +1244,67 @@ fn decode_observation(body: &str) -> Result<(), ControlFailure> {
         return Err(bad());
     }
     Ok(())
+}
+
+fn decode_client_observation(
+    answer: &[u8],
+    expected_session: u128,
+    expected_window: u64,
+) -> Result<&str, ControlFailure> {
+    let bad = || ControlFailure::Unreachable("malformed client observation".into());
+    if answer.len() > REQUEST_LIMIT {
+        return Err(bad());
+    }
+    let text = std::str::from_utf8(answer).map_err(|_| bad())?;
+    let Some(body) = text.strip_prefix("ok\n") else {
+        return split_answer(text, false).and_then(|_| Err(bad()));
+    };
+    let mut fields = body.strip_suffix('\n').ok_or_else(bad)?.split(' ');
+    if fields.next() != Some("td-client-v1") {
+        return Err(bad());
+    }
+    let session = fields
+        .next()
+        .and_then(|s| s.strip_prefix("session="))
+        .and_then(parse_session)
+        .ok_or_else(bad)?;
+    let window = fields
+        .next()
+        .and_then(|s| s.strip_prefix("window="))
+        .and_then(|s| window(Some(s), "observe-client").ok())
+        .ok_or_else(bad)?;
+    fields
+        .next()
+        .and_then(|s| s.strip_prefix("client="))
+        .and_then(parse_counter)
+        .filter(|n| *n > 0)
+        .ok_or_else(bad)?;
+    let commit = fields
+        .next()
+        .and_then(|s| s.strip_prefix("commit="))
+        .and_then(parse_counter)
+        .ok_or_else(bad)?;
+    let output = fields
+        .next()
+        .and_then(|s| s.strip_prefix("output="))
+        .and_then(parse_counter)
+        .ok_or_else(bad)?;
+    let current = fields
+        .next()
+        .and_then(|s| s.strip_prefix("current="))
+        .ok_or_else(bad)?;
+    if !matches!(current, "yes" | "no")
+        || fields.next().is_some()
+        || (current == "yes" && (commit == 0 || output == 0))
+    {
+        return Err(bad());
+    }
+    if session != expected_session || window != expected_window {
+        return Err(ControlFailure::Unreachable(
+            "client observation belongs to another session or window".into(),
+        ));
+    }
+    Ok(body)
 }
 
 fn ask_bounded(
@@ -1554,6 +1641,56 @@ mod tests {
     fn input_line(line: &str, session: u128) -> String {
         let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
         format!("{verb} {session:032x} {rest}")
+    }
+
+    #[test]
+    fn client_observation_grammar_is_exact_bounded_and_generation_guarded() {
+        let reply = format!(
+            "ok\ntd-client-v1 session={:032x} window=@12 client=5 commit=8 output=9 current=yes\n", 7,
+        );
+        assert_eq!(decode_client_observation(reply.as_bytes(), 7, 12).unwrap(), &reply[3..]);
+        for end in 0..reply.len() {
+            assert!(decode_client_observation(&reply.as_bytes()[..end], 7, 12).is_err());
+        }
+        assert!(decode_client_observation(reply.as_bytes(), 8, 12).is_err());
+        assert!(decode_client_observation(reply.as_bytes(), 7, 13).is_err());
+        for (from, to) in [
+            ("current=yes", "current=no"),
+            ("commit=8", "commit=18446744073709551615"),
+            ("output=9", "output=18446744073709551615"),
+        ] {
+            assert!(decode_client_observation(reply.replace(from, to).as_bytes(), 7, 12).is_ok());
+        }
+        for (from, to) in [
+            ("session=00000000000000000000000000000007", "session=7"),
+            ("window=@12", "window=@012"), ("client=5", "client=0"),
+            ("client=5", "client=05"), ("commit=8", "commit=0"),
+            ("commit=8", "commit=+1"), ("commit=8", "commit=01"),
+            ("commit=8", "commit=18446744073709551616"),
+            ("output=9", "output=0"), ("current=yes", "current=true"),
+            ("current=yes\n", "current=yes\n\n"),
+            ("current=yes\n", "current=yes extra\n"),
+            (" client=", "  client="), ("client=5", "other=5"),
+        ] {
+            let invalid = reply.replace(from, to);
+            assert!(decode_client_observation(invalid.as_bytes(), 7, 12).is_err(), "{invalid}");
+        }
+        let zero = reply.replace("commit=8", "commit=0")
+            .replace("output=9", "output=0").replace("current=yes", "current=no");
+        assert!(decode_client_observation(zero.as_bytes(), 7, 12).is_ok());
+        assert!(decode_client_observation(&[b'x'; REQUEST_LIMIT + 1], 7, 12).is_err());
+        assert_eq!(decode_client_observation(b"error capture automation is disabled\n", 7, 12),
+            Err(ControlFailure::Refused("capture automation is disabled".into())));
+        assert_eq!(decode_client_observation(b"unavailable client observation window is gone\n", 7, 12),
+            Err(ControlFailure::Unreachable("client observation window is gone".into())));
+        let request = Request::ObserveClient { session: 7, window: 12 };
+        assert_eq!(Request::parse(&request.render()).unwrap(), request);
+        for line in ["observe-client", "observe-client 7 @12",
+            "observe-client 00000000000000000000000000000007 @0",
+            "observe-client 00000000000000000000000000000007 @12 extra"]
+        {
+            assert!(Request::parse(line).is_err());
+        }
     }
 
     #[test]

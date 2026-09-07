@@ -218,6 +218,17 @@ const MAX_FOREIGN_HANDLE_BYTES: usize = 128;
 const DND_ACTION_MASK: u32 = 1 | 2 | 4;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_client_id(next: &AtomicU64) -> Result<u64, String> {
+    let mut value = next.load(Ordering::Relaxed);
+    loop {
+        let successor = value.checked_add(1).ok_or("Wayland client identity exhausted")?;
+        match next.compare_exchange_weak(value, successor, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(value) => return Ok(value),
+            Err(current) => value = current,
+        }
+    }
+}
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
 static NEXT_BUFFER_SERIAL: AtomicU64 = AtomicU64::new(1);
 static NEXT_KEYMAP_FILE: AtomicU64 = AtomicU64::new(1);
@@ -4717,6 +4728,13 @@ impl Client {
                 return Err("runtime lock poisoned".to_string());
             }
         };
+        let number = match runtime.begin_client_commit(self.id) {
+            Ok(number) => number,
+            Err(error) => {
+                self.discard_deferred_outbound();
+                return Err(error);
+            }
+        };
         if let Err(error) = runtime.begin_compound_commit() {
             self.discard_deferred_outbound();
             return Err(error);
@@ -4726,7 +4744,13 @@ impl Client {
             .and_then(|()| {
                 self.apply_subsurface_parent_commit_with_runtime(id, false, &mut runtime)
             });
-        let settle = runtime.finish_compound_commit();
+        let settle = runtime.finish_compound_commit().and_then(|()| {
+            if operation.is_ok() {
+                runtime.finish_client_commit(self.id, number)
+            } else {
+                Ok(())
+            }
+        });
         drop(runtime);
         self.finish_surface_transaction(operation, settle)
     }
@@ -4741,6 +4765,13 @@ impl Client {
                 return Err("runtime lock poisoned".to_string());
             }
         };
+        let number = match runtime.begin_client_commit(self.id) {
+            Ok(number) => number,
+            Err(error) => {
+                self.discard_deferred_outbound();
+                return Err(error);
+            }
+        };
         if let Err(error) = runtime.begin_compound_commit() {
             self.discard_deferred_outbound();
             return Err(error);
@@ -4750,7 +4781,13 @@ impl Client {
             .and_then(|_| {
                 self.apply_subsurface_parent_commit_with_runtime(surface, false, &mut runtime)
             });
-        let settle = runtime.finish_compound_commit();
+        let settle = runtime.finish_compound_commit().and_then(|()| {
+            if operation.is_ok() {
+                runtime.finish_client_commit(self.id, number)
+            } else {
+                Ok(())
+            }
+        });
         drop(runtime);
         self.finish_surface_transaction(operation, settle)
     }
@@ -7638,7 +7675,7 @@ fn accept_clients(
                 continue;
             }
         };
-        let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
+        let id = allocate_client_id(&NEXT_CLIENT)?;
         let runtime = Arc::clone(&runtime);
         let keymap = keymap.clone();
         thread::Builder::new()
@@ -12858,6 +12895,12 @@ mod tests {
     fn subsurface_fixture(
         label: &str,
     ) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf, PathBuf) {
+        subsurface_fixture_mode(label, false)
+    }
+
+    fn subsurface_fixture_mode(
+        label: &str, headless: bool,
+    ) -> (Client, UnixStream, Arc<Mutex<Runtime>>, PathBuf, PathBuf) {
         let stem = format!(
             "td-subsurface-{label}-{}-{}",
             std::process::id(),
@@ -12879,7 +12922,11 @@ mod tests {
             80 * 4,
         )
         .unwrap();
-        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let runtime = Arc::new(Mutex::new(if headless {
+            Runtime::headless(framebuffer, 7)
+        } else {
+            Runtime::new(framebuffer)
+        }));
         let (server, peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
@@ -12939,6 +12986,64 @@ mod tests {
         body.i32(0);
         body.i32(0);
         client.dispatch(request(surface, 1, body).unwrap(), &mut VecDeque::new())
+    }
+
+    #[test]
+    fn client_publications_count_applied_transactions_not_subsurface_caches() {
+        let (mut client, _peer, runtime, framebuffer_path, pool_path) =
+            subsurface_fixture_mode("client-observer", true);
+        let observe = || runtime.lock().unwrap().observe_client(7, 1).unwrap();
+        assert!(observe().contains("commit=0 "));
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+        attach_surface(&mut client, 6, 40).unwrap();
+        client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        assert!(observe().contains("commit=0 "), "cached child was published early");
+        client.dispatch(request(5, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        assert!(observe().contains("commit=1 "));
+        assert!(observe().ends_with("current=yes\n"));
+        attach_surface(&mut client, 6, 41).unwrap();
+        client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        assert!(observe().contains("commit=1 "));
+        client.dispatch(request(30, 5, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        assert!(observe().contains("commit=2 "), "desync publication was missed");
+        runtime.lock().unwrap().capture_public_ppm().unwrap();
+        assert!(observe().contains("commit=2 "), "compositor paint counted as client commit");
+        attach_surface(&mut client, 7, 42).unwrap();
+        assert!(client.dispatch(request(7, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).is_err(), "roleless surface accepted a buffer");
+        runtime.lock().unwrap().capture_public_ppm().unwrap();
+        assert!(observe().contains("commit=2 "), "rejected operation got a number");
+        assert!(observe().ends_with("current=no\n"));
+        // Production disconnects after the error; direct dispatch can recover
+        // here to exercise the independent failed-settlement branch as well.
+        attach_surface(&mut client, 6, 40).unwrap();
+        client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).unwrap();
+        assert!(observe().contains("commit=3 "));
+        attach_surface(&mut client, 6, 42).unwrap();
+        runtime.lock().unwrap().fail_next_repaint();
+        assert!(client.dispatch(request(6, 6, wire::Builder::new()).unwrap(),
+            &mut VecDeque::new()).is_err());
+        assert!(observe().contains("commit=3 "), "failed transaction got a number");
+        runtime.lock().unwrap().capture_public_ppm().unwrap();
+        assert!(observe().ends_with("current=no\n"), "paint hid a failed transaction");
+        runtime.lock().unwrap().remove_client(88).unwrap();
+        assert!(runtime.lock().unwrap().observe_client(7, 1).is_err());
+        let _ = fs::remove_file(framebuffer_path);
+        let _ = fs::remove_file(pool_path);
+    }
+
+    #[test]
+    fn client_identity_allocation_never_wraps_or_reuses_a_retired_identity() {
+        let next = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_client_id(&next).unwrap(), u64::MAX - 1);
+        assert!(allocate_client_id(&next).is_err());
+        assert!(allocate_client_id(&next).is_err());
+        assert_eq!(next.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
