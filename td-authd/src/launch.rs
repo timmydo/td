@@ -321,7 +321,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x15, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
+        [0x10..=0x16, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -422,3 +422,15 @@ pub(crate) fn serve(mut channel: Channel, config: Config) -> Result<(), String> 
 #[cfg(test)]
 #[path = "../tests/launch.rs"]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
+    use crate::consent::Recovery;
+    for (tag, recovery) in [(0, Recovery::Unrecoverable), (1, Recovery::SecondToken)] {
+        assert_eq!(request(&[0x16, tag])?, Request::Secret(crate::session::Request::Enroll(recovery)));
+    }
+    assert!(request(&[0x17]).is_err());
+    assert!(request(&[0x16, 2]).is_err());
+    Ok(())
+}

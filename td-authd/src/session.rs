@@ -1,6 +1,6 @@
 //! At most one concurrent secret operation per authenticated generation.
 
-use crate::consent::{Request as Description, Role};
+use crate::consent::{Recovery, Request as Description, Role};
 use crate::unlock::{Event, Unlock};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ pub(crate) enum Request {
     Prepare,
     Poll,
     Begin(Role),
+    Enroll(Recovery),
     Presented(Description),
     Commit(Description),
     Cancel([u8; 32]),
@@ -24,6 +25,8 @@ impl Request {
             [0x11] => Ok(Self::Poll),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
+            [0x16, 0] => Ok(Self::Enroll(Recovery::Unrecoverable)),
+            [0x16, 1] => Ok(Self::Enroll(Recovery::SecondToken)),
             [0x13, rest @ ..] => Ok(Self::Presented(Description::decode(rest)?)),
             [0x14, rest @ ..] => Ok(Self::Commit(Description::decode(rest)?)),
             [0x15, rest @ ..] if rest.len() == 32 => {
@@ -34,6 +37,21 @@ impl Request {
                 Ok(Self::Cancel(nonce))
             }
             _ => Err("invalid secret session request".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Start {
+    Unlock(Role),
+    Enroll(Recovery),
+}
+
+impl Start {
+    fn begin(owner: u32, start: Self) -> Result<Unlock, String> {
+        match start {
+            Self::Unlock(role) => Unlock::start(owner, role),
+            Self::Enroll(recovery) => Unlock::start_enrollment(owner, recovery),
         }
     }
 }
@@ -136,14 +154,14 @@ impl Session {
     }
 
     pub fn answer(&mut self, request: Request) -> Result<Vec<u8>, String> {
-        self.answer_with(request, cleanup_command, Unlock::start)
+        self.answer_with(request, cleanup_command, Start::begin)
     }
 
     fn answer_with(
         &mut self,
         request: Request,
         cleanup: impl FnOnce(u32) -> Command,
-        begin: impl FnOnce(u32, Role) -> Result<Unlock, String>,
+        begin: impl FnOnce(u32, Start) -> Result<Unlock, String>,
     ) -> Result<Vec<u8>, String> {
         match request {
             Request::Prepare => {
@@ -159,17 +177,8 @@ impl Session {
                 self.tick()?;
                 self.reply()
             }
-            Request::Begin(role) => {
-                if !self.prepared || self.cleanup.is_some() || self.operation.is_some() {
-                    return Err("secret session is not ready for a new operation".into());
-                }
-                let operation = begin(self.owner, role)?;
-                let mut answer = vec![0x92];
-                answer.extend_from_slice(&operation.request().encode());
-                self.operation = Some(operation);
-                self.event = Some(Event::Waiting);
-                Ok(answer)
-            }
+            Request::Begin(role) => self.begin(Start::Unlock(role), begin),
+            Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
             Request::Presented(description) => {
                 self.operation
                     .as_mut()
@@ -202,6 +211,22 @@ impl Session {
                 }
             }
         }
+    }
+
+    fn begin(
+        &mut self,
+        start: Start,
+        begin: impl FnOnce(u32, Start) -> Result<Unlock, String>,
+    ) -> Result<Vec<u8>, String> {
+        if !self.prepared || self.cleanup.is_some() || self.operation.is_some() {
+            return Err("secret session is not ready for a new operation".into());
+        }
+        let operation = begin(self.owner, start)?;
+        let mut answer = vec![0x92];
+        answer.extend_from_slice(&operation.request().encode());
+        self.operation = Some(operation);
+        self.event = Some(Event::Waiting);
+        Ok(answer)
     }
 
     /// Terminal traffic also advances watchdogs without consuming events.

@@ -1,6 +1,6 @@
 //! Nonblocking ownership of one private root token child.
 
-use crate::consent::{Operation, Request, Role};
+use crate::consent::{Enrollment, Operation, Platform, Recovery, Request, Role};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
@@ -186,18 +186,45 @@ fn command(verb: &str, owner: u32) -> Command {
     command
 }
 
+fn operation_verb(operation: &Operation) -> Result<&'static str, String> {
+    match operation {
+        Operation::Unlock { .. } => Ok("unlock-operation"),
+        Operation::Enroll {
+            step: Enrollment::CreatePrimary,
+            ..
+        } => Ok("enroll-operation"),
+        _ => Err("unsupported private token operation".into()),
+    }
+}
+
 impl Unlock {
     /// Call only after root startup and paired-session admission.
     pub fn start(owner: u32, role: Role) -> Result<Self, String> {
+        Self::start_operation(owner, Operation::Unlock { role })
+    }
+
+    pub fn start_enrollment(owner: u32, recovery: Recovery) -> Result<Self, String> {
+        Self::start_operation(
+            owner,
+            Operation::Enroll {
+                platform: Platform::TpmPcr7,
+                recovery,
+                step: Enrollment::CreatePrimary,
+            },
+        )
+    }
+
+    fn start_operation(owner: u32, operation: Operation) -> Result<Self, String> {
+        let verb = operation_verb(&operation)?;
         if owner != 1000 {
-            return Err("unlock supervisor requires the configured graphical session".into());
+            return Err("token supervisor requires the configured graphical session".into());
         }
         let mut nonce = [0; 32];
         File::open("/dev/urandom")
             .and_then(|mut file| file.read_exact(&mut nonce))
-            .map_err(|_| "read unlock request randomness")?;
-        let request = Request::new(nonce, owner, Operation::Unlock { role })?;
-        Self::spawn(request, command("unlock-operation", owner))
+            .map_err(|_| "read token request randomness")?;
+        let request = Request::new(nonce, owner, operation)?;
+        Self::spawn(request, command(verb, owner))
     }
 
     fn spawn(request: Request, mut command: Command) -> Result<Self, String> {
@@ -374,15 +401,17 @@ impl Unlock {
             self.phase = Phase::Exit;
             return Ok(Event::Waiting);
         }
-        let tag = if self.phase == Phase::Presentation {
-            0x10
+        let (tag, expected) = if self.phase == Phase::Presentation {
+            (0x10, self.request.clone())
+        } else if let Some(next) = self.request.following_enrollment_step()? {
+            (0x10, next)
         } else {
-            0x12
+            (0x12, self.request.clone())
         };
-        if frame.first() != Some(&tag) || frame.get(33..) != Some(self.request.encode().as_slice())
-        {
-            return Err("private unlock prompt changed its request".into());
+        if frame.first() != Some(&tag) || frame.get(33..) != Some(expected.encode().as_slice()) {
+            return Err("private token prompt changed its request or skipped a step".into());
         }
+        self.request = expected;
         self.round = frame;
         self.acknowledgement_deadline = Some(deadline_after(ACK_TIME)?);
         self.phase = if tag == 0x10 {

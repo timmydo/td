@@ -755,8 +755,8 @@ labels or token instructions. All consumers pin the codec source and its
 tests assert the complete public argument display.
 
 These are structural checks, not caller admission or proof of
-randomness. The private root unlock worker in `td-secret/DESIGN.md`
-consumes this codec. The paired authority exposes its typed private
+randomness. The private root unlock and enrollment workers in
+`td-secret/DESIGN.md` consume this codec. The paired authority exposes its typed private
 session extension; the compositor receipt integration is not activated; there is no
 public operation listener.
 The future authority must pin the requester and credential input, admit
@@ -771,16 +771,17 @@ renderer and its current unconsumed receipt API are specified in
 ## Private unlock child supervision prerequisite
 
 `unlock.rs` owns one root-private `td-secret unlock-operation --uid
-1000` child. The paired service calls this controller through the
+1000` or `td-secret enroll-operation --uid 1000` child. The paired service calls this controller through the
 private session extension below. The compositor receipt integration
 remains the activation prerequisite.
 There is no public listener, automatic release, or new keyboard
 authorization. The live caller must enforce root startup and
 paired-session admission before constructing the production controller.
 The child independently requires root; this controller adds no
-credential switch. It generates the complete Unlock request with fresh
-kernel randomness and a typed primary/recovery role, rather than
-accepting a caller-selected nonce, executable, path, account or argument
+credential switch. It generates a fresh kernel-random nonce for either
+a typed Unlock role or an Enroll request starting at CreatePrimary with
+one explicit recovery policy and the fixed SHA-256 PCR 7 profile. It
+accepts no caller-selected nonce, executable, path, account or argument
 vector.
 
 The fixed child starts from `/`, with an empty environment, private
@@ -808,7 +809,7 @@ were presented. Receipt validation remains a duty of the authenticated
 paired caller; this controller cannot observe the compositor output. The
 root controller validates the retained request and deadline again before
 queuing either acknowledgement. Each controller owns exactly one
-request. The caller must own at most one controller per admitted session
+operation nonce and its current immutable step description. The caller must own at most one controller per admitted session
 and must not construct a replacement while the old child remains owned.
 Publication is complete only after the final success frame and observed
 successful child exit. A final frame followed by a failed exit is a
@@ -872,6 +873,7 @@ assertion, private worker round, caller-selected executable or path.
 | `10` prepare this generation | `90` cleanup started |
 | `11` poll session | `91` plus status and, for operation statuses, the full canonical description |
 | `12 01` primary unlock, `12 02` recovery unlock | `92` plus the root-generated canonical description |
+| `16 00` unrecoverable enrollment, `16 01` enrollment with a second token | `92` plus the root-generated CreatePrimary description |
 | `13` plus canonical description | `93` presentation acknowledged |
 | `14` plus canonical description | `94` commit queued |
 | `15` plus the nonzero 32-byte operation nonce | `95 00` stopping, `95 01` already completed, or `95 02` already failed/relocked |
@@ -898,19 +900,20 @@ helper has already exited.
 Prepare is single use. It runs only the fixed root `td-secret
 lock-session --uid 1000` helper with an empty environment, root cwd,
 and null standard descriptors. Polling requires successful observed
-exit within two seconds before admitting any unlock. Expiry kills and
+exit within two seconds before admitting any secret operation. Expiry kills and
 retains the child until reaping; failed cleanup ends the generation.
 This does not open a persistent store or access hardware. A new operation
 requires completed preparation and no retained predecessor, including
 an unpolled completion. Root generates its nonce and fixes its owner;
-the peer selects only the primary or recovery role. The existing worker
-refuses a store that is not token protected.
+the peer selects only the unlock role or explicit enrollment recovery
+policy. Unlock refuses a store that is not token protected; enrollment
+refuses token replacement. Enrollment success leaves the store locked.
 
 Acknowledgements must exactly match the immutable description and the
 supervisor phase/deadline. Cancellation must match the active nonce and
 is applied before any further child poll. Queueing commit is the root
 execution decision: cancellation after the worker receives it cannot
-undo an already completed release. A presentation or commit
+undo an already completed release or enrollment publication. A presentation or commit
 acknowledgement reports the queued transition,
 not token success. Cancellation against a retained terminal result
 reports that result explicitly and preserves it. A stopping response
@@ -940,7 +943,8 @@ ordering is mandatory for the upcoming compositor integration.
 This extension stages the root API. The current compositor uses only
 terminal records and keeps secure attention inert. Before sending the
 new records, its client must bind a physical attention lifetime to one
-immutable presentation receipt, serialize observed cancellation against
+operation and each required immutable presentation receipt, serialize
+observed cancellation against
 commit and withhold input admission until generation cleanup succeeds.
 The root verifies the authenticated peer and exact public description;
 it cannot independently observe the peer's framebuffer. A matching
@@ -957,3 +961,61 @@ and generation teardown removes a newly seeded key. This fixture calls
 the actual session controller; the separate channel fixtures prove
 sender authentication. It does not claim physical token presence or a
 compositor presentation.
+
+
+Enrollment progression is fixed by `Request::following_enrollment_step`
+in the shared canonical codec. It retains nonce, owner, platform and
+recovery policy, advancing CreatePrimary to ProvePrimary and, only when
+SecondToken was selected, to CreateRecovery and ProveRecovery. A final
+proof has no following presentation. The canonical wire format is
+unchanged. All three consumers pin the updated source; literal sequence
+tests distinguish the two policies.
+
+After acknowledging one step's presentation, the root supervisor accepts
+only the next exact private worker `10` invitation. Only after the selected final proof
+may it accept a private worker `12` commit invitation for that same final description.
+Initial invitations still match CreatePrimary exactly. A skipped,
+repeated, changed or early-commit invitation cancels the child and requires
+reaping and successful relocking before failure can be reported. The
+current public description changes only after this strict validation;
+stale earlier receipts cannot acknowledge a later step. Neither an
+accepted step nor its presentation renews the 120-second operation
+deadline. Each new invitation receives only the existing three-second
+acknowledgement window.
+
+The paired Session exposes each current description through the existing
+poll records and requires it in acknowledgement requests. Responses
+contain only their acknowledgement tag. Cancellation retains the same nonce
+throughout every step. Enrollment and unlock share the single concurrent
+operation slot, generation preparation, terminal-result retention and
+teardown. Public credential-write requests remain unimplemented. The
+compositor still does not activate these records: before doing so it must
+fully present each exact next step and invalidate its earlier receipt,
+without allowing arbitrary prompt replacement or resetting physical
+attention after cancellation.
+
+Host child fixtures exercise both complete enrollment sequences through
+the supervisor and paired Session, with literal expected steps and a
+fixed operation deadline. They reject changed nonce, owner or recovery
+policy, skipped/repeated steps, early commit and a stale previous receipt.
+The root lifecycle fixture additionally runs both enrollment policies
+against the production missing-store refusal and verifies runtime cleanup.
+These checks establish protocol sequencing and ownership, not physical
+presentation or token presence.
+
+
+The fixed 120-second operation ceiling covers every enrollment step,
+including four touches and any second-token connection time. It is a
+conservative refusal boundary shared with the private worker and HID
+transport, not a measured usability budget. The UI must instruct the user
+to have both tokens ready before starting and show the remaining overall
+time. Physical timing validation remains an activation check; this API
+neither certifies that budget for hardware nor renews it after a step.
+
+The authenticated paired root API is callable now. Compositor abstinence
+is the current activation boundary, not an authd feature flag: a trusted
+compositor that violates its presentation duties could invoke it. The
+root cannot observe its framebuffer and trusts that admitted peer to
+supply receipts honestly. These duties apply before a compositor consumer
+ships. Presentation acknowledgements carry descriptions in the request;
+responses are the bare 93/94 tags, while poll results carry descriptions.

@@ -97,6 +97,36 @@ impl Request {
         &self.operation
     }
 
+    /// The only next presentation in this same enrollment operation.
+    pub fn following_enrollment_step(&self) -> Result<Option<Self>, String> {
+        let Operation::Enroll {
+            platform,
+            recovery,
+            step,
+        } = &self.operation
+        else {
+            return Ok(None);
+        };
+        let next = match (*step, *recovery) {
+            (Enrollment::CreatePrimary, _) => Enrollment::ProvePrimary,
+            (Enrollment::ProvePrimary, Recovery::SecondToken) => Enrollment::CreateRecovery,
+            (Enrollment::CreateRecovery, Recovery::SecondToken) => Enrollment::ProveRecovery,
+            (Enrollment::ProvePrimary, Recovery::Unrecoverable)
+            | (Enrollment::ProveRecovery, Recovery::SecondToken) => return Ok(None),
+            _ => return Err("invalid enrollment progression".into()),
+        };
+        Self::new(
+            self.nonce,
+            self.owner,
+            Operation::Enroll {
+                platform: *platform,
+                recovery: *recovery,
+                step: next,
+            },
+        )
+        .map(Some)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(MAX_BYTES);
         bytes.extend_from_slice(MAGIC);
@@ -337,6 +367,52 @@ impl<'a> Input<'a> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    #[test]
+    fn enrollment_progression_preserves_identity_and_stops_at_the_selected_final_proof() {
+        for recovery in [Recovery::SecondToken, Recovery::Unrecoverable] {
+            let mut request = Request::new(
+                [42; 32],
+                1000,
+                Operation::Enroll {
+                    platform: Platform::TpmPcr7,
+                    recovery,
+                    step: Enrollment::CreatePrimary,
+                },
+            )
+            .unwrap();
+            let mut expected = vec![Enrollment::ProvePrimary];
+            if recovery == Recovery::SecondToken {
+                expected.extend([Enrollment::CreateRecovery, Enrollment::ProveRecovery]);
+            }
+            for step in expected {
+                request = request.following_enrollment_step().unwrap().unwrap();
+                assert_eq!(
+                    request,
+                    Request::new(
+                        [42; 32],
+                        1000,
+                        Operation::Enroll {
+                            platform: Platform::TpmPcr7,
+                            recovery,
+                            step,
+                        }
+                    )
+                    .unwrap()
+                );
+            }
+            assert_eq!(request.following_enrollment_step().unwrap(), None);
+        }
+        let unlock = Request::new(
+            [42; 32],
+            1000,
+            Operation::Unlock {
+                role: Role::Primary,
+            },
+        )
+        .unwrap();
+        assert_eq!(unlock.following_enrollment_step().unwrap(), None);
+    }
 
     #[test]
     fn every_operation_roundtrips_and_refuses_truncation_or_trailing_bytes() {

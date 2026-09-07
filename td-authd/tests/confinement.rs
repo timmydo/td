@@ -85,7 +85,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xf1d3b878619f19f4,
+        0xd3593686debcc228,
         "shared consent changed: reconcile td-secret/src/main.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -95,7 +95,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x1cb0f1e8581e48e9,
+        0x278f8d6afeeb5087,
         "private unlock supervisor changed"
     );
     assert_eq!(
@@ -105,7 +105,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0xcfef94a2fc023999,
+        0xb62dc9d600ca92ca,
         "paired secret controller changed"
     );
     let application = include_str!("../src/application.rs")
@@ -292,4 +292,4 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0xac770e461e98fb85;
+const LAUNCH_FINGERPRINT: u64 = 0xfb91bd5c084d2b47;

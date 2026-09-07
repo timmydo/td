@@ -273,3 +273,240 @@ fn root_supervisor_relocks_after_the_production_worker_refuses() {
     assert!(unlock.child.is_none());
     assert!(!Path::new(key).exists());
 }
+
+fn enrollment_request(recovery: Recovery, nonce: u8) -> Request {
+    Request::new(
+        [nonce; 32],
+        1000,
+        Operation::Enroll {
+            platform: Platform::TpmPcr7,
+            recovery,
+            step: Enrollment::CreatePrimary,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+#[ignore = "exec-only complete enrollment protocol peer"]
+fn enrollment_child() {
+    let mut stream = child_stream();
+    let mut request = Request::decode(&read_frame(&mut stream)).unwrap();
+    loop {
+        let mut frame = vec![0x10];
+        frame.extend_from_slice(&[16; 32]);
+        frame.extend_from_slice(&request.encode());
+        send_frame(&mut stream, &frame);
+        frame[0] = 0x11;
+        assert_eq!(read_frame(&mut stream), frame);
+        let Some(next) = request.following_enrollment_step().unwrap() else {
+            break;
+        };
+        request = next;
+    }
+    let mut frame = vec![0x12];
+    frame.extend_from_slice(&[18; 32]);
+    frame.extend_from_slice(&request.encode());
+    send_frame(&mut stream, &frame);
+    frame[0] = 0x13;
+    assert_eq!(read_frame(&mut stream), frame);
+    send_frame(&mut stream, &[0x14]);
+}
+
+#[test]
+fn enrollment_requires_every_step_without_renewing_the_operation_deadline() {
+    for recovery in [Recovery::Unrecoverable, Recovery::SecondToken] {
+        let initial = enrollment_request(recovery, 42);
+        let mut supervisor = Unlock::spawn(initial.clone(), fixture("enrollment_child")).unwrap();
+        let deadline = supervisor.deadline;
+        let mut steps = vec![Enrollment::CreatePrimary, Enrollment::ProvePrimary];
+        if recovery == Recovery::SecondToken {
+            steps.extend([Enrollment::CreateRecovery, Enrollment::ProveRecovery]);
+        }
+        let mut last = initial;
+        for step in steps {
+            let expected = Request::new(
+                [42; 32],
+                1000,
+                Operation::Enroll {
+                    platform: Platform::TpmPcr7,
+                    recovery,
+                    step,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                advance(&mut supervisor).unwrap(),
+                Event::Present(expected.clone())
+            );
+            assert_eq!(supervisor.request(), &expected);
+            assert_eq!(supervisor.deadline, deadline);
+            assert!(supervisor.commit(&expected).is_err());
+            supervisor.presented(&expected).unwrap();
+            last = expected;
+        }
+        assert_eq!(
+            advance(&mut supervisor).unwrap(),
+            Event::Commit(last.clone())
+        );
+        supervisor.commit(&last).unwrap();
+        assert_eq!(advance(&mut supervisor).unwrap(), Event::Complete);
+    }
+}
+
+#[test]
+#[ignore = "exec-only forged enrollment step peer"]
+fn changed_enrollment_child() {
+    let mut stream = child_stream();
+    let initial = Request::decode(&read_frame(&mut stream)).unwrap();
+    let mut frame = vec![0x10];
+    frame.extend_from_slice(&[16; 32]);
+    frame.extend_from_slice(&initial.encode());
+    send_frame(&mut stream, &frame);
+    frame[0] = 0x11;
+    assert_eq!(read_frame(&mut stream), frame);
+    // 1 skipped step; 2 changed recovery; 3 changed nonce; 4 early commit;
+    // 5 repeated step; 6 changed owner; 7 correct next description/wrong tag.
+    let case = initial.nonce()[0];
+    let step = match case {
+        1 => Enrollment::CreateRecovery,
+        5 => Enrollment::CreatePrimary,
+        _ => Enrollment::ProvePrimary,
+    };
+    let changed = Request::new(
+        if case == 3 {
+            [99; 32]
+        } else {
+            *initial.nonce()
+        },
+        if case == 6 { 1001 } else { 1000 },
+        Operation::Enroll {
+            platform: Platform::TpmPcr7,
+            recovery: if case == 2 {
+                Recovery::Unrecoverable
+            } else {
+                Recovery::SecondToken
+            },
+            step,
+        },
+    )
+    .unwrap();
+    let mut frame = vec![if matches!(case, 4 | 7) { 0x12 } else { 0x10 }];
+    frame.extend_from_slice(&[17; 32]);
+    frame.extend_from_slice(&if case == 4 {
+        initial.encode()
+    } else {
+        changed.encode()
+    });
+    send_frame(&mut stream, &frame);
+    let _ = stream.read(&mut [0]);
+}
+
+#[test]
+fn skipped_repeated_changed_or_early_commit_steps_are_reaped_and_relocked() {
+    for case in 1..=7 {
+        let initial = enrollment_request(Recovery::SecondToken, case);
+        let mut supervisor =
+            Unlock::spawn(initial.clone(), fixture("changed_enrollment_child")).unwrap();
+        assert_eq!(
+            advance(&mut supervisor).unwrap(),
+            Event::Present(initial.clone())
+        );
+        supervisor.presented(&initial).unwrap();
+        assert_eq!(
+            advance(&mut supervisor).unwrap(),
+            Event::Failed("private token prompt changed its request or skipped a step".into(),)
+        );
+        assert_eq!(supervisor.request(), &initial);
+        assert!(supervisor.child.is_none());
+    }
+}
+
+#[test]
+fn a_previous_step_receipt_cannot_authorize_the_next_step() {
+    let initial = enrollment_request(Recovery::SecondToken, 42);
+    let mut supervisor = Unlock::spawn(initial.clone(), fixture("enrollment_child")).unwrap();
+    assert_eq!(
+        advance(&mut supervisor).unwrap(),
+        Event::Present(initial.clone())
+    );
+    supervisor.presented(&initial).unwrap();
+    let next = initial.following_enrollment_step().unwrap().unwrap();
+    assert_eq!(advance(&mut supervisor).unwrap(), Event::Present(next));
+    assert!(supervisor.presented(&initial).is_err());
+    assert!(matches!(
+        advance(&mut supervisor).unwrap(),
+        Event::Failed(_)
+    ));
+    assert!(supervisor.child.is_none());
+}
+
+#[test]
+fn canonical_operation_selects_the_fixed_worker_verb() {
+    assert_eq!(
+        operation_verb(&Operation::Unlock {
+            role: Role::Primary
+        })
+        .unwrap(),
+        "unlock-operation"
+    );
+    for recovery in [Recovery::Unrecoverable, Recovery::SecondToken] {
+        let initial = enrollment_request(recovery, 42);
+        assert_eq!(
+            operation_verb(initial.operation()).unwrap(),
+            "enroll-operation"
+        );
+        assert!(operation_verb(
+            initial
+                .following_enrollment_step()
+                .unwrap()
+                .unwrap()
+                .operation()
+        )
+        .is_err());
+    }
+}
+
+#[test]
+#[ignore = "exec-only final proof with a presentation tag instead of commit"]
+fn wrong_final_enrollment_tag_child() {
+    let mut stream = child_stream();
+    let initial = Request::decode(&read_frame(&mut stream)).unwrap();
+    let last = initial.following_enrollment_step().unwrap().unwrap();
+    for request in [&initial, &last] {
+        let mut frame = vec![0x10];
+        frame.extend_from_slice(&[16; 32]);
+        frame.extend_from_slice(&request.encode());
+        send_frame(&mut stream, &frame);
+        frame[0] = 0x11;
+        assert_eq!(read_frame(&mut stream), frame);
+    }
+    let mut frame = vec![0x10];
+    frame.extend_from_slice(&[18; 32]);
+    frame.extend_from_slice(&last.encode());
+    send_frame(&mut stream, &frame);
+    let _ = stream.read(&mut [0]);
+}
+
+#[test]
+fn final_proof_description_with_a_presentation_tag_is_refused() {
+    let initial = enrollment_request(Recovery::Unrecoverable, 42);
+    let last = initial.following_enrollment_step().unwrap().unwrap();
+    let mut supervisor =
+        Unlock::spawn(initial.clone(), fixture("wrong_final_enrollment_tag_child")).unwrap();
+    assert_eq!(
+        advance(&mut supervisor).unwrap(),
+        Event::Present(initial.clone())
+    );
+    supervisor.presented(&initial).unwrap();
+    assert_eq!(
+        advance(&mut supervisor).unwrap(),
+        Event::Present(last.clone())
+    );
+    supervisor.presented(&last).unwrap();
+    assert!(matches!(
+        advance(&mut supervisor).unwrap(),
+        Event::Failed(_)
+    ));
+    assert!(supervisor.child.is_none());
+}

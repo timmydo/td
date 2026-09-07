@@ -1320,7 +1320,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xf1d3b878619f19f4,
+            0xd3593686debcc228,
             "shared consent changed: reconcile td-secret/src/main.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);

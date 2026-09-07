@@ -29,7 +29,7 @@ fn description() -> Description {
     .unwrap()
 }
 
-fn unexpected_begin(_: u32, _: Role) -> Result<Unlock, String> {
+fn unexpected_begin(_: u32, _: Start) -> Result<Unlock, String> {
     panic!("operation began before admission")
 }
 
@@ -224,7 +224,7 @@ fn one_operation_retains_its_bound_description_until_terminal_delivery() {
             cleanup_command,
             |owner, role| {
                 assert_eq!(owner, 1000);
-                assert_eq!(role, Role::Recovery);
+                assert_eq!(role, Start::Unlock(Role::Recovery));
                 Unlock::fixture(description(), fixture("unlock_child"))
             },
         )
@@ -329,18 +329,26 @@ fn root_session_preparation_failure_and_generation_exit_relock() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(!Path::new(key).exists());
-    session.answer(Request::Begin(Role::Primary)).unwrap();
-    let until = Instant::now() + Duration::from_secs(5);
-    loop {
-        let reply = session.answer(Request::Poll).unwrap();
-        if reply[1] == 7 {
-            break;
+    for request in [
+        Request::Begin(Role::Primary),
+        Request::Enroll(Recovery::Unrecoverable),
+        Request::Enroll(Recovery::SecondToken),
+    ] {
+        seed();
+        session.answer(request).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reply = session.answer(Request::Poll).unwrap();
+            if reply[1] == 7 {
+                break;
+            }
+            assert_eq!(reply[1], 3, "missing store reached presentation/release");
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(reply[1], 3, "missing store reached presentation/release");
-        assert!(Instant::now() < until);
-        thread::sleep(Duration::from_millis(1));
+        assert!(session.operation.is_none());
+        assert!(!Path::new(key).exists());
     }
-    assert!(session.operation.is_none());
     seed();
     session.close().unwrap();
     assert!(!Path::new(key).exists());
@@ -453,4 +461,167 @@ fn generation_exit_cleans_an_unpolled_completion() {
         .unwrap();
     assert!(called);
     assert!(session.operation.is_none());
+}
+
+fn enrollment_description(recovery: Recovery, step: crate::consent::Enrollment) -> Description {
+    Description::new(
+        [42; 32],
+        1000,
+        Operation::Enroll {
+            platform: crate::consent::Platform::TpmPcr7,
+            recovery,
+            step,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+#[ignore = "exec-only paired enrollment protocol peer"]
+fn enrollment_child() {
+    use crate::consent::Enrollment;
+    let mut stream = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let initial = Description::decode(&read_frame(&mut stream)).unwrap();
+    let recovery = match initial.operation() {
+        Operation::Enroll { recovery, .. } => *recovery,
+        _ => panic!("expected enrollment"),
+    };
+    assert_eq!(
+        initial,
+        enrollment_description(recovery, Enrollment::CreatePrimary)
+    );
+    let mut steps = vec![Enrollment::CreatePrimary, Enrollment::ProvePrimary];
+    if recovery == Recovery::SecondToken {
+        steps.extend([Enrollment::CreateRecovery, Enrollment::ProveRecovery]);
+    }
+    let mut last = initial;
+    for step in steps {
+        last = enrollment_description(recovery, step);
+        let mut bytes = vec![0x10];
+        bytes.extend_from_slice(&[16; 32]);
+        bytes.extend_from_slice(&last.encode());
+        send_frame(&mut stream, &bytes);
+        bytes[0] = 0x11;
+        assert_eq!(read_frame(&mut stream), bytes);
+    }
+    let mut bytes = vec![0x12];
+    bytes.extend_from_slice(&[18; 32]);
+    bytes.extend_from_slice(&last.encode());
+    send_frame(&mut stream, &bytes);
+    bytes[0] = 0x13;
+    assert_eq!(read_frame(&mut stream), bytes);
+    send_frame(&mut stream, &[0x14]);
+}
+
+fn secret_event(session: &mut Session) -> Vec<u8> {
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let response = session.answer(Request::Poll).unwrap();
+        if response.get(1) != Some(&3) {
+            return response;
+        }
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn paired_enrollment_fixes_recovery_and_returns_each_required_presentation() {
+    use crate::consent::Enrollment;
+    for (flag, recovery) in [(0, Recovery::Unrecoverable), (1, Recovery::SecondToken)] {
+        let start = Request::decode(&[0x16, flag]).unwrap();
+        assert_eq!(start, Request::Enroll(recovery));
+        let mut session = Session::new(1000).unwrap();
+        assert!(session
+            .answer_with(start, cleanup_command, unexpected_begin)
+            .is_err());
+        prepare(&mut session);
+        let initial = enrollment_description(recovery, Enrollment::CreatePrimary);
+        let response = session
+            .answer_with(
+                Request::Enroll(recovery),
+                cleanup_command,
+                |owner, start| {
+                    assert_eq!(owner, 1000);
+                    assert_eq!(start, Start::Enroll(recovery));
+                    Unlock::fixture(initial.clone(), fixture("enrollment_child"))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            response,
+            [&[0x92][..], initial.encode().as_slice()].concat()
+        );
+        assert!(session
+            .answer_with(Request::Enroll(recovery), cleanup_command, unexpected_begin)
+            .is_err());
+        let mut steps = vec![Enrollment::CreatePrimary, Enrollment::ProvePrimary];
+        if recovery == Recovery::SecondToken {
+            steps.extend([Enrollment::CreateRecovery, Enrollment::ProveRecovery]);
+        }
+        let mut last = initial;
+        for step in steps {
+            last = enrollment_description(recovery, step);
+            assert_eq!(
+                secret_event(&mut session),
+                [&[0x91, 4][..], last.encode().as_slice()].concat()
+            );
+            assert_eq!(
+                session.answer(Request::Presented(last.clone())).unwrap(),
+                [0x93]
+            );
+        }
+        assert_eq!(
+            secret_event(&mut session),
+            [&[0x91, 5][..], last.encode().as_slice()].concat()
+        );
+        assert_eq!(
+            session.answer(Request::Commit(last.clone())).unwrap(),
+            [0x94]
+        );
+        assert_eq!(
+            secret_event(&mut session),
+            [&[0x91, 6][..], last.encode().as_slice()].concat()
+        );
+        assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    }
+    for bytes in [vec![0x16], vec![0x16, 2], vec![0x16, 255], vec![0x16, 0, 0]] {
+        assert!(Request::decode(&bytes).is_err());
+    }
+}
+
+#[test]
+fn invalid_enrollment_receipts_require_generation_teardown() {
+    use crate::consent::Enrollment;
+    for stale in [false, true] {
+        let recovery = Recovery::Unrecoverable;
+        let initial = enrollment_description(recovery, Enrollment::CreatePrimary);
+        let mut session = Session::new(1000).unwrap();
+        prepare(&mut session);
+        session
+            .answer_with(Request::Enroll(recovery), cleanup_command, |_, _| {
+                Unlock::fixture(initial.clone(), fixture("enrollment_child"))
+            })
+            .unwrap();
+        assert_eq!(secret_event(&mut session).get(1), Some(&4));
+        let rejected = if stale {
+            session.answer(Request::Presented(initial.clone())).unwrap();
+            assert_eq!(secret_event(&mut session).get(1), Some(&4));
+            session.answer(Request::Presented(initial))
+        } else {
+            session.answer(Request::Commit(initial))
+        };
+        assert!(rejected.is_err());
+        let pid = session.operation.as_ref().unwrap().fixture_pid().unwrap();
+        session
+            .close_with(|_| {
+                assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+                fixture("cleanup_child")
+            })
+            .unwrap();
+        assert!(session.operation.is_none());
+    }
 }
